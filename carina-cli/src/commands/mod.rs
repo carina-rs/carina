@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
-use carina_core::override_aware::CanonicalUnresolvedResources;
+use carina_core::override_aware::CanonicalResourcePair;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
@@ -413,7 +413,7 @@ impl ConfigNameResolution for EvaluatedConfigOnly {
 struct PairedConfig(UnresolvedConfigSnapshot);
 
 impl ConfigNameResolution for PairedConfig {
-    type Output = CanonicalUnresolvedResources;
+    type Output = CanonicalResourcePair;
 
     fn resolve<E>(
         self,
@@ -424,8 +424,8 @@ impl ConfigNameResolution for PairedConfig {
     }
 }
 
-/// Validate the evaluated file and canonicalize its authored resource
-/// snapshot at the same schema-aware name-resolution boundary.
+/// Validate and canonicalize the evaluated and authored resource snapshots at
+/// the same schema-aware name-resolution boundary.
 pub(crate) fn validate_and_resolve_config_pair(
     parsed: &mut carina_core::parser::InferredFile,
     unresolved: UnresolvedConfigSnapshot,
@@ -433,7 +433,7 @@ pub(crate) fn validate_and_resolve_config_pair(
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalUnresolvedResources, AppError> {
+) -> Result<CanonicalResourcePair, AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
     validate_and_resolve_config_pair_with_context(
@@ -458,7 +458,7 @@ pub(crate) fn validate_and_resolve_config_pair_with_context(
     load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalUnresolvedResources, AppError> {
+) -> Result<CanonicalResourcePair, AppError> {
     validate_and_resolve_errors_with_context_inner(
         parsed,
         base_dir,

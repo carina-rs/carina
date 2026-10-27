@@ -3178,7 +3178,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
         ..Default::default()
     };
 
-    let canonical_unresolved = resolve_config_block_names_with_schemas(
+    let canonical_pair = resolve_config_block_names_with_schemas(
         &mut evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
@@ -3187,9 +3187,102 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
 
     assert!(evaluated.resources[0].attributes.contains_key("rules"));
     assert!(!evaluated.resources[0].attributes.contains_key("rule"));
-    let unresolved = &canonical_unresolved.as_slice()[0].attributes;
+    assert!(
+        canonical_pair.evaluated()[0]
+            .attributes
+            .contains_key("rules")
+    );
+    assert!(
+        !canonical_pair.evaluated()[0]
+            .attributes
+            .contains_key("rule")
+    );
+    let unresolved = &canonical_pair.unresolved()[0].attributes;
     assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
+}
+
+#[test]
+fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
+    let lifecycle_type = AttributeType::struct_(
+        "LifecycleConfiguration".to_string(),
+        vec![
+            StructField::new(
+                "transition",
+                AttributeType::struct_("Transition".to_string(), vec![]),
+            ),
+            StructField::new(
+                "transitions",
+                AttributeType::list(AttributeType::struct_("Transition".to_string(), vec![])),
+            )
+            .with_block_name("transition"),
+        ],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("thing").attribute(AttributeSchema::new(
+            "lifecycle_configuration",
+            lifecycle_type,
+        )),
+    );
+
+    // Reference resolution may make the evaluated value a concrete list, but
+    // the authored ResourceRef still identifies assignment syntax. The paired
+    // resolver must therefore keep the real singular field on both sides.
+    let evaluated_resource = Resource::with_provider("test", "thing", "consumer", None)
+        .with_attribute(
+            "lifecycle_configuration",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "transition".to_string(),
+                Value::Concrete(ConcreteValue::List(Vec::new())),
+            )]))),
+        );
+    let unresolved_ref = Value::resource_ref("source", "transitions", Vec::new());
+    let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
+        .with_attribute(
+            "lifecycle_configuration",
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "transition".to_string(),
+                unresolved_ref.clone(),
+            )]))),
+        );
+    let mut evaluated = crate::parser::ParsedFile {
+        resources: vec![evaluated_resource],
+        ..Default::default()
+    };
+    let unresolved = crate::parser::ParsedFile {
+        resources: vec![unresolved_resource],
+        ..Default::default()
+    };
+
+    let canonical_pair = resolve_config_block_names_with_schemas(
+        &mut evaluated,
+        crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        &schemas,
+    )
+    .expect("paired resolution must use the authored ambiguous-key decision");
+
+    for resource in [
+        &canonical_pair.evaluated()[0],
+        &canonical_pair.unresolved()[0],
+    ] {
+        let lifecycle = match resource.get_attr("lifecycle_configuration") {
+            Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+            _ => panic!("expected lifecycle map"),
+        };
+        assert!(lifecycle.contains_key("transition"));
+        assert!(!lifecycle.contains_key("transitions"));
+    }
+    let unresolved_lifecycle =
+        match canonical_pair.unresolved()[0].get_attr("lifecycle_configuration") {
+            Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+            _ => panic!("expected unresolved lifecycle map"),
+        };
+    assert_eq!(
+        unresolved_lifecycle.get("transition"),
+        Some(&unresolved_ref)
+    );
 }
 
 #[test]
@@ -3234,9 +3327,10 @@ fn resolve_file_block_names_canonicalizes_data_source_blocks() {
 }
 
 #[test]
-fn resolve_block_names_real_field_takes_precedence_over_block_alias() {
-    // The schema's real `transition` field wins over the `transitions`
-    // field's block_name, independently of the parsed value shape.
+fn resolve_block_names_block_syntax_wins_ambiguous_non_list_field() {
+    // When the authored key is both a real non-list field and another
+    // field's block name, a concrete list identifies parser-produced block
+    // syntax and therefore belongs to the aliased list field.
     let mut inner_map = IndexMap::new();
     // Block syntax produces Value::Concrete(ConcreteValue::List)
     inner_map.insert(
@@ -3293,15 +3387,59 @@ fn resolve_block_names_real_field_takes_precedence_over_block_alias() {
         Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
-    // Alias resolution is schema-driven, so this key remains `transition`.
+    // Block syntax belongs to the canonical list field.
     assert!(
-        lifecycle.contains_key("transition"),
-        "expected the real 'transition' field to remain"
+        lifecycle.contains_key("transitions"),
+        "expected block syntax under canonical 'transitions' field"
     );
     assert!(
-        !lifecycle.contains_key("transitions"),
-        "expected the colliding block alias not to win over a real field"
+        !lifecycle.contains_key("transition"),
+        "expected ambiguous block-name spelling to be removed"
     );
+}
+
+#[test]
+fn resolve_block_names_real_list_field_wins_ambiguous_list_value() {
+    let mut resources = vec![Resource::new("s3.Bucket", "my-bucket").with_attribute(
+        "lifecycle_configuration",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "transition".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("manual".into()),
+            )])),
+        )]))),
+    )];
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
+            "lifecycle_configuration",
+            AttributeType::struct_(
+                "LifecycleConfiguration".to_string(),
+                vec![
+                    StructField::new("transition", AttributeType::list(AttributeType::string())),
+                    StructField::new(
+                        "transitions",
+                        AttributeType::list(AttributeType::struct_(
+                            "Transition".to_string(),
+                            vec![],
+                        )),
+                    )
+                    .with_block_name("transition"),
+                ],
+            ),
+        )),
+    );
+
+    resolve_block_names(&mut resources, &schemas).unwrap();
+
+    let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
+        Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+        _ => panic!("expected Map"),
+    };
+    assert!(lifecycle.contains_key("transition"));
+    assert!(!lifecycle.contains_key("transitions"));
 }
 
 #[test]

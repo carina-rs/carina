@@ -550,6 +550,55 @@ let item = mock.test.resource {
 }
 
 #[test]
+fn block_syntax_matching_singular_field_uses_list_alias() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name = "transition-blocks"
+  lifecycle_configuration = {
+    transition { storage_class = "STANDARD_IA" }
+    transition { storage_class = "GLACIER" }
+  }
+}
+"#,
+    );
+
+    assert_success(
+        "plan with ambiguous transition block syntax",
+        &scenario.carina(&["plan", "."]),
+    );
+    let apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("apply with ambiguous transition block syntax", &apply);
+
+    let state = scenario.state_json();
+    let provider = scenario.provider_json();
+    for (label, attributes) in [
+        (
+            "Carina state",
+            &state_resource_by_name(&state, "transition-blocks")["attributes"],
+        ),
+        (
+            "mock provider state",
+            provider_resource_by_name(&provider, "transition-blocks"),
+        ),
+    ] {
+        let lifecycle = &attributes["lifecycle_configuration"];
+        let transitions = lifecycle["transitions"]
+            .as_array()
+            .expect("canonical transitions list");
+        assert_eq!(transitions.len(), 2, "{label}: {lifecycle:#?}");
+        assert_eq!(transitions[0]["storage_class"], "STANDARD_IA");
+        assert_eq!(transitions[1]["storage_class"], "GLACIER");
+        assert!(
+            lifecycle.get("transition").is_none(),
+            "{label} kept the ambiguous block spelling: {lifecycle:#?}",
+        );
+    }
+}
+
+#[test]
 fn unknown_block_name_keeps_main_validation_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(

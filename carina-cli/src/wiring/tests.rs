@@ -45,7 +45,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
 fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> CanonicalUnresolvedResources {
+) -> CanonicalResourcePair {
     let unresolved = carina_core::parser::ParsedFile {
         resources,
         ..Default::default()
@@ -60,16 +60,14 @@ fn canonical_unresolved(
 }
 
 fn build_override_aware_pair_for_test<S>(
-    unresolved: CanonicalUnresolvedResources,
+    unresolved: CanonicalResourcePair,
     state_file: Option<&S>,
     inputs: PreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
 where
     S: carina_core::override_aware::NameOverrideSource + ?Sized,
 {
-    let evaluated = unresolved.as_slice().to_vec();
     OverrideAwareResources::build_pair_with_stability(
-        evaluated,
         unresolved,
         state_file,
         inputs,
@@ -4748,7 +4746,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     );
     assert_eq!(evaluated_deferred.attributes[0].0, "rules");
 
-    let unresolved_resources = canonical_unresolved.as_slice();
+    let unresolved_resources = canonical_unresolved.unresolved();
     assert!(unresolved_resources[0].attributes.contains_key("rules"));
     assert!(!unresolved_resources[0].attributes.contains_key("rule"));
 }

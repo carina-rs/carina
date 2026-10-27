@@ -25,8 +25,7 @@ use carina_core::executor::{
     ExecutionOutcome, ExecutionResult, ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::{
-    CanonicalUnresolvedResources, OverrideAwareBuildMode, OverrideAwareResources,
-    RebuildBindingsInputs,
+    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
@@ -1703,7 +1702,7 @@ struct SavedPlanApplyExecuted {
 async fn run_apply_locked_owned(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
-    unresolved_resources: &CanonicalUnresolvedResources,
+    canonical_resources: &CanonicalResourcePair,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
@@ -2161,8 +2160,9 @@ async fn run_apply_locked_owned(
             )?;
             let (mut override_aware_resources, unresolved_override_aware_resources) =
                 OverrideAwareResources::build_pair_with_stability(
-                    sorted_resources,
-                    unresolved_resources.clone(),
+                    canonical_resources
+                        .clone()
+                        .with_transformed_evaluated(sorted_resources),
                     state_file.as_ref(),
                     carina_core::binding_index::PreApplyInputs {
                         managed: &[],

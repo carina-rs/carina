@@ -11,7 +11,7 @@ use std::sync::Arc;
 use indexmap::{IndexMap, IndexSet};
 
 use crate::config_loader::UnresolvedConfigSnapshot;
-use crate::override_aware::CanonicalUnresolvedResources;
+use crate::override_aware::CanonicalResourcePair;
 use crate::parser::display_string_literal;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
@@ -7032,15 +7032,15 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlockNameAlias {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockNameConflict {
     resource_id: String,
     path: String,
     alias: String,
     canonical: String,
 }
 
-impl BlockNameAlias {
+impl BlockNameConflict {
     pub(crate) fn resource_id(&self) -> &str {
         &self.resource_id
     }
@@ -7058,14 +7058,6 @@ impl BlockNameAlias {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BlockNameConflict {
-    resource_id: String,
-    path: String,
-    alias: String,
-    canonical: String,
-}
-
 impl fmt::Display for BlockNameConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -7076,29 +7068,17 @@ impl fmt::Display for BlockNameConflict {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlockValuePathSegment {
-    Field(String),
-    Index(usize),
-}
-
-struct BlockNameOccurrence {
-    alias: BlockNameAlias,
-    map_path: Vec<BlockValuePathSegment>,
-    conflicts: bool,
-}
-
-#[derive(Default)]
-struct BlockNameWalk {
-    occurrences: Vec<BlockNameOccurrence>,
-    conflicts: Vec<BlockNameConflict>,
-}
-
 #[derive(Clone, Copy)]
 struct BlockFieldRef<'a> {
     name: &'a str,
     block_name: Option<&'a str>,
     field_type: &'a AttributeType,
+}
+
+#[derive(Clone, Copy)]
+enum BlockFieldMatch<'a> {
+    Canonical,
+    Alias(BlockFieldRef<'a>),
 }
 
 fn nested_path(parent: &str, name: &str) -> String {
@@ -7109,109 +7089,147 @@ fn nested_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn walk_block_names_in_map(
-    map: &IndexMap<String, Value>,
+fn match_block_field<'a>(
+    key: &str,
+    value: &Value,
+    fields: &[BlockFieldRef<'a>],
+    defs: &BTreeMap<String, AttributeType>,
+) -> Option<BlockFieldMatch<'a>> {
+    let canonical = fields.iter().copied().find(|field| field.name == key);
+    let alias = fields
+        .iter()
+        .copied()
+        .find(|field| field.block_name == Some(key) && field.name != key);
+
+    match (canonical, alias) {
+        // Parser-produced block syntax is represented as a concrete list. In
+        // the otherwise ambiguous case, it belongs to the aliased field when
+        // the real field cannot itself accept a list. Attribute assignment,
+        // references, calls, unknowns, and a real list field all keep the real
+        // field meaning.
+        (Some(canonical), Some(alias))
+            if matches!(value, Value::Concrete(ConcreteValue::List(_)))
+                && !matches!(
+                    canonical.field_type.shape_with_defs(defs),
+                    Shape::List { .. }
+                ) =>
+        {
+            Some(BlockFieldMatch::Alias(alias))
+        }
+        (Some(_), _) => Some(BlockFieldMatch::Canonical),
+        (None, Some(alias)) => Some(BlockFieldMatch::Alias(alias)),
+        (None, None) => None,
+    }
+}
+
+fn block_name_conflict(
+    resource_id: &str,
+    parent_path: &str,
+    alias: &str,
+    canonical: &str,
+) -> BlockNameConflict {
+    BlockNameConflict {
+        resource_id: resource_id.to_string(),
+        path: nested_path(parent_path, alias),
+        alias: alias.to_string(),
+        canonical: canonical.to_string(),
+    }
+}
+
+fn value_for_field<'a>(
+    map: &'a IndexMap<String, Value>,
+    field: BlockFieldRef<'_>,
+    fields: &[BlockFieldRef<'_>],
+    defs: &BTreeMap<String, AttributeType>,
+) -> Option<&'a Value> {
+    if let Some(value) = map.get(field.name) {
+        return Some(value);
+    }
+    let alias = field.block_name.filter(|alias| *alias != field.name)?;
+    let value = map.get(alias)?;
+    matches!(
+        match_block_field(alias, value, fields, defs),
+        Some(BlockFieldMatch::Alias(selected)) if selected.name == field.name
+    )
+    .then_some(value)
+}
+
+fn resolve_block_names_in_map(
+    map: &mut IndexMap<String, Value>,
+    authored_map: Option<&IndexMap<String, Value>>,
     fields: &[BlockFieldRef<'_>],
     defs: &BTreeMap<String, AttributeType>,
     resource_id: &str,
-    map_path: &[BlockValuePathSegment],
     parent_path: &str,
-    walk: &mut BlockNameWalk,
+    conflicts: &mut Vec<BlockNameConflict>,
 ) {
-    let canonical_fields = fields
-        .iter()
-        .map(|field| field.name)
-        .collect::<HashSet<_>>();
-    let block_fields = fields
-        .iter()
-        .filter_map(|field| {
-            let block_name = field.block_name?;
-            (block_name != field.name).then_some((block_name, *field))
-        })
-        .collect::<HashMap<_, _>>();
-
     // Preserve the source map's order, matching the pre-walker resolver: each
     // renamed key is removed in authored order and appended under its canonical
     // spelling in that same order.
-    for block_name in map.keys() {
-        // A schema field name always wins over another field's block-name
-        // alias. This is what distinguishes a real singular field such as
-        // `transition` from `transitions` whose block_name is also
-        // `transition`, without consulting the parsed value's shape.
-        if canonical_fields.contains(block_name.as_str()) {
+    let keys = map.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        let Some(value) = map.get(&key) else {
             continue;
-        }
-        let Some(field) = block_fields.get(block_name.as_str()) else {
+        };
+        let decision_value = authored_map
+            .and_then(|authored| authored.get(&key))
+            .unwrap_or(value);
+        let Some(BlockFieldMatch::Alias(field)) =
+            match_block_field(&key, decision_value, fields, defs)
+        else {
             continue;
         };
 
-        let path = nested_path(parent_path, block_name);
-        let conflicts = map.contains_key(field.name);
-        walk.occurrences.push(BlockNameOccurrence {
-            alias: BlockNameAlias {
-                resource_id: resource_id.to_string(),
-                path: path.clone(),
-                alias: block_name.to_string(),
-                canonical: field.name.to_string(),
-            },
-            map_path: map_path.to_vec(),
-            conflicts,
-        });
-        if conflicts {
-            walk.conflicts.push(BlockNameConflict {
-                resource_id: resource_id.to_string(),
-                path,
-                alias: block_name.to_string(),
-                canonical: field.name.to_string(),
-            });
+        if map.contains_key(field.name) {
+            conflicts.push(block_name_conflict(
+                resource_id,
+                parent_path,
+                &key,
+                field.name,
+            ));
+            continue;
+        }
+        if let Some(value) = map.shift_remove(&key) {
+            map.insert(field.name.to_string(), value);
         }
     }
 
     for field in fields {
-        let canonical = map.get(field.name);
-        let aliased = field.block_name.and_then(|block_name| {
-            (block_name != field.name
-                && canonical.is_none()
-                && !canonical_fields.contains(block_name)
-                && block_fields
-                    .get(block_name)
-                    .is_some_and(|selected| selected.name == field.name))
-            .then(|| map.get(block_name))
-            .flatten()
-        });
-        let Some(value) = canonical.or(aliased) else {
+        let authored_value =
+            authored_map.and_then(|authored| value_for_field(authored, *field, fields, defs));
+        let Some(value) = map.get_mut(field.name) else {
             continue;
         };
-        let mut value_path = map_path.to_vec();
-        value_path.push(BlockValuePathSegment::Field(field.name.to_string()));
-        walk_block_names_in_value(
+        resolve_block_names_in_value(
             value,
+            authored_value,
             field.field_type,
             defs,
             resource_id,
-            &value_path,
             &nested_path(parent_path, field.name),
-            walk,
+            conflicts,
         );
     }
 }
 
-fn walk_block_names_in_value(
-    value: &Value,
+fn resolve_block_names_in_value(
+    value: &mut Value,
+    authored_value: Option<&Value>,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
     resource_id: &str,
-    value_path: &[BlockValuePathSegment],
     path: &str,
-    walk: &mut BlockNameWalk,
+    conflicts: &mut Vec<BlockNameConflict>,
 ) {
     match attr_type.shape_with_defs(defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return;
             };
-            let fields = struct_fields_with_defs(attr_type, defs)
-                .expect("Shape::Struct must expose struct fields internally")
+            let Some(struct_fields) = struct_fields_with_defs(attr_type, defs) else {
+                return;
+            };
+            let fields = struct_fields
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
@@ -7219,7 +7237,19 @@ fn walk_block_names_in_value(
                     field_type: &field.field_type,
                 })
                 .collect::<Vec<_>>();
-            walk_block_names_in_map(map, &fields, defs, resource_id, value_path, path, walk);
+            let authored_map = match authored_value {
+                Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
+                _ => None,
+            };
+            resolve_block_names_in_map(
+                map,
+                authored_map,
+                &fields,
+                defs,
+                resource_id,
+                path,
+                conflicts,
+            );
         }
         Shape::List { element_type, .. } => {
             if !matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) {
@@ -7228,8 +7258,10 @@ fn walk_block_names_in_value(
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return;
             };
-            let fields = struct_fields_with_defs(element_type, defs)
-                .expect("Shape::Struct must expose struct fields internally")
+            let Some(struct_fields) = struct_fields_with_defs(element_type, defs) else {
+                return;
+            };
+            let fields = struct_fields
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
@@ -7237,20 +7269,28 @@ fn walk_block_names_in_value(
                     field_type: &field.field_type,
                 })
                 .collect::<Vec<_>>();
-            for (index, item) in items.iter().enumerate() {
+            let authored_items = match authored_value {
+                Some(Value::Concrete(ConcreteValue::List(items))) => Some(items.as_slice()),
+                _ => None,
+            };
+            for (index, item) in items.iter_mut().enumerate() {
                 let Value::Concrete(ConcreteValue::Map(map)) = item else {
                     continue;
                 };
-                let mut item_path = value_path.to_vec();
-                item_path.push(BlockValuePathSegment::Index(index));
-                walk_block_names_in_map(
+                let authored_map = authored_items
+                    .and_then(|authored| authored.get(index))
+                    .and_then(|item| match item {
+                        Value::Concrete(ConcreteValue::Map(map)) => Some(map),
+                        _ => None,
+                    });
+                resolve_block_names_in_map(
                     map,
+                    authored_map,
                     &fields,
                     defs,
                     resource_id,
-                    &item_path,
                     &format!("{path}[{index}]"),
-                    walk,
+                    conflicts,
                 );
             }
         }
@@ -7258,12 +7298,8 @@ fn walk_block_names_in_value(
     }
 }
 
-fn walk_attribute_block_names(
-    resource_id: &ResourceId,
-    attributes: &IndexMap<String, Value>,
-    schema: &ResourceSchema,
-) -> BlockNameWalk {
-    let fields = schema
+fn block_fields(schema: &ResourceSchema) -> Vec<BlockFieldRef<'_>> {
+    schema
         .attributes
         .values()
         .map(|attribute| BlockFieldRef {
@@ -7271,95 +7307,133 @@ fn walk_attribute_block_names(
             block_name: attribute.block_name.as_deref(),
             field_type: &attribute.attr_type,
         })
-        .collect::<Vec<_>>();
-    let mut walk = BlockNameWalk::default();
-    walk_block_names_in_map(
-        attributes,
-        &fields,
-        &schema.defs,
-        &resource_id.to_string(),
-        &[],
-        "",
-        &mut walk,
-    );
-    walk
-}
-
-fn map_at_block_path_mut<'a>(
-    root: &'a mut IndexMap<String, Value>,
-    path: &[BlockValuePathSegment],
-) -> Option<&'a mut IndexMap<String, Value>> {
-    let Some((first, rest)) = path.split_first() else {
-        return Some(root);
-    };
-    let BlockValuePathSegment::Field(name) = first else {
-        return None;
-    };
-    map_in_block_value_mut(root.get_mut(name)?, rest)
-}
-
-fn map_in_block_value_mut<'a>(
-    value: &'a mut Value,
-    path: &[BlockValuePathSegment],
-) -> Option<&'a mut IndexMap<String, Value>> {
-    let Some((first, rest)) = path.split_first() else {
-        return match value {
-            Value::Concrete(ConcreteValue::Map(map)) => Some(map),
-            _ => None,
-        };
-    };
-    match first {
-        BlockValuePathSegment::Field(name) => match value {
-            Value::Concrete(ConcreteValue::Map(map)) => {
-                map_in_block_value_mut(map.get_mut(name)?, rest)
-            }
-            _ => None,
-        },
-        BlockValuePathSegment::Index(index) => match value {
-            Value::Concrete(ConcreteValue::List(items)) => {
-                map_in_block_value_mut(items.get_mut(*index)?, rest)
-            }
-            _ => None,
-        },
-    }
+        .collect()
 }
 
 fn resolve_attribute_block_names(
     resource_id: &ResourceId,
     attributes: &mut IndexMap<String, Value>,
+    authored_attributes: Option<&IndexMap<String, Value>>,
     schema: &ResourceSchema,
 ) -> Vec<BlockNameConflict> {
-    let walk = walk_attribute_block_names(resource_id, attributes, schema);
-    for occurrence in walk
-        .occurrences
-        .iter()
-        .filter(|occurrence| !occurrence.conflicts)
-    {
-        let map = map_at_block_path_mut(attributes, &occurrence.map_path)
-            .expect("block-name walk paths must resolve during the rename pass");
-        let value = map
-            .shift_remove(occurrence.alias.alias())
-            .expect("block-name alias found by the walk must still exist");
-        map.insert(occurrence.alias.canonical().to_string(), value);
+    let fields = block_fields(schema);
+    let mut conflicts = Vec::new();
+    resolve_block_names_in_map(
+        attributes,
+        authored_attributes,
+        &fields,
+        &schema.defs,
+        &resource_id.to_string(),
+        "",
+        &mut conflicts,
+    );
+    conflicts
+}
+
+fn find_block_name_alias_in_map(
+    map: &IndexMap<String, Value>,
+    fields: &[BlockFieldRef<'_>],
+    defs: &BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    parent_path: &str,
+) -> Option<BlockNameConflict> {
+    for (key, value) in map {
+        if let Some(BlockFieldMatch::Alias(field)) = match_block_field(key, value, fields, defs) {
+            return Some(block_name_conflict(
+                resource_id,
+                parent_path,
+                key,
+                field.name,
+            ));
+        }
     }
-    walk.conflicts
+
+    for field in fields {
+        let Some(value) = map.get(field.name) else {
+            continue;
+        };
+        if let Some(alias) = find_block_name_alias_in_value(
+            value,
+            field.field_type,
+            defs,
+            resource_id,
+            &nested_path(parent_path, field.name),
+        ) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+fn find_block_name_alias_in_value(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    path: &str,
+) -> Option<BlockNameConflict> {
+    match attr_type.shape_with_defs(defs) {
+        Shape::Struct { .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let fields = struct_fields_with_defs(attr_type, defs)?
+                .iter()
+                .map(|field| BlockFieldRef {
+                    name: &field.name,
+                    block_name: field.block_name.as_deref(),
+                    field_type: &field.field_type,
+                })
+                .collect::<Vec<_>>();
+            find_block_name_alias_in_map(map, &fields, defs, resource_id, path)
+        }
+        Shape::List { element_type, .. }
+            if matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) =>
+        {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return None;
+            };
+            let fields = struct_fields_with_defs(element_type, defs)?
+                .iter()
+                .map(|field| BlockFieldRef {
+                    name: &field.name,
+                    block_name: field.block_name.as_deref(),
+                    field_type: &field.field_type,
+                })
+                .collect::<Vec<_>>();
+            items.iter().enumerate().find_map(|(index, item)| {
+                let Value::Concrete(ConcreteValue::Map(map)) = item else {
+                    return None;
+                };
+                find_block_name_alias_in_map(
+                    map,
+                    &fields,
+                    defs,
+                    resource_id,
+                    &format!("{path}[{index}]"),
+                )
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Find the first block alias without cloning or mutating the resource.
 ///
-/// This uses the same schema-first walk as the rename pass: real field names
-/// take precedence over another field's `block_name`, and otherwise aliases
-/// are recognized independently of their values. Union values are left to
+/// This uses the same field matcher as the rename pass, including the narrow
+/// ambiguous-name rule for parser-produced lists. Union values are left to
 /// normal schema validation.
 pub(crate) fn find_resource_block_name_alias(
     resource: &Resource,
     schema: &ResourceSchema,
-) -> Option<BlockNameAlias> {
-    walk_attribute_block_names(&resource.id, &resource.attributes, schema)
-        .occurrences
-        .into_iter()
-        .next()
-        .map(|occurrence| occurrence.alias)
+) -> Option<BlockNameConflict> {
+    find_block_name_alias_in_map(
+        &resource.attributes,
+        &block_fields(schema),
+        &schema.defs,
+        &resource.id.to_string(),
+        "",
+    )
 }
 
 fn resolve_block_names_detailed(
@@ -7373,6 +7447,31 @@ fn resolve_block_names_detailed(
             Some(resolve_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
+                None,
+                schema,
+            ))
+        })
+        .flatten()
+        .collect()
+}
+
+fn resolve_block_names_detailed_with_authored(
+    resources: &mut [Resource],
+    authored: &[Resource],
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    resources
+        .iter_mut()
+        .filter_map(|resource| {
+            let schema = registry.get_for(resource)?;
+            let authored_attributes = authored
+                .iter()
+                .find(|candidate| candidate.id == resource.id)
+                .map(|candidate| &candidate.attributes);
+            Some(resolve_attribute_block_names(
+                &resource.id,
+                &mut resource.attributes,
+                authored_attributes,
                 schema,
             ))
         })
@@ -7407,6 +7506,7 @@ fn resolve_file_block_names<E>(
             conflicts.extend(resolve_attribute_block_names(
                 &data_source.id,
                 &mut data_source.attributes,
+                None,
                 schema,
             ));
         }
@@ -7414,6 +7514,53 @@ fn resolve_file_block_names<E>(
     for deferred in &mut parsed.deferred_for_expressions {
         conflicts.extend(resolve_block_names_detailed(
             std::slice::from_mut(&mut deferred.template_resource),
+            registry,
+        ));
+        deferred.attributes = deferred
+            .template_resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+    conflicts
+}
+
+fn resolve_file_block_names_with_authored<E, A>(
+    parsed: &mut crate::parser::File<E>,
+    authored: &crate::parser::File<A>,
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    let mut conflicts = resolve_block_names_detailed_with_authored(
+        &mut parsed.resources,
+        &authored.resources,
+        registry,
+    );
+    for data_source in &mut parsed.data_sources {
+        if let Some(schema) = registry.get_for_data_source(data_source) {
+            let authored_attributes = authored
+                .data_sources
+                .iter()
+                .find(|candidate| candidate.id == data_source.id)
+                .map(|candidate| &candidate.attributes);
+            conflicts.extend(resolve_attribute_block_names(
+                &data_source.id,
+                &mut data_source.attributes,
+                authored_attributes,
+                schema,
+            ));
+        }
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        let authored_resources = authored
+            .deferred_for_expressions
+            .iter()
+            .find(|candidate| candidate.template_resource.id == deferred.template_resource.id)
+            .map(|candidate| std::slice::from_ref(&candidate.template_resource))
+            .unwrap_or_default();
+        conflicts.extend(resolve_block_names_detailed_with_authored(
+            std::slice::from_mut(&mut deferred.template_resource),
+            authored_resources,
             registry,
         ));
         deferred.attributes = deferred
@@ -7441,15 +7588,15 @@ pub fn resolve_file_block_names_with_schemas<E>(
 }
 
 /// Resolve an evaluated configuration and its authored snapshot in one
-/// schema-aware operation, returning the only resource type accepted by the
-/// override-aware authored-input boundary.
+/// schema-aware operation, returning the only resource pair accepted by the
+/// override-aware input boundary.
 pub fn resolve_config_block_names_with_schemas<E>(
     parsed: &mut crate::parser::File<E>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<CanonicalUnresolvedResources, Vec<BlockNameConflict>> {
+) -> Result<CanonicalResourcePair, Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
-    let mut conflicts = resolve_file_block_names(parsed, registry);
+    let mut conflicts = resolve_file_block_names_with_authored(parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
     for conflict in resolve_file_block_names(&mut unresolved, registry) {
         if seen.insert(conflict.clone()) {
@@ -7457,7 +7604,16 @@ pub fn resolve_config_block_names_with_schemas<E>(
         }
     }
     if conflicts.is_empty() {
-        Ok(CanonicalUnresolvedResources::new(unresolved.resources))
+        let evaluated = parsed
+            .iter_top_level_resources()
+            .filter_map(|resource| match resource {
+                crate::parser::ResourceRef::Resource(resource) => Some(resource.clone()),
+                crate::parser::ResourceRef::Composition(_)
+                | crate::parser::ResourceRef::DataSource(_)
+                | crate::parser::ResourceRef::Deferred { .. } => None,
+            })
+            .collect();
+        Ok(CanonicalResourcePair::new(evaluated, unresolved.resources))
     } else {
         Err(conflicts)
     }

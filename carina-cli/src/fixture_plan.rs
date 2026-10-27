@@ -388,8 +388,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("fixture managed binding stability must resolve");
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            sorted_resources.clone(),
-            unresolved_resources,
+            unresolved_resources.with_transformed_evaluated(sorted_resources.clone()),
             state_file.as_ref(),
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],

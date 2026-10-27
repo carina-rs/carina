@@ -52,7 +52,7 @@ fn canonical_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> carina_core::override_aware::CanonicalUnresolvedResources {
+) -> carina_core::override_aware::CanonicalResourcePair {
     let mut evaluated = parsed.clone();
     crate::wiring::resolve_config_block_names_with_ctx(ctx, &mut evaluated, unresolved.clone())
         .unwrap_or_else(|errors| {
@@ -66,7 +66,7 @@ fn canonical_unresolved_for_test(
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> carina_core::override_aware::CanonicalUnresolvedResources {
+) -> carina_core::override_aware::CanonicalResourcePair {
     let unresolved = carina_core::parser::ParsedFile {
         resources,
         ..Default::default()
@@ -2720,7 +2720,6 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
-        vec![resource.clone()],
         canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
         Some(&state),
         PreApplyInputs {

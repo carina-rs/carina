@@ -533,8 +533,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     .expect("block-name resolution");
     let (mut override_aware_resources, _) =
         carina_core::override_aware::OverrideAwareResources::build_pair_with_stability(
-            canonical_for_plan.resources,
-            canonical_unresolved,
+            canonical_unresolved.with_transformed_evaluated(canonical_for_plan.resources),
             None::<&carina_state::StateFile>,
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],

@@ -36,8 +36,7 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::{
-    CanonicalUnresolvedResources, OverrideAwareBuildMode, OverrideAwareResources,
-    RebuildBindingsInputs,
+    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
 };
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
@@ -642,7 +641,7 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
 /// Resolve block aliases in the evaluated and authored snapshots together.
 ///
 /// This is the only production constructor for
-/// [`CanonicalUnresolvedResources`]. The parser intentionally preserves the
+/// [`CanonicalResourcePair`]. The parser intentionally preserves the
 /// authored block spelling; once provider schemas become available here, both
 /// snapshots must cross the boundary together so an alias cannot survive only
 /// in the source snapshot later paired by `OverrideAwareResources`.
@@ -650,7 +649,7 @@ pub(crate) fn resolve_config_block_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
+) -> Result<CanonicalResourcePair, Vec<AppError>> {
     resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)
 }
@@ -659,11 +658,11 @@ pub(crate) fn resolve_config_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalUnresolvedResources, Vec<AppError>> {
-    let canonical_unresolved = resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?;
+) -> Result<CanonicalResourcePair, Vec<AppError>> {
+    let canonical_resources = resolve_config_block_names_with_ctx(ctx, parsed, unresolved)?;
     let errors = resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources);
     if errors.is_empty() {
-        Ok(canonical_unresolved)
+        Ok(canonical_resources)
     } else {
         Err(errors)
     }
@@ -2511,7 +2510,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
     provider_configs: &ResolvedProviderConfigs,
-    unresolved_resources: &CanonicalUnresolvedResources,
+    canonical_resources: &CanonicalResourcePair,
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2978,8 +2977,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     );
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            sorted_resources,
-            unresolved_resources.clone(),
+            canonical_resources
+                .clone()
+                .with_transformed_evaluated(sorted_resources),
             state_file.as_ref(),
             PreApplyInputs {
                 managed: &[],

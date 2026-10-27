@@ -7,27 +7,48 @@ use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
-/// Pre-value-resolution resources whose provider-schema block aliases have
-/// been folded into canonical attribute names.
+/// Evaluated and pre-value-resolution resources whose provider-schema block
+/// aliases have been folded into canonical attribute names together.
 ///
-/// The inner vector is deliberately private. Production construction is
-/// limited to the schema block-name resolver, and
-/// [`OverrideAwareResources`] consumes this type instead of a raw
-/// `Vec<Resource>` so an authored parser snapshot cannot bypass that resolver.
+/// The inner vectors are deliberately private. Production construction is
+/// limited to the paired schema block-name resolver, and
+/// [`OverrideAwareResources`] consumes this type instead of either raw
+/// `Vec<Resource>` so neither parser snapshot can bypass that resolver.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CanonicalUnresolvedResources(Vec<Resource>);
+pub struct CanonicalResourcePair {
+    evaluated: Vec<Resource>,
+    unresolved: Vec<Resource>,
+}
 
-impl CanonicalUnresolvedResources {
-    pub(crate) fn new(resources: Vec<Resource>) -> Self {
-        Self(resources)
+impl CanonicalResourcePair {
+    pub(crate) fn new(evaluated: Vec<Resource>, unresolved: Vec<Resource>) -> Self {
+        Self {
+            evaluated,
+            unresolved,
+        }
     }
 
-    pub fn as_slice(&self) -> &[Resource] {
-        &self.0
+    pub fn evaluated(&self) -> &[Resource] {
+        &self.evaluated
     }
 
-    fn into_vec(self) -> Vec<Resource> {
-        self.0
+    pub fn unresolved(&self) -> &[Resource] {
+        &self.unresolved
+    }
+
+    /// Replace the evaluated ordering/view after a transformation that cannot
+    /// introduce authored attribute spellings (dependency sorting, identity
+    /// reconciliation, or deferred-template materialization).
+    ///
+    /// This operation requires the proof returned by the paired resolver, so
+    /// callers cannot construct build inputs from raw parsed resources alone.
+    pub fn with_transformed_evaluated(mut self, evaluated: Vec<Resource>) -> Self {
+        self.evaluated = evaluated;
+        self
+    }
+
+    fn into_parts(self) -> (Vec<Resource>, Vec<Resource>) {
+        (self.evaluated, self.unresolved)
     }
 }
 
@@ -64,7 +85,8 @@ pub enum OverrideAwareBuildMode<'a> {
     },
 }
 
-/// Resources whose authored inputs have crossed schema block-name resolution.
+/// Resources whose evaluated and authored inputs crossed schema block-name
+/// resolution together.
 ///
 /// Raw resource vectors cannot be passed to the constructor:
 ///
@@ -78,7 +100,6 @@ pub enum OverrideAwareBuildMode<'a> {
 /// let _ = OverrideAwareResources::build_pair_with_stability::<
 ///     HashMap<ResourceId, HashMap<String, NameOverride>>,
 /// >(
-///     raw.clone(),
 ///     raw,
 ///     None,
 ///     inputs,
@@ -112,12 +133,10 @@ pub struct RebuildBindingsInputs<'a> {
 }
 
 impl OverrideAwareResources {
-    /// Build the evaluated and authored views together. The evaluated set can
-    /// be re-sorted or expanded after the canonicalization seam, while the
-    /// authored side must carry the opaque proof returned by that seam.
+    /// Build evaluated and authored views from the opaque pair returned by the
+    /// schema block-name resolver.
     pub fn build_pair_with_stability<S>(
-        evaluated: Vec<Resource>,
-        unresolved: CanonicalUnresolvedResources,
+        resources: CanonicalResourcePair,
         state_file: Option<&S>,
         inputs: PreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -126,14 +145,10 @@ impl OverrideAwareResources {
     where
         S: NameOverrideSource + ?Sized,
     {
+        let (evaluated, unresolved) = resources.into_parts();
         let evaluated = Self::build_inner(evaluated, state_file, &inputs, managed_stability, mode)?;
-        let unresolved = Self::build_inner(
-            unresolved.into_vec(),
-            state_file,
-            &inputs,
-            managed_stability,
-            mode,
-        )?;
+        let unresolved =
+            Self::build_inner(unresolved, state_file, &inputs, managed_stability, mode)?;
         Ok((evaluated, unresolved))
     }
 
@@ -543,8 +558,7 @@ mod tests {
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
         OverrideAwareResources::build_pair_with_stability(
-            resources.clone(),
-            CanonicalUnresolvedResources::new(resources),
+            CanonicalResourcePair::new(resources.clone(), resources),
             Some(overrides),
             PreApplyInputs {
                 managed: &[],
