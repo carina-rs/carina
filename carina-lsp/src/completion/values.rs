@@ -1527,10 +1527,11 @@ impl CompletionProvider {
                 binding_name,
                 rhs.trim_end_matches('{').trim()
             );
-            let Some(module_name) = super::extract_let_module_call_name(header.trim()) else {
+            let Some(module_name) = crate::enclosing_block::named_module_call_name(header.trim())
+            else {
                 continue;
             };
-            let Some(parsed) = self.load_called_module(&module_name, text, base_path) else {
+            let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
                 continue;
             };
             for export in &parsed.export_params {

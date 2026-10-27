@@ -139,7 +139,7 @@ outer {
 }
 
 #[test]
-fn round2_completion_inside_multiline_list_of_struct_uses_shared_path() {
+fn completion_inside_multiline_list_of_struct_uses_shared_path() {
     let provider = test_provider_with_list_of_structs();
     let text = r#"test.Policy {
   rules = [
@@ -159,7 +159,7 @@ fn round2_completion_inside_multiline_list_of_struct_uses_shared_path() {
 }
 
 #[test]
-fn round2_completion_after_same_line_resource_and_struct_openers_uses_shared_path() {
+fn completion_after_same_line_resource_and_struct_openers_uses_shared_path() {
     let provider = test_provider_with_nested_structs();
     let text = "test.nested.resource { outer = { ";
     let position = Position::new(0, text.chars().count() as u32);
@@ -182,7 +182,7 @@ fn position_at_end(text: &str) -> Position {
 }
 
 #[test]
-fn review_round1_scalar_list_values_keep_value_completion_context() {
+fn scalar_list_values_keep_value_completion_context() {
     let provider = test_provider_for_enclosing_block_regressions();
     for text in [
         "let role = 'admin'\ntest.review.Resource {\n  attr = [",
@@ -200,7 +200,7 @@ fn review_round1_scalar_list_values_keep_value_completion_context() {
 }
 
 #[test]
-fn review_round1_function_argument_comma_stays_in_struct_value_context() {
+fn function_argument_comma_stays_in_struct_value_context() {
     let provider = test_provider_for_enclosing_block_regressions();
     for text in [
         "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = join(role, ",
@@ -218,7 +218,7 @@ fn review_round1_function_argument_comma_stays_in_struct_value_context() {
 }
 
 #[test]
-fn review_round1_map_comma_still_starts_a_new_field_segment() {
+fn map_comma_still_starts_a_new_field_segment() {
     let provider = test_provider_for_enclosing_block_regressions();
     let text = "test.review.Resource {\n  outer {\n    tags = { Name = 'a', Env = ";
     let context = provider.get_completion_context(text, position_at_end(text));
@@ -240,7 +240,7 @@ fn review_round1_map_comma_still_starts_a_new_field_segment() {
 }
 
 #[test]
-fn review_round1_assignment_expressions_and_control_blocks_keep_struct_context() {
+fn assignment_expressions_and_control_blocks_keep_struct_context() {
     let provider = test_provider_for_enclosing_block_regressions();
     for (text, expected_path) in [
         (
@@ -286,7 +286,7 @@ fn review_round1_assignment_expressions_and_control_blocks_keep_struct_context()
 }
 
 #[test]
-fn review_round2_else_branches_keep_assignment_struct_context() {
+fn else_branches_keep_assignment_struct_context() {
     let provider = test_provider_with_nested_structs();
     for text in [
         r#"test.nested.resource {
@@ -315,7 +315,7 @@ fn review_round2_else_branches_keep_assignment_struct_context() {
 }
 
 #[test]
-fn review_round2_quoted_map_key_does_not_fall_back_to_resource_attributes() {
+fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
     let provider = test_provider_with_nested_structs();
     for text in [
         r#"test.nested.resource {

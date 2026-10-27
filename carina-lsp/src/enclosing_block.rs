@@ -9,6 +9,11 @@ use crate::lex::{LexKind, lex};
 /// completion from rebuilding subtly different resource-header matchers.
 pub(crate) struct ResourceTypePatterns(Vec<String>);
 
+struct ResourceHeader<'a> {
+    resource_type: &'a str,
+    binding: Option<String>,
+}
+
 impl ResourceTypePatterns {
     pub(crate) fn from_schemas(schemas: &SchemaRegistry) -> Self {
         let mut patterns: Vec<String> = schemas
@@ -34,9 +39,13 @@ impl ResourceTypePatterns {
             .map(String::as_str)
     }
 
-    pub(crate) fn header_resource_type<'a>(&'a self, segment: &str) -> Option<&'a str> {
+    fn resource_header<'a>(&'a self, segment: &str) -> Option<ResourceHeader<'a>> {
         let trimmed = segment.trim();
-        let after_binding = strip_let_assignment(trimmed).unwrap_or(trimmed);
+        let assignment = parse_let_assignment(trimmed);
+        let (binding, after_binding) = match assignment {
+            Some(assignment) => (Some(assignment.binding.to_string()), assignment.expression),
+            None => (None, trimmed),
+        };
         let candidate = strip_keyword(after_binding, "read")
             .unwrap_or(after_binding)
             .trim();
@@ -44,7 +53,10 @@ impl ResourceTypePatterns {
         self.0
             .iter()
             .find(|pattern| candidate == pattern.as_str())
-            .map(String::as_str)
+            .map(|pattern| ResourceHeader {
+                resource_type: pattern,
+                binding,
+            })
     }
 }
 
@@ -53,6 +65,7 @@ pub(crate) enum EnclosingBlock {
     Resource {
         resource_type: String,
         struct_path: Vec<String>,
+        binding: Option<String>,
     },
     ModuleCall {
         module_name: String,
@@ -65,6 +78,7 @@ pub(crate) enum EnclosingBlock {
 enum SegmentSyntax {
     Assignment,
     Bare,
+    NamedModule,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,7 +101,10 @@ struct LineSegment {
 }
 
 enum BraceOpener {
-    Resource(String),
+    Resource {
+        resource_type: String,
+        binding: Option<String>,
+    },
     Path(PathSegment),
     Else,
     ControlFlow,
@@ -100,6 +117,17 @@ enum ElseState {
     None,
     AwaitingBranchCloser,
     ReclassifyBranchOpener,
+}
+
+#[derive(Clone, Copy)]
+enum PendingElement {
+    None,
+    Unnamed,
+}
+
+struct LetAssignment<'a> {
+    binding: &'a str,
+    expression: &'a str,
 }
 
 struct PathSegment {
@@ -128,7 +156,7 @@ pub(crate) fn enclosing_block(
     let mut brace_depth = 0_usize;
     let mut bracket_depth = 0_usize;
     let mut reverse_path = Vec::new();
-    let mut crossed_list_element = false;
+    let mut pending_element = PendingElement::None;
     let mut else_state = ElseState::None;
 
     for line_index in (0..=current_line).rev() {
@@ -176,21 +204,59 @@ pub(crate) fn enclosing_block(
                         char_index,
                         SegmentScanMode::BeforeOpener,
                     );
+                    match pending_element {
+                        PendingElement::None => {}
+                        PendingElement::Unnamed => {
+                            match classify_brace_opener(&segment, resource_types) {
+                                BraceOpener::Path(PathSegment {
+                                    name,
+                                    syntax: SegmentSyntax::Assignment,
+                                }) => {
+                                    reverse_path.push(PathSegment {
+                                        name,
+                                        syntax: SegmentSyntax::Assignment,
+                                    });
+                                    pending_element = PendingElement::None;
+                                    continue;
+                                }
+                                BraceOpener::Else => {
+                                    else_state = ElseState::AwaitingBranchCloser;
+                                    continue;
+                                }
+                                BraceOpener::ControlFlow => continue,
+                                BraceOpener::Resource {
+                                    resource_type: _,
+                                    binding: _,
+                                }
+                                | BraceOpener::Path(PathSegment {
+                                    name: _,
+                                    syntax: SegmentSyntax::Bare,
+                                })
+                                | BraceOpener::Path(PathSegment {
+                                    name: _,
+                                    syntax: SegmentSyntax::NamedModule,
+                                })
+                                | BraceOpener::Anonymous
+                                | BraceOpener::Other => return EnclosingBlock::Other,
+                            }
+                        }
+                    }
                     match classify_brace_opener(&segment, resource_types) {
-                        BraceOpener::Resource(resource_type) => {
-                            let mut struct_path: Vec<String> = reverse_path
-                                .into_iter()
-                                .map(|segment: PathSegment| segment.name)
-                                .collect();
-                            struct_path.reverse();
+                        BraceOpener::Resource {
+                            resource_type,
+                            binding,
+                        } => {
+                            let Some(struct_path) = resource_struct_path(reverse_path) else {
+                                return EnclosingBlock::Other;
+                            };
                             return EnclosingBlock::Resource {
                                 resource_type,
                                 struct_path,
+                                binding,
                             };
                         }
                         BraceOpener::Path(path_segment) => {
                             reverse_path.push(path_segment);
-                            crossed_list_element = false;
                         }
                         BraceOpener::Else => {
                             else_state = ElseState::AwaitingBranchCloser;
@@ -200,7 +266,7 @@ pub(crate) fn enclosing_block(
                             // A nameless `{` after `[` or `,` is a transparent
                             // element wrapper. Remember it until the matching
                             // list opener supplies the attribute name.
-                            crossed_list_element = true;
+                            pending_element = PendingElement::Unnamed;
                         }
                         BraceOpener::Other => return EnclosingBlock::Other,
                     }
@@ -208,28 +274,35 @@ pub(crate) fn enclosing_block(
                 ']' => bracket_depth += 1,
                 '[' if bracket_depth > 0 => bracket_depth -= 1,
                 '[' if brace_depth > 0 => {}
-                '[' if crossed_list_element => {
-                    // A list name is part of a schema path only while the
-                    // cursor is inside one of its struct elements. Directly
-                    // inside `[value, |]`, the list is a value expression and
-                    // must not masquerade as a struct block.
-                    let segment = scan_line_segment(
-                        &source_chars,
-                        classified,
-                        char_index,
-                        SegmentScanMode::BeforeOpener,
-                    );
-                    if let Some(path_segment) = parse_path_segment(&segment, false) {
+                '[' => match pending_element {
+                    PendingElement::None => {}
+                    PendingElement::Unnamed => {
+                        // A list name is part of a schema path only while the
+                        // cursor is inside one of its struct elements. Directly
+                        // inside `[value, |]`, the list is a value expression and
+                        // must not masquerade as a struct block.
+                        let segment = scan_line_segment(
+                            &source_chars,
+                            classified,
+                            char_index,
+                            SegmentScanMode::BeforeOpener,
+                        );
+                        let Some(path_segment) = parse_list_attribute_segment(&segment) else {
+                            return EnclosingBlock::Other;
+                        };
                         reverse_path.push(path_segment);
-                        crossed_list_element = false;
+                        pending_element = PendingElement::None;
                     }
-                }
+                },
                 _ => {}
             }
         }
     }
 
-    classify_non_resource(reverse_path)
+    match pending_element {
+        PendingElement::None => classify_non_resource(reverse_path),
+        PendingElement::Unnamed => EnclosingBlock::Other,
+    }
 }
 
 fn scan_line_segment(
@@ -389,16 +462,36 @@ fn parse_path_segment(segment: &LineSegment, allow_bare: bool) -> Option<PathSeg
     Some(PathSegment { name, syntax })
 }
 
+fn parse_list_attribute_segment(segment: &LineSegment) -> Option<PathSegment> {
+    let (name, value_prefix) = segment.code.split_once('=')?;
+    let name = name.trim();
+    if !is_identifier(name) || !value_prefix.trim().is_empty() {
+        return None;
+    }
+    Some(PathSegment {
+        name: name.to_string(),
+        syntax: SegmentSyntax::Assignment,
+    })
+}
+
 fn classify_brace_opener(
     segment: &LineSegment,
     resource_types: &ResourceTypePatterns,
 ) -> BraceOpener {
-    if let Some(resource_type) = resource_types.header_resource_type(&segment.code) {
-        BraceOpener::Resource(resource_type.to_string())
+    if let Some(header) = resource_types.resource_header(&segment.code) {
+        BraceOpener::Resource {
+            resource_type: header.resource_type.to_string(),
+            binding: header.binding,
+        }
     } else if is_else_segment(&segment.code) {
         BraceOpener::Else
     } else if is_control_flow_segment(&segment.block_code) {
         BraceOpener::ControlFlow
+    } else if let Some(module_name) = named_module_call_name(&segment.code) {
+        BraceOpener::Path(PathSegment {
+            name: module_name.to_string(),
+            syntax: SegmentSyntax::NamedModule,
+        })
     } else if let Some(path_segment) = parse_path_segment(segment, true) {
         BraceOpener::Path(path_segment)
     } else if segment.code.trim().is_empty() {
@@ -415,17 +508,37 @@ fn is_else_segment(segment: &str) -> bool {
 
 fn is_control_flow_segment(segment: &str) -> bool {
     let trimmed = segment.trim();
-    let expression = strip_let_assignment(trimmed).unwrap_or(trimmed);
+    let expression = parse_let_assignment(trimmed)
+        .map(|assignment| assignment.expression)
+        .unwrap_or(trimmed);
     expression == "if"
         || expression.starts_with("if ")
         || expression == "for"
         || expression.starts_with("for ") && expression.contains(" in ")
 }
 
-fn strip_let_assignment(segment: &str) -> Option<&str> {
+fn parse_let_assignment(segment: &str) -> Option<LetAssignment<'_>> {
     let after_let = strip_keyword(segment, "let")?;
     let (binding, expression) = after_let.split_once('=')?;
-    is_identifier(binding.trim()).then(|| expression.trim_start())
+    let binding = binding.trim();
+    is_identifier(binding).then(|| LetAssignment {
+        binding,
+        expression: expression.trim_start(),
+    })
+}
+
+pub(crate) fn named_module_call_name(header: &str) -> Option<&str> {
+    let trimmed = header.trim();
+    let without_opener = trimmed
+        .strip_suffix('{')
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
+    let assignment = parse_let_assignment(without_opener)?;
+    let module_name = assignment.expression.trim();
+    if matches!(module_name, "use" | "upstream_state" | "read" | "provider") {
+        return None;
+    }
+    is_module_identifier(module_name).then_some(module_name)
 }
 
 fn strip_keyword<'a>(segment: &'a str, keyword: &str) -> Option<&'a str> {
@@ -459,27 +572,51 @@ fn is_identifier(candidate: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
+fn is_module_identifier(candidate: &str) -> bool {
+    let mut characters = candidate.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn resource_struct_path(mut reverse_path: Vec<PathSegment>) -> Option<Vec<String>> {
+    let mut struct_path = Vec::with_capacity(reverse_path.len());
+    for segment in reverse_path.drain(..) {
+        match segment.syntax {
+            SegmentSyntax::Assignment | SegmentSyntax::Bare => struct_path.push(segment.name),
+            SegmentSyntax::NamedModule => return None,
+        }
+    }
+    struct_path.reverse();
+    Some(struct_path)
+}
+
 fn classify_non_resource(mut reverse_path: Vec<PathSegment>) -> EnclosingBlock {
     let Some(outermost) = reverse_path.pop() else {
         return EnclosingBlock::Other;
     };
-    let SegmentSyntax::Bare = outermost.syntax else {
-        return EnclosingBlock::Other;
+    let module_name = match outermost.syntax {
+        SegmentSyntax::Bare | SegmentSyntax::NamedModule => outermost.name,
+        SegmentSyntax::Assignment => return EnclosingBlock::Other,
     };
     if matches!(
-        outermost.name.as_str(),
+        module_name.as_str(),
         "arguments" | "attributes" | "directives" | "exports"
     ) {
         return EnclosingBlock::Other;
     }
 
-    let mut arg_path: Vec<String> = reverse_path
-        .into_iter()
-        .map(|segment| segment.name)
-        .collect();
+    let mut arg_path = Vec::with_capacity(reverse_path.len());
+    for segment in reverse_path {
+        match segment.syntax {
+            SegmentSyntax::Assignment | SegmentSyntax::Bare => arg_path.push(segment.name),
+            SegmentSyntax::NamedModule => return EnclosingBlock::Other,
+        }
+    }
     arg_path.reverse();
     EnclosingBlock::ModuleCall {
-        module_name: outermost.name,
+        module_name,
         arg_path,
     }
 }

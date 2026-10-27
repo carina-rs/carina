@@ -198,6 +198,7 @@ impl HoverProvider {
             EnclosingBlock::Resource {
                 resource_type,
                 struct_path,
+                binding: _binding,
             } => {
                 if let Some(hover) = self.attribute_hover(&word, resource_type, struct_path) {
                     return Some(hover);
@@ -728,7 +729,7 @@ mod tests {
             })
     }
 
-    fn issue_3835_hover_provider() -> HoverProvider {
+    fn nested_attribute_hover_provider() -> HoverProvider {
         let alias_target = AttributeType::struct_(
             "AliasTarget",
             vec![
@@ -764,7 +765,7 @@ mod tests {
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
-    fn review_round3_resource_header_hover_provider() -> HoverProvider {
+    fn resource_header_hover_provider() -> HoverProvider {
         let security_group = ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new("description", AttributeType::string())
                 .with_description("REAL RESOURCE DESCRIPTION"),
@@ -779,7 +780,34 @@ mod tests {
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
-    fn assert_module_argument_hover_in_control_flow(text: &str) {
+    fn unnamed_expression_hover_provider() -> HoverProvider {
+        let x = AttributeType::struct_(
+            "X",
+            vec![
+                StructField::new("field", AttributeType::string()).with_description("NESTED field"),
+            ],
+        );
+        let rule = AttributeType::struct_(
+            "Rule",
+            vec![StructField::new("name", AttributeType::string()).with_description("NESTED name")],
+        );
+        let schema = ResourceSchema::new("Review")
+            .attribute(AttributeSchema::new("x", x))
+            .attribute(AttributeSchema::new("rules", AttributeType::list(rule)))
+            .attribute(
+                AttributeSchema::new("field", AttributeType::string())
+                    .with_description("TOP-LEVEL field"),
+            )
+            .attribute(
+                AttributeSchema::new("name", AttributeType::string())
+                    .with_description("TOP-LEVEL name"),
+            );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        HoverProvider::new(Arc::new(schemas), vec![])
+    }
+
+    fn assert_module_argument_hover(text: &str) {
         let temp_dir = tempfile::tempdir().unwrap();
         let module_dir = temp_dir.path().join("modules").join("example");
         std::fs::create_dir_all(&module_dir).unwrap();
@@ -1078,7 +1106,7 @@ awscc.ec2.vpc_gateway_attachment {
     }
 
     #[test]
-    fn issue_3835_nested_struct_attribute_hover_in_multifile_directory() {
+    fn nested_struct_attribute_hover_in_multifile_directory() {
         let temp_dir = tempfile::tempdir().unwrap();
         let main_text = r#"let bucket = aws.s3.Bucket {
   name = 'website-bucket'
@@ -1106,7 +1134,7 @@ aws.route53.RecordSet {
         )
         .unwrap();
 
-        let provider = issue_3835_hover_provider();
+        let provider = nested_attribute_hover_provider();
         let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
 
         let nested_zone = hover_markdown(
@@ -1170,8 +1198,8 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn issue_3835_nested_struct_hover_supports_block_syntax() {
-        let provider = issue_3835_hover_provider();
+    fn nested_struct_hover_supports_block_syntax() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   alias_target {
     hosted_zone_id = 'Z0123456789ABC'
@@ -1191,7 +1219,7 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn issue_3835_nested_struct_hover_supports_list_and_repeated_block_syntax() {
+    fn nested_struct_hover_supports_list_and_repeated_block_syntax() {
         let rule_type = AttributeType::struct_(
             "Rule",
             vec![
@@ -1255,7 +1283,7 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn issue_3835_nested_struct_hover_resolves_ref_fields_two_levels_deep() {
+    fn nested_struct_hover_resolves_ref_fields_two_levels_deep() {
         let outer = AttributeType::struct_(
             "Outer",
             vec![StructField::new(
@@ -1298,7 +1326,7 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn issue_3835_nested_struct_value_identifier_has_no_attribute_hover() {
+    fn nested_struct_value_identifier_has_no_attribute_hover() {
         let alias_target = AttributeType::struct_(
             "AliasTarget",
             vec![StructField::new("dns_name", AttributeType::string())],
@@ -1328,46 +1356,34 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn round2_same_line_resource_and_struct_openers_keep_nested_path() {
-        let provider = issue_3835_hover_provider();
-        let text = r#"aws.route53.RecordSet { alias_target = {
+    fn same_line_resource_and_struct_openers_keep_nested_path() {
+        let provider = nested_attribute_hover_provider();
+        for text in [
+            r#"aws.route53.RecordSet { alias_target = {
   hosted_zone_id = 'Z0123456789ABC'
 }
 }
-"#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
-
-        let content = hover_markdown(
-            &provider,
-            &doc,
-            hover_position(text, "hosted_zone_id", 0),
-            None,
-        )
-        .expect("nested field after same-line openers should have hover");
-        assert!(content.contains("NESTED alias zone"), "{content}");
-        assert!(!content.contains("TOP-LEVEL zone"), "{content}");
+"#,
+            "aws.route53.RecordSet { alias_target = { hosted_zone_id = 'Z0123456789ABC' } }",
+        ] {
+            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let content = hover_markdown(
+                &provider,
+                &doc,
+                hover_position(text, "hosted_zone_id", 0),
+                None,
+            )
+            .unwrap_or_else(|| {
+                panic!("nested field after same-line openers has no hover:\n{text}")
+            });
+            assert!(content.contains("NESTED alias zone"), "{text}\n{content}");
+            assert!(!content.contains("TOP-LEVEL zone"), "{text}\n{content}");
+        }
     }
 
     #[test]
-    fn round2_fully_single_line_resource_keeps_nested_path() {
-        let provider = issue_3835_hover_provider();
-        let text = "aws.route53.RecordSet { alias_target = { hosted_zone_id = 'Z0123456789ABC' } }";
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
-
-        let content = hover_markdown(
-            &provider,
-            &doc,
-            hover_position(text, "hosted_zone_id", 0),
-            None,
-        )
-        .expect("nested field in a single-line resource should have hover");
-        assert!(content.contains("NESTED alias zone"), "{content}");
-        assert!(!content.contains("TOP-LEVEL zone"), "{content}");
-    }
-
-    #[test]
-    fn round2_comments_and_strings_do_not_change_resource_structure() {
-        let provider = issue_3835_hover_provider();
+    fn comments_and_strings_do_not_change_resource_structure() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   name = '[{'
   # an unmatched bracket is not structure: [
@@ -1387,8 +1403,8 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn round2_crlf_lines_keep_lexer_and_walker_positions_aligned() {
-        let provider = issue_3835_hover_provider();
+    fn crlf_lines_keep_lexer_and_walker_positions_aligned() {
+        let provider = nested_attribute_hover_provider();
         let text = "aws.route53.RecordSet {\r\n  hosted_zone_id = 'Z0123456789ABC'\r\n}\r\n";
         let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
 
@@ -1403,8 +1419,8 @@ aws.route53.RecordSet {
     }
 
     #[test]
-    fn round2_heredoc_body_does_not_change_resource_structure() {
-        let provider = issue_3835_hover_provider();
+    fn heredoc_body_does_not_change_resource_structure() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   name = <<EOT
 if [ -f x ]; then {
@@ -1425,8 +1441,8 @@ EOT
     }
 
     #[test]
-    fn round2_interpolation_code_does_not_change_nested_structure() {
-        let provider = issue_3835_hover_provider();
+    fn interpolation_code_does_not_change_nested_structure() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   alias_target = {
     dns_name = "${replace('x', 'x', '{')}"
@@ -1448,7 +1464,7 @@ EOT
     }
 
     #[test]
-    fn round2_union_path_finds_field_in_later_struct_member() {
+    fn union_path_finds_field_in_later_struct_member() {
         let union = AttributeType::union(vec![
             AttributeType::struct_(
                 "First",
@@ -1489,7 +1505,7 @@ EOT
     }
 
     #[test]
-    fn round2_jsonencode_object_inside_resource_is_not_a_module_call() {
+    fn jsonencode_object_inside_resource_is_not_a_module_call() {
         let temp_dir = tempfile::tempdir().unwrap();
         let module_dir = temp_dir.path().join("modules").join("policy");
         std::fs::create_dir_all(&module_dir).unwrap();
@@ -1512,7 +1528,7 @@ EOT
 }
 "#;
         std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
-        let provider = issue_3835_hover_provider();
+        let provider = nested_attribute_hover_provider();
         let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
 
         let hover = provider.hover_with_base_path(
@@ -1527,7 +1543,7 @@ EOT
     }
 
     #[test]
-    fn review_round1_assignment_expressions_and_control_blocks_keep_attribute_context() {
+    fn assignment_expressions_and_control_blocks_keep_attribute_context() {
         let nested = AttributeType::struct_(
             "Nested",
             vec![
@@ -1574,53 +1590,23 @@ EOT
     }
 
     #[test]
-    fn review_round1_module_argument_hover_inside_for_body() {
+    fn module_argument_hover_works_inside_control_flow_bodies() {
         for text in [
             "for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
             "if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
+            "for k, v in m {\n  mymod {\n    arg = v\n  }\n}\n",
+            "for a in ['x', 'y'] {\n  mymod {\n    arg = a\n  }\n}\n",
+            "let ms = for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
+            "let m = if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
+            "let m = if c {\n  'left'\n} else {\n  mymod {\n    arg = 'right'\n  }\n}\n",
         ] {
-            assert_module_argument_hover_in_control_flow(text);
+            assert_module_argument_hover(text);
         }
     }
 
     #[test]
-    fn review_round3_module_argument_hover_inside_destructuring_for_body() {
-        assert_module_argument_hover_in_control_flow(
-            "for k, v in m {\n  mymod {\n    arg = v\n  }\n}\n",
-        );
-    }
-
-    #[test]
-    fn review_round3_module_argument_hover_inside_list_for_body() {
-        assert_module_argument_hover_in_control_flow(
-            "for a in ['x', 'y'] {\n  mymod {\n    arg = a\n  }\n}\n",
-        );
-    }
-
-    #[test]
-    fn review_round3_module_argument_hover_inside_let_for_body() {
-        assert_module_argument_hover_in_control_flow(
-            "let ms = for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
-        );
-    }
-
-    #[test]
-    fn review_round3_module_argument_hover_inside_let_if_body() {
-        assert_module_argument_hover_in_control_flow(
-            "let m = if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
-        );
-    }
-
-    #[test]
-    fn review_round3_module_argument_hover_inside_let_else_body() {
-        assert_module_argument_hover_in_control_flow(
-            "let m = if c {\n  'left'\n} else {\n  mymod {\n    arg = 'right'\n  }\n}\n",
-        );
-    }
-
-    #[test]
-    fn review_round3_arguments_type_is_not_a_resource_header() {
-        let provider = review_round3_resource_header_hover_provider();
+    fn arguments_type_is_not_a_resource_header() {
+        let provider = resource_header_hover_provider();
         let text = r#"arguments {
   sg: aws.ec2.SecurityGroup {
     description = 'x'
@@ -1637,8 +1623,8 @@ EOT
     }
 
     #[test]
-    fn review_round3_exports_type_is_not_a_resource_header() {
-        let provider = review_round3_resource_header_hover_provider();
+    fn exports_type_is_not_a_resource_header() {
+        let provider = resource_header_hover_provider();
         let text = r#"exports {
   x: map(aws.ec2.Vpc) = {
     description = 'x'
@@ -1655,8 +1641,8 @@ EOT
     }
 
     #[test]
-    fn review_round3_valid_resource_headers_keep_attribute_hover() {
-        let provider = review_round3_resource_header_hover_provider();
+    fn valid_resource_headers_keep_attribute_hover() {
+        let provider = resource_header_hover_provider();
         for text in [
             "aws.ec2.SecurityGroup {\n  description = 'direct'\n}\n",
             "let x = read aws.ec2.Vpc {\n  description = 'read'\n}\n",
@@ -1675,8 +1661,75 @@ EOT
     }
 
     #[test]
-    fn review_round2_else_branch_keeps_nested_attribute_hover() {
-        let provider = issue_3835_hover_provider();
+    fn unnamed_object_element_in_merge_has_no_attribute_hover() {
+        let provider = unnamed_expression_hover_provider();
+        let text = r#"test.Review {
+  x = merge(
+    {
+      field = 'a'
+    }
+  )
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "field", 0));
+        assert!(
+            hover.is_none(),
+            "an unnamed merge element has no schema path: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn second_unnamed_object_element_in_merge_has_no_attribute_hover() {
+        let provider = unnamed_expression_hover_provider();
+        let text = r#"test.Review {
+  x = merge({
+    a = 1
+  }, {
+    field = 'a'
+  })
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "field", 0));
+        assert!(
+            hover.is_none(),
+            "a later unnamed merge element has no schema path: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn unnamed_list_element_in_concat_has_no_attribute_hover() {
+        let provider = unnamed_expression_hover_provider();
+        let text = r#"test.Review {
+  rules = concat(
+    [
+      {
+        name = 'a'
+      }
+    ]
+  )
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "name", 0));
+        assert!(
+            hover.is_none(),
+            "an unnamed concat list element has no schema path: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn named_module_call_argument_hover_uses_imported_schema() {
+        assert_module_argument_hover("let m = mymod {\n  arg = 'value'\n}\n");
+    }
+
+    #[test]
+    fn else_branch_keeps_nested_attribute_hover() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   alias_target = if true {
     {
@@ -1703,8 +1756,8 @@ EOT
     }
 
     #[test]
-    fn review_round2_else_if_chain_keeps_nested_attribute_hover() {
-        let provider = issue_3835_hover_provider();
+    fn else_if_chain_keeps_nested_attribute_hover() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   alias_target = if first {
     {
@@ -1737,8 +1790,8 @@ EOT
     }
 
     #[test]
-    fn review_round2_quoted_map_key_has_no_attribute_hover() {
-        let provider = issue_3835_hover_provider();
+    fn quoted_map_key_has_no_attribute_hover() {
+        let provider = nested_attribute_hover_provider();
         let text = r#"aws.route53.RecordSet {
   alias_target = {
     "k" = {
@@ -2083,7 +2136,7 @@ EOT
     }
 
     #[test]
-    fn round2_nested_module_argument_object_is_not_a_module_call() {
+    fn nested_module_argument_object_is_not_a_module_call() {
         let temp_dir = tempfile::tempdir().unwrap();
         let github_module = temp_dir.path().join("modules").join("github-oidc");
         let cfg_module = temp_dir.path().join("modules").join("cfg");
