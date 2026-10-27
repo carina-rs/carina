@@ -1,4 +1,14 @@
 PLAN_FIXTURE = cargo run --manifest-path $(CURDIR)/Cargo.toml -p carina-cli --example plan-fixture --quiet --
+PLAN_IMAGE_THEME = $(if $(strip $(THEME)),--image-theme "$(THEME)")
+
+plan-image:
+	$(if $(strip $(FIXTURE)),,$(error FIXTURE is required, for example FIXTURE=mixed_operations))
+	$(if $(strip $(OUT)),,$(error OUT is required, for example OUT=/tmp/plan.png))
+	$(PLAN_FIXTURE) $(FIXTURE) --image "$(OUT)" $(PLAN_IMAGE_THEME)
+
+plan-image-inline:
+	$(if $(strip $(FIXTURE)),,$(error FIXTURE is required, for example FIXTURE=mixed_operations))
+	$(PLAN_FIXTURE) $(FIXTURE) --image-inline $(PLAN_IMAGE_THEME)
 
 plan-all-create:
 	$(PLAN_FIXTURE) all_create
@@ -8,6 +18,12 @@ plan-empty-explicit-children-no-changes:
 	$(PLAN_FIXTURE) empty_explicit_children_no_changes
 plan-mixed:
 	$(PLAN_FIXTURE) mixed_operations
+plan-image-module-cascade:
+	$(PLAN_FIXTURE) plan_image_module_cascade
+plan-image-reference-layout:
+	$(PLAN_FIXTURE) plan_image_reference_layout
+plan-image-anonymous:
+	$(PLAN_FIXTURE) plan_image_anonymous
 plan-replace-create-only:
 	$(PLAN_FIXTURE) replace_create_only
 plan-replace-with-non-forcing-diffs:
@@ -327,7 +343,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
+.PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \

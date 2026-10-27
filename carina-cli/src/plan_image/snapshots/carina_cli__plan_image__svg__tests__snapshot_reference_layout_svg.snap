@@ -1,0 +1,134 @@
+---
+source: carina-cli/src/plan_image/svg.rs
+expression: "fixture_svg(\"plan_image_reference_layout\")"
+---
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1141" viewBox="0 0 900 1141" role="img" aria-labelledby="title desc">
+  <rect id="background" fill="#ffffff" x="0" y="0" width="900" height="1141"/>
+  <title id="title">carina plan</title>
+  <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
+  <defs>
+    <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
+    <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
+  </defs>
+  <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
+    <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#1a7f37" font-weight="600">1 to create</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">3 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#8250df" font-weight="700">1 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to destroy</tspan></text>
+    <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-plan-image-reference-layout · serial 12</text>
+    <rect x="336.0" y="714.0" width="252.0" height="335.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+    <path d="M248.0,208.0 C257.4,208.0 257.4,208.0 266.7,208.0 C300.0,208.0 300.0,167.0 333.3,167.0 C342.6,167.0 342.6,167.0 352.0,167.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>
+    <path d="M248.0,375.5 C257.4,375.5 257.4,375.5 266.7,375.5 C300.0,375.5 300.0,273.0 333.3,273.0 C342.6,273.0 342.6,273.0 352.0,273.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <path d="M248.0,453.5 C257.4,453.5 257.4,453.5 266.7,453.5 C300.0,453.5 300.0,414.5 333.3,414.5 C342.6,414.5 342.6,414.5 352.0,414.5" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-replace)"/>
+    <path d="M462.0,846.0 C462.0,846.0 462.0,900.0 462.0,900.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M528.0,489.0 C528.0,489.0 528.0,624.5 528.0,624.5 C495.0,624.5 495.0,624.5 462.0,624.5 C462.0,624.5 462.0,760.0 462.0,760.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <path d="M396.0,489.0 C396.0,489.0 396.0,516.0 396.0,516.0 C429.0,516.0 429.0,516.0 462.0,516.0 C462.0,516.0 462.0,543.0 462.0,543.0" fill="none" stroke="#8250df" stroke-width="2.2" stroke-opacity="0.76" stroke-dasharray="6 5" marker-end="url(#arrow-replace)"/>
+    <rect x="344.0" y="719.0" width="190.2" height="21" rx="4" fill="#f6f8fa"/>
+    <text x="350.0" y="734.0" font-size="11" font-weight="600" fill="#57606a">module &quot;app&quot; (./app-module)</text>
+    <rect x="23.0" y="154.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#cf222e" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="28.0" y="159.0" width="220.0" height="98.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect x="28.0" y="159.0" width="6" height="98.0" rx="3" fill="#cf222e"/>
+      <text x="45.0" y="186.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
+      <rect x="66.0" y="169.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
+      <text x="74.0" y="183.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
+      <text x="46.0" y="208.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">legacy_worker</text>
+      <text x="46.0" y="226.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="46.0" y="247.0" font-size="10" font-weight="600" fill="#cf222e">affected by legacy</text>
+    </g>
+    <g>
+      <rect x="28.0" y="349.5" width="220.0" height="130.0" rx="9" fill="#fbefff" fill-opacity="1" stroke="#8250df"/>
+      <rect x="28.0" y="349.5" width="6" height="130.0" rx="3" fill="#8250df"/>
+      <text x="45.0" y="376.5" font-size="13" font-weight="700" fill="#8250df">±</text>
+      <rect x="66.0" y="359.5" width="58.0" height="20" rx="10" fill="#8250df" fill-opacity="0.10"/>
+      <text x="74.0" y="374.0" font-size="10" font-weight="700" fill="#8250df">replace</text>
+      <text x="46.0" y="398.5" font-size="14" font-weight="700" fill="#1f2328">network</text>
+      <text x="46.0" y="416.5" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="46.0" y="434.5" font-size="10.5" fill="#57606a">create before destroy</text>
+      <text x="46.0" y="451.5" font-size="10.5" font-weight="600" fill="#8250df">forces replacement:</text>
+      <text x="54.0" y="467.5" font-size="10.5" fill="#24292f">• external_name</text>
+    </g>
+    <g>
+      <rect x="352.0" y="128.0" width="220.0" height="78.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect x="352.0" y="128.0" width="6" height="78.0" rx="3" fill="#cf222e"/>
+      <text x="369.0" y="155.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
+      <rect x="390.0" y="138.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
+      <text x="398.0" y="152.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
+      <text x="370.0" y="177.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">legacy</text>
+      <text x="370.0" y="195.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+    </g>
+    <rect x="347.0" y="219.0" width="230.0" height="108.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="352.0" y="224.0" width="220.0" height="98.0" rx="9" fill="#dafbe1" fill-opacity="1" stroke="#1a7f37"/>
+      <rect x="352.0" y="224.0" width="6" height="98.0" rx="3" fill="#1a7f37"/>
+      <text x="369.0" y="251.0" font-size="13" font-weight="700" fill="#1a7f37">+</text>
+      <rect x="390.0" y="234.0" width="52.0" height="20" rx="10" fill="#1a7f37" fill-opacity="0.10"/>
+      <text x="398.0" y="248.5" font-size="10" font-weight="700" fill="#1a7f37">create</text>
+      <text x="370.0" y="273.0" font-size="14" font-weight="700" fill="#1f2328">cache</text>
+      <text x="370.0" y="291.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="312.0" font-size="10" font-weight="600" fill="#8250df">affected by network</text>
+    </g>
+    <rect x="347.0" y="335.0" width="230.0" height="159.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="352.0" y="340.0" width="220.0" height="149.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="352.0" y="340.0" width="6" height="149.0" rx="3" fill="#0969da"/>
+      <text x="369.0" y="367.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="390.0" y="350.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="398.0" y="364.5" font-size="10" font-weight="700" fill="#0969da">update</text>
+      <text x="370.0" y="389.0" font-size="14" font-weight="700" fill="#1f2328">subnet</text>
+      <text x="370.0" y="407.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="425.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
+      <text x="378.0" y="441.0" font-size="10.5" fill="#24292f">• description</text>
+      <text x="378.0" y="457.0" font-size="10.5" fill="#24292f">• metric_name</text>
+      <text x="370.0" y="479.0" font-size="10" font-weight="600" fill="#8250df">affected by network</text>
+    </g>
+    <rect x="347.0" y="538.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="352.0" y="543.0" width="220.0" height="133.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="352.0" y="543.0" width="6" height="133.0" rx="3" fill="#0969da"/>
+      <text x="369.0" y="570.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="390.0" y="553.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="398.0" y="567.5" font-size="10" font-weight="700" fill="#0969da">update</text>
+      <text x="370.0" y="592.0" font-size="14" font-weight="700" fill="#1f2328">dns</text>
+      <text x="370.0" y="610.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="628.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
+      <text x="378.0" y="644.0" font-size="10.5" fill="#24292f">• metric_name</text>
+      <text x="370.0" y="666.0" font-size="10" font-weight="600" fill="#8250df">affected by network</text>
+    </g>
+    <rect x="347.0" y="755.0" width="230.0" height="96.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="352.0" y="760.0" width="220.0" height="86.0" rx="9" fill="#f6f8fa" fill-opacity="0.72" stroke="#afb8c1"/>
+      <rect x="366.0" y="770.0" width="70.0" height="20" rx="10" fill="#6e7781" fill-opacity="0.10"/>
+      <text x="374.0" y="784.5" font-size="10" font-weight="700" fill="#6e7781">unchanged</text>
+      <text x="370.0" y="805.0" font-size="14" font-weight="700" fill="#1f2328">app.server</text>
+      <text x="370.0" y="821.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="836.0" font-size="10" font-weight="600" fill="#8250df">affected by network</text>
+    </g>
+    <rect x="347.0" y="895.0" width="230.0" height="143.0" rx="14" fill="none" stroke="#8250df" stroke-width="8" stroke-opacity="0.24"/>
+    <g>
+      <rect x="352.0" y="900.0" width="220.0" height="133.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="352.0" y="900.0" width="6" height="133.0" rx="3" fill="#0969da"/>
+      <text x="369.0" y="927.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="390.0" y="910.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="398.0" y="924.5" font-size="10" font-weight="700" fill="#0969da">update</text>
+      <text x="370.0" y="949.0" font-size="14" font-weight="700" fill="#1f2328">app.sidecar</text>
+      <text x="370.0" y="967.0" font-size="11" fill="#6e7781">test.test.Widget</text>
+      <text x="370.0" y="985.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
+      <text x="378.0" y="1001.0" font-size="10.5" fill="#24292f">• metric_name</text>
+      <text x="370.0" y="1023.0" font-size="10" font-weight="600" fill="#8250df">affected by network</text>
+    </g>
+    <line x1="28" y1="1059.0" x2="872" y2="1059.0" stroke="#d8dee4"/>
+    <text x="28.0" y="1080.0" font-size="11" font-weight="700" fill="#1a7f37">+</text>
+    <text x="40.6" y="1080.0" font-size="10" fill="#57606a">create</text>
+    <text x="98.6" y="1080.0" font-size="11" font-weight="700" fill="#0969da">~</text>
+    <text x="111.2" y="1080.0" font-size="10" fill="#57606a">update</text>
+    <text x="169.2" y="1080.0" font-size="11" font-weight="700" fill="#8250df">±</text>
+    <text x="181.8" y="1080.0" font-size="10" fill="#57606a">replace</text>
+    <text x="245.8" y="1080.0" font-size="11" font-weight="700" fill="#cf222e">-</text>
+    <text x="258.4" y="1080.0" font-size="10" fill="#57606a">delete</text>
+    <text x="316.4" y="1080.0" font-size="11" font-weight="700" fill="#6e7781">=</text>
+    <text x="329.0" y="1080.0" font-size="10" fill="#57606a">unchanged</text>
+    <line x1="28.0" y1="1127.0" x2="72.0" y2="1127.0" stroke="#8c959f" stroke-width="1.6" marker-end="url(#arrow-default)"/><text x="82.0" y="1131.0" font-size="10" fill="#57606a">runs before</text>
+    <line x1="174.0" y1="1127.0" x2="218.0" y2="1127.0" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/><text x="228.0" y="1131.0" font-size="10" fill="#57606a">references</text>
+    <rect x="320.0" y="1118.0" width="24" height="13" rx="4" fill="none" stroke="#8250df" stroke-width="5" stroke-opacity="0.24"/><text x="354.0" y="1131.0" font-size="10" fill="#57606a">halo = downstream blast radius</text>
+  </g>
+</svg>

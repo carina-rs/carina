@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
-use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan};
+use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::value::{
     RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
@@ -142,11 +142,26 @@ pub struct DependencyGraph {
 
 /// Build the dependency graph maps from a plan's effects.
 pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
+    build_dependency_graph_from_effects(plan.effects(), plan.replace_display_info())
+}
+
+/// Build dependency graph maps from borrowed effect-like values.
+///
+/// This is the same analysis as [`build_dependency_graph`], but permits
+/// display-only callers to append lightweight synthetic effects without
+/// cloning the plan or the values carried by its real effects.
+pub fn build_dependency_graph_from_effects<'a, E>(
+    effects: &[E],
+    replacement_display: impl IntoIterator<Item = ReplaceDisplayInfo<'a>>,
+) -> DependencyGraph
+where
+    E: AsRef<Effect>,
+{
     let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
     let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
     let mut effect_bindings: HashMap<usize, String> = HashMap::new();
     let mut effect_types: HashMap<usize, String> = HashMap::new();
-    let replacement_display: Vec<_> = plan.replace_display_info().collect();
+    let replacement_display: Vec<_> = replacement_display.into_iter().collect();
     let replacement_delete_indices: HashSet<_> = replacement_display
         .iter()
         .map(|metadata| metadata.delete_idx)
@@ -156,7 +171,8 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
         .map(|metadata| (metadata.create_idx, *metadata))
         .collect();
 
-    for (idx, effect) in plan.effects().iter().enumerate() {
+    for (idx, effect) in effects.iter().enumerate() {
+        let effect = effect.as_ref();
         if replacement_delete_indices.contains(&idx) {
             continue;
         }
@@ -271,7 +287,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     binding,
                     dependencies,
                     ..
-                }) = plan.effects().get(metadata.delete_idx)
+                }) = effects.get(metadata.delete_idx).map(AsRef::as_ref)
             {
                 deps.extend(dependencies.iter().cloned());
                 if let Some(binding) = binding {

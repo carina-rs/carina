@@ -9,7 +9,8 @@ use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_replace_delete_deps;
 use crate::effect::deps::{
-    ScheduleInputs, UnresolvedRequiredDependency, build_effect_dependency_analysis,
+    DependencyAnalysis, DependencyAnalysisFailure, ScheduleInputs, UnresolvedRequiredDependency,
+    build_effect_dependency_analysis, build_effect_dependency_analysis_from_resources,
     relax_update_update_edges,
 };
 
@@ -79,12 +80,43 @@ pub(super) fn build_scheduler_deps(
     compositions: &[crate::resource::Composition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
-    let (mut analysis, unresolved) = match build_effect_dependency_analysis(
+    finish_scheduler_deps(
         effects,
-        unresolved_resources,
-        compositions,
-        ScheduleInputs::Apply,
-    ) {
+        build_effect_dependency_analysis(
+            effects,
+            unresolved_resources,
+            compositions,
+            ScheduleInputs::Apply,
+        ),
+        deferred_replace_delete_deps,
+    )
+}
+
+pub(super) fn build_scheduler_deps_from_resources(
+    effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
+    compositions: &[crate::resource::Composition],
+    deferred_replace_delete_deps: &[(usize, usize)],
+) -> SchedulerDeps {
+    let effect_refs: Vec<_> = effects.iter().collect();
+    finish_scheduler_deps(
+        effects,
+        build_effect_dependency_analysis_from_resources(
+            &effect_refs,
+            unresolved_resources,
+            compositions,
+            ScheduleInputs::Apply,
+        ),
+        deferred_replace_delete_deps,
+    )
+}
+
+fn finish_scheduler_deps(
+    effects: &[Effect],
+    analysis: Result<DependencyAnalysis, DependencyAnalysisFailure>,
+    deferred_replace_delete_deps: &[(usize, usize)],
+) -> SchedulerDeps {
+    let (mut analysis, unresolved) = match analysis {
         Ok(analysis) => (analysis, Vec::new()),
         Err(failure) => failure.into_parts(),
     };

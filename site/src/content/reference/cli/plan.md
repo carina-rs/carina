@@ -89,6 +89,121 @@ Output the plan as structured JSON instead of human-readable text. The output us
 carina plan --json
 ```
 
+### `--image <FILE>`
+
+Write the plan as a dependency-graph image, in addition to the normal text,
+`--json`, or `--tui` output. The format is chosen by the file extension:
+`.svg` or `.png` (case-insensitive). Any other extension is rejected before
+planning starts.
+
+The image is meant for reviewing a plan where the text output is hard to scan,
+such as a pull request:
+
+- Each changed resource is a card colored by its effect (create, update,
+  replace, delete, and so on). Update cards list the names of the changed
+  attributes; replace cards list the attributes that force the replacement.
+- Cards are laid out left to right in apply order. Cards in the same column
+  have no ordering dependency on each other and can run in parallel. Solid
+  arrows mean "runs before".
+- Resources downstream of a replace or delete are highlighted with a halo,
+  so the blast radius of a destructive change is visible at a glance.
+- Dashed edges mean "references" and impose no ordering. Unchanged resources
+  appear only when they connect two changed resources. A module call with no
+  changes is collapsed into a single card.
+- Resources inside a module call are grouped in a box labelled with the call.
+- The header shows per-effect counts, with replace and destroy counts in bold,
+  and the state lineage and serial the plan was computed against.
+
+The image never contains attribute values, so it can be shared without
+exposing secrets.
+
+The image is written last, after everything else in the command has
+succeeded, so a failed `plan` never leaves a fresh image behind. The image is
+rendered before the `--out` file is saved: if rendering fails, the command
+exits with code `1` and writes neither file. Only an I/O error while writing
+the image file itself can happen after `--out` has been saved. PNG output is
+limited to 64 megapixels; for very large plans, use `.svg` instead.
+
+`--image` does not change exit codes: with `--detailed-exitcode`, the exit
+code is the same as without `--image`.
+
+PNG output uses an embedded font, so it renders identically on every machine,
+including CI runners without any fonts installed.
+
+```bash
+carina plan --image plan.png
+```
+
+In GitHub Actions, keep exit code `2` (changes present) from failing the job,
+fail it on a real error (`1`), and post the image to the pull request with
+`gh pr comment --attach` (GitHub CLI 2.99.0 or later):
+
+```yaml
+- id: plan
+  run: |
+    set +e
+    carina plan --detailed-exitcode --image plan.png
+    code=$?
+    echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+    [ "$code" -ne 1 ]
+- if: steps.plan.outputs.exitcode == '2'
+  env:
+    GH_TOKEN: ${{ secrets.PLAN_COMMENT_TOKEN }}
+  run: gh pr comment "${{ github.event.pull_request.number }}" --attach 'plan.png#carina plan'
+```
+
+The workflow's own `GITHUB_TOKEN` cannot upload attachments: the upload
+endpoint answers `404` to it even with `contents`, `issues`, and
+`pull-requests` write permissions. Store a classic personal access token with
+the `repo` scope, from a user with write access to the repository, as a secret
+(`PLAN_COMMENT_TOKEN` above).
+
+### `--image-inline`
+
+Display the dependency graph directly in an image-capable terminal after the
+normal text plan. Carina renders the graph as PNG and uses the Kitty graphics
+protocol in Kitty and Ghostty, or the iTerm2 inline-image protocol in iTerm2
+and WezTerm. In Kitty-compatible terminals, an image wider than the terminal
+is scaled down to the available columns.
+
+Any other terminal, including tmux, and output that is not a terminal are
+rejected before planning starts; use `--image <FILE>` there. `--image-inline`
+cannot be combined with `--json`, which keeps stdout as JSON, or `--tui`,
+which owns the terminal. It can be combined with `--image <FILE>` to display
+the graph and save it in one run.
+
+```bash
+carina plan --image-inline
+```
+
+### `--image-theme <THEME>`
+
+Select the palette used by `--image` and `--image-inline`. The accepted values
+are `light`, `dark`, and `auto`.
+
+When this option is omitted, SVG and PNG files use the light palette, while
+inline terminal images use `auto`. An explicit `light` or `dark` value applies
+to every requested image output. For an SVG file, `auto` embeds both palettes
+and switches them with `@media (prefers-color-scheme: dark)`. For inline
+output, `auto` queries the terminal background and falls back to light if the
+terminal does not reply. PNG colors are fixed at render time, so combining a
+PNG file with explicit `--image-theme auto` is rejected before planning starts.
+
+For a GitHub page or pull-request description, render separate light and dark
+PNGs and select between them with `<picture>`:
+
+```bash
+carina plan --image-theme light --image plan-light.png
+carina plan --image-theme dark --image plan-dark.png
+```
+
+```html
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="plan-dark.png">
+  <img src="plan-light.png" alt="carina plan">
+</picture>
+```
+
 ### `--check-iam`
 
 Before showing the plan, check whether the AWS caller identity (the role that will run `apply`) has the IAM actions the providers declare for the planned effects. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.

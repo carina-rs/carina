@@ -1,0 +1,14 @@
+arguments {
+  subnet_output: String
+}
+
+let server = test.test.Widget {
+  external_name = "app-server"
+  description   = subnet_output
+}
+
+let sidecar = test.test.Widget {
+  external_name = "app-sidecar"
+  description   = server.output_id
+  metric_name   = "sidecar-new"
+}

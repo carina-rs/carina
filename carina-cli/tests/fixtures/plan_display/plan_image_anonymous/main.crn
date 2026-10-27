@@ -1,0 +1,15 @@
+provider test {}
+
+let anchor = test.test.Widget {
+  external_name = "anchor"
+}
+
+test.test.Widget {
+  external_name = "anonymous-one"
+  description   = anchor.output_id
+}
+
+test.test.Widget {
+  external_name = "anonymous-two"
+  description   = anchor.output_id
+}

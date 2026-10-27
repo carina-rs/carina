@@ -1998,6 +1998,26 @@ fn test_extract_hash_from_identifier() {
     assert_eq!(extract_hash_from_identifier("ec2_eip_aabbccddeeff"), None);
 }
 
+#[test]
+fn anonymous_identity_discriminator_uses_canonical_hash_suffix_parser() {
+    assert_eq!(
+        anonymous_identity_discriminator(&ResourceIdentity::new(
+            "awscc_ec2_security_group_166e04b3"
+        )),
+        Some("166e04b3".to_string())
+    );
+    assert_eq!(
+        anonymous_identity_discriminator(&ResourceIdentity::new(
+            "module.awscc_ec2_eip_a3f2b1c8d79f1524"
+        )),
+        Some("a3f2b1c8d79f1524".to_string())
+    );
+    assert_eq!(
+        anonymous_identity_discriminator(&ResourceIdentity::new("named_resource")),
+        None
+    );
+}
+
 fn subnet_route_table_association_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.SubnetRouteTableAssociation")
         .attribute(AttributeSchema::new("route_table_id", AttributeType::string()).create_only())

@@ -1,0 +1,12 @@
+arguments {
+  description: String
+}
+
+let module_node = test.test.Widget {
+  external_name = "module-widget"
+  description   = description
+}
+
+attributes {
+  metric_name = module_node.metric_name
+}

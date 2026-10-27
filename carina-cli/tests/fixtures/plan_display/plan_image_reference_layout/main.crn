@@ -1,0 +1,36 @@
+provider test {}
+
+let network = test.test.Widget {
+  external_name = "network-new"
+  directives { create_before_destroy = true }
+}
+
+let subnet = test.test.Widget {
+  external_name = "subnet"
+  description   = network.output_id
+  metric_name   = "subnet-new"
+}
+
+let dns = test.test.Widget {
+  external_name = "dns"
+  description   = subnet.output_id
+  metric_name   = "dns-new"
+}
+
+let cache = test.test.Widget {
+  external_name = "cache"
+  description   = network.output_id
+}
+
+let app_module = use {
+  source = './app-module'
+}
+
+let app = app_module {
+  subnet_output = subnet.output_id
+}
+
+exports {
+  cache_name = cache.external_name
+  dns_metric = dns.metric_name
+}

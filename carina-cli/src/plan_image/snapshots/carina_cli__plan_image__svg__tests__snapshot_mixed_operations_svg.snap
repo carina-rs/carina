@@ -1,0 +1,60 @@
+---
+source: carina-cli/src/plan_image/svg.rs
+expression: "fixture_svg(\"mixed_operations\")"
+---
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="481" viewBox="0 0 900 481" role="img" aria-labelledby="title desc">
+  <rect id="background" fill="#ffffff" x="0" y="0" width="900" height="481"/>
+  <title id="title">carina plan</title>
+  <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
+  <defs>
+    <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
+    <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
+  </defs>
+  <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
+    <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#1a7f37" font-weight="600">1 to create</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">1 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">1 to destroy</tspan></text>
+    <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-lineage-mixed · serial 2</text>
+    <path d="M248.0,184.5 C257.4,184.5 257.4,184.5 266.7,184.5 C300.0,184.5 300.0,184.5 333.3,184.5 C342.6,184.5 342.6,184.5 352.0,184.5" fill="none" stroke="#8c959f" stroke-width="1.6" stroke-opacity="0.68" marker-end="url(#arrow-default)"/>
+    <path d="M138.0,241.0 C138.0,241.0 138.0,295.0 138.0,295.0" fill="none" stroke="#8c959f" stroke-width="1.6" stroke-opacity="0.68" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/>
+    <g>
+      <rect x="28.0" y="128.0" width="220.0" height="113.0" rx="9" fill="#ddf4ff" fill-opacity="1" stroke="#0969da"/>
+      <rect x="28.0" y="128.0" width="6" height="113.0" rx="3" fill="#0969da"/>
+      <text x="45.0" y="155.0" font-size="13" font-weight="700" fill="#0969da">~</text>
+      <rect x="66.0" y="138.0" width="52.0" height="20" rx="10" fill="#0969da" fill-opacity="0.10"/>
+      <text x="74.0" y="152.5" font-size="10" font-weight="700" fill="#0969da">update</text>
+      <text x="46.0" y="177.0" font-size="14" font-weight="700" fill="#1f2328">vpc</text>
+      <text x="46.0" y="195.0" font-size="11" fill="#6e7781">awscc.ec2.Vpc</text>
+      <text x="46.0" y="213.0" font-size="10.5" font-weight="600" fill="#0969da">changed attributes:</text>
+      <text x="54.0" y="229.0" font-size="10.5" fill="#24292f">• tags</text>
+    </g>
+    <g>
+      <rect x="28.0" y="295.0" width="220.0" height="78.0" rx="9" fill="#ffebe9" fill-opacity="1" stroke="#cf222e" stroke-dasharray="6 4"/>
+      <rect x="28.0" y="295.0" width="6" height="78.0" rx="3" fill="#cf222e"/>
+      <text x="45.0" y="322.0" font-size="13" font-weight="700" fill="#cf222e">-</text>
+      <rect x="66.0" y="305.0" width="52.0" height="20" rx="10" fill="#cf222e" fill-opacity="0.10"/>
+      <text x="74.0" y="319.5" font-size="10" font-weight="700" fill="#cf222e">delete</text>
+      <text x="46.0" y="344.0" font-size="14" font-weight="700" fill="#1f2328" text-decoration="line-through">my_subnet</text>
+      <text x="46.0" y="362.0" font-size="11" fill="#6e7781">awscc.ec2.Subnet</text>
+    </g>
+    <g>
+      <rect x="352.0" y="137.0" width="220.0" height="95.0" rx="9" fill="#dafbe1" fill-opacity="1" stroke="#1a7f37"/>
+      <rect x="352.0" y="137.0" width="6" height="95.0" rx="3" fill="#1a7f37"/>
+      <text x="369.0" y="164.0" font-size="13" font-weight="700" fill="#1a7f37">+</text>
+      <rect x="390.0" y="147.0" width="52.0" height="20" rx="10" fill="#1a7f37" fill-opacity="0.10"/>
+      <text x="398.0" y="161.5" font-size="10" font-weight="700" fill="#1a7f37">create</text>
+      <text x="370.0" y="186.0" font-size="14" font-weight="700" fill="#1f2328">SecurityGroup</text>
+      <text x="370.0" y="204.0" font-size="11" fill="#6e7781">awscc.ec2.SecurityGroup</text>
+      <text x="370.0" y="222.0" font-size="10.5" fill="#57606a">anonymous #166e04b3</text>
+    </g>
+    <line x1="28" y1="399.0" x2="872" y2="399.0" stroke="#d8dee4"/>
+    <text x="28.0" y="420.0" font-size="11" font-weight="700" fill="#1a7f37">+</text>
+    <text x="40.6" y="420.0" font-size="10" fill="#57606a">create</text>
+    <text x="98.6" y="420.0" font-size="11" font-weight="700" fill="#0969da">~</text>
+    <text x="111.2" y="420.0" font-size="10" fill="#57606a">update</text>
+    <text x="169.2" y="420.0" font-size="11" font-weight="700" fill="#cf222e">-</text>
+    <text x="181.8" y="420.0" font-size="10" fill="#57606a">delete</text>
+    <line x1="28.0" y1="467.0" x2="72.0" y2="467.0" stroke="#8c959f" stroke-width="1.6" marker-end="url(#arrow-default)"/><text x="82.0" y="471.0" font-size="10" fill="#57606a">runs before</text>
+    <line x1="174.0" y1="467.0" x2="218.0" y2="467.0" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrow-default)"/><text x="228.0" y="471.0" font-size="10" fill="#57606a">references</text>
+  </g>
+</svg>

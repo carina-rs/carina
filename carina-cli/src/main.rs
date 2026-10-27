@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
+use carina_cli::plan_image::{ImageTheme, PlanImageTarget, resolve_plan_image_options};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
@@ -57,6 +58,18 @@ enum Commands {
         /// Save plan to a file for later apply
         #[arg(long = "out")]
         out: Option<PathBuf>,
+
+        /// Write the dependency graph as SVG or PNG (selected by extension)
+        #[arg(long, value_parser = carina_cli::plan_image::parse_output_target)]
+        image: Option<PlanImageTarget>,
+
+        /// Display the dependency graph in a supported image-capable terminal
+        #[arg(long, conflicts_with_all = ["json", "tui"])]
+        image_inline: bool,
+
+        /// Select the plan image palette: light, dark, or output-aware auto
+        #[arg(long, value_enum)]
+        image_theme: Option<ImageTheme>,
 
         /// Return exit code 2 when changes are present
         #[arg(long = "detailed-exitcode")]
@@ -356,11 +369,30 @@ async fn main() {
     // `CursorGuard`'s `Drop` cannot reach (#3153, #3158).
     carina_cli::cursor::install_panic_restore_hook();
 
+    let cli = Cli::parse();
+
+    let plan_images = match &cli.command {
+        Commands::Plan {
+            image,
+            image_inline,
+            image_theme,
+            ..
+        } => match resolve_plan_image_options(
+            image.as_ref(),
+            *image_inline,
+            *image_theme,
+            |name| std::env::var(name).ok(),
+            std::io::stdout().is_terminal(),
+        ) {
+            Ok(images) => images,
+            Err(error) => handle_app_error(error.into()),
+        },
+        _ => Default::default(),
+    };
+
     // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
     let provider_context = create_provider_context();
-
-    let cli = Cli::parse();
 
     // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
     // after `Cli::parse()` because that exits the process itself on
@@ -373,6 +405,9 @@ async fn main() {
         if let Commands::Plan {
             path,
             out,
+            image: _,
+            image_inline: _,
+            image_theme: _,
             detailed_exitcode,
             detail,
             tui,
@@ -385,6 +420,8 @@ async fn main() {
             match run_plan(
                 &path,
                 out.as_deref(),
+                plan_images.file(),
+                plan_images.inline(),
                 detail,
                 tui,
                 refresh,
@@ -960,6 +997,160 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_flag_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn plan_image_extension_is_validated_during_cli_parsing() {
+        let error = match Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--image",
+            "review.jpg",
+            "directory-that-must-not-be-read",
+        ]) {
+            Ok(_) => panic!("unsupported image extension must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("plan image path must end in .svg or .png: review.jpg")
+        );
+    }
+
+    #[test]
+    fn plan_image_before_project_path_parses() {
+        let cli = Cli::try_parse_from(["carina", "plan", "--image", "review.PNG", "infra/foo"])
+            .expect("plan --image <file> <dir> should parse");
+
+        match cli.command {
+            Commands::Plan { path, image, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(image.unwrap().path(), Path::new("review.PNG"));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_image_theme_values_parse() {
+        for (value, expected) in [
+            ("light", ImageTheme::Light),
+            ("dark", ImageTheme::Dark),
+            ("auto", ImageTheme::Auto),
+        ] {
+            let cli = Cli::try_parse_from(["carina", "plan", "--image-theme", value])
+                .expect("supported image theme should parse");
+
+            match cli.command {
+                Commands::Plan { image_theme, .. } => {
+                    assert_eq!(image_theme, Some(expected), "value: {value}");
+                }
+                _ => panic!("expected plan command"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_image_theme_is_unset_when_omitted() {
+        let cli = Cli::try_parse_from(["carina", "plan"]).unwrap();
+
+        match cli.command {
+            Commands::Plan { image_theme, .. } => assert_eq!(image_theme, None),
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_image_theme_rejects_unknown_value() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-theme", "sepia"]) {
+            Ok(_) => panic!("unsupported image theme must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let message = error.to_string();
+        for value in ["light", "dark", "auto"] {
+            assert!(message.contains(value), "{message}");
+        }
+    }
+
+    #[test]
+    fn plan_png_rejects_explicit_auto_theme_during_cli_resolution() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--image",
+            "review.png",
+            "--image-theme",
+            "auto",
+            "directory-that-must-not-be-read",
+        ])
+        .unwrap();
+
+        let Commands::Plan {
+            image,
+            image_inline,
+            image_theme,
+            ..
+        } = cli.command
+        else {
+            panic!("expected plan command");
+        };
+        let error =
+            resolve_plan_image_options(image.as_ref(), image_inline, image_theme, |_| None, false)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            carina_cli::plan_image::PlanImageError::PngAutoTheme
+        ));
+    }
+
+    #[test]
+    fn plan_image_inline_can_be_combined_with_image() {
+        let cli =
+            Cli::try_parse_from(["carina", "plan", "--image-inline", "--image", "review.png"])
+                .expect("--image-inline and --image should be composable");
+
+        match cli.command {
+            Commands::Plan {
+                image_inline,
+                image,
+                ..
+            } => {
+                assert!(image_inline);
+                assert_eq!(image.unwrap().path(), Path::new("review.png"));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_image_inline_conflicts_with_json() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-inline", "--json"]) {
+            Ok(_) => panic!("inline terminal output must not corrupt JSON stdout"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--image-inline"), "{message}");
+        assert!(message.contains("--json"), "{message}");
+    }
+
+    #[test]
+    fn plan_image_inline_conflicts_with_tui() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-inline", "--tui"]) {
+            Ok(_) => panic!("the TUI must retain exclusive ownership of the terminal"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--image-inline"), "{message}");
+        assert!(message.contains("--tui"), "{message}");
     }
 
     #[test]

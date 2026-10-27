@@ -100,6 +100,15 @@ carina plan --detailed-exitcode
 # Exit 0 = no changes, Exit 2 = changes present
 ```
 
+### Render the plan as an image for review
+
+```bash
+carina plan --image plan.png   # or plan.svg
+carina plan --image-inline     # show the graph in Kitty, Ghostty, iTerm2, or WezTerm
+carina plan --image-theme dark --image plan.png  # choose light, dark, or auto
+# Dependency graph in apply order, effect-colored cards, blast-radius halos
+```
+
 ### Save and apply a plan
 
 ```bash
