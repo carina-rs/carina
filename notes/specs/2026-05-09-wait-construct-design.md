@@ -262,7 +262,7 @@ Failure semantics: if the wait errors (timeout), the wait binding never gets reg
 - If the target already satisfies `until`, the wait completes in one `read()` (typically sub-second).
 - If the target does not satisfy `until`, the wait either eventually succeeds (within `timeout`) or fails.
 
-Rationale: a wait represents a synchronisation contract, not a managed object. There is no "waited" or "unwaited" state to persist; the source of truth is the current state of the target, which is itself either persisted (for managed resources) or re-read (for data sources).
+Rationale: a wait represents a synchronisation contract, not a managed object. There is no "waited" or "unwaited" state to persist; the source of truth is the current state of its managed-resource target. Data sources are rejected as wait targets (carina#3916).
 
 This avoids:
 
@@ -374,7 +374,7 @@ If the target's read returns `State::not_found` mid-poll (e.g. someone deleted t
 
 ### Wait against a data source
 
-Allowed in principle — the executor calls whichever read API the target uses (`provider.read` for managed resources, `provider.read_data_source` for data sources). No special handling needed beyond looking up the target's binding kind.
+Rejected. Data sources have plan-time read semantics rather than managed-resource polling semantics, so they cannot be wait targets (carina#3916).
 
 ### Wait inside a module
 

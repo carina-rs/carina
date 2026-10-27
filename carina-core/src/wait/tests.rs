@@ -1,31 +1,104 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::resource::{ConcreteValue, ResourceId, Value};
-use crate::schema::SchemaKind;
+use crate::resource::{ConcreteValue, DataSource, ResolvedResource, Resource, Value};
 use crate::wait::predicate::{AttrPath, WaitPredicate};
-use crate::wait::{BindingPattern, find_wait_target_with_schema_kind};
+use crate::wait::{BindingPattern, WaitTargetLookup, resolve_wait_target};
+
+fn managed(identity: &'static str, binding: Option<&'static str>) -> ResolvedResource {
+    let resource = Resource::with_provider("aws", "test.Resource", identity, None);
+    ResolvedResource::new(match binding {
+        Some(binding) => resource.with_binding(binding),
+        None => resource,
+    })
+}
+
+fn data_source(identity: &'static str, binding: Option<&'static str>) -> DataSource {
+    let resource = DataSource::with_provider("aws", "test.Lookup", identity, None);
+    match binding {
+        Some(binding) => resource.with_binding(binding),
+        None => resource,
+    }
+}
 
 #[test]
-fn target_lookup_prefers_bindings_then_falls_back_to_identity() {
-    let identity_match = ResourceId::with_provider_identity("aws", "test.Resource", "target", None);
-    let binding_match =
-        ResourceId::with_provider_identity("aws", "test.Resource", "different", None);
+fn target_lookup_prefers_managed_binding_over_data_source_binding() {
+    let managed = managed("managed", Some("target"));
+    let data_source = data_source("lookup", Some("target"));
 
-    let found = find_wait_target_with_schema_kind(
+    let WaitTargetLookup::Managed(found) = resolve_wait_target(
         "target",
-        [
-            (&identity_match, None, SchemaKind::DataSource),
-            (&binding_match, Some("target"), SchemaKind::Resource),
-        ],
-    );
-    assert_eq!(found, Some((&binding_match, SchemaKind::Resource)));
+        std::slice::from_ref(&managed),
+        std::slice::from_ref(&data_source),
+    ) else {
+        panic!("managed binding must win over a data-source binding");
+    };
+    assert_eq!(found.id(), &managed.resolved_id());
+}
 
-    let found = find_wait_target_with_schema_kind(
+#[test]
+fn target_lookup_finds_data_source_binding() {
+    let data_source = data_source("lookup", Some("target"));
+
+    assert!(matches!(
+        resolve_wait_target("target", &[], std::slice::from_ref(&data_source)),
+        WaitTargetLookup::DataSource
+    ));
+}
+
+#[test]
+fn target_lookup_finds_data_source_identity_without_binding() {
+    let data_source = data_source("target", None);
+
+    assert!(matches!(
+        resolve_wait_target("target", &[], std::slice::from_ref(&data_source)),
+        WaitTargetLookup::DataSource
+    ));
+}
+
+#[test]
+fn target_lookup_prefers_data_source_binding_over_managed_identity() {
+    let managed = managed("target", None);
+    let data_source = data_source("lookup", Some("target"));
+
+    assert!(matches!(
+        resolve_wait_target(
+            "target",
+            std::slice::from_ref(&managed),
+            std::slice::from_ref(&data_source),
+        ),
+        WaitTargetLookup::DataSource
+    ));
+}
+
+#[test]
+fn target_lookup_prefers_managed_identity_over_data_source_identity() {
+    let managed = managed("target", None);
+    let data_source = data_source("target", None);
+
+    let WaitTargetLookup::Managed(found) = resolve_wait_target(
         "target",
-        [(&identity_match, None, SchemaKind::DataSource)],
-    );
-    assert_eq!(found, Some((&identity_match, SchemaKind::DataSource)));
+        std::slice::from_ref(&managed),
+        std::slice::from_ref(&data_source),
+    ) else {
+        panic!("managed identity must win over a data-source identity");
+    };
+    assert_eq!(found.id(), &managed.resolved_id());
+}
+
+#[test]
+fn target_lookup_reports_missing_when_no_binding_or_identity_matches() {
+    let managed = managed("managed", Some("managed_binding"));
+    let data_source = data_source("lookup", Some("lookup_binding"));
+
+    assert!(matches!(
+        resolve_wait_target(
+            "target",
+            std::slice::from_ref(&managed),
+            std::slice::from_ref(&data_source),
+        ),
+        WaitTargetLookup::Missing
+    ));
 }
 
 #[test]

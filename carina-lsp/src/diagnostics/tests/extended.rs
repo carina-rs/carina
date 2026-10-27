@@ -8705,6 +8705,41 @@ let waited = wait nonexistent {
 }
 
 #[test]
+fn lsp_rejects_sibling_data_source_wait_target_at_target_anchor() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        fixture.path().join("data.crn"),
+        r#"let lookup = read aws.acm.Certificate {
+    domain_name = "example.com"
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let found = wait lookup {
+    until = lookup.status == "ISSUED"
+}
+"#;
+    let diagnostics = test_engine_with_wait_target().analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message
+                == "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources"
+        })
+        .unwrap_or_else(|| panic!("missing data-source wait diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 0);
+    assert_eq!(diagnostic.range.start.character, 17);
+    assert_eq!(diagnostic.range.end.line, 0);
+    assert_eq!(diagnostic.range.end.character, 23);
+}
+
+#[test]
 fn lsp_flags_wait_unknown_attribute() {
     let engine = test_engine_with_wait_target();
     let src = r#"

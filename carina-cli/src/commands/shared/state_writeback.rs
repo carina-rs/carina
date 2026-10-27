@@ -2216,7 +2216,6 @@ mod apply_state_save_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &plan_input,
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &state.build_directives(),
@@ -5339,7 +5338,6 @@ mod apply_state_save_tests {
                     &SchemaRegistry::new(),
                     &[],
                 ),
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -5478,7 +5476,6 @@ mod apply_state_save_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -5623,7 +5620,6 @@ mod apply_state_save_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -6176,7 +6172,6 @@ mod apply_state_save_tests {
                     &SchemaRegistry::new(),
                     &[],
                 ),
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -6255,7 +6250,6 @@ mod apply_state_save_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
-                &HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),

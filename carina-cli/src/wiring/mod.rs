@@ -3851,7 +3851,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
-        PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
+        PlanPriorStates::new(&plan_input_current, &orphans),
         &directives_map,
         ctx.schemas(),
         &saved_attrs,

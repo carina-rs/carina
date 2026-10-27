@@ -245,7 +245,7 @@ where
                     // uses only the target edge because it visualizes the
                     // structural "wait gates this resource" relationship.
                     let mut deps = HashSet::new();
-                    deps.insert(target_id.identity_str().to_string());
+                    deps.insert(target_id.id().identity_str().to_string());
                     let binding = identity.to_string();
                     binding_to_effect.insert(binding.clone(), idx);
                     effect_bindings.insert(idx, binding.clone());
@@ -991,11 +991,12 @@ mod tests {
         })));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("wait_validation_record_0"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.Record",
-                "validation_records[0]",
-            )),
+            target_id: crate::wait::ManagedWaitTarget::new(
+                &crate::resource::ResolvedResource::new(Resource::new(
+                    "route53.Record",
+                    "validation_records[0]",
+                )),
+            ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ready".into())),

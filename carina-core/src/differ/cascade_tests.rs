@@ -118,11 +118,7 @@ fn plan_for(
         &unresolved,
         &[],
         &crate::provider::ProviderRouter::new(),
-        crate::differ::PlanPriorStates::new(
-            &plan_input_states,
-            &HashMap::new(),
-            &crate::differ::Orphans::new(),
-        ),
+        crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
         &HashMap::new(),
         schemas,
         &empty_lifted_saved_attrs(),

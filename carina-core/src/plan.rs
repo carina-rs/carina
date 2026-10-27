@@ -99,6 +99,10 @@ pub enum PlanErrorKind {
         wait_binding: String,
         target: String,
     },
+    WaitTargetIsDataSource {
+        wait_binding: String,
+        target: String,
+    },
     WaitPredicateInvalid {
         wait_binding: String,
         reason: String,
@@ -223,6 +227,13 @@ impl std::fmt::Display for PlanErrorKind {
             } => write!(
                 f,
                 "wait `{wait_binding}`: target binding `{target}` is not a known resource"
+            ),
+            Self::WaitTargetIsDataSource {
+                wait_binding,
+                target,
+            } => write!(
+                f,
+                "wait `{wait_binding}`: target binding `{target}` is a data source; wait targets must be managed resources"
             ),
             Self::WaitPredicateInvalid {
                 wait_binding,
@@ -1173,17 +1184,16 @@ mod tests {
 
     #[test]
     fn format_effect_brief_renders_wait() {
-        use crate::resource::{ConcreteValue, ResourceId, Value};
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
                 "acm.Certificate",
                 "cert",
-            )),
+            ))),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -1202,7 +1212,7 @@ mod tests {
 
     #[test]
     fn plan_summary_counts_wait() {
-        use crate::resource::{ConcreteValue, ResourceId, Value};
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -1213,11 +1223,10 @@ mod tests {
         ))));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
                 "acm.Certificate",
                 "cert",
-            )),
+            ))),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -1655,6 +1664,14 @@ mod tests {
             }
             .to_string(),
             "wait `cert_issued`: target binding `cert` is not a known resource"
+        );
+        assert_eq!(
+            PlanErrorKind::WaitTargetIsDataSource {
+                wait_binding: "roles_ready".to_string(),
+                target: "roles".to_string(),
+            }
+            .to_string(),
+            "wait `roles_ready`: target binding `roles` is a data source; wait targets must be managed resources"
         );
         assert_eq!(
             PlanErrorKind::WaitPredicateInvalid {

@@ -590,7 +590,6 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
                 ctx.schemas(),
                 &resources_for_plan,
             ),
-            &HashMap::new(),
             &orphans,
         ),
         &HashMap::new(),

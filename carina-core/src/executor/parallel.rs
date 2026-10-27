@@ -676,7 +676,7 @@ pub(super) async fn execute_effects_sequential(
                                     crate::binding_index::BindingValueSource::Local
                                     | crate::binding_index::BindingValueSource::Upstream,
                                 )
-                                | None => target_id.identity_str().to_string(),
+                                | None => target_id.id().identity_str().to_string(),
                             };
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
@@ -1018,6 +1018,12 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn managed_wait_target(id: ResourceId) -> crate::wait::ManagedWaitTarget {
+        crate::wait::ManagedWaitTarget::new(&ResolvedResource::from_id(
+            crate::resource::ResolvedResourceId::new(id),
+        ))
+    }
+
     fn update_effect(binding: &'static str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
         let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
@@ -1225,8 +1231,7 @@ mod tests {
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
+            target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -1328,8 +1333,7 @@ mod tests {
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
+            target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ISSUED".into())),

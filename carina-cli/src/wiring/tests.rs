@@ -348,7 +348,7 @@ fn create_plan(
         &managed,
         data_sources,
         provider,
-        carina_core::differ::PlanPriorStates::new(current_states, &HashMap::new(), orphans),
+        carina_core::differ::PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,
