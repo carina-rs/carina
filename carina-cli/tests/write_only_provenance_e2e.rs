@@ -310,6 +310,7 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
         &fs::read_to_string(&scenario.mock_state).expect("read mock provider state"),
     )
     .expect("parse mock provider state");
+    // This pins Reassert: the mock applies the patch over `from` and omits `password` on read, so plaintext can only arrive through the patch.
     assert_eq!(
         provider["states"]["test.resource.r1"]["password"],
         serde_json::json!("reasserted-secret"),
@@ -331,7 +332,7 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
     assert_eq!(
         row.write_only_attributes(),
         ["password"],
-        "accepted update provenance must keep the reasserted key recorded as sent"
+        "the write-only row must keep password recorded after the update"
     );
 
     let converged = scenario.plan_with_refresh();
