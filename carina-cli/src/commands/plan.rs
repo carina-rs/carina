@@ -32,7 +32,7 @@ use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
-use crate::display::{print_plan, refresh_plan_separator};
+use crate::display::print_plan;
 use crate::error::AppError;
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
@@ -2033,10 +2033,6 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else {
-        // Separate the refresh-progress block (printed above when `refresh`)
-        // from the plan's terminal section so they don't read as a run-on
-        // (#3148).
-        print!("{}", refresh_plan_separator(refresh));
         print_plan(
             &ctx.plan,
             &summary,

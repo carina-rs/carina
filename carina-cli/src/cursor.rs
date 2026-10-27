@@ -83,10 +83,9 @@ fn restore_cursor_once() -> bool {
 /// covered by explicit `restore_cursor()` calls and
 /// [`install_panic_restore_hook`] reading the same flag.
 ///
-/// Hiding is gated on `stdout().is_terminal()`, matching
-/// [`crate::wiring::finish_refresh_bar_region`]'s gate: when stdout is not a
-/// TTY (CI capture, redirection to a file) nothing is emitted, so captured
-/// logs stay clean. With `should_hide` false the guard is fully inert.
+/// Hiding is gated on `stdout().is_terminal()`: when stdout is not a TTY (CI
+/// capture, redirection to a file) nothing is emitted, so captured logs stay
+/// clean. With `should_hide` false the guard is fully inert.
 pub struct CursorGuard<W: std::io::Write> {
     writer: W,
     should_hide: bool,

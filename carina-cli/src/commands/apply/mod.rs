@@ -63,7 +63,7 @@ use crate::commands::shared::lock_heartbeat::{
 use crate::commands::shared::observer::{CliObserver, partial_read_detail_lines};
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
-    RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
+    ProgressBackend, RefreshProgress, emit_newline_on_interrupt, format_duration,
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
@@ -1834,7 +1834,7 @@ async fn run_apply_locked_owned(
             // an identifier stays present and invalid until planning reports it.
             // Skip composition resources (module attribute containers) — they have no infrastructure.
             RefreshProgress::start_header();
-            let multi = refresh_multi_progress();
+            let progress_backend = ProgressBackend::new();
             let provider_ref = &provider;
             let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
             let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
@@ -1867,7 +1867,7 @@ async fn run_apply_locked_owned(
             let phase1_results: Vec<Result<(ResourceId, Current), AppError>> =
                 stream::iter(sorted_resources.iter())
                     .map(|resource| {
-                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let progress = RefreshProgress::begin(&progress_backend, &resource.id);
                         let loaded = persisted_state
                             .map(|sf| sf.build_state_for_resource(&resource.id))
                             .unwrap_or_else(|| Current::absent(resource.id.clone()));
@@ -2031,7 +2031,7 @@ async fn run_apply_locked_owned(
             let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
                 stream::iter(resolved_data_sources.iter())
                     .map(|resource| {
-                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let progress = RefreshProgress::begin(&progress_backend, &resource.id);
                         let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                         let data_source_bindings = &data_source_bindings;
                         let module_gate = &module_gate;
@@ -2085,9 +2085,6 @@ async fn run_apply_locked_owned(
                 deferred_create_targets,
                 new_child_ids: _,
                 refreshable_child_ids: _,
-                // `printed_warnings` drives the plan path's spinner-bar-region
-                // close (#3150); the apply path's post-refresh bar handling is
-                // tracked separately in #3151 and does not consume it here.
                 printed_warnings: _,
             } = crate::wiring::expand_refresh_and_lift_states(
                 crate::wiring::ExpandRefreshAndLiftInputs {
@@ -2105,13 +2102,14 @@ async fn run_apply_locked_owned(
                     saved_dep_bindings: &HashMap::new(),
                     saved_attrs: &saved_attrs,
                     prev_explicit: &prev_explicit,
-                    multi: &multi,
+                    progress: &progress_backend,
                     schemas: ctx.schemas(),
                 },
             )
             .await?;
             sorted_resources = resorted;
             let parsed = canonical_resources.parsed();
+            progress_backend.finish_refresh_phase();
             // Expansion mutates the canonical file in place. Keep passing the
             // explicit residual list to `print_plan`, matching the plan path's
             // `ctx.residual_deferred_for` (`commands/plan.rs`).
