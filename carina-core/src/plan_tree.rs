@@ -991,6 +991,7 @@ mod tests {
         })));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("wait_validation_record_0"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "route53.Record",
                 "validation_records[0]",

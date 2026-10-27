@@ -2101,6 +2101,9 @@ pub async fn create_providers_from_configs_with_ctx(
             .await?;
     }
 
+    if ctx.uses_builtin_mock() {
+        router.add_normalizer(BUILTIN_PROVIDER_NAME, Box::new(MockProvider::new()));
+    }
     if router.is_empty() && ctx.uses_builtin_mock() {
         println!("{}", "Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
@@ -2130,6 +2133,10 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
                     .map_err(|error| AppError::Provider(error.for_provider(config.name())))?,
             );
         }
+    }
+
+    if ctx.uses_builtin_mock() {
+        router.add_normalizer(BUILTIN_PROVIDER_NAME, Box::new(MockProvider::new()));
     }
 
     Ok(router)

@@ -1,5 +1,6 @@
 //! Typed application error for carina-cli
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
@@ -77,6 +78,31 @@ impl std::fmt::Display for ProjectBackendError {
 // legacy-state recovery message embeds a project-specific `carina plan`
 // command, so exposing the backend error again would repeat the diagnostic.
 impl std::error::Error for ProjectBackendError {}
+
+/// All provider-schema differences that invalidate one saved plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanSchemaMismatchError {
+    pub providers: BTreeMap<String, Vec<String>>,
+    pub replan_command: String,
+}
+
+impl std::fmt::Display for SavedPlanSchemaMismatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Provider schema mismatch; changed or missing types:")?;
+        for (provider, changed_types) in &self.providers {
+            for changed_type in changed_types {
+                write!(formatter, "\n  - provider `{provider}`: {changed_type}")?;
+            }
+        }
+        write!(
+            formatter,
+            "\nRe-run `{}` to produce a new saved plan before applying.",
+            self.replan_command
+        )
+    }
+}
+
+impl std::error::Error for SavedPlanSchemaMismatchError {}
 
 /// A backend-selection failure annotated with the upstream project whose
 /// state was being resolved.
@@ -682,6 +708,10 @@ pub enum AppError {
         error: serde_json::Error,
     },
 
+    /// A saved plan was computed against different provider schemas.
+    #[error("{0}")]
+    SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError),
+
     /// Apply completed with one or more partial create results.
     #[error("{0}")]
     PartialSuccess(String),
@@ -810,6 +840,31 @@ mod tests {
             AppError::Backend(BackendError::Configuration(_))
         ));
         assert!(app_err.to_string().contains("missing bucket"));
+    }
+
+    #[test]
+    fn saved_plan_schema_mismatch_renders_types_as_readable_lines() {
+        let error = AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
+            providers: BTreeMap::from([(
+                "mock".to_string(),
+                vec![
+                    "managed `test.resource` (changed)".to_string(),
+                    "data source `iam.Roles` (missing)".to_string(),
+                ],
+            )]),
+            replan_command: "carina plan --out plan.json".to_string(),
+        });
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("\n  - provider `mock`: managed `test.resource` (changed)")
+                && rendered.contains("\n  - provider `mock`: data source `iam.Roles` (missing)"),
+            "schema changes must render one per line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("[\"") && !rendered.contains("\\\""),
+            "schema changes must not use Debug list formatting: {rendered}"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::resource::{
     DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State,
 };
+use crate::schema::SchemaKind;
 use crate::wait::predicate::WaitPredicate;
 
 #[cfg(test)]
@@ -581,6 +582,8 @@ pub enum Effect {
         /// Resolved id of the target resource (`wait cert { ... }` →
         /// `cert`'s `ResourceId`).
         target_id: ResolvedResourceId,
+        /// Schema namespace resolved for the target by the differ.
+        target_schema_kind: SchemaKind,
         /// Typed predicate evaluated against each `read()` snapshot.
         until: WaitPredicate,
         /// Surface form of the `until` expression as the user wrote it
@@ -812,6 +815,7 @@ impl Effect {
             (
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
+                    target_schema_kind: SchemaKind::Resource,
                     target_id: crate::resource::ResolvedResourceId::new(id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
@@ -1636,6 +1640,7 @@ mod tests {
                 "Wait",
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
+                    target_schema_kind: SchemaKind::Resource,
                     target_id: crate::resource::ResolvedResourceId::new(rid),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
@@ -2192,6 +2197,7 @@ mod tests {
 
         let _ = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -2216,6 +2222,7 @@ mod tests {
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -2241,6 +2248,7 @@ mod tests {
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -2267,6 +2275,7 @@ mod tests {
 
         let original = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: SchemaKind::DataSource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -2290,6 +2299,10 @@ mod tests {
             json
         );
         assert!(json.contains("\"identity\":\"cert_issued\""), "got: {json}");
+        assert!(
+            json.contains("\"target_schema_kind\":\"data_source\""),
+            "got: {json}"
+        );
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, original);
     }
@@ -2362,6 +2375,7 @@ mod tests {
         };
         let wait = Effect::Wait {
             identity: ResourceIdentity::new("w"),
+            target_schema_kind: SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(rid.clone()),
             until: WaitPredicate::equals(
                 crate::wait::predicate::AttrPath::single("status"),

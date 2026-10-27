@@ -21,7 +21,8 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
-    StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
+    ResourceValidation as CoreResourceValidation, StructField as CoreStructField,
+    UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -1939,7 +1940,7 @@ fn proto_schema_to_core(
             })
             .collect::<Result<_, _>>()?,
         description: description.clone(),
-        validator: build_validator_from_types(validators),
+        validation: CoreResourceValidation::Declared(validators.clone()),
         kind: match kind {
             proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
@@ -1976,44 +1977,6 @@ fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec
         proto::UniqueNameSpec::Coexisting => CoreUniqueNameSpec::Coexisting,
         proto::UniqueNameSpec::Conflicting => CoreUniqueNameSpec::Conflicting,
     }
-}
-
-/// Reconstruct a validator function from serializable `ValidatorType` declarations.
-fn build_validator_from_types(
-    types: &[proto::ValidatorType],
-) -> Option<carina_core::schema::ResourceValidator> {
-    if types.is_empty() {
-        return None;
-    }
-    // Currently only TagsKeyValueCheck exists. When more variants are added,
-    // compose validators by collecting checks and running all of them.
-    if types.contains(&proto::ValidatorType::TagsKeyValueCheck) {
-        Some(validate_tags_key_value)
-    } else {
-        None
-    }
-}
-
-fn validate_tags_key_value(
-    attrs: &HashMap<String, CoreValue>,
-) -> Result<(), Vec<carina_core::schema::TypeError>> {
-    if let Some(CoreValue::Concrete(ConcreteValue::Map(map))) = attrs.get("tags") {
-        let (mut has_key, mut has_value) = (false, false);
-        for k in map.keys() {
-            if k.eq_ignore_ascii_case("key") {
-                has_key = true;
-            } else if k.eq_ignore_ascii_case("value") {
-                has_value = true;
-            }
-            if has_key && has_value {
-                return Err(vec![carina_core::schema::TypeError::ResourceValidationFailed {
-                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
-                    attribute: Some("tags".to_string()),
-                }]);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn proto_attr_schema_to_core(
@@ -4588,7 +4551,12 @@ mod tests {
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
-        assert!(core_schema.validator.is_some());
+        assert!(matches!(
+            &core_schema.validation,
+            carina_core::schema::ResourceValidation::Declared(validators)
+                if validators == &[proto::ValidatorType::TagsKeyValueCheck]
+        ));
+        assert!(core_schema.validator().is_some());
     }
 
     #[test]
@@ -4605,7 +4573,12 @@ mod tests {
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
-        assert!(core_schema.validator.is_none());
+        assert!(matches!(
+            &core_schema.validation,
+            carina_core::schema::ResourceValidation::Declared(validators)
+                if validators.is_empty()
+        ));
+        assert!(core_schema.validator().is_none());
     }
 
     #[test]
@@ -5317,7 +5290,12 @@ mod tests {
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
-        let validator = core_schema.validator.unwrap();
+        assert!(matches!(
+            &core_schema.validation,
+            carina_core::schema::ResourceValidation::Declared(validators)
+                if validators == &[proto::ValidatorType::TagsKeyValueCheck]
+        ));
+        let validator = core_schema.validator().unwrap();
 
         // key/value pattern should fail
         let mut attrs = HashMap::new();

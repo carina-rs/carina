@@ -986,9 +986,9 @@ pub struct ProviderError {
 
 /// Serializable validator types that can cross the WASM boundary.
 ///
-/// Function-pointer validators (`ResourceSchema.validator`) are lost during
-/// WASM serialization. This enum allows providers to declare validators as
-/// data, which the host reconstructs into actual validator functions.
+/// Function-pointer validators cannot cross WASM serialization. This enum
+/// allows providers to declare validators as data, which the host reconstructs
+/// into actual validator functions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorType {
