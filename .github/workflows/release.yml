@@ -68,8 +68,8 @@ jobs:
 
       - name: Verify x86-64 baseline compatibility and version stamp
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
         run: |
-          set -o pipefail
           apt-get update
           apt-get install -y qemu-user
           qemu-x86_64 -cpu qemu64 target/x86_64-unknown-linux-gnu/release/carina --version | grep -E '\([0-9a-f]{7,} '
