@@ -1,11 +1,14 @@
 use std::fmt::Write as _;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
-use super::PlanImageError;
+use super::{PlanImageError, Theme};
 
 const KITTY_CHUNK_SIZE: usize = 4096;
+const TERMINAL_BACKGROUND_TIMEOUT: Duration = Duration::from_millis(200);
+const OSC_11_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
 /// Terminal graphics protocol used for an inline plan image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,11 +24,13 @@ pub struct TerminalSize {
     pub pixel_width: Option<u32>,
 }
 
-/// A validated inline-image request and its optional terminal dimensions.
+/// A validated inline-image request with a concrete palette and optional
+/// terminal dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineImageRequest {
     pub protocol: InlineImageProtocol,
     pub terminal: Option<TerminalSize>,
+    pub theme: Theme,
 }
 
 /// A rendered PNG already wrapped in the selected terminal protocol.
@@ -85,6 +90,115 @@ pub fn terminal_size() -> Option<TerminalSize> {
         columns: size.columns,
         pixel_width: (size.width > 0).then_some(u32::from(size.width)),
     })
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Query the terminal background through OSC 11, falling back to light for
+/// absent terminals, timeouts, malformed replies, and unsupported platforms.
+pub(crate) fn query_terminal_theme() -> Theme {
+    query_terminal_theme_inner().unwrap_or(Theme::Light)
+}
+
+#[cfg(unix)]
+fn query_terminal_theme_inner() -> Option<Theme> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/tty")
+        .ok()?;
+    crossterm::terminal::enable_raw_mode().ok()?;
+    let _raw_mode = RawModeGuard;
+
+    tty.write_all(OSC_11_QUERY).ok()?;
+    tty.flush().ok()?;
+
+    let deadline = Instant::now() + TERMINAL_BACKGROUND_TIMEOUT;
+    let mut response = Vec::with_capacity(64);
+    let mut buffer = [0_u8; 64];
+    loop {
+        match tty.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.ends_with(b"\x07") || response.ends_with(b"\x1b\\") {
+                    return parse_terminal_background_theme(&response);
+                }
+                if response.len() > 256 {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+    }
+}
+
+#[cfg(not(unix))]
+fn query_terminal_theme_inner() -> Option<Theme> {
+    None
+}
+
+fn parse_terminal_background_theme(response: &[u8]) -> Option<Theme> {
+    let body = response.strip_prefix(b"\x1b]11;rgb:")?;
+    let body = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+    let body = std::str::from_utf8(body).ok()?;
+    let mut channels = body.split('/');
+    let red = parse_osc_channel(channels.next()?)?;
+    let green = parse_osc_channel(channels.next()?)?;
+    let blue = parse_osc_channel(channels.next()?)?;
+    if channels.next().is_some() {
+        return None;
+    }
+    Some(theme_from_rgb(red, green, blue))
+}
+
+fn parse_osc_channel(channel: &str) -> Option<f64> {
+    if channel.is_empty()
+        || channel.len() > 4
+        || !channel.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let value = u16::from_str_radix(channel, 16).ok()?;
+    let maximum = (1_u32 << (channel.len() * 4)) - 1;
+    Some(f64::from(value) / f64::from(maximum))
+}
+
+fn theme_from_rgb(red: f64, green: f64, blue: f64) -> Theme {
+    fn linearize(channel: f64) -> f64 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    let luminance = 0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue);
+    if luminance < 0.5 {
+        Theme::Dark
+    } else {
+        Theme::Light
+    }
 }
 
 pub(crate) fn encode_inline_image(
@@ -243,6 +357,49 @@ mod tests {
         assert!(message.contains("--image <FILE>"), "{message}");
     }
 
+    #[test]
+    fn parses_osc_11_bel_and_st_terminators() {
+        assert_eq!(
+            parse_terminal_background_theme(b"\x1b]11;rgb:00/00/00\x07"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            parse_terminal_background_theme(b"\x1b]11;rgb:ff/ff/ff\x1b\\"),
+            Some(Theme::Light)
+        );
+    }
+
+    #[test]
+    fn parses_two_and_four_digit_osc_11_channels() {
+        assert_eq!(
+            parse_terminal_background_theme(b"\x1b]11;rgb:12/34/56\x07"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            parse_terminal_background_theme(b"\x1b]11;rgb:ffff/ffff/ffff\x07"),
+            Some(Theme::Light)
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_osc_11_responses() {
+        for response in [
+            &b"garbage"[..],
+            &b"\x1b]11;rgb:00/00/00"[..],
+            &b"\x1b]11;rgb:00000/00/00\x07"[..],
+            &b"\x1b]11;rgb:gg/00/00\x07"[..],
+            &b"\x1b]10;rgb:00/00/00\x07"[..],
+        ] {
+            assert_eq!(parse_terminal_background_theme(response), None);
+        }
+    }
+
+    #[test]
+    fn relative_luminance_classifies_black_and_white() {
+        assert_eq!(theme_from_rgb(0.0, 0.0, 0.0), Theme::Dark);
+        assert_eq!(theme_from_rgb(1.0, 1.0, 1.0), Theme::Light);
+    }
+
     fn kitty_commands(bytes: &[u8]) -> Vec<(&str, &str)> {
         let text = std::str::from_utf8(bytes).unwrap();
         assert!(text.ends_with("\n"));
@@ -261,7 +418,11 @@ mod tests {
         protocol: InlineImageProtocol,
         terminal: Option<TerminalSize>,
     ) -> InlineImageRequest {
-        InlineImageRequest { protocol, terminal }
+        InlineImageRequest {
+            protocol,
+            terminal,
+            theme: Theme::Light,
+        }
     }
 
     #[test]

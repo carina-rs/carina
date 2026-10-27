@@ -1,13 +1,14 @@
 PLAN_FIXTURE = cargo run --manifest-path $(CURDIR)/Cargo.toml -p carina-cli --example plan-fixture --quiet --
+PLAN_IMAGE_THEME = $(if $(strip $(THEME)),--image-theme "$(THEME)")
 
 plan-image:
 	$(if $(strip $(FIXTURE)),,$(error FIXTURE is required, for example FIXTURE=mixed_operations))
 	$(if $(strip $(OUT)),,$(error OUT is required, for example OUT=/tmp/plan.png))
-	$(PLAN_FIXTURE) $(FIXTURE) --image "$(OUT)"
+	$(PLAN_FIXTURE) $(FIXTURE) --image "$(OUT)" $(PLAN_IMAGE_THEME)
 
 plan-image-inline:
 	$(if $(strip $(FIXTURE)),,$(error FIXTURE is required, for example FIXTURE=mixed_operations))
-	$(PLAN_FIXTURE) $(FIXTURE) --image-inline
+	$(PLAN_FIXTURE) $(FIXTURE) --image-inline $(PLAN_IMAGE_THEME)
 
 plan-all-create:
 	$(PLAN_FIXTURE) all_create

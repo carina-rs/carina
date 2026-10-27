@@ -5,7 +5,7 @@
 //! the `make plan-*` targets for visual confirmation of plan display.
 //!
 //! Usage:
-//!   cargo run --example plan-fixture -- <fixture_name> [--detail <level>] [--destroy] [--tui] [--image <path>] [--image-inline]
+//!   cargo run --example plan-fixture -- <fixture_name> [--detail <level>] [--destroy] [--tui] [--image <path>] [--image-inline] [--image-theme <light|dark|auto>]
 //!
 //! Flags:
 //!   --detail <full|explicit|none>   Detail level (default: full)
@@ -13,6 +13,7 @@
 //!   --tui                           Launch interactive TUI instead of printing
 //!   --image <path>                  Also write the plan graph as SVG or PNG
 //!   --image-inline                  Display the plan graph in the terminal
+//!   --image-theme <light|dark|auto> Select the image palette
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -24,14 +25,13 @@ use carina_cli::fixture_plan::{
     delete_instance_attributes_from_plan,
 };
 use carina_cli::plan_image::{
-    InlineImageRequest, PlanImageInput, PlanImageTarget, StateMetadata,
-    detect_inline_image_protocol, parse_output_target, render_plan_outputs, terminal_size,
-    write_inline_image, write_plan_image,
+    ImageTheme, PlanImageInput, PlanImageTarget, StateMetadata, parse_output_target,
+    render_plan_outputs, resolve_plan_image_options, write_inline_image, write_plan_image,
 };
 
 fn print_usage() {
     eprintln!(
-        "usage: plan-fixture <fixture_name> [--detail <full|explicit|none>] [--destroy] [--tui] [--image <path>] [--image-inline]"
+        "usage: plan-fixture <fixture_name> [--detail <full|explicit|none>] [--destroy] [--tui] [--image <path>] [--image-inline] [--image-theme <light|dark|auto>]"
     );
 }
 
@@ -57,6 +57,7 @@ fn main() -> ExitCode {
     let mut tui = false;
     let mut image: Option<PlanImageTarget> = None;
     let mut image_inline = false;
+    let mut image_theme = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -76,6 +77,22 @@ fn main() -> ExitCode {
             "--destroy" => destroy = true,
             "--tui" => tui = true,
             "--image-inline" => image_inline = true,
+            "--image-theme" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("error: --image-theme requires a value");
+                    return ExitCode::from(2);
+                };
+                image_theme = match value.as_str() {
+                    "light" => Some(ImageTheme::Light),
+                    "dark" => Some(ImageTheme::Dark),
+                    "auto" => Some(ImageTheme::Auto),
+                    _ => {
+                        eprintln!("error: unknown --image-theme value: {value}");
+                        return ExitCode::from(2);
+                    }
+                };
+            }
             "--image" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -116,19 +133,18 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let inline_protocol = if image_inline {
-        match detect_inline_image_protocol(
-            |name| std::env::var(name).ok(),
-            std::io::stdout().is_terminal(),
-        ) {
-            Ok(protocol) => Some(protocol),
-            Err(error) => {
-                eprintln!("error: {error}");
-                return ExitCode::from(1);
-            }
+    let images = match resolve_plan_image_options(
+        image.as_ref(),
+        image_inline,
+        image_theme,
+        |name| std::env::var(name).ok(),
+        std::io::stdout().is_terminal(),
+    ) {
+        Ok(images) => images,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
         }
-    } else {
-        None
     };
 
     let fp = build_plan_from_fixture_name(&fixture);
@@ -136,18 +152,14 @@ fn main() -> ExitCode {
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
 
-    let inline_request = inline_protocol.map(|protocol| InlineImageRequest {
-        protocol,
-        terminal: terminal_size(),
-    });
-    let (rendered_image, rendered_inline_image) = if image.is_some() || inline_request.is_some() {
+    let (rendered_image, rendered_inline_image) = if !images.is_empty() {
         let state = fp.state_file.as_ref().map(|state| StateMetadata {
             lineage: &state.lineage,
             serial: state.serial,
         });
         match render_plan_outputs(
-            image.as_ref(),
-            inline_request,
+            images.file(),
+            images.inline(),
             PlanImageInput {
                 plan: &fp.plan,
                 desired_resources: &fp.desired_resources,
@@ -175,8 +187,8 @@ fn main() -> ExitCode {
         }
         eprintln!(
             "Plan image written to {}",
-            image
-                .as_ref()
+            images
+                .file()
                 .expect("a rendered file image has a target")
                 .path()
                 .display()

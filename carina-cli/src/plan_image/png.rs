@@ -1,12 +1,23 @@
-use super::PlanImageError;
-use super::svg::SvgDocument;
+use super::layout::Layout;
+use super::model::GraphModel;
+use super::svg::{SvgDocument, render_svg};
+use super::{PlanImageError, SvgTheme, Theme};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
 const JETBRAINS_MONO_BOLD: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
 const MAX_PNG_PIXELS: u64 = 64_000_000;
 
-pub(crate) fn render_png(svg: &SvgDocument) -> Result<Vec<u8>, PlanImageError> {
+pub(crate) fn render_png(
+    model: &GraphModel,
+    layout: &Layout,
+    theme: Theme,
+) -> Result<Vec<u8>, PlanImageError> {
+    let svg = render_svg(model, layout, SvgTheme::Fixed(theme));
+    rasterize_svg(&svg)
+}
+
+fn rasterize_svg(svg: &SvgDocument) -> Result<Vec<u8>, PlanImageError> {
     let scaled_width = u64::from(svg.width) * 2;
     let scaled_height = u64::from(svg.height) * 2;
     let pixels = scaled_width.saturating_mul(scaled_height);
@@ -48,9 +59,9 @@ pub(crate) fn render_png(svg: &SvgDocument) -> Result<Vec<u8>, PlanImageError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::plan_image::Theme;
     use crate::plan_image::layout::layout_graph;
     use crate::plan_image::model::{PlanImageInput, build_model};
-    use crate::plan_image::svg::render_svg;
 
     use super::*;
 
@@ -67,15 +78,15 @@ mod tests {
             state: None,
             summary: &summary,
         });
-        let svg = render_svg(&model, &layout_graph(&model));
+        let layout = layout_graph(&model);
 
-        let png = render_png(&svg).unwrap();
+        let png = render_png(&model, &layout, Theme::Light).unwrap();
 
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
-        assert_eq!(width, svg.width * 2);
-        assert_eq!(height, svg.height * 2);
+        assert_eq!(width, layout.width * 2);
+        assert_eq!(height, layout.height * 2);
     }
 
     #[test]
@@ -86,7 +97,8 @@ mod tests {
             height: 4_000,
         };
 
-        let error = render_png(&svg).expect_err("64Mpx budget must be enforced before allocation");
+        let error =
+            rasterize_svg(&svg).expect_err("64Mpx budget must be enforced before allocation");
 
         assert!(matches!(
             error,

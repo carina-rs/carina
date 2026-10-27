@@ -5,12 +5,161 @@ use super::layout::{
     edge_segment_controls,
 };
 use super::model::{BlastKind, EffectKind, GraphModel, GraphNode, GraphNodeId};
+use super::{SvgTheme, Theme};
 use crate::plan_summary::PlanEffectSummaryKind;
 
 pub(crate) const FONT_FAMILY: &str =
     "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const TITLE: &str = concat!("carina", " plan");
 const LEGEND_EDGE_SAMPLE_WIDTH: f32 = 44.0;
+
+#[derive(Clone, Copy)]
+struct EffectPalette {
+    color: &'static str,
+    tint: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    background: &'static str,
+    surface: &'static str,
+    primary_text: &'static str,
+    body_text: &'static str,
+    muted_text: &'static str,
+    subtle_text: &'static str,
+    edge: &'static str,
+    border: &'static str,
+    divider: &'static str,
+    unchanged_border: &'static str,
+    teal: EffectPalette,
+    create: EffectPalette,
+    update: EffectPalette,
+    replace: EffectPalette,
+    delete: EffectPalette,
+    gray: EffectPalette,
+    unchanged: EffectPalette,
+    halo_opacity: &'static str,
+    unchanged_opacity: &'static str,
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    background: "#ffffff",
+    surface: "#f6f8fa",
+    primary_text: "#1f2328",
+    body_text: "#24292f",
+    muted_text: "#57606a",
+    subtle_text: "#6e7781",
+    edge: "#8c959f",
+    border: "#d0d7de",
+    divider: "#d8dee4",
+    unchanged_border: "#afb8c1",
+    teal: EffectPalette {
+        color: "#1b7c83",
+        tint: "#d8f3f6",
+    },
+    create: EffectPalette {
+        color: "#1a7f37",
+        tint: "#dafbe1",
+    },
+    update: EffectPalette {
+        color: "#0969da",
+        tint: "#ddf4ff",
+    },
+    replace: EffectPalette {
+        color: "#8250df",
+        tint: "#fbefff",
+    },
+    delete: EffectPalette {
+        color: "#cf222e",
+        tint: "#ffebe9",
+    },
+    gray: EffectPalette {
+        color: "#57606a",
+        tint: "#f6f8fa",
+    },
+    unchanged: EffectPalette {
+        color: "#6e7781",
+        tint: "#f6f8fa",
+    },
+    halo_opacity: "0.24",
+    unchanged_opacity: "0.72",
+};
+
+const DARK_PALETTE: Palette = Palette {
+    background: "#0d1117",
+    surface: "#161b22",
+    primary_text: "#e6edf3",
+    body_text: "#e6edf3",
+    muted_text: "#8b949e",
+    subtle_text: "#8b949e",
+    edge: "#6e7681",
+    border: "#30363d",
+    divider: "#30363d",
+    unchanged_border: "#30363d",
+    teal: EffectPalette {
+        color: "#39c5cf",
+        tint: "#0f2629",
+    },
+    create: EffectPalette {
+        color: "#3fb950",
+        tint: "#12261e",
+    },
+    update: EffectPalette {
+        color: "#4493f8",
+        tint: "#121d2f",
+    },
+    replace: EffectPalette {
+        color: "#ab7df8",
+        tint: "#1f1530",
+    },
+    delete: EffectPalette {
+        color: "#f85149",
+        tint: "#2d1517",
+    },
+    gray: EffectPalette {
+        color: "#8b949e",
+        tint: "#161b22",
+    },
+    unchanged: EffectPalette {
+        color: "#8b949e",
+        tint: "#161b22",
+    },
+    halo_opacity: "0.38",
+    unchanged_opacity: "1",
+};
+
+#[derive(Clone, Copy)]
+struct RenderStyle {
+    palette: &'static Palette,
+    auto: bool,
+}
+
+impl RenderStyle {
+    fn new(theme: SvgTheme) -> Self {
+        match theme {
+            SvgTheme::Fixed(Theme::Light) => Self {
+                palette: &LIGHT_PALETTE,
+                auto: false,
+            },
+            SvgTheme::Fixed(Theme::Dark) => Self {
+                palette: &DARK_PALETTE,
+                auto: false,
+            },
+            SvgTheme::Auto => Self {
+                palette: &LIGHT_PALETTE,
+                auto: true,
+            },
+        }
+    }
+
+    fn class(self, names: &str) -> String {
+        if self.auto {
+            format!(" class=\"{names}\"")
+        } else {
+            String::new()
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SvgDocument {
@@ -19,7 +168,8 @@ pub(crate) struct SvgDocument {
     pub height: u32,
 }
 
-pub(crate) fn render_svg(model: &GraphModel, layout: &Layout) -> SvgDocument {
+pub(crate) fn render_svg(model: &GraphModel, layout: &Layout, theme: SvgTheme) -> SvgDocument {
+    let style = RenderStyle::new(theme);
     let mut out = String::new();
     writeln!(
         out,
@@ -29,8 +179,11 @@ pub(crate) fn render_svg(model: &GraphModel, layout: &Layout) -> SvgDocument {
     .unwrap();
     writeln!(
         out,
-        r##"  <rect id="background" fill="#ffffff" x="0" y="0" width="{}" height="{}"/>"##,
-        layout.width, layout.height
+        r#"  <rect id="background"{} fill="{}" x="0" y="0" width="{}" height="{}"/>"#,
+        style.class("fill-background"),
+        style.palette.background,
+        layout.width,
+        layout.height
     )
     .unwrap();
     writeln!(out, "  <title id=\"title\">{TITLE}</title>").unwrap();
@@ -39,7 +192,10 @@ pub(crate) fn render_svg(model: &GraphModel, layout: &Layout) -> SvgDocument {
         "  <desc id=\"desc\">Apply-order dependency graph with destructive-change blast radii.</desc>"
     )
     .unwrap();
-    write_markers(&mut out);
+    if style.auto {
+        write_auto_palette_css(&mut out);
+    }
+    write_markers(&mut out, style);
     writeln!(
         out,
         "  <g font-family=\"{}\" text-rendering=\"geometricPrecision\">",
@@ -47,11 +203,11 @@ pub(crate) fn render_svg(model: &GraphModel, layout: &Layout) -> SvgDocument {
     )
     .unwrap();
 
-    render_header(&mut out, model);
-    render_module_bands(&mut out, model, layout);
-    render_edges(&mut out, model, layout);
-    render_nodes(&mut out, model, layout);
-    render_legend(&mut out, model, layout);
+    render_header(&mut out, model, style);
+    render_module_bands(&mut out, model, layout, style);
+    render_edges(&mut out, model, layout, style);
+    render_nodes(&mut out, model, layout, style);
+    render_legend(&mut out, model, layout, style);
 
     writeln!(out, "  </g>").unwrap();
     writeln!(out, "</svg>").unwrap();
@@ -68,87 +224,129 @@ struct KindStyle {
     label: &'static str,
     color: &'static str,
     tint: &'static str,
+    fill_class: &'static str,
+    stroke_class: &'static str,
+    tint_class: &'static str,
 }
 
-fn kind_style(kind: EffectKind) -> KindStyle {
+fn kind_style(kind: EffectKind, palette: &Palette) -> KindStyle {
     match kind {
         EffectKind::Read => KindStyle {
             symbol: "r",
             label: "read",
-            color: "#1b7c83",
-            tint: "#d8f3f6",
+            color: palette.teal.color,
+            tint: palette.teal.tint,
+            fill_class: "fill-teal",
+            stroke_class: "stroke-teal",
+            tint_class: "fill-teal-tint",
         },
         EffectKind::Create => KindStyle {
             symbol: "+",
             label: "create",
-            color: "#1a7f37",
-            tint: "#dafbe1",
+            color: palette.create.color,
+            tint: palette.create.tint,
+            fill_class: "fill-create",
+            stroke_class: "stroke-create",
+            tint_class: "fill-create-tint",
         },
         EffectKind::ResumeCreate => KindStyle {
             symbol: "↻",
             label: "resume",
-            color: "#1a7f37",
-            tint: "#dafbe1",
+            color: palette.create.color,
+            tint: palette.create.tint,
+            fill_class: "fill-create",
+            stroke_class: "stroke-create",
+            tint_class: "fill-create-tint",
         },
         EffectKind::Update => KindStyle {
             symbol: "~",
             label: "update",
-            color: "#0969da",
-            tint: "#ddf4ff",
+            color: palette.update.color,
+            tint: palette.update.tint,
+            fill_class: "fill-update",
+            stroke_class: "stroke-update",
+            tint_class: "fill-update-tint",
         },
         EffectKind::Replace => KindStyle {
             symbol: "±",
             label: "replace",
-            color: "#8250df",
-            tint: "#fbefff",
+            color: palette.replace.color,
+            tint: palette.replace.tint,
+            fill_class: "fill-replace",
+            stroke_class: "stroke-replace",
+            tint_class: "fill-replace-tint",
         },
         EffectKind::Delete => KindStyle {
             symbol: "-",
             label: "delete",
-            color: "#cf222e",
-            tint: "#ffebe9",
+            color: palette.delete.color,
+            tint: palette.delete.tint,
+            fill_class: "fill-delete",
+            stroke_class: "stroke-delete",
+            tint_class: "fill-delete-tint",
         },
         EffectKind::Import => KindStyle {
             symbol: "i",
             label: "import",
-            color: "#1b7c83",
-            tint: "#d8f3f6",
+            color: palette.teal.color,
+            tint: palette.teal.tint,
+            fill_class: "fill-teal",
+            stroke_class: "stroke-teal",
+            tint_class: "fill-teal-tint",
         },
         EffectKind::Remove => KindStyle {
             symbol: "x",
             label: "remove",
-            color: "#57606a",
-            tint: "#f6f8fa",
+            color: palette.gray.color,
+            tint: palette.gray.tint,
+            fill_class: "fill-gray",
+            stroke_class: "stroke-gray",
+            tint_class: "fill-gray-tint",
         },
         EffectKind::Move => KindStyle {
             symbol: "→",
             label: "move",
-            color: "#1b7c83",
-            tint: "#d8f3f6",
+            color: palette.teal.color,
+            tint: palette.teal.tint,
+            fill_class: "fill-teal",
+            stroke_class: "stroke-teal",
+            tint_class: "fill-teal-tint",
         },
         EffectKind::Wait => KindStyle {
             symbol: "w",
             label: "wait",
-            color: "#57606a",
-            tint: "#f6f8fa",
+            color: palette.gray.color,
+            tint: palette.gray.tint,
+            fill_class: "fill-gray",
+            stroke_class: "stroke-gray",
+            tint_class: "fill-gray-tint",
         },
         EffectKind::DeferredCreate => KindStyle {
             symbol: "d+",
             label: "deferred create",
-            color: "#57606a",
-            tint: "#f6f8fa",
+            color: palette.gray.color,
+            tint: palette.gray.tint,
+            fill_class: "fill-gray",
+            stroke_class: "stroke-gray",
+            tint_class: "fill-gray-tint",
         },
         EffectKind::DeferredReplace => KindStyle {
             symbol: "d±",
             label: "deferred replace",
-            color: "#57606a",
-            tint: "#f6f8fa",
+            color: palette.gray.color,
+            tint: palette.gray.tint,
+            fill_class: "fill-gray",
+            stroke_class: "stroke-gray",
+            tint_class: "fill-gray-tint",
         },
         EffectKind::Unchanged => KindStyle {
             symbol: "=",
             label: "unchanged",
-            color: "#6e7781",
-            tint: "#f6f8fa",
+            color: palette.unchanged.color,
+            tint: palette.unchanged.tint,
+            fill_class: "fill-unchanged",
+            stroke_class: "stroke-unchanged-kind",
+            tint_class: "fill-unchanged-tint",
         },
     }
 }
@@ -161,8 +359,16 @@ impl BlastKind {
         }
     }
 
-    fn color(self) -> &'static str {
-        kind_style(self.effect_kind()).color
+    fn color(self, palette: &Palette) -> &'static str {
+        kind_style(self.effect_kind(), palette).color
+    }
+
+    fn fill_class(self, palette: &Palette) -> &'static str {
+        kind_style(self.effect_kind(), palette).fill_class
+    }
+
+    fn stroke_class(self, palette: &Palette) -> &'static str {
+        kind_style(self.effect_kind(), palette).stroke_class
     }
 
     fn marker_id(self) -> &'static str {
@@ -191,31 +397,43 @@ fn summary_label(kind: EffectKind) -> &'static str {
     }
 }
 
-fn render_header(out: &mut String, model: &GraphModel) {
+fn render_header(out: &mut String, model: &GraphModel, render_style: RenderStyle) {
+    let palette = render_style.palette;
     writeln!(
         out,
-        r##"    <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">{TITLE}</text>"##
+        r#"    <text{} x="28" y="36" font-size="22" font-weight="700" fill="{}">{TITLE}</text>"#,
+        render_style.class("fill-primary"),
+        palette.primary_text,
     )
     .unwrap();
 
     write!(
         out,
-        r##"    <text x="28" y="65" font-size="12.5" fill="#57606a">"##
+        r#"    <text{} x="28" y="65" font-size="12.5" fill="{}">"#,
+        render_style.class("fill-muted"),
+        palette.muted_text,
     )
     .unwrap();
     if !model.summary.has_changes() {
-        write!(out, r##"<tspan fill="#57606a">No changes</tspan>"##).unwrap();
+        write!(
+            out,
+            r#"<tspan{} fill="{}">No changes</tspan>"#,
+            render_style.class("fill-muted"),
+            palette.muted_text,
+        )
+        .unwrap();
     } else {
         let mut has_part = false;
         for part in model.summary.effect_parts() {
-            write_summary_separator(out, &mut has_part);
+            write_summary_separator(out, &mut has_part, render_style);
             let kind = effect_kind_for_summary(part.kind);
-            let style = kind_style(kind);
+            let style = kind_style(kind, palette);
             let destructive = matches!(kind, EffectKind::Replace | EffectKind::Delete);
             let weight = if destructive { "700" } else { "600" };
             write!(
                 out,
-                "<tspan fill=\"{}\" font-weight=\"{weight}\">{} {}</tspan>",
+                "<tspan{} fill=\"{}\" font-weight=\"{weight}\">{} {}</tspan>",
+                render_style.class(style.fill_class),
                 style.color,
                 part.count,
                 summary_label(kind)
@@ -224,7 +442,7 @@ fn render_header(out: &mut String, model: &GraphModel) {
         }
         let export_count = model.summary.export_change_count();
         if export_count > 0 {
-            write_summary_separator(out, &mut has_part);
+            write_summary_separator(out, &mut has_part, render_style);
             let label = if export_count == 1 {
                 "export to change"
             } else {
@@ -232,13 +450,15 @@ fn render_header(out: &mut String, model: &GraphModel) {
             };
             write!(
                 out,
-                r##"<tspan fill="#57606a" font-weight="600">{export_count} {label}</tspan>"##
+                r#"<tspan{} fill="{}" font-weight="600">{export_count} {label}</tspan>"#,
+                render_style.class("fill-muted"),
+                palette.muted_text,
             )
             .unwrap();
         }
         let deferred_count = model.summary.residual_deferred_for_count();
         if deferred_count > 0 {
-            write_summary_separator(out, &mut has_part);
+            write_summary_separator(out, &mut has_part, render_style);
             let label = if deferred_count == 1 {
                 "deferred loop pending"
             } else {
@@ -246,7 +466,9 @@ fn render_header(out: &mut String, model: &GraphModel) {
             };
             write!(
                 out,
-                r##"<tspan fill="#57606a" font-weight="600">{deferred_count} {label}</tspan>"##
+                r#"<tspan{} fill="{}" font-weight="600">{deferred_count} {label}</tspan>"#,
+                render_style.class("fill-muted"),
+                palette.muted_text,
             )
             .unwrap();
         }
@@ -256,7 +478,9 @@ fn render_header(out: &mut String, model: &GraphModel) {
     if let Some(state) = &model.state {
         writeln!(
             out,
-            r##"    <text x="28" y="90" font-size="10.5" fill="#6e7781">state {} · serial {}</text>"##,
+            r#"    <text{} x="28" y="90" font-size="10.5" fill="{}">state {} · serial {}</text>"#,
+            render_style.class("fill-subtle"),
+            palette.subtle_text,
             escape(&state.lineage),
             state.serial
         )
@@ -264,9 +488,15 @@ fn render_header(out: &mut String, model: &GraphModel) {
     }
 }
 
-fn write_summary_separator(out: &mut String, has_part: &mut bool) {
+fn write_summary_separator(out: &mut String, has_part: &mut bool, render_style: RenderStyle) {
     if *has_part {
-        write!(out, r##"<tspan fill="#8c959f"> · </tspan>"##).unwrap();
+        write!(
+            out,
+            r#"<tspan{} fill="{}"> · </tspan>"#,
+            render_style.class("fill-edge"),
+            render_style.palette.edge,
+        )
+        .unwrap();
     }
     *has_part = true;
 }
@@ -288,34 +518,101 @@ fn effect_kind_for_summary(kind: PlanEffectSummaryKind) -> EffectKind {
     }
 }
 
-fn write_markers(out: &mut String) {
+fn write_auto_palette_css(out: &mut String) {
+    let palette = &DARK_PALETTE;
+    writeln!(out, "  <style>").unwrap();
+    writeln!(out, "    @media (prefers-color-scheme: dark) {{").unwrap();
+    for (class, property, color) in [
+        ("fill-background", "fill", palette.background),
+        ("fill-surface", "fill", palette.surface),
+        ("fill-primary", "fill", palette.primary_text),
+        ("fill-body", "fill", palette.body_text),
+        ("fill-muted", "fill", palette.muted_text),
+        ("fill-subtle", "fill", palette.subtle_text),
+        ("fill-edge", "fill", palette.edge),
+        ("stroke-edge", "stroke", palette.edge),
+        ("stroke-border", "stroke", palette.border),
+        ("stroke-divider", "stroke", palette.divider),
+        ("stroke-unchanged", "stroke", palette.unchanged_border),
+        ("fill-teal", "fill", palette.teal.color),
+        ("stroke-teal", "stroke", palette.teal.color),
+        ("fill-teal-tint", "fill", palette.teal.tint),
+        ("fill-create", "fill", palette.create.color),
+        ("stroke-create", "stroke", palette.create.color),
+        ("fill-create-tint", "fill", palette.create.tint),
+        ("fill-update", "fill", palette.update.color),
+        ("stroke-update", "stroke", palette.update.color),
+        ("fill-update-tint", "fill", palette.update.tint),
+        ("fill-replace", "fill", palette.replace.color),
+        ("stroke-replace", "stroke", palette.replace.color),
+        ("fill-replace-tint", "fill", palette.replace.tint),
+        ("fill-delete", "fill", palette.delete.color),
+        ("stroke-delete", "stroke", palette.delete.color),
+        ("fill-delete-tint", "fill", palette.delete.tint),
+        ("fill-gray", "fill", palette.gray.color),
+        ("stroke-gray", "stroke", palette.gray.color),
+        ("fill-gray-tint", "fill", palette.gray.tint),
+        ("fill-unchanged", "fill", palette.unchanged.color),
+        ("stroke-unchanged-kind", "stroke", palette.unchanged.color),
+        ("fill-unchanged-tint", "fill", palette.unchanged.tint),
+    ] {
+        writeln!(out, "      .{class} {{ {property}: {color}; }}").unwrap();
+    }
+    writeln!(
+        out,
+        "      .halo {{ stroke-opacity: {}; }}",
+        palette.halo_opacity
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "      .unchanged-card {{ fill-opacity: {}; }}",
+        palette.unchanged_opacity
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "  </style>").unwrap();
+}
+
+fn write_markers(out: &mut String, render_style: RenderStyle) {
     writeln!(out, "  <defs>").unwrap();
     writeln!(
         out,
-        "    <marker id=\"arrow-default\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path d=\"M0,0 L8,4 L0,8 z\" fill=\"#8c959f\"/></marker>"
+        "    <marker id=\"arrow-default\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path{} d=\"M0,0 L8,4 L0,8 z\" fill=\"{}\"/></marker>",
+        render_style.class("fill-edge"),
+        render_style.palette.edge,
     )
     .unwrap();
     for blast in [BlastKind::Replace, BlastKind::Delete] {
         let id = blast.marker_id();
-        let color = blast.color();
+        let color = blast.color(render_style.palette);
         writeln!(
             out,
-            "    <marker id=\"arrow-{id}\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path d=\"M0,0 L8,4 L0,8 z\" fill=\"{color}\"/></marker>"
+            "    <marker id=\"arrow-{id}\" markerWidth=\"8\" markerHeight=\"8\" refX=\"7\" refY=\"4\" orient=\"auto\" markerUnits=\"strokeWidth\"><path{} d=\"M0,0 L8,4 L0,8 z\" fill=\"{color}\"/></marker>",
+            render_style.class(blast.fill_class(render_style.palette)),
         )
         .unwrap();
     }
     writeln!(out, "  </defs>").unwrap();
 }
 
-fn render_module_bands(out: &mut String, model: &GraphModel, layout: &Layout) {
+fn render_module_bands(
+    out: &mut String,
+    model: &GraphModel,
+    layout: &Layout,
+    render_style: RenderStyle,
+) {
+    let palette = render_style.palette;
     for rect in &layout.modules {
         let Some(module) = model.modules.iter().find(|module| module.id == rect.id) else {
             continue;
         };
         writeln!(
             out,
-            r##"    <rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>"##,
+            r#"    <rect{} x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="12" fill="{}" stroke="{}"/>"#,
+            render_style.class("fill-surface stroke-border"),
             rect.x, rect.y, rect.width, rect.height
+            , palette.surface, palette.border
         )
         .unwrap();
         let source = module
@@ -330,9 +627,11 @@ fn render_module_bands(out: &mut String, model: &GraphModel, layout: &Layout) {
         };
         writeln!(
             out,
-            r##"    <text x="{:.1}" y="{:.1}" font-size="11" font-weight="600" fill="#57606a">module &quot;{}&quot;{}{}</text>"##,
+            r#"    <text{} x="{:.1}" y="{:.1}" font-size="11" font-weight="600" fill="{}">module &quot;{}&quot;{}{}</text>"#,
+            render_style.class("fill-muted"),
             rect.x + 14.0,
             rect.y + 20.0,
+            palette.muted_text,
             escape(&module.label),
             escape(&source),
             collapsed
@@ -341,7 +640,7 @@ fn render_module_bands(out: &mut String, model: &GraphModel, layout: &Layout) {
     }
 }
 
-fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout) {
+fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout, render_style: RenderStyle) {
     let mut edges: Vec<_> = model
         .ordering_edges
         .iter()
@@ -388,9 +687,21 @@ fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout) {
             )
             .unwrap();
         }
-        let (color, marker, opacity, width) = match edge.highlight {
-            Some(blast) => (blast.color(), blast.marker_id(), 0.76, 2.2),
-            None => ("#8c959f", "default", 0.68, 1.6),
+        let (color, color_class, marker, opacity, width) = match edge.highlight {
+            Some(blast) => (
+                blast.color(render_style.palette),
+                blast.stroke_class(render_style.palette),
+                blast.marker_id(),
+                0.76,
+                2.2,
+            ),
+            None => (
+                render_style.palette.edge,
+                "stroke-edge",
+                "default",
+                0.68,
+                1.6,
+            ),
         };
         let dash = if is_reference {
             " stroke-dasharray=\"6 5\""
@@ -399,39 +710,53 @@ fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout) {
         };
         writeln!(
             out,
-            "    <path d=\"{path}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{width:.1}\" stroke-opacity=\"{opacity:.2}\"{dash} marker-end=\"url(#arrow-{marker})\"/>",
+            "    <path{} d=\"{path}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{width:.1}\" stroke-opacity=\"{opacity:.2}\"{dash} marker-end=\"url(#arrow-{marker})\"/>",
+            render_style.class(color_class),
         )
         .unwrap();
     }
 }
 
-fn render_nodes(out: &mut String, model: &GraphModel, layout: &Layout) {
+fn render_nodes(out: &mut String, model: &GraphModel, layout: &Layout, render_style: RenderStyle) {
     for rect in &layout.nodes {
         if let Some(node) = model.node(&rect.id) {
-            render_node(out, node, rect);
+            render_node(out, node, rect, render_style);
         }
     }
 }
 
-fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
-    let style = kind_style(node.kind);
+fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect, render_style: RenderStyle) {
+    let palette = render_style.palette;
+    let style = kind_style(node.kind, palette);
     if let Some(halo) = node_halo(node) {
-        let color = halo.color();
+        let color = halo.color(palette);
         writeln!(
             out,
-            "    <rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"14\" fill=\"none\" stroke=\"{color}\" stroke-width=\"8\" stroke-opacity=\"0.24\"/>",
+            "    <rect{} x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"14\" fill=\"none\" stroke=\"{color}\" stroke-width=\"8\" stroke-opacity=\"{}\"/>",
+            render_style.class(&format!("{} halo", halo.stroke_class(palette))),
             rect.x - 5.0,
             rect.y - 5.0,
             rect.width + 10.0,
             rect.height + 10.0,
+            palette.halo_opacity,
         )
         .unwrap();
     }
 
-    let (fill, border, fill_opacity) = if node.kind == EffectKind::Unchanged {
-        ("#f6f8fa", "#afb8c1", "0.72")
+    let (fill, border, fill_opacity, card_classes) = if node.kind == EffectKind::Unchanged {
+        (
+            palette.surface,
+            palette.unchanged_border,
+            palette.unchanged_opacity,
+            "fill-surface stroke-unchanged unchanged-card".to_string(),
+        )
     } else {
-        (style.tint, style.color, "1")
+        (
+            style.tint,
+            style.color,
+            "1",
+            format!("{} {}", style.tint_class, style.stroke_class),
+        )
     };
     let dash = if node.kind == EffectKind::Delete {
         " stroke-dasharray=\"6 4\""
@@ -441,14 +766,16 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     writeln!(out, "    <g>").unwrap();
     writeln!(
         out,
-        "      <rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"9\" fill=\"{fill}\" fill-opacity=\"{fill_opacity}\" stroke=\"{border}\"{dash}/>",
+        "      <rect{} x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"9\" fill=\"{fill}\" fill-opacity=\"{fill_opacity}\" stroke=\"{border}\"{dash}/>",
+        render_style.class(&card_classes),
         rect.x, rect.y, rect.width, rect.height
     )
     .unwrap();
     if node.kind != EffectKind::Unchanged {
         writeln!(
             out,
-            "      <rect x=\"{:.1}\" y=\"{:.1}\" width=\"6\" height=\"{:.1}\" rx=\"3\" fill=\"{}\"/>",
+            "      <rect{} x=\"{:.1}\" y=\"{:.1}\" width=\"6\" height=\"{:.1}\" rx=\"3\" fill=\"{}\"/>",
+            render_style.class(style.fill_class),
             rect.x,
             rect.y,
             rect.height,
@@ -462,7 +789,8 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     } else {
         writeln!(
             out,
-            "      <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"13\" font-weight=\"700\" fill=\"{}\">{}</text>",
+            "      <text{} x=\"{:.1}\" y=\"{:.1}\" font-size=\"13\" font-weight=\"700\" fill=\"{}\">{}</text>",
+            render_style.class(style.fill_class),
             rect.x + 17.0,
             rect.y + 27.0,
             style.color,
@@ -474,14 +802,16 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     let badge_width = text_width(style.label, 10.0) + 16.0;
     writeln!(
         out,
-        "      <rect x=\"{badge_x:.1}\" y=\"{:.1}\" width=\"{badge_width:.1}\" height=\"20\" rx=\"10\" fill=\"{}\" fill-opacity=\"0.10\"/>",
+        "      <rect{} x=\"{badge_x:.1}\" y=\"{:.1}\" width=\"{badge_width:.1}\" height=\"20\" rx=\"10\" fill=\"{}\" fill-opacity=\"0.10\"/>",
+        render_style.class(style.fill_class),
         rect.y + 10.0,
         style.color
     )
     .unwrap();
     writeln!(
         out,
-        "      <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" font-weight=\"700\" fill=\"{}\">{}</text>",
+        "      <text{} x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" font-weight=\"700\" fill=\"{}\">{}</text>",
+        render_style.class(style.fill_class),
         badge_x + 8.0,
         rect.y + 24.5,
         style.color,
@@ -502,7 +832,9 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     };
     writeln!(
         out,
-        "      <text x=\"{text_x:.1}\" y=\"{label_y:.1}\" font-size=\"14\" font-weight=\"700\" fill=\"#1f2328\"{decoration}>{}</text>",
+        "      <text{} x=\"{text_x:.1}\" y=\"{label_y:.1}\" font-size=\"14\" font-weight=\"700\" fill=\"{}\"{decoration}>{}</text>",
+        render_style.class("fill-primary"),
+        palette.primary_text,
         escape(&truncate(&node.label, MAX_LABEL_CHARS))
     )
     .unwrap();
@@ -513,7 +845,9 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     };
     writeln!(
         out,
-        r##"      <text x="{text_x:.1}" y="{type_y:.1}" font-size="11" fill="#6e7781">{}</text>"##,
+        r#"      <text{} x="{text_x:.1}" y="{type_y:.1}" font-size="11" fill="{}">{}</text>"#,
+        render_style.class("fill-subtle"),
+        palette.subtle_text,
         escape(&truncate(&node.resource_type, MAX_TYPE_CHARS))
     )
     .unwrap();
@@ -522,7 +856,9 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
     if let Some(note) = &node.note {
         writeln!(
             out,
-            r##"      <text x="{text_x:.1}" y="{cursor:.1}" font-size="10.5" fill="#57606a">{}</text>"##,
+            r#"      <text{} x="{text_x:.1}" y="{cursor:.1}" font-size="10.5" fill="{}">{}</text>"#,
+            render_style.class("fill-muted"),
+            palette.muted_text,
             escape(&truncate(note, MAX_TYPE_CHARS))
         )
         .unwrap();
@@ -538,7 +874,8 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
         };
         writeln!(
             out,
-            "      <text x=\"{text_x:.1}\" y=\"{cursor:.1}\" font-size=\"10.5\" font-weight=\"600\" fill=\"{}\">{heading}</text>",
+            "      <text{} x=\"{text_x:.1}\" y=\"{cursor:.1}\" font-size=\"10.5\" font-weight=\"600\" fill=\"{}\">{heading}</text>",
+            render_style.class(style.fill_class),
             style.color
         )
         .unwrap();
@@ -546,8 +883,10 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
         for attribute in node.attribute_names.iter().take(MAX_ATTRIBUTE_NAMES) {
             writeln!(
                 out,
-                r##"      <text x="{:.1}" y="{cursor:.1}" font-size="10.5" fill="#24292f">• {}</text>"##,
+                r#"      <text{} x="{:.1}" y="{cursor:.1}" font-size="10.5" fill="{}">• {}</text>"#,
+                render_style.class("fill-body"),
                 text_x + 8.0,
+                palette.body_text,
                 escape(&truncate(attribute, MAX_TYPE_CHARS))
             )
             .unwrap();
@@ -556,8 +895,10 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
         if node.attribute_names.len() > MAX_ATTRIBUTE_NAMES {
             writeln!(
                 out,
-                r##"      <text x="{:.1}" y="{cursor:.1}" font-size="10.5" fill="#6e7781">+{} more</text>"##,
+                r#"      <text{} x="{:.1}" y="{cursor:.1}" font-size="10.5" fill="{}">+{} more</text>"#,
+                render_style.class("fill-subtle"),
                 text_x + 8.0,
+                palette.subtle_text,
                 node.attribute_names.len() - MAX_ATTRIBUTE_NAMES
             )
             .unwrap();
@@ -566,7 +907,7 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
 
     if !node.affected_by.is_empty() {
         let halo = node_halo(node).expect("affected node has a halo kind");
-        let color = halo.color();
+        let color = halo.color(palette);
         let affected = if node.affected_by.len() == 1 {
             format!("affected by {}", node.affected_by[0].label)
         } else {
@@ -574,7 +915,8 @@ fn render_node(out: &mut String, node: &GraphNode, rect: &NodeRect) {
         };
         writeln!(
             out,
-            "      <text x=\"{text_x:.1}\" y=\"{:.1}\" font-size=\"10\" font-weight=\"600\" fill=\"{color}\">{}</text>",
+            "      <text{} x=\"{text_x:.1}\" y=\"{:.1}\" font-size=\"10\" font-weight=\"600\" fill=\"{color}\">{}</text>",
+            render_style.class(halo.fill_class(palette)),
             rect.y + rect.height - 10.0,
             escape(&truncate(&affected, MAX_TYPE_CHARS))
         )
@@ -601,7 +943,8 @@ fn node_halo(node: &GraphNode) -> Option<BlastKind> {
     }
 }
 
-fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
+fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_style: RenderStyle) {
+    let palette = render_style.palette;
     let kinds = [
         EffectKind::Read,
         EffectKind::Create,
@@ -631,14 +974,16 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
     let divider_y = layout.height as f32 - 82.0;
     writeln!(
         out,
-        r##"    <line x1="28" y1="{divider_y:.1}" x2="{}" y2="{divider_y:.1}" stroke="#d8dee4"/>"##,
-        layout.width - 28
+        r#"    <line{} x1="28" y1="{divider_y:.1}" x2="{}" y2="{divider_y:.1}" stroke="{}"/>"#,
+        render_style.class("stroke-divider"),
+        layout.width - 28,
+        palette.divider
     )
     .unwrap();
     let mut x = 28.0;
     let mut y = divider_y + 21.0;
     for kind in visible_kinds {
-        let style = kind_style(kind);
+        let style = kind_style(kind, palette);
         let item_width = text_width(style.symbol, 11.0) + text_width(style.label, 10.0) + 28.0;
         if x + item_width > layout.width as f32 - 28.0 {
             x = 28.0;
@@ -646,7 +991,8 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
         }
         writeln!(
             out,
-            "    <text x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"11\" font-weight=\"700\" fill=\"{}\">{}</text>",
+            "    <text{} x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"11\" font-weight=\"700\" fill=\"{}\">{}</text>",
+            render_style.class(style.fill_class),
             style.color,
             escape(style.symbol)
         )
@@ -654,7 +1000,9 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
         let label_x = x + text_width(style.symbol, 11.0) + 6.0;
         writeln!(
             out,
-            r##"    <text x="{label_x:.1}" y="{y:.1}" font-size="10" fill="#57606a">{}</text>"##,
+            r#"    <text{} x="{label_x:.1}" y="{y:.1}" font-size="10" fill="{}">{}</text>"#,
+            render_style.class("fill-muted"),
+            palette.muted_text,
             escape(style.label)
         )
         .unwrap();
@@ -665,11 +1013,15 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
     if has_ordering_edges {
         writeln!(
             out,
-            "    <line x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#8c959f\" stroke-width=\"1.6\" marker-end=\"url(#arrow-default)\"/><text x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"#57606a\">runs before</text>",
+            "    <line{} x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"1.6\" marker-end=\"url(#arrow-default)\"/><text{} x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"{}\">runs before</text>",
+            render_style.class("stroke-edge"),
             semantics_y - 4.0,
             semantics_x + LEGEND_EDGE_SAMPLE_WIDTH,
             semantics_y - 4.0,
+            palette.edge,
+            render_style.class("fill-muted"),
             semantics_x + LEGEND_EDGE_SAMPLE_WIDTH + 10.0,
+            palette.muted_text,
         )
         .unwrap();
         semantics_x += 146.0;
@@ -677,22 +1029,33 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout) {
     if has_reference_edges {
         writeln!(
             out,
-            "    <line x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#8c959f\" stroke-width=\"1.6\" stroke-dasharray=\"6 5\" marker-end=\"url(#arrow-default)\"/><text x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"#57606a\">references (unchanged)</text>",
+            "    <line{} x1=\"{semantics_x:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"1.6\" stroke-dasharray=\"6 5\" marker-end=\"url(#arrow-default)\"/><text{} x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"{}\">references (unchanged)</text>",
+            render_style.class("stroke-edge"),
             semantics_y - 4.0,
             semantics_x + LEGEND_EDGE_SAMPLE_WIDTH,
             semantics_y - 4.0,
+            palette.edge,
+            render_style.class("fill-muted"),
             semantics_x + LEGEND_EDGE_SAMPLE_WIDTH + 10.0,
+            palette.muted_text,
         )
         .unwrap();
         semantics_x += 208.0;
     }
     if has_halo {
-        let color = BlastKind::Replace.color();
+        let color = BlastKind::Replace.color(palette);
         writeln!(
             out,
-            "    <rect x=\"{semantics_x:.1}\" y=\"{:.1}\" width=\"24\" height=\"13\" rx=\"4\" fill=\"none\" stroke=\"{color}\" stroke-width=\"5\" stroke-opacity=\"0.24\"/><text x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"#57606a\">halo = downstream blast radius</text>",
+            "    <rect{} x=\"{semantics_x:.1}\" y=\"{:.1}\" width=\"24\" height=\"13\" rx=\"4\" fill=\"none\" stroke=\"{color}\" stroke-width=\"5\" stroke-opacity=\"{}\"/><text{} x=\"{:.1}\" y=\"{semantics_y:.1}\" font-size=\"10\" fill=\"{}\">halo = downstream blast radius</text>",
+            render_style.class(&format!(
+                "{} halo",
+                BlastKind::Replace.stroke_class(palette)
+            )),
             semantics_y - 13.0,
+            palette.halo_opacity,
+            render_style.class("fill-muted"),
             semantics_x + 34.0,
+            palette.muted_text,
         )
         .unwrap();
     }
@@ -745,7 +1108,7 @@ mod tests {
     use crate::plan_image::layout::layout_graph;
     use crate::plan_image::model::{PlanImageInput, StateMetadata, build_model};
 
-    fn fixture_svg(name: &str) -> String {
+    fn fixture_svg_with_theme(name: &str, theme: SvgTheme) -> String {
         let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
         let state = fixture.state_file.as_ref().map(|state| StateMetadata {
             lineage: &state.lineage,
@@ -762,7 +1125,11 @@ mod tests {
             summary: &summary,
         });
         let layout = layout_graph(&model);
-        render_svg(&model, &layout).text
+        render_svg(&model, &layout, theme).text
+    }
+
+    fn fixture_svg(name: &str) -> String {
+        fixture_svg_with_theme(name, SvgTheme::Fixed(Theme::Light))
     }
 
     #[test]
@@ -818,7 +1185,7 @@ mod tests {
             state: None,
             summary: &summary,
         });
-        let svg = render_svg(&model, &layout_graph(&model)).text;
+        let svg = render_svg(&model, &layout_graph(&model), SvgTheme::Fixed(Theme::Light)).text;
 
         assert!(svg.contains("secret_token"));
         assert!(svg.contains("write_only_token"));
@@ -852,7 +1219,7 @@ mod tests {
             state: None,
             summary: &summary,
         });
-        let svg = render_svg(&model, &layout_graph(&model)).text;
+        let svg = render_svg(&model, &layout_graph(&model), SvgTheme::Fixed(Theme::Light)).text;
 
         assert!(!svg.contains(long_label));
         assert!(svg.contains('…'));
@@ -864,8 +1231,29 @@ mod tests {
     #[test]
     fn svg_has_explicit_white_background_and_vendored_font_family() {
         let svg = fixture_svg("mixed_operations");
-        assert!(svg.contains(r##"id="background" fill="#ffffff""##));
+        assert!(svg.contains(&format!(
+            r#"id="background" fill="{}""#,
+            LIGHT_PALETTE.background
+        )));
         assert!(svg.contains(FONT_FAMILY));
+    }
+
+    #[test]
+    fn auto_svg_contains_both_palettes_and_dark_media_query() {
+        let svg = fixture_svg_with_theme("plan_image_module_cascade", SvgTheme::Auto);
+
+        assert!(svg.contains("@media (prefers-color-scheme: dark)"));
+        assert!(svg.contains(LIGHT_PALETTE.background));
+        assert!(svg.contains(DARK_PALETTE.background));
+    }
+
+    #[test]
+    fn fixed_dark_svg_uses_no_light_background() {
+        let svg = fixture_svg_with_theme("plan_image_module_cascade", SvgTheme::Fixed(Theme::Dark));
+
+        assert!(svg.contains(DARK_PALETTE.background));
+        assert!(!svg.contains(LIGHT_PALETTE.background));
+        assert!(!svg.contains("prefers-color-scheme"));
     }
 
     #[test]
@@ -933,7 +1321,7 @@ mod tests {
             state: None,
             summary: &summary,
         });
-        let svg = render_svg(&model, &layout_graph(&model)).text;
+        let svg = render_svg(&model, &layout_graph(&model), SvgTheme::Fixed(Theme::Light)).text;
 
         assert!(svg.contains("stroke-dasharray=\"6 5\""));
         assert!(svg.contains(">references (unchanged)</text>"));
@@ -1000,5 +1388,21 @@ mod tests {
     #[test]
     fn snapshot_module_cascade_svg() {
         insta::assert_snapshot!(fixture_svg("plan_image_module_cascade"));
+    }
+
+    #[test]
+    fn snapshot_module_cascade_dark_svg() {
+        insta::assert_snapshot!(fixture_svg_with_theme(
+            "plan_image_module_cascade",
+            SvgTheme::Fixed(Theme::Dark),
+        ));
+    }
+
+    #[test]
+    fn snapshot_module_cascade_auto_svg() {
+        insta::assert_snapshot!(fixture_svg_with_theme(
+            "plan_image_module_cascade",
+            SvgTheme::Auto,
+        ));
     }
 }

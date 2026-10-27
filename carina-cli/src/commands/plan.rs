@@ -38,9 +38,13 @@ use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
+#[cfg(test)]
 use crate::plan_image::{
-    InlineImageProtocol, InlineImageRequest, PlanImageInput, PlanImageTarget, RenderedInlineImage,
-    StateMetadata, render_plan_outputs, terminal_size, write_inline_image, write_plan_image,
+    ImageTheme, InlineImageProtocol, PlanImageTarget, Theme, resolve_plan_image_options,
+};
+use crate::plan_image::{
+    InlineImageRequest, PlanImageInput, RenderedInlineImage, ResolvedPlanImageTarget,
+    StateMetadata, render_plan_outputs, write_inline_image, write_plan_image,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -1708,8 +1712,8 @@ async fn drift_detection_test_barrier() {
 pub async fn run_plan(
     path: &Path,
     out: Option<&Path>,
-    image: Option<&PlanImageTarget>,
-    inline_image: Option<InlineImageProtocol>,
+    image: Option<&ResolvedPlanImageTarget>,
+    inline_image: Option<InlineImageRequest>,
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
@@ -2106,10 +2110,6 @@ pub async fn run_plan(
         lineage: &state.lineage,
         serial: state.serial,
     });
-    let inline_image = inline_image.map(|protocol| InlineImageRequest {
-        protocol,
-        terminal: terminal_size(),
-    });
     let rendered_inline_image = write_plan_artifacts(
         out.zip(plan_output.as_deref()),
         (image.is_some() || inline_image.is_some()).then_some(PlanImageArtifactRequest {
@@ -2161,7 +2161,7 @@ pub async fn run_plan(
 }
 
 struct PlanImageArtifactRequest<'a> {
-    file: Option<&'a PlanImageTarget>,
+    file: Option<&'a ResolvedPlanImageTarget>,
     inline: Option<InlineImageRequest>,
     input: PlanImageInput<'a>,
 }
@@ -3616,6 +3616,15 @@ mod run_plan_out_tests {
     };
     use std::fs;
 
+    fn resolved_image_target(path: PathBuf, theme: ImageTheme) -> ResolvedPlanImageTarget {
+        let target = PlanImageTarget::try_from(path).unwrap();
+        resolve_plan_image_options(Some(&target), false, Some(theme), |_| None, false)
+            .unwrap()
+            .file()
+            .expect("file image requested")
+            .clone()
+    }
+
     fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
         Resource::with_provider(
             "mock",
@@ -3876,7 +3885,7 @@ mod run_plan_out_tests {
         crate::commands::ensure_backend_lock(dir, None).unwrap();
 
         let image_path = dir.join("plan.svg");
-        let image = PlanImageTarget::try_from(image_path.clone()).unwrap();
+        let image = resolved_image_target(image_path.clone(), ImageTheme::Light);
         let missing_parent_out = dir.join("missing/plan.json");
         let result = run_plan(
             dir,
@@ -3905,7 +3914,7 @@ mod run_plan_out_tests {
         let tmp = tempfile::tempdir().unwrap();
         let out_path = tmp.path().join("plan.json");
         let image_path = tmp.path().join("plan.png");
-        let image_target = PlanImageTarget::try_from(image_path.clone()).unwrap();
+        let image_target = resolved_image_target(image_path.clone(), ImageTheme::Light);
 
         let mut plan = Plan::new();
         for index in 0..300 {
@@ -3959,7 +3968,7 @@ mod run_plan_out_tests {
         let tmp = tempfile::tempdir().unwrap();
         let out_path = tmp.path().join("plan.json");
         let image_path = tmp.path().join("plan.svg");
-        let image_target = PlanImageTarget::try_from(image_path.clone()).unwrap();
+        let image_target = resolved_image_target(image_path.clone(), ImageTheme::Light);
 
         let mut plan = Plan::new();
         for index in 0..300 {
@@ -3986,6 +3995,7 @@ mod run_plan_out_tests {
                     inline: Some(InlineImageRequest {
                         protocol: InlineImageProtocol::Kitty,
                         terminal: None,
+                        theme: Theme::Light,
                     }),
                     input: PlanImageInput {
                         plan: &plan,

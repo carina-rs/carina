@@ -19,7 +19,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
-use carina_cli::plan_image::{PlanImageTarget, detect_inline_image_protocol};
+use carina_cli::plan_image::{ImageTheme, PlanImageTarget, resolve_plan_image_options};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
@@ -66,6 +66,10 @@ enum Commands {
         /// Display the dependency graph in a supported image-capable terminal
         #[arg(long, conflicts_with_all = ["json", "tui"])]
         image_inline: bool,
+
+        /// Select the plan image palette: light, dark, or output-aware auto
+        #[arg(long, value_enum)]
+        image_theme: Option<ImageTheme>,
 
         /// Return exit code 2 when changes are present
         #[arg(long = "detailed-exitcode")]
@@ -364,17 +368,23 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let inline_image_protocol = match &cli.command {
+    let plan_images = match &cli.command {
         Commands::Plan {
-            image_inline: true, ..
-        } => match detect_inline_image_protocol(
+            image,
+            image_inline,
+            image_theme,
+            ..
+        } => match resolve_plan_image_options(
+            image.as_ref(),
+            *image_inline,
+            *image_theme,
             |name| std::env::var(name).ok(),
             std::io::stdout().is_terminal(),
         ) {
-            Ok(protocol) => Some(protocol),
+            Ok(images) => images,
             Err(error) => handle_app_error(error.into()),
         },
-        _ => None,
+        _ => Default::default(),
     };
 
     // Create parser configuration with AWS KMS decryptor.
@@ -392,8 +402,9 @@ async fn main() {
         if let Commands::Plan {
             path,
             out,
-            image,
+            image: _,
             image_inline: _,
+            image_theme: _,
             detailed_exitcode,
             detail,
             tui,
@@ -406,8 +417,8 @@ async fn main() {
             match run_plan(
                 &path,
                 out.as_deref(),
-                image.as_ref(),
-                inline_image_protocol,
+                plan_images.file(),
+                plan_images.inline(),
                 detail,
                 tui,
                 refresh,
@@ -1017,6 +1028,81 @@ mod error_format_tests {
             }
             _ => panic!("expected plan command"),
         }
+    }
+
+    #[test]
+    fn plan_image_theme_values_parse() {
+        for (value, expected) in [
+            ("light", ImageTheme::Light),
+            ("dark", ImageTheme::Dark),
+            ("auto", ImageTheme::Auto),
+        ] {
+            let cli = Cli::try_parse_from(["carina", "plan", "--image-theme", value])
+                .expect("supported image theme should parse");
+
+            match cli.command {
+                Commands::Plan { image_theme, .. } => {
+                    assert_eq!(image_theme, Some(expected), "value: {value}");
+                }
+                _ => panic!("expected plan command"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_image_theme_is_unset_when_omitted() {
+        let cli = Cli::try_parse_from(["carina", "plan"]).unwrap();
+
+        match cli.command {
+            Commands::Plan { image_theme, .. } => assert_eq!(image_theme, None),
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_image_theme_rejects_unknown_value() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-theme", "sepia"]) {
+            Ok(_) => panic!("unsupported image theme must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let message = error.to_string();
+        for value in ["light", "dark", "auto"] {
+            assert!(message.contains(value), "{message}");
+        }
+    }
+
+    #[test]
+    fn plan_png_rejects_explicit_auto_theme_during_cli_resolution() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--image",
+            "review.png",
+            "--image-theme",
+            "auto",
+            "directory-that-must-not-be-read",
+        ])
+        .unwrap();
+
+        let Commands::Plan {
+            image,
+            image_inline,
+            image_theme,
+            ..
+        } = cli.command
+        else {
+            panic!("expected plan command");
+        };
+        let error =
+            resolve_plan_image_options(image.as_ref(), image_inline, image_theme, |_| None, false)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            carina_cli::plan_image::PlanImageError::PngAutoTheme
+        ));
     }
 
     #[test]

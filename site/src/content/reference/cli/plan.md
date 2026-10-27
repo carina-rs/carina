@@ -176,6 +176,34 @@ the graph and save it in one run.
 carina plan --image-inline
 ```
 
+### `--image-theme <THEME>`
+
+Select the palette used by `--image` and `--image-inline`. The accepted values
+are `light`, `dark`, and `auto`.
+
+When this option is omitted, SVG and PNG files use the light palette, while
+inline terminal images use `auto`. An explicit `light` or `dark` value applies
+to every requested image output. For an SVG file, `auto` embeds both palettes
+and switches them with `@media (prefers-color-scheme: dark)`. For inline
+output, `auto` queries the terminal background and falls back to light if the
+terminal does not reply. PNG colors are fixed at render time, so combining a
+PNG file with explicit `--image-theme auto` is rejected before planning starts.
+
+For a GitHub page or pull-request description, render separate light and dark
+PNGs and select between them with `<picture>`:
+
+```bash
+carina plan --image-theme light --image plan-light.png
+carina plan --image-theme dark --image plan-dark.png
+```
+
+```html
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="plan-dark.png">
+  <img src="plan-light.png" alt="carina plan">
+</picture>
+```
+
 ## Examples
 
 Plan from the current directory:
