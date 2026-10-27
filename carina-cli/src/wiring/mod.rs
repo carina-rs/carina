@@ -35,7 +35,8 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::{
-    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
+    CanonicalResourcePair, DeferredForExpansionChoice, OverrideAwareBuildMode,
+    OverrideAwareResources, RebuildBindingsInputs,
 };
 #[cfg(test)]
 use carina_core::parser::{MovedAddresses, ParseWarning};
@@ -2612,7 +2613,6 @@ impl DeferredForExpansion {
 /// constructor is [`PreparedDeferredForExpansion::expand`].
 pub(crate) struct ExpandedCanonicalResources<E> {
     resources: CanonicalResourcePair<E>,
-    expansion: Option<DeferredForExpansion>,
 }
 
 impl<E> ExpandedCanonicalResources<E> {
@@ -2622,15 +2622,6 @@ impl<E> ExpandedCanonicalResources<E> {
 
     pub(crate) fn as_pair(&self) -> &CanonicalResourcePair<E> {
         &self.resources
-    }
-
-    /// Move expansion metadata to a consumer while retaining the branded
-    /// canonical pair. The pair remains an [`ExpandedCanonicalResources`]
-    /// witness and cannot be replaced with an independently assembled view.
-    pub(crate) fn take_expansion(&mut self) -> DeferredForExpansion {
-        self.expansion
-            .take()
-            .expect("deferred-for expansion metadata may only be consumed once")
     }
 
     pub(crate) async fn prepare_desired_side_for_plan(
@@ -2719,7 +2710,7 @@ impl PreparedDeferredForExpansion {
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
-    ) -> Result<ExpandedCanonicalResources<E>, AppError> {
+    ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
         let expansion = expand_same_config_deferred_for_target(
             &mut resources,
             &self.0.sorted_resources,
@@ -2734,10 +2725,7 @@ impl PreparedDeferredForExpansion {
             &self.0.already_refreshed,
             warning_policy,
         )?;
-        Ok(ExpandedCanonicalResources {
-            resources,
-            expansion: Some(expansion),
-        })
+        Ok((ExpandedCanonicalResources { resources }, expansion))
     }
 
     /// Raw-file expansion is reserved for address-preserving state refresh
@@ -2804,15 +2792,16 @@ impl PreparedDeferredForExpansion {
 pub(crate) trait DeferredExpansionTarget<E> {
     fn parsed(&self) -> &carina_core::parser::File<E>;
 
-    fn expand_partitioned(
+    fn expand_partitioned<F>(
         &mut self,
-        selected: Vec<carina_core::parser::DeferredForExpression>,
-        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
+        classify: F,
     ) -> Result<
         Vec<carina_core::parser::DeferredForExpression>,
         carina_core::parser::DeferredForExpansionError,
-    >;
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice;
 }
 
 impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
@@ -2820,16 +2809,18 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         self.parsed()
     }
 
-    fn expand_partitioned(
+    fn expand_partitioned<F>(
         &mut self,
-        selected: Vec<carina_core::parser::DeferredForExpression>,
-        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
+        classify: F,
     ) -> Result<
         Vec<carina_core::parser::DeferredForExpression>,
         carina_core::parser::DeferredForExpansionError,
-    > {
-        self.expand_deferred_for_expressions(selected, retained, bindings)
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+    {
+        self.expand_deferred_for_expressions(bindings, classify)
     }
 }
 
@@ -2838,15 +2829,21 @@ impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
         self
     }
 
-    fn expand_partitioned(
+    fn expand_partitioned<F>(
         &mut self,
-        selected: Vec<carina_core::parser::DeferredForExpression>,
-        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
+        mut classify: F,
     ) -> Result<
         Vec<carina_core::parser::DeferredForExpression>,
         carina_core::parser::DeferredForExpansionError,
-    > {
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+    {
+        let (selected, retained): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.deferred_for_expressions)
+                .into_iter()
+                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
                 || !retained
@@ -2929,15 +2926,13 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
     let mut deferred_create_targets = Vec::new();
-    let pre_expandable_deferred_for: Vec<_> = parsed
-        .deferred_for_expressions
-        .iter()
-        .filter_map(|deferred| {
+    let residual_deferred_for = target
+        .expand_partitioned(&iterable_bindings, |deferred| {
             match iterable_bindings.resolve_value(&deferred.iterable) {
                 Ok(carina_core::resolver::ValueResolution::Present(value))
                     if is_value_fully_concrete_for_expansion(&value) =>
                 {
-                    Some(deferred.clone())
+                    DeferredForExpansionChoice::Expand
                 }
                 Ok(
                     carina_core::resolver::ValueResolution::Present(_)
@@ -2947,24 +2942,12 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
                     if let Some(target) = DeferredCreateTarget::from_deferred(deferred) {
                         deferred_create_targets.push(target);
                     }
-                    None
+                    DeferredForExpansionChoice::Retain
                 }
                 // Let the shared expansion path render the path-aware error.
-                Err(_) => Some(deferred.clone()),
+                Err(_) => DeferredForExpansionChoice::Expand,
             }
         })
-        .collect();
-
-    let retained_deferred_for = deferred_create_targets
-        .iter()
-        .map(|target| target.template.clone())
-        .collect::<Vec<_>>();
-    let residual_deferred_for = target
-        .expand_partitioned(
-            pre_expandable_deferred_for,
-            retained_deferred_for,
-            &iterable_bindings,
-        )
         .map_err(|error| AppError::Validation(error.to_string()))?;
     let printed_warnings =
         warning_policy == DeferredForWarningPolicy::Print && target.parsed().print_warnings();
@@ -3085,8 +3068,9 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
 /// Every call site that needs a post-expansion view of `sorted_resources`
 /// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) MUST
-/// obtain it via [`expand_refresh_and_lift_states`], and the constructor
-/// performs the complete post-expansion sequence:
+/// obtain it via [`expand_refresh_and_lift_states`] or
+/// [`expand_canonical_refresh_and_lift_states`], and those constructors perform
+/// the complete post-expansion sequence:
 ///
 /// 1. `expand_same_config_deferred_for` — synthesise for-loop children
 ///    and re-sort the augmented set.
@@ -3104,10 +3088,10 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// inside this operation prevents a refresh path from transforming only one
 /// part of prior state.
 #[non_exhaustive]
-pub struct ExpandedRefreshState<E> {
-    /// Present only for plan/apply expansion. State refresh deliberately uses
-    /// the raw parsed-file path and therefore cannot mint this witness.
-    pub(crate) canonical_resources: Option<ExpandedCanonicalResources<E>>,
+pub struct ExpandedRefreshState<R> {
+    /// The resource witness selected by the constructor: `()` for raw-file
+    /// state refresh, or [`ExpandedCanonicalResources`] for plan/apply.
+    pub(crate) canonical_resources: R,
     pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -3116,18 +3100,12 @@ pub struct ExpandedRefreshState<E> {
     pub printed_warnings: bool,
 }
 
-/// Inputs for [`expand_refresh_and_lift_states`].
+/// Shared inputs for the refresh-and-lift constructors.
 ///
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
-pub(crate) enum ExpandRefreshConfig<'a, E> {
-    Parsed(&'a mut carina_core::parser::File<E>),
-    Canonical(Box<CanonicalResourcePair<E>>),
-}
-
-pub(crate) struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
-    pub config: ExpandRefreshConfig<'a, E>,
+pub(crate) struct ExpandRefreshAndLiftInputs<'a, P: Provider + ProviderNormalizer> {
     pub provider: &'a P,
     /// Address/metadata parity witness produced by the shared I/O-free
     /// prelude. Expansion cannot be invoked with independently assembled
@@ -3142,34 +3120,49 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + Provide
 }
 
 /// Run the expand → child-refresh → hydrate → lift quartet in
-/// lock-step.
+/// lock-step for address-preserving raw-file state refresh.
 ///
-/// See [`ExpandedRefreshState`] for why this is a single function.
+/// The unit resource witness makes the raw-file variant distinct from the
+/// canonical plan/apply result at the type level.
 pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
-    inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
-) -> Result<ExpandedRefreshState<E>, AppError> {
-    // Phase 1: expand for-loops.
-    let (canonical_resources, expansion) = match inputs.config {
-        ExpandRefreshConfig::Parsed(parsed) => (
-            None,
-            inputs.expansion.expand_parsed(
-                parsed,
-                inputs.schemas,
-                inputs.remote_bindings,
-                inputs.warning_policy,
-            )?,
-        ),
-        ExpandRefreshConfig::Canonical(resources) => {
-            let mut expanded = inputs.expansion.expand(
-                *resources,
-                inputs.schemas,
-                inputs.remote_bindings,
-                inputs.warning_policy,
-            )?;
-            let expansion = expanded.take_expansion();
-            (Some(expanded), expansion)
-        }
-    };
+    parsed: &mut carina_core::parser::File<E>,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<()>, AppError> {
+    let expansion = inputs.expansion.expand_parsed(
+        parsed,
+        inputs.schemas,
+        inputs.remote_bindings,
+        inputs.warning_policy,
+    )?;
+    finish_expanded_refresh_state((), expansion, inputs).await
+}
+
+/// Run the expand → child-refresh → hydrate → lift quartet in lock-step for a
+/// canonical plan/apply resource pair.
+///
+/// The returned state always owns the branded canonical expansion witness; no
+/// optional field or variant-dependent assertion is needed by its caller.
+pub(crate) async fn expand_canonical_refresh_and_lift_states<
+    E: Clone,
+    P: Provider + ProviderNormalizer,
+>(
+    canonical_resources: CanonicalResourcePair<E>,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<ExpandedCanonicalResources<E>>, AppError> {
+    let (canonical_resources, expansion) = inputs.expansion.expand(
+        canonical_resources,
+        inputs.schemas,
+        inputs.remote_bindings,
+        inputs.warning_policy,
+    )?;
+    finish_expanded_refresh_state(canonical_resources, expansion, inputs).await
+}
+
+async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
+    canonical_resources: R,
+    expansion: DeferredForExpansion,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<R>, AppError> {
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
@@ -3532,13 +3525,12 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // here we perform the I/O half — targeted-refresh of the children
     // so a re-plan after they were applied sees their live state
     // instead of a phantom Create.
-    let mut expanded_canonical_resources = prepared_expansion.expand(
+    let (expanded_canonical_resources, expansion) = prepared_expansion.expand(
         canonical_resources,
         ctx.schemas(),
         remote_bindings,
         DeferredForWarningPolicy::Print,
     )?;
-    let expansion = expanded_canonical_resources.take_expansion();
     let DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,

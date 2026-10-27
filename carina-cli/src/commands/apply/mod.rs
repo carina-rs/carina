@@ -2041,8 +2041,9 @@ async fn run_apply_locked_owned(
             // inside `expand_same_config_deferred_for`.
             //
             // carina#3278: the expand → child-refresh → hydrate(2nd) → lift
-            // quartet runs through `expand_refresh_and_lift_states` so the
-            // apply and refresh paths cannot diverge on these phases. The
+            // quartet runs through
+            // `expand_canonical_refresh_and_lift_states` so the apply and
+            // refresh paths cannot diverge on these phases. The
             // constructor is the only way to obtain an `ExpandedRefreshState`
             // — leaving a phase out becomes a compile error.
             let crate::wiring::ExpandedRefreshState {
@@ -2053,11 +2054,9 @@ async fn run_apply_locked_owned(
                 new_child_ids: _,
                 refreshable_child_ids: _,
                 printed_warnings: _,
-            } = crate::wiring::expand_refresh_and_lift_states(
+            } = crate::wiring::expand_canonical_refresh_and_lift_states(
+                canonical_resources,
                 crate::wiring::ExpandRefreshAndLiftInputs {
-                    config: crate::wiring::ExpandRefreshConfig::Canonical(Box::new(
-                        canonical_resources,
-                    )),
                     provider: &provider,
                     expansion: &mut prepared_expansion,
                     warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
@@ -2079,8 +2078,6 @@ async fn run_apply_locked_owned(
                 wait_aliases,
                 moved_pairs,
             } = prepared_expansion.into_parts();
-            let expanded_canonical_resources = expanded_canonical_resources
-                .expect("canonical expansion must return canonical resources");
             let parsed = expanded_canonical_resources.parsed();
             progress_backend.finish_refresh_phase();
             // Keep passing the explicit residual list to `print_plan`, matching
@@ -2880,7 +2877,7 @@ async fn prepare_saved_plan_secret_candidates(
             crate::wiring::DeferredForWarningPolicy::Suppress,
         )?
         .seal();
-    let mut expanded_canonical_resources = prepared_expansion.expand(
+    let (mut expanded_canonical_resources, _expansion) = prepared_expansion.expand(
         canonical_resources,
         wiring.schemas(),
         provider_inputs.remote_bindings(),

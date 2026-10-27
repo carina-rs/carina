@@ -590,7 +590,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
 
     let prepared_expansion = reconciled_expansion.seal();
-    let mut expanded_canonical_resources = prepared_expansion
+    let (expanded_canonical_resources, deferred_for_expansion) = prepared_expansion
         .expand(
             canonical_resources,
             wiring.schemas(),
@@ -598,7 +598,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             crate::wiring::DeferredForWarningPolicy::Print,
         )
         .expect("fixture deferred-for expansion failed");
-    let deferred_for_expansion = expanded_canonical_resources.take_expansion();
     let crate::wiring::PreparedDeferredForExpansionParts {
         mut managed_current,
         data_source_states,

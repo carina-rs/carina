@@ -1323,17 +1323,19 @@ async fn run_state_refresh_locked_with_ctx(
         residual_deferred_for: _,
         deferred_create_targets: _,
         printed_warnings: _,
-    } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
-        config: crate::wiring::ExpandRefreshConfig::Parsed(parsed),
-        provider: &provider,
-        expansion: &mut prepared_expansion,
-        warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
-        remote_bindings: &HashMap::new(),
-        state_file: &state_file,
-        saved_dep_bindings: &saved_dep_bindings,
-        progress: &progress,
-        schemas: ctx.schemas(),
-    })
+    } = crate::wiring::expand_refresh_and_lift_states(
+        parsed,
+        crate::wiring::ExpandRefreshAndLiftInputs {
+            provider: &provider,
+            expansion: &mut prepared_expansion,
+            warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
+            remote_bindings: &HashMap::new(),
+            state_file: &state_file,
+            saved_dep_bindings: &saved_dep_bindings,
+            progress: &progress,
+            schemas: ctx.schemas(),
+        },
+    )
     .await?;
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
@@ -3391,8 +3393,8 @@ mod tests {
             .seal();
         let progress = ProgressBackend::plain(std::io::sink());
         let expanded = crate::wiring::expand_refresh_and_lift_states(
+            &mut parsed,
             crate::wiring::ExpandRefreshAndLiftInputs {
-                config: crate::wiring::ExpandRefreshConfig::Parsed(&mut parsed),
                 provider: &provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,

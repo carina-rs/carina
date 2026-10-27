@@ -33,6 +33,17 @@ pub struct CanonicalResourcePair<E> {
     unresolved: Vec<Resource>,
 }
 
+/// Selects how a deferred-for expression owned by a
+/// [`CanonicalResourcePair`] crosses the expansion boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredForExpansionChoice {
+    /// Materialize the expression now (or preserve it as a parser residual if
+    /// expansion reports that it is still unresolved).
+    Expand,
+    /// Keep the expression as an apply-time deferred template.
+    Retain,
+}
+
 /// Failure while canonicalizing resource values and assigning anonymous
 /// identities inside a [`CanonicalResourcePair`].
 #[derive(Debug, thiserror::Error)]
@@ -144,17 +155,22 @@ impl<E> CanonicalResourcePair<E> {
         )
     }
 
-    /// Materialize the selected deferred-for templates and retain the
-    /// deliberately deferred partition as one atomic update of the owned
-    /// evaluated file. Generated children and retained templates both inherit
-    /// canonical attribute names from the already-resolved file.
-    pub fn expand_deferred_for_expressions(
+    /// Partition and materialize this pair's own deferred-for templates as one
+    /// atomic update of the owned evaluated file. Generated children and
+    /// retained templates both inherit canonical attribute names from the
+    /// already-resolved file.
+    pub fn expand_deferred_for_expressions<F>(
         &mut self,
-        selected: Vec<crate::parser::DeferredForExpression>,
-        retained: Vec<crate::parser::DeferredForExpression>,
         bindings: &crate::binding_index::IterableBindings<'_>,
+        mut classify: F,
     ) -> Result<Vec<crate::parser::DeferredForExpression>, crate::parser::DeferredForExpansionError>
+    where
+        F: FnMut(&crate::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
+        let (selected, retained): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.parsed.deferred_for_expressions)
+                .into_iter()
+                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.parsed.warnings.retain(|warning| {
             warning.kind != crate::parser::WarningKind::DeferredFor
                 || !retained
