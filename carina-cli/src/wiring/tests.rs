@@ -59,6 +59,25 @@ fn canonical_unresolved(
     .expect("test block-name resolution must succeed")
 }
 
+fn build_override_aware_pair_for_test<S>(
+    unresolved: CanonicalUnresolvedResources,
+    state_file: Option<&S>,
+    inputs: PreApplyInputs<'_>,
+) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
+where
+    S: carina_core::override_aware::NameOverrideSource + ?Sized,
+{
+    let evaluated = unresolved.as_slice().to_vec();
+    OverrideAwareResources::build_pair_with_stability(
+        evaluated,
+        unresolved,
+        state_file,
+        inputs,
+        &HashMap::new(),
+        OverrideAwareBuildMode::Apply,
+    )
+}
+
 fn resolved_provider_configs<E>(
     parsed: &carina_core::parser::File<E>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
@@ -368,7 +387,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         state_called: Arc::clone(&state_called),
     };
     let ctx = WiringContext::new(Vec::new(), &[]);
-    let mut resources = OverrideAwareResources::build(
+    let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
         carina_core::binding_index::PreApplyInputs {
@@ -488,7 +507,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             Value::Concrete(ConcreteValue::String("saved".into())),
         );
     desired.binding = Some("resource".to_string());
-    let mut resources = OverrideAwareResources::build(
+    let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(vec![desired], &SchemaRegistry::new()),
         None::<&StateFile>,
         PreApplyInputs {
@@ -4883,7 +4902,7 @@ fn anonymous_route_resource() -> Resource {
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new(vec![], &[]);
-    let mut resources = OverrideAwareResources::build(
+    let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(
             vec![
                 Resource::pending_with_provider("aws", "s3.Bucket", None),
@@ -7342,7 +7361,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
-    use super::canonical_unresolved;
+    use super::{build_override_aware_pair_for_test, canonical_unresolved};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
@@ -7635,7 +7654,7 @@ mod resolved_value_constraint_gate {
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
-        let resources = OverrideAwareResources::build(
+        let (resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(source, &SchemaRegistry::new()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
@@ -7736,7 +7755,7 @@ mod resolved_value_constraint_gate {
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
-        let mut resources = OverrideAwareResources::build(
+        let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(vec![producer], ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {
@@ -7872,7 +7891,7 @@ mod resolved_value_constraint_gate {
     async fn resolved_data_source_input_uses_the_same_gate() {
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let normalizer = RewritingNormalizer::default();
-        let mut resources = OverrideAwareResources::build(
+        let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(Vec::new(), ctx.schemas()),
             None::<&carina_state::StateFile>,
             PreApplyInputs {

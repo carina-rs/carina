@@ -531,24 +531,28 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ctx.schemas(),
     )
     .expect("block-name resolution");
-    let mut override_aware_resources = carina_core::override_aware::OverrideAwareResources::build(
-        canonical_unresolved,
-        None::<&carina_state::StateFile>,
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
-            managed_current: &carina_core::resource::into_plan_input_current_map(
-                current_states.clone(),
-                ctx.schemas(),
-                &resource_origins,
-            ),
-            data_source_states: &HashMap::new(),
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-    )
-    .expect("override-aware resolve");
+    let (mut override_aware_resources, _) =
+        carina_core::override_aware::OverrideAwareResources::build_pair_with_stability(
+            canonical_for_plan.resources,
+            canonical_unresolved,
+            None::<&carina_state::StateFile>,
+            carina_core::binding_index::PreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                data_sources: &parsed.data_sources,
+                managed_current: &carina_core::resource::into_plan_input_current_map(
+                    current_states.clone(),
+                    ctx.schemas(),
+                    &resource_origins,
+                ),
+                data_source_states: &HashMap::new(),
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &HashMap::new(),
+            carina_core::override_aware::OverrideAwareBuildMode::Apply,
+        )
+        .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
     let wait_bindings = parsed.wait_bindings.clone();

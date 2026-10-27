@@ -3142,6 +3142,57 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
 }
 
 #[test]
+fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
+    let schema = ResourceSchema::new("thing").attribute(
+        AttributeSchema::new(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            )),
+        )
+        .with_block_name("rule"),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+
+    let evaluated_resource = Resource::with_provider("test", "thing", "consumer", None)
+        .with_attribute(
+            "rule",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "action".to_string(),
+                    Value::Concrete(ConcreteValue::String("allow".into())),
+                )])),
+            )])),
+        );
+    let unresolved_ref = Value::resource_ref("source", "rules", Vec::new());
+    let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
+        .with_attribute("rule", unresolved_ref.clone());
+    let mut evaluated = crate::parser::ParsedFile {
+        resources: vec![evaluated_resource],
+        ..Default::default()
+    };
+    let unresolved = crate::parser::ParsedFile {
+        resources: vec![unresolved_resource],
+        ..Default::default()
+    };
+
+    let canonical_unresolved = resolve_config_block_names_with_schemas(
+        &mut evaluated,
+        crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        &schemas,
+    )
+    .expect("schema alias must resolve independently of the authored value shape");
+
+    assert!(evaluated.resources[0].attributes.contains_key("rules"));
+    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
+    let unresolved = &canonical_unresolved.as_slice()[0].attributes;
+    assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
+    assert!(!unresolved.contains_key("rule"));
+}
+
+#[test]
 fn resolve_file_block_names_canonicalizes_data_source_blocks() {
     let mut data_source =
         crate::resource::DataSource::with_provider("test", "thing", "lookup", None);
@@ -3183,9 +3234,9 @@ fn resolve_file_block_names_canonicalizes_data_source_blocks() {
 }
 
 #[test]
-fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
-    // Block syntax `transition { ... }` should still be renamed to `transitions`
-    // even when a singular `transition` field exists in the schema.
+fn resolve_block_names_real_field_takes_precedence_over_block_alias() {
+    // The schema's real `transition` field wins over the `transitions`
+    // field's block_name, independently of the parsed value shape.
     let mut inner_map = IndexMap::new();
     // Block syntax produces Value::Concrete(ConcreteValue::List)
     inner_map.insert(
@@ -3242,14 +3293,14 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
         Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
-    // Block syntax (Value::Concrete(ConcreteValue::List)) should be renamed to "transitions"
+    // Alias resolution is schema-driven, so this key remains `transition`.
     assert!(
-        lifecycle.contains_key("transitions"),
-        "expected 'transitions' key after resolve (block syntax)"
+        lifecycle.contains_key("transition"),
+        "expected the real 'transition' field to remain"
     );
     assert!(
-        !lifecycle.contains_key("transition"),
-        "expected 'transition' key to be removed (block syntax renamed)"
+        !lifecycle.contains_key("transitions"),
+        "expected the colliding block alias not to win over a real field"
     );
 }
 

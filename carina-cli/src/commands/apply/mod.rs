@@ -25,7 +25,8 @@ use carina_core::executor::{
     ExecutionOutcome, ExecutionResult, ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::{
-    CanonicalUnresolvedResources, OverrideAwareResources, RebuildBindingsInputs,
+    CanonicalUnresolvedResources, OverrideAwareBuildMode, OverrideAwareResources,
+    RebuildBindingsInputs,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
@@ -2173,6 +2174,7 @@ async fn run_apply_locked_owned(
                         wait_aliases: &wait_aliases,
                     },
                     &managed_stability,
+                    OverrideAwareBuildMode::Apply,
                 )?;
             crate::legacy_name_overrides::emit_legacy_override_warnings(
                 &override_aware_resources,

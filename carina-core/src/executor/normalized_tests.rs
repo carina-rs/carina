@@ -99,8 +99,10 @@ async fn normalized_resource_rejects_block_aliases_returned_by_provider_normaliz
     .expect_err("provider normalizers must return canonical attribute names");
 
     assert!(matches!(error, ProviderError::InvalidInput(_)));
-    assert!(error.to_string().contains("block-name alias `rule`"));
-    assert!(error.to_string().contains("canonical attribute `rules`"));
+    let message = error.to_string();
+    assert!(message.contains("block-name alias `rule` reached the provider boundary"));
+    assert!(message.contains("canonical attribute `rules`"));
+    assert!(!message.contains("provider normalizer returned"));
 }
 
 #[tokio::test]

@@ -36,7 +36,8 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::{
-    CanonicalUnresolvedResources, OverrideAwareResources, RebuildBindingsInputs,
+    CanonicalUnresolvedResources, OverrideAwareBuildMode, OverrideAwareResources,
+    RebuildBindingsInputs,
 };
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
@@ -2976,7 +2977,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &sorted_resources,
     );
     let (mut override_aware_resources, unresolved_override_aware_resources) =
-        OverrideAwareResources::build_pair_for_plan_with_stability(
+        OverrideAwareResources::build_pair_with_stability(
             sorted_resources,
             unresolved_resources.clone(),
             state_file.as_ref(),
@@ -2989,8 +2990,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 remote_bindings,
                 wait_aliases: &wait_aliases,
             },
-            &upstream_binding_names,
             &managed_stability,
+            OverrideAwareBuildMode::Plan {
+                unresolved_upstream_bindings: &upstream_binding_names,
+            },
         )?;
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,

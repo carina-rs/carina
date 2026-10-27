@@ -126,7 +126,7 @@ pub async fn apply_desired_normalization_slice(
 ) -> ProviderResult<()> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     normalizer.normalize_desired(resources).await?;
-    reject_normalizer_block_aliases(resources, schemas)?;
+    reject_provider_boundary_block_aliases(resources, schemas)?;
     crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
     for config in provider_configs {
         merge_default_tags(config, resources, schemas)?;
@@ -134,7 +134,7 @@ pub async fn apply_desired_normalization_slice(
     Ok(())
 }
 
-fn reject_normalizer_block_aliases(
+fn reject_provider_boundary_block_aliases(
     resources: &[Resource],
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
@@ -144,7 +144,7 @@ fn reject_normalizer_block_aliases(
         };
         if let Some(alias) = find_resource_block_name_alias(resource, schema) {
             return Err(crate::provider::ProviderError::invalid_input(format!(
-                "{}: provider normalizer returned block-name alias `{}` at `{}`; return canonical attribute `{}`",
+                "{}: block-name alias `{}` reached the provider boundary at `{}`; expected canonical attribute `{}`",
                 alias.resource_id(),
                 alias.alias(),
                 alias.path(),

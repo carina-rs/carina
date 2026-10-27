@@ -7118,6 +7118,10 @@ fn walk_block_names_in_map(
     parent_path: &str,
     walk: &mut BlockNameWalk,
 ) {
+    let canonical_fields = fields
+        .iter()
+        .map(|field| field.name)
+        .collect::<HashSet<_>>();
     let block_fields = fields
         .iter()
         .filter_map(|field| {
@@ -7129,13 +7133,17 @@ fn walk_block_names_in_map(
     // Preserve the source map's order, matching the pre-walker resolver: each
     // renamed key is removed in authored order and appended under its canonical
     // spelling in that same order.
-    for (block_name, value) in map {
+    for block_name in map.keys() {
+        // A schema field name always wins over another field's block-name
+        // alias. This is what distinguishes a real singular field such as
+        // `transition` from `transitions` whose block_name is also
+        // `transition`, without consulting the parsed value's shape.
+        if canonical_fields.contains(block_name.as_str()) {
+            continue;
+        }
         let Some(field) = block_fields.get(block_name.as_str()) else {
             continue;
         };
-        if !matches!(value, Value::Concrete(ConcreteValue::List(_))) {
-            continue;
-        }
 
         let path = nested_path(parent_path, block_name);
         let conflicts = map.contains_key(field.name);
@@ -7164,13 +7172,10 @@ fn walk_block_names_in_map(
         let aliased = field.block_name.and_then(|block_name| {
             (block_name != field.name
                 && canonical.is_none()
+                && !canonical_fields.contains(block_name)
                 && block_fields
                     .get(block_name)
-                    .is_some_and(|selected| selected.name == field.name)
-                && matches!(
-                    map.get(block_name),
-                    Some(Value::Concrete(ConcreteValue::List(_)))
-                ))
+                    .is_some_and(|selected| selected.name == field.name))
             .then(|| map.get(block_name))
             .flatten()
         });
@@ -7340,10 +7345,12 @@ fn resolve_attribute_block_names(
     walk.conflicts
 }
 
-/// Find the first List-valued block alias without cloning or mutating the
-/// resource. This uses the same walk as the rename pass: Map-valued assignments
-/// can be legitimate fields whose names happen to collide with a sibling
-/// field's `block_name`, and Union values are left to normal schema validation.
+/// Find the first block alias without cloning or mutating the resource.
+///
+/// This uses the same schema-first walk as the rename pass: real field names
+/// take precedence over another field's `block_name`, and otherwise aliases
+/// are recognized independently of their values. Union values are left to
+/// normal schema validation.
 pub(crate) fn find_resource_block_name_alias(
     resource: &Resource,
     schema: &ResourceSchema,

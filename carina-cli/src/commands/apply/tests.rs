@@ -2719,7 +2719,8 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let current_states = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
-    let override_aware = OverrideAwareResources::build(
+    let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
+        vec![resource.clone()],
         canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
         Some(&state),
         PreApplyInputs {
@@ -2731,6 +2732,8 @@ fn apply_emits_legacy_override_warning_to_stderr() {
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
+        &HashMap::new(),
+        OverrideAwareBuildMode::Apply,
     )
     .expect("override-aware resources should build");
 

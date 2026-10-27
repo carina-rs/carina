@@ -446,6 +446,71 @@ let b = mock.test.resource {
 }
 
 #[test]
+fn block_alias_resource_reference_is_canonical_for_live_and_saved_plan_apply() {
+    const SOURCE: &str = r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource {
+  name = "seed"
+  rules = [{ action = "a" }]
+}
+let b = mock.test.resource {
+  name = "b"
+  rule = r.rules
+}
+"#;
+
+    let assert_canonical_state = |scenario: &Scenario, label: &str| {
+        let state = scenario.state_json();
+        let attributes = state_resource_by_name(&state, "b")["attributes"]
+            .as_object()
+            .expect("resource attributes");
+        assert!(
+            !attributes.contains_key("rule"),
+            "{label} kept the block-name alias in Carina state: {attributes:#?}",
+        );
+        assert_eq!(attributes["rules"][0]["action"], "a");
+
+        let provider = scenario.provider_json();
+        let provider_attributes = provider_resource_by_name(&provider, "b")
+            .as_object()
+            .expect("provider attributes");
+        assert!(
+            !provider_attributes.contains_key("rule"),
+            "{label} sent the block-name alias across the provider boundary: {provider_attributes:#?}",
+        );
+        assert_eq!(provider_attributes["rules"][0]["action"], "a");
+    };
+
+    let live = Scenario::new(SOURCE);
+    assert_success("live resource-ref alias plan", &live.carina(&["plan", "."]));
+    assert_success(
+        "live resource-ref alias apply",
+        &live.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    assert_canonical_state(&live, "live apply");
+
+    let saved = Scenario::new(SOURCE);
+    assert_success("saved resource-ref alias plan", &saved.plan());
+    let saved_plan = read_json(&saved.project.join("plan.json"));
+    let unresolved_attributes = saved_plan["unresolved_resources"]
+        .as_array()
+        .expect("saved-plan unresolved resources")
+        .iter()
+        .find(|resource| {
+            resource.pointer("/attributes/name/String") == Some(&Value::String("b".into()))
+        })
+        .and_then(|resource| resource["attributes"].as_object())
+        .expect("saved-plan unresolved attributes for b");
+    assert!(
+        unresolved_attributes.contains_key("rules") && !unresolved_attributes.contains_key("rule"),
+        "saved plan kept the block-name alias: {unresolved_attributes:#?}",
+    );
+    assert_success("saved resource-ref alias apply", &saved.apply_plan());
+    assert_canonical_state(&saved, "saved-plan apply");
+}
+
+#[test]
 fn singular_field_matching_another_fields_block_name_is_not_renamed() {
     let scenario = Scenario::new(
         r#"backend local { path = "carina.state.json" }

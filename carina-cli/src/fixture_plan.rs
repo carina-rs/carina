@@ -13,7 +13,9 @@ use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::UnresolvedResource;
-use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
+use carina_core::override_aware::{
+    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
@@ -385,7 +387,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture managed binding stability must resolve");
     let (mut override_aware_resources, unresolved_override_aware_resources) =
-        OverrideAwareResources::build_pair_for_plan_with_stability(
+        OverrideAwareResources::build_pair_with_stability(
             sorted_resources.clone(),
             unresolved_resources,
             state_file.as_ref(),
@@ -398,8 +400,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
-            &upstream_binding_names,
             &managed_stability,
+            OverrideAwareBuildMode::Plan {
+                unresolved_upstream_bindings: &upstream_binding_names,
+            },
         )
         .expect("Failed to build override-aware resources");
     crate::legacy_name_overrides::emit_legacy_override_warnings(
