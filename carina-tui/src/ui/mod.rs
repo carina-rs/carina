@@ -6,8 +6,11 @@
 mod detail;
 mod diff;
 mod help;
+mod row;
 mod search;
 mod style;
+#[cfg(test)]
+mod test_render;
 mod tree;
 mod value_view;
 

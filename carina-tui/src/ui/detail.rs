@@ -7,9 +7,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{App, FocusedPanel};
 
 use super::diff::{
-    render_list_of_maps_diff, render_map_diff_entries, render_string_list_diff_entries,
+    ListOfMapsDiffHeader, render_list_of_maps_diff, render_map_diff_entries,
+    render_string_list_diff_entries,
 };
 use super::push_annotation_span;
+use super::row::{Indent, Row};
 use super::style::effect_style;
 use super::value_view::{
     ValueStyle, has_semantic_color, value_spans, value_spans_dimmed, value_spans_styled,
@@ -36,35 +38,42 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let effect_color = effect_style(node.kind);
-    let mut lines: Vec<Line> = Vec::new();
+    let mut rows = Vec::new();
 
     // Header: symbol + resource type + name
-    lines.push(Line::from(vec![
-        Span::styled(format!("{} ", node.symbol), effect_color),
-        Span::styled(
-            node.resource_type.clone(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(node.name_part.clone(), effect_color),
-    ]));
-    lines.push(Line::from(""));
+    rows.push(Row::new(
+        Indent::new(0),
+        vec![
+            Span::styled(format!("{} ", node.symbol), effect_color),
+            Span::styled(
+                node.resource_type.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(node.name_part.clone(), effect_color),
+        ],
+    ));
+    rows.push(Row::blank());
 
     if node.detail_rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "(no attributes)",
-            Style::default().fg(Color::DarkGray),
-        )));
+        rows.push(Row::new(
+            Indent::new(0),
+            vec![Span::styled(
+                "(no attributes)",
+                Style::default().fg(Color::DarkGray),
+            )],
+        ));
     } else {
         let is_detail_focused = app.focused_panel == FocusedPanel::Detail;
         for (row_idx, row) in node.detail_rows.iter().enumerate() {
             let is_selected = is_detail_focused && row_idx == app.detail_selected;
-            render_detail_row_to_lines(&mut lines, row, is_selected);
+            render_detail_row_to_rows(&mut rows, row, is_selected);
         }
     }
 
+    let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
     let detail = Paragraph::new(lines)
         .block(
             Block::default()
@@ -77,17 +86,15 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(detail, area);
 }
 
-/// Render a single `DetailRow` into TUI `Line`s.
-fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selected: bool) {
+/// Render a single `DetailRow` into typed TUI rows.
+fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_selected: bool) {
     let dim_style = Style::default().fg(Color::DarkGray);
 
     match row {
         DetailRow::Text { text } => {
-            let mut line = Line::from(vec![Span::raw(format!("  {}", text))]);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(
+                Row::new(Indent::new(2), vec![Span::raw(text.clone())]).highlighted(is_selected),
+            );
         }
         DetailRow::Attribute {
             key,
@@ -96,7 +103,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             annotation,
         } => {
             let is_navigable = ref_binding.is_some();
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans(value));
             if is_navigable {
                 spans.push(Span::styled(
@@ -105,31 +112,22 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 ));
             }
             push_annotation_span(&mut spans, annotation.as_deref());
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::PrettyAttribute { key, value } => {
             // TUI uses a fixed 2-col prefix instead of the CLI's dynamic
             // tree-indent string, so the layout is approximated.
             let layout = carina_core::value::PrettyLayout::for_attribute(2, key);
             let pretty = value.render(layout);
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans(&pretty));
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::MapExpanded { key, entries } => {
-            let mut header_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
-            if is_selected {
-                header_line = header_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(header_line);
+            rows.push(
+                Row::new(Indent::new(2), vec![Span::raw(format!("{}:", key))])
+                    .highlighted(is_selected),
+            );
             let mut prev_needs_separator = false;
             for entry in entries {
                 // Inject a blank line after a multi-element list-of-maps
@@ -138,19 +136,19 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 // but not element ends (#2555). Mirrors the same logic
                 // in `carina-cli/src/display/mod.rs::MapExpanded`.
                 if prev_needs_separator {
-                    lines.push(Line::from(""));
+                    rows.push(Row::blank());
                 }
                 prev_needs_separator = entry.value.needs_trailing_separator();
                 let layout = carina_core::value::PrettyLayout::for_map_key(4, &entry.key);
                 let pretty = entry.value.render(layout);
-                let mut spans = vec![Span::raw(format!("    {}: ", entry.key))];
+                let mut spans = vec![Span::raw(format!("{}: ", entry.key))];
                 spans.extend(value_spans(&pretty));
                 push_annotation_span(&mut spans, entry.annotation.as_deref());
-                lines.push(Line::from(spans));
+                rows.push(Row::new(Indent::new(4), spans));
             }
         }
         DetailRow::Changed { key, old, new } => {
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
             spans.push(Span::raw(" -> "));
             let new_spans = value_spans(new);
@@ -160,14 +158,10 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             } else {
                 spans.extend(new_spans);
             }
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::ChangedForcesReplacement { key, old, new } => {
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
             spans.push(Span::raw(" -> "));
             spans.extend(value_spans_styled(new, ValueStyle::Yellow));
@@ -175,30 +169,27 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 " (forces replacement)",
                 Style::default().fg(Color::Magenta),
             ));
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::MapDiff { key, entries } => {
-            let mut first_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_map_diff_entries(lines, entries.as_slice());
+            rows.push(
+                Row::new(Indent::new(2), vec![Span::raw(format!("{}:", key))])
+                    .highlighted(is_selected),
+            );
+            render_map_diff_entries(rows, entries.as_slice());
         }
         DetailRow::MapDiffForcesReplacement { key, entries } => {
-            let mut first_line = Line::from(vec![
-                Span::raw(format!("  {}:", key)),
-                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
-            ]);
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_map_diff_entries(lines, entries.as_slice());
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![
+                        Span::raw(format!("{}:", key)),
+                        Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
+                    ],
+                )
+                .highlighted(is_selected),
+            );
+            render_map_diff_entries(rows, entries.as_slice());
         }
         DetailRow::StringListDiff {
             key,
@@ -206,12 +197,11 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             added,
             removed,
         } => {
-            let mut first_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_string_list_diff_entries(lines, unchanged, added, removed);
+            rows.push(
+                Row::new(Indent::new(2), vec![Span::raw(format!("{}:", key))])
+                    .highlighted(is_selected),
+            );
+            render_string_list_diff_entries(rows, unchanged, added, removed);
         }
         DetailRow::StringListDiffForcesReplacement {
             key,
@@ -219,103 +209,99 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             added,
             removed,
         } => {
-            let mut first_line = Line::from(vec![
-                Span::raw(format!("  {}:", key)),
-                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
-            ]);
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_string_list_diff_entries(lines, unchanged, added, removed);
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![
+                        Span::raw(format!("{}:", key)),
+                        Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
+                    ],
+                )
+                .highlighted(is_selected),
+            );
+            render_string_list_diff_entries(rows, unchanged, added, removed);
         }
         DetailRow::ListOfMapsDiff { key, block } => {
             render_list_of_maps_diff(
-                lines,
+                rows,
                 key,
                 block.unchanged(),
                 block.modified(),
                 block.added(),
                 block.removed(),
-                is_selected,
+                ListOfMapsDiffHeader::Standard {
+                    highlighted: is_selected,
+                },
             );
         }
         DetailRow::ListOfMapsDiffForcesReplacement { key, block } => {
-            let start = lines.len();
             render_list_of_maps_diff(
-                lines,
+                rows,
                 key,
                 block.unchanged(),
                 block.modified(),
                 block.added(),
                 block.removed(),
-                is_selected,
+                ListOfMapsDiffHeader::ForcesReplacement {
+                    highlighted: is_selected,
+                },
             );
-            if let Some(header) = lines.get_mut(start) {
-                header.spans = vec![
-                    Span::raw(format!("  {}: ", key)),
-                    Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
-                    Span::raw(" ["),
-                ];
-            }
         }
         DetailRow::ForceReplaceMapHeader { key }
         | DetailRow::ForceReplaceListOfMapsHeader { key } => {
-            let mut line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
-            ]);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![
+                        Span::raw(format!("{}: ", key)),
+                        Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
+                    ],
+                )
+                .highlighted(is_selected),
+            );
         }
         DetailRow::Removed { key, old } => {
             let mut spans = vec![Span::styled(
-                format!("  {}: ", key),
+                format!("{}: ", key),
                 Style::default()
                     .fg(Color::Red)
                     .add_modifier(Modifier::CROSSED_OUT),
             )];
             spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::Default { key, value } => {
-            let mut spans = vec![Span::styled(format!("  {}: ", key), dim_style)];
+            let mut spans = vec![Span::styled(format!("{}: ", key), dim_style)];
             spans.extend(value_spans_dimmed(value));
             spans.push(Span::styled("  # default", dim_style));
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::ReadOnly { key } => {
-            let mut line = Line::from(vec![
-                Span::styled(format!("  {}: ", key), dim_style),
-                Span::styled("(known after apply)", dim_style),
-            ]);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![
+                        Span::styled(format!("{}: ", key), dim_style),
+                        Span::styled("(known after apply)", dim_style),
+                    ],
+                )
+                .highlighted(is_selected),
+            );
         }
         DetailRow::HiddenUnchanged { count } => {
-            let mut line = Line::from(Span::styled(
-                format!("  {}", hidden_unchanged_summary(*count, "attribute")),
-                dim_style,
-            ));
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![Span::styled(
+                        hidden_unchanged_summary(*count, "attribute"),
+                        dim_style,
+                    )],
+                )
+                .highlighted(is_selected),
+            );
         }
         DetailRow::ReplaceRemoved { key, old } => {
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
             spans.extend([
                 Span::raw(" -> "),
@@ -326,22 +312,14 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                         .add_modifier(Modifier::CROSSED_OUT),
                 ),
             ]);
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::ReplaceCascade { key, old, new } => {
-            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            let mut spans = vec![Span::raw(format!("{}: ", key))];
             spans.extend(value_spans_styled(old, ValueStyle::RedStrikethrough));
             spans.push(Span::raw(" -> "));
             spans.extend(value_spans_styled(new, ValueStyle::Yellow));
-            let mut line = Line::from(spans);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
         DetailRow::TemporaryNameNote {
             can_rename,
@@ -349,27 +327,24 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             original_value,
             attribute,
         } => {
-            let mut line = if *can_rename {
-                Line::from(Span::styled(
+            let spans = if *can_rename {
+                vec![Span::styled(
                     format!(
-                        "  # New resource created with {attribute} = {temporary_value}, \
+                        "# New resource created with {attribute} = {temporary_value}, \
                          then renamed to {original_value} after old resource is deleted"
                     ),
                     dim_style,
-                ))
+                )]
             } else {
-                Line::from(Span::styled(
+                vec![Span::styled(
                     format!(
-                        "  # {attribute} = {temporary_value} (temporary); \
+                        "# {attribute} = {temporary_value} (temporary); \
                          original {original_value} reused after old resource deleted"
                     ),
                     dim_style,
-                ))
+                )]
             };
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
         }
     }
 }
@@ -381,6 +356,29 @@ mod tests {
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
+
+    use crate::ui::test_render::{first_content_cell, render_with_unstyled_indentation};
+
+    #[test]
+    fn removed_row_keeps_indentation_unstyled() {
+        let row = DetailRow::Removed {
+            key: "legacy".to_string(),
+            old: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
+                "gone".into(),
+            ))),
+        };
+        let mut rows = Vec::new();
+
+        render_detail_row_to_rows(&mut rows, &row, false);
+
+        let buffer =
+            render_with_unstyled_indentation(rows.into_iter().map(Row::into_line).collect());
+        let (column, key_cell) =
+            first_content_cell(&buffer, 0).expect("removed row has key content");
+        assert_eq!(column, 2, "removed row uses a two-column indent");
+        assert_eq!(key_cell.fg, Color::Red);
+        assert!(key_cell.modifier.contains(Modifier::CROSSED_OUT));
+    }
 
     /// A multi-element list-of-maps entry inside a `MapExpanded` row
     /// must be followed by a blank `Line` before the next sibling
@@ -417,8 +415,9 @@ mod tests {
             ],
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        render_detail_row_to_lines(&mut lines, &row, false);
+        let mut rows = Vec::new();
+        render_detail_row_to_rows(&mut rows, &row, false);
+        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
 
         let version_idx = lines
             .iter()
@@ -468,8 +467,9 @@ mod tests {
             ],
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        render_detail_row_to_lines(&mut lines, &row, false);
+        let mut rows = Vec::new();
+        render_detail_row_to_rows(&mut rows, &row, false);
+        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
 
         let last = lines.last().expect("at least one line");
         assert!(
@@ -490,8 +490,9 @@ mod tests {
             ))),
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        render_detail_row_to_lines(&mut lines, &row, false);
+        let mut rows = Vec::new();
+        render_detail_row_to_rows(&mut rows, &row, false);
+        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
 
         let line = lines.first().expect("changed row should render one line");
         let new_span = line
@@ -524,8 +525,9 @@ mod tests {
             .unwrap(),
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        render_detail_row_to_lines(&mut lines, &row, false);
+        let mut rows = Vec::new();
+        render_detail_row_to_rows(&mut rows, &row, false);
+        let lines = rows.into_iter().map(Row::into_line).collect::<Vec<_>>();
 
         let header = lines.first().expect("list-of-maps header should render");
         assert_eq!(

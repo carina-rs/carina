@@ -8,51 +8,51 @@ use carina_core::value::{PrettyLayout, RenderedValue};
 use ratatui::prelude::*;
 
 use super::push_annotation_span;
+use super::row::{Indent, Row};
 use super::value_view::{ValueStyle, value_lines_styled, value_spans_styled};
+
+pub(super) enum ListOfMapsDiffHeader {
+    Standard { highlighted: bool },
+    ForcesReplacement { highlighted: bool },
+}
 
 /// Render string-list diff entries (#2943) into TUI lines. Mirrors
 /// `carina-cli::display::render_string_list_diff_entries` — including
 /// the trailing-summary placement.
 pub(super) fn render_string_list_diff_entries(
-    lines: &mut Vec<Line>,
+    lines: &mut Vec<Row<'_>>,
     unchanged: &[RenderedValue],
     added: &[RenderedValue],
     removed: &[RenderedValue],
 ) {
     for s in removed {
-        let mut spans = vec![
-            Span::raw("    "),
-            Span::styled(
-                "- ",
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::CROSSED_OUT),
-            ),
-        ];
+        let mut spans = vec![Span::styled(
+            "- ",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::CROSSED_OUT),
+        )];
         spans.extend(value_spans_styled(s, ValueStyle::RedStrikethrough));
-        lines.push(Line::from(spans));
+        lines.push(Row::new(Indent::new(4), spans));
     }
     for s in added {
-        let mut spans = vec![
-            Span::raw("    "),
-            Span::styled("+ ", Style::default().fg(Color::Green)),
-        ];
+        let mut spans = vec![Span::styled("+ ", Style::default().fg(Color::Green))];
         spans.extend(value_spans_styled(s, ValueStyle::Green));
-        lines.push(Line::from(spans));
+        lines.push(Row::new(Indent::new(4), spans));
     }
     if !unchanged.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
+        lines.push(Row::new(
+            Indent::new(4),
+            vec![Span::styled(
                 hidden_unchanged_summary(unchanged.len(), "element"),
                 Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+            )],
+        ));
     }
 }
 
 /// Render map diff entries into TUI lines.
-pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffEntryIR]) {
+pub(super) fn render_map_diff_entries(lines: &mut Vec<Row<'_>>, entries: &[MapDiffEntryIR]) {
     for entry in entries {
         match entry {
             MapDiffEntryIR::Changed {
@@ -62,7 +62,6 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                 annotation,
             } => {
                 let mut spans = vec![
-                    Span::raw("    "),
                     Span::styled("~ ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!("{}: ", key)),
                 ];
@@ -70,7 +69,7 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                 spans.push(Span::raw(" -> "));
                 spans.extend(value_spans_styled(new, ValueStyle::Green));
                 push_annotation_span(&mut spans, annotation.as_deref());
-                lines.push(Line::from(spans));
+                lines.push(Row::new(Indent::new(4), spans));
             }
             MapDiffEntryIR::Added {
                 key,
@@ -78,17 +77,15 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                 annotation,
             } => {
                 let mut spans = vec![
-                    Span::raw("    "),
                     Span::styled("+ ", Style::default().fg(Color::Green)),
                     Span::raw(format!("{}: ", key)),
                 ];
                 spans.extend(value_spans_styled(value, ValueStyle::Green));
                 push_annotation_span(&mut spans, annotation.as_deref());
-                lines.push(Line::from(spans));
+                lines.push(Row::new(Indent::new(4), spans));
             }
             MapDiffEntryIR::Removed { key, value } => {
                 let mut spans = vec![
-                    Span::raw("    "),
                     Span::styled(
                         "- ",
                         Style::default()
@@ -103,19 +100,17 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                     ),
                 ];
                 spans.extend(value_spans_styled(value, ValueStyle::RedStrikethrough));
-                lines.push(Line::from(spans));
+                lines.push(Row::new(Indent::new(4), spans));
             }
             MapDiffEntryIR::NestedMapDiff { key, entries } => {
-                lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::raw(format!("{}:", key)),
-                ]));
+                lines.push(Row::new(
+                    Indent::new(6),
+                    vec![Span::raw(format!("{}:", key))],
+                ));
                 let mut nested_lines = Vec::new();
                 render_map_diff_entries(&mut nested_lines, entries.as_slice());
                 for line in nested_lines {
-                    let mut indented_spans = vec![Span::raw("    ")];
-                    indented_spans.extend(line.spans);
-                    lines.push(Line::from(indented_spans));
+                    lines.push(line.indented(Indent::new(4)));
                 }
             }
             MapDiffEntryIR::NestedListOfMapsDiff { key, block } => {
@@ -127,12 +122,10 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                     block.modified(),
                     block.added(),
                     block.removed(),
-                    false,
+                    ListOfMapsDiffHeader::Standard { highlighted: false },
                 );
                 for line in nested_lines {
-                    let mut indented_spans = vec![Span::raw("    ")];
-                    indented_spans.extend(line.spans);
-                    lines.push(Line::from(indented_spans));
+                    lines.push(line.indented(Indent::new(4)));
                 }
             }
             MapDiffEntryIR::StringListChanged {
@@ -142,16 +135,14 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
                 removed,
             } => {
                 // #3234.
-                lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::raw(format!("{}:", key)),
-                ]));
+                lines.push(Row::new(
+                    Indent::new(6),
+                    vec![Span::raw(format!("{}:", key))],
+                ));
                 let mut nested_lines = Vec::new();
                 render_string_list_diff_entries(&mut nested_lines, unchanged, added, removed);
                 for line in nested_lines {
-                    let mut indented_spans = vec![Span::raw("    ")];
-                    indented_spans.extend(line.spans);
-                    lines.push(Line::from(indented_spans));
+                    lines.push(line.indented(Indent::new(4)));
                 }
             }
         }
@@ -160,26 +151,36 @@ pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffE
 
 /// Render list-of-maps diff into TUI lines.
 pub(super) fn render_list_of_maps_diff(
-    lines: &mut Vec<Line>,
+    lines: &mut Vec<Row<'_>>,
     key: &str,
     unchanged: &[RenderedValue],
     modified: &[ListOfMapsDiffModified],
     added: &[ListOfMapsDiffItem],
     removed: &[ListOfMapsDiffItem],
-    is_selected: bool,
+    header: ListOfMapsDiffHeader,
 ) {
-    let mut first_line = Line::from(Span::raw(format!("  {}: [", key)));
-    if is_selected {
-        first_line = first_line.style(Style::default().bg(Color::DarkGray));
-    }
-    lines.push(first_line);
+    let (header_spans, highlighted) = match header {
+        ListOfMapsDiffHeader::Standard { highlighted } => {
+            (vec![Span::raw(format!("{}: [", key))], highlighted)
+        }
+        ListOfMapsDiffHeader::ForcesReplacement { highlighted } => (
+            vec![
+                Span::raw(format!("{}: ", key)),
+                Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
+                Span::raw(" ["),
+            ],
+            highlighted,
+        ),
+    };
+    lines.push(Row::new(Indent::new(2), header_spans).highlighted(highlighted));
     for item in unchanged {
-        let mut spans = vec![Span::raw("    ")];
+        let mut spans = Vec::new();
         spans.extend(value_spans_styled(item, ValueStyle::DarkGray));
-        lines.push(Line::from(spans));
+        lines.push(Row::new(Indent::new(4), spans));
     }
     for m in modified {
-        let mut spans = vec![Span::raw("    {")];
+        let mut spans = vec![Span::raw("{")];
+        let mut spans_indent = Indent::new(4);
         let mut emitted = 0usize;
         for field in m.fields.iter() {
             if emitted > 0 {
@@ -196,13 +197,12 @@ pub(super) fn render_list_of_maps_diff(
                 ListOfMapsDiffField::NestedMapChanged { key, entries } => {
                     // Flush current spans as a line, then render nested entries
                     spans.push(Span::raw(format!("{}: ", key)));
-                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    lines.push(Row::new(spans_indent, std::mem::take(&mut spans)));
+                    spans_indent = Indent::new(0);
                     let mut nested_lines = Vec::new();
                     render_map_diff_entries(&mut nested_lines, entries);
                     for line in nested_lines {
-                        let mut indented = vec![Span::raw("      ")];
-                        indented.extend(line.spans);
-                        lines.push(Line::from(indented));
+                        lines.push(line.indented(Indent::new(6)));
                     }
                 }
                 ListOfMapsDiffField::StringListChanged {
@@ -212,13 +212,12 @@ pub(super) fn render_list_of_maps_diff(
                     removed,
                 } => {
                     spans.push(Span::raw(format!("{}: ", key)));
-                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    lines.push(Row::new(spans_indent, std::mem::take(&mut spans)));
+                    spans_indent = Indent::new(0);
                     let mut nested_lines = Vec::new();
                     render_string_list_diff_entries(&mut nested_lines, unchanged, added, removed);
                     for line in nested_lines {
-                        let mut indented = vec![Span::raw("      ")];
-                        indented.extend(line.spans);
-                        lines.push(Line::from(indented));
+                        lines.push(line.indented(Indent::new(6)));
                     }
                 }
             }
@@ -236,10 +235,7 @@ pub(super) fn render_list_of_maps_diff(
             // row (`detail.rs::dim_style`) so both render identically.
             let dim = Style::default().fg(Color::DarkGray);
             if spans.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(summary, dim),
-                ]));
+                lines.push(Row::new(Indent::new(6), vec![Span::styled(summary, dim)]));
             } else {
                 if emitted > 0 {
                     spans.push(Span::raw(", "));
@@ -249,10 +245,10 @@ pub(super) fn render_list_of_maps_diff(
         }
         if !spans.is_empty() {
             spans.push(Span::raw("}"));
-            lines.push(Line::from(spans));
+            lines.push(Row::new(spans_indent, spans));
         } else {
             // Closing brace on its own line aligned with the opening.
-            lines.push(Line::from(Span::raw("    }")));
+            lines.push(Row::new(Indent::new(4), vec![Span::raw("}")]));
         }
     }
     for item in added {
@@ -261,7 +257,7 @@ pub(super) fn render_list_of_maps_diff(
     for item in removed {
         push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Removed);
     }
-    lines.push(Line::from(Span::raw("  ]")));
+    lines.push(Row::new(Indent::new(2), vec![Span::raw("]")]));
 }
 
 /// Render a wholly added or removed list-of-maps element as a multi-line
@@ -270,7 +266,7 @@ pub(super) fn render_list_of_maps_diff(
 /// field's value goes through `PrettyValue::render` so nested long lists
 /// or maps wrap to multiple indented lines instead of dumping inline.
 fn push_added_removed_block(
-    lines: &mut Vec<Line>,
+    lines: &mut Vec<Row<'_>>,
     item: &ListOfMapsDiffItem,
     kind: ListOfMapsDiffItemKind,
 ) {
@@ -280,24 +276,23 @@ fn push_added_removed_block(
     };
     let style = Style::default().fg(color).add_modifier(modifier);
 
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{} {{", marker), style),
-    ]));
+    lines.push(Row::new(
+        Indent::new(4),
+        vec![Span::styled(format!("{} {{", marker), style)],
+    ));
 
     // Constant indent — nesting (e.g. `NestedListOfMapsDiff`) is handled by
-    // the outer wrapper that prepends `"    "` to every line, shifting first-
+    // the outer wrapper that adds to each row's typed indent, shifting first-
     // line key and continuation indent together. So we don't need to thread a
     // dynamic prefix through here the way the CLI side does.
     let field_indent_cols = 6;
-    let field_indent = " ".repeat(field_indent_cols);
     let mut prev_needs_separator = false;
     for (key, value) in &item.fields {
         // Mirror `format_map_vertical`: insert a blank line before the
         // next sibling key when the previous value was a multi-element
         // list-of-maps so the boundary stays visible (#2555).
         if prev_needs_separator {
-            lines.push(Line::from(Span::raw("")));
+            lines.push(Row::blank());
         }
         prev_needs_separator = value.needs_trailing_separator();
         let layout = PrettyLayout::for_map_key(field_indent_cols, key);
@@ -311,31 +306,40 @@ fn push_added_removed_block(
             .enumerate()
         {
             if index == 0 {
-                let mut spans = vec![
-                    Span::raw(field_indent.clone()),
-                    Span::styled(format!("{}: ", key), style),
-                ];
+                let mut spans = vec![Span::styled(format!("{}: ", key), style)];
                 spans.append(&mut line.spans);
-                lines.push(Line::from(spans));
+                lines.push(Row::new(Indent::new(field_indent_cols), spans));
             } else {
-                lines.push(line);
+                lines.push(Row::new(Indent::new(0), line.spans));
             }
         }
     }
 
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled("}".to_string(), style),
-    ]));
+    lines.push(Row::new(
+        Indent::new(4),
+        vec![Span::styled("}".to_string(), style)],
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::detail_rows::{
+        DetailLevel, DetailRow, HistoricalDisplayAttributes, NonEmptyListOfMapsBlock,
+        build_detail_rows_by_instance,
+    };
+    use carina_core::effect::Effect;
+    use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
     use carina_core::value::{PrettyValue, RenderedKey};
+    use indexmap::IndexMap;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Paragraph;
+
+    use crate::ui::test_render::{
+        first_content_cell, leading_space_count, render_with_unstyled_indentation,
+    };
 
     fn rendered_string(value: &str) -> RenderedValue {
         carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(value.into())))
@@ -346,6 +350,261 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn into_lines<'a>(rows: Vec<Row<'a>>) -> Vec<Line<'a>> {
+        rows.into_iter().map(Row::into_line).collect()
+    }
+
+    fn string_value(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    fn map_value(entries: Vec<(&str, Value)>) -> Value {
+        Value::Concrete(ConcreteValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<IndexMap<_, _>>(),
+        ))
+    }
+
+    fn update_detail_rows(old: Value, new: Value) -> Vec<DetailRow> {
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let effect = Effect::Update {
+            identifier: crate::fixture_applied_identifier("example-id"),
+            from: Box::new(
+                State::existing(id, [("value".to_string(), old)].into_iter().collect())
+                    .with_identifier("example-id"),
+            ),
+            to: ResolvedResource::new(
+                Resource::new("test.Widget", "example").with_attribute("value", new),
+            ),
+            changed_attributes: vec!["value".to_string()],
+        };
+        let mut plan = Plan::new();
+        plan.add(effect);
+        let historical = HistoricalDisplayAttributes::for_plan(&plan);
+
+        build_detail_rows_by_instance(
+            &plan.effects()[0],
+            None,
+            DetailLevel::Explicit,
+            &historical,
+            None,
+        )
+    }
+
+    #[test]
+    fn nested_map_diff_keeps_wrapper_and_inner_indentation_unstyled() {
+        let old = map_value(vec![(
+            "nested",
+            map_value(vec![("removed", string_value("old"))]),
+        )]);
+        let new = map_value(vec![(
+            "nested",
+            map_value(vec![("added", string_value("new"))]),
+        )]);
+        let rows = update_detail_rows(old, new);
+        let entries = match rows.as_slice() {
+            [DetailRow::MapDiff { entries, .. }] => entries,
+            other => panic!("expected one map-diff row, got {other:?}"),
+        };
+        let nested_entries = match entries.as_slice() {
+            [MapDiffEntryIR::NestedMapDiff { entries, .. }] => entries.as_slice(),
+            other => panic!("expected one nested map diff, got {other:?}"),
+        };
+        assert!(
+            nested_entries
+                .iter()
+                .any(|entry| matches!(entry, MapDiffEntryIR::Removed { .. }))
+        );
+        assert!(
+            nested_entries
+                .iter()
+                .any(|entry| matches!(entry, MapDiffEntryIR::Added { .. }))
+        );
+
+        let mut rows = Vec::new();
+        render_map_diff_entries(&mut rows, entries.as_slice());
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let mut saw_removed = false;
+        let mut saw_added = false;
+
+        for row in 0..buffer.area.height {
+            let Some((column, cell)) = first_content_cell(&buffer, row) else {
+                continue;
+            };
+            match cell.symbol() {
+                "-" => {
+                    assert_eq!(column, 8, "nested removed marker indentation");
+                    assert_eq!(cell.fg, Color::Red);
+                    assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+                    saw_removed = true;
+                }
+                "+" => {
+                    assert_eq!(column, 8, "nested added marker indentation");
+                    assert_eq!(cell.fg, Color::Green);
+                    assert!(!cell.modifier.contains(Modifier::CROSSED_OUT));
+                    saw_added = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_removed, "expected a styled nested removed marker");
+        assert!(saw_added, "expected a styled nested added marker");
+    }
+
+    #[test]
+    fn nested_list_of_maps_removed_multiline_value_keeps_indentation_unstyled() {
+        let long_string_list = || {
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "a".repeat(60).into(),
+                "b".repeat(60).into(),
+                "c".repeat(60).into(),
+            ]))
+        };
+        let item = ListOfMapsDiffItem {
+            fields: vec![
+                (
+                    RenderedKey::from_raw("cfg"),
+                    PrettyValue::new(map_value(vec![
+                        ("first", long_string_list()),
+                        ("second", long_string_list()),
+                    ])),
+                ),
+                (
+                    RenderedKey::from_raw("values"),
+                    PrettyValue::new(long_string_list()),
+                ),
+            ],
+        };
+        let block = NonEmptyListOfMapsBlock::from_parts(vec![], vec![], vec![], vec![item])
+            .expect("removed item makes the block non-empty");
+        let entries = vec![MapDiffEntryIR::NestedListOfMapsDiff {
+            key: RenderedKey::from_raw("rules"),
+            block,
+        }];
+        let mut rows = Vec::new();
+
+        render_map_diff_entries(&mut rows, &entries);
+
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let mut saw_removed_marker = false;
+        let mut saw_field_row = false;
+        let mut saw_deep_indentation = false;
+        for row in 0..buffer.area.height {
+            let indent = leading_space_count(&buffer, row);
+            saw_deep_indentation |= indent >= 12;
+            let Some((column, cell)) = first_content_cell(&buffer, row) else {
+                continue;
+            };
+
+            if cell.symbol() == "-" {
+                assert_eq!(column, 8, "nested removed block marker indentation");
+                assert_eq!(cell.fg, Color::Red);
+                assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+                saw_removed_marker = true;
+            }
+            if column >= 10 {
+                assert_eq!(cell.fg, Color::Red);
+                assert!(
+                    cell.modifier.contains(Modifier::CROSSED_OUT),
+                    "first content cell is not crossed out at row {row}, column {column}"
+                );
+                saw_field_row = true;
+            }
+        }
+
+        assert!(saw_removed_marker, "expected a styled removed marker");
+        assert!(saw_field_row, "expected at least one removed field row");
+        assert!(
+            saw_deep_indentation,
+            "expected a continuation row indented by at least 12 columns"
+        );
+    }
+
+    #[test]
+    fn modified_list_nested_map_keeps_wrapper_indentation_unstyled() {
+        let old_item = map_value(vec![
+            ("id", string_value("same")),
+            (
+                "settings",
+                map_value(vec![
+                    ("keep", string_value("same")),
+                    ("removed", string_value("gone")),
+                ]),
+            ),
+        ]);
+        let new_item = map_value(vec![
+            ("id", string_value("same")),
+            ("settings", map_value(vec![("keep", string_value("same"))])),
+        ]);
+        let rows = update_detail_rows(
+            Value::Concrete(ConcreteValue::List(vec![old_item])),
+            Value::Concrete(ConcreteValue::List(vec![new_item])),
+        );
+        let block = match rows.as_slice() {
+            [DetailRow::ListOfMapsDiff { block, .. }] => block,
+            other => panic!("expected one list-of-maps diff row, got {other:?}"),
+        };
+        let modified = block.modified().first().expect("one modified item");
+        assert!(matches!(
+            modified.fields.as_slice(),
+            [ListOfMapsDiffField::NestedMapChanged { entries, .. }]
+                if entries.iter().any(|entry| matches!(entry, MapDiffEntryIR::Removed { .. }))
+        ));
+        let mut rows = Vec::new();
+
+        render_list_of_maps_diff(
+            &mut rows,
+            "value",
+            block.unchanged(),
+            block.modified(),
+            block.added(),
+            block.removed(),
+            ListOfMapsDiffHeader::Standard { highlighted: false },
+        );
+
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let mut saw_removed = false;
+        for row in 0..buffer.area.height {
+            let Some((column, cell)) = first_content_cell(&buffer, row) else {
+                continue;
+            };
+            if cell.symbol() == "-" {
+                assert_eq!(column, 10, "six-column wrapper plus map indentation");
+                assert_eq!(cell.fg, Color::Red);
+                assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+                saw_removed = true;
+            }
+        }
+        assert!(saw_removed, "expected a styled nested removed marker");
+    }
+
+    #[test]
+    fn string_list_diff_keeps_indentation_unstyled() {
+        let removed = [rendered_string("old")];
+        let added = [rendered_string("new")];
+        let mut rows = Vec::new();
+
+        render_string_list_diff_entries(&mut rows, &[], &added, &removed);
+
+        let buffer = render_with_unstyled_indentation(into_lines(rows));
+        let (removed_column, removed_cell) =
+            first_content_cell(&buffer, 0).expect("removed entry content");
+        assert_eq!(removed_column, 4);
+        assert_eq!(removed_cell.symbol(), "-");
+        assert_eq!(removed_cell.fg, Color::Red);
+        assert!(removed_cell.modifier.contains(Modifier::CROSSED_OUT));
+
+        let (added_column, added_cell) =
+            first_content_cell(&buffer, 1).expect("added entry content");
+        assert_eq!(added_column, 4);
+        assert_eq!(added_cell.symbol(), "+");
+        assert_eq!(added_cell.fg, Color::Green);
+        assert!(!added_cell.modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
@@ -367,9 +626,10 @@ mod tests {
                 value: rendered_string("gone"),
             },
         ];
-        let mut lines = Vec::new();
+        let mut rows = Vec::new();
 
-        render_map_diff_entries(&mut lines, &entries);
+        render_map_diff_entries(&mut rows, &entries);
+        let lines = into_lines(rows);
 
         assert_eq!(
             lines.iter().map(line_text).collect::<Vec<_>>(),
@@ -410,9 +670,18 @@ mod tests {
                 ),
             ],
         };
-        let mut lines = Vec::new();
+        let mut rows = Vec::new();
 
-        render_list_of_maps_diff(&mut lines, "rules", &[], &[], &[], &[item], false);
+        render_list_of_maps_diff(
+            &mut rows,
+            "rules",
+            &[],
+            &[],
+            &[],
+            &[item],
+            ListOfMapsDiffHeader::Standard { highlighted: false },
+        );
+        let lines = into_lines(rows);
 
         let width = 120;
         let height = u16::try_from(lines.len()).expect("rendered lines fit in terminal height");

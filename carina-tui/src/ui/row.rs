@@ -1,0 +1,153 @@
+//! Typed detail-pane rows with structurally unstyled indentation.
+
+use std::ops::Add;
+
+use ratatui::prelude::*;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Indent(usize);
+
+impl Indent {
+    pub(super) const fn new(cols: usize) -> Self {
+        Self(cols)
+    }
+}
+
+impl Add for Indent {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+pub(super) struct Row<'a> {
+    indent: Indent,
+    content: Vec<Span<'a>>,
+    highlighted: bool,
+}
+
+impl<'a> Row<'a> {
+    pub(super) fn new(indent: Indent, content: impl Into<Vec<Span<'a>>>) -> Self {
+        let content = content.into();
+        let mut normalized = Vec::with_capacity(content.len());
+        let mut leading_space_cols = 0;
+        let mut at_start = true;
+
+        for mut span in content {
+            if at_start {
+                let leading_spaces = span
+                    .content
+                    .bytes()
+                    .take_while(|byte| *byte == b' ')
+                    .count();
+                leading_space_cols += leading_spaces;
+
+                if leading_spaces == span.content.len() {
+                    continue;
+                }
+                if leading_spaces > 0 {
+                    span.content = span.content[leading_spaces..].to_string().into();
+                }
+                at_start = false;
+            }
+            normalized.push(span);
+        }
+
+        Self {
+            indent: indent + Indent::new(leading_space_cols),
+            content: normalized,
+            highlighted: false,
+        }
+    }
+
+    pub(super) fn blank() -> Self {
+        Self::new(Indent::new(0), Vec::new())
+    }
+
+    pub(super) fn indented(mut self, extra: Indent) -> Self {
+        self.indent = self.indent + extra;
+        self
+    }
+
+    pub(super) fn highlighted(mut self, on: bool) -> Self {
+        self.highlighted = on;
+        self
+    }
+
+    pub(super) fn into_line(mut self) -> Line<'a> {
+        let mut spans = Vec::with_capacity(self.content.len() + usize::from(self.indent.0 > 0));
+        if self.indent.0 > 0 {
+            spans.push(Span::raw(" ".repeat(self.indent.0)));
+        }
+        spans.append(&mut self.content);
+
+        let line = Line::from(spans);
+        if self.highlighted {
+            line.style(Style::default().bg(Color::DarkGray))
+        } else {
+            line
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_moves_styled_leading_spaces_into_unstyled_indent() {
+        let style = Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::CROSSED_OUT);
+
+        let line = Row::new(Indent::new(2), vec![Span::styled("  key", style)]).into_line();
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "    ");
+        assert_eq!(line.spans[0].style, Style::default());
+        assert_eq!(line.spans[1].content.as_ref(), "key");
+        assert_eq!(line.spans[1].style, style);
+    }
+
+    #[test]
+    fn new_peels_across_spans_and_drops_all_space_spans() {
+        let discarded_style = Style::default().fg(Color::Red);
+        let retained_style = Style::default().fg(Color::Green);
+
+        let line = Row::new(
+            Indent::new(1),
+            vec![
+                Span::styled("  ", discarded_style),
+                Span::raw(" "),
+                Span::styled("  key", retained_style),
+            ],
+        )
+        .into_line();
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "      ");
+        assert_eq!(line.spans[0].style, Style::default());
+        assert_eq!(line.spans[1].content.as_ref(), "key");
+        assert_eq!(line.spans[1].style, retained_style);
+    }
+
+    #[test]
+    fn indented_adds_columns() {
+        let line = Row::new(Indent::new(2), vec![Span::raw("key")])
+            .indented(Indent::new(3))
+            .into_line();
+
+        assert_eq!(line.spans[0].content.as_ref(), "     ");
+        assert_eq!(line.spans[1].content.as_ref(), "key");
+    }
+
+    #[test]
+    fn highlighted_applies_background_as_line_style() {
+        let line = Row::new(Indent::new(0), vec![Span::raw("key")])
+            .highlighted(true)
+            .into_line();
+
+        assert_eq!(line.style, Style::default().bg(Color::DarkGray));
+    }
+}
