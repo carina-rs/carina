@@ -700,7 +700,6 @@ fn node_from_effect(
         Effect::Wait {
             identity,
             target_id,
-            target_schema_kind: _,
             until: _,
             until_surface: _,
             timeout: _,
@@ -708,7 +707,7 @@ fn node_from_effect(
             explicit_dependencies: _,
         } => (
             identity.to_string(),
-            format!("wait on {}", target_id.display_type()),
+            format!("wait on {}", target_id.id().display_type()),
             EffectKind::Wait,
             Vec::new(),
             None,

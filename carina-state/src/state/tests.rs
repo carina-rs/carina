@@ -4059,7 +4059,6 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
             &plan_input_states,
-            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &state.build_directives(),

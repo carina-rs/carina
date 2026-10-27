@@ -132,7 +132,7 @@ if is_production {
 
 ## Wait Expression
 
-`wait` blocks downstream resources until a target resource reaches a condition. It is the right-hand side of a `let` binding:
+`wait` blocks downstream resources until a target resource reaches a condition. The target must be a managed resource; data sources declared with `read` and module calls are rejected. It is the right-hand side of a `let` binding:
 
 ```crn
 let cert = aws.acm.Certificate {

@@ -5256,7 +5256,6 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
             &plan_input_states,
-            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -7692,7 +7691,8 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 23 adds the mandatory
+    //! `carina plan` is the supported migration. Version 24 removes the wait
+    //! target schema kind (carina#3916); version 23 added the mandatory
     //! provider-schema fingerprint snapshot (carina#3983).
 
     use std::path::Path;
@@ -7707,8 +7707,8 @@ mod saved_plan_version_tests {
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            23,
-            "adding provider-schema fingerprints must bump the saved-plan format",
+            24,
+            "making wait targets managed-only must bump the saved-plan format",
         );
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
@@ -7755,7 +7755,7 @@ mod saved_plan_version_tests {
         else {
             panic!("expected typed version error, got {error:?}");
         };
-        assert_eq!((*found, *expected), (22, 23));
+        assert_eq!((*found, *expected), (22, 24));
         let expected_replan = format!("carina plan --out {} infra", plan_path.display());
         assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
         assert!(
@@ -8421,7 +8421,6 @@ mod saved_plan_version_tests {
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
                 &plan_input_states,
-                &std::collections::HashMap::new(),
                 &carina_core::differ::Orphans::new(),
             ),
             &std::collections::HashMap::new(),

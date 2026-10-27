@@ -199,38 +199,39 @@ fn removed_block_for_removed_provider_type_round_trips_through_saved_plan() {
 }
 
 #[test]
-fn saved_plan_records_data_source_kind_for_emitted_wait() {
+fn saved_plan_records_resource_kind_for_emitted_wait() {
     let scenario = Scenario::new(
-        r#"let roles = read mock.iam.Roles {
-  name_regex = ".*"
+        r#"let target = mock.test.resource {
+  name    = "target"
+  comment = "pending"
 }
 
-let roles_ready = wait roles {
-  until = roles.name_regex == "never"
+let target_ready = wait target {
+  until = target.comment == "ready"
 }
 
 let consumer = mock.test.resource {
   name    = "consumer"
-  comment = roles_ready.name_regex
+  comment = target_ready.comment
 }
 "#,
     );
 
     let plan = scenario.plan();
-    assert_success("plan --out with data-source wait", &plan);
+    assert_success("plan --out with managed-resource wait", &plan);
     let plan = scenario.saved_plan_json();
     let entries = plan["schema_fingerprints"]["providers"]["mock"]["schemas"]
         .as_array()
         .expect("saved schema entries")
         .iter()
-        .filter(|entry| entry["resource_type"] == "iam.Roles")
+        .filter(|entry| entry["resource_type"] == "test.resource")
         .collect::<Vec<_>>();
     assert_eq!(
         entries.len(),
         1,
         "wait target must be recorded once: {entries:?}"
     );
-    assert_eq!(entries[0]["kind"], "data_source");
+    assert_eq!(entries[0]["kind"], "resource");
 }
 
 #[test]

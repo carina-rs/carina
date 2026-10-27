@@ -29,6 +29,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::InvalidImportProviderIdentifier
             | PlanErrorKind::MissingDeposedProviderIdentifier { .. }
             | PlanErrorKind::WaitTargetMissing { .. }
+            | PlanErrorKind::WaitTargetIsDataSource { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }
             | PlanErrorKind::CreateInFlightOrphan

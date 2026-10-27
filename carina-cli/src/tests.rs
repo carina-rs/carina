@@ -505,7 +505,7 @@ fn plan_file_serde_round_trip() {
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(23));
+    assert_eq!(wire["version"], serde_json::json!(24));
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");
@@ -825,14 +825,13 @@ fn test_detailed_exitcode_read_only_no_changes() {
 fn test_detailed_exitcode_wait_only_no_changes() {
     use std::time::Duration;
 
-    use carina_core::resource::ResolvedResourceId;
+    use carina_core::wait::ManagedWaitTarget;
     use carina_core::wait::predicate::{AttrPath, WaitPredicate};
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
         identity: "cert_issued".into(),
-        target_schema_kind: carina_core::schema::SchemaKind::Resource,
-        target_id: ResolvedResourceId::with_identity("acm.Certificate", "cert"),
+        target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
             Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -1639,7 +1638,6 @@ fn orphaned_state_resource_produces_delete_effect() {
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
-            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -2457,7 +2455,6 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
-            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -2560,7 +2557,6 @@ fn refresh_false_uses_cached_state_from_state_file() {
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
-            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &directives_map,
@@ -2623,7 +2619,6 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
-            &HashMap::new(),
             &orphans,
         ),
         &directives_map,
@@ -2678,7 +2673,6 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
             ),
-            &HashMap::new(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -2955,7 +2949,6 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
                 &schemas,
                 &resources,
             ),
-            reloaded.data_source_states(),
             &carina_core::differ::Orphans::new(),
         ),
         &HashMap::new(),
@@ -3218,6 +3211,114 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         .validate_resource_identities()
         .expect_err("a saved plan must reject a missing resource identity");
     assert!(error.contains("sorted_resources[0]"), "got: {error}");
+}
+
+fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
+    use std::time::Duration;
+
+    use carina_core::wait::ManagedWaitTarget;
+    use carina_core::wait::predicate::{AttrPath, WaitPredicate};
+
+    let managed_target = resolved(Resource::with_provider(
+        "mock",
+        "test.resource",
+        "managed",
+        None,
+    ));
+    let target_id = managed_target.resolved_id().as_inner().clone();
+    let mut plan = Plan::new();
+    plan.add(Effect::Wait {
+        identity: "lookup_ready".into(),
+        target_id: ManagedWaitTarget::for_test(&managed_target),
+        until: WaitPredicate::equals(
+            AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ready".into())),
+        )
+        .unwrap(),
+        until_surface: "managed.status == \"ready\"".to_string(),
+        timeout: Duration::from_secs(60),
+        interval: Duration::from_secs(5),
+        explicit_dependencies: HashSet::new(),
+    });
+    PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        source_path: "main.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(Vec::new()),
+        backend_config: None,
+        plan,
+        sorted_resources: vec![managed_target.into_inner()],
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![CurrentStateEntry::managed(
+            target_id.clone(),
+            State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
+        )],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
+    }
+}
+
+fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFile {
+    let mut json = serde_json::to_value(plan_file).unwrap();
+    json["plan"]["effects"][0]["Wait"]["target_id"] = serde_json::to_value(target).unwrap();
+    serde_json::from_value(json)
+        .expect("the transparent wait target should deserialize before load validation")
+}
+
+#[test]
+fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
+    let data_source =
+        DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
+    let mut plan_file = plan_file_with_unchanged_managed_wait_target();
+    plan_file.data_sources.push(data_source.clone());
+    assert!(plan_file.data_source_origins.is_empty());
+
+    let decoded = replace_saved_wait_target(plan_file, &data_source.id);
+    let error = decoded
+        .validate_resource_identities()
+        .expect_err("a saved plan must reject a wait targeting a data source");
+    assert_eq!(
+        error,
+        format!(
+            "Invalid saved plan: wait `lookup_ready` targets `{}`, which is not a managed resource in this plan",
+            data_source.id
+        )
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_wait_target_missing_from_managed_resources() {
+    let unknown = ResourceId::with_provider_identity("mock", "test.resource", "unknown", None);
+    let decoded =
+        replace_saved_wait_target(plan_file_with_unchanged_managed_wait_target(), &unknown);
+
+    let error = decoded
+        .validate_resource_identities()
+        .expect_err("a saved plan must reject an unknown wait target");
+    assert_eq!(
+        error,
+        format!(
+            "Invalid saved plan: wait `lookup_ready` targets `{unknown}`, which is not a managed resource in this plan"
+        )
+    );
+}
+
+#[test]
+fn plan_file_validation_accepts_unchanged_managed_wait_target() {
+    let encoded = serde_json::to_value(plan_file_with_unchanged_managed_wait_target()).unwrap();
+    let decoded: PlanFile = serde_json::from_value(encoded).unwrap();
+
+    decoded
+        .validate_resource_identities()
+        .expect("a wait-only plan may target an unchanged managed resource");
 }
 
 /// Backend that captures the state written to it.

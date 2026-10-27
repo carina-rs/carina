@@ -2265,7 +2265,7 @@ async fn run_apply_locked_owned(
                 &resolved_unresolved_resources,
                 &data_sources_for_plan,
                 &provider,
-                PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
+                PlanPriorStates::new(&plan_input_current, &orphans),
                 &directives_map,
                 schemas,
                 &saved_attrs,
@@ -3086,8 +3086,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 23 persists the
-    // provider-schema fingerprints checked before saved-plan execution.
+    // Validate version compatibility. Plan-file version 24 removes the
+    // redundant wait target schema kind now that waits are managed-only.
+    // Version 23 persists the provider-schema fingerprints checked before
+    // saved-plan execution.
     // Version 22 persists deferred coalesce operands and complete deferred-for
     // iterable expressions. Version 21 represents an
     // in-flight managed current instance as an address-level marker and never

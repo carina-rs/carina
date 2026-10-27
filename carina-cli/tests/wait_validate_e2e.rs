@@ -70,7 +70,11 @@ impl ProviderFactory for WaitTestFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![cert_schema(), nested_holder_schema()]
+        vec![
+            cert_schema(),
+            cert_data_source_schema(),
+            nested_holder_schema(),
+        ]
     }
 }
 
@@ -94,6 +98,13 @@ fn cert_schema() -> ResourceSchema {
             "certificate_arn",
             AttributeType::string(),
         ))
+}
+
+fn cert_data_source_schema() -> ResourceSchema {
+    ResourceSchema::new("acm.Certificate")
+        .as_data_source()
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("status", AttributeType::string()))
 }
 
 fn nested_holder_schema() -> ResourceSchema {
@@ -277,6 +288,34 @@ fn validate_flags_wait_unknown_target() {
         diags.iter().any(|d| d.contains("nonexistent")),
         "validate must surface unknown wait target; got: {:?}",
         diags
+    );
+}
+
+#[test]
+fn validate_rejects_data_source_wait_target_from_sibling_file() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws {}\n"),
+        (
+            "data.crn",
+            r#"let lookup = read aws.acm.Certificate {
+    domain_name = "example.com"
+}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let found = wait lookup {
+    until = lookup.status == "ISSUED"
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = cli_validate(&fixture);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            == "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources"),
+        "validate must reject a sibling data source as a wait target; got: {diagnostics:?}"
     );
 }
 

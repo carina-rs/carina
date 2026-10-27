@@ -232,12 +232,12 @@ pub struct PlanFile {
     #[serde(default)]
     pub wait_bindings: Vec<PlanWaitBinding>,
     /// Canonical fingerprints of exactly the managed and data-source schemas
-    /// this plan used. This field is mandatory in plan format 23.
+    /// this plan used. This field is mandatory since plan format 23.
     pub schema_fingerprints: PlanSchemaFingerprints,
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 23;
+    pub const CURRENT_VERSION: u32 = 24;
 
     /// Capture the exact schema type inventory reached by this plan.
     pub fn record_schema_fingerprints(&mut self, schemas: &carina_core::schema::SchemaRegistry) {
@@ -317,14 +317,17 @@ impl PlanFile {
                 Effect::Wait {
                     identity: _identity,
                     target_id,
-                    target_schema_kind,
                     until: _until,
                     until_surface: _until_surface,
                     timeout: _timeout,
                     interval: _interval,
                     explicit_dependencies: _explicit_dependencies,
                 } => {
-                    insert(&mut references, target_id, *target_schema_kind);
+                    insert(
+                        &mut references,
+                        target_id.id().as_inner(),
+                        SchemaKind::Resource,
+                    );
                 }
                 Effect::DeferredReplace(payload) => {
                     insert(
@@ -653,10 +656,30 @@ impl PlanFile {
                     require_identity(&from.id, &format!("{location}.from"))?;
                     require_identity(&to.id, &format!("{location}.to"))?;
                 }
-                Effect::Delete { id, .. }
-                | Effect::Import { id, .. }
-                | Effect::Remove { id }
-                | Effect::Wait { target_id: id, .. } => require_identity(id, &location)?,
+                Effect::Delete { id, .. } | Effect::Import { id, .. } | Effect::Remove { id } => {
+                    require_identity(id, &location)?
+                }
+                Effect::Wait {
+                    identity,
+                    target_id,
+                    until: _until,
+                    until_surface: _until_surface,
+                    timeout: _timeout,
+                    interval: _interval,
+                    explicit_dependencies: _explicit_dependencies,
+                } => {
+                    let target = target_id.id().as_inner();
+                    require_identity(target, &location)?;
+                    if !self
+                        .sorted_resources
+                        .iter()
+                        .any(|resource| &resource.id == target)
+                    {
+                        return Err(format!(
+                            "Invalid saved plan: wait `{identity}` targets `{target}`, which is not a managed resource in this plan"
+                        ));
+                    }
+                }
                 Effect::Move { from, to } => {
                     require_identity(from, &format!("{location}.from"))?;
                     require_identity(to, &format!("{location}.to"))?;

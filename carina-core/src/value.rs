@@ -2568,7 +2568,6 @@ pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) ->
         Effect::Wait {
             identity: _identity,
             target_id: _target_id,
-            target_schema_kind: _target_schema_kind,
             until,
             until_surface: _until_surface,
             timeout: _timeout,

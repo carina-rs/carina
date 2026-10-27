@@ -397,27 +397,24 @@ fn extend_disjoint_states<T>(
 
 /// The complete prior-state input to planning.
 ///
-/// Planning-ready managed current states, transient data-source states, and
-/// typed orphans remain separately owned before the differ, but callers must
-/// pass all three views to [`create_plan`]. The differ materializes same-id
-/// orphans as current state for managed resources and emits orphan deletes
-/// only for ids that remain unmanaged.
+/// Planning-ready managed current states and typed orphans remain separately
+/// owned before the differ, but callers must pass both views to
+/// [`create_plan`]. The differ materializes same-id orphans as current state
+/// for managed resources and emits orphan deletes only for ids that remain
+/// unmanaged.
 #[derive(Clone, Copy)]
 pub struct PlanPriorStates<'a> {
     current_states: &'a HashMap<ResourceId, PlanInputCurrent>,
-    data_source_states: &'a HashMap<ResourceId, State>,
     orphans: &'a Orphans,
 }
 
 impl<'a> PlanPriorStates<'a> {
     pub fn new(
         current_states: &'a HashMap<ResourceId, PlanInputCurrent>,
-        data_source_states: &'a HashMap<ResourceId, State>,
         orphans: &'a Orphans,
     ) -> Self {
         Self {
             current_states,
-            data_source_states,
             orphans,
         }
     }
@@ -443,10 +440,6 @@ impl<'a> PlanPriorStates<'a> {
 
     fn orphans(self) -> &'a Orphans {
         self.orphans
-    }
-
-    fn data_source_states(self) -> &'a HashMap<ResourceId, State> {
-        self.data_source_states
     }
 }
 
@@ -607,7 +600,7 @@ fn create_plan_for_tests(
         &managed,
         data_sources,
         provider,
-        PlanPriorStates::new(current_states, &HashMap::new(), orphans),
+        PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,

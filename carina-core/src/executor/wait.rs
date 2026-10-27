@@ -21,11 +21,13 @@ use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
-use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
+#[cfg(test)]
+use crate::resource::ResolvedResourceId;
+use crate::resource::{Current, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
-use crate::wait::WaitObservation;
 use crate::wait::predicate::WaitPredicate;
+use crate::wait::{ManagedWaitTarget, WaitObservation};
 
 pub(crate) type WaitIdentifierResolver<'a> =
     dyn Fn(&ResourceId) -> Option<AppliedIdentifier> + Send + Sync + 'a;
@@ -33,9 +35,8 @@ pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<App
 
 pub(super) fn initial_wait_identifiers(
     managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
 ) -> SharedWaitIdentifiers {
-    let mut identifiers: HashMap<ResourceId, Option<AppliedIdentifier>> = managed_current
+    let identifiers: HashMap<ResourceId, Option<AppliedIdentifier>> = managed_current
         .iter()
         .map(|(id, current)| {
             let identifier = match current {
@@ -47,13 +48,6 @@ pub(super) fn initial_wait_identifiers(
             (id.clone(), identifier)
         })
         .collect();
-    identifiers.extend(data_source_states.iter().map(|(id, state)| {
-        let identifier = state
-            .identifier
-            .as_deref()
-            .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
-        (id.clone(), identifier)
-    }));
     Arc::new(Mutex::new(identifiers))
 }
 
@@ -359,7 +353,7 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 pub async fn execute_wait_effect(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
-    target_id: &ResolvedResourceId,
+    target: &ManagedWaitTarget,
     identifier_resolver: &WaitIdentifierResolver<'_>,
     until: &WaitPredicate,
     timeout: Duration,
@@ -367,6 +361,7 @@ pub async fn execute_wait_effect(
     cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver,
 ) -> WaitOutcome {
+    let target_id = target.id();
     execute_wait_effect_with_heartbeat_cadence(
         cleanup_loop,
         provider,
@@ -500,7 +495,7 @@ mod tests {
         AppliedState, BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
         UpdateRequest,
     };
-    use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
+    use crate::resource::{ConcreteValue, DeferredValue, ResolvedResource, UnknownReason, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -508,6 +503,12 @@ mod tests {
     use tokio::sync::{oneshot, watch};
 
     const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
+
+    fn managed_wait_target() -> ManagedWaitTarget {
+        ManagedWaitTarget::new(&ResolvedResource::from_id(ResolvedResourceId::new(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+        )))
+    }
 
     fn provider_identifier(_: &ResourceId) -> Option<AppliedIdentifier> {
         Some(
@@ -517,20 +518,22 @@ mod tests {
     }
 
     #[test]
-    fn initial_wait_identifiers_include_separate_data_source_states() {
-        let id = ResourceId::with_identity("test.lookup", "target");
-        let data_source_states = HashMap::from([(
+    fn initial_wait_identifiers_include_managed_current() {
+        let id = ResourceId::with_identity("test.resource", "target");
+        let managed_current = HashMap::from([(
             id.clone(),
-            State::existing(id.clone(), HashMap::new()).with_identifier("lookup-id"),
+            Current::from_state(
+                State::existing(id.clone(), HashMap::new()).with_identifier("managed-id"),
+            ),
         )]);
 
-        let identifiers = initial_wait_identifiers(&HashMap::new(), &data_source_states);
+        let identifiers = initial_wait_identifiers(&managed_current);
 
         assert_eq!(
             resolve_wait_identifier(&identifiers, &id)
-                .expect("data-source identifier must be available to waits")
+                .expect("managed identifier must be available to waits")
                 .as_str(),
-            "lookup-id"
+            "managed-id"
         );
     }
 
@@ -737,8 +740,7 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::pending();
             let pred = equals_status("ISSUED");
-            let target =
-                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+            let target = managed_wait_target();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -793,8 +795,7 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING")]);
             let pred = equals_status("ISSUED");
-            let target =
-                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+            let target = managed_wait_target();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -864,8 +865,7 @@ mod tests {
                 .expect("failed to build wait-test runtime");
             let result = runtime.block_on(async move {
                 let pred = equals_status("ISSUED");
-                let target =
-                    ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+                let target = managed_wait_target();
                 let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
                 let observer = NoopWaitObserver;
                 let cleanup_loop = shutdown.cleanup_aware_loop();
@@ -910,8 +910,7 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
             let pred = equals_status("ISSUED");
-            let target =
-                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+            let target = managed_wait_target();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -954,7 +953,7 @@ mod tests {
     async fn wait_returns_immediately_when_until_already_true() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+        let target = managed_wait_target();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -989,7 +988,7 @@ mod tests {
             state_with_status("ISSUED"),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+        let target = managed_wait_target();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1017,7 +1016,7 @@ mod tests {
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+        let target = managed_wait_target();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1131,7 +1130,7 @@ mod tests {
             State::not_found(ResourceId::with_identity("acm.Certificate", "cert")),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+        let target = managed_wait_target();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1158,7 +1157,7 @@ mod tests {
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
+        let target = managed_wait_target();
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);

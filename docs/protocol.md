@@ -113,6 +113,11 @@ current provider binary. A changed presence or fingerprint rejects the saved
 plan before normalizer construction, secret evaluation, or CRUD-capable
 provider construction.
 
+Saved-plan format 24 removes `target_schema_kind` from serialized
+`Effect::Wait` values. Wait targets are always managed resources, so their
+schema kind is always `Resource`; data sources are rejected as wait targets
+(carina#3916).
+
 Hosts and providers must both use protocol v10. The minimum supported protocol
 version is 10.
 

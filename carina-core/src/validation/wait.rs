@@ -4,6 +4,8 @@
 //!
 //! - **target not found**: `wait foo { ... }` where `foo` is not a
 //!   known resource binding in the merged directory parse.
+//! - **unsupported data-source target**: a `read` binding has no managed
+//!   provider identity for the wait executor to poll.
 //! - **attribute not in target schema**: `until = cert.statu == ...`
 //!   where the target's schema has `status` but not `statu`.
 //! - **unresolved enum identifier**: an unquoted RHS is not a member of the
@@ -17,6 +19,7 @@
 //! error surfaces via the regular parser diagnostic path.
 
 use crate::parser::{File, ResourceRef};
+use crate::plan::PlanErrorKind;
 use crate::schema::{SchemaKind, SchemaRegistry};
 use crate::wait::predicate::resolve_wait_predicate;
 
@@ -24,8 +27,8 @@ enum WaitTarget {
     Pollable {
         provider: String,
         resource_type: String,
-        schema_kind: SchemaKind,
     },
+    DataSource,
     Composition,
 }
 
@@ -54,12 +57,9 @@ pub fn validate_wait_bindings<E>(
     let mut out: Vec<WaitDiagnostic> = Vec::new();
 
     // Build the binding → wait-target lookup once.
-    // carina#3181: walk the typed top-level slices so a data-source
-    // target (`let x = read ...`) is still found, and carry its
-    // `SchemaKind` so the schema lookup below uses the matching kind.
-    // Compositions are retained as a distinct target so validation can
-    // reject them explicitly instead of silently treating their missing
-    // provider schema as a reason to skip the predicate check.
+    // Walk the typed top-level slices so unsupported data-source and
+    // composition targets remain distinct from a missing binding. Both are
+    // rejected explicitly before managed-resource predicate validation.
     let mut by_binding: std::collections::HashMap<String, WaitTarget> =
         std::collections::HashMap::new();
     for rref in parsed.iter_top_level_resources() {
@@ -69,13 +69,8 @@ pub fn validate_wait_bindings<E>(
                 ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    schema_kind: SchemaKind::Resource,
                 },
-                ResourceRef::DataSource(_) => WaitTarget::Pollable {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                    schema_kind: SchemaKind::DataSource,
-                },
+                ResourceRef::DataSource(_) => WaitTarget::DataSource,
                 ResourceRef::Composition(_) => WaitTarget::Composition,
             };
             by_binding.insert(b.to_string(), target);
@@ -96,25 +91,35 @@ pub fn validate_wait_bindings<E>(
             });
             continue;
         };
-        let WaitTarget::Pollable {
-            provider,
-            resource_type,
-            schema_kind,
-        } = target
-        else {
-            out.push(WaitDiagnostic {
-                message: format!(
-                    "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
-                    wb.binding, wb.target
-                ),
-                binding_name: wb.binding.as_str().to_string(),
-                target: wb.target.as_str().to_string(),
-                attribute: None,
-                rhs: None,
-            });
-            continue;
+        let pollable = match target {
+            WaitTarget::Pollable {
+                provider,
+                resource_type,
+            } => Ok((provider, resource_type)),
+            WaitTarget::DataSource => Err(PlanErrorKind::WaitTargetIsDataSource {
+                wait_binding: wb.binding.to_string(),
+                target: wb.target.to_string(),
+            }
+            .to_string()),
+            WaitTarget::Composition => Err(format!(
+                "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
+                wb.binding, wb.target
+            )),
         };
-        let Some(schema) = schemas.get(provider, resource_type, *schema_kind) else {
+        let (provider, resource_type) = match pollable {
+            Ok(target) => target,
+            Err(message) => {
+                out.push(WaitDiagnostic {
+                    message,
+                    binding_name: wb.binding.as_str().to_string(),
+                    target: wb.target.as_str().to_string(),
+                    attribute: None,
+                    rhs: None,
+                });
+                continue;
+            }
+        };
+        let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
             // No schema for this resource type — skip the attr check.
             // The user already gets a separate "unknown resource type"
             // diagnostic from the upstream identifier-scope pass.
@@ -329,18 +334,11 @@ let ready = wait job {
     }
 
     #[test]
-    fn data_source_wait_uses_data_source_schema_when_managed_type_matches() {
+    fn data_source_wait_is_rejected_while_managed_wait_is_accepted() {
         let managed_status = AttributeType::enum_(
             TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
             Some(vec!["READY".to_string()]),
             vec![("READY".to_string(), "ready".to_string())],
-            None,
-            None,
-        );
-        let data_source_status = AttributeType::enum_(
-            TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
-            Some(vec!["FOUND".to_string()]),
-            vec![("FOUND".to_string(), "found".to_string())],
             None,
             None,
         );
@@ -350,14 +348,12 @@ let ready = wait job {
             ResourceSchema::new("lookup.Job")
                 .attribute(AttributeSchema::new("status", managed_status)),
         );
-        schemas.insert(
-            "test",
-            ResourceSchema::new("lookup.Job")
-                .as_data_source()
-                .attribute(AttributeSchema::new("status", data_source_status)),
-        );
         let parsed = parse(
             r#"
+let managed = test.lookup.Job {}
+let ready = wait managed {
+    until = managed.status == test.lookup.Job.Status.ready
+}
 let lookup = read test.lookup.Job {}
 let found = wait lookup {
     until = lookup.status == test.lookup.Job.Status.found
@@ -367,6 +363,15 @@ let found = wait lookup {
         )
         .expect("fixture must parse");
 
-        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+        assert_eq!(
+            validate_wait_bindings(&parsed, &schemas),
+            vec![WaitDiagnostic {
+                message: "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources".to_string(),
+                binding_name: "found".to_string(),
+                target: "lookup".to_string(),
+                attribute: None,
+                rhs: None,
+            }]
+        );
     }
 }
