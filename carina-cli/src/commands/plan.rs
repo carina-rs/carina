@@ -27,12 +27,9 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{
-    BackendConfig as StateBackendConfig, ResourceState, StateBackend, StateFile, create_backend,
-    read_published_exports,
-};
+use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 
-use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
+use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -1743,39 +1740,25 @@ pub async fn run_plan(
     )?;
     let parsed = canonical_resources.parsed();
 
-    let mut plan_backend_config = parsed
-        .backend
-        .as_ref()
-        .map(StateBackendConfig::try_from)
-        .transpose()
-        .map_err(carina_state::BackendError::from)?;
-    let mut plan_file_backend_config = parsed.backend.clone();
-    let mut use_locked_backend = false;
-    let drift_note = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
-        BackendDriftStatus::Fresh => {
-            return Err(AppError::Config(format!(
-                "Backend lock file not found. Run `{}` to initialize the project.",
-                ProjectCommand::new("init", path)
-            )));
-        }
-        BackendDriftStatus::Unchanged => None,
-        BackendDriftStatus::Drifted {
-            existing,
-            configured,
-        } => {
-            let warning = drift_warning(&existing, &configured, path);
-            eprintln!("{}", warning.yellow());
-            let locked_config = existing.to_state_config()?;
-            plan_file_backend_config = Some(locked_config.to_parser_config());
-            plan_backend_config = Some(locked_config);
-            use_locked_backend = true;
-            Some(format!(
-                "Backend migration pending: plan read state from the OLD backend recorded in \
-                 carina-backend.lock. Run `{}` before apply.",
-                ProjectCommand::new("init --migrate-state", path)
-            ))
-        }
-    };
+    let plan_backend = resolve_backend_for_read(
+        base_dir,
+        path,
+        parsed.backend.as_ref(),
+        BackendLockRequirement::RequirePresent,
+        ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
+    )
+    .await?;
+    let plan_file_backend_config = plan_backend
+        .selected_config()
+        .map(carina_state::BackendConfig::to_parser_config);
+    let use_locked_backend = plan_backend.migration_pending();
+    let drift_note = use_locked_backend.then(|| {
+        format!(
+            "Backend migration pending: plan read state from the OLD backend recorded in \
+             carina-backend.lock. Run `{}` before apply.",
+            ProjectCommand::new("init --migrate-state", path)
+        )
+    });
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -1783,12 +1766,11 @@ pub async fn run_plan(
     let mut state_bucket_name = String::new();
     let mut state_file: Option<StateFile> = None;
 
-    let plan_backend: Box<dyn StateBackend> = if let Some(config) = plan_backend_config.as_ref() {
-        let backend = create_backend(Some(config), base_dir)
+    if let Some(config) = plan_backend.selected_config() {
+        let bucket_exists = plan_backend
+            .bucket_exists()
             .await
             .map_err(AppError::Backend)?;
-
-        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
         if bucket_exists {
             // Try to load state from backend. `plan` is read-only and
@@ -1796,7 +1778,7 @@ pub async fn run_plan(
             // so it drops the migration token via `into_state()` —
             // carina#3315 routes persistence through the lock-held
             // `apply` / `destroy` / `state refresh` paths.
-            state_file = backend
+            state_file = plan_backend
                 .read_state()
                 .await
                 .map_err(AppError::Backend)?
@@ -1815,7 +1797,7 @@ pub async fn run_plan(
                 .ok_or("Backend does not manage an S3 bucket")?;
             let bucket_name = settings.bucket().to_string();
 
-            let backend_resource_type = backend
+            let backend_resource_type = plan_backend
                 .resource_type()
                 .ok_or("Backend does not specify a resource type")?;
             #[rustfmt::skip]
@@ -1843,21 +1825,16 @@ pub async fn run_plan(
                 }
             }
         }
-        backend
     } else {
         // Use local backend by default. Plan is read-only; drop any
         // pending-migration token (carina#3315 — lock-held callers
         // persist instead).
-        let backend = create_backend(None, base_dir)
-            .await
-            .map_err(AppError::Backend)?;
-        state_file = backend
+        state_file = plan_backend
             .read_state()
             .await
             .map_err(AppError::Backend)?
             .map(|loaded| loaded.into_state());
-        backend
-    };
+    }
 
     // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
     let state_snapshot_t0 = StateSnapshot::capture(state_file.as_ref());
@@ -2723,7 +2700,8 @@ pub(crate) async fn load_upstream_states(
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
 
-        let published_exports = read_published_exports(backend.as_ref())
+        let published_exports = backend
+            .read_published_exports()
             .await
             .map_err(AppError::Backend)?;
         match (published_exports, policy) {
@@ -2765,7 +2743,7 @@ async fn build_upstream_backend(
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
-) -> Result<Box<dyn StateBackend>, AppError> {
+) -> Result<ResolvedReadBackend, AppError> {
     let loaded = load_configuration_with_config(
         source_abs,
         provider_context,
@@ -2788,22 +2766,20 @@ async fn build_upstream_backend(
     ))
     .await?;
 
-    // Anchor local-backend state paths at the upstream's source directory
-    // so `path = "foo.json"` resolves relative to the upstream, not the
-    // downstream process's CWD.
-    let upstream_backend_config = loaded
-        .parsed
-        .backend
-        .as_ref()
-        .map(StateBackendConfig::try_from)
-        .transpose()
-        .map_err(carina_state::BackendError::from)?;
-    let backend: Box<dyn StateBackend> =
-        create_backend(upstream_backend_config.as_ref(), source_abs)
-            .await
-            .map_err(AppError::Backend)?;
-
-    Ok(backend)
+    // Anchor local-backend state paths and the backend lock at the upstream's
+    // source directory. A pending migration in the upstream must read the old
+    // locked backend just like a top-level read command.
+    resolve_backend_for_read(
+        source_abs,
+        source_abs,
+        loaded.parsed.backend.as_ref(),
+        BackendLockRequirement::AllowMissing,
+        ReadBackendWarningPolicy::UpstreamSource {
+            source_dir: source_abs,
+        },
+    )
+    .await
+    .map_err(|error| error.with_upstream_state_source(source_abs))
 }
 
 /// Walk an upstream's transitive `upstream_state` chain *without*
@@ -3131,6 +3107,55 @@ mod load_upstream_states_tests {
         assert_eq!(
             result["orgs"]["account_id"],
             Value::Concrete(ConcreteValue::String("123".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_uses_locked_backend_while_migration_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "new.state.json" }"#,
+        )
+        .unwrap();
+
+        let mut state = StateFile::new();
+        state.insert_export_json_for_test("account_id", serde_json::json!("from-old-backend"));
+        fs::write(
+            dir.path().join("old.state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let old_backend = carina_core::parser::parse(
+            r#"backend local { path = "old.state.json" }"#,
+            &ProviderContext::default(),
+        )
+        .unwrap()
+        .backend
+        .unwrap();
+        carina_state::BackendLock::for_config(Some(&old_backend))
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: dir.path().to_path_buf(),
+        }];
+        let result = load_upstream_states(
+            &upstream_states,
+            dir.path().parent().unwrap(),
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result["orgs"]["account_id"],
+            Value::Concrete(ConcreteValue::String("from-old-backend".into()))
         );
     }
 

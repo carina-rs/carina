@@ -4,6 +4,8 @@
 use std::fs;
 use std::process::{Command, Output};
 
+use carina_cli::commands::plan::PlanFile;
+use carina_core::effect::Effect;
 use carina_core::resource::{ConcreteValue, Value};
 use carina_state::{BackendLock, LockInfo, ResourceState, StateFile};
 use tempfile::TempDir;
@@ -13,6 +15,10 @@ fn carina(project: &std::path::Path, args: &[&str]) -> Output {
     cmd.current_dir(project)
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
+        .env(
+            "CARINA_MOCK_STATE_FILE",
+            project.join("mock-provider-state.json"),
+        )
         .args(args)
         .output()
         .expect("failed to execute carina")
@@ -115,6 +121,116 @@ fn write_clean_fixture(include_resource: bool) -> TempDir {
     write_project(project, "state.json", include_resource);
     local_backend_lock("state.json").save(project).unwrap();
     tmp
+}
+
+fn write_applied_read_drift_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"state-a.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("main.crn"),
+        r#"let from_a = mock.test.resource {
+  name = "resource-from-a"
+}
+
+exports {
+  from_a_name: String = from_a.name
+}
+"#,
+    )
+    .unwrap();
+
+    let init = carina(project, &["init", "."]);
+    assert!(
+        init.status.success(),
+        "fixture init failed.\nstdout: {}\nstderr: {}",
+        stdout(&init),
+        stderr(&init),
+    );
+    let apply = carina(project, &["apply", "--auto-approve", "--lock=false", "."]);
+    assert!(
+        apply.status.success(),
+        "fixture apply failed.\nstdout: {}\nstderr: {}",
+        stdout(&apply),
+        stderr(&apply),
+    );
+    assert!(project.join("state-a.json").is_file());
+
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"state-b.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    assert!(!project.join("state-b.json").exists());
+
+    tmp
+}
+
+fn write_upstream_drift_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let upstream = tmp.path().join("upstream");
+    let downstream = tmp.path().join("downstream");
+    fs::create_dir_all(&upstream).unwrap();
+    fs::create_dir_all(&downstream).unwrap();
+
+    fs::write(
+        upstream.join("backend.crn"),
+        "backend local { path = \"state-b.json\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        upstream.join("main.crn"),
+        "exports { resource_name: String = \"declared-shape\" }\n",
+    )
+    .unwrap();
+    let mut upstream_state = StateFile::new();
+    upstream_state.insert_export_json_for_test(
+        "resource_name",
+        serde_json::json!("from-upstream-backend-a"),
+    );
+    fs::write(
+        upstream.join("state-a.json"),
+        serde_json::to_string_pretty(&upstream_state).unwrap(),
+    )
+    .unwrap();
+    local_backend_lock("state-a.json").save(&upstream).unwrap();
+
+    fs::write(
+        downstream.join("backend.crn"),
+        "backend local { path = \"downstream.state.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    fs::write(
+        downstream.join("main.crn"),
+        r#"let upstream = upstream_state {
+  source = "../upstream"
+}
+
+let from_upstream = mock.test.resource {
+  name = upstream.resource_name
+}
+"#,
+    )
+    .unwrap();
+    local_backend_lock("downstream.state.json")
+        .save(&downstream)
+        .unwrap();
+
+    (tmp, upstream, downstream)
+}
+
+fn assert_read_drift_warning(output: &Output) {
+    let stderr = stderr(output);
+    assert!(
+        stderr.contains("Backend configuration changed")
+            && stderr.contains("reads state from the OLD backend recorded in carina-backend.lock")
+            && stderr.contains("carina init --migrate-state"),
+        "read command must explain that it selected the locked old backend.\nstderr:\n{stderr}",
+    );
 }
 
 fn lock_json(project: &std::path::Path) -> String {
@@ -329,6 +445,185 @@ mod backend_drift_gate {
                 .and_then(serde_json::Value::as_str),
             Some("legacy/state.json"),
             "saved plan must record the locked backend that supplied state:\n{plan_json:#}",
+        );
+    }
+
+    #[test]
+    fn state_list_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["state", "list", "."]);
+
+        assert!(
+            output.status.success(),
+            "state list should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert!(
+            stdout(&output).contains("mock.test.resource from_a"),
+            "state list did not list the resource applied to backend A.\nstdout:\n{}",
+            stdout(&output),
+        );
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn state_show_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["state", "show", "--json", "."]);
+
+        assert!(
+            output.status.success(),
+            "state show should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        let shown: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("state show --json must emit valid JSON");
+        assert_eq!(shown["resources"][0]["binding"], "from_a");
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn state_lookup_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(
+            tmp.path(),
+            &["state", "lookup", "from_a.name", "--json", "."],
+        );
+
+        assert!(
+            output.status.success(),
+            "state lookup should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert_eq!(stdout(&output).trim(), r#""resource-from-a""#);
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn export_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["export", "from_a_name", "--raw"]);
+
+        assert!(
+            output.status.success(),
+            "export should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert_eq!(stdout(&output).trim(), "resource-from-a");
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn downstream_plan_warns_once_and_reads_upstream_locked_backend() {
+        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
+        let output = carina(&downstream, &["plan", "--json", "--refresh=false", "."]);
+
+        assert!(
+            output.status.success(),
+            "downstream plan should read upstream backend A while U's migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        let stdout = stdout(&output);
+        let json_start = stdout
+            .find('{')
+            .expect("JSON plan must follow provider status lines");
+        let plan: PlanFile = serde_json::from_str(&stdout[json_start..]).unwrap();
+        let created_name = plan.plan.effects().iter().find_map(|effect| match effect {
+            Effect::Create(resource) => resource.get_attr("name"),
+            _ => None,
+        });
+        assert_eq!(
+            created_name,
+            Some(&Value::Concrete(ConcreteValue::String(
+                "from-upstream-backend-a".into()
+            ))),
+            "downstream plan must resolve the export stored in U's locked old backend",
+        );
+
+        let upstream = upstream.canonicalize().unwrap();
+        let warning = format!(
+            "upstream_state source {} has a pending backend migration; reading its OLD backend",
+            upstream.display()
+        );
+        let stderr = stderr(&output);
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            1,
+            "upstream migration warning must use upstream-specific wording exactly once.\nstderr:\n{stderr}",
+        );
+        assert!(
+            stderr.contains(&format!(
+                "carina init --migrate-state {}",
+                upstream.display()
+            )),
+            "upstream warning must include the migration command for U.\nstderr:\n{stderr}",
+        );
+    }
+
+    #[test]
+    fn saved_plan_apply_warns_once_when_it_resolves_same_drifted_upstream_twice() {
+        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
+        let plan = carina(
+            &downstream,
+            &["plan", "--refresh=false", "--out", "plan.json", "."],
+        );
+        assert!(
+            plan.status.success(),
+            "fixture plan should succeed.\nstdout: {}\nstderr: {}",
+            stdout(&plan),
+            stderr(&plan),
+        );
+
+        let output = carina(
+            &downstream,
+            &["apply", "--auto-approve", "--lock=false", "plan.json"],
+        );
+        assert!(
+            output.status.success(),
+            "saved-plan apply should succeed.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+
+        let upstream = upstream.canonicalize().unwrap();
+        let warning = format!(
+            "upstream_state source {} has a pending backend migration; reading its OLD backend",
+            upstream.display()
+        );
+        let stderr = stderr(&output);
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            1,
+            "saved-plan apply resolves the upstream twice but must warn once per source.\nstderr:\n{stderr}",
+        );
+    }
+
+    #[test]
+    fn downstream_plan_corrupt_upstream_lock_names_source_and_lock_path() {
+        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
+        let upstream = upstream.canonicalize().unwrap();
+        let lock_path = upstream.join("carina-backend.lock");
+        fs::write(&lock_path, "{ definitely not valid json").unwrap();
+
+        let output = carina(&downstream, &["plan", "--refresh=false", "."]);
+
+        assert!(
+            !output.status.success(),
+            "a corrupt upstream lock must fail closed",
+        );
+        let stderr = stderr(&output);
+        assert!(
+            stderr.contains(&format!("upstream_state source {}", upstream.display())),
+            "error must identify the upstream source directory.\nstderr:\n{stderr}",
+        );
+        assert!(
+            stderr.contains(&lock_path.display().to_string()),
+            "error must identify the exact unreadable lock file.\nstderr:\n{stderr}",
         );
     }
 
@@ -583,12 +878,11 @@ mod backend_drift_gate {
             !output.status.success(),
             "bucket-delete should reject the locked old bucket name when configured bucket differs",
         );
-        assert!(
-            stderr(&output).contains(
-                "Bucket name 'old-bucket' does not match backend configuration bucket 'new-bucket'"
-            ),
-            "bucket-delete should be pinned to the configured bucket guard.\nstderr:\n{}",
+        assert_eq!(
             stderr(&output),
+            "Error: Bucket name 'old-bucket' does not match backend configuration bucket \
+             'new-bucket'.\n",
+            "bucket-delete mismatch must retain its configuration-error CLI rendering",
         );
     }
 

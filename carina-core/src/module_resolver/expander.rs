@@ -2073,18 +2073,21 @@ fn substitute_arguments_with_position(
                 .collect::<Result<_, _>>()?;
             Value::Deferred(DeferredValue::Interpolation(substituted_parts))
         }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
+        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
+            let mut substituted = value.clone();
+            let Value::Deferred(
+                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
+            ) = &mut substituted
+            else {
+                unreachable!("matched a built-in call")
+            };
+            let substituted_args = args
                 .iter()
                 .map(|argument| substitute_function_argument(argument, arguments))
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
+                .collect::<Result<_, _>>()?;
+            *args = substituted_args;
+            substituted
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -2120,7 +2123,23 @@ fn substitute_arguments_with_position(
                     parse_error: None,
                 })?
         }
-        _ => value.clone(),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => value.clone(),
     };
 
     if let (Some(binding_index), Value::Deferred(DeferredValue::ResourceRef { path })) =
@@ -2203,13 +2222,15 @@ pub(super) fn rewrite_intra_module_refs(
                 .collect();
             Value::Deferred(DeferredValue::Interpolation(rewritten_parts))
         }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
+        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
+            let mut rewritten = value.clone();
+            let Value::Deferred(
+                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
+            ) = &mut rewritten
+            else {
+                unreachable!("matched a built-in call")
+            };
+            let rewritten_args = args
                 .iter()
                 .map(|argument| {
                     argument
@@ -2222,9 +2243,10 @@ pub(super) fn rewrite_intra_module_refs(
                         })
                         .expect("infallible function-argument rewrite")
                 })
-                .collect(),
-            source_line: *source_line,
-        }),
+                .collect();
+            *args = rewritten_args;
+            rewritten
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -2269,7 +2291,23 @@ pub(super) fn rewrite_intra_module_refs(
                 )),
             })
         }
-        _ => value.clone(),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => value.clone(),
     }
 }
 

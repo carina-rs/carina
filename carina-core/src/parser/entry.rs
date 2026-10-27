@@ -3,7 +3,6 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::CarinaParser;
 use super::ProviderContext;
 use super::Rule;
 use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
@@ -31,8 +30,6 @@ use super::resolve::{
 use crate::eval_value::{EvalValue, EvalValueError, StructuralHandle, StructuralHandleMetadata};
 use crate::resource::{DataSource, Resource, Value};
 use indexmap::IndexMap;
-use pest::Parser;
-use pest::error::LineColLocation;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -168,13 +165,8 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 /// before the fixed-point pass has a chance to classify the referenced
 /// binding as a value or structural declaration.
 pub(crate) fn top_level_let_binding_names(input: &str) -> Result<Vec<String>, ParseError> {
-    let preprocess_result =
-        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
-            line: 0,
-            message: e.to_string(),
-        })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let preprocessed_file = super::preprocess_file(input)?;
+    let pairs = preprocessed_file.parse()?;
     let mut names = Vec::new();
 
     for pair in pairs {
@@ -269,13 +261,8 @@ pub fn top_level_upstream_state_spans(
 pub fn top_level_anonymous_resource_spans(
     input: &str,
 ) -> Result<Vec<AnonymousResourceSourceSpan>, ParseError> {
-    let preprocess_result =
-        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
-            line: 0,
-            message: e.to_string(),
-        })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let preprocessed_file = super::preprocess_file(input)?;
+    let pairs = preprocessed_file.parse()?;
     let mut spans = Vec::new();
 
     for pair in pairs {
@@ -312,7 +299,7 @@ pub fn top_level_anonymous_resource_spans(
                 provider: provider.to_string(),
                 resource_type: resource_type.to_string(),
                 span: TopLevelBlockSourceSpan {
-                    start_line: original_line(preprocessed_line, &preprocess_result.line_map),
+                    start_line: preprocessed_file.original_line(preprocessed_line),
                     start_column,
                     end_column: start_column + full_type.chars().count(),
                 },
@@ -327,13 +314,8 @@ fn top_level_block_spans(
     input: &str,
     keyword_for_statement: fn(&pest::iterators::Pair<Rule>) -> Option<&'static str>,
 ) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
-    let preprocess_result =
-        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
-            line: 0,
-            message: e.to_string(),
-        })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let preprocessed_file = super::preprocess_file(input)?;
+    let pairs = preprocessed_file.parse()?;
     let mut spans = Vec::new();
 
     for pair in pairs {
@@ -356,7 +338,7 @@ fn top_level_block_spans(
             };
             let (preprocessed_line, start_column) = block.as_span().start_pos().line_col();
             spans.push(TopLevelBlockSourceSpan {
-                start_line: original_line(preprocessed_line, &preprocess_result.line_map),
+                start_line: preprocessed_file.original_line(preprocessed_line),
                 start_column,
                 end_column: start_column + keyword.len(),
             });
@@ -439,11 +421,11 @@ fn resolve_top_level_user_functions(
     // owns the seed, while two declarations in the same file are an error.
     let mut owners = HashMap::<String, usize>::new();
     for (source_index, (path, input)) in sources.iter().enumerate() {
-        let preprocess_result = preprocess_function_source(input)
+        let preprocessed_file =
+            super::preprocess_file(input).map_err(|error| locate_function_error(error, *path))?;
+        let pairs = preprocessed_file
+            .parse()
             .map_err(|error| locate_function_error(error, *path))?;
-        let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-            .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))
-            .map_err(|error| locate_function_error(ParseError::Syntax(error), *path))?;
         let mut local_names = HashSet::new();
         for pair in pairs {
             if pair.as_rule() != Rule::file {
@@ -483,11 +465,11 @@ fn resolve_top_level_user_functions(
     while !pending.is_empty() {
         let mut made_progress = false;
         for (source_index, (path, input)) in sources.iter().enumerate() {
-            let preprocess_result = preprocess_function_source(input)
+            let preprocessed_file = super::preprocess_file(input)
                 .map_err(|error| locate_function_error(error, *path))?;
-            let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-                .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))
-                .map_err(|error| locate_function_error(ParseError::Syntax(error), *path))?;
+            let pairs = preprocessed_file
+                .parse()
+                .map_err(|error| locate_function_error(error, *path))?;
             for pair in pairs {
                 if pair.as_rule() != Rule::file {
                     continue;
@@ -552,18 +534,6 @@ fn resolve_top_level_user_functions(
     Ok(functions)
 }
 
-fn preprocess_function_source(input: &str) -> Result<crate::heredoc::PreprocessResult, ParseError> {
-    crate::heredoc::preprocess_heredocs(input).map_err(|error| {
-        let line = match &error {
-            crate::heredoc::HeredocError::Unterminated { line, .. } => *line,
-        };
-        ParseError::InvalidExpression {
-            line,
-            message: error.to_string(),
-        }
-    })
-}
-
 fn locate_function_error(error: ParseError, path: Option<&Path>) -> ParseError {
     match path {
         Some(path) => error.in_file(path.to_path_buf()),
@@ -572,17 +542,8 @@ fn locate_function_error(error: ParseError, path: Option<&Path>) -> ParseError {
 }
 
 pub(crate) fn top_level_argument_names(input: &str) -> Result<Vec<String>, ParseError> {
-    let preprocess_result = crate::heredoc::preprocess_heredocs(input).map_err(|error| {
-        let line = match &error {
-            crate::heredoc::HeredocError::Unterminated { line, .. } => *line,
-        };
-        ParseError::InvalidExpression {
-            line,
-            message: error.to_string(),
-        }
-    })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-        .map_err(|error| map_pest_error_lines(error, &preprocess_result.line_map))?;
+    let preprocessed_file = super::preprocess_file(input)?;
+    let pairs = preprocessed_file.parse()?;
     let mut names = Vec::new();
     for pair in pairs {
         if pair.as_rule() != Rule::file {
@@ -631,18 +592,13 @@ fn parse_with_seeded_bindings_inner(
     seeded_user_functions: &HashMap<String, UserFunction>,
     bindings_fully_classified: bool,
 ) -> Result<ParsedFile, ParseError> {
-    let preprocess_result =
-        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
-            line: 0,
-            message: e.to_string(),
-        })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
-        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let preprocessed_file = super::preprocess_file(input)?;
+    let pairs = preprocessed_file.parse()?;
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
     // evaluates static conditions against the now-typed seed table.
     let single_quote_warnings = if bindings_fully_classified {
-        collect_single_quoted_interpolation_warnings(pairs.clone(), &preprocess_result.line_map)
+        collect_single_quoted_interpolation_warnings(pairs.clone(), &preprocessed_file)
     } else {
         Vec::new()
     };
@@ -1057,18 +1013,22 @@ fn parse_with_seeded_bindings_inner(
 
 fn collect_single_quoted_interpolation_warnings(
     pairs: pest::iterators::Pairs<'_, Rule>,
-    line_map: &[usize],
+    preprocessed_file: &super::PreprocessedFile,
 ) -> Vec<ParseWarning> {
     let mut warnings = Vec::new();
     for pair in pairs {
-        collect_single_quoted_interpolation_warnings_from_pair(pair, line_map, &mut warnings);
+        collect_single_quoted_interpolation_warnings_from_pair(
+            pair,
+            preprocessed_file,
+            &mut warnings,
+        );
     }
     warnings
 }
 
 fn collect_single_quoted_interpolation_warnings_from_pair(
     pair: pest::iterators::Pair<'_, Rule>,
-    line_map: &[usize],
+    preprocessed_file: &super::PreprocessedFile,
     warnings: &mut Vec<ParseWarning>,
 ) {
     if pair.as_rule() == Rule::single_quoted_string
@@ -1084,9 +1044,9 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
             let (preprocessed_end_line, end_column) =
                 line_column_after_prefix((preprocessed_line, column), snippet);
             let span = ParseWarningSpan {
-                start_line: original_line(preprocessed_line, line_map),
+                start_line: preprocessed_file.original_line(preprocessed_line),
                 start_column: column,
-                end_line: original_line(preprocessed_end_line, line_map),
+                end_line: preprocessed_file.original_line(preprocessed_end_line),
                 end_column,
             };
             warnings.push(ParseWarning {
@@ -1100,7 +1060,7 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
     }
 
     for child in pair.into_inner() {
-        collect_single_quoted_interpolation_warnings_from_pair(child, line_map, warnings);
+        collect_single_quoted_interpolation_warnings_from_pair(child, preprocessed_file, warnings);
     }
 }
 
@@ -1132,31 +1092,6 @@ fn line_column_after_prefix(
                 (line, column + 1)
             }
         })
-}
-
-fn original_line(preprocessed_line: usize, line_map: &[usize]) -> usize {
-    line_map
-        .get(preprocessed_line.saturating_sub(1))
-        .copied()
-        .unwrap_or(preprocessed_line)
-}
-
-fn map_pest_error_lines(
-    mut error: pest::error::Error<Rule>,
-    line_map: &[usize],
-) -> pest::error::Error<Rule> {
-    error.line_col = match error.line_col {
-        LineColLocation::Pos((line, column)) => {
-            LineColLocation::Pos((original_line(line, line_map), column))
-        }
-        LineColLocation::Span((start_line, start_column), (end_line, end_column)) => {
-            LineColLocation::Span(
-                (original_line(start_line, line_map), start_column),
-                (original_line(end_line, line_map), end_column),
-            )
-        }
-    };
-    error
 }
 
 /// Pre-register `seeds` as lexical bindings in `ctx`.
@@ -1266,4 +1201,20 @@ pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
     resolve_provider_unresolved_attributes(&mut parsed, &ProviderContext::default())?;
     finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_span_api_preserves_unterminated_heredoc_line() {
+        let error = top_level_upstream_state_spans("let x = mock.test.Thing {\n  p = <<EOT\nabc\n")
+            .expect_err("an unterminated heredoc must be rejected");
+
+        let ParseError::InvalidExpression { line, .. } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(line, 4);
+    }
 }

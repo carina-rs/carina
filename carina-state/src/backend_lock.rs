@@ -3,8 +3,9 @@
 //! Carina stores a snapshot of the current `backend` block in a local
 //! file (`carina-backend.lock`) at the project root. Commands compare
 //! the stored snapshot against the current configuration: `init` and
-//! `plan` warn on mismatch, while mutating commands refuse until
-//! `carina init --migrate-state` explicitly moves state.
+//! project-backed readers warn and keep reading the locked backend on
+//! mismatch, while mutating commands refuse until `carina init
+//! --migrate-state` explicitly moves state.
 //!
 //! This prevents silently pointing state operations at a different state
 //! file, which could lead to resources being treated as unmanaged or

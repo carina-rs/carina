@@ -6,14 +6,13 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 use carina_core::value::{PersistedExportValue, render_export_json_value};
-use carina_state::{
-    StateBackend, StateUrl, load_published_exports_from_url, read_published_exports,
-    resolve_backend_for_read,
-};
+use carina_state::{StateUrl, load_published_exports_from_url};
 
 use crate::display::colored_value;
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
+
+use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 
 /// Output format for the export command.
 pub enum OutputFormat {
@@ -46,11 +45,16 @@ pub async fn run_export(
         )?
         .parsed;
         let base_dir = get_base_dir(path);
-        let backend: Box<dyn StateBackend> =
-            resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
-                .await
-                .map_err(AppError::Backend)?;
-        read_published_exports(backend.as_ref())
+        let backend = resolve_backend_for_read(
+            base_dir,
+            path,
+            parsed.backend.as_ref(),
+            BackendLockRequirement::AllowMissing,
+            ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
+        )
+        .await?;
+        backend
+            .read_published_exports()
             .await
             .map_err(AppError::Backend)?
             .ok_or_else(|| {

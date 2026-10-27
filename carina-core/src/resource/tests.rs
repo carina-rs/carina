@@ -2267,6 +2267,38 @@ fn canonical_hash_consistency() {
 }
 
 #[test]
+fn unavailable_canonical_hash_matches_function_call_and_ignores_diagnostics() {
+    let unavailable = |argument: &str, reason: &str, source_line: usize| {
+        Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::Concrete(ConcreteValue::String(argument.into())).into()],
+            reason: UnavailableReason::from_builtin_error(reason.to_string()),
+            source_line: source_line.into(),
+        })
+    };
+    let function_call = |argument: &str| {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::Concrete(ConcreteValue::String(argument.into())).into()],
+            source_line: 0.into(),
+        })
+    };
+
+    assert_eq!(
+        unavailable("X", "first wording", 1).canonical_hash(),
+        unavailable("X", "revised wording", 99).canonical_hash(),
+    );
+    assert_eq!(
+        unavailable("X", "diagnostic only", 7).canonical_hash(),
+        function_call("X").canonical_hash(),
+    );
+    assert_ne!(
+        unavailable("X", "same function", 7).canonical_hash(),
+        function_call("Y").canonical_hash(),
+    );
+}
+
+#[test]
 fn resource_typed_binding_field() {
     let resource = Resource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
     assert_eq!(resource.binding, Some("my_bucket".to_string()));

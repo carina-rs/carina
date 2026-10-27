@@ -1,0 +1,8 @@
+let o = mock.test.resource {
+  name = "o"
+}
+
+let r = mock.test.resource {
+  name    = "p"
+  comment = o.identifier ?? env("CARINA_MISSING_X")
+}

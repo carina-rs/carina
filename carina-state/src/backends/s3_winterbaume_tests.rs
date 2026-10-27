@@ -13,10 +13,10 @@
 //! paths are exercised here (in addition to state write/read,
 //! bucket auto-create, and single-holder lock acquire/release).
 
+use super::S3Backend;
+use crate::{BackendError, StateBackend, StateFile, read_published_exports};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use carina_state::backends::S3Backend;
-use carina_state::{BackendError, StateBackend, StateFile, read_published_exports};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::future::Future;
@@ -807,7 +807,7 @@ async fn acquire_then_release_lock_round_trips() {
         .await
         .expect_err("releasing an already-released lock must fail");
     assert!(
-        matches!(err, carina_state::BackendError::LockNotFound(_)),
+        matches!(err, BackendError::LockNotFound(_)),
         "expected LockNotFound after the lock object was deleted, got: {err:?}",
     );
 }
@@ -967,7 +967,7 @@ async fn write_state_locked_rejects_write_when_lock_not_held() {
         .await
         .expect_err("write_state_locked must fail when the lock is no longer held");
     assert!(
-        matches!(err, carina_state::BackendError::LockNotHeld(_)),
+        matches!(err, BackendError::LockNotHeld(_)),
         "expected LockNotHeld when the lock object is absent, got: {err:?}",
     );
 }

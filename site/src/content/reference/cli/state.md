@@ -10,6 +10,12 @@ State management commands for inspecting, modifying, and maintaining the Carina 
 carina state <SUBCOMMAND> [OPTIONS]
 ```
 
+For project-backed inspection commands, Carina compares the configured backend
+with `carina-backend.lock`. While a backend migration is pending, `list`,
+`show`, and `lookup` print a warning to stderr and read the locked old backend.
+An explicit `--state-url` bypasses project backend resolution and reads exactly
+the supplied URL.
+
 ## Subcommands
 
 ### `list`
@@ -136,6 +142,8 @@ carina state bucket-delete [OPTIONS] <BUCKET_NAME> [PATH]
 ```
 
 The bucket name must match the `bucket` attribute in the backend configuration. Without `--force`, Carina prompts for confirmation by requiring the user to type the bucket name.
+
+During a pending backend migration, `bucket-delete` targets the configured NEW backend, not the OLD backend recorded in `carina-backend.lock`.
 
 #### Flags
 

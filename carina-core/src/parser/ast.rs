@@ -2175,6 +2175,7 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
         ) => "deferred function call",
+        Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable function result",
         Value::Deferred(DeferredValue::Access(_)) => "deferred access expression",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
@@ -2303,6 +2304,7 @@ fn substitute_placeholder_with_policy(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args.iter_mut() {
@@ -2445,6 +2447,7 @@ fn substitute_placeholder_lazily(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {

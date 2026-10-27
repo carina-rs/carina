@@ -3817,6 +3817,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_)) => {

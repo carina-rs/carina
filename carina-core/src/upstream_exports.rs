@@ -627,6 +627,7 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
                 DeferredValue::BindingRef { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::RedactedSecret { .. }

@@ -12,6 +12,11 @@ carina export [OPTIONS] [NAME]
 
 **NAME** is optional. When omitted, every export is printed. When set, only the named export is printed.
 
+Without `--state-url`, Carina compares the configured backend with
+`carina-backend.lock`. While a backend migration is pending, `export` prints a
+warning to stderr and reads exports from the locked old backend. An explicit
+`--state-url` reads exactly the supplied URL instead.
+
 ## Flags
 
 ### `--json`

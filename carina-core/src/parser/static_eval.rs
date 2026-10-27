@@ -38,6 +38,7 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
+        | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => false,
         Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
@@ -166,7 +167,32 @@ pub(crate) fn evaluate_static_value(
                     message: error.to_string(),
                 })
         }
-        other => Ok(other),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            reason,
+            source_line,
+            ..
+        }) => Err(ParseError::InvalidExpression {
+            line: source_line.get().unwrap_or(0),
+            message: format!("{name}(): {reason}"),
+        }),
+        value @ Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | value @ Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => Ok(value),
     }
 }
 

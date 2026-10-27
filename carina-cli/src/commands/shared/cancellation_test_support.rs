@@ -9,8 +9,7 @@ use carina_core::shutdown::testing::{
     TestShutdownTrigger, same_shutdown_channel, shutdown_channel,
 };
 use carina_state::{
-    BackendError, BackendResult, LoadedState, LocalBackend, LockInfo, RawState, StateBackend,
-    StateFile,
+    BackendError, BackendResult, LoadedState, LockInfo, RawState, StateBackend, StateFile,
 };
 use tempfile::TempDir;
 
@@ -20,13 +19,13 @@ pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
 /// Delegates state I/O to a local backend but simulates another process taking
 /// the lock as soon as the heartbeat attempts its first renewal.
 pub(crate) struct LockLossBackend {
-    inner: Arc<LocalBackend>,
+    inner: Arc<dyn StateBackend>,
     locked_writes: AtomicUsize,
     releases: AtomicUsize,
 }
 
 impl LockLossBackend {
-    fn new(inner: Arc<LocalBackend>) -> Self {
+    fn new(inner: Arc<dyn StateBackend>) -> Self {
         Self {
             inner,
             locked_writes: AtomicUsize::new(0),
@@ -188,7 +187,7 @@ pub(crate) struct CancellationFixtureBase {
     crn_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
-    backend: std::sync::Arc<LocalBackend>,
+    backend: std::sync::Arc<dyn StateBackend>,
     shutdown_trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
 }
@@ -200,7 +199,9 @@ impl CancellationFixtureBase {
         let crn_path = dir.path().join("main.crn");
         let state_path = dir.path().join("carina.state.json");
         let lock_path = state_path.with_extension("lock");
-        let backend = std::sync::Arc::new(LocalBackend::with_path(state_path.clone()));
+        let backend = std::sync::Arc::<dyn StateBackend>::from(
+            crate::commands::local_backend_for_test(state_path.clone()),
+        );
 
         let (shutdown_trigger, shutdown) = shutdown_channel();
         Self {
@@ -257,10 +258,6 @@ impl CancellationFixtureBase {
 
     pub(crate) fn lock_path(&self) -> &Path {
         &self.lock_path
-    }
-
-    pub(crate) fn backend(&self) -> &LocalBackend {
-        &self.backend
     }
 
     pub(crate) fn backend_handle(&self) -> std::sync::Arc<dyn StateBackend> {

@@ -1288,6 +1288,7 @@ pub fn find_crn_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::DeferredValue;
     use std::fs;
 
     /// Helper to create a temporary directory for tests
@@ -1725,6 +1726,101 @@ mod tests {
         assert_eq!(config.parsed.providers.len(), 1);
         assert!(config.parsed.backend.is_some());
         assert!(config.backend_file.is_some());
+        cleanup(&dir);
+    }
+
+    fn unavailable_env_name() -> String {
+        format!(
+            "CARINA_TEST_ISSUE_3974_STRICT_MERGED_MISSING_{}",
+            std::process::id()
+        )
+    }
+
+    #[test]
+    fn load_configuration_multi_file_rejects_unavailable_let_binding() {
+        let dir = create_temp_dir("unavailable_let_binding");
+        let missing = unavailable_env_name();
+        unsafe {
+            std::env::remove_var(&missing);
+        }
+        fs::write(
+            dir.join("value.crn"),
+            format!("let token = env(\"{missing}\")\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
+
+        let error = match load_configuration(&dir) {
+            Ok(_) => panic!("the strict merged pass accepted an unavailable let binding"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains(&format!(
+                "env(): environment variable '{missing}' is not set"
+            )),
+            "unexpected error: {error}",
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_multi_file_rejects_unavailable_backend_attribute() {
+        let dir = create_temp_dir("unavailable_backend_attribute");
+        let missing = unavailable_env_name();
+        unsafe {
+            std::env::remove_var(&missing);
+        }
+        fs::write(
+            dir.join("backend.crn"),
+            format!(
+                r#"backend s3 {{
+    bucket = env("{missing}")
+    key    = "state.json"
+    region = "ap-northeast-1"
+}}
+"#,
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
+
+        let error = match load_configuration(&dir) {
+            Ok(_) => panic!("the strict merged pass accepted an unavailable backend attribute"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains(&format!(
+                "env(): environment variable '{missing}' is not set"
+            )),
+            "unexpected error: {error}",
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_multi_file_does_not_open_secret_for_strict_evaluation() {
+        let dir = create_temp_dir("unavailable_inside_secret");
+        let missing = unavailable_env_name();
+        unsafe {
+            std::env::remove_var(&missing);
+        }
+        fs::write(
+            dir.join("value.crn"),
+            format!("let token = secret(env(\"{missing}\"))\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
+
+        let loaded = load_configuration(&dir)
+            .expect("the strict merged pass must not descend into a typed secret");
+
+        assert!(matches!(
+            loaded.parsed.variables.get("token"),
+            Some(Value::Deferred(DeferredValue::Secret(inner)))
+                if matches!(inner.as_ref(), Value::Deferred(DeferredValue::Unavailable { .. }))
+        ));
         cleanup(&dir);
     }
 

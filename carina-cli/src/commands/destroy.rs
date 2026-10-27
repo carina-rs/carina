@@ -1936,12 +1936,12 @@ mod tests {
             carina_core::utils::pretty_with_newline(&state).unwrap(),
         )
         .unwrap();
-        let backend = carina_state::LocalBackend::with_path(state_path);
+        let backend = crate::commands::local_backend_for_test(state_path);
 
         run_destroy_locked_with_ctx(
             &mut parsed,
             true,
-            std::sync::Arc::new(backend),
+            std::sync::Arc::from(backend),
             None,
             StateLock::disabled_for_test(),
             false,
@@ -1981,11 +1981,11 @@ mod tests {
             });
 
         let backend =
-            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+            crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         run_destroy_locked(
             &mut parsed,
             true,
-            std::sync::Arc::new(backend),
+            std::sync::Arc::from(backend),
             None,
             StateLock::disabled_for_test(),
             false,
@@ -2011,12 +2011,12 @@ mod tests {
         )
         .unwrap();
         let backend =
-            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+            crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         let error = match run_destroy_locked(
             &mut parsed,
             true,
-            std::sync::Arc::new(backend),
+            std::sync::Arc::from(backend),
             None,
             StateLock::disabled_for_test(),
             false,
@@ -2043,12 +2043,12 @@ mod tests {
     #[tokio::test]
     async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
-        let backend = carina_state::LocalBackend::with_path(base_dir.join("state.json"));
+        let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
             &mut parsed,
             true,
-            std::sync::Arc::new(backend),
+            std::sync::Arc::from(backend),
             None,
             StateLock::disabled_for_test(),
             false,
@@ -2065,12 +2065,12 @@ mod tests {
     #[tokio::test]
     async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
-        let backend = carina_state::LocalBackend::with_path(base_dir.join("state.json"));
+        let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
             &mut parsed,
             true,
-            std::sync::Arc::new(backend),
+            std::sync::Arc::from(backend),
             None,
             StateLock::disabled_for_test(),
             false,
@@ -2169,7 +2169,7 @@ mod tests {
             "expected Interrupted, got {err:?}"
         );
         let state = fixture.read_state().await;
-        assert!(fixture.backend().state_path().exists());
+        assert!(fixture.state_path().exists());
         assert!(
             state
                 .find_resource("mock", "test.resource", "first")

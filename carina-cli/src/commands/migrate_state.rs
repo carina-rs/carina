@@ -21,13 +21,15 @@ use std::path::Path;
 
 use colored::Colorize;
 
-#[cfg(test)]
-use carina_state::LocalBackend;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendLock, StateBackend, StateFile, anchored_local_path,
-    create_backend,
+    BackendConfig as StateBackendConfig, BackendDriftStatus, BackendSelection, MigrationBackends,
+    StateFile, anchored_local_path, inspect_backend_drift,
 };
+#[cfg(test)]
+use carina_state::{BackendLock, LocalBackend};
 
+#[cfg(test)]
+use super::local_backend_for_test;
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
 
@@ -63,31 +65,29 @@ pub enum MigrationOutcome {
     },
 }
 
-/// Migrate state between two already-constructed backends.
+/// Migrate state through purpose-limited source and target capabilities.
 ///
-/// This is the testable core: it takes the source/target backends and
-/// the cleanup policy and performs the read → guard → write → verify →
-/// (optional) delete sequence. Lock-file rewriting is the caller's
-/// responsibility (it owns `base_dir`).
+/// This is the testable core: it takes the migration backend pair and the
+/// overwrite policy and performs the read → guard → write → verify sequence.
+/// Lock-file rewriting and source cleanup are the caller's responsibility.
 ///
 /// `force` allows overwriting a target that already contains a
 /// *different* state (different lineage or non-empty resources). Without
 /// it, a populated target aborts the migration loudly.
 async fn perform_state_migration(
-    source: &dyn StateBackend,
-    target: &dyn StateBackend,
+    backends: &MigrationBackends,
     force: bool,
     project_dir: &Path,
 ) -> Result<StateFile, AppError> {
     // `carina init --migrate-state` copies the source state into the
-    // target backend verbatim. The pending-migration token is
-    // discarded here: `target.write_state(&state)` will re-emit the
+    // target backend verbatim. The pending schema-migration marker is
+    // discarded here: writing the target state will re-emit the
     // state at `StateFile::CURRENT_VERSION` on disk regardless, and
     // the `--migrate-state` command is itself the backend-relocation
     // path (carina#3315 — schema-migration persistence is handled by
     // apply/destroy/state-refresh in the source-or-target directory).
-    let state = source
-        .read_state()
+    let state = backends
+        .read_source_state()
         .await
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
@@ -102,8 +102,8 @@ async fn perform_state_migration(
 
     // Target guard: refuse to clobber a populated, differently-lineaged
     // target unless the operator explicitly opted in with --force.
-    if let Some(existing) = target
-        .read_state()
+    if let Some(existing) = backends
+        .read_target_state()
         .await
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
@@ -120,16 +120,16 @@ async fn perform_state_migration(
         )));
     }
 
-    target
-        .write_state(&state)
+    backends
+        .write_target_state(&state)
         .await
         .map_err(AppError::Backend)?;
 
     // Verify the copy landed before we rewrite the lock / delete the
     // source — a migration that silently lost resources is the worst
     // possible outcome.
-    let roundtrip = target
-        .read_state()
+    let roundtrip = backends
+        .read_target_state()
         .await
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
@@ -164,20 +164,17 @@ pub async fn run_init_migrate_state(
     backend_config: Option<&carina_core::parser::BackendConfig>,
     force: bool,
 ) -> Result<MigrationOutcome, AppError> {
-    let configured = BackendLock::for_config(backend_config)?;
-    let locked = BackendLock::load(project_dir)
-        .map_err(AppError::Backend)?
-        .ok_or_else(|| {
-            AppError::Config(format!(
+    let drift = match inspect_backend_drift(project_dir, backend_config)? {
+        BackendDriftStatus::Fresh => {
+            return Err(AppError::Config(format!(
                 "No backend lock found. Run `{}` (without \
                  --migrate-state) to initialize the project first.",
                 ProjectCommand::new("init", project_dir)
-            ))
-        })?;
-
-    if locked == configured {
-        return Ok(MigrationOutcome::NotNeeded);
-    }
+            )));
+        }
+        BackendDriftStatus::Unchanged => return Ok(MigrationOutcome::NotNeeded),
+        BackendDriftStatus::Drifted(drift) => drift,
+    };
 
     println!(
         "{}",
@@ -185,24 +182,16 @@ pub async fn run_init_migrate_state(
             .cyan()
             .bold()
     );
-    println!("{}", locked.describe_diff(&configured));
+    println!("{}", drift.existing().describe_diff(drift.configured()));
 
-    let locked_config = locked.to_state_config()?;
-    let configured_state_config = configured.to_state_config()?;
-
-    // Both addresses are reconstructed from the *locked* / *configured*
-    // snapshots, so a relative local `path` must be anchored at the
-    // project dir (not the binary's CWD) for `carina init <dir>` invoked
-    // from elsewhere.
-    let source = create_backend(Some(&locked_config), project_dir)
-        .await
-        .map_err(AppError::Backend)?;
-    let target = create_backend(Some(&configured_state_config), project_dir)
+    // The typed drift above resolves directly to purpose-limited migration
+    // backends: the locked OLD source and configured NEW target, both anchored
+    // at the project directory.
+    let backends = BackendSelection::for_migration(&drift)
         .await
         .map_err(AppError::Backend)?;
 
-    let state =
-        perform_state_migration(source.as_ref(), target.as_ref(), force, project_dir).await?;
+    let state = perform_state_migration(&backends, force, project_dir).await?;
     println!(
         "  {} copied {} resource(s) to the configured backend",
         "✓".green(),
@@ -222,7 +211,10 @@ pub async fn run_init_migrate_state(
     // Deleting the source first, as an earlier revision did, could
     // instead strand the project: a crash between the delete and the
     // lock rewrite would point the lock at a now-missing source.)
-    configured.save(project_dir).map_err(AppError::Backend)?;
+    drift
+        .configured()
+        .save(project_dir)
+        .map_err(AppError::Backend)?;
     println!("  {} updated backend lock", "✓".green());
 
     // A local source is deleted after the commit (matches the retired
@@ -230,7 +222,7 @@ pub async fn run_init_migrate_state(
     // (remote → remote in this scope). A failure to delete here is *not*
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
-    let source = if let StateBackendConfig::Local(local_settings) = &locked_config {
+    let source = if let Some(StateBackendConfig::Local(local_settings)) = backends.source_config() {
         let path = anchored_local_path(local_settings, project_dir);
         if !path.exists() {
             SourceDisposition::Deleted
@@ -292,17 +284,48 @@ mod tests {
         s
     }
 
+    fn local_config(path: &Path) -> carina_core::parser::BackendConfig {
+        carina_core::parser::BackendConfig {
+            backend_type: "local".to_string(),
+            attributes: HashMap::from([(
+                "path".to_string(),
+                Value::Concrete(ConcreteValue::String(
+                    path.to_string_lossy().into_owned().into(),
+                )),
+            )]),
+            attribute_spans: HashMap::new(),
+        }
+    }
+
+    async fn migration_backends(
+        project_dir: &Path,
+        source_path: &Path,
+        target_path: &Path,
+    ) -> MigrationBackends {
+        BackendLock::for_config(Some(&local_config(source_path)))
+            .unwrap()
+            .save(project_dir)
+            .unwrap();
+        let BackendDriftStatus::Drifted(drift) =
+            inspect_backend_drift(project_dir, Some(&local_config(target_path))).unwrap()
+        else {
+            panic!("test fixture must describe a pending backend migration")
+        };
+        BackendSelection::for_migration(&drift).await.unwrap()
+    }
+
     #[tokio::test]
     async fn migrates_state_from_source_to_empty_target() {
         let tmp = tempfile::tempdir().unwrap();
         let src_path = tmp.path().join("old.state.json");
         let dst_path = tmp.path().join("new.state.json");
 
-        let src = LocalBackend::with_path(src_path.clone());
-        let dst = LocalBackend::with_path(dst_path.clone());
+        let src = local_backend_for_test(src_path.clone());
+        let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-1", 3)).await.unwrap();
+        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
 
-        let state = perform_state_migration(&src, &dst, false, tmp.path())
+        let state = perform_state_migration(&backends, false, tmp.path())
             .await
             .unwrap();
         assert_eq!(state.resources().len(), 3);
@@ -315,12 +338,15 @@ mod tests {
     #[tokio::test]
     async fn refuses_populated_target_without_force() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = LocalBackend::with_path(tmp.path().join("a.json"));
-        let dst = LocalBackend::with_path(tmp.path().join("b.json"));
+        let src_path = tmp.path().join("a.json");
+        let dst_path = tmp.path().join("b.json");
+        let src = local_backend_for_test(src_path.clone());
+        let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
+        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
 
-        let err = perform_state_migration(&src, &dst, false, tmp.path())
+        let err = perform_state_migration(&backends, false, tmp.path())
             .await
             .unwrap_err();
         assert!(
@@ -335,12 +361,15 @@ mod tests {
     #[tokio::test]
     async fn force_overwrites_populated_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = LocalBackend::with_path(tmp.path().join("a.json"));
-        let dst = LocalBackend::with_path(tmp.path().join("b.json"));
+        let src_path = tmp.path().join("a.json");
+        let dst_path = tmp.path().join("b.json");
+        let src = local_backend_for_test(src_path.clone());
+        let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
+        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
 
-        perform_state_migration(&src, &dst, true, tmp.path())
+        perform_state_migration(&backends, true, tmp.path())
             .await
             .unwrap();
         let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
@@ -356,7 +385,7 @@ mod tests {
 
         let mut source_state = state_with("lin-shared", 1);
         source_state.increment_serial();
-        LocalBackend::with_path(src_path.clone())
+        local_backend_for_test(src_path.clone())
             .write_state(&source_state)
             .await
             .unwrap();
@@ -364,18 +393,22 @@ mod tests {
         let mut target_state = state_with("lin-shared", 2);
         target_state.increment_serial();
         target_state.increment_serial();
-        LocalBackend::with_path(dst_path.clone())
+        local_backend_for_test(dst_path.clone())
             .write_state(&target_state)
             .await
             .unwrap();
 
-        let source = LocalBackend::with_path(src_path);
-        let target = LocalBackend::with_path(dst_path);
-        perform_state_migration(&source, &target, true, tmp.path())
+        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
+        perform_state_migration(&backends, true, tmp.path())
             .await
             .unwrap();
 
-        let migrated = target.read_state().await.unwrap().unwrap().into_state();
+        let migrated = local_backend_for_test(dst_path)
+            .read_state()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_state();
         assert_eq!(migrated.lineage, source_state.lineage);
         assert_eq!(migrated.serial, source_state.serial);
         assert_eq!(migrated.resources().len(), 1);
@@ -384,10 +417,11 @@ mod tests {
     #[tokio::test]
     async fn errors_when_source_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = LocalBackend::with_path(tmp.path().join("a.json"));
-        let dst = LocalBackend::with_path(tmp.path().join("b.json"));
+        let src_path = tmp.path().join("a.json");
+        let dst_path = tmp.path().join("b.json");
+        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
 
-        let err = perform_state_migration(&src, &dst, false, tmp.path())
+        let err = perform_state_migration(&backends, false, tmp.path())
             .await
             .unwrap_err();
         assert!(
@@ -414,7 +448,7 @@ mod tests {
         // Locked = local default (carina.state.json under base_dir).
         BackendLock::local_default().save(base).unwrap();
         let src_path = base.join(LocalBackend::DEFAULT_STATE_FILE);
-        LocalBackend::with_path(src_path.clone())
+        local_backend_for_test(src_path.clone())
             .write_state(&state_with("lin-x", 2))
             .await
             .unwrap();
@@ -451,7 +485,7 @@ mod tests {
             !src_path.exists(),
             "source should be deleted (local cleanup)"
         );
-        let migrated = LocalBackend::with_path(dst_path)
+        let migrated = local_backend_for_test(dst_path)
             .read_state()
             .await
             .unwrap()
@@ -478,7 +512,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         BackendLock::local_default().save(base).unwrap();
-        LocalBackend::with_path(base.join(LocalBackend::DEFAULT_STATE_FILE))
+        local_backend_for_test(base.join(LocalBackend::DEFAULT_STATE_FILE))
             .write_state(&state_with("lin-z", 1))
             .await
             .unwrap();
