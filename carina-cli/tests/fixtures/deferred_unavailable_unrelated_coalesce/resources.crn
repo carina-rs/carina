@@ -1,0 +1,8 @@
+let o = mock.test.resource {
+  name = "unrelated-coalesce-origin"
+}
+
+let dependent = mock.test.resource {
+  name    = "unrelated-coalesce-dependent"
+  comment = "${o.identifier}-${secret("k")}" ?? env("CARINA_MISSING_Y")
+}

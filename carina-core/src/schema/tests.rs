@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn unavailable_type_name_matches_the_equivalent_function_call() {
+    let args = vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
+    let call = Value::Deferred(DeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::env,
+        args: args.clone(),
+        source_line: 1.into(),
+    });
+    let unavailable = Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::env,
+        args,
+        reason: crate::resource::UnavailableReason::from_builtin_error(
+            "environment variable is not set".to_string(),
+        ),
+        source_line: 2.into(),
+    });
+
+    assert_eq!(unavailable.type_name(), call.type_name());
+}
+
+#[test]
 fn enum_custom_lookup_receives_resolved_api_spelling() {
     let schema = ResourceSchema::new("widget").attribute(AttributeSchema::new(
         "mode",

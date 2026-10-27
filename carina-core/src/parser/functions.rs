@@ -352,6 +352,7 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => false,
@@ -375,6 +376,7 @@ fn contains_module_argument(value: &Value) -> bool {
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().any(|argument| {
             argument.pending_parameter().is_some()
@@ -1048,6 +1050,26 @@ fn substitute_fn_params_with_position(
                 .collect::<Result<_, _>>()?,
             source_line: *call_line,
         }),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line: call_line,
+        }) => Value::Deferred(DeferredValue::Unavailable {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    substitute_function_call_argument(
+                        argument,
+                        substitutions,
+                        call_line.unwrap_or(source_line),
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            reason: reason.clone(),
+            source_line: *call_line,
+        }),
         Value::Deferred(DeferredValue::Access(access)) => access
             .rebuild_with_base(
                 substitute_fn_params_with_position(
@@ -1309,6 +1331,32 @@ pub(super) fn try_evaluate_fn_value(
             }
             Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)))
         }
-        other => Ok(other),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            reason,
+            source_line,
+            ..
+        }) => Err(ParseError::InvalidExpression {
+            line: source_line.unwrap_or(containing_line),
+            message: format!("{name}(): {reason}"),
+        }),
+        value @ Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | value @ Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => Ok(value),
     }
 }

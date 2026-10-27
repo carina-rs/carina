@@ -271,6 +271,7 @@ fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()

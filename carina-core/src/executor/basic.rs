@@ -221,6 +221,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::RedactedSecret { .. }
@@ -371,7 +372,9 @@ fn assert_fully_resolved(
                 bindings,
             ))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+        ) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
             Err(unresolved_binding_message(
                 attribute_key,
@@ -478,6 +481,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for a in args {

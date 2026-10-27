@@ -290,6 +290,7 @@ fn visit_refs_with_sink_inner<'a>(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             // The enclosing sink constrains the function result, not its
@@ -389,6 +390,7 @@ fn visit_computed_accesses_with_sink<'a>(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
@@ -1102,10 +1104,13 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         }
 
         match value {
-            Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-                let function = bindings.user_function(name);
+            Value::Deferred(
+                DeferredValue::FunctionCall { name, args, .. }
+                | DeferredValue::Unavailable { name, args, .. },
+            ) => {
+                let function = bindings.user_function(name.as_str());
                 check_call(
-                    name,
+                    name.as_str(),
                     args,
                     function,
                     result_sink.zip(context),
@@ -2837,6 +2842,7 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::RedactedSecret { .. })

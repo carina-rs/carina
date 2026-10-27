@@ -9,7 +9,9 @@ use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, Value,
+    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, DiagnosticSourceLine,
+    InterpolationPart, Resource, UnavailableCoalescePolicy, UnavailableReason,
+    UnavailableSecretPolicy, Value, find_unavailable_evaluation,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -1090,6 +1092,7 @@ fn collect_reference_roots(
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {
@@ -1449,7 +1452,21 @@ fn resolve_value_with_config(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
+            let resolved = resolved?;
+            reject_required_interpolation_unavailable(&resolved, defer_unknown_functions)?;
+            Ok(Value::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
+        }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            reason,
+            source_line,
+            ..
+        }) => {
+            if defer_unknown_functions {
+                Ok(value.clone())
+            } else {
+                Err(unavailable_builtin_error(*name, reason, *source_line))
+            }
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
@@ -1524,13 +1541,18 @@ fn resolve_value_with_config(
                     None => ParseError::UserFunctionError(error.to_string()),
                 }),
                 Err(e) => {
-                    if all_args_resolved && !defer_unknown_functions {
-                        // All args are resolved but evaluation failed — propagate the error.
-                        let message = format!("{}(): {}", name, e);
-                        Err(match authored_line {
-                            Some(line) => ParseError::InvalidExpression { line, message },
-                            None => ParseError::UserFunctionError(message),
-                        })
+                    if all_args_resolved {
+                        let reason = UnavailableReason::from_builtin_error(e);
+                        if defer_unknown_functions {
+                            Ok(Value::Deferred(DeferredValue::Unavailable {
+                                name: *name,
+                                args: resolved_args,
+                                reason,
+                                source_line: *source_line,
+                            }))
+                        } else {
+                            Err(unavailable_builtin_error(*name, &reason, *source_line))
+                        }
                     } else {
                         // Args contain unresolved refs — keep as FunctionCall for later resolution
                         Ok(Value::Deferred(DeferredValue::FunctionCall {
@@ -1557,8 +1579,58 @@ fn resolve_value_with_config(
                     message: error.to_string(),
                 })
         }
-        _ => Ok(value.clone()),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::BindingRef { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => Ok(value.clone()),
     }
+}
+
+fn unavailable_builtin_error(
+    name: crate::builtins::BuiltinFunction,
+    reason: &UnavailableReason,
+    source_line: DiagnosticSourceLine,
+) -> ParseError {
+    let message = format!("{name}(): {reason}");
+    match source_line.get() {
+        Some(line) => ParseError::InvalidExpression { line, message },
+        None => ParseError::UserFunctionError(message),
+    }
+}
+
+fn reject_required_interpolation_unavailable(
+    parts: &[InterpolationPart],
+    defer_unknown_functions: bool,
+) -> Result<(), ParseError> {
+    if defer_unknown_functions {
+        return Ok(());
+    }
+    if let Some((function, reason, source_line)) = parts.iter().find_map(|part| {
+        if let InterpolationPart::Expr(value) = part {
+            find_unavailable_evaluation(
+                value,
+                UnavailableCoalescePolicy::ExcludeDefault,
+                UnavailableSecretPolicy::Exclude,
+            )
+        } else {
+            None
+        }
+    }) {
+        return Err(unavailable_builtin_error(function, reason, source_line));
+    }
+    Ok(())
 }
 
 /// Walk a value tree and finalize any `Value::Deferred(DeferredValue::FunctionCall)` placeholder
@@ -1579,6 +1651,7 @@ fn resolve_function_calls_only(
     match value {
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Coalesce { .. },
@@ -1636,18 +1709,27 @@ fn resolve_function_calls_only(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
+            let resolved = resolved?;
+            reject_required_interpolation_unavailable(&resolved, defer_unknown_functions)?;
+            Ok(Value::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
-            DeferredValue::Secret(Box::new(resolve_function_calls_only(
-                inner,
-                binding_map,
-                fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )?)),
-        )),
-        _ => Ok(value.clone()),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => Ok(value.clone()),
     }
 }
 
@@ -1854,6 +1936,156 @@ let consumer = mock.test.resource { name = q.name[0] }
             Some(&authored),
             "resolving the known base attribute must not erase its postfix path",
         );
+    }
+}
+
+#[cfg(test)]
+mod unavailable_evaluation_tests {
+    use super::*;
+
+    const MISSING_ENV: &str = "CARINA_TEST_UNAVAILABLE_EVALUATION_3974";
+
+    fn parsed_with_comment(expression: &str) -> ParsedFile {
+        crate::parser::parse(
+            &format!(
+                r#"
+let item = mock.test.resource {{
+  name    = "unavailable-evaluation"
+  comment = {expression}
+}}
+"#,
+            ),
+            &ProviderContext::default(),
+        )
+        .expect("parse unavailable evaluation fixture")
+    }
+
+    fn comment(parsed: &ParsedFile) -> &Value {
+        parsed.resources[0]
+            .get_attr("comment")
+            .expect("fixture comment")
+    }
+
+    #[test]
+    fn permissive_resolution_distinguishes_failed_and_pending_builtin_calls() {
+        unsafe {
+            std::env::remove_var(MISSING_ENV);
+        }
+        let mut failed = parsed_with_comment(&format!(r#"env("{MISSING_ENV}")"#));
+        resolve_resource_refs_defer_unknown_functions(&mut failed, &ProviderContext::default())
+            .expect("permissive resolution retains a diagnostic value");
+
+        match comment(&failed) {
+            Value::Deferred(DeferredValue::Unavailable {
+                name, args, reason, ..
+            }) => {
+                assert_eq!(*name, crate::builtins::BuiltinFunction::env);
+                assert!(matches!(
+                    args.as_slice(),
+                    [argument]
+                        if matches!(
+                            argument.value(),
+                            Some(Value::Concrete(ConcreteValue::String(value)))
+                                if value == MISSING_ENV
+                        )
+                ));
+                assert_eq!(
+                    reason.as_str(),
+                    format!("environment variable '{MISSING_ENV}' is not set")
+                );
+            }
+            other => panic!("failed ready call must be Unavailable, got {other:?}"),
+        }
+        assert!(!comment(&failed).is_fully_resolved());
+        assert!(!is_static_value(comment(&failed)));
+
+        let mut pending = crate::parser::parse(
+            r#"
+let origin = mock.test.resource { name = "origin" }
+let item = mock.test.resource {
+  name    = "pending-evaluation"
+  comment = upper(origin.identifier)
+}
+"#,
+            &ProviderContext::default(),
+        )
+        .expect("parse pending evaluation fixture");
+        resolve_resource_refs_defer_unknown_functions(&mut pending, &ProviderContext::default())
+            .expect("pending call remains deferred");
+        assert!(matches!(
+            pending.resources[1].get_attr("comment"),
+            Some(Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::upper,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn strict_resolution_reports_the_original_unavailable_builtin_error() {
+        unsafe {
+            std::env::remove_var(MISSING_ENV);
+        }
+        let mut parsed = parsed_with_comment(&format!(r#"env("{MISSING_ENV}")"#));
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
+            .expect("permissive pass");
+
+        let error = resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
+            .expect_err("strict pass must reject an unavailable unwrapped builtin");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("environment variable '{MISSING_ENV}' is not set")),
+            "strict pass lost the original builtin diagnostic: {error}",
+        );
+    }
+
+    #[test]
+    fn secret_wraps_an_unavailable_value_without_losing_taint() {
+        unsafe {
+            std::env::remove_var(MISSING_ENV);
+        }
+        let mut parsed = parsed_with_comment(&format!(r#"secret(env("{MISSING_ENV}"))"#));
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
+            .expect("permissive pass");
+
+        assert!(matches!(
+            comment(&parsed),
+            Value::Deferred(DeferredValue::Secret(inner))
+                if matches!(inner.as_ref(), Value::Deferred(DeferredValue::Unavailable {
+                    name: crate::builtins::BuiltinFunction::env,
+                    ..
+                }))
+        ));
+    }
+
+    #[test]
+    fn unavailable_reason_does_not_expose_an_env_derived_variable_name() {
+        const NAME_SOURCE: &str = "CARINA_TEST_UNAVAILABLE_NAME_SOURCE_3974";
+        const SENSITIVE_NAME: &str = "CARINA_TEST_SENSITIVE_VARIABLE_NAME_3974";
+        unsafe {
+            std::env::set_var(NAME_SOURCE, SENSITIVE_NAME);
+            std::env::remove_var(SENSITIVE_NAME);
+        }
+        let mut parsed = parsed_with_comment(&format!(r#"env(env("{NAME_SOURCE}"))"#));
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
+            .expect("permissive pass");
+
+        let Value::Deferred(DeferredValue::Unavailable { reason, .. }) = comment(&parsed) else {
+            panic!(
+                "nested env failure must be unavailable: {:?}",
+                comment(&parsed)
+            );
+        };
+        assert_eq!(
+            reason.as_str(),
+            "environment variable named by a sensitive value is not set"
+        );
+        assert!(!format!("{reason:?}").contains(SENSITIVE_NAME));
+
+        unsafe {
+            std::env::remove_var(NAME_SOURCE);
+        }
     }
 }
 

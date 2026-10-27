@@ -1,0 +1,13 @@
+let r = mock.test.resource {
+  name = "secret-load-origin"
+}
+
+let direct = mock.test.resource {
+  name    = "secret-load-direct"
+  comment = "x-${secret(env("SECRET_V"))}"
+}
+
+let wrapped = mock.test.resource {
+  name    = "secret-load-wrapped"
+  comment = upper("${r.identifier}-${secret(env("SECRET_V"))}")
+}

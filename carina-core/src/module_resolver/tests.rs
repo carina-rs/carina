@@ -1348,6 +1348,144 @@ thing { name = 'beta'  }
 }
 
 #[test]
+fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
+    let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
+    origin.binding = Some("origin".to_string());
+
+    // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
+    // a bare handle in strict mode, while the permissive directory pass keeps
+    // the failed call as Unavailable for diagnostics and identity material.
+    let handle = crate::eval_value::StructuralHandle::new(
+        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
+            "mock",
+            "test.resource",
+        )),
+        "origin",
+    );
+    let mut dependent = Resource::pending_with_provider("mock", "test.resource", None);
+    dependent.set_attr(
+        "replacement_key".to_string(),
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![crate::resource::FunctionArgument::from_handle(handle)],
+            source_line: (7).into(),
+        }),
+    );
+    let mut module = ParsedFile {
+        resources: vec![origin, dependent],
+        ..ParsedFile::default()
+    };
+    crate::parser::resolve_resource_refs_defer_unknown_functions(
+        &mut module,
+        &ProviderContext::default(),
+    )
+    .expect("permissive resolution must retain the failed built-in");
+
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver.imported_modules.insert("m".to_string(), module);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "m".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::new(),
+    };
+    let mut resources = Vec::new();
+    for instance in ["first", "second"] {
+        resources.extend(
+            resolver
+                .expand_module_call(&call, instance)
+                .expect("expand module instance")
+                .resources,
+        );
+    }
+
+    let dependents = resources
+        .iter()
+        .filter(|resource| resource.get_attr("replacement_key").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(dependents.len(), 2, "expected one dependent per instance");
+
+    let argument_bindings = dependents
+        .iter()
+        .map(|resource| {
+            let Some(Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::upper,
+                args,
+                ..
+            })) = resource.get_attr("replacement_key")
+            else {
+                panic!(
+                    "upper(handle) must remain an unavailable built-in: {:?}",
+                    resource.get_attr("replacement_key")
+                );
+            };
+            let [argument] = args.as_slice() else {
+                panic!("upper() must retain one argument: {args:?}");
+            };
+            let Value::Deferred(DeferredValue::BindingRef { binding }) = argument.walker_value()
+            else {
+                panic!("upper() must retain its handle-shaped argument: {argument:?}");
+            };
+            binding.clone()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        argument_bindings,
+        HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
+    );
+
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("test.resource").attribute(
+            crate::schema::AttributeSchema::new(
+                "replacement_key",
+                crate::schema::AttributeType::string(),
+            )
+            .create_only(),
+        ),
+    );
+    crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &registry,
+        &|_| Vec::new(),
+    )
+    .expect("compute anonymous identities");
+
+    let identities = resources
+        .iter()
+        .filter(|resource| resource.get_attr("replacement_key").is_some())
+        .map(|resource| {
+            resource
+                .id
+                .identity_str()
+                .expect("computed identity")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(identities[0], identities[1]);
+    let hash_bases = identities
+        .iter()
+        .map(|identity| {
+            identity
+                .split_once('.')
+                .expect("module-prefixed identity")
+                .1
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        hash_bases.len(),
+        2,
+        "instance-prefixed unavailable arguments must produce distinct identity hashes: {identities:?}",
+    );
+}
+
+#[test]
 fn test_mixed_named_and_anonymous_module_calls_coexist() {
     let parsed = resolve_thing_fixture(
         r#"
@@ -2211,6 +2349,46 @@ fn test_substitute_arguments_function_call() {
             source_line: (0).into(),
         })
     );
+}
+
+#[test]
+fn test_substitute_arguments_unavailable_builtin_call() {
+    let inputs = HashMap::from([(
+        "source".to_string(),
+        Value::Concrete(ConcreteValue::String("resolved".into())),
+    )]);
+    let value = Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+                name: "source".to_string(),
+                source_line: (0).into(),
+                diagnostic_name: None,
+            }))
+            .into(),
+        ],
+        reason: crate::resource::UnavailableReason::from_builtin_error(
+            "fixture failure".to_string(),
+        ),
+        source_line: (7).into(),
+    });
+
+    let substituted = substitute_arguments(&value, &inputs).expect("substitution");
+    let Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::upper,
+        args,
+        reason,
+        source_line,
+    }) = substituted
+    else {
+        panic!("substitution must preserve Unavailable: {substituted:?}");
+    };
+    assert_eq!(
+        args[0].value(),
+        Some(&Value::Concrete(ConcreteValue::String("resolved".into())))
+    );
+    assert_eq!(reason.as_str(), "fixture failure");
+    assert_eq!(source_line.get(), Some(7));
 }
 
 /// Module with interpolation in resource attributes to test argument substitution

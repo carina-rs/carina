@@ -5861,8 +5861,10 @@ impl Value {
             }
             Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
-            Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-                format!("FunctionCall({})", name)
+            Value::Deferred(
+                DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+            ) => {
+                format!("FunctionCall({name})")
             }
             Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
                 format!("FunctionCall({})", function.name)
