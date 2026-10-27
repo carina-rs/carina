@@ -3540,7 +3540,8 @@ fn resolved_state_row_id(
 ///
 /// Returns a list of active Move pairs (from, to) where the `from` resource
 /// existed in state. Callers use this to add Move effects to the plan.
-pub fn materialize_moved_states(
+#[cfg(test)]
+fn materialize_moved_states(
     managed_current: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
