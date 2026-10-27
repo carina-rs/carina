@@ -111,11 +111,44 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
                     "rules",
                     AttributeType::list(AttributeType::struct_(
                         "Rule",
-                        vec![StructField::new("action", AttributeType::string())],
+                        vec![
+                            StructField::new("action", AttributeType::string()),
+                            StructField::new(
+                                "conditions",
+                                AttributeType::list(AttributeType::struct_(
+                                    "Condition",
+                                    vec![StructField::new("value", AttributeType::string())],
+                                )),
+                            )
+                            .with_block_name("condition"),
+                        ],
                     )),
                 )
                 .with_block_name("rule"),
             )
+            .attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration",
+                    vec![
+                        StructField::new(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition",
+                                vec![StructField::new("storage_class", AttributeType::string())],
+                            )),
+                        )
+                        .with_block_name("transition"),
+                        StructField::new(
+                            "transition",
+                            AttributeType::struct_(
+                                "Transition",
+                                vec![StructField::new("storage_class", AttributeType::string())],
+                            ),
+                        ),
+                    ],
+                ),
+            ))
             .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
             .attribute(

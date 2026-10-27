@@ -13,7 +13,9 @@ use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::UnresolvedResource;
-use carina_core::override_aware::{OverrideAwareResources, RebuildBindingsInputs};
+use carina_core::override_aware::{
+    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
@@ -24,13 +26,13 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
-use crate::commands::{collapse_errors, validate_and_resolve_errors_with_context};
+use crate::commands::validate_and_resolve_config_pair_with_context;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
-    add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
-    expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_late_anonymous_identities, reconcile_prefixed_names,
+    add_deferred_create_effects, compute_canonical_pair_anonymous_identifiers_with_ctx,
+    expand_same_config_deferred_for, reconcile_canonical_anonymous_identifiers_with_ctx,
+    reconcile_canonical_prefixed_names, reconcile_late_anonymous_identities,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -184,8 +186,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let loaded = load_configuration(&fixture_pathbuf).unwrap();
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let unresolved_resources = loaded.unresolved_parsed.resources;
-    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
     // Fixture planning deliberately skips loading provider artifacts. Supply
     // only the enum metadata validation needs here: the full fixture schema
@@ -196,19 +198,18 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let validation_errors = validate_and_resolve_errors_with_context(
-        &mut parsed,
+    let mut canonical_resources = validate_and_resolve_config_pair_with_context(
+        parsed,
+        unresolved_parsed,
         base_dir,
         true,
         &validation_wiring,
         HashMap::new(),
         &inference_errors,
         &duplicate_declarations,
-    );
-    if !validation_errors.is_empty() {
-        let error = collapse_errors(validation_errors);
-        panic!("fixture validation failed: {error}");
-    }
+    )
+    .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
+    let parsed = canonical_resources.parsed();
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         // Go through check_and_migrate so v5 fixtures (with the legacy
@@ -226,23 +227,23 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.providers,
         fixture_schemas(),
     );
-
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
     {
         // This fixture writes moved.to as the literal schema-derived anonymous
         // hash name, so compute the desired anonymous id before claims resolve.
-        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-            &mut parsed.resources,
-            wiring.schemas(),
+        let providers = parsed.providers.clone();
+        let errors = compute_canonical_pair_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut canonical_resources,
+            &providers,
         )
         .unwrap();
-        let errors =
-            compute_anonymous_identifiers_with_ctx(&wiring, canonical_resources, &parsed.providers);
         assert!(errors.is_empty(), "{errors:?}");
     }
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_canonical_prefixed_names(&mut canonical_resources, &state_file);
+    let parsed = canonical_resources.parsed();
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -253,9 +254,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wiring.schemas(),
     );
     if let Some(sf) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
+        canonical_resources.reconcile_anonymous_module_instances(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
@@ -266,15 +265,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         );
     }
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
+        reconcile_canonical_anonymous_identifiers_with_ctx(
             &wiring,
-            &mut parsed.resources,
-            &parsed.data_sources,
+            &mut canonical_resources,
             sf,
             &state_block_claims,
         )
         .expect("fixture state identities must remain unique");
     }
+    let parsed = canonical_resources.parsed();
 
     // carina#3181: `parsed.resources` is managed-only; data sources live
     // in `parsed.data_sources`. Only managed resources are dependency-
@@ -354,7 +353,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         remote_bindings.insert(us.binding.clone(), bindings);
     }
     let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
+        parsed,
         &remote_bindings,
         &carina_core::parser::ProviderContext::default(),
     )
@@ -376,7 +375,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &sorted_resources,
     );
     let managed_stability = crate::wiring::derive_managed_binding_stability(
-        &parsed,
+        parsed,
         &sorted_resources,
         &managed_current,
         &data_source_states,
@@ -387,29 +386,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &wait_aliases,
     )
     .expect("fixture managed binding stability must resolve");
-    let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
-        sorted_resources.clone(),
-        state_file.as_ref(),
-        carina_core::binding_index::PreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            data_sources: &data_sources,
-            managed_current: &pre_apply_input_current,
-            data_source_states: &data_source_states,
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &upstream_binding_names,
-        &managed_stability,
-    )
-    .expect("Failed to build override-aware resources");
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        state_file.as_ref(),
-    );
-    let unresolved_override_aware_resources =
-        OverrideAwareResources::build_for_plan_with_stability(
-            unresolved_resources,
+    let (mut override_aware_resources, unresolved_override_aware_resources) =
+        OverrideAwareResources::build_pair_with_stability(
+            &canonical_resources,
             state_file.as_ref(),
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
@@ -420,10 +399,16 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
-            &upstream_binding_names,
             &managed_stability,
+            OverrideAwareBuildMode::Plan {
+                unresolved_upstream_bindings: &upstream_binding_names,
+            },
         )
-        .expect("Failed to build unresolved override-aware resources");
+        .expect("Failed to build override-aware resources");
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
@@ -513,8 +498,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             state_file,
             schemas: wiring.schemas().clone(),
             moved_origins: HashMap::new(),
-            deferred_for_expressions: parsed.deferred_for_expressions,
-            export_params: parsed.export_params,
+            deferred_for_expressions: parsed.deferred_for_expressions.clone(),
+            export_params: parsed.export_params.clone(),
             resolved_export_params: carina_core::validation::check_export_values_pre_apply(
                 &[],
                 &carina_core::binding_index::ResolvedBindings::default(),
@@ -522,7 +507,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             )
             .expect("empty exports are checked"),
             prev_explicit,
-            expansion_trace: parsed.expansion_trace,
+            expansion_trace: parsed.expansion_trace.clone(),
         };
     }
     let resolved_desired_ids = reconcile_late_anonymous_identities(
@@ -588,7 +573,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
 
     let deferred_for_expansion = expand_same_config_deferred_for(
-        &parsed,
+        parsed,
         &sorted_resources,
         &managed_current,
         &data_source_states,
@@ -715,10 +700,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         schemas: wiring.schemas().clone(),
         moved_origins,
         deferred_for_expressions: residual_deferred_for,
-        export_params: parsed.export_params,
+        export_params: parsed.export_params.clone(),
         resolved_export_params,
         prev_explicit,
-        expansion_trace: parsed.expansion_trace,
+        expansion_trace: parsed.expansion_trace.clone(),
     }
 }
 
@@ -1268,4 +1253,46 @@ pub fn delete_instance_attributes_from_plan(
     state_file: Option<&StateFile>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
     crate::commands::plan::collect_historical_display_attributes(plan, managed_current, state_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn providerless_fixture_plan_canonicalizes_block_names_in_both_snapshots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("main.crn"),
+            r#"provider mock {}
+
+let item = mock.test.resource {
+  name = "fixture-block"
+  rule { action = "allow" }
+}
+"#,
+        )
+        .expect("write fixture");
+
+        let fixture = build_plan_from_fixture_path(temp.path());
+        let desired = fixture
+            .desired_resources
+            .iter()
+            .find(|resource| resource.id.resource_type == "test.resource")
+            .expect("desired fixture resource")
+            .as_resource();
+        assert!(desired.attributes.contains_key("rules"));
+        assert!(!desired.attributes.contains_key("rule"));
+
+        let unresolved = fixture
+            .unresolved_resources
+            .iter()
+            .find(|resource| resource.as_resource().id.resource_type == "test.resource")
+            .expect("unresolved fixture resource")
+            .as_resource();
+        assert!(unresolved.attributes.contains_key("rules"));
+        assert!(!unresolved.attributes.contains_key("rule"));
+    }
 }

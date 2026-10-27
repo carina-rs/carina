@@ -1323,7 +1323,7 @@ async fn run_state_refresh_locked_with_ctx(
         deferred_create_targets: _,
         printed_warnings: _,
     } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
-        parsed,
+        config: crate::wiring::ExpandRefreshConfig::Parsed(parsed),
         provider: &provider,
         sorted_resources: &sorted_resources,
         managed_current: &mut managed_current,
@@ -3382,7 +3382,7 @@ mod tests {
         let mut data_source_states = HashMap::new();
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
-                parsed: &parsed,
+                config: crate::wiring::ExpandRefreshConfig::Parsed(&parsed),
                 provider: &provider,
                 sorted_resources: &sorted_resources,
                 managed_current: &mut current_states,
