@@ -315,6 +315,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         compositions: vec![],
         data_sources: vec![],
         data_source_origins: vec![],
+        data_source_values: vec![],
         current_states,
         upstream_snapshot: HashMap::new(),
         upstream_sources: vec![],

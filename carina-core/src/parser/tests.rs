@@ -1,5 +1,5 @@
 use super::*;
-use crate::binding_index::{IterableBindings, PreApplyInputs, ResolvedBindings};
+use crate::binding_index::{IterableBindings, PreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
@@ -9521,12 +9521,11 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_data_source_read(PreDataSourceReadInputs {
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
         remote_bindings: &remote_bindings,
         wait_aliases: &[],
     });

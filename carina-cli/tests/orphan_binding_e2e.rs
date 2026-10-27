@@ -8,6 +8,7 @@ struct Scenario {
     _temp: TempDir,
     project: PathBuf,
     mock_state: PathBuf,
+    operation_log: PathBuf,
 }
 
 impl Scenario {
@@ -16,6 +17,7 @@ impl Scenario {
         let project = temp.path().to_path_buf();
         Self {
             mock_state: project.join("mock-state.json"),
+            operation_log: project.join("mock-operations.log"),
             project,
             _temp: temp,
         }
@@ -31,10 +33,15 @@ impl Scenario {
         .expect("write project configuration");
     }
 
+    fn write_file(&self, name: &str, contents: &str) {
+        fs::write(self.project.join(name), contents).expect("write project configuration");
+    }
+
     fn carina(&self, args: &[&str]) -> Output {
         command(&self.project)
             .args(args)
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_OP_LOG", &self.operation_log)
             .output()
             .expect("run carina")
     }
@@ -171,4 +178,109 @@ let b = mock.test.resource {
     let resources = state["resources"].as_array().expect("state resources");
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0]["identity"], "a");
+}
+
+#[test]
+fn state_refresh_reads_data_source_against_orphan_binding() {
+    let scenario = Scenario::new();
+    scenario.write_file(
+        "backend.crn",
+        "backend local { path = \"carina.state.json\" }\n",
+    );
+    scenario.write_file("providers.crn", "provider mock {}\n");
+    scenario.write_file(
+        "main.crn",
+        r#"let retired = mock.test.resource {
+  name = "retired-resource"
+}
+"#,
+    );
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.carina(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+    scenario.write_file("main.crn", "");
+    scenario.write_file(
+        "data.crn",
+        r#"let lookup = read mock.iam.Roles {
+  name_regex = retired.name
+}
+"#,
+    );
+    fs::write(&scenario.operation_log, "").expect("clear operation log");
+
+    let refresh = scenario.carina(&["state", "refresh", "--lock=false", "."]);
+    assert_success("state refresh with orphan-backed data source", &refresh);
+    let operations = fs::read_to_string(&scenario.operation_log).unwrap_or_default();
+    assert!(
+        operations.contains("read iam.Roles.lookup"),
+        "state refresh must resolve the orphan binding and dispatch the data source\n\
+         operations:\n{operations}\noutput:\n{}",
+        output_text(&refresh),
+    );
+}
+
+#[test]
+fn configured_binding_wins_over_same_binding_orphan_for_data_source_reads() {
+    let scenario = Scenario::new();
+    scenario.write_file(
+        "backend.crn",
+        "backend local { path = \"carina.state.json\" }\n",
+    );
+    scenario.write_file("providers.crn", "provider mock {}\n");
+    scenario.write_file(
+        "main.crn",
+        r#"let bucket = mock.test.resource {
+  name = "old-bucket"
+}
+"#,
+    );
+    fs::write(
+        &scenario.mock_state,
+        r#"{"version":2,"states":{"iam.Roles.lookup":{"name_regex":"old-bucket","names":["old"]}}}"#,
+    )
+    .expect("seed mock data source");
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.carina(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+    let mut mock_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scenario.mock_state).expect("read mock-provider state"))
+            .expect("parse mock-provider state");
+    mock_state["states"]["test.resource.bucket"]["generated_rules"] =
+        serde_json::json!([{ "action": "old-action" }]);
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&mock_state).expect("serialize mock-provider state"),
+    )
+    .expect("seed an old-type-only refreshed attribute");
+    scenario.write_file(
+        "main.crn",
+        r#"let bucket = mock.test.deferred_source {
+  name = "new-bucket"
+}
+"#,
+    );
+    scenario.write_file(
+        "data.crn",
+        r#"let lookup = read mock.iam.Roles {
+  name_regex = bucket.generated_rules[0].action
+}
+"#,
+    );
+    fs::write(&scenario.operation_log, "").expect("clear operation log");
+
+    let plan = scenario.carina(&["plan", "."]);
+    assert_success("plan after binding-preserving type change", &plan);
+    let operations = fs::read_to_string(&scenario.operation_log).unwrap_or_default();
+    assert!(
+        !operations.contains("read iam.Roles.lookup"),
+        "the configured runtime-dependent bucket must win over the stale orphan binding\n\
+         operations:\n{operations}\noutput:\n{}",
+        output_text(&plan),
+    );
 }

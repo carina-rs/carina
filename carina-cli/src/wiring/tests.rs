@@ -2,10 +2,11 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
-    DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome,
-    ProviderCheckInputs, UnresolvedResource, execute_plan,
+    ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome, ProviderCheckInputs,
+    UnresolvedResource, execute_plan,
 };
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
@@ -40,6 +41,18 @@ enum ReadBehavior {
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn test_data_source_values(
+    data_sources: &[DataSource],
+    states: &HashMap<ResourceId, State>,
+) -> DataSourceValues {
+    DataSourceValues::from_data_sources(data_sources, |data_source| {
+        states.get(&data_source.id).map_or_else(
+            || DataSourceValue::deferred_to_apply(Vec::new()),
+            |state| DataSourceValue::read(state.clone()),
+        )
+    })
 }
 
 fn canonical_unresolved(
@@ -418,9 +431,8 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         carina_core::binding_index::PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -428,7 +440,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     .unwrap();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
     let mut current_states = HashMap::new();
-    let mut data_source_states = HashMap::new();
+    let mut data_source_values = DataSourceValues::empty();
     let mut orphans = Orphans::new();
 
     let error = PlanPreprocessor::new(&normalizer, &ctx)
@@ -437,7 +449,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             &[],
             &module_gate,
             &mut current_states,
-            &mut data_source_states,
+            &mut data_source_values,
             &mut orphans,
             &[],
             &mut [],
@@ -538,9 +550,8 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -580,7 +591,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let normalizer = TransformingNormalizer;
     let saved_attrs = crate::empty_lifted_saved_attrs();
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "source", None);
-    let mut data_source_states = HashMap::from([(
+    let data_source_states = HashMap::from([(
         data_source_id.clone(),
         State::existing(
             data_source_id.clone(),
@@ -590,10 +601,13 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             )]),
         ),
     )]);
+    let data_source = DataSource::with_provider("mock", "test.lookup", "source", None);
+    let mut data_source_values =
+        test_data_source_values(std::slice::from_ref(&data_source), &data_source_states);
 
-    hydrate_prior_states(
+    hydrate_prior_data_source_values(
         &mut current_states,
-        &mut data_source_states,
+        &mut data_source_values,
         &mut orphans,
         &normalizer,
         &saved_attrs,
@@ -607,7 +621,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             &resource_origins,
             &carina_core::executor::ModuleConstraintGate::new(&[]),
             &mut current_states,
-            &mut data_source_states,
+            &mut data_source_values,
             &mut orphans,
             &[],
             &mut [],
@@ -616,7 +630,10 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         .await
         .unwrap();
 
-    let data_source_state = &data_source_states[&data_source_id];
+    let data_source_state = data_source_values
+        .read_states()
+        .find_map(|(id, state)| (id == &data_source_id).then_some(state))
+        .expect("configured data source remains read");
     assert_eq!(
         data_source_state.attributes.get("status"),
         Some(&Value::Concrete(ConcreteValue::String("canonical".into())))
@@ -645,9 +662,8 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     );
     resources.rebuild_bindings_after_identity_reconciliation(RebuildBindingsInputs {
         compositions: &[],
-        data_sources: &[],
         managed_current: &input_states,
-        data_source_states: &HashMap::new(),
+        data_source_values: &DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -729,11 +745,14 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     assert_eq!(state.partial_read, None);
 
     let mut current_states = HashMap::new();
-    let mut data_source_states =
-        HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
-    hydrate_prior_states(
+    let data_source = DataSource::with_provider("mock", "test.resource", "orphan", None);
+    let mut data_source_values =
+        DataSourceValues::from_data_sources(std::slice::from_ref(&data_source), |_| {
+            DataSourceValue::read(State::existing(id.clone(), HashMap::new()))
+        });
+    hydrate_prior_data_source_values(
         &mut current_states,
-        &mut data_source_states,
+        &mut data_source_values,
         &mut orphans,
         &SavedAttrsHydratingNormalizer,
         &saved_attrs,
@@ -757,12 +776,12 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
             "saved-value".into()
         )))
     );
-    assert!(
-        !data_source_states[&id]
-            .attributes
-            .contains_key("managed_saved")
-    );
-    assert_eq!(data_source_states[&id].partial_read, None);
+    let data_source_state = data_source_values
+        .read_states()
+        .find_map(|(read_id, state)| (read_id == &id).then_some(state))
+        .expect("configured data source remains read");
+    assert!(!data_source_state.attributes.contains_key("managed_saved"));
+    assert_eq!(data_source_state.partial_read, None);
     assert!(current_states.is_empty());
 }
 
@@ -1546,7 +1565,11 @@ let shared = read test.shared.Type {}
     );
     assert_eq!(orphan_state.partial_read, Some(partial_read));
 
-    let data_source_state = &plan_context.data_source_states[&data_source_id];
+    let data_source_state = plan_context
+        .data_source_values
+        .read_states()
+        .find_map(|(id, state)| (id == &data_source_id).then_some(state))
+        .expect("plan data source was read");
     assert!(!data_source_state.attributes.contains_key("managed_saved"));
     assert_eq!(data_source_state.partial_read, None);
 }
@@ -3936,13 +3959,17 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: &sorted_resources,
         compositions: &[],
-        data_sources: &plan_ctx.data_sources,
         managed_current: &plan_input_states,
-        data_source_states: &plan_ctx.data_source_states,
+        data_source_values: &plan_ctx.data_source_values,
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
 
+    let executable_data_source_values = plan_ctx
+        .data_source_values
+        .clone()
+        .into_executable()
+        .expect("fixture plan must not contain blocked data sources");
     let provider = CascadeCreateProvider::default();
     let input = ExecutionInput {
         plan: &plan_ctx.plan,
@@ -3953,8 +3980,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         compositions: &[],
         bindings,
         managed_current: plan_ctx.managed_current,
-        data_source_states: plan_ctx.data_source_states,
-        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        data_source_values: executable_data_source_values,
         normalizer: &carina_core::provider::NoopNormalizer,
         provider_configs: &parsed.providers,
         factories: ctx.factories(),
@@ -4135,7 +4161,6 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
         &[mizzy],
         &crate::managed_current_from_states(current_states.clone()),
         &HashMap::new(),
-        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -4188,7 +4213,6 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
-        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -4230,7 +4254,6 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
-        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -4258,7 +4281,6 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
         &[],
         &[],
         &[lookup],
-        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -4303,7 +4325,6 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
         &[lookup],
         &HashMap::new(),
         &HashMap::new(),
-        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -4339,7 +4360,6 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
         &[target],
         &[],
         &[lookup],
-        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -4392,7 +4412,6 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
         &[],
         &[lookup],
         &crate::managed_current_from_states(current_states.clone()),
-        &HashMap::new(),
         &HashMap::new(),
         &registry,
         &[],
@@ -4447,7 +4466,6 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
         &[lookup],
         &crate::managed_current_from_states(current_states.clone()),
         &HashMap::new(),
-        &HashMap::new(),
         &empty_registry,
         &[],
     )
@@ -4492,7 +4510,6 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
         &[target],
         &[],
         &[first, second],
-        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -4560,7 +4577,6 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
         &[lookup],
         &crate::managed_current_from_states(current_states.clone()),
         &HashMap::new(),
-        &HashMap::new(),
         &registry,
         &[],
     )
@@ -4593,7 +4609,6 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
         &[],
         &[],
         &[lookup],
-        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &empty_registry,
@@ -5003,9 +5018,8 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
         PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -5903,7 +5917,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &[],
             &HashMap::new(),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -5943,14 +5957,13 @@ mod expand_same_config_deferred_for_tests {
                     provider_configs: &[],
                     state_block_claims: &claims,
                     managed_current: HashMap::new(),
-                    data_source_states: HashMap::new(),
                     orphans: Orphans::new(),
                     already_refreshed: HashSet::new(),
                 },
                 DeferredForWarningPolicy::Suppress,
             )
             .expect("prepare expansion")
-            .seal();
+            .seal(DataSourceValues::empty());
 
         let out = prepared
             .expand_parsed(
@@ -6073,7 +6086,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6143,7 +6156,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6192,7 +6205,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6226,7 +6239,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6266,7 +6279,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6315,7 +6328,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(empty_states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6387,7 +6400,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &HashMap::new(),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6460,7 +6473,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6568,7 +6581,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6603,7 +6616,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6684,7 +6697,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6713,7 +6726,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6808,7 +6821,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -6845,7 +6858,7 @@ mod expand_same_config_deferred_for_tests {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -7808,7 +7821,6 @@ mod resolved_value_constraint_gate {
             .with_attribute("target", ref_value());
         let source = vec![producer, consumer];
         let compositions = Vec::<Composition>::new();
-        let data_sources = Vec::<DataSource>::new();
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
@@ -7818,9 +7830,8 @@ mod resolved_value_constraint_gate {
             PreApplyInputs {
                 managed: &[],
                 compositions: &compositions,
-                data_sources: &data_sources,
                 managed_current: &current_states,
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -7840,7 +7851,7 @@ mod resolved_value_constraint_gate {
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
         let mut current_states = HashMap::new();
-        let mut data_source_states = HashMap::new();
+        let mut data_source_values = DataSourceValues::empty();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
@@ -7850,7 +7861,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut current_states,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 &[],
                 &mut data_sources,
@@ -7909,7 +7920,6 @@ mod resolved_value_constraint_gate {
             producer.set_attr(name, value);
         }
         let compositions = std::slice::from_ref(composition);
-        let empty_data_sources = Vec::<DataSource>::new();
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
@@ -7919,9 +7929,8 @@ mod resolved_value_constraint_gate {
             PreApplyInputs {
                 managed: &[],
                 compositions,
-                data_sources: &empty_data_sources,
                 managed_current: &current_states,
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -7929,7 +7938,7 @@ mod resolved_value_constraint_gate {
         .unwrap();
         let origins = resources.paired_unresolved_resources();
         let mut states = HashMap::new();
-        let mut data_source_states = HashMap::new();
+        let mut data_source_values = DataSourceValues::empty();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let module_gate =
@@ -7941,7 +7950,7 @@ mod resolved_value_constraint_gate {
                 &origins,
                 &module_gate,
                 &mut states,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 &[],
                 &mut data_sources,
@@ -8055,9 +8064,8 @@ mod resolved_value_constraint_gate {
             PreApplyInputs {
                 managed: &[],
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &HashMap::new(),
-                data_source_states: &HashMap::new(),
+                data_source_values: &DataSourceValues::empty(),
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
             },
@@ -8073,7 +8081,7 @@ mod resolved_value_constraint_gate {
         ];
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
         let mut states = HashMap::new();
-        let mut data_source_states = HashMap::new();
+        let mut data_source_values = super::test_data_source_values(&data_sources, &HashMap::new());
         let mut orphans = Orphans::new();
 
         let errors = PlanPreprocessor::new(&normalizer, &ctx)
@@ -8082,7 +8090,7 @@ mod resolved_value_constraint_gate {
                 &[],
                 &module_gate,
                 &mut states,
-                &mut data_source_states,
+                &mut data_source_values,
                 &mut orphans,
                 &[],
                 &mut data_sources,
@@ -8252,7 +8260,7 @@ exports { team_prefix: String = "x" }"#,
     }
 
     #[tokio::test]
-    async fn plan_refresh_reports_module_constraint_without_dispatching_data_source() {
+    async fn plan_refresh_reads_data_source_before_reporting_unrelated_module_constraint() {
         let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
             expression: not_bad("value"),
@@ -8305,7 +8313,11 @@ exports { team_prefix: String = "x" }"#,
         .await
         .expect("module violations must be represented by the plan");
 
-        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "an unrelated module constraint must not block the query phase"
+        );
         assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
         assert!(matches!(
             &plan.plan.errors()[0].kind,

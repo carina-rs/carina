@@ -73,9 +73,8 @@ fn pre_apply_records_dsl_attributes() {
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[m],
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -98,13 +97,12 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[m],
         compositions: &[],
-        data_sources: &[],
         managed_current: &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -120,9 +118,8 @@ fn pre_apply_skips_resources_without_binding() {
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[m],
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -135,9 +132,8 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[],
         compositions: &[composition],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -160,9 +156,8 @@ fn add_compositions_layers_on_top_of_resources() {
     let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[managed],
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -188,9 +183,8 @@ fn add_compositions_overwrites_same_name_resource_binding() {
     let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[managed],
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -210,9 +204,8 @@ fn add_compositions_skips_unbound() {
     let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[],
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -236,9 +229,8 @@ fn managed_plus_virtual_layering() {
     let mut typed = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: std::slice::from_ref(&managed),
         compositions: &[],
-        data_sources: &[],
         managed_current: &HashMap::new(),
-        data_source_states: &HashMap::new(),
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });

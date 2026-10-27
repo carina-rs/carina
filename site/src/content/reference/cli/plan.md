@@ -73,9 +73,9 @@ This is useful in CI pipelines to detect whether changes exist without parsing o
 
 ### `--refresh <BOOL>`
 
-Refresh state from the cloud provider before planning. Defaults to `true`.
+Refresh managed-resource state from the cloud provider before planning. Defaults to `true`.
 
-When set to `false`, Carina uses cached state and prints a warning. The plan may not reflect actual infrastructure.
+When set to `false`, Carina uses cached state for managed resources and prints a warning. Data sources are queries rather than managed objects, so Carina always reads them regardless of this flag. The plan may not reflect the actual managed infrastructure.
 
 ```bash
 carina plan --refresh=false
