@@ -46,6 +46,7 @@ use crate::commands::plan::{
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
+use crate::commands::shared::progress::ProgressBackend;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -1314,7 +1315,7 @@ async fn run_state_refresh_locked_with_ctx(
                 .collect()
         })
         .unwrap_or_default();
-    let multi = indicatif::MultiProgress::new();
+    let progress = ProgressBackend::new();
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         new_child_ids: _,
@@ -1337,7 +1338,7 @@ async fn run_state_refresh_locked_with_ctx(
         saved_dep_bindings: &saved_dep_bindings,
         saved_attrs: &saved_attrs_for_expansion,
         prev_explicit: &prev_explicit_for_expansion,
-        multi: &multi,
+        progress: &progress,
         schemas: ctx.schemas(),
     })
     .await?;
@@ -3377,8 +3378,7 @@ mod tests {
         .expect("production orphan refresh should succeed");
         let mut orphans = orphans.into_plan_orphans();
         let state_file = Some(state_file);
-        let multi =
-            indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let progress = ProgressBackend::plain(std::io::sink());
         let mut data_source_states = HashMap::new();
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
@@ -3396,7 +3396,7 @@ mod tests {
                 saved_dep_bindings: &HashMap::new(),
                 saved_attrs: &saved_attrs_for_expansion,
                 prev_explicit: &HashMap::new(),
-                multi: &multi,
+                progress: &progress,
                 schemas: &schemas,
             },
         )

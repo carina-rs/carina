@@ -72,3 +72,4 @@ tower-lsp = "0.20"
 # process (#3227, follow-up to #3206).
 winterbaume-core = "0.2"
 winterbaume-kms = "0.2.1"
+vt100 = "0.15.2"
