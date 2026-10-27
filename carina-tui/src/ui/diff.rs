@@ -333,7 +333,9 @@ fn push_added_removed_block(
 mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::value::RenderedKey;
+    use carina_core::value::{PrettyValue, RenderedKey};
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
 
     fn rendered_string(value: &str) -> RenderedValue {
         carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(value.into())))
@@ -376,6 +378,96 @@ mod tests {
                 "    ~ ManagedBy: 'old' -> 'carina'  # default_tags",
                 "    - Legacy: 'gone'",
             ]
+        );
+    }
+
+    /// Regression for #3116: #3894 keeps removed-value strikethrough off layout indentation.
+    #[test]
+    fn removed_multiline_values_do_not_strike_layout_indentation() {
+        let long_string_list = || {
+            ConcreteValue::StringList(vec![
+                "a".repeat(60).into(),
+                "b".repeat(60).into(),
+                "c".repeat(60).into(),
+            ])
+        };
+        let item = ListOfMapsDiffItem {
+            fields: vec![
+                (
+                    RenderedKey::from_raw("cfg"),
+                    PrettyValue::new(Value::Concrete(ConcreteValue::Map(
+                        vec![
+                            ("first".to_string(), Value::Concrete(long_string_list())),
+                            ("second".to_string(), Value::Concrete(long_string_list())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ))),
+                ),
+                (
+                    RenderedKey::from_raw("values"),
+                    PrettyValue::new(Value::Concrete(long_string_list())),
+                ),
+            ],
+        };
+        let mut lines = Vec::new();
+
+        render_list_of_maps_diff(&mut lines, "rules", &[], &[], &[], &[item], false);
+
+        let width = 120;
+        let height = u16::try_from(lines.len()).expect("rendered lines fit in terminal height");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut has_nested_continuation = false;
+
+        for row in 0..height {
+            let indent = (0..width)
+                .take_while(|&column| buffer[(column, row)].symbol() == " ")
+                .count();
+            if indent == usize::from(width) {
+                continue;
+            }
+
+            has_nested_continuation |= indent >= 10;
+
+            for column in 0..indent {
+                assert!(
+                    !buffer[(column as u16, row)]
+                        .modifier
+                        .contains(Modifier::CROSSED_OUT),
+                    "leading indentation is crossed out at row {row}, column {column}"
+                );
+            }
+
+            let last_content_column = (indent..usize::from(width))
+                .rfind(|&column| buffer[(column as u16, row)].symbol() != " ")
+                .expect("non-blank row has content");
+            let row_text = (indent..=last_content_column)
+                .map(|column| buffer[(column as u16, row)].symbol())
+                .collect::<String>();
+            let is_layout_row = indent == 2 && matches!(row_text.as_str(), "rules: [" | "]");
+
+            if !is_layout_row {
+                for column in indent..=last_content_column {
+                    let cell = &buffer[(column as u16, row)];
+                    if cell.symbol() == " " {
+                        continue;
+                    }
+
+                    assert!(
+                        cell.modifier.contains(Modifier::CROSSED_OUT),
+                        "content cell is not crossed out at row {row}, column {column}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            has_nested_continuation,
+            "expected a wrapped continuation row indented by at least 10 columns"
         );
     }
 }
