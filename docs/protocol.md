@@ -74,6 +74,17 @@ Saved-plan format 21 records the address and in-flight marker, never the
 provider token. Apply reloads the envelope from locked state and rejects the
 saved plan if any address changed in-flight status in either direction.
 
+Saved-plan format 23 binds every managed-resource and data-source type
+referenced by the plan to the provider schema used during planning. Each entry
+is either `Present`, with the schema's canonical semantic fingerprint (encoded
+as `{"present":"..."}`), or `Absent` (encoded as `"absent"`) when a
+state-only type is no longer exposed by the provider. Apply captures the plan's
+complete type inventory before locked-state reload consumes its current-state
+snapshots, then compares the saved entries with the schemas exposed by the
+current provider binary. A changed presence or fingerprint rejects the saved
+plan before normalizer construction, secret evaluation, or CRUD-capable
+provider construction.
+
 Hosts and providers must both use protocol v10. The minimum supported protocol
 version is 10.
 

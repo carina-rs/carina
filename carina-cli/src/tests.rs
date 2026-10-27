@@ -500,11 +500,12 @@ fn plan_file_serde_round_trip() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
+        schema_fingerprints: Default::default(),
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(22));
+    assert_eq!(wire["version"], serde_json::json!(23));
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");
@@ -830,6 +831,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
         identity: "cert_issued".into(),
+        target_schema_kind: carina_core::schema::SchemaKind::Resource,
         target_id: ResolvedResourceId::with_identity("acm.Certificate", "cert"),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -3116,6 +3118,7 @@ fn plan_file_serialization_redacts_secrets() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
+        schema_fingerprints: Default::default(),
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
@@ -3164,6 +3167,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
 
     let error = serde_json::to_string(&plan_file)
@@ -3201,6 +3205,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
     };
     let mut json = serde_json::to_value(plan_file).unwrap();
     json["sorted_resources"][0]["id"]

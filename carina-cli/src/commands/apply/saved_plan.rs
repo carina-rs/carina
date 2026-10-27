@@ -7,10 +7,10 @@ use carina_core::resource::{Composition, Current, DataSource, Resource, Resource
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    MovedOrigins, PlanFile, PlanWaitBinding, ReloadedCurrentStateEntry, ReloadedPlanFile,
-    ResolvedProviderInputs, UpstreamSource,
+    MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, ReloadedCurrentStateEntry,
+    ReloadedPlanFile, ResolvedProviderInputs, UpstreamSource,
 };
-use crate::error::AppError;
+use crate::error::{AppError, SavedPlanSchemaMismatchError};
 use crate::wiring::ExpandedCanonicalResources;
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
@@ -111,14 +111,22 @@ pub(super) enum InspectedPlanFile {
 /// state until its in-flight markers are reconciled under the state lock.
 pub(super) struct VerifiedPlanFile {
     plan_file: PlanFile,
+    schema_references: PlanSchemaReferences,
 }
 
 impl InspectedPlanFile {
     pub(super) fn inspect(plan_file: PlanFile) -> Self {
+        let schema_references = plan_file.referenced_schema_types();
         if plan_file.contains_redacted_secret_placeholders() {
-            Self::NeedsSecretVerification(PendingPlanFile { plan_file })
+            Self::NeedsSecretVerification(PendingPlanFile {
+                plan_file,
+                schema_references,
+            })
         } else {
-            Self::Verified(VerifiedPlanFile { plan_file })
+            Self::Verified(VerifiedPlanFile {
+                plan_file,
+                schema_references,
+            })
         }
     }
 
@@ -159,22 +167,27 @@ impl InspectedPlanFile {
         state_file: Option<&carina_state::StateFile>,
     ) -> Result<ReloadedInspectedPlanFile, AppError> {
         match self {
-            Self::Verified(plan) => plan
-                .plan_file
+            Self::Verified(VerifiedPlanFile {
+                plan_file,
+                schema_references,
+            }) => plan_file
                 .reload_in_flight_from_locked_state(state_file)
                 .map(|plan_file| {
-                    ReloadedInspectedPlanFile::Verified(RehydratedPlanFile {
+                    ReloadedInspectedPlanFile::Verified(ReloadedVerifiedPlanFile {
                         plan_file,
-                        planned_secret_hashes: HashMap::new(),
+                        schema_references,
                     })
                 })
                 .map_err(AppError::Config),
-            Self::NeedsSecretVerification(plan) => plan
-                .plan_file
+            Self::NeedsSecretVerification(PendingPlanFile {
+                plan_file,
+                schema_references,
+            }) => plan_file
                 .reload_in_flight_from_locked_state(state_file)
                 .map(|plan_file| {
                     ReloadedInspectedPlanFile::NeedsSecretVerification(ReloadedPendingPlanFile {
                         plan_file,
+                        schema_references,
                     })
                 })
                 .map_err(AppError::Config),
@@ -184,20 +197,73 @@ impl InspectedPlanFile {
 
 /// Saved-plan state after the only locked-state reload transition.
 pub(super) enum ReloadedInspectedPlanFile {
-    Verified(RehydratedPlanFile),
+    Verified(ReloadedVerifiedPlanFile),
     NeedsSecretVerification(ReloadedPendingPlanFile),
+}
+
+/// Placeholder-free saved plan awaiting provider-schema verification.
+pub(super) struct ReloadedVerifiedPlanFile {
+    plan_file: ReloadedPlanFile,
+    schema_references: PlanSchemaReferences,
+}
+
+impl ReloadedInspectedPlanFile {
+    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
+        match self {
+            Self::Verified(plan) => plan.plan_file.provider_configs(),
+            Self::NeedsSecretVerification(plan) => plan.plan_file.provider_configs(),
+        }
+    }
+
+    /// Check the persisted schema snapshot immediately after schema loading.
+    /// Every later secret/normalizer/provider transition consumes this proof.
+    pub(super) fn verify_schema_fingerprints(
+        self,
+        schemas: &carina_core::schema::SchemaRegistry,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<SchemaCheckedPlanFile, AppError> {
+        let map_mismatch = |mismatch: crate::commands::plan::PlanSchemaFingerprintMismatch| {
+            AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
+                providers: mismatch.providers,
+                replan_command: apply_target.replan_command().to_string(),
+            })
+        };
+        match self {
+            Self::Verified(plan) => {
+                plan.plan_file
+                    .verify_schema_fingerprints(&plan.schema_references, schemas)
+                    .map_err(map_mismatch)?;
+                Ok(SchemaCheckedPlanFile::Verified(RehydratedPlanFile {
+                    plan_file: plan.plan_file,
+                    planned_secret_hashes: HashMap::new(),
+                }))
+            }
+            Self::NeedsSecretVerification(plan) => {
+                plan.plan_file
+                    .verify_schema_fingerprints(&plan.schema_references, schemas)
+                    .map_err(map_mismatch)?;
+                Ok(SchemaCheckedPlanFile::NeedsSecretVerification(
+                    SchemaCheckedPendingPlanFile {
+                        plan_file: plan.plan_file,
+                    },
+                ))
+            }
+        }
+    }
 }
 
 /// Deserialized saved plan whose typed placeholders still need fresh desired
 /// values. There is intentionally no accessor for the inner plan.
 pub(super) struct PendingPlanFile {
     plan_file: PlanFile,
+    schema_references: PlanSchemaReferences,
 }
 
 /// Reloaded saved plan whose desired secret placeholders still need fresh
 /// source values.
 pub(super) struct ReloadedPendingPlanFile {
     plan_file: ReloadedPlanFile,
+    schema_references: PlanSchemaReferences,
 }
 
 pub(super) struct ExpansionPriorStates {
@@ -258,7 +324,20 @@ impl SavedPlanSecretCandidates {
     }
 }
 
-impl ReloadedPendingPlanFile {
+/// Reloaded saved plan proven to match the currently loaded schemas. The
+/// secret-verification transition accepts only this checked state.
+pub(super) enum SchemaCheckedPlanFile {
+    Verified(RehydratedPlanFile),
+    NeedsSecretVerification(SchemaCheckedPendingPlanFile),
+}
+
+/// Schema-checked saved plan whose desired secret placeholders still need
+/// verification against the current configuration.
+pub(super) struct SchemaCheckedPendingPlanFile {
+    plan_file: ReloadedPlanFile,
+}
+
+impl SchemaCheckedPendingPlanFile {
     /// Reconstruct the minimal plan-time prior-state view needed by
     /// deferred-`for` expansion. Required sources are cloned from snapshots
     /// that already crossed the locked in-flight reload boundary; unrelated
@@ -305,16 +384,14 @@ impl ReloadedPendingPlanFile {
             already_refreshed,
         }
     }
-
     pub(super) fn verify_desired(
         self,
         candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
-        let planned_secret_hashes =
-            planned_secret_hashes(&self.plan_file.plan_file().sorted_resources);
+        let planned_secret_hashes = planned_secret_hashes(self.plan_file.sorted_resources());
         let mut plan_file = self.plan_file;
-        super::rehydrate_desired_plan_file(plan_file.plan_file_mut(), &candidates, apply_target)?;
+        super::rehydrate_desired_plan_file(&mut plan_file, &candidates, apply_target)?;
         Ok(DesiredPlanFile::NeedsHistoricalVerification(
             DesiredVerifiedPlanFile {
                 plan_file,
@@ -324,8 +401,8 @@ impl ReloadedPendingPlanFile {
     }
 }
 
-/// Common post-desired-verification state. Placeholder-free plans are already
-/// final; secret-bearing plans retain a sealed historical-verification step.
+/// Common post-schema-check and desired-verification state. Historical
+/// placeholders may still require provider reads before execution.
 pub(super) enum DesiredPlanFile {
     Verified(RehydratedPlanFile),
     NeedsHistoricalVerification(DesiredVerifiedPlanFile),
@@ -356,11 +433,13 @@ impl DesiredPlanFile {
     pub(super) fn historical_resource_addresses(&self) -> HistoricalResourceAddresses {
         let plan = match self {
             Self::Verified(plan) => plan.plan(),
-            Self::NeedsHistoricalVerification(plan) => &plan.plan_file.plan_file().plan,
+            Self::NeedsHistoricalVerification(plan) => plan.plan_file.plan(),
         };
         MovedOrigins::from_plan(plan)
     }
 
+    /// Complete historical secret verification and mint the sole executable
+    /// saved-plan capability while retaining the schema-check proof.
     pub(super) async fn verify_historical(
         self,
         provider: &dyn Provider,
@@ -368,9 +447,9 @@ impl DesiredPlanFile {
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<RehydratedPlanFile, AppError> {
-        match self {
-            Self::Verified(plan) => Ok(plan),
+    ) -> Result<ExecutablePlanFile, AppError> {
+        let plan = match self {
+            Self::Verified(plan) => plan,
             Self::NeedsHistoricalVerification(plan) => {
                 plan.verify_historical(
                     provider,
@@ -379,9 +458,10 @@ impl DesiredPlanFile {
                     historical_addresses,
                     apply_target,
                 )
-                .await
+                .await?
             }
-        }
+        };
+        Ok(ExecutablePlanFile { plan })
     }
 }
 
@@ -395,11 +475,11 @@ pub(super) struct DesiredVerifiedPlanFile {
 
 impl DesiredVerifiedPlanFile {
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.plan_file().provider_configs
+        self.plan_file.provider_configs()
     }
 
     pub(super) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.plan_file().sorted_resources
+        self.plan_file.sorted_resources()
     }
 
     pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
@@ -407,8 +487,8 @@ impl DesiredVerifiedPlanFile {
     }
 
     /// Verify every historical placeholder against a fresh provider read and
-    /// mint the sole saved-plan executor gate.
-    pub(super) async fn verify_historical(
+    /// return the rehydrated payload to the outer executor-gate transition.
+    async fn verify_historical(
         mut self,
         provider: &dyn Provider,
         actual_states: &mut HashMap<ResourceId, State>,
@@ -483,12 +563,12 @@ impl DesiredVerifiedPlanFile {
         }
         let rehydrated_plan =
             carina_core::value::rehydrate_plan_historical_secrets_from_verified_states(
-                &self.plan_file.plan_file().plan,
+                self.plan_file.plan(),
                 &redacted_states,
                 verified_planned_states,
             )
             .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-        self.plan_file.plan_file_mut().plan = rehydrated_plan;
+        *self.plan_file.plan_mut() = rehydrated_plan;
 
         Ok(RehydratedPlanFile {
             plan_file: self.plan_file,
@@ -499,59 +579,112 @@ impl DesiredVerifiedPlanFile {
 
 /// A saved plan that has crossed both typed secret-verification boundaries.
 ///
-/// The payload is deliberately private to this child module. This is the only
-/// type accepted by the saved-plan executor gateway.
+/// This is still not executable: the schema-checked [`DesiredPlanFile`]
+/// transition is the only path that can wrap it in [`ExecutablePlanFile`].
 pub(super) struct RehydratedPlanFile {
     plan_file: ReloadedPlanFile,
     planned_secret_hashes: PlannedSecretHashes,
 }
 
 impl RehydratedPlanFile {
-    pub(super) fn plan(&self) -> &Plan {
-        &self.plan_file.plan_file().plan
+    fn plan(&self) -> &Plan {
+        self.plan_file.plan()
     }
 
-    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.plan_file().provider_configs
+    fn provider_configs(&self) -> &SavedProviderConfigs {
+        self.plan_file.provider_configs()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.plan_file().sorted_resources
+    fn sorted_resources(&self) -> &[Resource] {
+        self.plan_file.sorted_resources()
     }
 
-    pub(super) fn planned_secret_hashes(&self) -> &PlannedSecretHashes {
+    fn planned_secret_hashes(&self) -> &PlannedSecretHashes {
         &self.planned_secret_hashes
     }
 
-    pub(super) fn unresolved_resources(&self) -> &[Resource] {
-        &self.plan_file.plan_file().unresolved_resources
+    fn unresolved_resources(&self) -> &[Resource] {
+        self.plan_file.unresolved_resources()
     }
 
-    pub(super) fn compositions(&self) -> &[Composition] {
-        &self.plan_file.plan_file().compositions
+    fn compositions(&self) -> &[Composition] {
+        self.plan_file.compositions()
     }
 
-    pub(super) fn data_sources(&self) -> &[DataSource] {
-        &self.plan_file.plan_file().data_sources
+    fn data_sources(&self) -> &[DataSource] {
+        self.plan_file.data_sources()
     }
 
-    pub(super) fn data_source_origins(&self) -> &[DataSource] {
-        &self.plan_file.plan_file().data_source_origins
+    fn data_source_origins(&self) -> &[DataSource] {
+        self.plan_file.data_source_origins()
     }
 
-    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+    fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
         self.plan_file.current_states()
     }
 
+    fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
+        self.plan_file.upstream_snapshot()
+    }
+
+    fn upstream_sources(&self) -> &[UpstreamSource] {
+        self.plan_file.upstream_sources()
+    }
+
+    fn wait_bindings(&self) -> &[PlanWaitBinding] {
+        self.plan_file.wait_bindings()
+    }
+}
+
+/// The only saved-plan type accepted by the executor gateway. Construction is
+/// private to [`DesiredPlanFile::verify_historical`], so a deserialized
+/// plan cannot execute without the provider-schema comparison.
+pub(super) struct ExecutablePlanFile {
+    plan: RehydratedPlanFile,
+}
+
+impl ExecutablePlanFile {
+    pub(super) fn plan(&self) -> &Plan {
+        self.plan.plan()
+    }
+
+    pub(super) fn sorted_resources(&self) -> &[Resource] {
+        self.plan.sorted_resources()
+    }
+
+    pub(super) fn planned_secret_hashes(&self) -> &PlannedSecretHashes {
+        self.plan.planned_secret_hashes()
+    }
+
+    pub(super) fn unresolved_resources(&self) -> &[Resource] {
+        self.plan.unresolved_resources()
+    }
+
+    pub(super) fn compositions(&self) -> &[Composition] {
+        self.plan.compositions()
+    }
+
+    pub(super) fn data_sources(&self) -> &[DataSource] {
+        self.plan.data_sources()
+    }
+
+    pub(super) fn data_source_origins(&self) -> &[DataSource] {
+        self.plan.data_source_origins()
+    }
+
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        self.plan.current_states()
+    }
+
     pub(super) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
-        &self.plan_file.plan_file().upstream_snapshot
+        self.plan.upstream_snapshot()
     }
 
     pub(super) fn upstream_sources(&self) -> &[UpstreamSource] {
-        &self.plan_file.plan_file().upstream_sources
+        self.plan.upstream_sources()
     }
 
     pub(super) fn wait_bindings(&self) -> &[PlanWaitBinding] {
-        &self.plan_file.plan_file().wait_bindings
+        self.plan.wait_bindings()
     }
 }

@@ -20,13 +20,14 @@ use crate::resource::{
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
 
+mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
-/// Per-resource operational configuration for provider timeouts and retries.
-pub use carina_provider_protocol::OperationConfig;
 pub use carina_provider_protocol::types::DslTransform;
+/// Per-resource operational configuration for provider timeouts and retries.
+pub use carina_provider_protocol::{OperationConfig, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
 use resolved_union_members::UnionMemberTypes;
 pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};
@@ -6160,7 +6161,10 @@ impl AttributeSchema {
 /// data source (read-only lookup of existing infrastructure).
 ///
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SchemaKind {
     Resource,
     DataSource,
@@ -6252,9 +6256,8 @@ pub struct ResourceSchema {
     pub resource_type: String,
     pub attributes: HashMap<String, AttributeSchema>,
     pub description: Option<String>,
-    /// Optional validator function for cross-attribute validation
-    /// (e.g., mutually exclusive required fields)
-    pub validator: Option<ResourceValidator>,
+    /// Cross-attribute validation, including its fingerprintable source.
+    pub validation: ResourceValidation,
     /// Whether this is a managed resource or a data source.
     /// Data sources must be used with the `read` keyword.
     pub kind: SchemaKind,
@@ -6264,8 +6267,8 @@ pub struct ResourceSchema {
     /// When None, provider defaults are used.
     pub operation_config: Option<OperationConfig>,
     /// Declarative "exactly one of" groups. Each inner vec is a group of
-    /// attribute names where exactly one must be specified. Unlike `validator`
-    /// (a function pointer), this is plain data and survives the WASM plugin
+    /// attribute names where exactly one must be specified. Unlike an
+    /// in-process validator, this is plain data and survives the WASM plugin
     /// boundary.
     pub exclusive_required: Vec<Vec<String>>,
     /// Default total timeout for `wait <target> { ... }` polling against
@@ -6287,6 +6290,59 @@ pub struct ResourceSchema {
     /// `AttributeType` (differ, detail_rows, LSP) MUST consult `defs`
     /// to resolve `Ref` variants rather than fall through a wildcard.
     pub defs: std::collections::BTreeMap<String, AttributeType>,
+}
+
+/// Source of a resource's executable cross-attribute validation.
+#[derive(Debug, Clone, Default)]
+pub enum ResourceValidation {
+    #[default]
+    None,
+    /// Portable declarations received from a WASM provider by the plugin host.
+    Declared(Vec<ValidatorType>),
+    /// A native callback; fingerprints use a fixed marker because callback
+    /// identity is not portable across processes.
+    InProcess(ResourceValidator),
+}
+
+impl ResourceValidation {
+    /// Return the executable validator represented by this source, if any.
+    pub fn validator(&self) -> Option<ResourceValidator> {
+        match self {
+            Self::None => None,
+            Self::Declared(types) => build_validator_from_types(types),
+            Self::InProcess(validator) => Some(*validator),
+        }
+    }
+}
+
+fn build_validator_from_types(types: &[ValidatorType]) -> Option<ResourceValidator> {
+    let mut has_tags_key_value_check = false;
+    for validator in types {
+        match validator {
+            ValidatorType::TagsKeyValueCheck => has_tags_key_value_check = true,
+        }
+    }
+    has_tags_key_value_check.then_some(validate_tags_key_value)
+}
+
+fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    if let Some(Value::Concrete(ConcreteValue::Map(map))) = attributes.get("tags") {
+        let (mut has_key, mut has_value) = (false, false);
+        for key in map.keys() {
+            if key.eq_ignore_ascii_case("key") {
+                has_key = true;
+            } else if key.eq_ignore_ascii_case("value") {
+                has_value = true;
+            }
+            if has_key && has_value {
+                return Err(vec![TypeError::ResourceValidationFailed {
+                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
+                    attribute: Some("tags".to_string()),
+                }]);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Return the top-level attribute keys the schema marks write-only.
@@ -6358,7 +6414,7 @@ impl ResourceSchema {
             resource_type: resource_type.into(),
             attributes: HashMap::new(),
             description: None,
-            validator: None,
+            validation: ResourceValidation::None,
             kind: SchemaKind::Resource,
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
@@ -6569,8 +6625,13 @@ impl ResourceSchema {
     }
 
     pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
-        self.validator = Some(validator);
+        self.validation = ResourceValidation::InProcess(validator);
         self
+    }
+
+    /// Return this schema's executable cross-attribute validator, if any.
+    pub fn validator(&self) -> Option<ResourceValidator> {
+        self.validation.validator()
     }
 
     /// Declare that exactly one of the given attributes must be specified.
@@ -6789,7 +6850,7 @@ impl ResourceSchema {
             None,
         );
 
-        if let Some(validator) = self.validator
+        if let Some(validator) = self.validator()
             && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
         {
             errors.append(&mut validation_errors);
@@ -6826,7 +6887,7 @@ impl ResourceSchema {
         );
 
         if !selected.is_empty()
-            && let Some(validator) = self.validator
+            && let Some(validator) = self.validator()
             && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
         {
             errors.append(&mut validation_errors);
@@ -6871,7 +6932,7 @@ impl ResourceSchema {
         }
 
         // Run custom validator if present
-        if let Some(validator) = self.validator
+        if let Some(validator) = self.validator()
             && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
         {
             errors.append(&mut validation_errors);

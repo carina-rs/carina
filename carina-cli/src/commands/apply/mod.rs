@@ -44,8 +44,9 @@ use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
     CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityInputs, ProviderUpstreamScope,
-    ResolvedProviderInputs, UpstreamMissingStatePolicy, collect_historical_display_attributes,
-    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
+    ReloadedPlanFile, ResolvedProviderInputs, UpstreamMissingStatePolicy,
+    collect_historical_display_attributes, load_and_resolve_provider_configs,
+    prepare_plan_identity_and_provider_inputs_with_wiring,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -87,8 +88,8 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
-    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, RehydratedPlanFile,
-    ReloadedInspectedPlanFile, ReloadedPendingPlanFile, SavedPlanSecretCandidates,
+    DesiredPlanFile, ExecutablePlanFile, HistoricalResourceAddresses, InspectedPlanFile,
+    SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile, SchemaCheckedPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -585,12 +586,12 @@ async fn execute_effects_with_observer(
     outcome
 }
 
-/// Saved-plan executor gateway. Requiring [`RehydratedPlanFile`] here makes it
+/// Saved-plan executor gateway. Requiring [`ExecutablePlanFile`] here makes it
 /// impossible for the deserialized `PlanFile` path to dispatch effects before
-/// all typed secret placeholders have been verified and removed.
+/// schema compatibility and all typed secret placeholders have been verified.
 #[allow(clippy::too_many_arguments)]
 async fn execute_rehydrated_saved_plan(
-    plan_file: &RehydratedPlanFile,
+    plan_file: &ExecutablePlanFile,
     provider: &dyn Provider,
     normalizer: &dyn ProviderNormalizer,
     provider_configs: &[ProviderConfig],
@@ -1695,7 +1696,7 @@ struct SavedPlanApplyExecuted {
     apply_phase_started: Instant,
     state_base: FinalStateBase,
     state_save_inputs: Arc<ApplyStateSaveInputs>,
-    rehydrated_plan: RehydratedPlanFile,
+    rehydrated_plan: ExecutablePlanFile,
     wait_aliases: Vec<WaitAliasSpec>,
     cancel: ShutdownToken,
 }
@@ -2826,27 +2827,28 @@ fn import_identifiers_from_current_config(
 }
 
 /// Reproduce the state-aware desired-side preparation that plan runs before
-/// persisting secret placeholders. This function deliberately builds only
-/// normalizers; CRUD-capable providers are created after every desired secret
-/// has been verified.
+/// persisting secret placeholders. The supplied wiring has already passed the
+/// saved-plan schema check; only then may this function build normalizers.
 async fn prepare_saved_plan_secret_candidates(
     mut canonical_resources: CanonicalResourcePair<carina_core::parser::InferredExportParam>,
-    pending_plan: &ReloadedPendingPlanFile,
+    pending_plan: &SchemaCheckedPendingPlanFile,
     state_file: &Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
+    wiring: WiringContext,
 ) -> Result<(SavedPlanSecretCandidates, WiringContext), AppError> {
     let mut candidate_state = state_file.clone();
     let PreparedPlanIdentityInputs {
         wiring,
         provider_inputs,
         state_blocks,
-    } = prepare_plan_identity_and_provider_inputs(
+    } = prepare_plan_identity_and_provider_inputs_with_wiring(
         &mut canonical_resources,
         &mut candidate_state,
         base_dir,
         provider_context,
         UpstreamMissingStatePolicy::Strict,
+        wiring,
     )
     .await?;
 
@@ -2902,49 +2904,50 @@ async fn prepare_saved_plan_secret_candidates(
 }
 
 fn rehydrate_desired_plan_file(
-    plan_file: &mut PlanFile,
+    plan_file: &mut ReloadedPlanFile,
     candidates: &SavedPlanSecretCandidates,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let parsed = candidates.parsed();
     let provider_inputs = candidates.provider_inputs();
     let mut resource_candidates = HashMap::new();
-    for saved in &plan_file.sorted_resources {
+    for saved in plan_file.sorted_resources() {
         if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
             resource_candidates.insert(saved.id.clone(), fresh.clone());
         }
     }
     let mut data_source_candidates = HashMap::new();
-    for saved in &plan_file.data_sources {
+    for saved in plan_file.data_sources() {
         if let Some(fresh) = matching_resource_like(saved, &parsed.data_sources) {
             data_source_candidates.insert(saved.id.clone(), fresh.clone());
         }
     }
-    let import_identifiers = import_identifiers_from_current_config(&plan_file.plan, parsed);
+    let import_identifiers = import_identifiers_from_current_config(plan_file.plan(), parsed);
 
-    plan_file.plan = carina_core::value::rehydrate_plan_desired_secrets(
-        &plan_file.plan,
+    let rehydrated_plan = carina_core::value::rehydrate_plan_desired_secrets(
+        plan_file.plan(),
         &resource_candidates,
         &data_source_candidates,
         &import_identifiers,
         &parsed.deferred_for_expressions,
     )
     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    *plan_file.plan_mut() = rehydrated_plan;
 
     rehydrate_saved_resource_like(
-        &mut plan_file.sorted_resources,
+        plan_file.sorted_resources_mut(),
         &resource_candidates,
         apply_target,
         carina_core::value::rehydrate_resource_secrets,
     )?;
     rehydrate_saved_resource_like(
-        &mut plan_file.unresolved_resources,
+        plan_file.unresolved_resources_mut(),
         &resource_candidates,
         apply_target,
         carina_core::value::rehydrate_resource_secrets,
     )?;
 
-    for composition in &mut plan_file.compositions {
+    for composition in plan_file.compositions_mut() {
         let has_placeholder = composition
             .signature
             .arguments
@@ -2975,13 +2978,13 @@ fn rehydrate_desired_plan_file(
     }
 
     rehydrate_saved_resource_like(
-        &mut plan_file.data_sources,
+        plan_file.data_sources_mut(),
         &data_source_candidates,
         apply_target,
         carina_core::value::rehydrate_data_source_secrets,
     )?;
     rehydrate_saved_resource_like(
-        &mut plan_file.data_source_origins,
+        plan_file.data_source_origins_mut(),
         &data_source_candidates,
         apply_target,
         carina_core::value::rehydrate_data_source_secrets,
@@ -2989,11 +2992,12 @@ fn rehydrate_desired_plan_file(
 
     let fresh_provider_configs =
         carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-    plan_file.provider_configs = plan_file
-        .provider_configs
+    let provider_configs = plan_file
+        .provider_configs()
         .rehydrate_secrets(&fresh_provider_configs)
         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    for (binding, attributes) in &mut plan_file.upstream_snapshot {
+    *plan_file.provider_configs_mut() = provider_configs;
+    for (binding, attributes) in plan_file.upstream_snapshot_mut() {
         if let Some((key, _)) = attributes
             .iter()
             .find(|(_, value)| carina_core::value::contains_redacted_secret(value))
@@ -3080,9 +3084,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 22 persists deferred
-    // coalesce operands and complete deferred-for iterable expressions.
-    // Version 21 represents an
+    // Validate version compatibility. Plan-file version 23 persists the
+    // provider-schema fingerprints checked before saved-plan execution.
+    // Version 22 persists deferred coalesce operands and complete deferred-for
+    // iterable expressions. Version 21 represents an
     // in-flight managed current instance as an address-level marker and never
     // serializes its provider token; apply reloads that continuation from
     // locked state. Version 20 explicitly tags current-state ownership and
@@ -3423,11 +3428,18 @@ async fn run_apply_from_plan_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-            let (desired_plan, prepared_wiring) = match inspected_plan {
-                ReloadedInspectedPlanFile::Verified(plan) => {
-                    (DesiredPlanFile::Verified(plan), None)
-                }
-                ReloadedInspectedPlanFile::NeedsSecretVerification(plan) => {
+            // Loading the factory exposes its schemas. Check the saved snapshot
+            // immediately, before normalizer construction or secret evaluation.
+            let saved_provider_configs = inspected_plan.provider_configs().as_provider_configs();
+            let (factories, _) =
+                build_factories_from_providers(saved_provider_configs, project_dir)?;
+            let ctx = WiringContext::new(factories, saved_provider_configs);
+            let schema_checked_plan =
+                inspected_plan.verify_schema_fingerprints(ctx.schemas(), apply_target)?;
+
+            let (desired_plan, ctx) = match schema_checked_plan {
+                SchemaCheckedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), ctx),
+                SchemaCheckedPlanFile::NeedsSecretVerification(pending) => {
                     let canonical_resources = current_resources.ok_or_else(|| {
                         saved_plan_secret_evaluation_error(
                             AppError::Config(
@@ -3438,14 +3450,15 @@ async fn run_apply_from_plan_locked_owned(
                     })?;
                     let (candidates, wiring) = prepare_saved_plan_secret_candidates(
                         canonical_resources,
-                        &plan,
+                        &pending,
                         &state_file,
                         project_dir,
                         provider_context,
+                        ctx,
                     )
                     .await
                     .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-                    (plan.verify_desired(candidates, apply_target)?, Some(wiring))
+                    (pending.verify_desired(candidates, apply_target)?, wiring)
                 }
             };
 
@@ -3457,14 +3470,6 @@ async fn run_apply_from_plan_locked_owned(
             // Desired/config secret verification is complete before a CRUD-capable
             // provider is constructed. Historical placeholders are verified by the
             // drift reads below before the executor gate is minted.
-            let ctx = match prepared_wiring {
-                Some(wiring) => wiring,
-                None => {
-                    let (factories, _) =
-                        build_factories_from_providers(raw_provider_configs, project_dir)?;
-                    WiringContext::new(factories, raw_provider_configs)
-                }
-            };
             let provider = create_providers_from_configs_with_ctx(
                 &ctx,
                 &resolved_provider_configs,

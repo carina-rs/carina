@@ -734,6 +734,7 @@ fn create_plan_parts(
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new(wb.binding.as_str()),
             target_id: ResolvedResourceId::new(target_id),
+            target_schema_kind,
             until,
             until_surface: wb.until_raw.clone(),
             timeout,

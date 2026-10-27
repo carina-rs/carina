@@ -229,6 +229,7 @@ mod tests {
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
+            target_schema_kind: crate::schema::SchemaKind::Resource,
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",

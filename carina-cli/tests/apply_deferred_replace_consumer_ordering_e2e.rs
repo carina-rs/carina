@@ -50,6 +50,14 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
     SavedProviderConfigs::from(&resolved)
 }
 
+fn record_mock_schema_fingerprints(plan_file: &mut PlanFile) {
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    for schema in carina_provider_mock::builtin_schemas() {
+        schemas.insert("mock", schema);
+    }
+    plan_file.record_schema_fingerprints(&schemas);
+}
+
 struct Scenario {
     _tmp: TempDir,
     project: PathBuf,
@@ -285,7 +293,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         CurrentStateEntry::managed(consumer.id.clone(), consumer_from),
     ];
 
-    PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-06-25T00:00:00Z".to_string(),
@@ -311,7 +319,10 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         upstream_snapshot: HashMap::new(),
         upstream_sources: vec![],
         wait_bindings: vec![],
-    }
+        schema_fingerprints: Default::default(),
+    };
+    record_mock_schema_fingerprints(&mut plan_file);
+    plan_file
 }
 
 #[test]
