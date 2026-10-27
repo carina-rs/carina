@@ -137,6 +137,11 @@ fn downgrade_state_to_v13(state: &mut Value) {
         if let Some(value) = current.remove("partial_read") {
             row_object.insert("partial_read".to_string(), value);
         }
+        assert_eq!(
+            current.remove("nested_write_only"),
+            Some(serde_json::json!({})),
+            "legacy-secret fixtures must not carry nested write-only provenance"
+        );
         assert!(
             current.is_empty(),
             "unexpected v15 current fields: {current:?}"

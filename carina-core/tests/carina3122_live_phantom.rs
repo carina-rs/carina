@@ -100,11 +100,13 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let mut state_attrs: HashMap<String, Value> = HashMap::new();
     state_attrs.insert("distribution_config".to_string(), state_dc);
     let current = State::existing(id, state_attrs);
+    let saved = carina_core::provider::RawSavedAttrs::default()
+        .lift(&carina_core::schema::SchemaRegistry::new());
 
     let result = diff(
         &ResolvedResource::new(desired),
         &current,
-        None,
+        &saved,
         Some(&prev_explicit),
         None,
     );

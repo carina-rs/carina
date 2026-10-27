@@ -3,7 +3,7 @@ use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
 use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
-use crate::schema::TypeIdentity;
+use crate::schema::{ResourceSchema, TypeIdentity};
 use crate::value::value_to_json;
 use indexmap::IndexMap;
 
@@ -702,6 +702,520 @@ fn type_aware_unordered_list_ignores_reorder() {
     );
 }
 
+#[test]
+fn oidc_listener_with_matching_nested_write_only_provenance_converges() {
+    use crate::provider::NestedWriteOnlyRecord;
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+    let oidc_config = AttributeType::struct_(
+        "AuthenticateOidcConfig",
+        vec![
+            StructField::new("issuer", AttributeType::string()),
+            StructField::new("client_secret", AttributeType::string()).write_only(),
+        ],
+    );
+    let schema = ResourceSchema::new("elasticloadbalancingv2.Listener")
+        .attribute(AttributeSchema::new(
+            "default_actions",
+            AttributeType::list(AttributeType::struct_(
+                "Action",
+                vec![
+                    StructField::new("type", AttributeType::string()),
+                    StructField::new("authenticate_oidc_config", oidc_config),
+                ],
+            )),
+        ))
+        .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()));
+
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("oidc-client-secret".into()),
+    ))));
+    let action = |client_secret: Option<Value>| {
+        let mut config = IndexMap::from([(
+            "issuer".to_string(),
+            Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+        )]);
+        if let Some(client_secret) = client_secret {
+            config.insert("client_secret".to_string(), client_secret);
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                (
+                    "type".to_string(),
+                    Value::Concrete(ConcreteValue::String("authenticate-oidc".into())),
+                ),
+                (
+                    "authenticate_oidc_config".to_string(),
+                    Value::Concrete(ConcreteValue::Map(config)),
+                ),
+            ])),
+        )]))
+    };
+    let desired = HashMap::from([
+        ("default_actions".to_string(), action(Some(secret))),
+        (
+            "ssl_policy".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "ELBSecurityPolicy-TLS13-1-2-2021-06".into(),
+            )),
+        ),
+    ]);
+    let current = HashMap::from([
+        ("default_actions".to_string(), action(None)),
+        (
+            "ssl_policy".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "ELBSecurityPolicy-TLS13-1-2-2021-06".into(),
+            )),
+        ),
+    ]);
+    let mut nested_write_only = NestedWriteOnlyRecord::default();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["default_actions"], &desired_for_record, None)
+        .expect("OIDC client secret is persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "matching accepted client_secret provenance must converge: {changed:?}"
+    );
+}
+
+fn oidc_listener_diff_fixture(
+    client_secret: &str,
+) -> (
+    ResourceSchema,
+    HashMap<String, Value>,
+    HashMap<String, Value>,
+) {
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+    let schema = ResourceSchema::new("elasticloadbalancingv2.Listener")
+        .attribute(AttributeSchema::new(
+            "default_actions",
+            AttributeType::list(AttributeType::struct_(
+                "Action",
+                vec![StructField::new(
+                    "authenticate_oidc_config",
+                    AttributeType::struct_(
+                        "AuthenticateOidcConfig",
+                        vec![
+                            StructField::new("issuer", AttributeType::string()),
+                            StructField::new("client_secret", AttributeType::string()).write_only(),
+                        ],
+                    ),
+                )],
+            )),
+        ))
+        .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()));
+    let oidc_action = |secret: Option<&str>| {
+        let mut config = IndexMap::from([(
+            "issuer".to_string(),
+            Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+        )]);
+        if let Some(secret) = secret {
+            config.insert(
+                "client_secret".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String(secret.into()),
+                )))),
+            );
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "authenticate_oidc_config".to_string(),
+                Value::Concrete(ConcreteValue::Map(config)),
+            )])),
+        )]))
+    };
+    let ssl_policy = Value::Concrete(ConcreteValue::String(
+        "ELBSecurityPolicy-TLS13-1-2-2021-06".into(),
+    ));
+    (
+        schema,
+        HashMap::from([
+            (
+                "default_actions".to_string(),
+                oidc_action(Some(client_secret)),
+            ),
+            ("ssl_policy".to_string(), ssl_policy.clone()),
+        ]),
+        HashMap::from([
+            ("default_actions".to_string(), oidc_action(None)),
+            ("ssl_policy".to_string(), ssl_policy),
+        ]),
+    )
+}
+
+#[test]
+fn key_should_enter_patch_uses_matching_recorded_nested_write_only_provenance() {
+    let (schema, desired, current) = oidc_listener_diff_fixture("client-secret");
+    let mut nested_write_only = NestedWriteOnlyRecord::new();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["default_actions"], &desired_for_record, None)
+        .expect("OIDC client secret is persistable");
+    let recorded = nested_write_only
+        .get("default_actions")
+        .expect("matching leaf provenance was recorded");
+    assert_eq!(recorded.len(), 1);
+
+    let desired_value = desired
+        .get("default_actions")
+        .expect("fixture has desired default actions");
+    let current_value = current
+        .get("default_actions")
+        .expect("fixture has provider-read default actions");
+    let attr_type = &schema.attributes["default_actions"].attr_type;
+
+    assert!(
+        !key_should_enter_patch(
+            "default_actions",
+            Some(&schema),
+            LeafProvenance::Recorded(Some(recorded)),
+            AttrComparison {
+                from: Some(current_value),
+                to: desired_value,
+                saved: None,
+                type_info: Some(TypedAttr {
+                    attr_type,
+                    defs: &schema.defs,
+                }),
+            },
+        ),
+        "matching recorded provenance must suppress the provider-omitted leaf"
+    );
+}
+
+#[test]
+fn oidc_listener_secret_rotation_plans_update() {
+    use crate::provider::NestedWriteOnlyRecord;
+
+    let (schema, previous_desired, _current) = oidc_listener_diff_fixture("old-secret");
+    let (_equivalent_schema, desired, current) = oidc_listener_diff_fixture("new-secret");
+    let mut nested_write_only = NestedWriteOnlyRecord::default();
+    let previous_for_record = previous_desired
+        .clone()
+        .into_iter()
+        .collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["default_actions"], &previous_for_record, None)
+        .unwrap();
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert_eq!(changed, ["default_actions"]);
+}
+
+#[test]
+fn oidc_listener_missing_nested_write_only_record_plans_reconciliation_update() {
+    let (schema, desired, current) = oidc_listener_diff_fixture("client-secret");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
+
+    assert_eq!(changed, ["default_actions"]);
+}
+
+#[test]
+fn oidc_listener_without_write_only_leaf_needs_no_provenance() {
+    let (schema, _desired_with_secret, current) = oidc_listener_diff_fixture("unused");
+    let desired = current.clone();
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "an absent record is complete when the desired value has no write-only leaves: {changed:?}"
+    );
+}
+
+fn secret_wrapped_oidc_listener_fixture(
+    wrap_default_actions: bool,
+) -> (
+    ResourceSchema,
+    HashMap<String, Value>,
+    HashMap<String, Value>,
+) {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema =
+        ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(AttributeSchema::new(
+            "default_actions",
+            AttributeType::list(AttributeType::struct_(
+                "Action",
+                vec![StructField::new(
+                    "authenticate_oidc_config",
+                    AttributeType::struct_(
+                        "AuthenticateOidcConfig",
+                        vec![
+                            StructField::new("issuer", AttributeType::string()),
+                            StructField::new("client_secret", AttributeType::string()).write_only(),
+                        ],
+                    ),
+                )],
+            )),
+        ));
+    let issuer = || Value::Concrete(ConcreteValue::String("https://issuer.example.com".into()));
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("issuer".to_string(), issuer()),
+        (
+            "client_secret".to_string(),
+            Value::Concrete(ConcreteValue::String("oidc-client-secret".into())),
+        ),
+    ])));
+    let observable_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "issuer".to_string(),
+        issuer(),
+    )])));
+    let action = |config| {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "authenticate_oidc_config".to_string(),
+                config,
+            )])),
+        )]))
+    };
+    let secret = |value| Value::Deferred(DeferredValue::Secret(Box::new(value)));
+
+    let (desired_actions, current_actions) = if wrap_default_actions {
+        let desired = secret(action(desired_config));
+        let observable = secret(action(observable_config));
+        let current = persisted_secret(&value_to_json(&observable).unwrap());
+        (desired, current)
+    } else {
+        let desired = action(secret(desired_config));
+        let observable = secret(observable_config);
+        let current = action(persisted_secret(&value_to_json(&observable).unwrap()));
+        (desired, current)
+    };
+
+    (
+        schema,
+        HashMap::from([("default_actions".to_string(), desired_actions)]),
+        HashMap::from([("default_actions".to_string(), current_actions)]),
+    )
+}
+
+#[test]
+fn oidc_listener_with_secret_wrapped_config_converges() {
+    use crate::provider::NestedWriteOnlyRecord;
+
+    let (schema, desired, current) = secret_wrapped_oidc_listener_fixture(false);
+    let mut nested_write_only = NestedWriteOnlyRecord::new();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["default_actions"], &desired_for_record, None)
+        .expect("secret-wrapped config is persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "a matching secret-wrapped OIDC config must converge: {changed:?}"
+    );
+}
+
+#[test]
+fn oidc_listener_with_secret_wrapped_action_list_converges() {
+    use crate::provider::NestedWriteOnlyRecord;
+
+    let (schema, desired, current) = secret_wrapped_oidc_listener_fixture(true);
+    let mut nested_write_only = NestedWriteOnlyRecord::new();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["default_actions"], &desired_for_record, None)
+        .expect("secret-wrapped action list is persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "a matching secret-wrapped action list must converge: {changed:?}"
+    );
+}
+
+#[test]
+fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() {
+    use crate::provider::NestedWriteOnlyRecord;
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
+        "creds",
+        AttributeType::struct_(
+            "Credentials",
+            vec![StructField::new("password", AttributeType::string()).write_only()],
+        ),
+    ));
+    let desired = HashMap::from([(
+        "creds".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "password".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("accepted-secret".into()),
+            )))),
+        )]))),
+    )]);
+    let current = HashMap::new();
+    let mut nested_write_only = NestedWriteOnlyRecord::default();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["creds"], &desired_for_record, None)
+        .expect("fixture credentials are persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "an omitted attribute with no observable leaves must converge: {changed:?}"
+    );
+}
+
+#[test]
+fn omitted_read_with_empty_observable_string_list_converges() {
+    use crate::provider::NestedWriteOnlyRecord;
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
+        "creds",
+        AttributeType::struct_(
+            "Credentials",
+            vec![
+                StructField::new("aliases", AttributeType::list(AttributeType::string())),
+                StructField::new("password", AttributeType::string()).write_only(),
+            ],
+        ),
+    ));
+    let desired = HashMap::from([(
+        "creds".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "aliases".to_string(),
+                Value::Concrete(ConcreteValue::StringList(Vec::new())),
+            ),
+            (
+                "password".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("accepted-secret".into()),
+                )))),
+            ),
+        ]))),
+    )]);
+    let current = HashMap::new();
+    let mut nested_write_only = NestedWriteOnlyRecord::new();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["creds"], &desired_for_record, None)
+        .expect("fixture credentials are persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "an omitted attribute with only an empty observable string list must converge: {changed:?}"
+    );
+}
+
+#[test]
+fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
+    use crate::provider::NestedWriteOnlyRecord;
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
+        "creds",
+        AttributeType::struct_(
+            "Credentials",
+            vec![StructField::new("password", AttributeType::string()).write_only()],
+        ),
+    ));
+    let desired = HashMap::from([(
+        "creds".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("accepted-secret".into())),
+            )])),
+        )))),
+    )]);
+    let current = HashMap::new();
+    let mut nested_write_only = NestedWriteOnlyRecord::new();
+    let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
+    nested_write_only
+        .record_sent(&schema, ["creds"], &desired_for_record, None)
+        .expect("secret-wrapped credentials are persistable");
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &nested_write_only,
+        None,
+        Some(&schema),
+    );
+
+    assert!(
+        changed.is_empty(),
+        "a secret wrapper around an empty observable projection carries no provider content: {changed:?}"
+    );
+}
+
 // --- Tests for absent write-only attributes in find_changed_attributes ---
 
 #[test]
@@ -728,7 +1242,14 @@ fn non_create_only_write_only_attr_in_desired_not_in_current_detects_diff() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.contains(&"ipv4_netmask_length".to_string()),
         "updatable write-only attribute absent from current should trigger a diff: {changed:?}"
@@ -762,7 +1283,14 @@ fn create_only_write_only_attr_in_desired_not_in_current_has_no_diff() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.is_empty(),
         "create-only write-only attribute absent from current must not force replacement: {changed:?}"
@@ -798,7 +1326,14 @@ fn write_only_attr_in_both_same_value_no_diff() {
         ),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.is_empty(),
         "Write-only attribute with same value should not trigger a diff, got: {:?}",
@@ -835,7 +1370,14 @@ fn write_only_attr_in_both_different_value_detects_diff() {
         ),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.contains(&"ipv4_netmask_length".to_string()),
         "Write-only attribute with different value should trigger a diff"
@@ -865,7 +1407,14 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.contains(&"enable_dns".to_string()),
         "Non-write-only attribute absent from current should trigger a diff"
@@ -929,7 +1478,14 @@ fn secret_in_find_changed_attributes_no_change() {
     let desired = HashMap::from([("password".to_string(), secret_value)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&hash_json))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.is_empty(),
         "Secret with matching hash should not show as changed, got: {:?}",
@@ -950,7 +1506,14 @@ fn diagnostic_sensitive_string_matches_plain_state_without_diff() {
         Value::Concrete(ConcreteValue::String("hunter2SECRET".into())),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.is_empty(),
         "marker must not create diff churn: {changed:?}"
@@ -971,7 +1534,14 @@ fn secret_in_find_changed_attributes_changed() {
     let desired = HashMap::from([("password".to_string(), new_secret)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_json))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.contains(&"password".to_string()),
         "Secret with different hash should show as changed"
@@ -1009,6 +1579,7 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
     assert!(!key_should_enter_patch(
         "tags",
         None,
+        LeafProvenance::DecidedByPlan { key_changed: false },
         AttrComparison {
             from: Some(&current),
             to: &desired,
@@ -1047,6 +1618,7 @@ fn nested_post_create_read_unknown_cannot_enter_a_patch() {
         !key_should_enter_patch(
             "tags",
             None,
+            LeafProvenance::DecidedByPlan { key_changed: false },
             AttrComparison {
                 from: Some(&current),
                 to: &desired,
@@ -1117,7 +1689,14 @@ fn secret_in_map_no_change_when_hash_matches() {
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), state_tags)]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.is_empty(),
         "Secret in map with matching hash should not show as changed, got: {:?}",
@@ -1134,7 +1713,14 @@ fn secret_with_embedded_salt_no_change_when_hash_matches() {
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.is_empty(),
         "Secret with matching embedded-salt digest should not show as changed, got: {:?}",
@@ -1154,7 +1740,14 @@ fn secret_with_embedded_salt_detects_change() {
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        None,
+    );
     assert!(
         changed.contains(&"master_password".to_string()),
         "Secret with different value should show as changed"
@@ -1179,7 +1772,15 @@ fn equal_plaintexts_get_distinct_digests_that_both_verify() {
     for hash in [hash1, hash2] {
         let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash))]);
         assert!(
-            find_changed_attributes(&desired, &current, None, None, None).is_empty(),
+            find_changed_attributes(
+                &desired,
+                &current,
+                None,
+                &NestedWriteOnlyRecord::new(),
+                None,
+                None,
+            )
+            .is_empty(),
             "each independently salted digest must verify the plaintext",
         );
     }
@@ -1203,7 +1804,15 @@ fn provider_null_fields_do_not_create_a_secret_diff() {
     )]);
 
     assert!(
-        find_changed_attributes(&desired, &current, None, None, None).is_empty(),
+        find_changed_attributes(
+            &desired,
+            &current,
+            None,
+            &NestedWriteOnlyRecord::new(),
+            None,
+            None,
+        )
+        .is_empty(),
         "provider-only null fields must not cause a phantom secret update",
     );
 }
@@ -1299,7 +1908,14 @@ fn secret_in_map_with_refresh_no_false_diff() {
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), current_tags)]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        None,
+        Some(&schema),
+    );
     assert!(
         changed.is_empty(),
         "Secret in map should not show false diff when current has plain-text from provider (issue #1249), got changed: {:?}",
@@ -2286,7 +2902,14 @@ fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_mat
     ]);
     let current = desired.clone();
     let prev_explicit = ExplicitFields::Unrecorded;
-    let changed = find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
     assert!(
         changed.is_empty(),
         "carina#3280: `Unrecorded` is the \"no authoring record\" \
@@ -2313,7 +2936,14 @@ fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
         Value::Concrete(ConcreteValue::String("USER".into())),
     )]);
     let prev_explicit = ExplicitFields::Unrecorded;
-    let changed = find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None);
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
     assert_eq!(
         changed,
         vec!["principal_type".to_string()],

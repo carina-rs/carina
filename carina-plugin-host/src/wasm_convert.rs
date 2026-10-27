@@ -85,6 +85,10 @@ impl SchemaDecodeError {
         Self::new("input mode cannot be both required and read-only")
     }
 
+    fn conflicting_write_only_mode() -> Self {
+        Self::new("struct field cannot be both write-only and provider-populated")
+    }
+
     fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
         Self::new(format!(
             "legacy Custom wire type '{enclosing_custom_name}' has unsupported base {base:?}"
@@ -1928,7 +1932,7 @@ fn proto_schema_to_core(
         defs,
     } = s;
 
-    Ok(CoreResourceSchema {
+    let schema = CoreResourceSchema {
         resource_type: resource_type.clone(),
         attributes: attributes
             .iter()
@@ -1965,7 +1969,13 @@ fn proto_schema_to_core(
                     .map_err(|error| error.prepend_attribute(k).with_resource_type(resource_type))
             })
             .collect::<Result<_, _>>()?,
-    })
+    };
+    if let Some(conflict) = schema.first_write_only_conflict() {
+        return Err(SchemaDecodeError::new(conflict.message())
+            .prepend_attribute(conflict.attribute())
+            .with_resource_type(resource_type));
+    }
+    Ok(schema)
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -2290,8 +2300,13 @@ fn proto_struct_field_to_core(
         block_name,
         provider_name,
         read_only,
+        write_only,
         deferred_populate,
     } = f;
+
+    if *read_only && *write_only {
+        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
+    }
 
     let input_mode = proto_input_mode_to_core(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
@@ -2306,6 +2321,7 @@ fn proto_struct_field_to_core(
         provider_name: provider_name.clone(),
         block_name: block_name.clone(),
         deferred_populate: *deferred_populate,
+        write_only: *write_only,
     })
 }
 
@@ -2583,8 +2599,8 @@ mod tests {
             provider_name,
             block_name,
             deferred_populate,
+            write_only,
         } = field;
-
         let (required, read_only) = core_input_mode_to_proto(input_mode);
 
         proto::StructField {
@@ -2595,6 +2611,7 @@ mod tests {
             block_name: block_name.clone(),
             provider_name: provider_name.clone(),
             read_only,
+            write_only: *write_only,
             deferred_populate: *deferred_populate,
         }
     }
@@ -2655,6 +2672,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: true,
+            write_only: false,
             deferred_populate: false,
         };
 
@@ -2664,6 +2682,29 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "attribute 'provider_id': input mode cannot be both required and read-only"
+        );
+    }
+
+    #[test]
+    fn read_only_write_only_struct_field_is_rejected_at_the_wire_boundary() {
+        let field = proto::StructField {
+            name: "client_secret".to_string(),
+            field_type: proto_string(),
+            required: false,
+            description: None,
+            block_name: None,
+            provider_name: None,
+            read_only: true,
+            write_only: true,
+            deferred_populate: false,
+        };
+
+        let error = proto_struct_field_to_core(&field)
+            .expect_err("read-only and write-only must not form a core StructField");
+
+        assert_eq!(
+            error.to_string(),
+            "attribute 'client_secret': struct field cannot be both write-only and provider-populated"
         );
     }
 
@@ -2694,6 +2735,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: true,
+            write_only: false,
             deferred_populate: false,
         };
         let destination = proto::StructField {
@@ -2707,6 +2749,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: false,
+            write_only: false,
             deferred_populate: false,
         };
         let metadata = proto_attr(
@@ -2732,6 +2775,75 @@ mod tests {
     }
 
     #[test]
+    fn top_level_write_only_and_write_only_bearing_is_rejected_at_wire_boundary() {
+        let mut config = proto_attr(
+            "config",
+            proto::AttributeType::Struct {
+                name: "Config".to_string(),
+                fields: vec![proto::StructField {
+                    name: "client_secret".to_string(),
+                    field_type: proto_string(),
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: true,
+                    deferred_populate: false,
+                }],
+            },
+        );
+        config.write_only = true;
+        let schema = proto_resource("test.Resource", [("config".to_string(), config)]);
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("whole and nested write-only modes cannot be combined");
+
+        assert_eq!(
+            error.to_string(),
+            "resource 'test.Resource' attribute 'config': top-level attribute cannot be both write-only and write-only-bearing"
+        );
+    }
+
+    #[test]
+    fn write_only_bearing_union_member_is_rejected_at_wire_boundary() {
+        let authentication = proto_attr(
+            "authentication",
+            proto::AttributeType::Union {
+                members: vec![
+                    proto_string(),
+                    proto::AttributeType::Struct {
+                        name: "OidcConfig".to_string(),
+                        fields: vec![proto::StructField {
+                            name: "client_secret".to_string(),
+                            field_type: proto_string(),
+                            required: false,
+                            description: None,
+                            block_name: None,
+                            provider_name: None,
+                            read_only: false,
+                            write_only: true,
+                            deferred_populate: false,
+                        }],
+                    },
+                ],
+            },
+        );
+        let schema = proto_resource(
+            "test.Resource",
+            [("authentication".to_string(), authentication)],
+        );
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("a union member must not hide nested write-only fields");
+
+        assert_eq!(
+            error.to_string(),
+            "resource 'test.Resource' attribute 'authentication': union members cannot be write-only-bearing"
+        );
+    }
+
+    #[test]
     fn schema_transport_round_trip_is_exhaustive_for_touched_types() {
         let core_field = CoreStructField::new("provider_id", CoreAttributeType::string())
             .with_description("Provider-assigned identifier")
@@ -2753,6 +2865,7 @@ mod tests {
             provider_name,
             block_name,
             deferred_populate,
+            write_only,
         } = &round_tripped_field;
         assert_eq!(name, "provider_id");
         assert!(matches!(
@@ -2766,6 +2879,21 @@ mod tests {
         assert_eq!(provider_name.as_deref(), Some("ProviderId"));
         assert_eq!(block_name.as_deref(), Some("provider_id_block"));
         assert!(*deferred_populate);
+        assert!(!write_only);
+
+        let write_only_field =
+            CoreStructField::new("client_secret", CoreAttributeType::string()).write_only();
+        let wire = core_struct_field_to_proto_for_schema_round_trip(&write_only_field);
+        assert!(wire.write_only);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["write_only"],
+            true
+        );
+        let round_tripped =
+            proto_struct_field_to_core(&serde_json::from_str::<proto::StructField>(&json).unwrap())
+                .unwrap();
+        assert!(round_tripped.write_only);
 
         let required_field = CoreStructField::new("name", CoreAttributeType::string()).required();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
@@ -4199,9 +4327,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v11_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 11);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+    fn test_protocol_version_range_is_v12_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 12);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+    }
+
+    #[test]
+    fn test_check_protocol_version_rejects_v11_provider() {
+        let error = check_protocol_version(
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":11}"#,
+        )
+        .expect_err("a v12 host must reject a v11 provider");
+
+        assert!(error.contains("provider 'old'"));
+        assert!(error.contains("protocol version 11"));
+        assert!(error.contains("requires at least version 12"));
     }
 
     #[test]
@@ -4260,6 +4400,35 @@ mod tests {
     }
 
     #[test]
+    fn test_json_to_schemas_requires_nested_write_only_flag() {
+        let err = json_to_schemas(
+            r#"[{
+                "resource_type":"test.Resource",
+                "attributes":{
+                    "config":{
+                        "name":"config",
+                        "attr_type":{
+                            "type":"struct",
+                            "name":"Config",
+                            "fields":[{
+                                "name":"client_secret",
+                                "field_type":{"type":"String"},
+                                "required":true
+                            }]
+                        },
+                        "required":true
+                    }
+                }
+            }]"#,
+        )
+        .expect_err("protocol v12 schema JSON must declare nested write_only");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("schema JSON parse error"));
+        assert!(rendered.contains("missing field `write_only`"));
+    }
+
+    #[test]
     fn test_json_to_schemas_malformed_unique_name_spec_returns_error() {
         let err = json_to_schemas(
             r#"[{
@@ -4304,6 +4473,7 @@ mod tests {
                             "name": "from_port",
                             "field_type": { "type": "Int" },
                             "required": true,
+                            "write_only": false,
                             "description": "Start of port range",
                             "block_name": "from_port_block",
                             "provider_name": "FromPort"
@@ -4312,6 +4482,7 @@ mod tests {
                             "name": "protocol",
                             "field_type": { "type": "String" },
                             "required": true,
+                            "write_only": false,
                             "description": null,
                             "block_name": null,
                             "provider_name": null

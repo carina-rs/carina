@@ -77,6 +77,27 @@ let r1 = mock.test.resource {{
         .expect("write secret and comment configuration");
     }
 
+    fn write_nested_secret_and_comment_config(&self, client_secret: &str, comment: &str) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let r1 = mock.test.resource {{
+  name    = "r1"
+  comment = "{comment}"
+  oidc_config = {{
+    issuer        = "https://issuer.example.com"
+    client_secret = secret("{client_secret}")
+  }}
+}}
+"#
+            ),
+        )
+        .expect("write nested secret and comment configuration");
+    }
+
     fn clear_write_only_metadata(&self) {
         let path = self.project.join("carina.state.json");
         let mut state: serde_json::Value =
@@ -341,6 +362,111 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
     assert!(
         converged_text.contains("No changes. Infrastructure is up-to-date."),
         "the normal update plus write-only reassert must converge\nstdout/stderr:\n{converged_text}"
+    );
+}
+
+#[test]
+fn nested_write_only_secret_rotates_reasserts_and_converges() {
+    let scenario = Scenario::new();
+    scenario.write_nested_secret_and_comment_config("secret-a", "before");
+    assert_success("carina init", &scenario.init());
+    assert_success("initial plan", &scenario.save_plan("initial.json"));
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    let state_path = scenario.project.join("carina.state.json");
+    let state_text = fs::read_to_string(&state_path).expect("read state after create");
+    let state_json: serde_json::Value =
+        serde_json::from_str(&state_text).expect("parse state after create");
+    let nested_record = &state_json["resources"][0]["current"]["nested_write_only"];
+    assert!(nested_record["oidc_config"].is_array(), "{state_json:#}");
+    assert!(
+        nested_record.to_string().contains("$secret")
+            && !nested_record.to_string().contains("secret-a"),
+        "nested secret provenance must contain only a hash: {state_json:#}"
+    );
+
+    let unchanged = scenario.plan_with_refresh();
+    assert_success("unchanged nested-secret plan", &unchanged);
+    assert!(
+        output_text(&unchanged).contains("No changes. Infrastructure is up-to-date."),
+        "provider omission must converge once leaf provenance exists\n{}",
+        output_text(&unchanged)
+    );
+
+    scenario.write_nested_secret_and_comment_config("secret-b", "before");
+    let rotation = scenario.save_plan_with_refresh("rotate.json");
+    assert_success("nested-secret rotation plan", &rotation);
+    assert!(
+        output_text(&rotation).contains("~ mock.test.resource r1")
+            && output_text(&rotation).contains("1 to change"),
+        "rotating the nested secret must plan an update\n{}",
+        output_text(&rotation)
+    );
+    assert_success(
+        "nested-secret rotation apply",
+        &scenario.apply_plan("rotate.json"),
+    );
+
+    scenario.write_nested_secret_and_comment_config("secret-b", "after");
+    assert_success(
+        "unrelated update plan",
+        &scenario.save_plan_with_refresh("comment.json"),
+    );
+    assert_success(
+        "unrelated update apply",
+        &scenario.apply_plan("comment.json"),
+    );
+
+    let provider: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&scenario.mock_state).expect("read mock provider state"),
+    )
+    .expect("parse mock provider state");
+    assert_eq!(
+        provider["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        serde_json::json!("secret-b"),
+        "an unrelated update must reassert the whole write-only-bearing attribute"
+    );
+    assert_eq!(
+        provider["states"]["test.resource.r1"]["comment"],
+        serde_json::json!("after")
+    );
+
+    let converged = scenario.plan_with_refresh();
+    assert_success("nested-secret converged plan", &converged);
+    assert!(
+        output_text(&converged).contains("No changes. Infrastructure is up-to-date."),
+        "accepted rotation and reassertion must converge\n{}",
+        output_text(&converged)
+    );
+}
+
+#[test]
+fn saved_plan_apply_display_hides_unrelated_nested_write_only_reassert() {
+    let scenario = Scenario::new();
+    scenario.write_nested_secret_and_comment_config("accepted-secret", "before");
+    assert_success("carina init", &scenario.init());
+    assert_success("initial plan", &scenario.save_plan("initial.json"));
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.write_nested_secret_and_comment_config("accepted-secret", "after");
+    let planned = scenario.save_plan_with_refresh("comment.json");
+    assert_success("unrelated nested-secret update plan", &planned);
+    let planned_text = output_text(&planned);
+    assert!(
+        planned_text.contains("comment")
+            && !planned_text.contains("oidc_config")
+            && !planned_text.contains("client_secret"),
+        "ordinary plan display must show only the unrelated change:\n{planned_text}"
+    );
+
+    let applied = scenario.apply_plan("comment.json");
+    assert_success("unrelated nested-secret saved-plan apply", &applied);
+    let applied_text = output_text(&applied);
+    assert!(
+        applied_text.contains("comment")
+            && !applied_text.contains("oidc_config")
+            && !applied_text.contains("client_secret"),
+        "saved-plan apply display must agree with plan and hide the nested Reassert:\n{applied_text}"
     );
 }
 

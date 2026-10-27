@@ -2111,10 +2111,14 @@ where
 }
 
 fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
-    RawSavedAttrs::from_persisted(HashMap::from([(
-        target.id.as_inner().clone(),
-        target.generation.persisted_attributes().clone(),
-    )]))
+    RawSavedAttrs::from_persisted(
+        HashMap::from([(
+            target.id.as_inner().clone(),
+            target.generation.persisted_attributes().clone(),
+        )]),
+        // Deposed generations predate per-instance nested write-only provenance.
+        HashMap::new(),
+    )
 }
 
 /// Compare old state with fresh provider state for a single resource,
@@ -4695,12 +4699,12 @@ mod tests {
             },
             "refresh must repair from empty desired without promoting provider attributes"
         );
-        let saved = state.build_saved_attrs();
+        let saved = state.build_saved_attrs().lift(&schemas);
         assert!(matches!(
             diff(
                 &desired,
                 &fresh,
-                saved.get(&id),
+                &saved,
                 Some(&row.explicit),
                 schemas.get_for(&desired),
             ),
@@ -4786,13 +4790,13 @@ mod tests {
             row.explicit, prior_explicit,
             "refresh must not record an unapplied removal as authored state"
         );
-        let saved = state.build_saved_attrs();
+        let saved = state.build_saved_attrs().lift(&schemas);
         let Diff::Update {
             changed_attributes, ..
         } = diff(
             &desired,
             &fresh,
-            saved.get(&id),
+            &saved,
             Some(&row.explicit),
             schemas.get_for(&desired),
         )
@@ -4833,13 +4837,13 @@ mod tests {
         prior_state
             .upsert_resource(prior.clone())
             .expect("prior row should be valid");
-        let prior_saved = prior_state.build_saved_attrs();
+        let prior_saved = prior_state.build_saved_attrs().lift(&SchemaRegistry::new());
         let Diff::Update {
             changed_attributes, ..
         } = diff(
             &desired,
             &provider_state,
-            prior_saved.get(&id),
+            &prior_saved,
             Some(&prior.explicit),
             None,
         )
@@ -4882,15 +4886,11 @@ mod tests {
             .find_resource_for_id(&id)
             .expect("refreshed row should remain");
         let explicit = refreshed.explicit.clone();
-        let saved = refreshed_state.build_saved_attrs();
+        let saved = refreshed_state
+            .build_saved_attrs()
+            .lift(&SchemaRegistry::new());
         (
-            diff(
-                &desired,
-                &provider_state,
-                saved.get(&id),
-                Some(&explicit),
-                None,
-            ),
+            diff(&desired, &provider_state, &saved, Some(&explicit), None),
             explicit,
         )
     }

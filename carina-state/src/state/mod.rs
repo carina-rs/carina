@@ -12,10 +12,10 @@ use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
-    AppliedIdentifier, EmptyAppliedIdentifier, InFlightCreate, InFlightPersistence, Observation,
-    ObservedCreate, PersistedAttributes, PersistedAttributesError, RawSavedAttrs, Sent, SentRecord,
-    StateRowInFlightCreate, StateTransformMap, merge_previous_secret_hashes_into_provider_value,
-    previous_hash,
+    AppliedIdentifier, EmptyAppliedIdentifier, InFlightCreate, InFlightPersistence,
+    NestedWriteOnlyRecord, Observation, ObservedCreate, PersistedAttributes,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentRecord, StateRowInFlightCreate,
+    StateTransformMap, merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
@@ -773,7 +773,9 @@ impl StateFile {
     /// v17: Added top-level `exports_version` so published exports have a
     ///      compatibility contract independent of managed resource rows. See
     ///      [`Self::EXPORTS_VERSION_INTRODUCED`].
-    pub const CURRENT_VERSION: u32 = 17;
+    /// v18: Added per-instance nested write-only leaf provenance. The v17
+    ///      migration initializes the record to empty.
+    pub const CURRENT_VERSION: u32 = 18;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
@@ -1097,14 +1099,16 @@ impl StateFile {
 
     /// Build a map of saved attributes, converting JSON values to DSL values.
     pub fn build_saved_attrs(&self) -> RawSavedAttrs {
-        let mut result = HashMap::new();
+        let mut attributes = HashMap::new();
+        let mut nested_write_only = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            if let Some(attributes) = rs.persisted_attributes() {
-                result.insert(id, attributes.clone());
+            if let Some(persisted) = rs.persisted_attributes() {
+                attributes.insert(id.clone(), persisted.clone());
+                nested_write_only.insert(id, rs.nested_write_only().clone());
             }
         }
-        RawSavedAttrs::from_persisted(result)
+        RawSavedAttrs::from_persisted(attributes, nested_write_only)
     }
 
     /// Remove historical rows that correspond to typed `read` declarations.
@@ -1241,6 +1245,7 @@ impl StateFile {
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes: _write_only_attributes,
+                nested_write_only: _nested_write_only,
                 partial_read,
             } => Current::from_state(State {
                 id: id.clone(),
@@ -1817,7 +1822,18 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             } else {
                 None
             };
-            let migrated_content = migrated_v14.as_deref().unwrap_or(pre_current_migration);
+            let pre_nested_write_only_migration =
+                migrated_v14.as_deref().unwrap_or(pre_current_migration);
+            let migrated_v17 = if v <= 17 {
+                Some(migrate_v17_nested_write_only(
+                    pre_nested_write_only_migration,
+                )?)
+            } else {
+                None
+            };
+            let migrated_content = migrated_v17
+                .as_deref()
+                .unwrap_or(pre_nested_write_only_migration);
             let mut state = StateFile::from_json_str(migrated_content)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
@@ -2035,6 +2051,7 @@ pub enum CurrentInstance {
         attributes: PersistedAttributes,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         write_only_attributes: Vec<String>,
+        nested_write_only: NestedWriteOnlyRecord,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         partial_read: Option<PartialReadMarker>,
     },
@@ -2048,6 +2065,7 @@ pub enum CurrentInstance {
         attributes: PersistedAttributes,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         write_only_attributes: Vec<String>,
+        nested_write_only: NestedWriteOnlyRecord,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         partial_read: Option<PartialReadMarker>,
     },
@@ -2062,6 +2080,7 @@ enum EncodedCurrentInstance {
         attributes: HashMap<String, serde_json::Value>,
         #[serde(default)]
         write_only_attributes: Vec<String>,
+        nested_write_only: NestedWriteOnlyRecord,
         #[serde(default)]
         partial_read: Option<PartialReadMarker>,
     },
@@ -2073,6 +2092,7 @@ enum EncodedCurrentInstance {
         attributes: HashMap<String, serde_json::Value>,
         #[serde(default)]
         write_only_attributes: Vec<String>,
+        nested_write_only: NestedWriteOnlyRecord,
         #[serde(default)]
         partial_read: Option<PartialReadMarker>,
     },
@@ -2211,12 +2231,14 @@ impl<'de> Deserialize<'de> for ResourceState {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => CurrentInstance::Applied {
                 identifier,
                 attributes: PersistedAttributes::from_encoded(attributes)
                     .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             },
             EncodedCurrentInstance::CreateInFlight {
@@ -2231,11 +2253,13 @@ impl<'de> Deserialize<'de> for ResourceState {
             EncodedCurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => CurrentInstance::MissingIdentifier {
                 attributes: PersistedAttributes::from_encoded(attributes)
                     .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             },
         };
@@ -2297,11 +2321,13 @@ impl WritableResourceState {
                 identifier,
                 attributes,
                 write_only_attributes: Vec::new(),
+                nested_write_only: NestedWriteOnlyRecord::default(),
                 partial_read: state.partial_read.clone(),
             },
             None => CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes: Vec::new(),
+                nested_write_only: NestedWriteOnlyRecord::default(),
                 partial_read: state.partial_read.clone(),
             },
         };
@@ -2340,11 +2366,13 @@ impl RefreshableResourceState<'_> {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only: source.nested_write_only().clone(),
                 partial_read: state.partial_read.clone(),
             },
             None => CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only: source.nested_write_only().clone(),
                 partial_read: state.partial_read.clone(),
             },
         };
@@ -2420,6 +2448,22 @@ impl ResourceState {
         }
     }
 
+    /// Borrow accepted desired values for nested write-only leaves.
+    pub fn nested_write_only(&self) -> &NestedWriteOnlyRecord {
+        match &self.current {
+            CurrentInstance::Applied {
+                nested_write_only, ..
+            }
+            | CurrentInstance::MissingIdentifier {
+                nested_write_only, ..
+            } => nested_write_only,
+            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+                static EMPTY: NestedWriteOnlyRecord = NestedWriteOnlyRecord::new();
+                &EMPTY
+            }
+        }
+    }
+
     pub fn partial_read(&self) -> Option<&PartialReadMarker> {
         match &self.current {
             CurrentInstance::Applied { partial_read, .. }
@@ -2469,6 +2513,7 @@ impl ResourceState {
                 self.current = CurrentInstance::MissingIdentifier {
                     attributes: upgraded,
                     write_only_attributes: Vec::new(),
+                    nested_write_only: NestedWriteOnlyRecord::default(),
                     partial_read: None,
                 };
             }
@@ -2567,6 +2612,7 @@ impl ResourceState {
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes: _write_only_attributes,
+                nested_write_only: _nested_write_only,
                 partial_read: _partial_read,
             } => serde_json::json!({
                 "status": "missing_identifier",
@@ -2631,6 +2677,7 @@ impl ResourceState {
             identifier,
             attributes: PersistedAttributes::default(),
             write_only_attributes: Vec::new(),
+            nested_write_only: NestedWriteOnlyRecord::default(),
             partial_read: None,
         };
         row
@@ -2752,6 +2799,7 @@ impl ResourceState {
             identifier: bucket_name,
             attributes,
             write_only_attributes: Vec::new(),
+            nested_write_only: NestedWriteOnlyRecord::default(),
             partial_read: None,
         };
         state.protected = true;
@@ -2977,6 +3025,7 @@ impl ResourceState {
                 (sent_values, write_only)
             }
         };
+        let sent_keys_for_nested_write_only = sent_values.keys().cloned().collect::<Vec<_>>();
         selected.overlay_sent(&sent_values, &sent_write_only);
         let previous_hash_authority = previous
             .map(PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired)
@@ -3005,6 +3054,15 @@ impl ResourceState {
             })
         });
         let stored_attributes = attributes.to_values();
+        let mut nested_write_only = NestedWriteOnlyRecord::default();
+        if let Some(schema) = schema {
+            nested_write_only.record_sent(
+                schema,
+                sent_keys_for_nested_write_only.iter().map(String::as_str),
+                &writeback_resource.attributes,
+                existing.map(ResourceState::nested_write_only),
+            )?;
+        }
 
         let mut row = Self::new(
             &resource.id.resource_type,
@@ -3015,6 +3073,7 @@ impl ResourceState {
             identifier: created.identifier().clone(),
             attributes,
             write_only_attributes,
+            nested_write_only,
             partial_read,
         };
         row.populate_desired_metadata(
@@ -3238,6 +3297,39 @@ impl ResourceState {
             true,
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
+        let previous_nested_write_only = existing
+            .map(ResourceState::nested_write_only)
+            .cloned()
+            .unwrap_or_default();
+        let (mut nested_write_only, keys_to_record) = match row_basis {
+            RowBasis::Applied(request) => match request.kind() {
+                AcceptedRequestKind::Create => (
+                    NestedWriteOnlyRecord::default(),
+                    writeback_resource
+                        .attributes
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                ),
+                AcceptedRequestKind::Update { sent, removed } => {
+                    let mut record = previous_nested_write_only.clone();
+                    for key in removed {
+                        record.remove_attribute(key);
+                    }
+                    (record, sent.iter().map(String::as_str).collect::<Vec<_>>())
+                }
+            },
+            RowBasis::Imported => (NestedWriteOnlyRecord::default(), Vec::new()),
+            RowBasis::Carried => (previous_nested_write_only.clone(), Vec::new()),
+        };
+        if let Some(schema) = schema {
+            nested_write_only.record_sent(
+                schema,
+                keys_to_record,
+                &writeback_resource.attributes,
+                Some(&previous_nested_write_only),
+            )?;
+        }
         rs.current = match state
             .identifier
             .as_deref()
@@ -3247,11 +3339,13 @@ impl ResourceState {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read: state.partial_read.clone(),
             },
             None => CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read: state.partial_read.clone(),
             },
         };
@@ -3379,6 +3473,46 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
     root["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v14: {error}"))
+    })
+}
+
+/// v17 → v18: initialize leaf provenance on every attribute-bearing current
+/// instance. In-flight and deposed-only rows have no accepted applied values.
+fn migrate_v17_nested_write_only(content: &str) -> Result<String, BackendError> {
+    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v17: {error}"))
+    })?;
+    let resources = root
+        .get_mut("resources")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v17: resources must be an array".to_string(),
+            )
+        })?;
+    for resource in resources {
+        let Some(current) = resource
+            .get_mut("current")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if matches!(
+            current.get("kind").and_then(serde_json::Value::as_str),
+            Some("applied" | "missing_identifier")
+        ) {
+            current
+                .entry("nested_write_only".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+        }
+    }
+    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    root.as_object_mut()
+        .expect("a state file root validated as an object")
+        .entry("exports_version".to_string())
+        .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
+    serde_json::to_string(&root).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v17: {error}"))
     })
 }
 

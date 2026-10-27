@@ -624,6 +624,133 @@ fn replace_when_create_only_attr_changed() {
     );
 }
 
+fn create_only_nested_write_only_fixture(
+    password: &str,
+) -> (Resource, State, crate::schema::ResourceSchema) {
+    use crate::resource::DeferredValue;
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let schema = crate::schema::ResourceSchema::new("test.Credential").attribute(
+        AttributeSchema::new(
+            "creds",
+            AttributeType::struct_(
+                "Credentials",
+                vec![
+                    StructField::new("username", AttributeType::string()),
+                    StructField::new("password", AttributeType::string()).write_only(),
+                ],
+            ),
+        )
+        .create_only(),
+    );
+    let desired_creds = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "username".to_string(),
+            Value::Concrete(ConcreteValue::String("alice".into())),
+        ),
+        (
+            "password".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(password.into()),
+            )))),
+        ),
+    ])));
+    let desired =
+        Resource::new("test.Credential", "example").with_attribute("creds", desired_creds);
+    let current = existing_state(
+        desired.id.clone(),
+        HashMap::from([(
+            "creds".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "username".to_string(),
+                Value::Concrete(ConcreteValue::String("alice".into())),
+            )]))),
+        )]),
+    );
+    (desired, current, schema)
+}
+
+#[test]
+fn create_only_nested_write_only_without_record_plans_no_change() {
+    let (desired, current, schema) = create_only_nested_write_only_fixture("accepted-secret");
+    let id = desired.id.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", schema);
+    let saved = crate::provider::RawSavedAttrs::from_persisted(
+        HashMap::new(),
+        HashMap::from([(
+            id.clone(),
+            crate::provider::NestedWriteOnlyRecord::default(),
+        )]),
+    )
+    .lift(&schemas);
+    let current_states = HashMap::from([(id.clone(), current)]);
+
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "an empty migrated/imported provenance record must not replace a create-only resource: {:?}",
+        plan.effects()
+    );
+}
+
+#[test]
+fn create_only_nested_write_only_changed_record_plans_replace() {
+    let (previous_desired, _previous_current, schema) =
+        create_only_nested_write_only_fixture("old-secret");
+    let (desired, current, _equivalent_schema) =
+        create_only_nested_write_only_fixture("new-secret");
+    let id = desired.id.clone();
+    let mut record = crate::provider::NestedWriteOnlyRecord::default();
+    record
+        .record_sent(&schema, ["creds"], &previous_desired.attributes, None)
+        .expect("fixture credentials are persistable");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", schema);
+    let saved = crate::provider::RawSavedAttrs::from_persisted(
+        HashMap::new(),
+        HashMap::from([(id.clone(), record)]),
+    )
+    .lift(&schemas);
+    let current_states = HashMap::from([(id.clone(), current)]);
+
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["creds".to_string()]);
+}
+
 #[test]
 fn normal_update_when_non_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};

@@ -12,10 +12,11 @@ use crate::diff_helpers::{
     compute_map_diff, compute_unchanged_count, list_element_type, map_entry_subtype,
     schema_aware_equal,
 };
+use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch};
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::{Plan, ReplaceDisplayInfo};
-use crate::provider::PersistedAttributes;
+use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
     ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value, pair_list_elements,
 };
@@ -45,7 +46,13 @@ pub enum DetailLevel {
 #[derive(Debug, Clone)]
 pub struct HistoricalDisplayAttributes {
     updates: HashMap<ResourceId, HashMap<String, Value>>,
-    deletes: HashMap<DeletedInstanceKey, HashMap<String, Value>>,
+    deletes: HashMap<DeletedInstanceKey, HistoricalDeleteAttributes>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalDeleteAttributes {
+    attributes: HashMap<String, Value>,
+    nested_write_only: NestedWriteOnlyRecord,
 }
 
 impl HistoricalDisplayAttributes {
@@ -78,7 +85,10 @@ impl HistoricalDisplayAttributes {
                             generation.clone(),
                             identifier.to_string(),
                         ),
-                        HashMap::new(),
+                        HistoricalDeleteAttributes {
+                            attributes: HashMap::new(),
+                            nested_write_only: NestedWriteOnlyRecord::new(),
+                        },
                     );
                 }
                 _ => {}
@@ -104,7 +114,13 @@ impl HistoricalDisplayAttributes {
                     generation.clone(),
                     identifier.to_string(),
                 ),
-                mask_attributes_using_secret_shape(replacement.previous_attributes, &to.attributes),
+                HistoricalDeleteAttributes {
+                    attributes: mask_attributes_using_secret_shape(
+                        replacement.previous_attributes,
+                        &to.attributes,
+                    ),
+                    nested_write_only: NestedWriteOnlyRecord::new(),
+                },
             );
         }
 
@@ -132,11 +148,19 @@ impl HistoricalDisplayAttributes {
         key: DeletedInstanceKey,
         provider_attributes: &HashMap<String, Value>,
         persisted_attributes: Option<&PersistedAttributes>,
+        nested_write_only: &NestedWriteOnlyRecord,
     ) {
         let persisted_masked =
             mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
-        let masked = combine_with_desired_secret_shape(persisted_masked, self.deletes.get(&key));
-        self.deletes.insert(key, masked);
+        let desired_shape = self.deletes.get(&key).map(|entry| &entry.attributes);
+        let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
+        self.deletes.insert(
+            key,
+            HistoricalDeleteAttributes {
+                attributes: masked,
+                nested_write_only: nested_write_only.clone(),
+            },
+        );
     }
 
     /// Decode a deposed generation directly from persisted JSON. Valid
@@ -147,15 +171,24 @@ impl HistoricalDisplayAttributes {
         persisted_attributes: &PersistedAttributes,
     ) {
         let persisted = persisted_attributes.to_values();
-        let masked = combine_with_desired_secret_shape(persisted, self.deletes.get(&key));
-        self.deletes.insert(key, masked);
+        let desired_shape = self.deletes.get(&key).map(|entry| &entry.attributes);
+        let masked = combine_with_desired_secret_shape(persisted, desired_shape);
+        self.deletes.insert(
+            key,
+            HistoricalDeleteAttributes {
+                attributes: masked,
+                // State v18 introduced provenance only for the current
+                // instance; historical generations have no leaf record.
+                nested_write_only: NestedWriteOnlyRecord::new(),
+            },
+        );
     }
 
     fn update(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
         self.updates.get(id)
     }
 
-    fn delete(&self, key: &DeletedInstanceKey) -> Option<&HashMap<String, Value>> {
+    fn delete(&self, key: &DeletedInstanceKey) -> Option<&HistoricalDeleteAttributes> {
         self.deletes.get(key)
     }
 }
@@ -729,6 +762,7 @@ fn build_update_rows(
             schema,
             defs,
             detail,
+            changed_attributes,
         )
         .with_explicit(explicit),
     );
@@ -843,9 +877,22 @@ struct AttributeDiffContext<'a> {
     schema: Option<&'a ResourceSchema>,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
+    leaf_provenance: DetailLeafProvenance<'a>,
     forces_replacement_keys: Option<&'a HashSet<&'a str>>,
     cascade_ref_hints: &'a [(String, String)],
     explicit: Option<&'a crate::explicit::ExplicitFields>,
+}
+
+#[derive(Clone, Copy)]
+enum DetailLeafProvenance<'a> {
+    DecidedByPlan(&'a [String]),
+    Recorded(&'a NestedWriteOnlyRecord),
+}
+
+struct ReplacementDiffContext<'a> {
+    nested_write_only: &'a NestedWriteOnlyRecord,
+    forces_replacement_keys: &'a HashSet<&'a str>,
+    cascade_ref_hints: &'a [(String, String)],
 }
 
 impl<'a> AttributeDiffContext<'a> {
@@ -855,6 +902,7 @@ impl<'a> AttributeDiffContext<'a> {
         schema: Option<&'a ResourceSchema>,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
+        changed_attribute_keys: &'a [String],
     ) -> Self {
         Self {
             from_attrs_raw,
@@ -862,6 +910,7 @@ impl<'a> AttributeDiffContext<'a> {
             schema,
             defs,
             detail,
+            leaf_provenance: DetailLeafProvenance::DecidedByPlan(changed_attribute_keys),
             forces_replacement_keys: None,
             cascade_ref_hints: &[],
             explicit: None,
@@ -874,8 +923,7 @@ impl<'a> AttributeDiffContext<'a> {
         schema: Option<&'a ResourceSchema>,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
-        forces_replacement_keys: &'a HashSet<&'a str>,
-        cascade_ref_hints: &'a [(String, String)],
+        replacement: ReplacementDiffContext<'a>,
     ) -> Self {
         Self {
             from_attrs_raw,
@@ -883,8 +931,9 @@ impl<'a> AttributeDiffContext<'a> {
             schema,
             defs,
             detail,
-            forces_replacement_keys: Some(forces_replacement_keys),
-            cascade_ref_hints,
+            leaf_provenance: DetailLeafProvenance::Recorded(replacement.nested_write_only),
+            forces_replacement_keys: Some(replacement.forces_replacement_keys),
+            cascade_ref_hints: replacement.cascade_ref_hints,
             explicit: None,
         }
     }
@@ -896,6 +945,15 @@ impl<'a> AttributeDiffContext<'a> {
 
     fn is_whole_value_authored(&self, key: &str) -> bool {
         is_whole_value(self.explicit_for_key(key))
+    }
+
+    fn leaf_provenance(&self, key: &str) -> LeafProvenance<'_> {
+        match self.leaf_provenance {
+            DetailLeafProvenance::DecidedByPlan(keys) => LeafProvenance::DecidedByPlan {
+                key_changed: keys.iter().any(|changed| changed == key),
+            },
+            DetailLeafProvenance::Recorded(record) => LeafProvenance::Recorded(record.get(key)),
+        }
     }
 
     fn explicit_for_key(&self, key: &str) -> Option<&'a crate::explicit::ExplicitFields> {
@@ -1010,15 +1068,30 @@ fn build_attribute_diff_rows(
             .schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
-        // Sites 1/2 (carina#3073): schema-aware top-level equality.
-        // When the only diffs inside this attribute are enum-equal
-        // leaves, `type_aware_equal` recurses Struct/List/Map
-        // internally and returns true, so no row is built at all.
-        let is_same = old_value
+        // Keep the raw verdict only for the hidden-unchanged accounting below.
+        let raw_is_same = old_value
             .map(|ov| schema_aware_equal(ov, new_value, attr_type, ctx.defs))
             .unwrap_or(false);
+        let type_info = attr_type.map(|attr_type| TypedAttr {
+            attr_type,
+            defs: ctx.defs,
+        });
+        let is_same = !key_should_enter_patch(
+            key,
+            ctx.schema,
+            ctx.leaf_provenance(key),
+            AttrComparison {
+                from: old_value,
+                to: new_value,
+                saved: None,
+                type_info,
+            },
+        );
 
         if is_same {
+            if !raw_is_same {
+                effectively_unchanged += 1;
+            }
             if forces_replacement {
                 let old_str = old_value
                     .map(render_value)
@@ -1175,7 +1248,8 @@ pub fn build_replace_detail_rows_from_display(
     };
     let schema = registry.and_then(|reg| reg.get_for(to));
     build_replace_rows_from_attributes(
-        historical_attributes,
+        &historical_attributes.attributes,
+        &historical_attributes.nested_write_only,
         to,
         replacement.changed_create_only,
         replacement.temporary_name,
@@ -1189,6 +1263,7 @@ pub fn build_replace_detail_rows_from_display(
 #[allow(clippy::too_many_arguments)]
 fn build_replace_rows_from_attributes(
     previous_attributes: &HashMap<String, Value>,
+    nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
@@ -1212,8 +1287,11 @@ fn build_replace_rows_from_attributes(
             schema,
             defs,
             detail,
-            &force_keys,
-            cascade_ref_hints,
+            ReplacementDiffContext {
+                nested_write_only,
+                forces_replacement_keys: &force_keys,
+                cascade_ref_hints,
+            },
         )
         .with_explicit(explicit),
     );
@@ -1362,7 +1440,8 @@ fn build_delete_rows(
     let mut rows = Vec::new();
 
     let key = DeletedInstanceKey::new(id.clone(), generation.clone(), identifier.to_string());
-    if let Some(attrs) = historical_attributes.delete(&key) {
+    if let Some(historical) = historical_attributes.delete(&key) {
+        let attrs = &historical.attributes;
         let mut keys: Vec<_> = attrs.keys().collect();
         keys.sort();
         for key in keys {
@@ -2192,11 +2271,16 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(effect.clone());
         let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
+        let empty_nested_write_only = NestedWriteOnlyRecord::new();
         if let Some(delete_attributes) = delete_attributes {
             for key in effect.deleted_resource_attribute_keys() {
                 if let Some(attributes) = delete_attributes.get(key.id()) {
-                    historical_attributes
-                        .set_delete_from_provider_and_persisted(key, attributes, None);
+                    historical_attributes.set_delete_from_provider_and_persisted(
+                        key,
+                        attributes,
+                        None,
+                        &empty_nested_write_only,
+                    );
                 }
             }
         }
@@ -2224,6 +2308,7 @@ mod tests {
             .collect();
         build_replace_rows_from_attributes(
             &from.attributes,
+            &NestedWriteOnlyRecord::new(),
             &to,
             &changed_create_only,
             None,

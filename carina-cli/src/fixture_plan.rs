@@ -88,6 +88,28 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
                     AttributeType::map(AttributeType::string()),
                 )),
         ),
+        awscc(
+            ResourceSchema::new("elasticloadbalancingv2.Listener")
+                .attribute(AttributeSchema::new(
+                    "default_actions",
+                    AttributeType::list(AttributeType::struct_(
+                        "Action",
+                        vec![StructField::new(
+                            "authenticate_oidc_config",
+                            AttributeType::struct_(
+                                "AuthenticateOidcConfig",
+                                vec![
+                                    StructField::new("issuer", AttributeType::string()),
+                                    StructField::new("client_secret", AttributeType::string())
+                                        .write_only(),
+                                ],
+                            ),
+                        )],
+                    )),
+                ))
+                .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()))
+                .attribute(AttributeSchema::new("port", AttributeType::int()).create_only()),
+        ),
         awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
         awscc(
             ResourceSchema::new("issue3885.Role")

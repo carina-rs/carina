@@ -2280,7 +2280,7 @@ async fn skipped_or_cancelled_resume_has_no_applied_entry() {
 }
 
 fn provider_boundary_constraint_schemas() -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2290,7 +2290,17 @@ fn provider_boundary_constraint_schemas() -> SchemaRegistry {
                 "target",
                 AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
             ))
-            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only()),
+            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only())
+            .attribute(AttributeSchema::new(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::new("issuer", AttributeType::string()),
+                        StructField::new("client_secret", AttributeType::string()).write_only(),
+                    ],
+                ),
+            )),
     );
     schemas
 }
@@ -2647,6 +2657,19 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         "token",
         Value::Concrete(ConcreteValue::String("unchanged-token".into())),
     );
+    updated.set_attr(
+        "config",
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+            (
+                "issuer".to_string(),
+                Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+            ),
+            (
+                "client_secret".to_string(),
+                Value::Concrete(ConcreteValue::String("client-secret".into())),
+            ),
+        ]))),
+    );
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
@@ -2662,6 +2685,13 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             (
                 "token".to_string(),
                 Value::Concrete(ConcreteValue::String("unchanged-token".into())),
+            ),
+            (
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "issuer".to_string(),
+                    Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+                )]))),
             ),
         ]),
     )
@@ -2726,6 +2756,16 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             |op| matches!(op, crate::provider::PatchOp::Reassert { key, .. } if key == "token")
         )
     );
+    assert!(
+        requests[0].patch().ops.iter().any(
+            |op| matches!(op, crate::provider::PatchOp::Reassert { key, .. } if key == "config")
+        )
+    );
+    assert!(
+        !requests[0].patch().ops.iter().any(
+            |op| matches!(op, crate::provider::PatchOp::Replace { key, .. } if key == "config")
+        )
+    );
     let Some(Applied::Complete { request, .. }) = result.applied_states.get(&update_id) else {
         panic!("successful update must publish accepted-request provenance");
     };
@@ -2734,9 +2774,104 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     };
     assert_eq!(
         sent,
-        &BTreeSet::from(["target".to_string(), "token".to_string()])
+        &BTreeSet::from([
+            "config".to_string(),
+            "target".to_string(),
+            "token".to_string(),
+        ])
     );
     assert_eq!(removed, &BTreeSet::from(["obsolete".to_string()]));
+}
+
+#[tokio::test]
+async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentation() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let provider = MockProvider::new();
+    let mut updated = make_resource("entirely-write-only", &[]);
+    updated.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("good-after".into())),
+    );
+    updated.set_attr(
+        "creds",
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "password".to_string(),
+            Value::Concrete(ConcreteValue::String("client-secret".into())),
+        )]))),
+    );
+    let id = updated.id.clone();
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".into())),
+        )]),
+    )
+    .with_identifier("id-123");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("id-123"),
+        from: Box::new(from),
+        to: resolved(updated),
+        changed_attributes: vec!["target".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&id)));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test")
+            .attribute(AttributeSchema::new(
+                "target",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new(
+                "creds",
+                AttributeType::struct_(
+                    "Credentials",
+                    vec![StructField::new("password", AttributeType::string()).write_only()],
+                ),
+            )),
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.failure_count, 0);
+    let requests = provider.captured_update_requests();
+    assert!(
+        requests[0].patch().ops.iter().any(
+            |op| matches!(op, crate::provider::PatchOp::Reassert { key, .. } if key == "creds")
+        )
+    );
+    assert!(
+        !requests[0].patch().ops.iter().any(
+            |op| matches!(op, crate::provider::PatchOp::Replace { key, .. } if key == "creds")
+        )
+    );
 }
 
 #[tokio::test]

@@ -208,11 +208,13 @@ impl PlanFile {
                         identifier: _identifier,
                         attributes: _attributes,
                         write_only_attributes: _write_only_attributes,
+                        nested_write_only: _nested_write_only,
                         partial_read: _partial_read,
                     } => false,
                     carina_state::CurrentInstance::MissingIdentifier {
                         attributes: _attributes,
                         write_only_attributes: _write_only_attributes,
+                        nested_write_only: _nested_write_only,
                         partial_read: _partial_read,
                     } => false,
                 };
@@ -594,13 +596,19 @@ pub(crate) fn collect_historical_display_attributes(
                             Current::MissingIdentifier(state) => state.state(),
                         };
                         let persisted_id = moved_origins.origin_for(key.id());
-                        let persisted = state_file
-                            .and_then(|file| file.find_resource_for_id(persisted_id))
-                            .and_then(ResourceState::persisted_attributes);
+                        let persisted_row =
+                            state_file.and_then(|file| file.find_resource_for_id(persisted_id));
+                        let persisted = persisted_row.and_then(ResourceState::persisted_attributes);
+                        let empty_nested_write_only =
+                            carina_core::provider::NestedWriteOnlyRecord::new();
+                        let nested_write_only = persisted_row
+                            .map(ResourceState::nested_write_only)
+                            .unwrap_or(&empty_nested_write_only);
                         display.set_delete_from_provider_and_persisted(
                             key,
                             &state.attributes,
                             persisted,
+                            nested_write_only,
                         );
                     }
                 }

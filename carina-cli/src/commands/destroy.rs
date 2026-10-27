@@ -2653,7 +2653,8 @@ mod tests {
                     "identity": "broken",
                     "current": {
                         "kind": "missing_identifier",
-                        "attributes": {}
+                        "attributes": {},
+                        "nested_write_only": {}
                     }
                 }],
                 "exports": {}

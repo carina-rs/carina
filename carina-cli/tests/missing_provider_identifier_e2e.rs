@@ -108,7 +108,8 @@ let roles = read mock.iam.Roles {
                 "provider": "mock",
                 "current": {
                     "kind": "missing_identifier",
-                    "attributes": { "names": ["old-role"] }
+                    "attributes": { "names": ["old-role"] },
+                    "nested_write_only": {}
                 },
                 "binding": "roles"
             }]);
@@ -124,7 +125,8 @@ let roles = read mock.iam.Roles {
                 "current": {
                     "kind": "applied",
                     "identifier": "managed-provider-id",
-                    "attributes": { "names": ["old-managed-value"] }
+                    "attributes": { "names": ["old-managed-value"] },
+                    "nested_write_only": {}
                 },
                 "binding": "roles"
             }]);

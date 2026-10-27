@@ -524,7 +524,13 @@ impl InputMode {
     }
 }
 
-/// A field within a Struct type
+/// A field within a Struct type.
+///
+/// Like [`InputMode`] (carina#3772), the fields remain public so provider
+/// adapters can convert this record exhaustively. The [`Self::write_only`] and
+/// [`Self::read_only`] builders panic on conflicting modes, resource schema
+/// construction rechecks manually assembled fields, and host wire decoding
+/// rejects `read_only && write_only` before admitting the schema.
 #[derive(Debug, Clone)]
 pub struct StructField {
     /// Field name (snake_case, e.g., "ip_protocol")
@@ -547,6 +553,9 @@ pub struct StructField {
     /// outer list attribute). See `AttributeSchema::deferred_populate`
     /// (carina#3034).
     pub deferred_populate: bool,
+    /// Whether this nested field is accepted on write but omitted from reads.
+    /// This describes provider observability, not secrecy.
+    pub write_only: bool,
 }
 
 impl StructField {
@@ -559,6 +568,7 @@ impl StructField {
             provider_name: None,
             block_name: None,
             deferred_populate: false,
+            write_only: false,
         }
     }
 
@@ -589,6 +599,10 @@ impl StructField {
     /// Mark this nested field as provider-populated and therefore not
     /// assignable by users.
     pub fn read_only(mut self) -> Self {
+        assert!(
+            !self.write_only,
+            "struct field cannot be both write-only and provider-populated"
+        );
         self.input_mode.transition_to(InputMode::ProviderPopulated);
         self
     }
@@ -597,11 +611,45 @@ impl StructField {
         self.input_mode.is_provider_populated()
     }
 
+    /// Mark this nested field as accepted on write but omitted from reads.
+    pub fn write_only(mut self) -> Self {
+        assert!(
+            !self.input_mode.is_provider_populated(),
+            "struct field cannot be both write-only and provider-populated"
+        );
+        self.write_only = true;
+        self
+    }
+
     /// Mark this nested field as populated asynchronously by the
     /// provider after Create. See the field doc on `deferred_populate`.
     pub fn deferred_populate(mut self) -> Self {
         self.deferred_populate = true;
         self
+    }
+}
+
+/// One typed step from a top-level attribute to a nested write-only field.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum LeafPathSegment {
+    StructField(String),
+    ListIndex(usize),
+    MapKey(String),
+}
+
+/// Location of one write-only field inside a top-level attribute value.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct LeafPath(Vec<LeafPathSegment>);
+
+impl LeafPath {
+    pub fn from_segments(segments: impl IntoIterator<Item = LeafPathSegment>) -> Self {
+        Self(segments.into_iter().collect())
     }
 }
 
@@ -6302,6 +6350,342 @@ pub fn schema_write_only_keys(schema: Option<&ResourceSchema>) -> HashSet<String
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WriteOnlyTypeAnalysis {
+    contains_write_only: bool,
+    union_conflict: bool,
+    field_mode_conflict: bool,
+}
+
+fn type_write_only_analysis<'schema>(
+    attr_type: &'schema AttributeType,
+    defs: &'schema BTreeMap<String, AttributeType>,
+    ref_chain: &mut Vec<&'schema str>,
+) -> WriteOnlyTypeAnalysis {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return WriteOnlyTypeAnalysis::default();
+            }
+            let Some(definition) = defs.get(name) else {
+                return WriteOnlyTypeAnalysis::default();
+            };
+            ref_chain.push(name);
+            let analysis = type_write_only_analysis(definition, defs, ref_chain);
+            ref_chain.pop();
+            analysis
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            type_write_only_analysis(element_type, defs, ref_chain)
+        }
+        AttrTypeKind::Map { value, .. } => type_write_only_analysis(value, defs, ref_chain),
+        AttrTypeKind::Struct { fields, .. } => {
+            fields
+                .iter()
+                .fold(WriteOnlyTypeAnalysis::default(), |analysis, field| {
+                    let nested = type_write_only_analysis(&field.field_type, defs, ref_chain);
+                    WriteOnlyTypeAnalysis {
+                        contains_write_only: analysis.contains_write_only
+                            || field.write_only
+                            || nested.contains_write_only,
+                        union_conflict: analysis.union_conflict || nested.union_conflict,
+                        field_mode_conflict: analysis.field_mode_conflict
+                            || nested.field_mode_conflict
+                            || (field.write_only && field.input_mode.is_provider_populated()),
+                    }
+                })
+        }
+        AttrTypeKind::Union(members) => {
+            let nested = members.as_raw_slice().iter().fold(
+                WriteOnlyTypeAnalysis::default(),
+                |analysis, member| {
+                    let member = type_write_only_analysis(member, defs, ref_chain);
+                    WriteOnlyTypeAnalysis {
+                        contains_write_only: analysis.contains_write_only
+                            || member.contains_write_only,
+                        union_conflict: analysis.union_conflict || member.union_conflict,
+                        field_mode_conflict: analysis.field_mode_conflict
+                            || member.field_mode_conflict,
+                    }
+                },
+            );
+            WriteOnlyTypeAnalysis {
+                union_conflict: nested.contains_write_only || nested.union_conflict,
+                ..nested
+            }
+        }
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => WriteOnlyTypeAnalysis::default(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOnlySchemaConflictKind {
+    TopLevelAndNested,
+    UnionMemberBearing,
+    NestedFieldReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOnlySchemaConflict<'a> {
+    attribute: &'a str,
+    kind: WriteOnlySchemaConflictKind,
+}
+
+impl WriteOnlySchemaConflict<'_> {
+    pub fn attribute(&self) -> &str {
+        self.attribute
+    }
+
+    pub fn message(&self) -> &'static str {
+        match self.kind {
+            WriteOnlySchemaConflictKind::TopLevelAndNested => {
+                "top-level attribute cannot be both write-only and write-only-bearing"
+            }
+            WriteOnlySchemaConflictKind::UnionMemberBearing => {
+                "union members cannot be write-only-bearing"
+            }
+            WriteOnlySchemaConflictKind::NestedFieldReadWrite => {
+                "struct field cannot be both write-only and provider-populated"
+            }
+        }
+    }
+}
+
+fn project_write_only_leaves<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    defs: &'schema BTreeMap<String, AttributeType>,
+    path: &mut Vec<LeafPathSegment>,
+    ref_chain: &mut Vec<&'schema str>,
+    inherited_secret: bool,
+    leaves: &mut Vec<(LeafPath, Value, &'schema AttributeType)>,
+) {
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        project_write_only_leaves(attr_type, inner, defs, path, ref_chain, true, leaves);
+        return;
+    }
+
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return;
+            }
+            let Some(definition) = defs.get(name) else {
+                return;
+            };
+            ref_chain.push(name);
+            project_write_only_leaves(
+                definition,
+                value,
+                defs,
+                path,
+                ref_chain,
+                inherited_secret,
+                leaves,
+            );
+            ref_chain.pop();
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return;
+            };
+            for (index, item) in items.iter().enumerate() {
+                path.push(LeafPathSegment::ListIndex(index));
+                project_write_only_leaves(
+                    element_type,
+                    item,
+                    defs,
+                    path,
+                    &mut Vec::new(),
+                    inherited_secret,
+                    leaves,
+                );
+                path.pop();
+            }
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return;
+            };
+            for (key, entry) in entries {
+                path.push(LeafPathSegment::MapKey(key.clone()));
+                project_write_only_leaves(
+                    value_type,
+                    entry,
+                    defs,
+                    path,
+                    &mut Vec::new(),
+                    inherited_secret,
+                    leaves,
+                );
+                path.pop();
+            }
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return;
+            };
+            for field in fields {
+                let Some(field_value) = entries.get(&field.name) else {
+                    continue;
+                };
+                path.push(LeafPathSegment::StructField(field.name.clone()));
+                if field.write_only {
+                    let projected = if inherited_secret
+                        && !matches!(
+                            field_value,
+                            Value::Deferred(
+                                DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }
+                            )
+                        ) {
+                        Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone())))
+                    } else {
+                        field_value.clone()
+                    };
+                    leaves.push((
+                        LeafPath::from_segments(path.iter().cloned()),
+                        projected,
+                        &field.field_type,
+                    ));
+                } else {
+                    project_write_only_leaves(
+                        &field.field_type,
+                        field_value,
+                        defs,
+                        path,
+                        &mut Vec::new(),
+                        inherited_secret,
+                        leaves,
+                    );
+                }
+                path.pop();
+            }
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
+fn strip_write_only_leaves_from_value<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    defs: &'schema BTreeMap<String, AttributeType>,
+    ref_chain: &mut Vec<&'schema str>,
+) -> Value {
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        return Value::Deferred(DeferredValue::Secret(Box::new(
+            strip_write_only_leaves_from_value(attr_type, inner, defs, ref_chain),
+        )));
+    }
+
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return value.clone();
+            }
+            let Some(definition) = defs.get(name) else {
+                return value.clone();
+            };
+            ref_chain.push(name);
+            let stripped = strip_write_only_leaves_from_value(definition, value, defs, ref_chain);
+            ref_chain.pop();
+            stripped
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return value.clone();
+            };
+            Value::Concrete(ConcreteValue::List(
+                items
+                    .iter()
+                    .map(|item| {
+                        strip_write_only_leaves_from_value(
+                            element_type,
+                            item,
+                            defs,
+                            &mut Vec::new(),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return value.clone();
+            };
+            Value::Concrete(ConcreteValue::Map(
+                entries
+                    .iter()
+                    .map(|(key, entry)| {
+                        (
+                            key.clone(),
+                            strip_write_only_leaves_from_value(
+                                value_type,
+                                entry,
+                                defs,
+                                &mut Vec::new(),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return value.clone();
+            };
+            Value::Concrete(ConcreteValue::Map(
+                entries
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        let field = fields.iter().find(|field| field.name == *key);
+                        match field {
+                            Some(field) if field.write_only => None,
+                            Some(field) => Some((
+                                key.clone(),
+                                strip_write_only_leaves_from_value(
+                                    &field.field_type,
+                                    entry,
+                                    defs,
+                                    &mut Vec::new(),
+                                ),
+                            )),
+                            None => Some((key.clone(), entry.clone())),
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => value.clone(),
+    }
+}
+
 /// Fallback total timeout when neither the user nor the resource schema
 /// declares one. Conservative — real provider workloads should declare
 /// their own (e.g. ACM Certificate at 75min, EC2 Instance Running at
@@ -6377,6 +6761,7 @@ impl ResourceSchema {
     /// against this map.
     pub fn with_def(mut self, name: impl Into<String>, ty: AttributeType) -> Self {
         self.defs.insert(name.into(), ty);
+        self.assert_write_only_invariants();
         self
     }
 
@@ -6394,7 +6779,91 @@ impl ResourceSchema {
 
     pub fn attribute(mut self, schema: AttributeSchema) -> Self {
         self.attributes.insert(schema.name.clone(), schema);
+        self.assert_write_only_invariants();
         self
+    }
+
+    fn assert_write_only_invariants(&self) {
+        if let Some(conflict) = self.first_write_only_conflict() {
+            panic!("{}", conflict.message());
+        }
+    }
+
+    /// Return the first schema shape that cannot safely represent nested
+    /// write-only provenance.
+    pub fn first_write_only_conflict(&self) -> Option<WriteOnlySchemaConflict<'_>> {
+        let mut attributes = self.attributes.iter().collect::<Vec<_>>();
+        attributes.sort_unstable_by_key(|(name, _)| *name);
+
+        attributes.into_iter().find_map(|(name, attribute)| {
+            let analysis =
+                type_write_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new());
+            if analysis.field_mode_conflict {
+                return Some(WriteOnlySchemaConflict {
+                    attribute: name,
+                    kind: WriteOnlySchemaConflictKind::NestedFieldReadWrite,
+                });
+            }
+            if attribute.write_only && analysis.contains_write_only {
+                return Some(WriteOnlySchemaConflict {
+                    attribute: name,
+                    kind: WriteOnlySchemaConflictKind::TopLevelAndNested,
+                });
+            }
+            analysis.union_conflict.then_some(WriteOnlySchemaConflict {
+                attribute: name,
+                kind: WriteOnlySchemaConflictKind::UnionMemberBearing,
+            })
+        })
+    }
+
+    /// Return whether a top-level attribute contains a nested write-only field.
+    pub fn write_only_bearing(&self, key: &str) -> bool {
+        self.attributes.get(key).is_some_and(|attribute| {
+            type_write_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
+                .contains_write_only
+        })
+    }
+
+    /// Project the write-only fields that exist in one desired attribute value.
+    ///
+    /// Paths are derived from the desired value, including concrete list
+    /// indices and map keys. The field type accompanies each value so callers
+    /// can use the normal type-aware and secret-hash comparison path.
+    pub fn write_only_leaf_projection<'schema>(
+        &'schema self,
+        key: &str,
+        value: &Value,
+    ) -> Vec<(LeafPath, Value, &'schema AttributeType)> {
+        let Some(attribute) = self.attributes.get(key) else {
+            return Vec::new();
+        };
+        let mut leaves = Vec::new();
+        project_write_only_leaves(
+            &attribute.attr_type,
+            value,
+            &self.defs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            false,
+            &mut leaves,
+        );
+        leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        leaves
+    }
+
+    pub(crate) fn strip_write_only_leaves(&self, key: &str, value: &Value) -> Value {
+        self.attributes.get(key).map_or_else(
+            || value.clone(),
+            |attribute| {
+                strip_write_only_leaves_from_value(
+                    &attribute.attr_type,
+                    value,
+                    &self.defs,
+                    &mut Vec::new(),
+                )
+            },
+        )
     }
 
     /// Pair an attribute or derived subtype with this resource's definitions.

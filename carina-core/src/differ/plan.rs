@@ -438,7 +438,14 @@ fn create_plan_parts(
                 ));
             }
             Current::Present(present) => {
-                match diff_present(resource, present, saved, prev_explicit_for_resource, schema) {
+                match diff_present(
+                    resource,
+                    present,
+                    saved,
+                    saved_attrs.nested_write_only(&resource.id),
+                    prev_explicit_for_resource,
+                    schema,
+                ) {
                     PresentDiff::Update {
                         id,
                         from,

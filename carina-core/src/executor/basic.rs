@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::differ::{
-    AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
+    AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch,
+    secret_grafted_comparison_view,
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
@@ -1027,16 +1028,21 @@ pub(super) async fn execute_basic_effect<'a>(
                 else {
                     continue;
                 };
-                if key_should_enter_patch(
+                // Apply-time augmentation detects newly resolved observable
+                // references. The plan already decided the unobservable leaf
+                // half, and keys it marked changed were skipped above.
+                let changed = key_should_enter_patch(
                     key,
                     Some(schema),
+                    LeafProvenance::DecidedByPlan { key_changed: false },
                     AttrComparison {
                         from: from.attributes.get(key),
                         to: comparison_value.as_ref(),
                         saved: None,
                         type_info,
                     },
-                ) {
+                );
+                if changed {
                     effective_changed.push(key.clone());
                 }
             }

@@ -102,6 +102,8 @@ plan-wait-cert:
 	$(PLAN_FIXTURE) wait_cert
 plan-secret-values:
 	$(PLAN_FIXTURE) secret_values
+plan-nested-write-only:
+	$(PLAN_FIXTURE) nested_write_only
 plan-moved-with-changes:
 	$(PLAN_FIXTURE) moved_with_changes
 plan-moved-prev-keys:
@@ -212,6 +214,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== secret_values ==="
 	@$(MAKE) plan-secret-values
+	@echo ""
+	@echo "=== nested_write_only ==="
+	@$(MAKE) plan-nested-write-only
 	@echo ""
 	@echo "=== moved_with_changes ==="
 	@$(MAKE) plan-moved-with-changes
@@ -350,7 +355,7 @@ plan-multi-instance-module:
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
-        plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
+        plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-nested-write-only plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \

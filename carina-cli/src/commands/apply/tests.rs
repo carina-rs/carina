@@ -5732,6 +5732,10 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
 
     // Saved attrs: same as current (from previous apply)
     let saved: HashMap<String, Value> = current.attributes.clone();
+    let saved = carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
+        [(resource.id.clone(), saved)],
+    ))
+    .lift(&SchemaRegistry::new());
 
     // Previous explicit tree: what the user wrote on first apply
     let prev_explicit = carina_core::explicit::ExplicitFields::Struct {
@@ -5750,7 +5754,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     let d = diff(
         &ResolvedResource::new(resource),
         &current,
-        Some(&saved),
+        &saved,
         Some(&prev_explicit),
         Some(&schema),
     );

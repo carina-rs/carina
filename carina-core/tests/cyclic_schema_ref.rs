@@ -153,11 +153,13 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     let mut current_attrs = HashMap::new();
     current_attrs.insert("rules".to_string(), rules_value);
     let current = State::existing(id.clone(), current_attrs);
+    let saved = carina_core::provider::RawSavedAttrs::default()
+        .lift(&carina_core::schema::SchemaRegistry::new());
 
     let d = diff(
         &ResolvedResource::new(desired),
         &current,
-        None,
+        &saved,
         None,
         Some(&schema),
     );
@@ -185,11 +187,13 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 2)])),
     );
     let current = State::existing(id.clone(), current_attrs);
+    let saved = carina_core::provider::RawSavedAttrs::default()
+        .lift(&carina_core::schema::SchemaRegistry::new());
 
     let d = diff(
         &ResolvedResource::new(desired),
         &current,
-        None,
+        &saved,
         None,
         Some(&schema),
     );

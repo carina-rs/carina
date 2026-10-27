@@ -106,6 +106,90 @@ fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
 }
 
 #[test]
+fn v17_migrates_nested_write_only_records_to_empty() {
+    let json = serde_json::json!({
+        "version": 17,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "v17-lineage",
+        "carina_version": "legacy",
+        "resources": [
+            {
+                "resource_type": "test.Resource",
+                "identity": "example",
+                "provider": "mock",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "cloud-id",
+                    "attributes": { "name": "example" }
+                }
+            },
+            {
+                "resource_type": "test.Resource",
+                "identity": "legacy",
+                "provider": "mock",
+                "current": {
+                    "kind": "missing_identifier",
+                    "attributes": { "name": "legacy" }
+                }
+            }
+        ],
+        "exports": {}
+    });
+
+    let migrated = check_and_migrate(&json.to_string()).expect("v17 state must migrate");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo {
+            from: 17,
+            to: StateFile::CURRENT_VERSION,
+        })
+    );
+    let state = migrated.into_state();
+    assert!(state.resources()[0].nested_write_only().is_empty());
+    assert!(state.resources()[1].nested_write_only().is_empty());
+    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
+    assert_eq!(
+        encoded["resources"][0]["current"]["nested_write_only"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        encoded["resources"][1]["current"]["nested_write_only"],
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn v18_applied_row_without_nested_write_only_is_rejected() {
+    let json = serde_json::json!({
+        "version": 18,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "v18-lineage",
+        "carina_version": "current",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "example",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "cloud-id",
+                "attributes": { "name": "example" }
+            }
+        }],
+        "exports": {}
+    });
+
+    let error = check_and_migrate(&json.to_string())
+        .expect_err("v18 must require explicit nested write-only provenance");
+
+    assert!(
+        error.to_string().contains("nested_write_only"),
+        "decode error must name the missing required field: {error}"
+    );
+}
+
+#[test]
 fn v15_in_flight_row_has_stable_golden_serialization() {
     let json = serde_json::json!({
         "version": 15,
@@ -180,6 +264,7 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
         identifier,
         attributes,
         write_only_attributes,
+        nested_write_only,
         partial_read,
     } = state.resources()[0].current()
     else {
@@ -188,6 +273,7 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
     assert_eq!(identifier.as_str(), "cloud-id");
     assert!(attributes.contains_key("password"));
     assert_eq!(write_only_attributes, &["password"]);
+    assert!(nested_write_only.is_empty());
     assert!(partial_read.is_some());
     assert_eq!(state.resources()[0].deposed.len(), 1);
 }
@@ -372,7 +458,7 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 17);
+    assert_eq!(StateFile::CURRENT_VERSION, 18);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -382,7 +468,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 17);
+    assert_eq!(StateFile::CURRENT_VERSION, 18);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -1000,7 +1086,8 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "current": {
                     "kind": "applied",
                     "identifier": "legacy-id",
-                    "attributes": {}
+                    "attributes": {},
+                    "nested_write_only": {}
                 },
                 "name_overrides": {
                     "name": "legacy-temp"
@@ -1013,7 +1100,8 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "current": {
                     "kind": "applied",
                     "identifier": "current-id",
-                    "attributes": {}
+                    "attributes": {},
+                    "nested_write_only": {}
                 },
                 "name_overrides": {
                     "name": {
@@ -1045,7 +1133,8 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
                 "current": {
                     "kind": "applied",
                     "identifier": "current-id",
-                    "attributes": {}
+                    "attributes": {},
+                    "nested_write_only": {}
                 },
                 "name_overrides": {
                     "name": {
@@ -1190,7 +1279,8 @@ fn test_resource_state_serialization_with_binding_and_deps() {
         "provider": "aws",
         "current": {
             "kind": "missing_identifier",
-            "attributes": {"region": "ap-northeast-1"}
+            "attributes": {"region": "ap-northeast-1"},
+            "nested_write_only": {}
         },
         "protected": false,
         "directives": {},
@@ -1219,7 +1309,8 @@ fn test_resource_state_deserialization_without_v3_fields() {
         "provider": "aws",
         "current": {
             "kind": "missing_identifier",
-            "attributes": {"region": "ap-northeast-1"}
+            "attributes": {"region": "ap-northeast-1"},
+            "nested_write_only": {}
         },
         "protected": false,
         "directives": {},
@@ -1243,7 +1334,8 @@ fn resource_state_name_overrides_migrates_from_v7_bare_string() {
         "provider": "aws",
         "current": {
             "kind": "missing_identifier",
-            "attributes": {"bucket": "old-name"}
+            "attributes": {"bucket": "old-name"},
+            "nested_write_only": {}
         },
         "protected": false,
         "directives": {},
@@ -1556,13 +1648,15 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
 
     let mut state = StateFile::new();
     state.upsert_resource(row).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     let stored = state.find_resource_for_id(&resource.id).unwrap();
     assert!(matches!(
         diff(
             &resolved(&resource),
             &provider_state,
-            saved.get(&resource.id),
+            &saved,
             Some(&stored.explicit),
             Some(&schema),
         ),
@@ -1580,7 +1674,7 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
     } = diff(
         &removed_name,
         &provider_state,
-        saved.get(&resource.id),
+        &saved,
         Some(&stored.explicit),
         Some(&schema),
     )
@@ -1822,12 +1916,14 @@ fn carried_top_level_unrecorded_child_still_plans_its_removal() {
 
     let mut state = StateFile::new();
     state.upsert_resource(carried.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &provider_state,
-            saved.get(&desired.id),
+            &saved,
             Some(&carried.explicit),
             None,
         ),
@@ -1859,12 +1955,14 @@ fn carried_list_pending_removal_transfers_across_unique_reorder() {
 
     let mut state = StateFile::new();
     state.upsert_resource(carried).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &fresh,
-            saved.get(&desired.id),
+            &saved,
             Some(&explicit),
             None,
         ),
@@ -1983,12 +2081,14 @@ fn carried_ambiguous_heterogeneous_removal_retries_the_whole_list() {
     let explicit = carried.explicit.clone();
     let mut state = StateFile::new();
     state.upsert_resource(carried).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &fresh,
-            saved.get(&desired.id),
+            &saved,
             Some(&explicit),
             None,
         ),
@@ -2080,12 +2180,14 @@ fn carried_converged_duplicate_elements_stay_aligned_across_refresh() {
 
     let mut state = StateFile::new();
     state.upsert_resource(second_refresh.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &fresh,
-            saved.get(&desired.id),
+            &saved,
             Some(&second_refresh.explicit),
             None,
         ),
@@ -2177,12 +2279,14 @@ fn carried_whole_value_keeps_remaining_pending_removal_after_partial_success() {
     let explicit = carried.explicit.clone();
     let mut state = StateFile::new();
     state.upsert_resource(carried).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &partially_updated,
-            saved.get(&desired.id),
+            &saved,
             Some(&explicit),
             None,
         ),
@@ -2288,12 +2392,14 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
     let explicit = refreshed.explicit.clone();
     let mut state = StateFile::new();
     state.upsert_resource(refreshed.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&applied),
             &provider,
-            saved.get(&applied.id),
+            &saved,
             Some(&explicit),
             Some(&schema),
         ),
@@ -2320,12 +2426,14 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
 
     let mut state = StateFile::new();
     state.upsert_resource(applied_row.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&applied),
             &provider,
-            saved.get(&applied.id),
+            &saved,
             Some(&applied_row.explicit),
             Some(&schema),
         ),
@@ -2413,12 +2521,14 @@ fn carried_legacy_list_mixed_refresh_rebuilds_alignment_and_plans_clean() {
 
     let mut state = StateFile::new();
     state.upsert_resource(refreshed.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &provider,
-            saved.get(&desired.id),
+            &saved,
             Some(&refreshed.explicit),
             Some(&schema),
         ),
@@ -2557,12 +2667,14 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
         "a current-version empty authored set must round-trip without becoming Unrecorded"
     );
 
-    let saved = reloaded.build_saved_attrs();
+    let saved = reloaded
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&resource),
             &provider_state,
-            saved.get(&resource.id),
+            &saved,
             Some(&reloaded_row.explicit),
             Some(&schema),
         ),
@@ -2572,7 +2684,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
         diff(
             &resolved(&resource),
             &provider_state,
-            saved.get(&resource.id),
+            &saved,
             Some(&ExplicitFields::Unrecorded),
             Some(&schema),
         ),
@@ -2668,7 +2780,9 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
 
     let mut state = StateFile::new();
     state.upsert_resource(row.clone()).unwrap();
-    let saved = state.build_saved_attrs();
+    let saved = state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     let reauthored = Resource::with_provider("mock", "listener.Listener", "listener", None)
         .with_attribute(
             "rules",
@@ -2681,7 +2795,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         diff(
             &resolved(&reauthored),
             &reordered_provider,
-            saved.get(&resource.id),
+            &saved,
             Some(&row.explicit),
             None,
         ),
@@ -3761,7 +3875,8 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
             "provider": "mock",
             "current": {
                 "kind": "missing_identifier",
-                "attributes": { "name": "legacy" }
+                "attributes": { "name": "legacy" },
+                "nested_write_only": {}
             }
         }],
         "exports": {}
@@ -4241,7 +4356,8 @@ fn current_state_rejects_unknown_reserved_payloads_in_attributes_and_exports() {
         "current": {
             "kind": "applied",
             "identifier": "current-id",
-            "attributes": {"bad": invalid.clone()}
+            "attributes": {"bad": invalid.clone()},
+            "nested_write_only": {}
         },
     }]);
 
@@ -4276,7 +4392,8 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
             "current": {
                 "kind": "applied",
                 "identifier": "current-id",
-                "attributes": {"event_pattern": {"$foo": 1}}
+                "attributes": {"event_pattern": {"$foo": 1}},
+                "nested_write_only": {}
             },
         }],
         "exports": {},
@@ -4378,7 +4495,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 17);
+    assert_eq!(StateFile::CURRENT_VERSION, 18);
     let json = format!(
         r#"{{
         "version": 11,
@@ -4655,7 +4772,8 @@ fn persisted_resource(provider: &str, resource_type: &str, identity: &str) -> se
         "current": {
             "kind": "applied",
             "identifier": format!("{provider}-{resource_type}-{identity}"),
-            "attributes": {}
+            "attributes": {},
+            "nested_write_only": {}
         }
     })
 }
@@ -5955,6 +6073,456 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
     );
 }
 
+fn nested_write_only_state_fixture(
+    secret: &str,
+) -> (carina_core::resource::Resource, ResourceSchema) {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "issuer".to_string(),
+            Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+        ),
+        (
+            "client_secret".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(secret.into()),
+            )))),
+        ),
+    ])));
+    let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
+        .with_attribute("config", config);
+    let schema = ResourceSchema::new("test.Resource").attribute(AttributeSchema::new(
+        "config",
+        AttributeType::struct_(
+            "Config",
+            vec![
+                StructField::new("issuer", AttributeType::string()),
+                StructField::new("client_secret", AttributeType::string()).write_only(),
+            ],
+        ),
+    ));
+    (resource, schema)
+}
+
+#[test]
+fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove() {
+    use carina_core::resource::State as ProviderState;
+
+    let provider_state = |resource: &carina_core::resource::Resource| {
+        ProviderState::existing(
+            resource.id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "issuer".to_string(),
+                    Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+                )]))),
+            )]),
+        )
+        .with_identifier("resource-id")
+    };
+
+    // Add: a sent attribute without prior leaf provenance establishes it.
+    let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
+    let add = AcceptedRequest::update_for_test(&["config"], &[]);
+    let added = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&added_resource),
+        &provider_state(&added_resource),
+        None,
+        Some(&schema),
+        RowBasis::Applied(&add),
+        None,
+    )
+    .expect("sent nested write-only attribute records provenance");
+    let added_leaves = added
+        .nested_write_only()
+        .get("config")
+        .expect("config provenance exists");
+    assert_eq!(added_leaves.len(), 1);
+    assert!(
+        added_leaves[0]
+            .1
+            .as_json()
+            .get(carina_core::value::PERSISTED_SECRET_KEY)
+            .is_some(),
+        "nested secret must be stored as an opaque hash"
+    );
+    assert!(
+        !serde_json::to_string(&added)
+            .unwrap()
+            .contains("add-secret")
+    );
+
+    // Replace and Reassert both arrive at state writeback as a sent key. A
+    // replacement rotates the recorded hash; a reassert preserves it.
+    let (replaced_resource, _) = nested_write_only_state_fixture("replace-secret");
+    let replace = AcceptedRequest::update_for_test(&["config"], &[]);
+    let replaced = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&replaced_resource),
+        &provider_state(&replaced_resource),
+        Some(&added),
+        Some(&schema),
+        RowBasis::Applied(&replace),
+        None,
+    )
+    .expect("replace refreshes nested write-only provenance");
+    assert_ne!(
+        added.nested_write_only().get("config"),
+        replaced.nested_write_only().get("config")
+    );
+
+    let reassert = AcceptedRequest::update_for_test(&["config"], &[]);
+    let reasserted = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&replaced_resource),
+        &provider_state(&replaced_resource),
+        Some(&replaced),
+        Some(&schema),
+        RowBasis::Applied(&reassert),
+        None,
+    )
+    .expect("reassert refreshes nested write-only provenance");
+    assert_eq!(
+        replaced.nested_write_only().get("config"),
+        reasserted.nested_write_only().get("config")
+    );
+
+    let removed_resource =
+        carina_core::resource::Resource::with_provider("mock", "test.Resource", "nested", None);
+    let remove = AcceptedRequest::update_for_test(&[], &["config"]);
+    let removed = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&removed_resource),
+        &ProviderState::existing(removed_resource.id.clone(), HashMap::new())
+            .with_identifier("resource-id"),
+        Some(&reasserted),
+        Some(&schema),
+        RowBasis::Applied(&remove),
+        None,
+    )
+    .expect("remove clears nested write-only provenance");
+    assert!(removed.nested_write_only().get("config").is_none());
+}
+
+#[test]
+fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let config = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([
+            (
+                "issuer".to_string(),
+                Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+            ),
+            (
+                "client_secret".to_string(),
+                Value::Concrete(ConcreteValue::String("wrapped-secret".into())),
+            ),
+        ])),
+    ))));
+    let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
+        .with_attribute("config", config);
+    let schema = ResourceSchema::new("test.Resource").attribute(AttributeSchema::new(
+        "config",
+        AttributeType::struct_(
+            "Config",
+            vec![
+                StructField::new("issuer", AttributeType::string()),
+                StructField::new("client_secret", AttributeType::string()).write_only(),
+            ],
+        ),
+    ));
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "config".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "issuer".to_string(),
+                Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+            )]))),
+        )]),
+    )
+    .with_identifier("resource-id");
+    let accepted = AcceptedRequest::update_for_test(&["config"], &[]);
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        None,
+        Some(&schema),
+        RowBasis::Applied(&accepted),
+        None,
+    )
+    .expect("secret-wrapped nested write-only leaf is persistable");
+
+    let leaves = row
+        .nested_write_only()
+        .get("config")
+        .expect("config provenance exists");
+    assert_eq!(leaves.len(), 1);
+    assert!(
+        leaves[0]
+            .1
+            .as_json()
+            .get(carina_core::value::PERSISTED_SECRET_KEY)
+            .is_some(),
+        "the leaf inherited from a secret wrapper must be hashed"
+    );
+    assert!(
+        !serde_json::to_string(&row)
+            .unwrap()
+            .contains("wrapped-secret")
+    );
+}
+
+#[test]
+fn resumed_persisted_create_records_nested_write_only_sent_values() {
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateAttempt, Observation, ObservedCreate, PendingToken,
+        PersistedAttributes, ReadOutcome, Sent,
+    };
+
+    let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
+    let identifier = AppliedIdentifier::new("resource-id").unwrap();
+    let sent_config = PersistedValue::encode_desired_value(
+        resource
+            .attributes
+            .get("config")
+            .expect("fixture has a sent config"),
+        None,
+    )
+    .unwrap();
+    let sent_secrets = PersistedAttributes::from_persisted_values(HashMap::from([(
+        "config".to_string(),
+        sent_config,
+    )]))
+    .unwrap();
+    let pending = CreateAttempt::for_test(resource.id.clone())
+        .issued(identifier.clone(), Sent::AllRequestAttributes)
+        .pending(PendingToken::new("resume-token"), 1)
+        .persist(PersistedAttributes::default(), sent_secrets);
+    let observed_state = AppliedState::new(
+        resource.id.clone(),
+        identifier.as_str(),
+        HashMap::from([(
+            "config".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "issuer".to_string(),
+                Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+            )]))),
+        )]),
+    )
+    .unwrap();
+    let created = ObservedCreate::from_in_flight_for_test(
+        pending,
+        identifier,
+        Observation::Read(ReadOutcome::found(observed_state)),
+    );
+
+    let row =
+        ResourceState::from_observation(&resolved(&resource), &created, None, Some(&schema), None)
+            .expect("resumed create observation must be persistable");
+
+    let leaves = row
+        .nested_write_only()
+        .get("config")
+        .expect("persisted sent envelope must establish nested provenance");
+    assert_eq!(leaves.len(), 1);
+    assert!(
+        leaves[0]
+            .1
+            .as_json()
+            .get(carina_core::value::PERSISTED_SECRET_KEY)
+            .is_some(),
+        "the resumed sent secret must remain hashed"
+    );
+}
+
+#[test]
+fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
+    use carina_core::differ::{Diff, diff};
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateFailureKind, Observation,
+        ObservedCreate, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
+    };
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
+
+    let issuer = || Value::Concrete(ConcreteValue::String("https://issuer.example.com".into()));
+    let action = |config| {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "authenticate_oidc_config".to_string(),
+                config,
+            )])),
+        )]))
+    };
+    let secret = |value| Value::Deferred(DeferredValue::Secret(Box::new(value)));
+
+    for (persisted_envelope, wrap_default_actions) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("issuer".to_string(), issuer()),
+            (
+                "client_secret".to_string(),
+                Value::Concrete(ConcreteValue::String("accepted-secret".into())),
+            ),
+        ])));
+        let desired_actions = if wrap_default_actions {
+            secret(action(desired_config))
+        } else {
+            action(secret(desired_config))
+        };
+        let wrapper = if wrap_default_actions {
+            "wrapped-actions"
+        } else {
+            "wrapped-config"
+        };
+        let identity = match (persisted_envelope, wrap_default_actions) {
+            (false, false) => "request-wrapped-config",
+            (false, true) => "request-wrapped-actions",
+            (true, false) => "persisted-wrapped-config",
+            (true, true) => "persisted-wrapped-actions",
+        };
+        let resource =
+            Resource::with_provider("mock", "elasticloadbalancingv2.Listener", identity, None)
+                .with_attribute("default_actions", desired_actions);
+        let schema = ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(
+            AttributeSchema::new(
+                "default_actions",
+                AttributeType::list(AttributeType::struct_(
+                    "Action",
+                    vec![StructField::new(
+                        "authenticate_oidc_config",
+                        AttributeType::struct_(
+                            "AuthenticateOidcConfig",
+                            vec![
+                                StructField::new("issuer", AttributeType::string()),
+                                StructField::new("client_secret", AttributeType::string())
+                                    .write_only(),
+                            ],
+                        ),
+                    )],
+                )),
+            )
+            .create_only(),
+        );
+        let identifier = AppliedIdentifier::new(format!("{identity}-id")).unwrap();
+        let observed_actions = action(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "issuer".to_string(),
+            issuer(),
+        )]))));
+        let observation = || {
+            let observed_state = AppliedState::new(
+                resource.id.clone(),
+                identifier.as_str(),
+                HashMap::from([("default_actions".to_string(), observed_actions.clone())]),
+            )
+            .unwrap();
+            Observation::Read(ReadOutcome::found(observed_state))
+        };
+        let created = if persisted_envelope {
+            let sent_actions = PersistedValue::encode_desired_value(
+                resource
+                    .attributes
+                    .get("default_actions")
+                    .expect("fixture has sent default actions"),
+                None,
+            )
+            .unwrap();
+            let sent_secrets = PersistedAttributes::from_persisted_values(HashMap::from([(
+                "default_actions".to_string(),
+                sent_actions,
+            )]))
+            .unwrap();
+            let pending = CreateAttempt::for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
+                .persist(PersistedAttributes::default(), sent_secrets);
+            ObservedCreate::from_in_flight_for_test(pending, identifier.clone(), observation())
+        } else {
+            let failed = CreateAttempt::for_test(resource.id.clone())
+                .issued(identifier.clone(), Sent::AllRequestAttributes)
+                .failed(
+                    observation(),
+                    ProviderError::internal("synthetic post-create finishing failure"),
+                );
+            match failed.into_kind() {
+                CreateFailureKind::Created {
+                    created,
+                    error: _error,
+                } => created,
+                CreateFailureKind::Untracked(error) => {
+                    panic!("expected an observed create, got untracked failure: {error}")
+                }
+                CreateFailureKind::InFlight {
+                    pending: _pending,
+                    error,
+                } => panic!("expected an observed create, got in-flight failure: {error}"),
+            }
+        };
+
+        let row = ResourceState::from_observation(
+            &resolved(&resource),
+            &created,
+            None,
+            Some(&schema),
+            None,
+        )
+        .expect("observed create must be persistable");
+        let leaves = row
+            .nested_write_only()
+            .get("default_actions")
+            .expect("sent bearing attribute must have a provenance entry");
+        assert_eq!(
+            leaves.len(),
+            1,
+            "ancestor secret wrapper must not hide its write-only leaf"
+        );
+        assert!(
+            leaves[0]
+                .1
+                .as_json()
+                .get(carina_core::value::PERSISTED_SECRET_KEY)
+                .is_some(),
+            "the projected client secret must be hashed"
+        );
+
+        let current = State::existing(
+            resource.id.clone(),
+            row.persisted_attributes()
+                .expect("observed create has stored attributes")
+                .to_values(),
+        )
+        .with_identifier(identifier.as_str());
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(row.clone())
+            .expect("observed row has a unique address");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", schema.clone());
+        let saved = state_file.build_saved_attrs().lift(&schemas);
+
+        assert!(
+            matches!(
+                diff(
+                    &resolved(&resource),
+                    &current,
+                    &saved,
+                    Some(&row.explicit),
+                    Some(&schema),
+                ),
+                Diff::NoChange(_)
+            ),
+            "the next plan must converge instead of replacing the create-only bearing attribute"
+        );
+    }
+}
+
 #[test]
 fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     use carina_core::resource::Resource;
@@ -6976,11 +7544,19 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     )]);
     let current = State::existing(desired.id.clone(), current_attributes.clone())
         .with_identifier("listener-id");
+    let persisted =
+        PersistedAttributes::from_typed_persisted_wire_values(current_attributes.clone())
+            .expect("fixture attributes are persistable");
+    let saved = RawSavedAttrs::from_persisted(
+        HashMap::from([(desired.id.clone(), persisted)]),
+        HashMap::new(),
+    )
+    .lift(&carina_core::schema::SchemaRegistry::new());
     assert!(matches!(
         diff(
             &resolved(&desired),
             &current,
-            Some(&current_attributes),
+            &saved,
             Some(&legacy_explicit),
             None,
         ),
@@ -7056,7 +7632,9 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
 
     let mut first_state = StateFile::new();
     first_state.upsert_resource(first_row.clone()).unwrap();
-    let saved = first_state.build_saved_attrs();
+    let saved = first_state
+        .build_saved_attrs()
+        .lift(&carina_core::schema::SchemaRegistry::new());
     let removed = Resource::with_provider("mock", "listener.Listener", "listener", None)
         .with_attribute(
             "rules",
@@ -7068,7 +7646,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     let removal = diff(
         &resolved(&removed),
         &first_provider,
-        saved.get(&authored.id),
+        &saved,
         Some(&first_row.explicit),
         None,
     );
@@ -7116,7 +7694,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
         diff(
             &resolved(&removed),
             &expected_effective,
-            saved.get(&authored.id),
+            &saved,
             Some(&first_row.explicit),
             None,
         ),

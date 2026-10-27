@@ -1994,11 +1994,13 @@ mod apply_state_save_tests {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => {
                 assert_eq!(identifier.as_str(), expected_identifier);
                 assert!(!attributes.is_empty());
                 assert!(write_only_attributes.is_empty());
+                assert!(nested_write_only.is_empty());
                 assert!(partial_read.is_none());
             }
             CurrentInstance::None => panic!("expected an applied current instance, got none"),
@@ -2010,9 +2012,10 @@ mod apply_state_save_tests {
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => panic!(
-                "expected applied current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+                "expected applied current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})"
             ),
         }
     }
@@ -2032,17 +2035,19 @@ mod apply_state_save_tests {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => panic!(
-                "expected in-flight current, got applied {} ({attributes:?}, {write_only_attributes:?}, {partial_read:?})",
+                "expected in-flight current, got applied {} ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})",
                 identifier.as_str()
             ),
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => panic!(
-                "expected in-flight current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+                "expected in-flight current, got identifierless state ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})"
             ),
         }
     }
@@ -2054,9 +2059,10 @@ mod apply_state_save_tests {
                 identifier,
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => panic!(
-                "expected no current instance, got applied {} ({attributes:?}, {write_only_attributes:?}, {partial_read:?})",
+                "expected no current instance, got applied {} ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})",
                 identifier.as_str()
             ),
             CurrentInstance::CreateInFlight { pending } => panic!(
@@ -2067,9 +2073,10 @@ mod apply_state_save_tests {
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
+                nested_write_only,
                 partial_read,
             } => panic!(
-                "expected no current instance, got identifierless state ({attributes:?}, {write_only_attributes:?}, {partial_read:?})"
+                "expected no current instance, got identifierless state ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})"
             ),
         }
     }

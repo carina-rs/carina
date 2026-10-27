@@ -79,6 +79,44 @@ fn struct_field_conflicting_input_mode_read_only_then_required_is_rejected() {
 }
 
 #[test]
+fn struct_field_write_only_builder_allows_required_input() {
+    let field = StructField::new("client_secret", AttributeType::string())
+        .required()
+        .write_only();
+
+    assert!(field.is_required());
+    assert!(field.write_only);
+}
+
+#[test]
+#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
+fn struct_field_conflicting_write_only_then_read_only_is_rejected() {
+    let _ = StructField::new("client_secret", AttributeType::string())
+        .write_only()
+        .read_only();
+}
+
+#[test]
+#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
+fn struct_field_conflicting_read_only_then_write_only_is_rejected() {
+    let _ = StructField::new("client_secret", AttributeType::string())
+        .read_only()
+        .write_only();
+}
+
+#[test]
+#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
+fn resource_schema_rejects_mutated_read_only_write_only_struct_field() {
+    let mut field = StructField::new("client_secret", AttributeType::string()).read_only();
+    field.write_only = true;
+
+    let _ = ResourceSchema::new("listener").attribute(AttributeSchema::new(
+        "authenticate_oidc_config",
+        AttributeType::struct_("AuthenticateOidcConfig", vec![field]),
+    ));
+}
+
+#[test]
 #[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
 fn attribute_schema_conflicting_input_mode_required_then_read_only_is_rejected() {
     let _ = AttributeSchema::new("arn", AttributeType::string())
@@ -104,6 +142,168 @@ fn attribute_schema_write_only_default_false() {
 fn attribute_schema_write_only_builder() {
     let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only();
     assert!(attr.write_only);
+}
+
+#[test]
+#[should_panic(expected = "top-level attribute cannot be both write-only and write-only-bearing")]
+fn top_level_write_only_attribute_cannot_also_bear_write_only_fields() {
+    let _ = ResourceSchema::new("listener").attribute(
+        AttributeSchema::new(
+            "default_actions",
+            AttributeType::struct_(
+                "Action",
+                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
+            ),
+        )
+        .write_only(),
+    );
+}
+
+#[test]
+fn first_write_only_conflict_reports_lexicographically_first_attribute() {
+    for _ in 0..8 {
+        let mut schema = ResourceSchema::new("listener");
+        for index in 0..32 {
+            let name = format!("conflict_{index:02}");
+            schema.attributes.insert(
+                name.clone(),
+                AttributeSchema::new(
+                    name,
+                    AttributeType::struct_(
+                        "Action",
+                        vec![
+                            StructField::new("client_secret", AttributeType::string()).write_only(),
+                        ],
+                    ),
+                )
+                .write_only(),
+            );
+        }
+
+        assert_eq!(
+            schema
+                .first_write_only_conflict()
+                .expect("the fixture contains conflicts")
+                .attribute(),
+            "conflict_00"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "union members cannot be write-only-bearing")]
+fn union_member_cannot_bear_write_only_fields() {
+    let _ = ResourceSchema::new("listener").attribute(AttributeSchema::new(
+        "authentication",
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::struct_(
+                "OidcConfig",
+                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
+            ),
+        ]),
+    ));
+}
+
+#[test]
+fn write_only_bearing_and_projection_walk_ref_list_and_map() {
+    let schema = ResourceSchema::new("listener")
+        .with_def(
+            "OidcConfig",
+            AttributeType::struct_(
+                "OidcConfig",
+                vec![
+                    StructField::new("issuer", AttributeType::string()),
+                    StructField::new("client_secret", AttributeType::string()).write_only(),
+                ],
+            ),
+        )
+        .attribute(AttributeSchema::new(
+            "configs",
+            AttributeType::map(AttributeType::list(AttributeType::ref_("OidcConfig"))),
+        ));
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "primary".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "issuer".to_string(),
+                    Value::Concrete(ConcreteValue::String("https://one.example".into())),
+                ),
+                (
+                    "client_secret".to_string(),
+                    Value::Concrete(ConcreteValue::String("secret-one".into())),
+                ),
+            ]))),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "issuer".to_string(),
+                    Value::Concrete(ConcreteValue::String("https://two.example".into())),
+                ),
+                (
+                    "client_secret".to_string(),
+                    Value::Concrete(ConcreteValue::String("secret-two".into())),
+                ),
+            ]))),
+        ])),
+    )])));
+
+    assert!(schema.write_only_bearing("configs"));
+    assert!(!schema.write_only_bearing("missing"));
+
+    let projected = schema.write_only_leaf_projection("configs", &value);
+    let paths = projected
+        .iter()
+        .map(|(path, _value, _field_type)| path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            LeafPath::from_segments([
+                LeafPathSegment::MapKey("primary".to_string()),
+                LeafPathSegment::ListIndex(0),
+                LeafPathSegment::StructField("client_secret".to_string()),
+            ]),
+            LeafPath::from_segments([
+                LeafPathSegment::MapKey("primary".to_string()),
+                LeafPathSegment::ListIndex(1),
+                LeafPathSegment::StructField("client_secret".to_string()),
+            ]),
+        ]
+    );
+}
+
+#[test]
+fn write_only_walkers_treat_dangling_refs_as_opaque() {
+    let schema = ResourceSchema::new("listener").attribute(AttributeSchema::new(
+        "config",
+        AttributeType::struct_(
+            "Config",
+            vec![
+                StructField::new("opaque", AttributeType::ref_("Missing")),
+                StructField::new("client_secret", AttributeType::string()).write_only(),
+            ],
+        ),
+    ));
+    let read_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "opaque".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "provider_field".to_string(),
+            Value::Concrete(ConcreteValue::String("preserved".into())),
+        )]))),
+    )])));
+
+    assert!(
+        schema
+            .write_only_leaf_projection("config", &read_value)
+            .is_empty(),
+        "an opaque dangling Ref cannot contribute known write-only leaves"
+    );
+    assert_eq!(
+        schema.strip_write_only_leaves("config", &read_value),
+        read_value,
+        "stripping must preserve the value behind a dangling Ref"
+    );
 }
 
 #[test]

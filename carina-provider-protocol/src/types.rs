@@ -1426,6 +1426,9 @@ pub struct StructField {
     /// Whether this nested field is provider-populated and cannot be assigned.
     #[serde(default)]
     pub read_only: bool,
+    /// Whether this nested field is accepted on write but omitted from reads.
+    /// Required in protocol v12 so host/provider skew fails loudly.
+    pub write_only: bool,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
     pub deferred_populate: bool,
@@ -1782,28 +1785,36 @@ mod tests {
                 block_name: None,
                 provider_name: None,
                 read_only: false,
+                write_only: true,
                 deferred_populate: false,
             }],
         };
 
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
+        let AttributeType::Struct { fields, .. } = &back else {
+            panic!("round-tripped attribute must remain a struct");
+        };
+        assert!(fields[0].write_only);
         assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 
     #[test]
-    fn schema_transport_flags_default_for_legacy_payloads() {
-        let field: StructField = serde_json::from_str(
+    fn struct_field_missing_write_only_is_rejected() {
+        let error = serde_json::from_str::<StructField>(
             r#"{
                 "name":"provider_id",
                 "field_type":{"type":"String"},
                 "required":false
             }"#,
         )
-        .unwrap();
-        assert!(!field.read_only);
-        assert!(!field.deferred_populate);
+        .expect_err("protocol v12 requires write_only on every struct field");
 
+        assert!(error.to_string().contains("missing field `write_only`"));
+    }
+
+    #[test]
+    fn attribute_schema_transport_flags_default_for_legacy_payloads() {
         let attr: AttributeSchema = serde_json::from_str(
             r#"{
                 "name":"status",
@@ -2146,6 +2157,7 @@ mod tests {
                         block_name: None,
                         provider_name: None,
                         read_only: false,
+                        write_only: false,
                         deferred_populate: false,
                     }],
                 },
@@ -2242,6 +2254,7 @@ mod tests {
                         block_name: None,
                         provider_name: None,
                         read_only: false,
+                        write_only: false,
                         deferred_populate: false,
                     }],
                 },
