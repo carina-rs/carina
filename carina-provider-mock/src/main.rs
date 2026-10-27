@@ -320,15 +320,26 @@ impl MockProcessProvider {
             .patch
             .ops
             .iter()
-            .find(|op| op.key == "update_pending_polls")
-            .or_else(|| {
-                request
-                    .patch
-                    .ops
-                    .iter()
-                    .find(|op| op.key == "pending_polls")
+            .find(|op| match op {
+                PatchOp::Add { key, .. }
+                | PatchOp::Replace { key, .. }
+                | PatchOp::Reassert { key, .. }
+                | PatchOp::Remove { key } => key == "update_pending_polls",
             })
-            .and_then(|op| op.value.as_ref())
+            .or_else(|| {
+                request.patch.ops.iter().find(|op| match op {
+                    PatchOp::Add { key, .. }
+                    | PatchOp::Replace { key, .. }
+                    | PatchOp::Reassert { key, .. }
+                    | PatchOp::Remove { key } => key == "pending_polls",
+                })
+            })
+            .and_then(|op| match op {
+                PatchOp::Add { value, .. }
+                | PatchOp::Replace { value, .. }
+                | PatchOp::Reassert { value, .. } => Some(value),
+                PatchOp::Remove { .. } => None,
+            })
             .and_then(|value| match value {
                 Value::Int(value) => u32::try_from(*value).ok(),
                 Value::Bool(_)
@@ -375,15 +386,13 @@ impl MockProcessProvider {
         let mut state = request.state_after_patch();
         let mut applied_op_kinds: Vec<Value> = Vec::with_capacity(request.patch.ops.len());
         for op in &request.patch.ops {
-            applied_op_kinds.push(Value::String(format!(
-                "{}:{}",
-                match op.kind {
-                    PatchOpKind::Add => "add",
-                    PatchOpKind::Replace => "replace",
-                    PatchOpKind::Remove => "remove",
-                },
-                op.key,
-            )));
+            let (kind, key) = match op {
+                PatchOp::Add { key, .. } => ("add", key),
+                PatchOp::Replace { key, .. } => ("replace", key),
+                PatchOp::Reassert { key, .. } => ("reassert", key),
+                PatchOp::Remove { key } => ("remove", key),
+            };
+            applied_op_kinds.push(Value::String(format!("{kind}:{key}")));
         }
         let patch_sentinel = Value::List(applied_op_kinds);
         state.attributes.insert(
@@ -405,20 +414,18 @@ impl MockProcessProvider {
         let mut states = self.states.lock().unwrap();
         let cloud_attributes = states.entry(Self::resource_key(id)).or_default();
         // The fake cloud retains its existing ordinary values and receives
-        // only the user's patch. Never rebuild it from persisted `from` state:
+        // only the checked patch. Never rebuild it from persisted `from` state:
         // that would either send redacted digests to the cloud or discard an
         // entire nested attribute containing an unchanged stored secret.
         for op in &request.patch.ops {
-            match op.kind {
-                PatchOpKind::Add | PatchOpKind::Replace => {
-                    if let Some(value) = &op.value {
-                        cloud_attributes.insert(op.key.clone(), value.clone());
-                    } else {
-                        cloud_attributes.remove(&op.key);
-                    }
+            match op {
+                PatchOp::Add { key, value }
+                | PatchOp::Replace { key, value }
+                | PatchOp::Reassert { key, value } => {
+                    cloud_attributes.insert(key.clone(), value.clone());
                 }
-                PatchOpKind::Remove => {
-                    cloud_attributes.remove(&op.key);
+                PatchOp::Remove { key } => {
+                    cloud_attributes.remove(key);
                 }
             }
         }

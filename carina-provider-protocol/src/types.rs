@@ -770,29 +770,20 @@ pub struct PartialReadDiagnostic {
     pub missing_attributes: Vec<String>,
 }
 
-/// Kind of a single [`PatchOp`]. Mirrors `patch-op-kind` in
-/// `wit/types.wit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PatchOpKind {
-    Add,
-    Replace,
-    Remove,
-}
-
 /// One operation inside an [`UpdatePatch`]. Mirrors `patch-op` in
 /// `wit/types.wit`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PatchOp {
-    pub kind: PatchOpKind,
-    pub key: String,
-    /// `Some(_)` for `Add`/`Replace`; `None` for `Remove`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PatchOp {
+    Add { key: String, value: Value },
+    Replace { key: String, value: Value },
+    Reassert { key: String, value: Value },
+    Remove { key: String },
 }
 
-/// Structured description of the user's intended change to a resource.
-/// Mirrors `update-patch` in `wit/types.wit`.
+/// Structured description of the user's intended change to a resource plus
+/// desired write-only values reasserted alongside that change. Mirrors
+/// `update-patch` in `wit/types.wit`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdatePatch {
     #[serde(default)]
@@ -811,7 +802,8 @@ pub struct CreateRequest {
     pub resource: Resource,
 }
 
-/// Per-operation request record for `update`. Mirrors
+/// Per-operation request record for `update`. The patch contains changed keys
+/// and any desired write-only values that must be reasserted with them. Mirrors
 /// `update-request` in `wit/types.wit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateRequest {
@@ -824,16 +816,14 @@ impl PersistedState {
     /// persisted attribute, including redacted secrets.
     pub fn apply_patch(&mut self, patch: &UpdatePatch) {
         for op in &patch.ops {
-            match op.kind {
-                PatchOpKind::Add | PatchOpKind::Replace => {
-                    if let Some(value) = op.value.clone() {
-                        self.attributes.insert(op.key.clone(), value.into());
-                    } else {
-                        self.attributes.remove(&op.key);
-                    }
+            match op {
+                PatchOp::Add { key, value }
+                | PatchOp::Replace { key, value }
+                | PatchOp::Reassert { key, value } => {
+                    self.attributes.insert(key.clone(), value.clone().into());
                 }
-                PatchOpKind::Remove => {
-                    self.attributes.remove(&op.key);
+                PatchOp::Remove { key } => {
+                    self.attributes.remove(key);
                 }
             }
         }
@@ -1627,10 +1617,9 @@ mod tests {
                 exists: true,
             },
             patch: UpdatePatch {
-                ops: vec![PatchOp {
-                    kind: PatchOpKind::Replace,
+                ops: vec![PatchOp::Replace {
                     key: "color".into(),
-                    value: Some(Value::String("blue".into())),
+                    value: Value::String("blue".into()),
                 }],
             },
         };
@@ -1647,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn update_patch_without_a_value_removes_add_and_replace_targets() {
+    fn update_patch_applies_all_operation_variants() {
         let mut state = PersistedState {
             id: ResourceId {
                 provider: "mock".into(),
@@ -1656,31 +1645,78 @@ mod tests {
             },
             identifier: Some("mock-id".into()),
             attributes: HashMap::from([
-                ("add-target".into(), PersistedValue::String("old".into())),
                 (
                     "replace-target".into(),
                     PersistedValue::String("old".into()),
                 ),
+                (
+                    "reassert-target".into(),
+                    PersistedValue::String("old".into()),
+                ),
+                ("remove-target".into(), PersistedValue::String("old".into())),
             ]),
             exists: true,
         };
         state.apply_patch(&UpdatePatch {
             ops: vec![
-                PatchOp {
-                    kind: PatchOpKind::Add,
+                PatchOp::Add {
                     key: "add-target".into(),
-                    value: None,
+                    value: Value::String("added".into()),
                 },
-                PatchOp {
-                    kind: PatchOpKind::Replace,
+                PatchOp::Replace {
                     key: "replace-target".into(),
-                    value: None,
+                    value: Value::String("replaced".into()),
+                },
+                PatchOp::Reassert {
+                    key: "reassert-target".into(),
+                    value: Value::String("reasserted".into()),
+                },
+                PatchOp::Remove {
+                    key: "remove-target".into(),
                 },
             ],
         });
 
-        assert!(!state.attributes.contains_key("add-target"));
-        assert!(!state.attributes.contains_key("replace-target"));
+        assert_eq!(
+            state.attributes.get("add-target"),
+            Some(&PersistedValue::String("added".into()))
+        );
+        assert_eq!(
+            state.attributes.get("replace-target"),
+            Some(&PersistedValue::String("replaced".into()))
+        );
+        assert_eq!(
+            state.attributes.get("reassert-target"),
+            Some(&PersistedValue::String("reasserted".into()))
+        );
+        assert!(!state.attributes.contains_key("remove-target"));
+    }
+
+    #[test]
+    fn patch_op_serde_round_trips_all_variants() {
+        let operations = [
+            PatchOp::Add {
+                key: "added".into(),
+                value: Value::String("a".into()),
+            },
+            PatchOp::Replace {
+                key: "replaced".into(),
+                value: Value::Int(2),
+            },
+            PatchOp::Reassert {
+                key: "reasserted".into(),
+                value: Value::Bool(true),
+            },
+            PatchOp::Remove {
+                key: "removed".into(),
+            },
+        ];
+
+        for operation in operations {
+            let json = serde_json::to_value(&operation).expect("serialize patch operation");
+            let back: PatchOp = serde_json::from_value(json).expect("deserialize patch operation");
+            assert_eq!(back, operation);
+        }
     }
 
     #[test]

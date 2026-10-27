@@ -3,9 +3,11 @@
 //! ```compile_fail
 //! use carina_core::provider::build_update_patch;
 //! use carina_core::resource::{Resource, State};
+//! use carina_core::schema::ResourceSchema;
 //! let r: Resource = unimplemented!();
 //! let s: State = unimplemented!();
-//! build_update_patch(&[], &r, &s);   // must not compile
+//! let schema = ResourceSchema::new("test");
+//! build_update_patch(&[], &r, &s, &schema);   // must not compile
 //! ```
 //!
 //! ```compile_fail
@@ -26,10 +28,12 @@
 //! ```compile_fail
 //! use carina_core::provider::build_update_patch;
 //! use carina_core::resource::{ResolvedResource, Resource, State};
+//! use carina_core::schema::ResourceSchema;
 //! let resource = Resource::new("test", "example");
 //! let resolved = ResolvedResource::new(resource);
 //! let state: State = unimplemented!();
-//! let _ = build_update_patch(&[], &resolved, &state); // checked witness required
+//! let schema = ResourceSchema::new("test");
+//! let _ = build_update_patch(&[], &resolved, &state, &schema); // checked witness required
 //! ```
 //!
 //! ```compile_fail
@@ -53,14 +57,6 @@
 //! use carina_core::resource::{ResolvedResource, Resource};
 //! let resolved = ResolvedResource::new(Resource::new("test", "example"));
 //! let _: ProviderReadyResource = resolved.into(); // no unchecked conversion
-//! ```
-//!
-//! ```compile_fail
-//! use carina_core::executor::compute_full_diff_patch;
-//! use carina_core::resource::{Resource, State};
-//! let from: State = unimplemented!();
-//! let to: Resource = unimplemented!();
-//! compute_full_diff_patch(&from, &to);   // must not compile: raw Resource has no schema-aware diff
 //! ```
 
 use std::collections::HashMap;

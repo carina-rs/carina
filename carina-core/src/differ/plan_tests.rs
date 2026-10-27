@@ -1152,11 +1152,19 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
     };
 
     assert_eq!(changed_attributes, vec!["distribution_config".to_string()]);
-    let patch =
-        crate::provider::build_update_patch(&changed_attributes, &provider_ready(to), &from);
+    let schema = crate::schema::ResourceSchema::new("awscc.cloudfront.Distribution");
+    let patch = crate::provider::build_update_patch(
+        &changed_attributes,
+        &provider_ready(to),
+        &from,
+        &schema,
+    );
     assert_eq!(patch.ops.len(), 1);
-    assert_eq!(patch.ops[0].kind, crate::provider::PatchOpKind::Replace);
-    let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
+    let crate::provider::PatchOp::Replace {
+        value: Value::Concrete(ConcreteValue::Map(patch_config)),
+        ..
+    } = &patch.ops[0]
+    else {
         panic!("Expected replacement value to be the desired distribution config");
     };
     assert!(
@@ -1446,11 +1454,18 @@ fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
     };
     assert_eq!(changed_attributes, vec!["rules".to_string()]);
 
-    let patch =
-        crate::provider::build_update_patch(&changed_attributes, &provider_ready(to), &from);
+    let schema = crate::schema::ResourceSchema::new("example.Listener");
+    let patch = crate::provider::build_update_patch(
+        &changed_attributes,
+        &provider_ready(to),
+        &from,
+        &schema,
+    );
     assert_eq!(patch.ops.len(), 1);
-    assert_eq!(patch.ops[0].kind, crate::provider::PatchOpKind::Replace);
-    assert_eq!(patch.ops[0].value.as_ref(), Some(&desired_rules));
+    assert!(matches!(
+        &patch.ops[0],
+        crate::provider::PatchOp::Replace { value, .. } if value == &desired_rules
+    ));
 }
 
 #[test]
@@ -1643,8 +1658,13 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     };
     assert_eq!(changed_attributes, &["distribution_config".to_string()]);
     let ready = provider_ready(to.as_resource().clone());
-    let patch = crate::provider::build_update_patch(changed_attributes, &ready, from);
-    let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
+    let schema = crate::schema::ResourceSchema::new("awscc.cloudfront.Distribution");
+    let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema);
+    let crate::provider::PatchOp::Replace {
+        value: Value::Concrete(ConcreteValue::Map(patch_config)),
+        ..
+    } = &patch.ops[0]
+    else {
         panic!("Expected distribution_config replacement value");
     };
     assert!(!patch_config.contains_key("web_acl_id"));

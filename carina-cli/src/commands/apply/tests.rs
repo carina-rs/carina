@@ -3,7 +3,7 @@ use carina_core::binding_index::PreApplyInputs;
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
-    PatchOpKind, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
+    PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
     ReadOutcome, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{
@@ -1670,15 +1670,14 @@ impl Provider for ApplyTimeReadProvider {
 
             let mut attrs = request.from().attributes.clone();
             for op in &request.patch().ops {
-                match op.kind {
-                    PatchOpKind::Add | PatchOpKind::Replace => {
-                        attrs.insert(
-                            op.key.clone(),
-                            op.value.clone().expect("add/replace patch carries a value"),
-                        );
+                match op {
+                    PatchOp::Add { key, value }
+                    | PatchOp::Replace { key, value }
+                    | PatchOp::Reassert { key, value } => {
+                        attrs.insert(key.clone(), value.clone());
                     }
-                    PatchOpKind::Remove => {
-                        attrs.remove(&op.key);
+                    PatchOp::Remove { key } => {
+                        attrs.remove(key);
                     }
                 }
             }

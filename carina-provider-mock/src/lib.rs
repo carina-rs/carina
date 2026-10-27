@@ -11,7 +11,7 @@ use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome,
-    CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOpKind, PendingToken,
+    CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken,
     Provider, ProviderError, ProviderResult, ReadOutcome, ReadRequest, Resume as CoreResume,
     ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent, UpdateOutcome, UpdateRequest,
 };
@@ -1065,14 +1065,14 @@ impl Provider for MockProvider {
             // unspecified fields.
             let mut attributes = request.from().attributes.clone();
             for op in &request.patch().ops {
-                match op.kind {
-                    PatchOpKind::Add | PatchOpKind::Replace => {
-                        if let Some(value) = &op.value {
-                            attributes.insert(op.key.clone(), value.clone());
-                        }
+                match op {
+                    PatchOp::Add { key, value }
+                    | PatchOp::Replace { key, value }
+                    | PatchOp::Reassert { key, value } => {
+                        attributes.insert(key.clone(), value.clone());
                     }
-                    PatchOpKind::Remove => {
-                        attributes.remove(&op.key);
+                    PatchOp::Remove { key } => {
+                        attributes.remove(key);
                     }
                 }
             }
@@ -1950,7 +1950,11 @@ mod tests {
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-            let schemas = carina_core::schema::SchemaRegistry::new();
+            let mut schemas = carina_core::schema::SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                carina_core::schema::ResourceSchema::new("test.resource"),
+            );
             let preparation = carina_core::executor::ProviderPreparationContext::new(
                 &bindings,
                 &module_gate,

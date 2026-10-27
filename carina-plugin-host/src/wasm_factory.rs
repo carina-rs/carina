@@ -5311,7 +5311,7 @@ mod tests {
     };
 
     #[test]
-    fn protocol_v10_wit_surface_compiles() {
+    fn protocol_v11_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::Observation>();

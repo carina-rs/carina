@@ -128,7 +128,17 @@ async fn update_request_for_test(
 ) -> UpdateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert(
+        resource.id.provider.clone(),
+        carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone()).attribute(
+            carina_core::schema::AttributeSchema::new(
+                "reassert_token",
+                carina_core::schema::AttributeType::string(),
+            )
+            .write_only(),
+        ),
+    );
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
@@ -1369,6 +1379,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
             Value::Concrete(ConcreteValue::String("red".into())),
         ),
         ("size".into(), Value::Concrete(ConcreteValue::Int(10))),
+        (
+            "removed".into(),
+            Value::Concrete(ConcreteValue::String("old".into())),
+        ),
+        (
+            "reassert_token".into(),
+            Value::Concrete(ConcreteValue::String("token".into())),
+        ),
     ]);
 
     let created = create_state_for_writeback(
@@ -1382,17 +1400,21 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::Concrete(ConcreteValue::String("red".into())))
     );
 
-    // Prepare the desired resource through the checked core seam. Both ops
-    // become Replace because the attributes exist in `from`.
+    // Prepare all four patch variants through the checked core seam.
     resource.set_attr(
         "color",
         Value::Concrete(ConcreteValue::String("blue".into())),
     );
-    resource.set_attr("size", Value::Concrete(ConcreteValue::Int(20)));
+    resource.attributes.shift_remove("removed");
+    resource.set_attr("added", Value::Concrete(ConcreteValue::Int(20)));
     let request = update_request_for_test(
         resource,
         created.clone(),
-        &["color".to_string(), "size".to_string()],
+        &[
+            "added".to_string(),
+            "color".to_string(),
+            "removed".to_string(),
+        ],
     )
     .await;
 
@@ -1406,8 +1428,13 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::Concrete(ConcreteValue::String("blue".into())))
     );
     assert_eq!(
-        updated.attributes.get("size"),
+        updated.attributes.get("added"),
         Some(&Value::Concrete(ConcreteValue::Int(20)))
+    );
+    assert!(!updated.attributes.contains_key("removed"));
+    assert_eq!(
+        updated.attributes.get("reassert_token"),
+        Some(&Value::Concrete(ConcreteValue::String("token".into())))
     );
     // The mock echoes the applied patch op kinds + keys as a sentinel
     // attribute so we can verify the patch round-tripped through the
@@ -1419,14 +1446,22 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let Value::Concrete(ConcreteValue::List(ops)) = echoed else {
         panic!("__mock_patch_ops__ should be a list, got {echoed:?}");
     };
-    assert_eq!(ops.len(), 2);
+    assert_eq!(ops.len(), 4);
     assert_eq!(
         ops[0],
-        Value::Concrete(ConcreteValue::String("replace:color".into()))
+        Value::Concrete(ConcreteValue::String("add:added".into()))
     );
     assert_eq!(
         ops[1],
-        Value::Concrete(ConcreteValue::String("replace:size".into()))
+        Value::Concrete(ConcreteValue::String("replace:color".into()))
+    );
+    assert_eq!(
+        ops[2],
+        Value::Concrete(ConcreteValue::String("remove:removed".into()))
+    );
+    assert_eq!(
+        ops[3],
+        Value::Concrete(ConcreteValue::String("reassert:reassert_token".into()))
     );
 
     // Read to verify update persisted in memory

@@ -59,6 +59,24 @@ let r1 = mock.test.resource {{
         .expect("write secret configuration");
     }
 
+    fn write_secret_and_comment_config(&self, password: &str, comment: &str) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let r1 = mock.test.resource {{
+  name     = "r1"
+  password = secret("{password}")
+  comment  = "{comment}"
+}}
+"#
+            ),
+        )
+        .expect("write secret and comment configuration");
+    }
+
     fn clear_write_only_metadata(&self) {
         let path = self.project.join("carina.state.json");
         let mut state: serde_json::Value =
@@ -263,6 +281,65 @@ fn adding_and_changing_updatable_write_only_value_converges() {
     assert!(
         unchanged_text.contains("No changes. Infrastructure is up-to-date."),
         "accepted write-only update must converge\nstdout/stderr:\n{unchanged_text}"
+    );
+}
+
+#[test]
+fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
+    let scenario = Scenario::new();
+    scenario.write_secret_and_comment_config("reasserted-secret", "before");
+    assert_success("carina init", &scenario.init());
+    assert_success("initial plan", &scenario.save_plan("initial.json"));
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.write_secret_and_comment_config("reasserted-secret", "after");
+    let update_plan = scenario.save_plan("update-comment.json");
+    assert_success("normal-attribute update plan", &update_plan);
+    let update_plan_text = output_text(&update_plan);
+    assert!(
+        update_plan_text.contains("~ mock.test.resource r1")
+            && update_plan_text.contains("1 to change"),
+        "changing only the normal attribute must plan an update\nstdout/stderr:\n{update_plan_text}"
+    );
+    assert_success(
+        "normal-attribute update apply",
+        &scenario.apply_plan("update-comment.json"),
+    );
+
+    let provider: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&scenario.mock_state).expect("read mock provider state"),
+    )
+    .expect("parse mock provider state");
+    assert_eq!(
+        provider["states"]["test.resource.r1"]["password"],
+        serde_json::json!("reasserted-secret"),
+        "the unchanged write-only secret must be reasserted as provider plaintext, not copied from the redacted current state"
+    );
+    assert_eq!(
+        provider["states"]["test.resource.r1"]["comment"],
+        serde_json::json!("after")
+    );
+
+    let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
+        .expect("read state after reasserting password");
+    let state = check_and_migrate(&state_text)
+        .expect("state after reasserting password must decode")
+        .into_state();
+    let row = state
+        .find_resource("mock", "test.resource", "r1")
+        .expect("r1 state row");
+    assert_eq!(
+        row.write_only_attributes(),
+        ["password"],
+        "accepted update provenance must keep the reasserted key recorded as sent"
+    );
+
+    let converged = scenario.plan_with_refresh();
+    assert_success("plan after reassert update", &converged);
+    let converged_text = output_text(&converged);
+    assert!(
+        converged_text.contains("No changes. Infrastructure is up-to-date."),
+        "the normal update plus write-only reassert must converge\nstdout/stderr:\n{converged_text}"
     );
 }
 

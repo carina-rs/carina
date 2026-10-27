@@ -860,9 +860,13 @@ use crate::provider::ProviderFactory;
 use crate::schema::SchemaRegistry;
 use std::sync::LazyLock;
 
-/// Empty schema registry shared by tests that don't exercise the
+/// Minimal matching schema registry shared by tests that don't exercise the
 /// canonicalize stage. `'static` so it can back `&` in `ExecutionInput`.
-static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(SchemaRegistry::new);
+static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    let mut registry = SchemaRegistry::new();
+    registry.insert("", crate::schema::ResourceSchema::new("test"));
+    registry
+});
 
 static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -2281,10 +2285,12 @@ fn provider_boundary_constraint_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test").attribute(AttributeSchema::new(
-            "target",
-            AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
-        )),
+        ResourceSchema::new("test")
+            .attribute(AttributeSchema::new(
+                "target",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only()),
     );
     schemas
 }
@@ -2560,6 +2566,73 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
 }
 
 #[tokio::test]
+async fn execute_plan_missing_update_schema_fails_before_provider_update() {
+    let provider = MockProvider::new();
+    let mut resource = Resource::with_provider("missing", "missing.resource", "no-schema", None);
+    resource.set_attr(
+        "description",
+        Value::Concrete(ConcreteValue::String("after".into())),
+    );
+    let id = resource.id.clone();
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "description".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("id-123");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("id-123"),
+        from: Box::new(from),
+        to: resolved(resource),
+        changed_attributes: vec!["description".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&id)));
+    let schemas = SchemaRegistry::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    let events = observer.events();
+    assert!(
+        events.iter().any(|event| {
+            event.starts_with(&format!("failed:{id}:"))
+                && event.contains("no managed schema is registered")
+        }),
+        "missing schema must be reported through EffectFailed: {events:?}"
+    );
+    assert!(
+        provider
+            .calls()
+            .iter()
+            .all(|(operation, _)| operation != "update"),
+        "provider update must not run when the managed schema is missing"
+    );
+    assert!(provider.captured_update_requests().is_empty());
+}
+
+#[tokio::test]
 async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let provider = MockProvider::new();
     let mut created = make_resource("valid-create", &[]);
@@ -2570,6 +2643,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let mut updated = make_resource("valid-update", &[]);
     let update_value = Value::Concrete(ConcreteValue::String("good-update".into()));
     updated.set_attr("target", update_value.clone());
+    updated.set_attr(
+        "token",
+        Value::Concrete(ConcreteValue::String("unchanged-token".into())),
+    );
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
@@ -2581,6 +2658,10 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
             (
                 "obsolete".to_string(),
                 Value::Concrete(ConcreteValue::String("remove-me".into())),
+            ),
+            (
+                "token".to_string(),
+                Value::Concrete(ConcreteValue::String("unchanged-token".into())),
             ),
         ]),
     )
@@ -2637,16 +2718,24 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         .patch()
         .ops
         .iter()
-        .find(|op| op.key == "target")
+        .find(|op| op.key() == "target")
         .expect("valid target must remain in the update patch");
-    assert_eq!(target.value.as_ref(), Some(&update_value));
+    assert_eq!(target.sent_value(), Some(&update_value));
+    assert!(
+        requests[0].patch().ops.iter().any(
+            |op| matches!(op, crate::provider::PatchOp::Reassert { key, .. } if key == "token")
+        )
+    );
     let Some(Applied::Complete { request, .. }) = result.applied_states.get(&update_id) else {
         panic!("successful update must publish accepted-request provenance");
     };
     let AcceptedRequestKind::Update { sent, removed } = request.kind() else {
         panic!("update must publish update request provenance");
     };
-    assert_eq!(sent, &BTreeSet::from(["target".to_string()]));
+    assert_eq!(
+        sent,
+        &BTreeSet::from(["target".to_string(), "token".to_string()])
+    );
     assert_eq!(removed, &BTreeSet::from(["obsolete".to_string()]));
 }
 
@@ -5120,11 +5209,11 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         .patch()
         .ops
         .iter()
-        .find(|op| op.key == "ip_protocol")
+        .find(|op| op.key() == "ip_protocol")
         .expect("patch must contain the changed `ip_protocol` attribute");
     assert!(
         matches!(
-            &op.value,
+            op.sent_value(),
             Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
                 if canonical.identity().to_string() == "test.ec2.SecurityGroup.IpProtocol"
                     && canonical.api_value() == "all"
@@ -5247,11 +5336,11 @@ async fn test_apply_renormalizes_update_path() {
         .patch()
         .ops
         .iter()
-        .find(|op| op.key == "marker")
+        .find(|op| op.key() == "marker")
         .expect("patch must contain the changed `marker` attribute");
     assert_eq!(
-        marker_op.value,
-        Some(Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
+        marker_op.sent_value(),
+        Some(&Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
         "Update patch must carry the re-normalized value, not raw DSL"
     );
 }
@@ -5336,12 +5425,12 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         .patch()
         .ops
         .iter()
-        .find(|op| op.key == "tags")
+        .find(|op| op.key() == "tags")
         .expect("patch must contain the changed `tags` attribute");
-    let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.value.as_ref() else {
+    let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.sent_value() else {
         panic!(
             "expected tags Replace value to be a map, got {:?}",
-            tags_op.value
+            tags_op.sent_value()
         );
     };
     assert_eq!(
@@ -5446,7 +5535,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         .patch()
         .ops
         .iter()
-        .map(|op| op.key.as_str())
+        .map(crate::provider::PatchOp::key)
         .collect();
     assert_eq!(patched_keys, vec!["description"]);
 }
@@ -5519,7 +5608,7 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         .patch()
         .ops
         .iter()
-        .map(|op| op.key.as_str())
+        .map(crate::provider::PatchOp::key)
         .collect();
     assert_eq!(
         patched_keys,

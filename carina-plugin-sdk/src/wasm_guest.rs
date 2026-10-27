@@ -1497,12 +1497,24 @@ macro_rules! export_provider {
                 })
             }
 
-            fn wit_to_proto_patch_op_kind(k: wit_types::PatchOpKind) -> proto::PatchOpKind {
-                match k {
-                    wit_types::PatchOpKind::Add => proto::PatchOpKind::Add,
-                    wit_types::PatchOpKind::Replace => proto::PatchOpKind::Replace,
-                    wit_types::PatchOpKind::Remove => proto::PatchOpKind::Remove,
-                }
+            fn wit_to_proto_patch_op(
+                op: wit_types::PatchOp,
+            ) -> Result<proto::PatchOp, helpers::WasmValueDecodeError> {
+                Ok(match op {
+                    wit_types::PatchOp::Add(value) => proto::PatchOp::Add {
+                        key: value.key,
+                        value: wit_to_proto_value(&value.value)?,
+                    },
+                    wit_types::PatchOp::Replace(value) => proto::PatchOp::Replace {
+                        key: value.key,
+                        value: wit_to_proto_value(&value.value)?,
+                    },
+                    wit_types::PatchOp::Reassert(value) => proto::PatchOp::Reassert {
+                        key: value.key,
+                        value: wit_to_proto_value(&value.value)?,
+                    },
+                    wit_types::PatchOp::Remove(key) => proto::PatchOp::Remove { key },
+                })
             }
 
             fn wit_to_proto_update_request(
@@ -1514,13 +1526,7 @@ macro_rules! export_provider {
                     .patch
                     .ops
                     .into_iter()
-                    .map(|op| {
-                        Ok(proto::PatchOp {
-                            kind: wit_to_proto_patch_op_kind(op.kind),
-                            key: op.key,
-                            value: op.value.as_ref().map(wit_to_proto_value).transpose()?,
-                        })
-                    })
+                    .map(wit_to_proto_patch_op)
                     .collect::<Result<Vec<_>, helpers::WasmValueDecodeError>>()?;
                 Ok(proto::UpdateRequest {
                     from,
