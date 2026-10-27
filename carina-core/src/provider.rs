@@ -3,7 +3,7 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use crate::resource::{
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
-use crate::schema::{ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
+use crate::schema::{LeafPath, ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
 };
@@ -717,7 +717,8 @@ impl PatchOp {
 /// - missing from both                     → no operation
 ///
 /// When at least one changed-key operation exists, desired attributes that the
-/// schema marks write-only but not create-only are appended as sorted
+/// schema marks write-only or write-only-bearing, but not create-only, are
+/// appended as sorted
 /// [`PatchOp::Reassert`] operations unless that key is already in the patch.
 ///
 /// ```compile_fail
@@ -768,18 +769,20 @@ pub fn build_update_patch(
         return UpdatePatch { ops };
     }
 
-    let mut reasserts =
-        to.attributes
-            .iter()
-            .filter_map(|(key, value)| {
-                let attribute = schema.attributes.get(key)?;
-                (attribute.write_only && !attribute.create_only && !patched_keys.contains(key))
-                    .then(|| PatchOp::Reassert {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
+    let mut reasserts = to
+        .attributes
+        .iter()
+        .filter_map(|(key, value)| {
+            let attribute = schema.attributes.get(key)?;
+            ((attribute.write_only || schema.write_only_bearing(key))
+                && !attribute.create_only
+                && !patched_keys.contains(key))
+            .then(|| PatchOp::Reassert {
+                key: key.clone(),
+                value: value.clone(),
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
     UpdatePatch { ops }
@@ -1117,6 +1120,70 @@ impl PersistedAttributes {
     }
 }
 
+/// Accepted desired values for nested write-only fields, grouped by their
+/// top-level attribute.
+///
+/// Values stay in the typed persisted encoding so secrets are represented by
+/// hashes and cannot accidentally be decoded as ordinary provider strings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NestedWriteOnlyRecord(BTreeMap<String, Vec<(LeafPath, PersistedValue)>>);
+
+impl NestedWriteOnlyRecord {
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&[(LeafPath, PersistedValue)]> {
+        self.0.get(key).map(Vec::as_slice)
+    }
+
+    /// Replace leaf records for write-only-bearing attributes that were sent
+    /// to the provider. Ordinary keys and absent values are ignored. Taking
+    /// the resource-owned `IndexMap` prevents an encoded persisted envelope
+    /// from being used as the projection source.
+    pub fn record_sent<'key>(
+        &mut self,
+        schema: &ResourceSchema,
+        keys: impl IntoIterator<Item = &'key str>,
+        desired_attributes: &IndexMap<String, Value>,
+        previous: Option<&Self>,
+    ) -> Result<(), SerializationError> {
+        for key in keys {
+            if !schema.write_only_bearing(key) {
+                continue;
+            }
+            let Some(desired) = desired_attributes.get(key) else {
+                continue;
+            };
+            let previous_leaves = previous.and_then(|record| record.get(key));
+            let leaves = schema
+                .write_only_leaf_projection(key, desired)
+                .into_iter()
+                .map(|(path, value, _field_type)| {
+                    let previous_value = previous_leaves.and_then(|leaves| {
+                        leaves
+                            .iter()
+                            .find_map(|(saved_path, saved)| (saved_path == &path).then_some(saved))
+                    });
+                    PersistedValue::encode_provider_value(&value, previous_value)
+                        .map(|value| (path, value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.0.insert(key.to_string(), leaves);
+        }
+        Ok(())
+    }
+
+    pub fn remove_attribute(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretHashShape {
     None,
@@ -1312,31 +1379,42 @@ fn hash_provider_view_as_secret(
 ///
 /// This type cannot be passed to planning or refresh hydration. Consume it
 /// with [`RawSavedAttrs::lift`] to obtain [`LiftedSavedAttrs`].
-/// Arbitrary desired values cannot assert persisted provenance:
+/// Persisted attributes cannot be admitted without their nested write-only
+/// provenance map:
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;
-/// use carina_core::provider::RawSavedAttrs;
-/// use carina_core::resource::{ResourceId, Value};
+/// use carina_core::provider::{PersistedAttributes, RawSavedAttrs};
+/// use carina_core::resource::ResourceId;
 ///
-/// let desired: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
-/// let _saved = RawSavedAttrs::from_persisted(desired);
+/// let persisted: HashMap<ResourceId, PersistedAttributes> = HashMap::new();
+/// let _saved = RawSavedAttrs::from_persisted(persisted);
 /// ```
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct RawSavedAttrs(SavedAttrs);
+pub struct RawSavedAttrs {
+    attributes: SavedAttrs,
+    nested_write_only: HashMap<ResourceId, NestedWriteOnlyRecord>,
+}
 
 impl RawSavedAttrs {
-    /// Collect opaque attribute maps obtained from persisted state rows.
-    pub fn from_persisted(saved_attrs: HashMap<ResourceId, PersistedAttributes>) -> Self {
-        Self(SavedAttrs(
-            saved_attrs
-                .into_iter()
-                .map(|(id, attributes)| {
-                    let values = attributes.to_values();
-                    (id, values)
-                })
-                .collect(),
-        ))
+    /// Collect persisted attributes and their nested write-only provenance as
+    /// one planning input so callers cannot accidentally drop the leaf record.
+    pub fn from_persisted(
+        saved_attrs: HashMap<ResourceId, PersistedAttributes>,
+        nested_write_only: HashMap<ResourceId, NestedWriteOnlyRecord>,
+    ) -> Self {
+        Self {
+            attributes: SavedAttrs(
+                saved_attrs
+                    .into_iter()
+                    .map(|(id, attributes)| {
+                        let values = attributes.to_values();
+                        (id, values)
+                    })
+                    .collect(),
+            ),
+            nested_write_only,
+        }
     }
 
     /// Construct saved attributes directly for tests that exercise invalid
@@ -1346,7 +1424,10 @@ impl RawSavedAttrs {
     pub fn from_decoded_values_for_test(
         saved_attrs: HashMap<ResourceId, HashMap<String, Value>>,
     ) -> Self {
-        Self(SavedAttrs(saved_attrs))
+        Self {
+            attributes: SavedAttrs(saved_attrs),
+            nested_write_only: HashMap::new(),
+        }
     }
 
     /// Lift enum leaves and structurally canonicalize every persisted entry
@@ -1355,13 +1436,16 @@ impl RawSavedAttrs {
     /// carina#3740: both rewrites live at this single raw-to-lifted seam so a
     /// saved map cannot reach hydration or the differ with only one applied.
     pub fn lift(mut self, registry: &SchemaRegistry) -> LiftedSavedAttrs {
-        crate::utils::lift_saved_state_enum_leaves(&mut self.0.0, registry);
-        LiftedSavedAttrs(self.0)
+        crate::utils::lift_saved_state_enum_leaves(&mut self.attributes.0, registry);
+        LiftedSavedAttrs {
+            attributes: self.attributes,
+            nested_write_only: self.nested_write_only,
+        }
     }
 
     /// Read a raw resource entry without changing its typestate.
     pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
-        self.0.get(id)
+        self.attributes.get(id)
     }
 }
 
@@ -1381,28 +1465,40 @@ impl RawSavedAttrs {
 /// requires_lifted(&raw);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct LiftedSavedAttrs(SavedAttrs);
+pub struct LiftedSavedAttrs {
+    attributes: SavedAttrs,
+    nested_write_only: HashMap<ResourceId, NestedWriteOnlyRecord>,
+}
 
 impl LiftedSavedAttrs {
     /// Borrow the plugin-ABI representation at a provider hydration boundary.
     pub fn as_provider_saved_attrs(&self) -> &SavedAttrs {
-        &self.0
+        &self.attributes
     }
 
     /// Read saved attributes for one resource.
     pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
-        self.0.get(id)
+        self.attributes.get(id)
+    }
+
+    /// Read the accepted nested write-only leaf record for one resource.
+    pub fn nested_write_only(&self, id: &ResourceId) -> &NestedWriteOnlyRecord {
+        static EMPTY: NestedWriteOnlyRecord = NestedWriteOnlyRecord::new();
+        self.nested_write_only.get(id).unwrap_or(&EMPTY)
     }
 
     /// Iterate resource IDs without exposing mutable map access.
     pub fn resource_ids(&self) -> impl Iterator<Item = &ResourceId> {
-        self.0.0.keys()
+        self.attributes.0.keys()
     }
 
     /// Transfer a resource's saved attributes to a new ID.
     pub fn remap_resource_id(&mut self, from: &ResourceId, to: ResourceId) {
-        if let Some(attrs) = self.0.0.remove(from) {
-            self.0.0.insert(to, attrs);
+        if let Some(attrs) = self.attributes.0.remove(from) {
+            self.attributes.0.insert(to.clone(), attrs);
+        }
+        if let Some(record) = self.nested_write_only.remove(from) {
+            self.nested_write_only.insert(to, record);
         }
     }
 }
@@ -1996,6 +2092,18 @@ pub struct ObservedCreate {
 }
 
 impl ObservedCreate {
+    /// Construct the observation produced by a resumed in-flight create in
+    /// cross-crate tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn from_in_flight_for_test(
+        pending: InFlightCreate,
+        identifier: AppliedIdentifier,
+        observation: Observation,
+    ) -> Self {
+        observed_from_resume(pending, identifier, observation)
+    }
+
     pub fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2646,6 +2754,13 @@ pub struct CreateAttempt {
 impl CreateAttempt {
     pub(crate) fn new(id: ResourceId) -> Self {
         Self { id }
+    }
+
+    /// Construct an initial-create witness in cross-crate tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn for_test(id: ResourceId) -> Self {
+        Self::new(id)
     }
 
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
@@ -5473,7 +5588,8 @@ mod tests {
         )]));
 
         let once = raw.lift(&registry);
-        let twice = RawSavedAttrs::from_decoded_values_for_test(once.0.0.clone()).lift(&registry);
+        let twice =
+            RawSavedAttrs::from_decoded_values_for_test(once.attributes.0.clone()).lift(&registry);
         let sorted_pairs = |attrs: &HashMap<String, Value>| {
             let mut pairs: Vec<_> = attrs
                 .iter()
@@ -6595,6 +6711,117 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
 
+    fn nested_write_only_patch_fixture() -> (ResourceSchema, Value) {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("description", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "default_actions",
+                AttributeType::list(AttributeType::struct_(
+                    "Action",
+                    vec![StructField::new(
+                        "authenticate_oidc_config",
+                        AttributeType::struct_(
+                            "AuthenticateOidcConfig",
+                            vec![
+                                StructField::new("issuer", AttributeType::string()),
+                                StructField::new("client_secret", AttributeType::string())
+                                    .write_only(),
+                            ],
+                        ),
+                    )],
+                )),
+            ));
+        let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "authenticate_oidc_config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "issuer".to_string(),
+                        patch_test_value("https://issuer.example.com"),
+                    ),
+                    (
+                        "client_secret".to_string(),
+                        Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
+                            "client-secret",
+                        )))),
+                    ),
+                ]))),
+            )])),
+        )]));
+        (schema, value)
+    }
+
+    #[test]
+    fn nested_write_only_record_sent_skips_non_bearing_keys() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "credentials",
+                AttributeType::struct_(
+                    "Credentials",
+                    vec![StructField::new("password", AttributeType::string()).write_only()],
+                ),
+            ));
+        let attributes = IndexMap::from([
+            ("name".to_string(), patch_test_value("example")),
+            (
+                "credentials".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "password".to_string(),
+                    patch_test_value("accepted-secret"),
+                )]))),
+            ),
+        ]);
+        let mut record = NestedWriteOnlyRecord::new();
+
+        record
+            .record_sent(&schema, ["name", "credentials"], &attributes, None)
+            .expect("ordinary sent keys must be ignored");
+
+        assert!(record.get("name").is_none());
+        assert!(record.get("credentials").is_some());
+    }
+
+    #[test]
+    fn build_update_patch_reasserts_whole_write_only_bearing_attribute() {
+        let (schema, default_actions) = nested_write_only_patch_fixture();
+        let id = ResourceId::with_identity("test", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                ("default_actions".to_string(), default_actions.clone()),
+            ]),
+        );
+        let to = resolved_for_test(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions.clone()),
+        );
+        let provider_ready_actions = to
+            .as_resource()
+            .attributes
+            .get("default_actions")
+            .expect("fixture includes default_actions")
+            .clone();
+
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+
+        assert!(matches!(
+            &patch.ops[..],
+            [
+                PatchOp::Replace { key: changed, .. },
+                PatchOp::Reassert { key: reasserted, value },
+            ] if changed == "description"
+                && reasserted == "default_actions"
+                && value == &provider_ready_actions
+        ));
+    }
+
     #[test]
     fn build_update_patch_reasserts_only_desired_updatable_write_only_keys() {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -6714,6 +6941,19 @@ mod tests {
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
+        );
+
+        let (schema, default_actions) = nested_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "nested"),
+            HashMap::from([("default_actions".to_string(), default_actions.clone())]),
+        );
+        let to = resolved_for_test(
+            Resource::new("test", "nested").with_attribute("default_actions", default_actions),
+        );
+        assert!(
+            build_update_patch(&[], &to, &from, &schema).ops.is_empty(),
+            "a write-only-bearing attribute cannot create a reassert-only patch"
         );
     }
 

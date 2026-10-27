@@ -6,12 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
+use crate::provider::NestedWriteOnlyRecord;
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, SavedValueViews, UnknownReason, Value,
     merge_with_saved,
 };
-use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
-use crate::value::{canonical_secret_hash_material, contains_secret};
+use crate::schema::{AttributeType, LeafPath, ResourceSchema, empty_defs_for_schema_walks};
+use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -520,6 +521,7 @@ fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct TypedAttr<'a> {
     pub(crate) attr_type: &'a AttributeType,
     pub(crate) defs: &'a BTreeMap<String, AttributeType>,
@@ -536,6 +538,18 @@ pub(crate) struct AttrComparison<'a> {
     pub(crate) to: &'a Value,
     pub(crate) saved: Option<SavedAttr<'a>>,
     pub(crate) type_info: Option<TypedAttr<'a>>,
+}
+
+/// Authority for the unobservable leaf half of a key comparison.
+///
+/// Planning compares desired leaves with the saved accepted-request record.
+/// Apply-time augmentation and Update display already have a plan verdict, so
+/// they must state that verdict explicitly instead of treating an absent
+/// record as a request for reconciliation.
+#[derive(Clone, Copy)]
+pub(crate) enum LeafProvenance<'a> {
+    Recorded(Option<&'a [(LeafPath, PersistedValue)]>),
+    DecidedByPlan { key_changed: bool },
 }
 
 fn contains_post_create_read_incomplete(value: &Value) -> bool {
@@ -624,6 +638,7 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
 pub(crate) fn key_should_enter_patch(
     key: &str,
     schema: Option<&ResourceSchema>,
+    leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
 ) -> bool {
     // CloudControl reads omit write-only values. Ignore that absence only when
@@ -635,7 +650,125 @@ pub(crate) fn key_should_enter_patch(
     {
         return false;
     }
+    if let Some(schema) = schema
+        && schema.write_only_bearing(key)
+    {
+        return nested_write_only_should_enter_patch(key, schema, leaf_provenance, cmp);
+    }
     should_patch_attr(cmp)
+}
+
+fn nested_write_only_should_enter_patch(
+    key: &str,
+    schema: &ResourceSchema,
+    leaf_provenance: LeafProvenance<'_>,
+    cmp: AttrComparison<'_>,
+) -> bool {
+    if contains_post_create_read_incomplete(cmp.to) {
+        return false;
+    }
+    let attr_type = &schema.attributes[key].attr_type;
+
+    let effective_to = cmp.saved.map_or_else(
+        || Cow::Borrowed(cmp.to),
+        |saved| {
+            Cow::Owned(merge_with_saved(
+                cmp.to,
+                saved.views,
+                saved.authoring,
+                Some(attr_type),
+                &schema.defs,
+            ))
+        },
+    );
+    let observable_equal =
+        write_only_observable_equal(schema, key, cmp.from, effective_to.as_ref(), attr_type);
+
+    let desired_leaves = schema.write_only_leaf_projection(key, cmp.to);
+    let leaf_equal = match leaf_provenance {
+        LeafProvenance::Recorded(saved_leaves) => {
+            if schema
+                .attributes
+                .get(key)
+                .is_some_and(|attribute| attribute.create_only)
+                && saved_leaves.is_none()
+            {
+                return !observable_equal;
+            }
+            saved_leaves.map_or(desired_leaves.is_empty(), |saved_leaves| {
+                saved_leaves.len() == desired_leaves.len()
+                    && desired_leaves.iter().zip(saved_leaves).all(
+                        |((path, desired, field_type), (saved_path, saved))| {
+                            saved_path == path
+                                && saved.decode().is_some_and(|saved| {
+                                    type_aware_equal(
+                                        desired,
+                                        &saved,
+                                        Some(field_type),
+                                        &schema.defs,
+                                    )
+                                })
+                        },
+                    )
+            })
+        }
+        LeafProvenance::DecidedByPlan { key_changed } => !key_changed,
+    };
+
+    !(observable_equal && leaf_equal)
+}
+
+fn has_observable_content(value: &Value) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            entries.values().any(has_observable_content)
+        }
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
+        Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
+        Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Coalesce { .. })
+        | Value::Deferred(DeferredValue::Interpolation(_))
+        | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+        | Value::Deferred(DeferredValue::Access(_))
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
+    }
+}
+
+/// Compare observable projections for `key_should_enter_patch`'s nested
+/// write-only branch.
+///
+/// A provider may omit the whole attribute when stripping its write-only
+/// leaves produces no observable content.
+fn write_only_observable_equal(
+    schema: &ResourceSchema,
+    key: &str,
+    from: Option<&Value>,
+    to: &Value,
+    attr_type: &AttributeType,
+) -> bool {
+    let observable_to = schema.strip_write_only_leaves(key, to);
+    let Some(from) = from else {
+        return !has_observable_content(&observable_to);
+    };
+    let observable_from = schema.strip_write_only_leaves(key, from);
+    type_aware_equal(
+        &observable_from,
+        &observable_to,
+        Some(attr_type),
+        &schema.defs,
+    )
 }
 
 /// Build a comparison-only view that grafts `Secret` wrappers from source.
@@ -722,6 +855,7 @@ pub(super) fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Vec<String> {
@@ -777,36 +911,39 @@ pub(super) fn find_changed_attributes(
                 .filter(|value| crate::value::contains_redacted_secret(value))
         });
 
-        if key_should_enter_patch(
+        let comparison = AttrComparison {
+            from: current_value,
+            to: desired_value,
+            saved: projected_saved.and_then(|projected_saved| {
+                projected_saved.get(key).map(|projected_value| SavedAttr {
+                    views: raw_saved
+                        .and_then(|raw_saved| raw_saved.get(key))
+                        .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
+                        .unwrap_or_else(|| SavedValueViews::same(projected_value)),
+                    authoring: match prev_explicit {
+                        Some(ExplicitFields::Struct { children }) => {
+                            children.get(key).unwrap_or(&ExplicitFields::Unrecorded)
+                        }
+                        Some(authoring @ ExplicitFields::Unrecorded) => authoring,
+                        Some(
+                            ExplicitFields::Leaf
+                            | ExplicitFields::List { .. }
+                            | ExplicitFields::ListElements { .. }
+                            | ExplicitFields::WholeValue { .. },
+                        )
+                        | None => &ExplicitFields::Unrecorded,
+                    },
+                })
+            }),
+            type_info,
+        };
+        let should_patch = key_should_enter_patch(
             key,
             schema,
-            AttrComparison {
-                from: current_value,
-                to: desired_value,
-                saved: projected_saved.and_then(|projected_saved| {
-                    projected_saved.get(key).map(|projected_value| SavedAttr {
-                        views: raw_saved
-                            .and_then(|raw_saved| raw_saved.get(key))
-                            .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
-                            .unwrap_or_else(|| SavedValueViews::same(projected_value)),
-                        authoring: match prev_explicit {
-                            Some(ExplicitFields::Struct { children }) => {
-                                children.get(key).unwrap_or(&ExplicitFields::Unrecorded)
-                            }
-                            Some(authoring @ ExplicitFields::Unrecorded) => authoring,
-                            Some(
-                                ExplicitFields::Leaf
-                                | ExplicitFields::List { .. }
-                                | ExplicitFields::ListElements { .. }
-                                | ExplicitFields::WholeValue { .. },
-                            )
-                            | None => &ExplicitFields::Unrecorded,
-                        },
-                    })
-                }),
-                type_info,
-            },
-        ) {
+            LeafProvenance::Recorded(nested_write_only.get(key)),
+            comparison,
+        );
+        if should_patch {
             changed.push(key.clone());
         }
     }

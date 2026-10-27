@@ -11,7 +11,7 @@ use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::MoveAuthority;
-use crate::provider::{LiftedSavedAttrs, ProviderError, StateTransformMap};
+use crate::provider::{LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, StateTransformMap};
 use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
@@ -53,6 +53,7 @@ pub fn managed_binding_stability(
             resource,
             present,
             saved_attrs.get(&resource.id),
+            saved_attrs.nested_write_only(&resource.id),
             prev_explicit.get(&resource.id),
             schema,
         ) {
@@ -628,8 +629,8 @@ fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
 // `find_changed_attributes`: detail rows render with the same equality,
 // and executor patch construction uses the same key/value gate.
 pub(crate) use comparison::{
-    AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
-    type_aware_equal,
+    AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch,
+    secret_grafted_comparison_view, type_aware_equal,
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for
@@ -691,16 +692,25 @@ fn diff_present(
     desired: &ResolvedResource,
     current: &PresentResourceState,
     saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> PresentDiff {
-    diff_existing_state(desired, current.state(), saved, prev_explicit, schema)
+    diff_existing_state(
+        desired,
+        current.state(),
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+    )
 }
 
 fn diff_existing_state(
     desired: &ResolvedResource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> PresentDiff {
@@ -708,6 +718,7 @@ fn diff_existing_state(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
+        nested_write_only,
         prev_explicit,
         schema,
     );
@@ -725,8 +736,11 @@ fn diff_existing_state(
 }
 
 /// Compare desired state with current state to compute a Diff.
-/// If `saved` is provided, unmanaged nested fields from the saved state are merged
-/// into desired before comparison, preventing false diffs when AWS returns extra fields.
+/// `saved_attrs` carries both persisted attributes and nested write-only leaf
+/// provenance. Unmanaged nested fields from the saved state are merged into
+/// desired before comparison, preventing false diffs when AWS returns extra
+/// fields. Requiring the paired input prevents callers from silently dropping
+/// nested write-only provenance.
 /// If `prev_explicit` is provided, the actual-state side is projected through
 /// the authoring tree before comparison so server-side default fields the
 /// user never wrote do not surface as diffs (refs awscc#206). The same
@@ -739,23 +753,62 @@ fn diff_existing_state(
 ///
 /// ```compile_fail
 /// use carina_core::differ::diff;
+/// use carina_core::provider::RawSavedAttrs;
 /// use carina_core::resource::{Resource, State};
+/// use carina_core::schema::SchemaRegistry;
 ///
 /// let resource = Resource::pending("test.Resource");
 /// let state = State::not_found(resource.id.clone());
+/// let saved = RawSavedAttrs::default().lift(&SchemaRegistry::new());
+/// let _ = diff(&resource, &state, &saved, None, None);
+/// ```
+///
+/// Nested write-only provenance is a required planning input:
+///
+/// ```compile_fail
+/// use carina_core::differ::diff;
+/// use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
+///
+/// let resource = ResolvedResource::new(Resource::new("test.Resource", "example"));
+/// let state = State::not_found(ResourceId::with_identity("test.Resource", "example"));
 /// let _ = diff(&resource, &state, None, None, None);
 /// ```
 pub fn diff(
     desired: &ResolvedResource,
     current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    diff_with_saved_parts(
+        desired,
+        current,
+        saved_attrs.get(&desired.id),
+        saved_attrs.nested_write_only(&desired.id),
+        prev_explicit,
+        schema,
+    )
+}
+
+fn diff_with_saved_parts(
+    desired: &ResolvedResource,
+    current: &State,
     saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
     if !current.exists {
         return Diff::Create(desired.as_resource().clone());
     }
-    match diff_existing_state(desired, current, saved, prev_explicit, schema) {
+    match diff_existing_state(
+        desired,
+        current,
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+    ) {
         PresentDiff::Update {
             id,
             from,
@@ -779,10 +832,11 @@ pub(crate) fn diff_test(
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
-    diff(
+    diff_with_saved_parts(
         &ResolvedResource::new(desired.clone()),
         current,
         saved,
+        &NestedWriteOnlyRecord::new(),
         prev_explicit,
         schema,
     )

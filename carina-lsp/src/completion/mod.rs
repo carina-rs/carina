@@ -695,14 +695,14 @@ impl CompletionProvider {
         schema: &'a ResourceSchema,
         attr_name: &str,
     ) -> Option<&'a carina_core::schema::AttributeSchema> {
-        if let Some(attr_schema) = schema.attributes.get(attr_name) {
+        if let Some(attr_schema) = schema.attributes().get(attr_name) {
             return Some(attr_schema);
         }
         // Fallback: check if attr_name matches a block_name
         schema
-            .attributes
+            .attributes()
             .values()
-            .find(|a| a.block_name.as_ref().is_some_and(|bn| bn == attr_name))
+            .find(|a| a.block_name().is_some_and(|bn| bn == attr_name))
     }
 
     /// Provide completions for struct fields inside a nested block
@@ -721,14 +721,14 @@ impl CompletionProvider {
         }
 
         let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
-        let mut current_type = &attr_schema.attr_type;
+        let mut current_type = attr_schema.attr_type();
 
         for name in &attr_path[1..] {
             let fields = self.extract_struct_fields(schema, current_type)?;
             let field = fields
                 .iter()
-                .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
-            current_type = &field.field_type;
+                .find(|f| f.name() == *name || f.block_name() == Some(name))?;
+            current_type = field.field_type();
         }
 
         Some(current_type)
@@ -767,11 +767,10 @@ impl CompletionProvider {
                             ""
                         };
                         CompletionItem {
-                            label: field.name.clone(),
+                            label: field.name().to_string(),
                             kind: Some(CompletionItemKind::FIELD),
                             detail: field
-                                .description
-                                .as_ref()
+                                .description()
                                 .map(|d| format!("{}{}", d, required_marker))
                                 .or_else(|| {
                                     if field.is_required() {
@@ -780,7 +779,7 @@ impl CompletionProvider {
                                         None
                                     }
                                 }),
-                            insert_text: Some(format!("{} = ", field.name)),
+                            insert_text: Some(format!("{} = ", field.name())),
                             command: Some(trigger_suggest.clone()),
                             ..Default::default()
                         }
@@ -855,12 +854,12 @@ impl CompletionProvider {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
-            && let Some(field) = fields.iter().find(|f| f.name == field_name)
+            && let Some(field) = fields.iter().find(|f| f.name() == field_name)
         {
             if field.is_read_only() {
                 return vec![];
             }
-            completions.extend(self.completions_for_type(&field.field_type, Some(resource_type)));
+            completions.extend(self.completions_for_type(field.field_type(), Some(resource_type)));
         }
         completions.extend(self.in_scope_binding_completions(
             text,

@@ -377,8 +377,8 @@ fn resource_ref_schemas() -> SchemaRegistry {
         .attribute(AttributeSchema::new("target_id", AttributeType::string()));
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert(producer.resource_type.clone(), producer);
-    schemas.insert(consumer.resource_type.clone(), consumer);
+    schemas.insert(producer.resource_type().to_string(), producer);
+    schemas.insert(consumer.resource_type().to_string(), consumer);
     schemas
 }
 

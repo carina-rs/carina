@@ -65,6 +65,26 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
+fn nested_write_only_listener_block<'a>(output: &'a str, name: &str) -> &'a str {
+    const LISTENER_PREFIX: &str = "awscc.elasticloadbalancingv2.Listener ";
+    let heading = format!("{LISTENER_PREFIX}{name}");
+    let start = output
+        .match_indices(&heading)
+        .find_map(|(start, _)| {
+            let suffix = &output[start + heading.len()..];
+            (suffix.starts_with(' ') || suffix.starts_with('\n')).then_some(start)
+        })
+        .unwrap_or_else(|| panic!("missing listener {name} in plan output:\n{output}"));
+    let content_start = start + heading.len();
+    let remaining = &output[content_start..];
+    let end = remaining
+        .find(LISTENER_PREFIX)
+        .or_else(|| remaining.find("\nPlan:"))
+        .unwrap_or(remaining.len());
+
+    &output[start..content_start + end]
+}
+
 /// Build a plan from a .crn fixture and optional state file, mimicking `--refresh=false`.
 fn build_plan_from_fixture(
     fixture_dir: &str,
@@ -1077,6 +1097,67 @@ fn snapshot_secret_values() {
         None,
         None,
     ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_nested_write_only() {
+    let fixture = build_plan_from_fixture_name("nested_write_only");
+    let historical = crate::commands::plan::collect_historical_display_attributes(
+        &fixture.plan,
+        &fixture.managed_current,
+        fixture.state_file.as_ref(),
+    );
+    let output = strip_ansi(&format_plan(
+        &fixture.plan,
+        DetailLevel::Full,
+        &historical,
+        Some(&fixture.schemas),
+        &fixture.moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    let unrelated = nested_write_only_listener_block(&output, "unrelated");
+    let rotated = nested_write_only_listener_block(&output, "rotated");
+    let replacement = nested_write_only_listener_block(&output, "replacement");
+    let replacement_same_secret =
+        nested_write_only_listener_block(&output, "replacement_same_secret");
+
+    assert!(
+        !unrelated.contains("default_actions"),
+        "an unrelated update must hide the provenance-matching reassertion:\n{unrelated}"
+    );
+    assert!(
+        !replacement_same_secret.contains("default_actions"),
+        "a replacement must hide a provenance-matching nested secret:\n{replacement_same_secret}"
+    );
+    assert!(
+        rotated.contains("default_actions"),
+        "a nested secret rotation must render the bearing attribute:\n{rotated}"
+    );
+    assert!(
+        replacement.contains("default_actions"),
+        "a replacement with a nested secret rotation must render the bearing attribute:\n{replacement}"
+    );
+    assert_eq!(
+        output.matches("default_actions").count(),
+        2,
+        "rotations should render, but unrelated reassertion and a provenance-matching replacement should not:\n{output}"
+    );
+    assert!(
+        output.contains("client_secret") && output.contains("(secret)"),
+        "the rotated leaf must remain visible but masked:\n{output}"
+    );
+    assert!(
+        !output.contains("accepted-secret")
+            && !output.contains("old-secret")
+            && !output.contains("new-secret")
+            && !output.contains("new-replace-secret"),
+        "nested write-only plaintext must never reach plan output:\n{output}"
+    );
     insta::assert_snapshot!(output);
 }
 

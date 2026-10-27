@@ -1,5 +1,33 @@
 # Provider protocol versions
 
+## Version 12
+
+Protocol v12 adds the required `write_only` boolean to every nested
+`StructField` in schema JSON. It has no serde default: schema JSON emitted by
+an older provider fails to decode instead of silently treating an
+unobservable nested member as readable. Host conversions carry the field into
+the core schema, where write-only members are incompatible with read-only
+(provider-populated) members but may be either required or optional. The WIT
+world does not change.
+
+The host rejects schema JSON at decode time when any of these combinations
+would make nested write-only provenance ambiguous or contradictory:
+
+- a top-level `write_only` attribute also contains write-only members;
+- a union member contains write-only members; or
+- one nested field is both `read_only` and `write_only`.
+
+The host uses nested write-only typing both to reassert the containing
+top-level attribute during an otherwise necessary update and to compare the
+unobservable leaves against accepted-request provenance. State format v18 adds
+that typed per-instance leaf record; the v17 migration initializes it empty so
+the first plan performs one reconciling update.
+
+Hosts and providers must both use protocol v12. The minimum supported protocol
+version is 12. Rejecting v11 at provider load is intentional: either direction
+of host/provider skew would otherwise discard the nested `write_only` marker
+and silently restore the non-converging and incomplete-update behavior.
+
 ## Version 11
 
 In protocol v11 an update patch op is a sum type, so its shape enforces its own

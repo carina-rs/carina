@@ -3603,7 +3603,7 @@ async fn run_apply_from_plan_locked_owned(
                 &summary,
                 DetailLevel::Full,
                 &historical_display,
-                None,
+                Some(ctx.schemas()),
                 &HashMap::new(),
                 None,
                 None,

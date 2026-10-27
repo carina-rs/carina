@@ -425,13 +425,11 @@ async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
 async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() {
     let mut planned_schema = carina_provider_mock::builtin_schemas()
         .into_iter()
-        .find(|schema| schema.resource_type == "test.resource")
+        .find(|schema| schema.resource_type() == "test.resource")
         .expect("built-in test.resource schema");
-    planned_schema
-        .attributes
-        .get_mut("comment")
-        .expect("comment attribute")
-        .write_only = true;
+    let comment_type = planned_schema.attributes()["comment"].attr_type().clone();
+    planned_schema = planned_schema
+        .attribute(carina_core::schema::AttributeSchema::new("comment", comment_type).write_only());
     let planning_schemas = mock_schema_registry([planned_schema]);
 
     let (result, operations) = run_saved_plan_schema_fingerprint_case(
@@ -6051,6 +6049,10 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
 
     // Saved attrs: same as current (from previous apply)
     let saved: HashMap<String, Value> = current.attributes.clone();
+    let saved = carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
+        [(resource.id.clone(), saved)],
+    ))
+    .lift(&SchemaRegistry::new());
 
     // Previous explicit tree: what the user wrote on first apply
     let prev_explicit = carina_core::explicit::ExplicitFields::Struct {
@@ -6069,7 +6071,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     let d = diff(
         &ResolvedResource::new(resource),
         &current,
-        Some(&saved),
+        &saved,
         Some(&prev_explicit),
         Some(&schema),
     );

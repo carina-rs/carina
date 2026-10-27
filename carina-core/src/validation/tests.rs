@@ -988,40 +988,12 @@ fn binding_used_inside_for_body_is_not_flagged_as_unused() {
 
 /// Helper to create a simple ResourceSchema with given attributes.
 fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> ResourceSchema {
-    let mut attributes = HashMap::new();
-    for (name, attr_type) in attrs {
-        attributes.insert(
-            name.to_string(),
-            crate::schema::AttributeSchema {
-                name: name.to_string(),
-                attr_type,
-                input_mode: crate::schema::InputMode::Optional,
-                default: None,
-                description: None,
-                completions: None,
-                provider_name: None,
-                create_only: false,
-                removable: None,
-                block_name: None,
-                write_only: false,
-                identity: false,
-                deferred_populate: false,
-            },
-        );
-    }
-    ResourceSchema {
-        resource_type: resource_type.to_string(),
-        attributes,
-        description: None,
-        validation: crate::schema::ResourceValidation::None,
-        kind: crate::schema::SchemaKind::Resource,
-        unique_name: crate::schema::UniqueNameSpec::Conflicting,
-        operation_config: None,
-        exclusive_required: Vec::new(),
-        default_wait_timeout: None,
-        default_wait_interval: None,
-        defs: std::collections::BTreeMap::new(),
-    }
+    attrs.into_iter().fold(
+        ResourceSchema::new(resource_type),
+        |schema, (name, attr_type)| {
+            schema.attribute(crate::schema::AttributeSchema::new(name, attr_type))
+        },
+    )
 }
 
 fn make_composition(binding: &str, attributes: &[&str]) -> Composition {

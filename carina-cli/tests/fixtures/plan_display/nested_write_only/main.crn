@@ -1,0 +1,64 @@
+# Nested write-only plan rendering: an unrelated update must not display the
+# provider-omitted leaf, while an actual leaf rotation remains visible and
+# masked.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let unrelated = awscc.elasticloadbalancingv2.Listener {
+  default_actions = [
+    {
+      authenticate_oidc_config = {
+        issuer        = "https://issuer.example.com"
+        client_secret = secret("accepted-secret")
+      }
+    },
+  ]
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+}
+
+let rotated = awscc.elasticloadbalancingv2.Listener {
+  default_actions = [
+    {
+      authenticate_oidc_config = {
+        issuer        = "https://issuer.example.com"
+        client_secret = secret("new-secret")
+      }
+    },
+  ]
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+}
+
+let replacement = awscc.elasticloadbalancingv2.Listener {
+  default_actions = [
+    {
+      authenticate_oidc_config = {
+        issuer        = "https://issuer.example.com"
+        client_secret = secret("new-replace-secret")
+      }
+    },
+  ]
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  port       = 8443
+}
+
+let replacement_same_secret = awscc.elasticloadbalancingv2.Listener {
+  default_actions = [
+    {
+      authenticate_oidc_config = {
+        issuer        = "https://issuer.example.com"
+        client_secret = secret("accepted-secret")
+      }
+    },
+  ]
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  port       = 8443
+}
+
+exports {
+  unrelated_policy               = unrelated.ssl_policy
+  rotated_policy                 = rotated.ssl_policy
+  replacement_policy             = replacement.ssl_policy
+  replacement_same_secret_policy = replacement_same_secret.ssl_policy
+}

@@ -238,9 +238,9 @@ impl WiringContext {
         if uses_builtin_mock {
             for schema in carina_provider_mock::builtin_schemas() {
                 let already_registered = if schema.is_data_source() {
-                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, &schema.resource_type)
+                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, schema.resource_type())
                 } else {
-                    schemas.has_managed(BUILTIN_PROVIDER_NAME, &schema.resource_type)
+                    schemas.has_managed(BUILTIN_PROVIDER_NAME, schema.resource_type())
                 };
                 if !already_registered {
                     schemas.insert(BUILTIN_PROVIDER_NAME, schema);
@@ -1278,7 +1278,7 @@ fn resolved_constraint_context(
 ) -> (Vec<String>, Vec<String>) {
     let mut origins_by_attribute: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (attribute, value) in origin_attributes {
-        if !schema.attributes.contains_key(attribute) {
+        if !schema.attributes().contains_key(attribute) {
             continue;
         }
         value.visit_resource_refs(&mut |path| {
@@ -1295,7 +1295,7 @@ fn resolved_constraint_context(
     } else if origins_by_attribute.is_empty() {
         let mut known = origin_attributes
             .keys()
-            .filter(|attribute| schema.attributes.contains_key(*attribute))
+            .filter(|attribute| schema.attributes().contains_key(*attribute))
             .cloned()
             .collect::<Vec<_>>();
         known.sort();

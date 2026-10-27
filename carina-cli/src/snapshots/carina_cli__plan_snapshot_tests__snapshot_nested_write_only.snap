@@ -1,0 +1,37 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -/+ awscc.elasticloadbalancingv2.Listener replacement (must be replaced)
+      default_actions:
+        + {
+            authenticate_oidc_config: 
+              client_secret: (secret)
+              issuer: 'https://issuer.example.com'
+          }
+        - {
+            authenticate_oidc_config: {issuer: 'https://issuer.example.com'}
+          }
+      port: 443 → 8443 (forces replacement)
+      # (1 unchanged attribute hidden)
+  -/+ awscc.elasticloadbalancingv2.Listener replacement_same_secret (must be replaced)
+      port: 443 → 8443 (forces replacement)
+      # (2 unchanged attributes hidden)
+  ~ awscc.elasticloadbalancingv2.Listener rotated
+      default_actions:
+        + {
+            authenticate_oidc_config: 
+              client_secret: (secret)
+              issuer: 'https://issuer.example.com'
+          }
+        - {
+            authenticate_oidc_config: {issuer: 'https://issuer.example.com'}
+          }
+      # (1 unchanged attribute hidden)
+  ~ awscc.elasticloadbalancingv2.Listener unrelated
+      ssl_policy: 'ELBSecurityPolicy-2016-08' → 'ELBSecurityPolicy-TLS13-1-2-2021-06'
+      # (1 unchanged attribute hidden)
+
+Plan: 0 to add, 2 to change, 2 to replace, 0 to destroy.

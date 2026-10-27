@@ -21,8 +21,12 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
-    ResourceValidation as CoreResourceValidation, StructField as CoreStructField,
-    UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
+    StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
+};
+#[cfg(test)]
+use carina_core::schema::{
+    AttributeSchemaParts as CoreAttributeSchemaParts,
+    ResourceSchemaParts as CoreResourceSchemaParts, StructFieldParts as CoreStructFieldParts,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -84,6 +88,14 @@ impl SchemaDecodeError {
 
     fn conflicting_input_mode() -> Self {
         Self::new("input mode cannot be both required and read-only")
+    }
+
+    fn conflicting_write_only_mode() -> Self {
+        Self::new("struct field cannot be both write-only and provider-populated")
+    }
+
+    fn conflicting_attribute_write_only_mode() -> Self {
+        Self::new("attribute cannot be both write-only and provider-populated")
     }
 
     fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
@@ -1929,44 +1941,62 @@ fn proto_schema_to_core(
         defs,
     } = s;
 
-    Ok(CoreResourceSchema {
-        resource_type: resource_type.clone(),
-        attributes: attributes
-            .iter()
-            .map(|(name, a)| {
-                proto_attr_schema_to_core(a)
-                    .map(|schema| (name.clone(), schema))
-                    .map_err(|error| error.with_resource_type(resource_type))
-            })
-            .collect::<Result<_, _>>()?,
-        description: description.clone(),
-        validation: CoreResourceValidation::Declared(validators.clone()),
-        kind: match kind {
-            proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
-            proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
-        },
-        unique_name: proto_unique_name_to_core(unique_name),
-        operation_config: operation_config.clone(),
-        exclusive_required: exclusive_required.clone(),
-        // Wait defaults are not (yet) carried across the WASM plugin
-        // boundary — providers fall back to the carina-core constants
-        // (`WAIT_DEFAULT_TIMEOUT` / `WAIT_DEFAULT_INTERVAL`) until the
-        // protocol gains explicit fields. See carina-rs/carina#2825.
-        default_wait_timeout: None,
-        default_wait_interval: None,
-        // Cyclic CFN struct definitions reachable via
-        // `AttributeType::Ref`. Mirrors the wire `defs` map onto the
-        // core schema so walk-sites that traverse a `Ref` can resolve
-        // it against the resource's own def table (carina#3340).
-        defs: defs
-            .iter()
-            .map(|(k, v)| {
-                proto_attr_type_to_core(v)
-                    .map(|attr_type| (k.clone(), attr_type))
-                    .map_err(|error| error.prepend_attribute(k).with_resource_type(resource_type))
-            })
-            .collect::<Result<_, _>>()?,
-    })
+    let mut schema = CoreResourceSchema::new(resource_type.clone());
+    if let Some(description) = description {
+        schema = schema.with_description(description.clone());
+    }
+    schema = schema.with_declared_validators(validators.clone());
+    schema = match kind {
+        proto::SchemaKind::Managed => schema,
+        proto::SchemaKind::DataSource => schema.as_data_source(),
+    };
+    schema = match proto_unique_name_to_core(unique_name) {
+        CoreUniqueNameSpec::Attribute(attribute) => schema.with_unique_name_attribute(attribute),
+        CoreUniqueNameSpec::Coexisting => schema.with_coexisting_replacement(),
+        CoreUniqueNameSpec::Conflicting => schema.with_conflicting_replacement(),
+    };
+    if let Some(operation_config) = operation_config {
+        schema = schema.with_operation_config(operation_config.clone());
+    }
+    for group in exclusive_required {
+        let fields = group.iter().map(String::as_str).collect::<Vec<_>>();
+        schema = schema.exclusive_required(&fields);
+    }
+
+    // Wait defaults are not (yet) carried across the WASM plugin boundary —
+    // providers fall back to the carina-core constants until the protocol
+    // gains explicit fields. See carina-rs/carina#2825.
+
+    // Cyclic CFN struct definitions reachable via `AttributeType::Ref` must
+    // be installed before attributes so the invariant-preserving attribute
+    // builder can analyze every referenced definition.
+    for (name, definition) in defs {
+        let definition = proto_attr_type_to_core(definition).map_err(|error| {
+            error
+                .prepend_attribute(name)
+                .with_resource_type(resource_type)
+        })?;
+        schema = schema.with_def(name.clone(), definition);
+    }
+    let mut attributes = attributes.iter().collect::<Vec<_>>();
+    attributes.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (map_name, attribute) in attributes {
+        let attribute = proto_attr_schema_to_core(attribute)
+            .map_err(|error| error.with_resource_type(resource_type))?;
+        if attribute.name() != map_name {
+            return Err(SchemaDecodeError::new(
+                "attribute map key does not match the attribute schema name",
+            )
+            .prepend_attribute(map_name)
+            .with_resource_type(resource_type));
+        }
+        schema = schema.try_attribute(attribute).map_err(|conflict| {
+            SchemaDecodeError::new(conflict.message())
+                .prepend_attribute(conflict.attribute())
+                .with_resource_type(resource_type)
+        })?;
+    }
+    Ok(schema)
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -2000,6 +2030,12 @@ fn proto_attr_schema_to_core(
         deferred_populate,
     } = a;
 
+    if *read_only && *write_only {
+        return Err(
+            SchemaDecodeError::conflicting_attribute_write_only_mode().prepend_attribute(name)
+        );
+    }
+
     let input_mode = proto_input_mode_to_core(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
     let attr_type =
@@ -2015,23 +2051,44 @@ fn proto_attr_schema_to_core(
         .transpose()
         .map_err(|error| error.prepend_attribute(name))?;
 
-    Ok(CoreAttributeSchema {
-        name: name.clone(),
-        attr_type,
-        input_mode,
-        default,
-        description: description.clone(),
-        // Provider configuration completions cross through the separate
-        // `provider-config-completions` WIT export, not schema JSON.
-        completions: None,
-        provider_name: provider_name.clone(),
-        create_only: *create_only,
-        removable: *removable,
-        block_name: block_name.clone(),
-        write_only: *write_only,
-        identity: *identity,
-        deferred_populate: *deferred_populate,
-    })
+    let mut schema = CoreAttributeSchema::new(name.clone(), attr_type);
+    schema = match input_mode {
+        CoreInputMode::Optional => schema,
+        CoreInputMode::Required => schema.required(),
+        CoreInputMode::ProviderPopulated => schema.read_only(),
+    };
+    if let Some(default) = default {
+        schema = schema.with_default(default);
+    }
+    if let Some(description) = description {
+        schema = schema.with_description(description.clone());
+    }
+    // Provider configuration completions cross through the separate
+    // `provider-config-completions` WIT export, not schema JSON.
+    if let Some(provider_name) = provider_name {
+        schema = schema.with_provider_name(provider_name.clone());
+    }
+    if *create_only {
+        schema = schema.create_only();
+    }
+    schema = match removable {
+        Some(true) => schema.removable(),
+        Some(false) => schema.non_removable(),
+        None => schema,
+    };
+    if let Some(block_name) = block_name {
+        schema = schema.with_block_name(block_name.clone());
+    }
+    if *write_only {
+        schema = schema.write_only();
+    }
+    if *identity {
+        schema = schema.identity();
+    }
+    if *deferred_populate {
+        schema = schema.deferred_populate();
+    }
+    Ok(schema)
 }
 
 fn proto_attr_type_to_core(
@@ -2253,23 +2310,41 @@ fn proto_struct_field_to_core(
         block_name,
         provider_name,
         read_only,
+        write_only,
         deferred_populate,
     } = f;
+
+    if *read_only && *write_only {
+        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
+    }
 
     let input_mode = proto_input_mode_to_core(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
     let field_type =
         proto_attr_type_to_core(field_type).map_err(|error| error.prepend_attribute(name))?;
 
-    Ok(CoreStructField {
-        name: name.clone(),
-        field_type,
-        input_mode,
-        description: description.clone(),
-        provider_name: provider_name.clone(),
-        block_name: block_name.clone(),
-        deferred_populate: *deferred_populate,
-    })
+    let mut field = CoreStructField::new(name.clone(), field_type);
+    field = match input_mode {
+        CoreInputMode::Optional => field,
+        CoreInputMode::Required => field.required(),
+        CoreInputMode::ProviderPopulated => field.read_only(),
+    };
+    if let Some(description) = description {
+        field = field.with_description(description.clone());
+    }
+    if let Some(provider_name) = provider_name {
+        field = field.with_provider_name(provider_name.clone());
+    }
+    if let Some(block_name) = block_name {
+        field = field.with_block_name(block_name.clone());
+    }
+    if *write_only {
+        field = field.write_only();
+    }
+    if *deferred_populate {
+        field = field.deferred_populate();
+    }
+    Ok(field)
 }
 
 fn proto_input_mode_to_core(
@@ -2527,7 +2602,7 @@ mod tests {
         proto_string()
     }
 
-    fn core_input_mode_to_proto(input_mode: &CoreInputMode) -> (bool, bool) {
+    fn core_input_mode_to_proto(input_mode: CoreInputMode) -> (bool, bool) {
         match input_mode {
             CoreInputMode::Optional => (false, false),
             CoreInputMode::Required => (true, false),
@@ -2538,7 +2613,7 @@ mod tests {
     fn core_struct_field_to_proto_for_schema_round_trip(
         field: &CoreStructField,
     ) -> proto::StructField {
-        let CoreStructField {
+        let CoreStructFieldParts {
             name,
             field_type,
             input_mode,
@@ -2546,26 +2621,27 @@ mod tests {
             provider_name,
             block_name,
             deferred_populate,
-        } = field;
-
+            write_only,
+        } = field.parts();
         let (required, read_only) = core_input_mode_to_proto(input_mode);
 
         proto::StructField {
-            name: name.clone(),
+            name: name.to_string(),
             field_type: core_string_to_proto_for_schema_round_trip(field_type),
             required,
-            description: description.clone(),
-            block_name: block_name.clone(),
-            provider_name: provider_name.clone(),
+            description: description.map(str::to_owned),
+            block_name: block_name.map(str::to_owned),
+            provider_name: provider_name.map(str::to_owned),
             read_only,
-            deferred_populate: *deferred_populate,
+            write_only,
+            deferred_populate,
         }
     }
 
     fn core_attr_schema_to_proto_for_schema_round_trip(
         attr: &CoreAttributeSchema,
     ) -> proto::AttributeSchema {
-        let CoreAttributeSchema {
+        let CoreAttributeSchemaParts {
             name,
             attr_type,
             input_mode,
@@ -2579,7 +2655,7 @@ mod tests {
             write_only,
             identity,
             deferred_populate,
-        } = attr;
+        } = attr.parts();
 
         assert!(
             completions.is_none(),
@@ -2587,24 +2663,24 @@ mod tests {
         );
         let (required, read_only) = core_input_mode_to_proto(input_mode);
         proto::AttributeSchema {
-            name: name.clone(),
+            name: name.to_string(),
             attr_type: core_string_to_proto_for_schema_round_trip(attr_type),
             required,
-            default: default.as_ref().map(|value| {
+            default: default.map(|value| {
                 let json = core_value_to_json(value)
                     .expect("round-trip fixture default must cross the WASM boundary");
                 serde_json::from_value(json)
                     .expect("round-trip fixture default must decode as a protocol value")
             }),
-            description: description.clone(),
-            create_only: *create_only,
+            description: description.map(str::to_owned),
+            create_only,
             read_only,
-            write_only: *write_only,
-            block_name: block_name.clone(),
-            provider_name: provider_name.clone(),
-            removable: *removable,
-            identity: *identity,
-            deferred_populate: *deferred_populate,
+            write_only,
+            block_name: block_name.map(str::to_owned),
+            provider_name: provider_name.map(str::to_owned),
+            removable,
+            identity,
+            deferred_populate,
         }
     }
 
@@ -2618,6 +2694,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: true,
+            write_only: false,
             deferred_populate: false,
         };
 
@@ -2627,6 +2704,29 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "attribute 'provider_id': input mode cannot be both required and read-only"
+        );
+    }
+
+    #[test]
+    fn read_only_write_only_struct_field_is_rejected_at_the_wire_boundary() {
+        let field = proto::StructField {
+            name: "client_secret".to_string(),
+            field_type: proto_string(),
+            required: false,
+            description: None,
+            block_name: None,
+            provider_name: None,
+            read_only: true,
+            write_only: true,
+            deferred_populate: false,
+        };
+
+        let error = proto_struct_field_to_core(&field)
+            .expect_err("read-only and write-only must not form a core StructField");
+
+        assert_eq!(
+            error.to_string(),
+            "attribute 'client_secret': struct field cannot be both write-only and provider-populated"
         );
     }
 
@@ -2648,6 +2748,22 @@ mod tests {
     }
 
     #[test]
+    fn read_only_write_only_attribute_is_rejected_at_the_wire_boundary() {
+        let mut token = proto_attr("token", proto_string());
+        token.read_only = true;
+        token.write_only = true;
+        let schema = proto_resource("test.Resource", [("token".to_string(), token)]);
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("read-only and write-only must not form a core AttributeSchema");
+
+        assert_eq!(
+            error.to_string(),
+            "resource 'test.Resource' attribute 'token': attribute cannot be both write-only and provider-populated"
+        );
+    }
+
+    #[test]
     fn nested_input_mode_error_names_resource_and_full_attribute_path() {
         let illegal_leaf = proto::StructField {
             name: "table_arn".to_string(),
@@ -2657,6 +2773,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: true,
+            write_only: false,
             deferred_populate: false,
         };
         let destination = proto::StructField {
@@ -2670,6 +2787,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             read_only: false,
+            write_only: false,
             deferred_populate: false,
         };
         let metadata = proto_attr(
@@ -2695,6 +2813,134 @@ mod tests {
     }
 
     #[test]
+    fn top_level_write_only_and_write_only_bearing_is_rejected_at_wire_boundary() {
+        let mut config = proto_attr(
+            "config",
+            proto::AttributeType::Struct {
+                name: "Config".to_string(),
+                fields: vec![proto::StructField {
+                    name: "client_secret".to_string(),
+                    field_type: proto_string(),
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: true,
+                    deferred_populate: false,
+                }],
+            },
+        );
+        config.write_only = true;
+        let schema = proto_resource("test.Resource", [("config".to_string(), config)]);
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("whole and nested write-only modes cannot be combined");
+
+        assert_eq!(
+            error.to_string(),
+            "resource 'test.Resource' attribute 'config': top-level attribute cannot be both write-only and write-only-bearing"
+        );
+    }
+
+    #[test]
+    fn schema_write_only_conflict_reports_lexicographically_first_attribute() {
+        let conflicting_attribute = |name: &str| {
+            let mut attribute = proto_attr(
+                name,
+                proto::AttributeType::Struct {
+                    name: "Config".to_string(),
+                    fields: vec![proto::StructField {
+                        name: "client_secret".to_string(),
+                        field_type: proto_string(),
+                        required: false,
+                        description: None,
+                        block_name: None,
+                        provider_name: None,
+                        read_only: false,
+                        write_only: true,
+                        deferred_populate: false,
+                    }],
+                },
+            );
+            attribute.write_only = true;
+            attribute
+        };
+
+        // Select exactly two names whose randomized HashMap iteration order
+        // disagrees with lexical order, so the assertion cannot pass by chance.
+        let hash_builder = std::collections::hash_map::RandomState::new();
+        let mut selected = None;
+        'pairs: for left in 0..32 {
+            for right in (left + 1)..32 {
+                let left = format!("conflict_{left:02}");
+                let right = format!("conflict_{right:02}");
+                let mut attributes = HashMap::with_hasher(hash_builder.clone());
+                attributes.insert(left.clone(), conflicting_attribute(&left));
+                attributes.insert(right.clone(), conflicting_attribute(&right));
+                let iteration_first = attributes.keys().next().expect("two attributes");
+                let lexical_first = attributes.keys().min().expect("two attributes").clone();
+                if iteration_first != &lexical_first {
+                    selected = Some((attributes, lexical_first));
+                    break 'pairs;
+                }
+            }
+        }
+        let (attributes, lexical_first) =
+            selected.expect("find a pair whose hash order differs from lexical order");
+        let mut schema = proto_resource("test.Resource", std::iter::empty());
+        schema.attributes = attributes;
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("both attributes violate the nested write-only invariant");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "resource 'test.Resource' attribute '{lexical_first}': top-level attribute cannot be both write-only and write-only-bearing"
+            )
+        );
+    }
+
+    #[test]
+    fn write_only_bearing_union_member_is_rejected_at_wire_boundary() {
+        let authentication = proto_attr(
+            "authentication",
+            proto::AttributeType::Union {
+                members: vec![
+                    proto_string(),
+                    proto::AttributeType::Struct {
+                        name: "OidcConfig".to_string(),
+                        fields: vec![proto::StructField {
+                            name: "client_secret".to_string(),
+                            field_type: proto_string(),
+                            required: false,
+                            description: None,
+                            block_name: None,
+                            provider_name: None,
+                            read_only: false,
+                            write_only: true,
+                            deferred_populate: false,
+                        }],
+                    },
+                ],
+            },
+        );
+        let schema = proto_resource(
+            "test.Resource",
+            [("authentication".to_string(), authentication)],
+        );
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("a union member must not hide nested write-only fields");
+
+        assert_eq!(
+            error.to_string(),
+            "resource 'test.Resource' attribute 'authentication': union members cannot be write-only-bearing"
+        );
+    }
+
+    #[test]
     fn schema_transport_round_trip_is_exhaustive_for_touched_types() {
         let core_field = CoreStructField::new("provider_id", CoreAttributeType::string())
             .with_description("Provider-assigned identifier")
@@ -2708,7 +2954,7 @@ mod tests {
         .unwrap();
         let proto_field: proto::StructField = serde_json::from_str(&field_json).unwrap();
         let round_tripped_field = proto_struct_field_to_core(&proto_field).unwrap();
-        let CoreStructField {
+        let CoreStructFieldParts {
             name,
             field_type,
             input_mode,
@@ -2716,7 +2962,8 @@ mod tests {
             provider_name,
             block_name,
             deferred_populate,
-        } = &round_tripped_field;
+            write_only,
+        } = round_tripped_field.parts();
         assert_eq!(name, "provider_id");
         assert!(matches!(
             field_type
@@ -2724,18 +2971,33 @@ mod tests {
                 .expect("round-tripped field type must be Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
-        assert_eq!(*input_mode, CoreInputMode::ProviderPopulated);
-        assert_eq!(description.as_deref(), Some("Provider-assigned identifier"));
-        assert_eq!(provider_name.as_deref(), Some("ProviderId"));
-        assert_eq!(block_name.as_deref(), Some("provider_id_block"));
-        assert!(*deferred_populate);
+        assert_eq!(input_mode, CoreInputMode::ProviderPopulated);
+        assert_eq!(description, Some("Provider-assigned identifier"));
+        assert_eq!(provider_name, Some("ProviderId"));
+        assert_eq!(block_name, Some("provider_id_block"));
+        assert!(deferred_populate);
+        assert!(!write_only);
+
+        let write_only_field =
+            CoreStructField::new("client_secret", CoreAttributeType::string()).write_only();
+        let wire = core_struct_field_to_proto_for_schema_round_trip(&write_only_field);
+        assert!(wire.write_only);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["write_only"],
+            true
+        );
+        let round_tripped =
+            proto_struct_field_to_core(&serde_json::from_str::<proto::StructField>(&json).unwrap())
+                .unwrap();
+        assert!(round_tripped.is_write_only());
 
         let required_field = CoreStructField::new("name", CoreAttributeType::string()).required();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
         assert!(proto_required.required);
         assert!(!proto_required.read_only);
         let round_tripped_required = proto_struct_field_to_core(&proto_required).unwrap();
-        assert_eq!(round_tripped_required.input_mode, CoreInputMode::Required);
+        assert_eq!(round_tripped_required.input_mode(), CoreInputMode::Required);
 
         let core_attr = CoreAttributeSchema::new("status", CoreAttributeType::string())
             .with_default(CoreValue::Concrete(ConcreteValue::String(
@@ -2744,7 +3006,6 @@ mod tests {
             .with_description("Eventually populated status")
             .with_provider_name("Status")
             .create_only()
-            .read_only()
             .non_removable()
             .with_block_name("status_block")
             .write_only()
@@ -2755,7 +3016,7 @@ mod tests {
                 .unwrap();
         let proto_attr: proto::AttributeSchema = serde_json::from_str(&attr_json).unwrap();
         let round_tripped_attr = proto_attr_schema_to_core(&proto_attr).unwrap();
-        let CoreAttributeSchema {
+        let CoreAttributeSchemaParts {
             name,
             attr_type,
             input_mode,
@@ -2769,7 +3030,7 @@ mod tests {
             write_only,
             identity,
             deferred_populate,
-        } = &round_tripped_attr;
+        } = round_tripped_attr.parts();
         assert_eq!(name, "status");
         assert!(matches!(
             attr_type
@@ -2777,21 +3038,35 @@ mod tests {
                 .expect("round-tripped attribute type must be Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
-        assert_eq!(*input_mode, CoreInputMode::ProviderPopulated);
+        assert_eq!(input_mode, CoreInputMode::Optional);
         assert!(matches!(
             default,
             Some(CoreValue::Concrete(ConcreteValue::String(value)))
                 if value == "provider-default"
         ));
-        assert_eq!(description.as_deref(), Some("Eventually populated status"));
+        assert_eq!(description, Some("Eventually populated status"));
         assert!(completions.is_none());
-        assert_eq!(provider_name.as_deref(), Some("Status"));
-        assert!(*create_only);
-        assert_eq!(*removable, Some(false));
-        assert_eq!(block_name.as_deref(), Some("status_block"));
-        assert!(*write_only);
-        assert!(*identity);
-        assert!(*deferred_populate);
+        assert_eq!(provider_name, Some("Status"));
+        assert!(create_only);
+        assert_eq!(removable, Some(false));
+        assert_eq!(block_name, Some("status_block"));
+        assert!(write_only);
+        assert!(identity);
+        assert!(deferred_populate);
+
+        let provider_populated_attr =
+            CoreAttributeSchema::new("arn", CoreAttributeType::string()).read_only();
+        let proto_provider_populated =
+            core_attr_schema_to_proto_for_schema_round_trip(&provider_populated_attr);
+        assert!(proto_provider_populated.read_only);
+        assert!(!proto_provider_populated.write_only);
+        let round_tripped_provider_populated =
+            proto_attr_schema_to_core(&proto_provider_populated).unwrap();
+        assert_eq!(
+            round_tripped_provider_populated.input_mode(),
+            CoreInputMode::ProviderPopulated
+        );
+        assert!(!round_tripped_provider_populated.is_write_only());
 
         let required_attr = CoreAttributeSchema::new("region", CoreAttributeType::string())
             .required()
@@ -2802,9 +3077,9 @@ mod tests {
         assert!(proto_required.required);
         assert!(!proto_required.read_only);
         let round_tripped_required = proto_attr_schema_to_core(&proto_required).unwrap();
-        assert_eq!(round_tripped_required.input_mode, CoreInputMode::Required);
+        assert_eq!(round_tripped_required.input_mode(), CoreInputMode::Required);
         assert!(matches!(
-            round_tripped_required.default,
+            round_tripped_required.default_value(),
             Some(CoreValue::Concrete(ConcreteValue::String(value)))
                 if value == "us-east-1"
         ));
@@ -4162,9 +4437,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v11_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 11);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+    fn test_protocol_version_range_is_v12_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 12);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+    }
+
+    #[test]
+    fn test_check_protocol_version_rejects_v11_provider() {
+        let error = check_protocol_version(
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":11}"#,
+        )
+        .expect_err("a v12 host must reject a v11 provider");
+
+        assert!(error.contains("provider 'old'"));
+        assert!(error.contains("protocol version 11"));
+        assert!(error.contains("requires at least version 12"));
     }
 
     #[test]
@@ -4223,6 +4510,35 @@ mod tests {
     }
 
     #[test]
+    fn test_json_to_schemas_requires_nested_write_only_flag() {
+        let err = json_to_schemas(
+            r#"[{
+                "resource_type":"test.Resource",
+                "attributes":{
+                    "config":{
+                        "name":"config",
+                        "attr_type":{
+                            "type":"struct",
+                            "name":"Config",
+                            "fields":[{
+                                "name":"client_secret",
+                                "field_type":{"type":"String"},
+                                "required":true
+                            }]
+                        },
+                        "required":true
+                    }
+                }
+            }]"#,
+        )
+        .expect_err("protocol v12 schema JSON must declare nested write_only");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("schema JSON parse error"));
+        assert!(rendered.contains("missing field `write_only`"));
+    }
+
+    #[test]
     fn test_json_to_schemas_malformed_unique_name_spec_returns_error() {
         let err = json_to_schemas(
             r#"[{
@@ -4267,6 +4583,7 @@ mod tests {
                             "name": "from_port",
                             "field_type": { "type": "Int" },
                             "required": true,
+                            "write_only": false,
                             "description": "Start of port range",
                             "block_name": "from_port_block",
                             "provider_name": "FromPort"
@@ -4275,6 +4592,7 @@ mod tests {
                             "name": "protocol",
                             "field_type": { "type": "String" },
                             "required": true,
+                            "write_only": false,
                             "description": null,
                             "block_name": null,
                             "provider_name": null
@@ -4330,59 +4648,77 @@ mod tests {
         assert_eq!(schemas.len(), 1);
 
         let schema = &schemas[0];
-        assert_eq!(schema.resource_type, "ec2.SecurityGroup");
-        assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
+        let CoreResourceSchemaParts {
+            resource_type,
+            attributes,
+            description,
+            validation,
+            kind,
+            unique_name,
+            operation_config,
+            exclusive_required,
+            default_wait_timeout,
+            default_wait_interval,
+            defs,
+        } = schema.parts();
+        assert_eq!(resource_type, "ec2.SecurityGroup");
+        assert_eq!(description, Some("EC2 Security Group"));
         assert!(!schema.is_data_source());
         assert_eq!(
-            schema.unique_name,
-            CoreUniqueNameSpec::Attribute("group_name".to_string())
+            unique_name,
+            &CoreUniqueNameSpec::Attribute("group_name".to_string())
+        );
+        let _ = (
+            validation,
+            kind,
+            operation_config,
+            exclusive_required,
+            default_wait_timeout,
+            default_wait_interval,
+            defs,
         );
 
         // Basic attribute types
-        let desc_attr = schema
-            .attributes
+        let desc_attr = attributes
             .get("description")
             .expect("description attribute");
-        assert_eq!(desc_attr.name, "description");
+        assert_eq!(desc_attr.name(), "description");
         assert!(matches!(
             desc_attr
-                .attr_type
+                .attr_type()
                 .shape_ref_free()
                 .expect("test schema is Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
         assert!(desc_attr.is_required());
 
-        let enabled_attr = schema.attributes.get("enabled").expect("enabled attribute");
+        let enabled_attr = attributes.get("enabled").expect("enabled attribute");
         assert!(matches!(
             enabled_attr
-                .attr_type
+                .attr_type()
                 .shape_ref_free()
                 .expect("test schema is Ref-free"),
             carina_core::schema::Shape::Bool
         ));
 
-        let priority_attr = schema
-            .attributes
-            .get("priority")
-            .expect("priority attribute");
+        let priority_attr = attributes.get("priority").expect("priority attribute");
         assert!(matches!(
             priority_attr
-                .attr_type
+                .attr_type()
                 .shape_ref_free()
                 .expect("test schema is Ref-free"),
             carina_core::schema::Shape::Int { .. }
         ));
 
         // Ingress attribute: list with ordered=false, provider_name, block_name, removable
-        let ingress_attr = schema.attributes.get("ingress").expect("ingress attribute");
-        assert_eq!(ingress_attr.provider_name.as_deref(), Some("IpPermissions"));
-        assert_eq!(ingress_attr.block_name.as_deref(), Some("ingress_block"));
-        assert_eq!(ingress_attr.removable, Some(false));
+        let ingress_attr = attributes.get("ingress").expect("ingress attribute");
+        assert_eq!(ingress_attr.provider_name(), Some("IpPermissions"));
+        assert_eq!(ingress_attr.block_name(), Some("ingress_block"));
+        assert_eq!(ingress_attr.removability_override(), Some(false));
 
         // List with ordered: false
         match ingress_attr
-            .attr_type
+            .attr_type()
             .shape_ref_free()
             .expect("test schema is Ref-free")
         {
@@ -4405,36 +4741,30 @@ mod tests {
                                 assert_eq!(fields.len(), 2);
 
                                 let from_port = &fields[0];
-                                assert_eq!(from_port.name, "from_port");
+                                assert_eq!(from_port.name(), "from_port");
                                 assert!(matches!(
                                     from_port
-                                        .field_type
+                                        .field_type()
                                         .shape_ref_free()
                                         .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::Int { .. }
                                 ));
                                 assert!(from_port.is_required());
-                                assert_eq!(
-                                    from_port.description.as_deref(),
-                                    Some("Start of port range")
-                                );
-                                assert_eq!(
-                                    from_port.block_name.as_deref(),
-                                    Some("from_port_block")
-                                );
-                                assert_eq!(from_port.provider_name.as_deref(), Some("FromPort"));
+                                assert_eq!(from_port.description(), Some("Start of port range"));
+                                assert_eq!(from_port.block_name(), Some("from_port_block"));
+                                assert_eq!(from_port.provider_name(), Some("FromPort"));
 
                                 let protocol = &fields[1];
-                                assert_eq!(protocol.name, "protocol");
+                                assert_eq!(protocol.name(), "protocol");
                                 assert!(matches!(
                                     protocol
-                                        .field_type
+                                        .field_type()
                                         .shape_ref_free()
                                         .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::String { .. }
                                 ));
-                                assert!(protocol.block_name.is_none());
-                                assert!(protocol.provider_name.is_none());
+                                assert!(protocol.block_name().is_none());
+                                assert!(protocol.provider_name().is_none());
                             }
                             other => panic!("expected Struct, got {:?}", other),
                         }
@@ -4552,7 +4882,7 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            &core_schema.validation,
+            core_schema.validation(),
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators == &[proto::ValidatorType::TagsKeyValueCheck]
         ));
@@ -4574,7 +4904,7 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            &core_schema.validation,
+            core_schema.validation(),
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators.is_empty()
         ));
@@ -4601,8 +4931,8 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert_eq!(
-            core_schema.exclusive_required,
-            vec![vec![
+            core_schema.exclusive_required_groups(),
+            &[vec![
                 "cidr_block".to_string(),
                 "ipv4_ipam_pool_id".to_string(),
             ]]
@@ -4638,8 +4968,8 @@ mod tests {
         let schemas = json_to_schemas(&json).unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(
-            schemas[0].exclusive_required,
-            vec![vec!["a".to_string(), "b".to_string()]]
+            schemas[0].exclusive_required_groups(),
+            &[vec!["a".to_string(), "b".to_string()]]
         );
     }
 
@@ -5170,7 +5500,7 @@ mod tests {
         ]"#;
 
         let schemas = json_to_schemas(json).unwrap();
-        let attr_type = &schemas[0].attributes["id"].attr_type;
+        let attr_type = schemas[0].attributes()["id"].attr_type();
         match attr_type.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String { identity, .. } => {
                 assert_eq!(
@@ -5291,7 +5621,7 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            &core_schema.validation,
+            core_schema.validation(),
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators == &[proto::ValidatorType::TagsKeyValueCheck]
         ));

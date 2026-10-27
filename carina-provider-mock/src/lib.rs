@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 
 pub const BUILTIN_PROVIDER_NAME: &str = "mock";
 const WRITE_ONLY_PASSWORD_ATTRIBUTE: &str = "password";
+const NESTED_WRITE_ONLY_ATTRIBUTE: &str = "oidc_config";
+const NESTED_WRITE_ONLY_FIELD: &str = "client_secret";
 
 const MOCK_STATE_VERSION: u32 = 2;
 
@@ -152,6 +154,18 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
             ))
             .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                NESTED_WRITE_ONLY_ATTRIBUTE,
+                AttributeType::struct_(
+                    "OidcConfig",
+                    vec![
+                        StructField::new("issuer", AttributeType::string()).required(),
+                        StructField::new(NESTED_WRITE_ONLY_FIELD, AttributeType::string())
+                            .required()
+                            .write_only(),
+                    ],
+                ),
+            ))
             .attribute(
                 AttributeSchema::new(WRITE_ONLY_PASSWORD_ATTRIBUTE, AttributeType::string())
                     .write_only(),
@@ -620,6 +634,15 @@ impl MockProvider {
         }
     }
 
+    fn strip_unobservable_nested_write_only(attributes: &mut HashMap<String, Value>) {
+        let Some(Value::Concrete(ConcreteValue::Map(config))) =
+            attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE)
+        else {
+            return;
+        };
+        config.shift_remove(NESTED_WRITE_ONLY_FIELD);
+    }
+
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
         if Some(target) != Self::resource_key(id) {
@@ -764,6 +787,7 @@ impl MockProvider {
 
         let mut state_attrs = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
+        Self::strip_unobservable_nested_write_only(&mut state_attrs);
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
                 state_attrs.remove(attr);
@@ -829,6 +853,7 @@ impl MockProvider {
 
         let mut attributes = resource.resolved_attributes();
         Self::populate_test_resource_identifier_value(id, &mut attributes);
+        Self::strip_unobservable_nested_write_only(&mut attributes);
         Ok(attributes)
     }
 }
@@ -936,11 +961,13 @@ impl MockProvider {
         let states = self.load_states_for_operation()?;
         let attributes = Self::resource_key(id).and_then(|key| {
             states.get(&key).map(|attrs| {
-                attrs
+                let mut attributes: HashMap<_, _> = attrs
                     .iter()
                     .filter(|(key, _value)| key.as_str() != WRITE_ONLY_PASSWORD_ATTRIBUTE)
                     .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-                    .collect()
+                    .collect();
+                Self::strip_unobservable_nested_write_only(&mut attributes);
+                attributes
             })
         });
         if let Some(read_outcome) = &mut read_outcome {
@@ -1213,6 +1240,8 @@ impl Provider for MockProvider {
             states.insert(key, attrs);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
+
+            Self::strip_unobservable_nested_write_only(&mut attributes);
 
             if let Some(config) = partial_update {
                 for attr in &config.missing_attributes {

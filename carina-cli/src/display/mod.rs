@@ -48,8 +48,14 @@ impl HistoricalDisplaySource for HistoricalDisplayAttributes {
 impl HistoricalDisplaySource for HashMap<DeletedInstanceKey, HashMap<String, Value>> {
     fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
         let mut display = HistoricalDisplayAttributes::for_plan(plan);
+        let empty_nested_write_only = carina_core::provider::NestedWriteOnlyRecord::new();
         for (key, attributes) in self {
-            display.set_delete_from_provider_and_persisted(key.clone(), attributes, None);
+            display.set_delete_from_provider_and_persisted(
+                key.clone(),
+                attributes,
+                None,
+                &empty_nested_write_only,
+            );
         }
         Cow::Owned(display)
     }

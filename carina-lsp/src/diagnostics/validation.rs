@@ -185,7 +185,7 @@ impl DiagnosticEngine {
 
         let mut diagnostics = Vec::new();
 
-        for (attr_name, attr_schema) in &schema.attributes {
+        for (attr_name, attr_schema) in schema.attributes() {
             // Resource-level validation reports read-only assignments; do not
             // offer authoring-style hints for attributes the user cannot set.
             if attr_schema.is_read_only() {
@@ -198,7 +198,7 @@ impl DiagnosticEngine {
             // `Ref("LifecycleConfiguration")` whose def carries a
             // `List<Ref<Rule>>` field (same bug class as carina#3349).
             let is_list_struct = matches!(
-                schema.shape_of(&attr_schema.attr_type),
+                schema.shape_of(attr_schema.attr_type()),
                 Shape::List { element_type: inner, .. } if matches!(
                     schema.shape_of(inner),
                     Shape::Struct { .. }
