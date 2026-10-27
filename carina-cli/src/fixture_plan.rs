@@ -590,14 +590,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
 
     let prepared_expansion = reconciled_expansion.seal();
-    let deferred_for_expansion = prepared_expansion
+    let mut expanded_canonical_resources = prepared_expansion
         .expand(
-            &mut canonical_resources,
+            canonical_resources,
             wiring.schemas(),
             &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Print,
         )
         .expect("fixture deferred-for expansion failed");
+    let deferred_for_expansion = expanded_canonical_resources.take_expansion();
     let crate::wiring::PreparedDeferredForExpansionParts {
         mut managed_current,
         data_source_states,
@@ -607,7 +608,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wait_aliases: _,
         moved_pairs,
     } = prepared_expansion.into_parts();
-    let parsed = canonical_resources.parsed();
+    let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()

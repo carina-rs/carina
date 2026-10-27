@@ -113,6 +113,40 @@ pub struct PlanContext {
     pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
+/// A completed plan together with the exact canonical resources consumed by
+/// its deferred-`for` expansion. Field access dereferences to [`PlanContext`]
+/// so existing plan consumers do not need a second, untyped resource channel.
+pub(crate) struct ExpandedPlanContext<E> {
+    context: PlanContext,
+    canonical_resources: ExpandedCanonicalResources<E>,
+}
+
+impl<E> ExpandedPlanContext<E> {
+    fn new(context: PlanContext, canonical_resources: ExpandedCanonicalResources<E>) -> Self {
+        Self {
+            context,
+            canonical_resources,
+        }
+    }
+
+    pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.canonical_resources.parsed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_context(self) -> PlanContext {
+        self.context
+    }
+}
+
+impl<E> std::ops::Deref for ExpandedPlanContext<E> {
+    type Target = PlanContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
 /// State-block targets resolved while constructing [`StateBlockClaims`].
 ///
 /// This keeps plan-time collision checks on the same effectiveness
@@ -2523,9 +2557,7 @@ pub struct DeferredForExpansion {
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     /// Warnings after resolved/deferred loops have been removed from the
-    /// parser view. Saved-plan candidate construction consumes these together
-    /// with `sorted_resources` and `residual_deferred_for` so it cannot create
-    /// a half-expanded file.
+    /// parser view. Retained only by the raw-file test adapter.
     #[cfg(test)]
     residual_warnings: Vec<ParseWarning>,
     /// Loops whose iterable is deferred until apply and should become
@@ -2542,9 +2574,8 @@ pub struct DeferredForExpansion {
     pub refreshable_child_ids: RefreshableChildIds,
     /// Whether `print_warnings()` emitted any `⚠` line during expansion.
     pub printed_warnings: bool,
-    /// Prevent callers from fabricating a post-expansion resource view. A
-    /// saved-plan verifier may only obtain this witness by running the shared
-    /// deferred-`for` expansion step.
+    /// Prevent callers from fabricating expansion metadata. Canonical
+    /// production consumers additionally require [`ExpandedCanonicalResources`].
     _expanded: DeferredForExpansionWitness,
 }
 
@@ -2570,6 +2601,47 @@ impl DeferredForExpansion {
         );
         parsed.warnings = self.residual_warnings;
         parsed
+    }
+}
+
+/// Canonical resources proven to have crossed the shared deferred-`for`
+/// expansion boundary.
+///
+/// The pair is owned and the field is private, so callers cannot combine an
+/// arbitrary canonical pair with expansion metadata. The only production
+/// constructor is [`PreparedDeferredForExpansion::expand`].
+pub(crate) struct ExpandedCanonicalResources<E> {
+    resources: CanonicalResourcePair<E>,
+    expansion: Option<DeferredForExpansion>,
+}
+
+impl<E> ExpandedCanonicalResources<E> {
+    pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.resources.parsed()
+    }
+
+    pub(crate) fn as_pair(&self) -> &CanonicalResourcePair<E> {
+        &self.resources
+    }
+
+    /// Move expansion metadata to a consumer while retaining the branded
+    /// canonical pair. The pair remains an [`ExpandedCanonicalResources`]
+    /// witness and cannot be replaced with an independently assembled view.
+    pub(crate) fn take_expansion(&mut self) -> DeferredForExpansion {
+        self.expansion
+            .take()
+            .expect("deferred-for expansion metadata may only be consumed once")
+    }
+
+    pub(crate) async fn prepare_desired_side_for_plan(
+        &mut self,
+        provider_configs: &[ProviderConfig],
+        normalizer: &dyn ProviderNormalizer,
+        schemas: &SchemaRegistry,
+    ) -> carina_core::provider::ProviderResult<()> {
+        self.resources
+            .prepare_desired_side_for_plan(provider_configs, normalizer, schemas)
+            .await
     }
 }
 
@@ -2639,18 +2711,47 @@ pub fn derive_managed_binding_stability<E>(
 
 impl PreparedDeferredForExpansion {
     /// Expand against the exact addressed state/metadata view sealed by
-    /// one of the prelude's typed address transitions. This is the only
-    /// production constructor for [`DeferredForExpansion`] and its private
-    /// witness.
-    pub(crate) fn expand<E: Clone, T: DeferredExpansionTarget<E>>(
+    /// one of the prelude's typed address transitions, consuming the canonical
+    /// pair into an [`ExpandedCanonicalResources`] witness.
+    pub(crate) fn expand<E: Clone>(
         &self,
-        target: &mut T,
+        mut resources: CanonicalResourcePair<E>,
+        schemas: &SchemaRegistry,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<ExpandedCanonicalResources<E>, AppError> {
+        let expansion = expand_same_config_deferred_for_target(
+            &mut resources,
+            &self.0.sorted_resources,
+            &self.0.managed_current,
+            &self.0.data_source_states,
+            schemas,
+            &self.0.saved_attrs,
+            &self.0.prev_explicit,
+            remote_bindings,
+            &self.0.wait_aliases,
+            &self.0.moved_pairs,
+            &self.0.already_refreshed,
+            warning_policy,
+        )?;
+        Ok(ExpandedCanonicalResources {
+            resources,
+            expansion: Some(expansion),
+        })
+    }
+
+    /// Raw-file expansion is reserved for address-preserving state refresh
+    /// and focused tests. Production plan/apply paths must use [`Self::expand`]
+    /// so the canonical pair is consumed into an owned witness.
+    pub(crate) fn expand_parsed<E: Clone>(
+        &self,
+        parsed: &mut carina_core::parser::File<E>,
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<DeferredForExpansion, AppError> {
         expand_same_config_deferred_for_target(
-            target,
+            parsed,
             &self.0.sorted_resources,
             &self.0.managed_current,
             &self.0.data_source_states,
@@ -2703,14 +2804,15 @@ impl PreparedDeferredForExpansion {
 pub(crate) trait DeferredExpansionTarget<E> {
     fn parsed(&self) -> &carina_core::parser::File<E>;
 
-    fn expand_selected(
+    fn expand_partitioned(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
+        selected: Vec<carina_core::parser::DeferredForExpression>,
+        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError>;
-
-    fn retain_deferred(&mut self, deferred: Vec<carina_core::parser::DeferredForExpression>);
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    >;
 }
 
 impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
@@ -2718,17 +2820,16 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         self.parsed()
     }
 
-    fn expand_selected(
+    fn expand_partitioned(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
+        selected: Vec<carina_core::parser::DeferredForExpression>,
+        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
-        self.expand_deferred_for_expressions(deferred, suppressed_warning_locations, bindings)
-    }
-
-    fn retain_deferred(&mut self, deferred: Vec<carina_core::parser::DeferredForExpression>) {
-        self.retain_deferred_for_expressions(deferred);
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    > {
+        self.expand_deferred_for_expressions(selected, retained, bindings)
     }
 }
 
@@ -2737,24 +2838,26 @@ impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
         self
     }
 
-    fn expand_selected(
+    fn expand_partitioned(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
+        selected: Vec<carina_core::parser::DeferredForExpression>,
+        retained: Vec<carina_core::parser::DeferredForExpression>,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    > {
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
-                || !suppressed_warning_locations
+                || !retained
                     .iter()
-                    .any(|location| location == &(warning.file.clone(), warning.line))
+                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.deferred_for_expressions = deferred;
-        self.expand_deferred_for_expressions(bindings)
-    }
-
-    fn retain_deferred(&mut self, deferred: Vec<carina_core::parser::DeferredForExpression>) {
-        self.deferred_for_expressions.extend(deferred);
+        self.deferred_for_expressions = selected;
+        self.expand_deferred_for_expressions(bindings)?;
+        let residual = self.deferred_for_expressions.clone();
+        self.deferred_for_expressions.extend(retained);
+        Ok(residual)
     }
 }
 
@@ -2852,37 +2955,21 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         })
         .collect();
 
-    let suppressed_warning_locations = deferred_create_targets
+    let retained_deferred_for = deferred_create_targets
         .iter()
-        .map(|target| (target.template.file.clone(), target.template.line))
+        .map(|target| target.template.clone())
         .collect::<Vec<_>>();
-    target
-        .expand_selected(
+    let residual_deferred_for = target
+        .expand_partitioned(
             pre_expandable_deferred_for,
-            &suppressed_warning_locations,
+            retained_deferred_for,
             &iterable_bindings,
         )
         .map_err(|error| AppError::Validation(error.to_string()))?;
-    let (printed_warnings, residual_deferred_for) = {
-        let parsed = target.parsed();
-        (
-            warning_policy == DeferredForWarningPolicy::Print && parsed.print_warnings(),
-            parsed.deferred_for_expressions.clone(),
-        )
-    };
+    let printed_warnings =
+        warning_policy == DeferredForWarningPolicy::Print && target.parsed().print_warnings();
     #[cfg(test)]
     let residual_warnings = target.parsed().warnings.clone();
-
-    // `DeferredCreate`/`DeferredReplace` still need their freshly evaluated
-    // templates at saved-plan verification time. Expansion intentionally
-    // excluded these from `expand_selected`; restore them to the same owned
-    // canonical file after capturing the diagnostic-only residual set.
-    target.retain_deferred(
-        deferred_create_targets
-            .iter()
-            .map(|target| target.template.clone())
-            .collect(),
-    );
     let parsed = target.parsed();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -2982,7 +3069,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         orphans: Orphans::new(),
     });
     let mut expanded = parsed.clone();
-    prepared.expand(
+    prepared.expand_parsed(
         &mut expanded,
         schemas,
         remote_bindings,
@@ -3017,7 +3104,10 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// inside this operation prevents a refresh path from transforming only one
 /// part of prior state.
 #[non_exhaustive]
-pub struct ExpandedRefreshState {
+pub struct ExpandedRefreshState<E> {
+    /// Present only for plan/apply expansion. State refresh deliberately uses
+    /// the raw parsed-file path and therefore cannot mint this witness.
+    pub(crate) canonical_resources: Option<ExpandedCanonicalResources<E>>,
     pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -3033,7 +3123,7 @@ pub struct ExpandedRefreshState {
 /// arg list would already trip the 7-argument lint here.
 pub(crate) enum ExpandRefreshConfig<'a, E> {
     Parsed(&'a mut carina_core::parser::File<E>),
-    Canonical(&'a mut CanonicalResourcePair<E>),
+    Canonical(Box<CanonicalResourcePair<E>>),
 }
 
 pub(crate) struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
@@ -3056,23 +3146,30 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + Provide
 ///
 /// See [`ExpandedRefreshState`] for why this is a single function.
 pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
-    mut inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
-) -> Result<ExpandedRefreshState, AppError> {
+    inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
+) -> Result<ExpandedRefreshState<E>, AppError> {
     // Phase 1: expand for-loops.
-    let expansion = match &mut inputs.config {
-        ExpandRefreshConfig::Parsed(parsed) => inputs.expansion.expand(
-            *parsed,
-            inputs.schemas,
-            inputs.remote_bindings,
-            inputs.warning_policy,
+    let (canonical_resources, expansion) = match inputs.config {
+        ExpandRefreshConfig::Parsed(parsed) => (
+            None,
+            inputs.expansion.expand_parsed(
+                parsed,
+                inputs.schemas,
+                inputs.remote_bindings,
+                inputs.warning_policy,
+            )?,
         ),
-        ExpandRefreshConfig::Canonical(resources) => inputs.expansion.expand(
-            *resources,
-            inputs.schemas,
-            inputs.remote_bindings,
-            inputs.warning_policy,
-        ),
-    }?;
+        ExpandRefreshConfig::Canonical(resources) => {
+            let mut expanded = inputs.expansion.expand(
+                *resources,
+                inputs.schemas,
+                inputs.remote_bindings,
+                inputs.warning_policy,
+            )?;
+            let expansion = expanded.take_expansion();
+            (Some(expanded), expansion)
+        }
+    };
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
@@ -3133,6 +3230,7 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
     lift_prior_state_enum_leaves(managed_current, orphans, &sorted_resources, inputs.schemas);
 
     Ok(ExpandedRefreshState {
+        canonical_resources,
         sorted_resources,
         residual_deferred_for,
         deferred_create_targets,
@@ -3145,7 +3243,7 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
-    canonical_resources: &mut CanonicalResourcePair<E>,
+    canonical_resources: CanonicalResourcePair<E>,
     provider_configs: &ResolvedProviderConfigs,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -3153,7 +3251,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
-) -> Result<PlanContext, AppError> {
+) -> Result<ExpandedPlanContext<E>, AppError> {
     let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
@@ -3168,7 +3266,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // are refreshed in a later phase against the already-populated
     // `managed_current`.
     let expansion_prelude =
-        DeferredForExpansionPrelude::new(canonical_resources, state_file, ctx.schemas())?;
+        DeferredForExpansionPrelude::new(&canonical_resources, state_file, ctx.schemas())?;
     // Refresh phases borrow the exact list retained by the typed prelude; no
     // second owned resource graph can diverge before the transition below.
     let sorted_resources = expansion_prelude.sorted_resources();
@@ -3434,6 +3532,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // here we perform the I/O half — targeted-refresh of the children
     // so a re-plan after they were applied sees their live state
     // instead of a phantom Create.
+    let mut expanded_canonical_resources = prepared_expansion.expand(
+        canonical_resources,
+        ctx.schemas(),
+        remote_bindings,
+        DeferredForWarningPolicy::Print,
+    )?;
+    let expansion = expanded_canonical_resources.take_expansion();
     let DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
@@ -3444,12 +3549,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         refreshable_child_ids,
         printed_warnings,
         _expanded: _,
-    } = prepared_expansion.expand(
-        canonical_resources,
-        ctx.schemas(),
-        remote_bindings,
-        DeferredForWarningPolicy::Print,
-    )?;
+    } = expansion;
     let sorted_resources = resorted;
     let PreparedDeferredForExpansionParts {
         mut managed_current,
@@ -3460,7 +3560,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         wait_aliases,
         moved_pairs,
     } = prepared_expansion.into_parts();
-    let parsed = canonical_resources.parsed();
+    let parsed = expanded_canonical_resources.parsed();
 
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
@@ -3563,7 +3663,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     );
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            canonical_resources,
+            expanded_canonical_resources.as_pair(),
             state_file.as_ref(),
             PreApplyInputs {
                 managed: &[],
@@ -3633,24 +3733,27 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
         let managed_current = into_all_prior_states(orphans, managed_current);
-        return Ok(PlanContext {
-            plan,
-            provider,
-            // Error plans are aborted before any resolved-resource consumer,
-            // including plan-image rendering. Do not weaken the successful
-            // path's type invariant to retain unusable pending resources.
-            sorted_resources: Vec::new(),
-            unresolved_resources: Vec::new(),
-            compositions: prepared_compositions,
-            data_sources: data_sources_for_plan,
-            managed_current,
-            data_source_states,
-            moved_origins,
-            upstream_snapshot: remote_bindings.clone(),
-            prev_explicit,
-            residual_deferred_for,
-            expansion_trace: parsed.expansion_trace.clone(),
-        });
+        return Ok(ExpandedPlanContext::new(
+            PlanContext {
+                plan,
+                provider,
+                // Error plans are aborted before any resolved-resource consumer,
+                // including plan-image rendering. Do not weaken the successful
+                // path's type invariant to retain unusable pending resources.
+                sorted_resources: Vec::new(),
+                unresolved_resources: Vec::new(),
+                compositions: prepared_compositions,
+                data_sources: data_sources_for_plan,
+                managed_current,
+                data_source_states,
+                moved_origins,
+                upstream_snapshot: remote_bindings.clone(),
+                prev_explicit,
+                residual_deferred_for,
+                expansion_trace: parsed.expansion_trace.clone(),
+            },
+            expanded_canonical_resources,
+        ));
     }
 
     // Anonymous resources whose identity attributes include ResourceRefs can
@@ -3771,28 +3874,31 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .map(ResolvedResource::into_inner)
         .map(UnresolvedResource::from_pre_resolve)
         .collect();
-    Ok(PlanContext {
-        plan,
-        provider,
-        // Keep the evaluated desired view distinct from the authored
-        // pre-resolution snapshot. Before carina#3861 this field was filled
-        // with `paired_unresolved_resources`; for let-bound resources that
-        // pairing deliberately prefers `unresolved_parsed` and therefore
-        // restored unevaluated calls such as `secret("...")`. Anonymous
-        // resources have no binding and kept this evaluated view, producing
-        // the bound/anonymous saved-plan divergence.
-        sorted_resources: resolved_resources,
-        unresolved_resources,
-        compositions: prepared_compositions,
-        data_sources: data_sources_for_plan,
-        managed_current,
-        data_source_states,
-        moved_origins,
-        upstream_snapshot: remote_bindings.clone(),
-        prev_explicit,
-        residual_deferred_for,
-        expansion_trace: parsed.expansion_trace.clone(),
-    })
+    Ok(ExpandedPlanContext::new(
+        PlanContext {
+            plan,
+            provider,
+            // Keep the evaluated desired view distinct from the authored
+            // pre-resolution snapshot. Before carina#3861 this field was filled
+            // with `paired_unresolved_resources`; for let-bound resources that
+            // pairing deliberately prefers `unresolved_parsed` and therefore
+            // restored unevaluated calls such as `secret("...")`. Anonymous
+            // resources have no binding and kept this evaluated view, producing
+            // the bound/anonymous saved-plan divergence.
+            sorted_resources: resolved_resources,
+            unresolved_resources,
+            compositions: prepared_compositions,
+            data_sources: data_sources_for_plan,
+            managed_current,
+            data_source_states,
+            moved_origins,
+            upstream_snapshot: remote_bindings.clone(),
+            prev_explicit,
+            residual_deferred_for,
+            expansion_trace: parsed.expansion_trace.clone(),
+        },
+        expanded_canonical_resources,
+    ))
 }
 
 fn resolved_state_row_id(

@@ -1572,7 +1572,7 @@ async fn run_apply_with_observer_factory(
     // heartbeat loss returns without a capability that could be released.
     let outcome = run_apply_locked_owned(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         auto_approve,
         Arc::clone(&backend),
         state_lock,
@@ -1703,7 +1703,7 @@ struct SavedPlanApplyExecuted {
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_locked_owned(
     ctx: &WiringContext,
-    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    mut canonical_resources: CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
@@ -1756,7 +1756,7 @@ async fn run_apply_locked_owned(
                 )?;
             }
 
-            reconcile_canonical_prefixed_names(canonical_resources, &state_file);
+            reconcile_canonical_prefixed_names(&mut canonical_resources, &state_file);
             let parsed = canonical_resources.parsed();
             let crate::wiring::StateBlockResolution {
                 claims: state_block_claims,
@@ -1781,7 +1781,7 @@ async fn run_apply_locked_owned(
             if let Some(sf) = state_file.as_mut() {
                 reconcile_canonical_anonymous_identifiers_with_ctx(
                     ctx,
-                    canonical_resources,
+                    &mut canonical_resources,
                     sf,
                     &state_block_claims,
                 )?;
@@ -1809,7 +1809,7 @@ async fn run_apply_locked_owned(
             // managed resources are dependency-sorted; data sources are
             // refreshed in a later phase against the populated `managed_current`.
             let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
-                canonical_resources,
+                &canonical_resources,
                 &state_file,
                 ctx.schemas(),
             )?;
@@ -2046,6 +2046,7 @@ async fn run_apply_locked_owned(
             // constructor is the only way to obtain an `ExpandedRefreshState`
             // — leaving a phase out becomes a compile error.
             let crate::wiring::ExpandedRefreshState {
+                canonical_resources: expanded_canonical_resources,
                 sorted_resources: resorted,
                 residual_deferred_for,
                 deferred_create_targets,
@@ -2054,7 +2055,9 @@ async fn run_apply_locked_owned(
                 printed_warnings: _,
             } = crate::wiring::expand_refresh_and_lift_states(
                 crate::wiring::ExpandRefreshAndLiftInputs {
-                    config: crate::wiring::ExpandRefreshConfig::Canonical(canonical_resources),
+                    config: crate::wiring::ExpandRefreshConfig::Canonical(Box::new(
+                        canonical_resources,
+                    )),
                     provider: &provider,
                     expansion: &mut prepared_expansion,
                     warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
@@ -2076,11 +2079,12 @@ async fn run_apply_locked_owned(
                 wait_aliases,
                 moved_pairs,
             } = prepared_expansion.into_parts();
-            let parsed = canonical_resources.parsed();
+            let expanded_canonical_resources = expanded_canonical_resources
+                .expect("canonical expansion must return canonical resources");
+            let parsed = expanded_canonical_resources.parsed();
             progress_backend.finish_refresh_phase();
-            // Expansion mutates the canonical file in place. Keep passing the
-            // explicit residual list to `print_plan`, matching the plan path's
-            // `ctx.residual_deferred_for` (`commands/plan.rs`).
+            // Keep passing the explicit residual list to `print_plan`, matching
+            // the plan path's `ctx.residual_deferred_for` (`commands/plan.rs`).
 
             // Data-source lifting stays inline: it operates on
             // `parsed.data_sources` (not `sorted_resources`), so it is
@@ -2123,7 +2127,7 @@ async fn run_apply_locked_owned(
             )?;
             let (mut override_aware_resources, unresolved_override_aware_resources) =
                 OverrideAwareResources::build_pair_with_stability(
-                    canonical_resources,
+                    expanded_canonical_resources.as_pair(),
                     state_file.as_ref(),
                     carina_core::binding_index::PreApplyInputs {
                         managed: &[],
@@ -2641,7 +2645,7 @@ async fn run_apply_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    let mut canonical_resources = crate::wiring::resolve_config_block_names_with_ctx(
+    let canonical_resources = crate::wiring::resolve_config_block_names_with_ctx(
         ctx,
         parsed.clone(),
         unresolved_parsed.clone(),
@@ -2649,7 +2653,7 @@ async fn run_apply_locked(
     .map_err(super::collapse_errors)?;
     run_apply_locked_canonical(
         ctx,
-        &mut canonical_resources,
+        canonical_resources,
         auto_approve,
         backend,
         lock,
@@ -2667,7 +2671,7 @@ async fn run_apply_locked(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_locked_canonical(
     ctx: &WiringContext,
-    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    canonical_resources: CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
@@ -2829,7 +2833,7 @@ fn import_identifiers_from_current_config(
 /// normalizers; CRUD-capable providers are created after every desired secret
 /// has been verified.
 async fn prepare_saved_plan_secret_candidates(
-    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    mut canonical_resources: CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     pending_plan: &ReloadedPendingPlanFile,
     state_file: &Option<StateFile>,
     base_dir: &Path,
@@ -2841,7 +2845,7 @@ async fn prepare_saved_plan_secret_candidates(
         provider_inputs,
         state_blocks,
     } = prepare_plan_identity_and_provider_inputs(
-        canonical_resources,
+        &mut canonical_resources,
         &mut candidate_state,
         base_dir,
         provider_context,
@@ -2855,7 +2859,7 @@ async fn prepare_saved_plan_secret_candidates(
     // neither performs provider reads nor observes apply-time drift.
     let parsed = canonical_resources.parsed();
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
-        canonical_resources,
+        &canonical_resources,
         &candidate_state,
         wiring.schemas(),
     )?;
@@ -2876,7 +2880,7 @@ async fn prepare_saved_plan_secret_candidates(
             crate::wiring::DeferredForWarningPolicy::Suppress,
         )?
         .seal();
-    let expansion = prepared_expansion.expand(
+    let mut expanded_canonical_resources = prepared_expansion.expand(
         canonical_resources,
         wiring.schemas(),
         provider_inputs.remote_bindings(),
@@ -2885,7 +2889,7 @@ async fn prepare_saved_plan_secret_candidates(
 
     let normalizers =
         create_normalizers_from_configs_with_ctx(&wiring, provider_inputs.configs()).await?;
-    canonical_resources
+    expanded_canonical_resources
         .prepare_desired_side_for_plan(
             provider_inputs.configs().as_provider_configs(),
             &normalizers,
@@ -2895,7 +2899,7 @@ async fn prepare_saved_plan_secret_candidates(
         .map_err(AppError::Provider)?;
 
     let candidates =
-        SavedPlanSecretCandidates::from_expansion(canonical_resources, provider_inputs, expansion);
+        SavedPlanSecretCandidates::from_expansion(expanded_canonical_resources, provider_inputs);
 
     Ok((candidates, wiring))
 }
@@ -3213,7 +3217,7 @@ async fn run_apply_from_plan_with_observer_factory(
     let parsed_backend = loaded_current_config
         .as_ref()
         .map(|config| config.parsed.backend.clone());
-    let mut current_resources = if needs_secret_verification {
+    let current_resources = if needs_secret_verification {
         let current_config = loaded_current_config
             .take()
             .expect("secret verification requires a loaded current configuration");
@@ -3289,7 +3293,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        current_resources.as_mut(),
+        current_resources,
         provider_context,
         auto_approve,
         Arc::clone(&backend),
@@ -3314,7 +3318,7 @@ async fn run_apply_from_plan_with_observer_factory(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
     inspected_plan: InspectedPlanFile,
-    current_resources: Option<&mut CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
+    current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3822,7 +3826,7 @@ async fn run_apply_from_plan_locked_owned(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
     inspected_plan: InspectedPlanFile,
-    current_resources: Option<&mut CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
+    current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,

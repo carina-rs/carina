@@ -144,34 +144,28 @@ impl<E> CanonicalResourcePair<E> {
         )
     }
 
-    /// Materialize the selected deferred-for templates in the owned evaluated
-    /// file. Generated children inherit canonical attribute names from their
-    /// already-resolved templates.
+    /// Materialize the selected deferred-for templates and retain the
+    /// deliberately deferred partition as one atomic update of the owned
+    /// evaluated file. Generated children and retained templates both inherit
+    /// canonical attribute names from the already-resolved file.
     pub fn expand_deferred_for_expressions(
         &mut self,
-        deferred: Vec<crate::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
+        selected: Vec<crate::parser::DeferredForExpression>,
+        retained: Vec<crate::parser::DeferredForExpression>,
         bindings: &crate::binding_index::IterableBindings<'_>,
-    ) -> Result<(), crate::parser::DeferredForExpansionError> {
+    ) -> Result<Vec<crate::parser::DeferredForExpression>, crate::parser::DeferredForExpansionError>
+    {
         self.parsed.warnings.retain(|warning| {
             warning.kind != crate::parser::WarningKind::DeferredFor
-                || !suppressed_warning_locations
+                || !retained
                     .iter()
-                    .any(|location| location == &(warning.file.clone(), warning.line))
+                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.parsed.deferred_for_expressions = deferred;
-        self.parsed.expand_deferred_for_expressions(bindings)
-    }
-
-    /// Retain templates that deliberately became deferred create/replace
-    /// effects rather than concrete children. The shared expansion prelude
-    /// selects only concretely expandable loops above, so these templates must
-    /// be restored to the owned file for saved-plan secret verification.
-    pub fn retain_deferred_for_expressions(
-        &mut self,
-        deferred: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
-    ) {
-        self.parsed.deferred_for_expressions.extend(deferred);
+        self.parsed.deferred_for_expressions = selected;
+        self.parsed.expand_deferred_for_expressions(bindings)?;
+        let residual = self.parsed.deferred_for_expressions.clone();
+        self.parsed.deferred_for_expressions.extend(retained);
+        Ok(residual)
     }
 
     /// Run the provider-bound desired normalization pipeline on the owned

@@ -308,7 +308,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resources: unresolved_resources.to_vec(),
         ..Default::default()
     };
-    let mut canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+    let canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         ctx.schemas(),
@@ -316,7 +316,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     .expect("test block-name resolution must succeed");
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         provider_configs,
         state_file,
         refresh,
@@ -326,6 +326,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         base_dir,
     )
     .await
+    .map(ExpandedPlanContext::into_context)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1031,10 +1032,10 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
-    let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+    let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &None,
         false,
@@ -1483,7 +1484,7 @@ let shared = read test.shared.Type {}
         provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut canonical_resources = canonical_pair(
+    let canonical_resources = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
@@ -1491,7 +1492,7 @@ let shared = read test.shared.Type {}
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &state_file,
         true,
@@ -3854,14 +3855,14 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_pair(
+    let canonical_resources = canonical_pair(
         &parsed,
         unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &Some(state_file),
         false,
@@ -3872,6 +3873,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     )
     .await
     .expect("plan should build");
+    let plan_ctx = plan_ctx.into_context();
 
     let subnet_create = plan_ctx
         .plan
@@ -5932,7 +5934,7 @@ mod expand_same_config_deferred_for_tests {
             .seal();
 
         let out = prepared
-            .expand(
+            .expand_parsed(
                 &mut parsed,
                 &schemas,
                 &HashMap::new(),
@@ -8192,10 +8194,10 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
-        let mut canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
+        let canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &mut canonical_resources,
+            canonical_resources,
             &provider_configs,
             &None,
             true,
@@ -8267,10 +8269,10 @@ exports { team_prefix: String = "x" }"#,
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test provider configs must resolve");
-        let mut canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+        let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
-            &mut canonical_resources,
+            canonical_resources,
             &provider_configs,
             &None,
             true,

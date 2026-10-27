@@ -1316,6 +1316,7 @@ async fn run_state_refresh_locked_with_ctx(
         .seal();
     let progress = ProgressBackend::new();
     let crate::wiring::ExpandedRefreshState {
+        canonical_resources: _,
         sorted_resources: resorted,
         new_child_ids: _,
         refreshable_child_ids: _,

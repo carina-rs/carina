@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use carina_core::override_aware::CanonicalResourcePair;
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
@@ -12,7 +11,7 @@ use crate::commands::plan::{
     ResolvedProviderInputs, UpstreamSource,
 };
 use crate::error::AppError;
-use crate::wiring::DeferredForExpansion;
+use crate::wiring::ExpandedCanonicalResources;
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -210,8 +209,8 @@ pub(super) struct ExpansionPriorStates {
 /// Fresh source values whose managed-resource slice is proven to have crossed
 /// the same deferred-`for` expansion seam as plan recording.
 ///
-/// The fields are private and the production constructor requires the opaque
-/// [`DeferredForExpansion`] witness, so a pending saved plan cannot be
+/// The fields are private and the production constructor consumes the opaque
+/// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
     source: SavedPlanSecretCandidateSource,
@@ -219,24 +218,18 @@ pub(super) struct SavedPlanSecretCandidates {
 }
 
 enum SavedPlanSecretCandidateSource {
-    Canonical(CanonicalResourcePair<InferredExportParam>),
+    Canonical(Box<ExpandedCanonicalResources<InferredExportParam>>),
     #[cfg(test)]
-    Parsed(carina_core::parser::InferredFile),
+    Parsed(Box<carina_core::parser::InferredFile>),
 }
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        canonical_resources: &CanonicalResourcePair<InferredExportParam>,
+        canonical_resources: ExpandedCanonicalResources<InferredExportParam>,
         provider_inputs: ResolvedProviderInputs,
-        expansion: DeferredForExpansion,
     ) -> Self {
-        debug_assert_eq!(
-            expansion.sorted_resources.len(),
-            canonical_resources.parsed().resources.len(),
-            "the expansion witness and canonical candidate view must describe the same resources"
-        );
         Self {
-            source: SavedPlanSecretCandidateSource::Canonical(canonical_resources.clone()),
+            source: SavedPlanSecretCandidateSource::Canonical(Box::new(canonical_resources)),
             provider_inputs,
         }
     }
@@ -247,7 +240,7 @@ impl SavedPlanSecretCandidates {
         provider_inputs: ResolvedProviderInputs,
     ) -> Self {
         Self {
-            source: SavedPlanSecretCandidateSource::Parsed(parsed),
+            source: SavedPlanSecretCandidateSource::Parsed(Box::new(parsed)),
             provider_inputs,
         }
     }
