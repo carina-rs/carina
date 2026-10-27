@@ -33,6 +33,19 @@ impl ResourceTypePatterns {
             .find(|pattern| segment.contains(pattern.as_str()))
             .map(String::as_str)
     }
+
+    pub(crate) fn header_resource_type<'a>(&'a self, segment: &str) -> Option<&'a str> {
+        let trimmed = segment.trim();
+        let after_binding = strip_let_assignment(trimmed).unwrap_or(trimmed);
+        let candidate = strip_keyword(after_binding, "read")
+            .unwrap_or(after_binding)
+            .trim();
+
+        self.0
+            .iter()
+            .find(|pattern| candidate == pattern.as_str())
+            .map(String::as_str)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +83,7 @@ enum SegmentScanMode {
 struct LineSegment {
     raw: String,
     code: String,
+    block_code: String,
 }
 
 enum BraceOpener {
@@ -79,6 +93,13 @@ enum BraceOpener {
     ControlFlow,
     Anonymous,
     Other,
+}
+
+#[derive(Clone, Copy)]
+enum ElseState {
+    None,
+    AwaitingBranchCloser,
+    ReclassifyBranchOpener,
 }
 
 struct PathSegment {
@@ -108,8 +129,7 @@ pub(crate) fn enclosing_block(
     let mut bracket_depth = 0_usize;
     let mut reverse_path = Vec::new();
     let mut crossed_list_element = false;
-    let mut awaiting_previous_branch_closer = false;
-    let mut reclassify_previous_branch_opener = false;
+    let mut else_state = ElseState::None;
 
     for line_index in (0..=current_line).rev() {
         let source_chars: Vec<char> = source_lines[line_index].chars().collect();
@@ -129,18 +149,25 @@ pub(crate) fn enclosing_block(
             match source_chars[char_index] {
                 '}' => {
                     brace_depth += 1;
-                    if awaiting_previous_branch_closer {
-                        awaiting_previous_branch_closer = false;
-                        reclassify_previous_branch_opener = true;
+                    match else_state {
+                        ElseState::None => {}
+                        ElseState::AwaitingBranchCloser => {
+                            else_state = ElseState::ReclassifyBranchOpener;
+                        }
+                        ElseState::ReclassifyBranchOpener => {}
                     }
                 }
                 '{' => {
                     if brace_depth > 0 {
                         brace_depth -= 1;
-                        if !reclassify_previous_branch_opener || brace_depth != 0 {
+                        let should_reclassify = match else_state {
+                            ElseState::None | ElseState::AwaitingBranchCloser => false,
+                            ElseState::ReclassifyBranchOpener => brace_depth == 0,
+                        };
+                        if !should_reclassify {
                             continue;
                         }
-                        reclassify_previous_branch_opener = false;
+                        else_state = ElseState::None;
                     }
 
                     let segment = scan_line_segment(
@@ -165,7 +192,9 @@ pub(crate) fn enclosing_block(
                             reverse_path.push(path_segment);
                             crossed_list_element = false;
                         }
-                        BraceOpener::Else => awaiting_previous_branch_closer = true,
+                        BraceOpener::Else => {
+                            else_state = ElseState::AwaitingBranchCloser;
+                        }
                         BraceOpener::ControlFlow => {}
                         BraceOpener::Anonymous => {
                             // A nameless `{` after `[` or `,` is a transparent
@@ -210,6 +239,7 @@ fn scan_line_segment(
     mode: SegmentScanMode,
 ) -> LineSegment {
     let mut segment_start = 0;
+    let mut block_start = 0;
     let mut openers = Vec::new();
 
     for index in 0..limit {
@@ -220,10 +250,12 @@ fn scan_line_segment(
             '{' => {
                 openers.push(LineOpener::Brace);
                 segment_start = index + 1;
+                block_start = index + 1;
             }
             '}' => {
                 pop_line_opener(&mut openers, LineOpener::Brace);
                 segment_start = index + 1;
+                block_start = index + 1;
             }
             '[' => {
                 openers.push(LineOpener::Bracket);
@@ -257,9 +289,24 @@ fn scan_line_segment(
     }
 
     let raw = source_chars[segment_start..limit].iter().collect();
-    let code = source_chars[segment_start..limit]
+    let code = masked_code(source_chars, classified, segment_start, limit);
+    let block_code = masked_code(source_chars, classified, block_start, limit);
+    LineSegment {
+        raw,
+        code,
+        block_code,
+    }
+}
+
+fn masked_code(
+    source_chars: &[char],
+    classified: &[crate::lex::ClassifiedChar],
+    start: usize,
+    limit: usize,
+) -> String {
+    source_chars[start..limit]
         .iter()
-        .zip(&classified[segment_start..limit])
+        .zip(&classified[start..limit])
         .map(|(character, classified)| {
             if classified.kind() == LexKind::Code {
                 *character
@@ -267,8 +314,7 @@ fn scan_line_segment(
                 ' '
             }
         })
-        .collect();
-    LineSegment { raw, code }
+        .collect()
 }
 
 /// Return the current field/value segment on the cursor line.
@@ -347,11 +393,11 @@ fn classify_brace_opener(
     segment: &LineSegment,
     resource_types: &ResourceTypePatterns,
 ) -> BraceOpener {
-    if let Some(resource_type) = resource_types.find_in(&segment.code) {
+    if let Some(resource_type) = resource_types.header_resource_type(&segment.code) {
         BraceOpener::Resource(resource_type.to_string())
     } else if is_else_segment(&segment.code) {
         BraceOpener::Else
-    } else if is_control_flow_segment(&segment.code) {
+    } else if is_control_flow_segment(&segment.block_code) {
         BraceOpener::ControlFlow
     } else if let Some(path_segment) = parse_path_segment(segment, true) {
         BraceOpener::Path(path_segment)
@@ -369,10 +415,26 @@ fn is_else_segment(segment: &str) -> bool {
 
 fn is_control_flow_segment(segment: &str) -> bool {
     let trimmed = segment.trim();
-    trimmed == "if"
-        || trimmed.starts_with("if ")
-        || trimmed == "for"
-        || trimmed.starts_with("for ") && trimmed.contains(" in ")
+    let expression = strip_let_assignment(trimmed).unwrap_or(trimmed);
+    expression == "if"
+        || expression.starts_with("if ")
+        || expression == "for"
+        || expression.starts_with("for ") && expression.contains(" in ")
+}
+
+fn strip_let_assignment(segment: &str) -> Option<&str> {
+    let after_let = strip_keyword(segment, "let")?;
+    let (binding, expression) = after_let.split_once('=')?;
+    is_identifier(binding.trim()).then(|| expression.trim_start())
+}
+
+fn strip_keyword<'a>(segment: &'a str, keyword: &str) -> Option<&'a str> {
+    let remainder = segment.strip_prefix(keyword)?;
+    remainder
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then(|| remainder.trim_start())
 }
 
 fn is_string_literal(candidate: &str) -> bool {

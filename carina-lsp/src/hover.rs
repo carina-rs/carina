@@ -764,6 +764,51 @@ mod tests {
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
+    fn review_round3_resource_header_hover_provider() -> HoverProvider {
+        let security_group = ResourceSchema::new("ec2.SecurityGroup").attribute(
+            AttributeSchema::new("description", AttributeType::string())
+                .with_description("REAL RESOURCE DESCRIPTION"),
+        );
+        let vpc = ResourceSchema::new("ec2.Vpc").attribute(
+            AttributeSchema::new("description", AttributeType::string())
+                .with_description("REAL RESOURCE DESCRIPTION"),
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("aws", security_group);
+        schemas.insert("aws", vpc);
+        HoverProvider::new(Arc::new(schemas), vec![])
+    }
+
+    fn assert_module_argument_hover_in_control_flow(text: &str) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let module_dir = temp_dir.path().join("modules").join("example");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            "arguments {\n  arg: String\n}\n",
+        )
+        .unwrap();
+        let consumer_dir = temp_dir.path().join("consumer");
+        std::fs::create_dir(&consumer_dir).unwrap();
+        std::fs::write(
+            consumer_dir.join("imports.crn"),
+            "let mymod = use { source = '../modules/example' }\n",
+        )
+        .unwrap();
+        std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
+
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let content = hover_markdown(
+            &provider,
+            &doc,
+            hover_position(text, "arg", 0),
+            Some(&consumer_dir),
+        )
+        .unwrap_or_else(|| panic!("module argument should have hover in:\n{text}"));
+        assert!(content.contains("mymod.arg"), "{text}\n{content}");
+    }
+
     #[test]
     fn test_convert_markdown_links_to_plain_text() {
         // Basic link conversion
@@ -1503,6 +1548,7 @@ EOT
 
         for text in [
             "test.Review {\n  outer = if true {\n    field = 'value'\n  }\n}\n",
+            "test.Review {\n  outer = for value in values {\n    field = value\n  }\n}\n",
             "test.Review {\n  x = merge(y, {\n    field = 'value'\n  })\n}\n",
         ] {
             let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
@@ -1529,36 +1575,102 @@ EOT
 
     #[test]
     fn review_round1_module_argument_hover_inside_for_body() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let module_dir = temp_dir.path().join("modules").join("example");
-        std::fs::create_dir_all(&module_dir).unwrap();
-        std::fs::write(
-            module_dir.join("main.crn"),
-            "arguments {\n  arg: String\n}\n",
-        )
-        .unwrap();
-        let consumer_dir = temp_dir.path().join("consumer");
-        std::fs::create_dir(&consumer_dir).unwrap();
-        std::fs::write(
-            consumer_dir.join("imports.crn"),
-            "let mymod = use { source = '../modules/example' }\n",
-        )
-        .unwrap();
-        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         for text in [
             "for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
             "if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
         ] {
-            std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
+            assert_module_argument_hover_in_control_flow(text);
+        }
+    }
+
+    #[test]
+    fn review_round3_module_argument_hover_inside_destructuring_for_body() {
+        assert_module_argument_hover_in_control_flow(
+            "for k, v in m {\n  mymod {\n    arg = v\n  }\n}\n",
+        );
+    }
+
+    #[test]
+    fn review_round3_module_argument_hover_inside_list_for_body() {
+        assert_module_argument_hover_in_control_flow(
+            "for a in ['x', 'y'] {\n  mymod {\n    arg = a\n  }\n}\n",
+        );
+    }
+
+    #[test]
+    fn review_round3_module_argument_hover_inside_let_for_body() {
+        assert_module_argument_hover_in_control_flow(
+            "let ms = for a in xs {\n  mymod {\n    arg = a\n  }\n}\n",
+        );
+    }
+
+    #[test]
+    fn review_round3_module_argument_hover_inside_let_if_body() {
+        assert_module_argument_hover_in_control_flow(
+            "let m = if enabled {\n  mymod {\n    arg = 'value'\n  }\n}\n",
+        );
+    }
+
+    #[test]
+    fn review_round3_module_argument_hover_inside_let_else_body() {
+        assert_module_argument_hover_in_control_flow(
+            "let m = if c {\n  'left'\n} else {\n  mymod {\n    arg = 'right'\n  }\n}\n",
+        );
+    }
+
+    #[test]
+    fn review_round3_arguments_type_is_not_a_resource_header() {
+        let provider = review_round3_resource_header_hover_provider();
+        let text = r#"arguments {
+  sg: aws.ec2.SecurityGroup {
+    description = 'x'
+  }
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "description", 0));
+        assert!(
+            hover.is_none(),
+            "a type nested in arguments is not a resource header: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn review_round3_exports_type_is_not_a_resource_header() {
+        let provider = review_round3_resource_header_hover_provider();
+        let text = r#"exports {
+  x: map(aws.ec2.Vpc) = {
+    description = 'x'
+  }
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "description", 0));
+        assert!(
+            hover.is_none(),
+            "a type nested in exports is not a resource header: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn review_round3_valid_resource_headers_keep_attribute_hover() {
+        let provider = review_round3_resource_header_hover_provider();
+        for text in [
+            "aws.ec2.SecurityGroup {\n  description = 'direct'\n}\n",
+            "let x = read aws.ec2.Vpc {\n  description = 'read'\n}\n",
+            "for item in items {\n  aws.ec2.SecurityGroup {\n    description = item\n  }\n}\n",
+        ] {
             let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
             let content = hover_markdown(
                 &provider,
                 &doc,
-                hover_position(text, "arg", 0),
-                Some(&consumer_dir),
+                hover_position(text, "description", 0),
+                None,
             )
-            .expect("module argument inside a control-flow body should have hover");
-            assert!(content.contains("mymod.arg"), "{content}");
+            .unwrap_or_else(|| panic!("valid resource header lost attribute hover:\n{text}"));
+            assert!(content.contains("REAL RESOURCE DESCRIPTION"), "{content}");
         }
     }
 
