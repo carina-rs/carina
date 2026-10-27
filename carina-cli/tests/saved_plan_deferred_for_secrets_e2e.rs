@@ -64,6 +64,58 @@ impl Scenario {
         )
     }
 
+    fn apply_source(&self, secret: Option<&str>) -> Output {
+        self.run(&["apply", "--auto-approve", "--lock=false", "."], secret)
+    }
+
+    fn write_project_file(&self, name: &str, contents: &str) {
+        fs::write(self.project.join(name), contents).expect("write project fixture file");
+    }
+
+    fn inject_replacement_option_provider_default(&self, resource_name: &str) {
+        let mut provider: Value = serde_json::from_str(
+            &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
+        )
+        .expect("parse mock provider state");
+        let provider_resource = provider["states"]
+            .as_object_mut()
+            .expect("mock provider resources")
+            .values_mut()
+            .find(|resource| resource["name"] == resource_name)
+            .unwrap_or_else(|| panic!("missing mock provider resource {resource_name:?}"));
+        provider_resource["replacement_options"]["provider_default"] =
+            Value::String("preserved".to_string());
+        provider_resource["generated_rules"] = serde_json::json!([
+            { "action": "moved-child" }
+        ]);
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&provider).expect("serialize mock provider state"),
+        )
+        .expect("write mock provider state");
+
+        let state_path = self.project.join("carina.state.json");
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read Carina state"))
+                .expect("parse Carina state");
+        let state_resource = state["resources"]
+            .as_array_mut()
+            .expect("Carina state resources")
+            .iter_mut()
+            .find(|resource| resource["current"]["attributes"]["name"] == resource_name)
+            .unwrap_or_else(|| panic!("missing Carina state resource {resource_name:?}"));
+        state_resource["current"]["attributes"]["replacement_options"]["provider_default"] =
+            Value::String("preserved".to_string());
+        state_resource["current"]["attributes"]["generated_rules"] = serde_json::json!({
+            "List": [{ "Map": { "action": { "String": "moved-child" } } }]
+        });
+        fs::write(
+            state_path,
+            serde_json::to_vec_pretty(&state).expect("serialize Carina state"),
+        )
+        .expect("write Carina state");
+    }
+
     fn plan_text(&self) -> String {
         fs::read_to_string(self.project.join("plan.json")).expect("read saved plan")
     }
@@ -227,4 +279,65 @@ fn unavailable_deferred_for_secret_reports_evaluation_failure() {
         !rendered.contains("secret changed since the plan"),
         "unavailable deferred-for secret must not be reported as a hash mismatch:\n{rendered}",
     );
+}
+
+#[test]
+fn moved_iterable_source_uses_the_same_expansion_prelude_at_saved_apply() {
+    let scenario = Scenario::new();
+    scenario.write_project_file(
+        "moved-source.crn",
+        r#"let old_seed = mock.test.deferred_source {
+  name = "moved-seed"
+  replacement_options = {
+    authored = "kept"
+  }
+}
+"#,
+    );
+    let initial_apply = scenario.apply_source(Some(PLANNED_SECRET));
+    assert_success("initial source apply", &initial_apply);
+    assert_no_plaintext("initial source apply output", &output_text(&initial_apply));
+    scenario.inject_replacement_option_provider_default("moved-seed");
+
+    scenario.write_project_file(
+        "moved-source.crn",
+        r#"moved {
+  from = mock.test.deferred_source 'old_seed'
+  to   = mock.test.deferred_source 'renamed_seed'
+}
+
+let renamed_seed = mock.test.deferred_source {
+  name = "moved-seed"
+  replacement_options = {
+    authored = "kept"
+  }
+}
+
+let moved_children = for rule in renamed_seed.generated_rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_SECRET_3990"))
+  }
+}
+"#,
+    );
+    let plan = scenario.plan();
+    assert_success("moved-source saved plan", &plan);
+    assert_no_plaintext("moved-source plan output", &output_text(&plan));
+    let plan_text = scenario.plan_text();
+    assert_no_plaintext("moved-source saved plan", &plan_text);
+    let plan_json: Value = serde_json::from_str(&plan_text).expect("parse saved plan");
+    assert!(
+        plan_json["sorted_resources"]
+            .as_array()
+            .expect("saved resource list")
+            .iter()
+            .any(|resource| resource["binding"] == "moved_children[0]"),
+        "plan-time expansion must materialize the child of the moved source",
+    );
+
+    let apply = scenario.apply(Some(PLANNED_SECRET));
+    assert_success("moved-source saved apply", &apply);
+    assert_no_plaintext("moved-source saved apply output", &output_text(&apply));
+    assert_no_plaintext("moved-source state", &scenario.state_text());
 }

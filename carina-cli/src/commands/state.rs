@@ -7,6 +7,7 @@ use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+#[cfg(test)]
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{
     Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves,
@@ -1180,7 +1181,9 @@ async fn run_state_refresh_locked_with_ctx(
     )
     .await?;
 
-    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    let expansion_prelude =
+        crate::wiring::DeferredForExpansionPrelude::new(parsed, &state_file, ctx.schemas())?;
+    let sorted_resources = expansion_prelude.sorted_resources().to_vec();
 
     // Select provider
     let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
@@ -1264,39 +1267,37 @@ async fn run_state_refresh_locked_with_ctx(
     // skip the Enum lift, surfacing snake_case ↔ SCREAMING_CASE
     // as a phantom `~` diff.
     //
-    // Refresh has no `moved` block (that is a plan/apply concept), so
-    // `moved_targets` is empty. `already_refreshed` carries the ids the
-    // managed read loop above already populated, so the post-expansion
-    // refresh below doesn't redundantly re-read them.
-    let wait_aliases_for_expansion: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
-        .wait_bindings
-        .iter()
-        .map(carina_core::binding_index::WaitAliasSpec::from)
-        .collect();
+    // The shared prelude derives any active moved targets from the same state
+    // view as plan/apply. `already_refreshed` carries the ids the managed read
+    // loop above already populated, so the post-expansion refresh below does
+    // not redundantly re-read them.
     // carina#3278: route the expand → child-refresh → hydrate(2nd) →
     // lift quartet through the shared constructor so this path and
     // `run_apply_locked` cannot drift on the sequence again.
     // carina#3739: `build_saved_attrs` returns raw persisted values; consuming
     // them through `lift` is required before the typed expansion input accepts
     // the map for Phase 2.5 hydration.
-    let saved_attrs_for_expansion = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default()
-        .lift(ctx.schemas());
-    let prev_explicit_for_expansion = state_file
-        .as_ref()
-        .map(StateFile::build_explicit)
-        .unwrap_or_default();
     crate::wiring::hydrate_prior_states(
         &mut managed_current,
         &mut data_source_states,
         &mut orphans,
         &provider,
-        &saved_attrs_for_expansion,
+        expansion_prelude.saved_attrs(),
         state_file.as_ref(),
     )
     .await?;
+    let mut prepared_expansion = expansion_prelude
+        .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
+            ctx,
+            parsed,
+            provider_configs: provider_inputs.configs().as_provider_configs(),
+            state_block_claims: &state_block_claims,
+            managed_current,
+            data_source_states,
+            orphans,
+            already_refreshed,
+        })?
+        .seal();
     let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
         .as_ref()
         .map(|sf| {
@@ -1325,23 +1326,23 @@ async fn run_state_refresh_locked_with_ctx(
     } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
         parsed,
         provider: &provider,
-        sorted_resources: &sorted_resources,
-        managed_current: &mut managed_current,
-        data_source_states: &mut data_source_states,
-        orphans: &mut orphans,
+        expansion: &mut prepared_expansion,
+        warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
         remote_bindings: &HashMap::new(),
-        wait_aliases: &wait_aliases_for_expansion,
-        moved_targets: &HashSet::new(),
-        already_refreshed: &already_refreshed,
         state_file: &state_file,
         saved_dep_bindings: &saved_dep_bindings,
-        saved_attrs: &saved_attrs_for_expansion,
-        prev_explicit: &prev_explicit_for_expansion,
         multi: &multi,
         schemas: ctx.schemas(),
     })
     .await?;
-    sorted_resources = resorted;
+    let sorted_resources = resorted;
+    let crate::wiring::PreparedDeferredForExpansionParts {
+        mut managed_current,
+        mut data_source_states,
+        orphans,
+        saved_attrs: saved_attrs_for_expansion,
+        ..
+    } = prepared_expansion.into_parts();
     match cancel.phase() {
         ShutdownPhase::Running => {}
         ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -3288,7 +3289,7 @@ mod tests {
             .iter()
             .find(|resource| resource.binding.as_deref() == Some("source"))
             .expect("source resource");
-        let mut current_states = HashMap::from([(
+        let current_states = HashMap::from([(
             source.id.clone(),
             Current::from_state(
                 State::existing(
@@ -3354,9 +3355,6 @@ mod tests {
             )),
         );
 
-        // This is the saved-attribute construction used by
-        // `run_state_refresh_locked` before the shared expansion path.
-        let saved_attrs_for_expansion = state_file.build_saved_attrs().lift(&schemas);
         let desired_ids = sorted_resources
             .iter()
             .map(|resource| resource.id.clone())
@@ -3375,33 +3373,53 @@ mod tests {
         )
         .await
         .expect("production orphan refresh should succeed");
-        let mut orphans = orphans.into_plan_orphans();
+        let orphans = orphans.into_plan_orphans();
         let state_file = Some(state_file);
+        let wiring = WiringContext::new(Vec::new(), &[]);
+        let state_block_claims = crate::wiring::resolve_state_block_claims(
+            &parsed.state_blocks,
+            &state_file,
+            &parsed.resources,
+            &schemas,
+        );
+        let expansion_prelude =
+            crate::wiring::DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
+                .expect("expansion prelude");
+        let mut prepared_expansion = expansion_prelude
+            .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
+                ctx: &wiring,
+                parsed: &parsed,
+                provider_configs: &[],
+                state_block_claims: &state_block_claims,
+                managed_current: current_states,
+                data_source_states: HashMap::new(),
+                orphans,
+                already_refreshed,
+            })
+            .expect("prepare expansion")
+            .seal();
         let multi =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
-        let mut data_source_states = HashMap::new();
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             crate::wiring::ExpandRefreshAndLiftInputs {
                 parsed: &parsed,
                 provider: &provider,
-                sorted_resources: &sorted_resources,
-                managed_current: &mut current_states,
-                data_source_states: &mut data_source_states,
-                orphans: &mut orphans,
+                expansion: &mut prepared_expansion,
+                warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
                 remote_bindings: &HashMap::new(),
-                wait_aliases: &[],
-                moved_targets: &HashSet::new(),
-                already_refreshed: &already_refreshed,
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
-                saved_attrs: &saved_attrs_for_expansion,
-                prev_explicit: &HashMap::new(),
                 multi: &multi,
                 schemas: &schemas,
             },
         )
         .await
         .expect("refresh expansion should succeed");
+        let crate::wiring::PreparedDeferredForExpansionParts {
+            managed_current: current_states,
+            orphans,
+            ..
+        } = prepared_expansion.into_parts();
         assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
         assert!(
             !current_states.contains_key(&child.id),

@@ -129,6 +129,30 @@ pub fn builtin_schemas() -> Vec<ResourceSchema> {
             .attribute(AttributeSchema::new("parent", AttributeType::string()))
             .attribute(AttributeSchema::new("parent_name", AttributeType::string()))
             .with_unique_name_attribute("name"),
+        ResourceSchema::new("test.deferred_source")
+            .attribute(
+                AttributeSchema::new("name", AttributeType::string())
+                    .required()
+                    .create_only(),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "replacement_options",
+                    AttributeType::map(AttributeType::string()),
+                )
+                .create_only(),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "generated_rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "GeneratedRule",
+                        vec![StructField::new("action", AttributeType::string())],
+                    )),
+                )
+                .read_only(),
+            )
+            .with_unique_name_attribute("name"),
         ResourceSchema::new("compute.Instance")
             .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
             .attribute(AttributeSchema::new("cluster_name", AttributeType::string()).create_only())

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use carina_core::parser::{BackendConfig, SavedProviderConfigs};
 use carina_core::plan::Plan;
@@ -200,6 +200,12 @@ pub(super) struct ReloadedPendingPlanFile {
     plan_file: ReloadedPlanFile,
 }
 
+pub(super) struct ExpansionPriorStates {
+    pub managed: HashMap<ResourceId, Current>,
+    pub data_sources: HashMap<ResourceId, State>,
+    pub already_refreshed: HashSet<ResourceId>,
+}
+
 /// Fresh source values whose managed-resource slice is proven to have crossed
 /// the same deferred-`for` expansion seam as plan recording.
 ///
@@ -213,12 +219,11 @@ pub(super) struct SavedPlanSecretCandidates {
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        parsed: &carina_core::parser::InferredFile,
+        parsed: carina_core::parser::InferredFile,
         provider_inputs: ResolvedProviderInputs,
         expansion: DeferredForExpansion,
     ) -> Self {
-        let mut parsed = parsed.clone();
-        parsed.resources = expansion.into_sorted_resources();
+        let parsed = expansion.into_expanded_file(parsed);
         Self {
             parsed,
             provider_inputs,
@@ -256,25 +261,51 @@ impl SavedPlanSecretCandidates {
 }
 
 impl ReloadedPendingPlanFile {
-    /// Reconstruct the exact plan-time prior-state ownership view used by
-    /// deferred-`for` expansion. These snapshots were captured in the saved
-    /// plan and have already crossed the locked in-flight reload boundary.
+    /// Reconstruct the minimal plan-time prior-state view needed by
+    /// deferred-`for` expansion. Required sources are cloned from snapshots
+    /// that already crossed the locked in-flight reload boundary; unrelated
+    /// managed snapshots contribute only their refreshed address, avoiding a
+    /// deep clone of every saved state.
     pub(super) fn expansion_prior_states(
         &self,
-    ) -> (HashMap<ResourceId, Current>, HashMap<ResourceId, State>) {
+        required_managed: &[Resource],
+        required_data_sources: &[DataSource],
+    ) -> ExpansionPriorStates {
+        let required_managed: HashSet<&ResourceId> = required_managed
+            .iter()
+            .map(|resource| &resource.id)
+            .collect();
+        let required_data_sources: HashSet<&ResourceId> = required_data_sources
+            .iter()
+            .map(|data_source| &data_source.id)
+            .collect();
         let mut managed = HashMap::new();
         let mut data_sources = HashMap::new();
+        let mut already_refreshed = HashSet::new();
         for entry in self.plan_file.current_states() {
             match entry {
                 ReloadedCurrentStateEntry::Managed { id, current } => {
-                    managed.insert(id.clone(), current.as_ref().clone());
+                    if required_managed.contains(id) {
+                        managed.insert(id.clone(), current.as_ref().clone());
+                    } else if !matches!(current.as_ref(), Current::Absent(_)) {
+                        // Plan-time orphan refresh owns these addresses. Keep
+                        // only their ids: expansion needs the exclusion set,
+                        // not a deep clone of every unrelated saved state.
+                        already_refreshed.insert(id.clone());
+                    }
                 }
                 ReloadedCurrentStateEntry::DataSource { id, state } => {
-                    data_sources.insert(id.clone(), state.as_ref().clone());
+                    if required_data_sources.contains(id) {
+                        data_sources.insert(id.clone(), state.as_ref().clone());
+                    }
                 }
             }
         }
-        (managed, data_sources)
+        ExpansionPriorStates {
+            managed,
+            data_sources,
+            already_refreshed,
+        }
     }
 
     pub(super) fn verify_desired(

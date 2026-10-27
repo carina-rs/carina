@@ -5687,6 +5687,62 @@ mod expand_same_config_deferred_for_tests {
         );
     }
 
+    #[test]
+    fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
+        let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
+        let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let state_file = None;
+        let schemas = SchemaRegistry::new();
+        let wiring = WiringContext::new(Vec::new(), &[]);
+        let claims = resolve_state_block_claims(
+            &parsed.state_blocks,
+            &state_file,
+            &parsed.resources,
+            &schemas,
+        );
+        let prepared = DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
+            .expect("build expansion prelude")
+            .reconcile(ReconcileDeferredForExpansionInputs {
+                ctx: &wiring,
+                parsed: &parsed,
+                provider_configs: &[],
+                state_block_claims: &claims,
+                managed_current: HashMap::new(),
+                data_source_states: HashMap::new(),
+                orphans: Orphans::new(),
+                already_refreshed: HashSet::new(),
+            })
+            .expect("prepare expansion")
+            .seal();
+
+        let out = prepared
+            .expand(
+                &parsed,
+                &schemas,
+                &HashMap::new(),
+                DeferredForWarningPolicy::Suppress,
+            )
+            .expect("deferred-for expansion should succeed");
+        assert!(
+            !out.printed_warnings,
+            "verification must not print warnings"
+        );
+
+        let expanded = out.into_expanded_file(parsed);
+        assert_eq!(
+            expanded.deferred_for_expressions.len(),
+            1,
+            "a DeferredCreate template remains available for secret rehydration"
+        );
+        assert!(
+            expanded
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == WarningKind::SingleQuotedInterpolation),
+            "suppression controls rendering, not the candidate parser state"
+        );
+    }
+
     /// Direct unit test of `RefreshableChildIds::select` — the sole
     /// constructor of the post-expansion refresh iterator. The
     /// `expand_*` tests cover it end-to-end, but `select` carries the
@@ -5833,6 +5889,11 @@ mod expand_same_config_deferred_for_tests {
             "resolved loop must leave no residual; got {:?}",
             out.residual_deferred_for
         );
+        let expanded = out.into_expanded_file(parsed);
+        assert!(
+            expanded.deferred_for_expressions.is_empty(),
+            "materialized loops must not remain in the candidate parser view"
+        );
     }
 
     #[test]
@@ -5875,6 +5936,12 @@ mod expand_same_config_deferred_for_tests {
         assert!(
             out.new_child_ids.is_empty(),
             "unresolved iterable must not report materialized children"
+        );
+        let expanded = out.into_expanded_file(parsed);
+        assert_eq!(
+            expanded.deferred_for_expressions.len(),
+            1,
+            "deferred effect templates must remain in the candidate parser view"
         );
     }
 
