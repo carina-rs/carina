@@ -3,8 +3,6 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use pest::Parser;
-
 use crate::schema::{TypeIdentity, levenshtein_distance};
 
 use super::ast::{ResourceTypePath, TypeExpr};
@@ -32,7 +30,7 @@ use super::{ProviderContext, Rule, first_inner, next_pair};
 /// hints into the type system without re-implementing pest plumbing.
 pub fn parse_type_expr_str(input: &str, config: &ProviderContext) -> Option<TypeExpr> {
     let trimmed = input.trim();
-    let mut pairs = super::CarinaParser::parse(super::Rule::type_expr, trimmed).ok()?;
+    let mut pairs = super::grammar::parse_type_expr_fragment(trimmed).ok()?;
     let pair = pairs.next()?;
     if pair.as_span().end() != trimmed.len() {
         return None;
