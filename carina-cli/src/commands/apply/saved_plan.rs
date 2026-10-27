@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use carina_core::parser::{BackendConfig, SavedProviderConfigs};
+use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
-use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{Composition, Current, DataSource, Resource, ResourceId, State, Value};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -11,6 +11,7 @@ use crate::commands::plan::{
     ResolvedProviderInputs, UpstreamSource,
 };
 use crate::error::AppError;
+use crate::wiring::ExpandedCanonicalResources;
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -199,22 +200,121 @@ pub(super) struct ReloadedPendingPlanFile {
     plan_file: ReloadedPlanFile,
 }
 
+pub(super) struct ExpansionPriorStates {
+    pub managed: HashMap<ResourceId, Current>,
+    pub data_sources: HashMap<ResourceId, State>,
+    pub already_refreshed: HashSet<ResourceId>,
+}
+
+/// Fresh source values whose managed-resource slice is proven to have crossed
+/// the same deferred-`for` expansion seam as plan recording.
+///
+/// The fields are private and the production constructor consumes the opaque
+/// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
+/// verified accidentally against the parser's pre-expansion resource view.
+pub(super) struct SavedPlanSecretCandidates {
+    source: SavedPlanSecretCandidateSource,
+    provider_inputs: ResolvedProviderInputs,
+}
+
+enum SavedPlanSecretCandidateSource {
+    Canonical(Box<ExpandedCanonicalResources<InferredExportParam>>),
+    #[cfg(test)]
+    Parsed(Box<carina_core::parser::InferredFile>),
+}
+
+impl SavedPlanSecretCandidates {
+    pub(super) fn from_expansion(
+        canonical_resources: ExpandedCanonicalResources<InferredExportParam>,
+        provider_inputs: ResolvedProviderInputs,
+    ) -> Self {
+        Self {
+            source: SavedPlanSecretCandidateSource::Canonical(Box::new(canonical_resources)),
+            provider_inputs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_test_parts(
+        parsed: carina_core::parser::InferredFile,
+        provider_inputs: ResolvedProviderInputs,
+    ) -> Self {
+        Self {
+            source: SavedPlanSecretCandidateSource::Parsed(Box::new(parsed)),
+            provider_inputs,
+        }
+    }
+
+    pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
+        match &self.source {
+            SavedPlanSecretCandidateSource::Canonical(resources) => resources.parsed(),
+            #[cfg(test)]
+            SavedPlanSecretCandidateSource::Parsed(parsed) => parsed,
+        }
+    }
+
+    pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
+        &self.provider_inputs
+    }
+}
+
 impl ReloadedPendingPlanFile {
+    /// Reconstruct the minimal plan-time prior-state view needed by
+    /// deferred-`for` expansion. Required sources are cloned from snapshots
+    /// that already crossed the locked in-flight reload boundary; unrelated
+    /// managed snapshots contribute only their refreshed address, avoiding a
+    /// deep clone of every saved state.
+    pub(super) fn expansion_prior_states(
+        &self,
+        required_managed: &[Resource],
+        required_data_sources: &[DataSource],
+    ) -> ExpansionPriorStates {
+        let required_managed: HashSet<&ResourceId> = required_managed
+            .iter()
+            .map(|resource| &resource.id)
+            .collect();
+        let required_data_sources: HashSet<&ResourceId> = required_data_sources
+            .iter()
+            .map(|data_source| &data_source.id)
+            .collect();
+        let mut managed = HashMap::new();
+        let mut data_sources = HashMap::new();
+        let mut already_refreshed = HashSet::new();
+        for entry in self.plan_file.current_states() {
+            match entry {
+                ReloadedCurrentStateEntry::Managed { id, current } => {
+                    if required_managed.contains(id) {
+                        managed.insert(id.clone(), current.as_ref().clone());
+                    } else if !matches!(current.as_ref(), Current::Absent(_)) {
+                        // Plan-time orphan refresh owns these addresses. Keep
+                        // only their ids: expansion needs the exclusion set,
+                        // not a deep clone of every unrelated saved state.
+                        already_refreshed.insert(id.clone());
+                    }
+                }
+                ReloadedCurrentStateEntry::DataSource { id, state } => {
+                    if required_data_sources.contains(id) {
+                        data_sources.insert(id.clone(), state.as_ref().clone());
+                    }
+                }
+            }
+        }
+        ExpansionPriorStates {
+            managed,
+            data_sources,
+            already_refreshed,
+        }
+    }
+
     pub(super) fn verify_desired(
         self,
-        parsed: &carina_core::parser::InferredFile,
-        provider_inputs: &ResolvedProviderInputs,
+        candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
         let planned_secret_hashes =
             planned_secret_hashes(&self.plan_file.plan_file().sorted_resources);
         let mut plan_file = self.plan_file;
-        super::rehydrate_desired_plan_file(
-            plan_file.plan_file_mut(),
-            parsed,
-            provider_inputs,
-            apply_target,
-        )?;
+        super::rehydrate_desired_plan_file(plan_file.plan_file_mut(), &candidates, apply_target)?;
         Ok(DesiredPlanFile::NeedsHistoricalVerification(
             DesiredVerifiedPlanFile {
                 plan_file,

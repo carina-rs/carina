@@ -400,6 +400,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .await
     .expect("resolve empty provider config");
+    let candidates = SavedPlanSecretCandidates::from_test_parts(parsed, provider_inputs);
     let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -423,8 +424,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let result = rehydrate_desired_plan_file(
         &mut plan_file,
-        &parsed,
-        &provider_inputs,
+        &candidates,
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -745,7 +745,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     );
 
     write_upstream("arn:aws:iam::222222222222:role/new");
-    let mut reloaded = reload_apply_configuration_after_bootstrap(
+    let reloaded = reload_apply_configuration_after_bootstrap(
         &downstream,
         &downstream,
         &ProviderContext::default(),
@@ -767,7 +767,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     run_apply_locked_canonical(
         &ctx,
-        &mut reloaded,
+        reloaded,
         true,
         backend,
         StateLock::disabled_for_test(),
@@ -1900,10 +1900,10 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &[],
     );
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &None,
         true,
@@ -3748,10 +3748,10 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     );
 
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &state_file,
         true,
@@ -3866,10 +3866,10 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step1_state = Some(step1_state);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &step1_state,
         true,
@@ -3927,10 +3927,10 @@ let nat = mock.ec2.NatGateway {{
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let step2_state = Some(step2_state);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &step2_state,
         true,
@@ -4058,10 +4058,10 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &saved,
         true,
@@ -4196,10 +4196,10 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (mut parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let before_failure = Some(fixture.read_state().await);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &before_failure,
         true,
@@ -4274,10 +4274,10 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &saved,
         true,
@@ -4346,10 +4346,10 @@ async fn assert_failed_nested_pending_removal_is_replanned(
 
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
-    let mut canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
+    let canonical_resources = canonical_unresolved_for_test(&ctx, &parsed, &unresolved_parsed);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
-        &mut canonical_resources,
+        canonical_resources,
         &provider_configs,
         &Some(applied),
         true,

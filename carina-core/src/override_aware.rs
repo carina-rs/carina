@@ -33,6 +33,17 @@ pub struct CanonicalResourcePair<E> {
     unresolved: Vec<Resource>,
 }
 
+/// Selects how a deferred-for expression owned by a
+/// [`CanonicalResourcePair`] crosses the expansion boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredForExpansionChoice {
+    /// Materialize the expression now (or preserve it as a parser residual if
+    /// expansion reports that it is still unresolved).
+    Expand,
+    /// Keep the expression as an apply-time deferred template.
+    Retain,
+}
+
 /// Failure while canonicalizing resource values and assigning anonymous
 /// identities inside a [`CanonicalResourcePair`].
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +68,12 @@ impl<E> CanonicalResourcePair<E> {
 
     pub fn unresolved(&self) -> &[Resource] {
         &self.unresolved
+    }
+
+    /// Dependency-sort the canonical evaluated resources without releasing
+    /// the owned file or accepting a replacement resource vector.
+    pub fn sorted_resources(&self) -> Result<Vec<Resource>, String> {
+        sort_resources_by_dependencies(&self.parsed.resources)
     }
 
     /// Resolve `<attribute>_prefix` meta-attributes without releasing the
@@ -138,23 +155,33 @@ impl<E> CanonicalResourcePair<E> {
         )
     }
 
-    /// Materialize the selected deferred-for templates in the owned evaluated
-    /// file. Generated children inherit canonical attribute names from their
-    /// already-resolved templates.
-    pub fn expand_deferred_for_expressions(
+    /// Partition and materialize this pair's own deferred-for templates as one
+    /// atomic update of the owned evaluated file. Generated children and
+    /// retained templates both inherit canonical attribute names from the
+    /// already-resolved file.
+    pub fn expand_deferred_for_expressions<F>(
         &mut self,
-        deferred: Vec<crate::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
         bindings: &crate::binding_index::IterableBindings<'_>,
-    ) -> Result<(), crate::parser::DeferredForExpansionError> {
+        mut classify: F,
+    ) -> Result<Vec<crate::parser::DeferredForExpression>, crate::parser::DeferredForExpansionError>
+    where
+        F: FnMut(&crate::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+    {
+        let (selected, retained): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.parsed.deferred_for_expressions)
+                .into_iter()
+                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.parsed.warnings.retain(|warning| {
             warning.kind != crate::parser::WarningKind::DeferredFor
-                || !suppressed_warning_locations
+                || !retained
                     .iter()
-                    .any(|location| location == &(warning.file.clone(), warning.line))
+                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.parsed.deferred_for_expressions = deferred;
-        self.parsed.expand_deferred_for_expressions(bindings)
+        self.parsed.deferred_for_expressions = selected;
+        self.parsed.expand_deferred_for_expressions(bindings)?;
+        let residual = self.parsed.deferred_for_expressions.clone();
+        self.parsed.deferred_for_expressions.extend(retained);
+        Ok(residual)
     }
 
     /// Run the provider-bound desired normalization pipeline on the owned
@@ -179,10 +206,7 @@ impl<E> CanonicalResourcePair<E> {
     }
 
     fn resources_for_build(&self) -> Result<(Vec<Resource>, Vec<Resource>), String> {
-        Ok((
-            sort_resources_by_dependencies(&self.parsed.resources)?,
-            self.unresolved.clone(),
-        ))
+        Ok((self.sorted_resources()?, self.unresolved.clone()))
     }
 }
 

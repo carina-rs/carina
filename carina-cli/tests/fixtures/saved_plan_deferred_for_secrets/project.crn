@@ -1,0 +1,9 @@
+backend local { path = "carina.state.json" }
+
+provider mock {}
+
+let nested_loops = use {
+  source = "./nested-loops"
+}
+
+let nested = nested_loops {}

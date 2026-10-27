@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
-use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
@@ -31,8 +30,8 @@ use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
     add_deferred_create_effects, compute_canonical_pair_anonymous_identifiers_with_ctx,
-    expand_same_config_deferred_for, reconcile_canonical_anonymous_identifiers_with_ctx,
-    reconcile_canonical_prefixed_names, reconcile_late_anonymous_identities,
+    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
+    reconcile_late_anonymous_identities,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -278,17 +277,23 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // carina#3181: `parsed.resources` is managed-only; data sources live
     // in `parsed.data_sources`. Only managed resources are dependency-
     // sorted.
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
     if let Some(sf) = state_file.as_mut() {
         sf.remove_legacy_data_source_rows(&data_sources);
     }
+    let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
+        &canonical_resources,
+        &state_file,
+        wiring.schemas(),
+    )
+    .expect("fixture deferred-for prelude must resolve");
+    let sorted_resources = expansion_prelude.sorted_resources();
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
     let mut orphans = Orphans::new();
     if let Some(sf) = state_file.as_ref() {
-        for resource in &sorted_resources {
+        for resource in sorted_resources {
             let current = sf.build_state_for_resource(&resource.id);
             managed_current.insert(resource.id.clone(), current);
         }
@@ -305,7 +310,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .collect();
         orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
     } else {
-        for resource in &sorted_resources {
+        for resource in sorted_resources {
             managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
         }
         for ds in &data_sources {
@@ -316,21 +321,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let directives_map = state_file
         .as_ref()
         .map(|sf| sf.build_directives())
-        .unwrap_or_default();
-
-    // Keep fixture plans aligned with the real CLI plan/apply wiring:
-    // state-file attributes are lifted before the differ sees them, so
-    // fixture coverage exercises the enum-state lift seam instead of
-    // relying on differ cross-shape tolerance.
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default()
-        .lift(wiring.schemas());
-
-    let mut prev_explicit = state_file
-        .as_ref()
-        .map(|sf| sf.build_explicit())
         .unwrap_or_default();
 
     // Insert every upstream binding — even when the state file is
@@ -360,30 +350,33 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
-    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
-        .wait_bindings
-        .iter()
-        .map(carina_core::binding_index::WaitAliasSpec::from)
-        .collect();
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
     // resolve through the composition layer to the managed sibling.
-    let upstream_binding_names = parsed.upstream_binding_names();
+    let upstream_binding_names_owned: HashSet<String> = parsed
+        .upstream_binding_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let upstream_binding_names: HashSet<&str> = upstream_binding_names_owned
+        .iter()
+        .map(String::as_str)
+        .collect();
     let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         wiring.schemas(),
-        &sorted_resources,
+        sorted_resources,
     );
     let managed_stability = crate::wiring::derive_managed_binding_stability(
         parsed,
-        &sorted_resources,
+        sorted_resources,
         &managed_current,
         &data_source_states,
         wiring.schemas(),
-        &saved_attrs,
-        &prev_explicit,
+        expansion_prelude.saved_attrs(),
+        expansion_prelude.prev_explicit(),
         &remote_bindings,
-        &wait_aliases,
+        expansion_prelude.wait_aliases(),
     )
     .expect("fixture managed binding stability must resolve");
     let (mut override_aware_resources, unresolved_override_aware_resources) =
@@ -397,7 +390,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                 managed_current: &pre_apply_input_current,
                 data_source_states: &data_source_states,
                 remote_bindings: &remote_bindings,
-                wait_aliases: &wait_aliases,
+                wait_aliases: expansion_prelude.wait_aliases(),
             },
             &managed_stability,
             OverrideAwareBuildMode::Plan {
@@ -486,6 +479,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             plan.add_error(error);
         }
         managed_current = into_all_prior_states(orphans, managed_current);
+        let prev_explicit = expansion_prelude.prev_explicit().clone();
+        drop(expansion_prelude);
         return FixturePlan {
             plan,
             // Error plans are never rendered, so they intentionally do not
@@ -522,26 +517,48 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture late anonymous identities must resolve uniquely");
 
-    let moved_pairs = crate::wiring::materialize_moved_states(
-        &mut managed_current,
-        &mut orphans,
-        &mut prev_explicit,
-        &mut saved_attrs,
-        &parsed.state_blocks,
-        &state_file,
-    )
-    .expect("fixture move routes must match their loaded current states");
+    let managed_bindings: HashSet<String> = expansion_prelude
+        .sorted_resources()
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect();
+    let non_managed_deferred_for = parsed
+        .deferred_for_expressions
+        .iter()
+        .filter(|deferred| {
+            !deferred
+                .root_bindings()
+                .iter()
+                .any(|binding| managed_bindings.contains(binding))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let reconciled_expansion = expansion_prelude
+        .reconcile_addresses(
+            crate::wiring::ReconcileDeferredForExpansionInputs {
+                ctx: &wiring,
+                parsed,
+                provider_configs: raw_provider_configs,
+                state_block_claims: &state_block_claims,
+                managed_current,
+                data_source_states,
+                orphans,
+                already_refreshed: HashSet::new(),
+            },
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
+        .expect("fixture move routes must match their loaded current states");
     crate::wiring::validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
-        &moved_pairs,
+        reconciled_expansion.moved_pairs(),
         &resolved_state_block_targets,
         &state_file,
     )
     .expect("state block collision validation failed");
 
     let reconciled_provider_states = provider_states_for(
-        &managed_current,
-        &orphans,
+        reconciled_expansion.managed_current(),
+        reconciled_expansion.orphans(),
         override_aware_resources.resources(),
     );
     let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
@@ -557,39 +574,40 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &stability_resources,
         &reconciled_input_current,
         wiring.schemas(),
-        &saved_attrs,
-        &prev_explicit,
+        reconciled_expansion.saved_attrs(),
+        reconciled_expansion.prev_explicit(),
     );
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
             managed_current: &reconciled_input_current,
-            data_source_states: &data_source_states,
+            data_source_states: reconciled_expansion.data_source_states(),
             remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
+            wait_aliases: reconciled_expansion.wait_aliases(),
         },
         &managed_stability,
     );
 
-    let deferred_for_expansion = expand_same_config_deferred_for(
-        parsed,
-        &sorted_resources,
-        &managed_current,
-        &data_source_states,
-        wiring.schemas(),
-        &saved_attrs,
-        &prev_explicit,
-        &remote_bindings,
-        &wait_aliases,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
-    .expect("fixture deferred-for expansion failed");
-    let managed_bindings: HashSet<String> = sorted_resources
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
+    let prepared_expansion = reconciled_expansion.seal();
+    let (expanded_canonical_resources, deferred_for_expansion) = prepared_expansion
+        .expand(
+            canonical_resources,
+            wiring.schemas(),
+            &remote_bindings,
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
+        .expect("fixture deferred-for expansion failed");
+    let crate::wiring::PreparedDeferredForExpansionParts {
+        mut managed_current,
+        data_source_states,
+        orphans,
+        saved_attrs,
+        prev_explicit,
+        wait_aliases: _,
+        moved_pairs,
+    } = prepared_expansion.into_parts();
+    let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()
@@ -602,18 +620,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         })
         .collect();
     let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
-    residual_deferred_for.extend(
-        parsed
-            .deferred_for_expressions
-            .iter()
-            .filter(|deferred| {
-                !deferred
-                    .root_bindings()
-                    .iter()
-                    .any(|binding| managed_bindings.contains(binding))
-            })
-            .cloned(),
-    );
+    residual_deferred_for.extend(non_managed_deferred_for);
     let image_compositions = parsed.compositions.clone();
     let resolved_resources =
         ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())

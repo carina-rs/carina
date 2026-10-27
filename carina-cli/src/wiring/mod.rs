@@ -35,10 +35,11 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::{
-    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
+    CanonicalResourcePair, DeferredForExpansionChoice, OverrideAwareBuildMode,
+    OverrideAwareResources, RebuildBindingsInputs,
 };
 #[cfg(test)]
-use carina_core::parser::MovedAddresses;
+use carina_core::parser::{MovedAddresses, ParseWarning};
 use carina_core::parser::{
     ProviderConfig, ResolvedProviderConfig, ResolvedProviderConfigs, StateBlock, StateBlockAddress,
     WarningKind,
@@ -111,6 +112,40 @@ pub struct PlanContext {
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
     pub expansion_trace: carina_core::resource::ExpansionTrace,
+}
+
+/// A completed plan together with the exact canonical resources consumed by
+/// its deferred-`for` expansion. Field access dereferences to [`PlanContext`]
+/// so existing plan consumers do not need a second, untyped resource channel.
+pub(crate) struct ExpandedPlanContext<E> {
+    context: PlanContext,
+    canonical_resources: ExpandedCanonicalResources<E>,
+}
+
+impl<E> ExpandedPlanContext<E> {
+    fn new(context: PlanContext, canonical_resources: ExpandedCanonicalResources<E>) -> Self {
+        Self {
+            context,
+            canonical_resources,
+        }
+    }
+
+    pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.canonical_resources.parsed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_context(self) -> PlanContext {
+        self.context
+    }
+}
+
+impl<E> std::ops::Deref for ExpandedPlanContext<E> {
+    type Target = PlanContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
 }
 
 /// State-block targets resolved while constructing [`StateBlockClaims`].
@@ -2201,6 +2236,318 @@ impl DeferredCreateTarget {
     }
 }
 
+/// I/O-free state derived from the identity-reconciled configuration/state
+/// view before managed and data-source refreshes run.
+///
+/// A caller must choose one of two typed transitions before it can obtain a
+/// [`PreparedDeferredForExpansion`]:
+///
+/// - [`DeferredForExpansionPrelude::reconcile_addresses`] for planning/apply
+///   views, which applies explicit moves and anonymous-to-named renames;
+/// - [`DeferredForExpansionPrelude::preserve_addresses`] for `state refresh`,
+///   which must refresh the rows at their persisted addresses without applying
+///   pending configuration transitions.
+///
+/// Both transitions own the exact state/metadata view accepted by expansion,
+/// so a future caller cannot silently choose the wrong behavior with a flag or
+/// substitute independently keyed maps.
+pub struct DeferredForExpansionPrelude<'state> {
+    state_file: &'state Option<StateFile>,
+    sorted_resources: Vec<Resource>,
+    saved_attrs: LiftedSavedAttrs,
+    prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    wait_aliases: Vec<WaitAliasSpec>,
+}
+
+/// Inputs for the I/O-free identity/move reconciliation transition.
+pub struct ReconcileDeferredForExpansionInputs<'a, E> {
+    pub ctx: &'a WiringContext,
+    pub parsed: &'a carina_core::parser::File<E>,
+    pub provider_configs: &'a [ProviderConfig],
+    pub state_block_claims: &'a StateBlockClaims,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
+    pub orphans: Orphans,
+    /// Addresses already read by the pre-expansion refresh pass. The prepared
+    /// expansion owns this exact set so no later caller can substitute an
+    /// empty/default set at the expansion seam.
+    pub already_refreshed: HashSet<ResourceId>,
+}
+
+/// State snapshots for the address-preserving `state refresh` transition.
+/// Deliberately excludes move/rename inputs: that operation is not authorized
+/// to change state-row ownership.
+pub struct PreserveDeferredForExpansionInputs {
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
+    pub orphans: Orphans,
+    pub already_refreshed: HashSet<ResourceId>,
+}
+
+impl<'state> DeferredForExpansionPrelude<'state> {
+    /// Build every state/config-derived input used by deferred `for`
+    /// expansion. Call this after prefix/module/anonymous identity
+    /// reconciliation has produced the state view the plan pipeline uses.
+    pub fn new<E>(
+        resources: &CanonicalResourcePair<E>,
+        state_file: &'state Option<StateFile>,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, AppError> {
+        Self::from_sorted_resources(
+            resources.parsed(),
+            resources.sorted_resources().map_err(AppError::Validation)?,
+            state_file,
+            schemas,
+        )
+    }
+
+    /// Build the same prelude for `state refresh`, whose parsed configuration
+    /// intentionally remains outside the planning-only canonical pair and
+    /// crosses the address-preserving transition below.
+    pub fn new_for_state_refresh<E>(
+        parsed: &carina_core::parser::File<E>,
+        state_file: &'state Option<StateFile>,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, AppError> {
+        let sorted_resources =
+            sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+        Self::from_sorted_resources(parsed, sorted_resources, state_file, schemas)
+    }
+
+    #[cfg(test)]
+    fn new_for_test<E>(
+        parsed: &carina_core::parser::File<E>,
+        state_file: &'state Option<StateFile>,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, AppError> {
+        Self::new_for_state_refresh(parsed, state_file, schemas)
+    }
+
+    fn from_sorted_resources<E>(
+        parsed: &carina_core::parser::File<E>,
+        sorted_resources: Vec<Resource>,
+        state_file: &'state Option<StateFile>,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, AppError> {
+        Ok(Self {
+            state_file,
+            sorted_resources,
+            saved_attrs: state_file
+                .as_ref()
+                .map(StateFile::build_saved_attrs)
+                .unwrap_or_default()
+                .lift(schemas),
+            prev_explicit: state_file
+                .as_ref()
+                .map(StateFile::build_explicit)
+                .unwrap_or_default(),
+            wait_aliases: parsed
+                .wait_bindings
+                .iter()
+                .map(WaitAliasSpec::from)
+                .collect(),
+        })
+    }
+
+    pub fn sorted_resources(&self) -> &[Resource] {
+        &self.sorted_resources
+    }
+
+    pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
+        &self.saved_attrs
+    }
+
+    pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
+        &self.prev_explicit
+    }
+
+    pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
+        &self.wait_aliases
+    }
+
+    /// Apply every address-changing state transition once and retain the exact
+    /// metadata/alias/exclusion inputs used by expansion.
+    pub fn reconcile_addresses<E>(
+        mut self,
+        mut inputs: ReconcileDeferredForExpansionInputs<'_, E>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<ReconciledDeferredForExpansion, AppError> {
+        let mut print_warning = |warning: String| eprintln!("{}", warning.yellow());
+        let mut suppress_warning = |_: String| {};
+        let warning_sink: &mut dyn FnMut(String) = match warning_policy {
+            DeferredForWarningPolicy::Print => &mut print_warning,
+            DeferredForWarningPolicy::Suppress => &mut suppress_warning,
+        };
+        let mut moved_pairs = materialize_moved_states_with_warning_sink(
+            &mut inputs.managed_current,
+            &mut inputs.orphans,
+            &mut self.prev_explicit,
+            &mut self.saved_attrs,
+            &inputs.parsed.state_blocks,
+            self.state_file,
+            warning_sink,
+        )?;
+        moved_pairs.extend(apply_anonymous_to_named_renames(
+            inputs.ctx,
+            &self.sorted_resources,
+            inputs.provider_configs,
+            &mut inputs.managed_current,
+            &mut inputs.orphans,
+            &mut self.prev_explicit,
+            &mut self.saved_attrs,
+            self.state_file,
+            inputs.state_block_claims,
+        )?);
+        Ok(ReconciledDeferredForExpansion(DeferredForExpansionInputs {
+            sorted_resources: self.sorted_resources,
+            saved_attrs: self.saved_attrs,
+            prev_explicit: self.prev_explicit,
+            wait_aliases: self.wait_aliases,
+            moved_pairs,
+            already_refreshed: inputs.already_refreshed,
+            managed_current: inputs.managed_current,
+            data_source_states: inputs.data_source_states,
+            orphans: inputs.orphans,
+        }))
+    }
+
+    /// Preserve persisted addresses for `state refresh`. This transition is a
+    /// different type from [`ReconciledDeferredForExpansion`] so the command
+    /// cannot accidentally begin applying pending move/rename declarations.
+    pub fn preserve_addresses(
+        self,
+        inputs: PreserveDeferredForExpansionInputs,
+    ) -> AddressPreservingDeferredForExpansion {
+        AddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
+            sorted_resources: self.sorted_resources,
+            saved_attrs: self.saved_attrs,
+            prev_explicit: self.prev_explicit,
+            wait_aliases: self.wait_aliases,
+            moved_pairs: Vec::new(),
+            already_refreshed: inputs.already_refreshed,
+            managed_current: inputs.managed_current,
+            data_source_states: inputs.data_source_states,
+            orphans: inputs.orphans,
+        })
+    }
+}
+
+struct DeferredForExpansionInputs {
+    sorted_resources: Vec<Resource>,
+    saved_attrs: LiftedSavedAttrs,
+    prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    wait_aliases: Vec<WaitAliasSpec>,
+    moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
+    already_refreshed: HashSet<ResourceId>,
+    managed_current: HashMap<ResourceId, Current>,
+    data_source_states: HashMap<ResourceId, State>,
+    orphans: Orphans,
+}
+
+/// Address-reconciled state before the plan path's data-source I/O phase has
+/// finished. This type deliberately has no expansion method: callers must
+/// populate its owned data-source snapshot and seal the complete view first.
+pub struct ReconciledDeferredForExpansion(DeferredForExpansionInputs);
+
+impl ReconciledDeferredForExpansion {
+    pub fn sorted_resources(&self) -> &[Resource] {
+        &self.0.sorted_resources
+    }
+
+    pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
+        &self.0.saved_attrs
+    }
+
+    pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
+        &self.0.prev_explicit
+    }
+
+    pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
+        &self.0.managed_current
+    }
+
+    pub fn data_source_states(&self) -> &HashMap<ResourceId, State> {
+        &self.0.data_source_states
+    }
+
+    pub fn orphans(&self) -> &Orphans {
+        &self.0.orphans
+    }
+
+    pub fn insert_data_source_state(&mut self, id: ResourceId, state: State) {
+        self.0.data_source_states.insert(id, state);
+    }
+
+    pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
+        &self.0.wait_aliases
+    }
+
+    pub fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
+        &self.0.moved_pairs
+    }
+
+    /// Seal the reconciled managed/data-source/orphan snapshots into the only
+    /// state accepted by deferred `for` expansion.
+    pub fn seal(self) -> PreparedDeferredForExpansion {
+        PreparedDeferredForExpansion(self.0)
+    }
+}
+
+/// Address-preserving state prepared specifically for `state refresh`.
+pub struct AddressPreservingDeferredForExpansion(DeferredForExpansionInputs);
+
+impl AddressPreservingDeferredForExpansion {
+    pub fn seal(self) -> PreparedDeferredForExpansion {
+        PreparedDeferredForExpansion(self.0)
+    }
+}
+
+/// The single addressed/configured/current-state view accepted by deferred
+/// `for` expansion. Its fields are private and it owns the exact snapshots
+/// that were reconciled with the persisted metadata, so expansion cannot be
+/// invoked with a different state map.
+pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs);
+
+/// Planning metadata released only after the prepared value has been
+/// consumed. This type cannot be converted back into an expansion witness;
+/// callers that need both must expand first, then consume the preparation.
+pub(crate) struct PreparedDeferredForExpansionParts {
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
+    pub orphans: Orphans,
+    pub saved_attrs: LiftedSavedAttrs,
+    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    pub wait_aliases: Vec<WaitAliasSpec>,
+    pub moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
+}
+
+impl PreparedDeferredForExpansion {
+    pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
+        PreparedDeferredForExpansionParts {
+            managed_current: self.0.managed_current,
+            data_source_states: self.0.data_source_states,
+            orphans: self.0.orphans,
+            saved_attrs: self.0.saved_attrs,
+            prev_explicit: self.0.prev_explicit,
+            wait_aliases: self.0.wait_aliases,
+            moved_pairs: self.0.moved_pairs,
+        }
+    }
+}
+
+/// Controls whether parse/expansion warnings are rendered at this call site.
+/// Saved-plan verification must be silent because the normal plan invocation
+/// already rendered the same warnings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredForWarningPolicy {
+    Print,
+    Suppress,
+}
+
+/// Private proof that the addressed resource view came from the shared
+/// deferred-`for` expansion step.
+struct DeferredForExpansionWitness;
+
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
@@ -2210,6 +2557,10 @@ pub struct DeferredForExpansion {
     /// Loops still unresolved (iterable genuinely unknowable at plan
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    /// Warnings after resolved/deferred loops have been removed from the
+    /// parser view. Retained only by the raw-file test adapter.
+    #[cfg(test)]
+    residual_warnings: Vec<ParseWarning>,
     /// Loops whose iterable is deferred until apply and should become
     /// state-only `Effect::DeferredCreate` entries in the plan.
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -2224,6 +2575,65 @@ pub struct DeferredForExpansion {
     pub refreshable_child_ids: RefreshableChildIds,
     /// Whether `print_warnings()` emitted any `⚠` line during expansion.
     pub printed_warnings: bool,
+    /// Prevent callers from fabricating expansion metadata. Canonical
+    /// production consumers additionally require [`ExpandedCanonicalResources`].
+    _expanded: DeferredForExpansionWitness,
+}
+
+impl DeferredForExpansion {
+    /// Consume the witness and apply every expansion-owned parser field as a
+    /// unit. This avoids the former resources-only clone/swap that left
+    /// resolved loops and warnings in a pre-expansion state.
+    #[cfg(test)]
+    pub(crate) fn into_expanded_file<E>(
+        self,
+        mut parsed: carina_core::parser::File<E>,
+    ) -> carina_core::parser::File<E> {
+        parsed.resources = self.sorted_resources;
+        // Concrete loops now live in `resources` and must disappear from the
+        // parser view. Genuinely deferred loops still back DeferredCreate /
+        // DeferredReplace effects, so retain their fresh templates alongside
+        // any residual diagnostic-only loops.
+        parsed.deferred_for_expressions = self.residual_deferred_for;
+        parsed.deferred_for_expressions.extend(
+            self.deferred_create_targets
+                .into_iter()
+                .map(|target| target.template),
+        );
+        parsed.warnings = self.residual_warnings;
+        parsed
+    }
+}
+
+/// Canonical resources proven to have crossed the shared deferred-`for`
+/// expansion boundary.
+///
+/// The pair is owned and the field is private, so callers cannot combine an
+/// arbitrary canonical pair with expansion metadata. The only production
+/// constructor is [`PreparedDeferredForExpansion::expand`].
+pub(crate) struct ExpandedCanonicalResources<E> {
+    resources: CanonicalResourcePair<E>,
+}
+
+impl<E> ExpandedCanonicalResources<E> {
+    pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.resources.parsed()
+    }
+
+    pub(crate) fn as_pair(&self) -> &CanonicalResourcePair<E> {
+        &self.resources
+    }
+
+    pub(crate) async fn prepare_desired_side_for_plan(
+        &mut self,
+        provider_configs: &[ProviderConfig],
+        normalizer: &dyn ProviderNormalizer,
+        schemas: &SchemaRegistry,
+    ) -> carina_core::provider::ProviderResult<()> {
+        self.resources
+            .prepare_desired_side_for_plan(provider_configs, normalizer, schemas)
+            .await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2290,6 +2700,61 @@ pub fn derive_managed_binding_stability<E>(
     Ok(stability)
 }
 
+impl PreparedDeferredForExpansion {
+    /// Expand against the exact addressed state/metadata view sealed by
+    /// one of the prelude's typed address transitions, consuming the canonical
+    /// pair into an [`ExpandedCanonicalResources`] witness.
+    pub(crate) fn expand<E: Clone>(
+        &self,
+        mut resources: CanonicalResourcePair<E>,
+        schemas: &SchemaRegistry,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
+        let expansion = expand_same_config_deferred_for_target(
+            &mut resources,
+            &self.0.sorted_resources,
+            &self.0.managed_current,
+            &self.0.data_source_states,
+            schemas,
+            &self.0.saved_attrs,
+            &self.0.prev_explicit,
+            remote_bindings,
+            &self.0.wait_aliases,
+            &self.0.moved_pairs,
+            &self.0.already_refreshed,
+            warning_policy,
+        )?;
+        Ok((ExpandedCanonicalResources { resources }, expansion))
+    }
+
+    /// Raw-file expansion is reserved for address-preserving state refresh
+    /// and focused tests. Production plan/apply paths must use [`Self::expand`]
+    /// so the canonical pair is consumed into an owned witness.
+    pub(crate) fn expand_parsed<E: Clone>(
+        &self,
+        parsed: &mut carina_core::parser::File<E>,
+        schemas: &SchemaRegistry,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<DeferredForExpansion, AppError> {
+        expand_same_config_deferred_for_target(
+            parsed,
+            &self.0.sorted_resources,
+            &self.0.managed_current,
+            &self.0.data_source_states,
+            schemas,
+            &self.0.saved_attrs,
+            &self.0.prev_explicit,
+            remote_bindings,
+            &self.0.wait_aliases,
+            &self.0.moved_pairs,
+            &self.0.already_refreshed,
+            warning_policy,
+        )
+    }
+}
+
 /// Pure core of the carina#3132 fix: project the post-refresh
 /// `ResolvedBindings` into the typed iterable view, expand every
 /// deferred-for whose iterable is now resolvable, and re-sort the
@@ -2306,11 +2771,11 @@ pub fn derive_managed_binding_stability<E>(
 /// calls exactly this function, then targeted-refreshes
 /// `refreshable_child_ids`.
 ///
-/// `moved_targets` is the set of `moved` block `to` ResourceIds (already
-/// materialized by `materialize_moved_states` on both the plan and apply
-/// paths before this call). Children whose id is in this set are kept
-/// out of `refreshable_child_ids` so their migrated state survives
-/// (carina#3141).
+/// `moved_targets` is derived here from the active `moved_pairs` already
+/// materialized on plan/apply paths. Children whose id is in this set are
+/// kept out of `refreshable_child_ids` so their migrated state survives
+/// (carina#3141). Keeping only the pairs in the prepared value prevents the
+/// two representations from diverging.
 ///
 /// `already_refreshed` is the set of ResourceIds the phase-1 orphan pass
 /// already performed a live provider read for *this run*. A for-loop
@@ -2324,15 +2789,19 @@ pub fn derive_managed_binding_stability<E>(
 /// (carina#3145). The decision is made here, once, alongside the
 /// moved-target exclusion, and carried in the typed `RefreshableChildIds`
 /// so the plan and apply paths cannot diverge.
-trait DeferredExpansionTarget<E> {
+pub(crate) trait DeferredExpansionTarget<E> {
     fn parsed(&self) -> &carina_core::parser::File<E>;
 
-    fn expand_selected(
+    fn expand_partitioned<F>(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError>;
+        classify: F,
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice;
 }
 
 impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
@@ -2340,13 +2809,18 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         self.parsed()
     }
 
-    fn expand_selected(
+    fn expand_partitioned<F>(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
-        self.expand_deferred_for_expressions(deferred, suppressed_warning_locations, bindings)
+        classify: F,
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+    {
+        self.expand_deferred_for_expressions(bindings, classify)
     }
 }
 
@@ -2355,20 +2829,32 @@ impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
         self
     }
 
-    fn expand_selected(
+    fn expand_partitioned<F>(
         &mut self,
-        deferred: Vec<carina_core::parser::DeferredForExpression>,
-        suppressed_warning_locations: &[(Option<String>, usize)],
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-    ) -> Result<(), carina_core::parser::DeferredForExpansionError> {
+        mut classify: F,
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    >
+    where
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+    {
+        let (selected, retained): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.deferred_for_expressions)
+                .into_iter()
+                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
-                || !suppressed_warning_locations
+                || !retained
                     .iter()
-                    .any(|location| location == &(warning.file.clone(), warning.line))
+                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.deferred_for_expressions = deferred;
-        self.expand_deferred_for_expressions(bindings)
+        self.deferred_for_expressions = selected;
+        self.expand_deferred_for_expressions(bindings)?;
+        let residual = self.deferred_for_expressions.clone();
+        self.deferred_for_expressions.extend(retained);
+        Ok(residual)
     }
 }
 
@@ -2383,8 +2869,9 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
-    moved_targets: &HashSet<ResourceId>,
+    moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     already_refreshed: &HashSet<ResourceId>,
+    warning_policy: DeferredForWarningPolicy,
 ) -> Result<DeferredForExpansion, AppError> {
     let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
@@ -2393,14 +2880,18 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     // expansion would remove none of them, so `parsed`'s set is exactly
     // what the post-expansion path would have printed.
     if parsed.deferred_for_expressions.is_empty() {
-        let printed_warnings = parsed.print_warnings();
+        let printed_warnings =
+            warning_policy == DeferredForWarningPolicy::Print && parsed.print_warnings();
         return Ok(DeferredForExpansion {
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: Vec::new(),
+            #[cfg(test)]
+            residual_warnings: parsed.warnings.clone(),
             deferred_create_targets: Vec::new(),
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
             printed_warnings,
+            _expanded: DeferredForExpansionWitness,
         });
     }
 
@@ -2435,15 +2926,13 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
     let mut deferred_create_targets = Vec::new();
-    let pre_expandable_deferred_for: Vec<_> = parsed
-        .deferred_for_expressions
-        .iter()
-        .filter_map(|deferred| {
+    let residual_deferred_for = target
+        .expand_partitioned(&iterable_bindings, |deferred| {
             match iterable_bindings.resolve_value(&deferred.iterable) {
                 Ok(carina_core::resolver::ValueResolution::Present(value))
                     if is_value_fully_concrete_for_expansion(&value) =>
                 {
-                    Some(deferred.clone())
+                    DeferredForExpansionChoice::Expand
                 }
                 Ok(
                     carina_core::resolver::ValueResolution::Present(_)
@@ -2453,28 +2942,18 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
                     if let Some(target) = DeferredCreateTarget::from_deferred(deferred) {
                         deferred_create_targets.push(target);
                     }
-                    None
+                    DeferredForExpansionChoice::Retain
                 }
                 // Let the shared expansion path render the path-aware error.
-                Err(_) => Some(deferred.clone()),
+                Err(_) => DeferredForExpansionChoice::Expand,
             }
         })
-        .collect();
-
-    let suppressed_warning_locations = deferred_create_targets
-        .iter()
-        .map(|target| (target.template.file.clone(), target.template.line))
-        .collect::<Vec<_>>();
-    target
-        .expand_selected(
-            pre_expandable_deferred_for,
-            &suppressed_warning_locations,
-            &iterable_bindings,
-        )
         .map_err(|error| AppError::Validation(error.to_string()))?;
+    let printed_warnings =
+        warning_policy == DeferredForWarningPolicy::Print && target.parsed().print_warnings();
+    #[cfg(test)]
+    let residual_warnings = target.parsed().warnings.clone();
     let parsed = target.parsed();
-    let printed_warnings = parsed.print_warnings();
-    let residual_deferred_for = parsed.deferred_for_expressions.clone();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
 
@@ -2511,6 +2990,10 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     //   live-read it under the same state name the child resolves to.
     //   Reading it again here is a redundant second provider call for
     //   the same address.
+    let moved_targets: HashSet<ResourceId> = moved_pairs
+        .iter()
+        .map(|(_, to)| to.as_inner().clone())
+        .collect();
     let refreshable_child_ids = RefreshableChildIds(
         new_child_ids
             .iter()
@@ -2522,20 +3005,27 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     Ok(DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
+        #[cfg(test)]
+        residual_warnings,
         deferred_create_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
+        _expanded: DeferredForExpansionWitness,
     })
 }
 
+/// Unit-test adapter for focused expansion fixtures that predate the
+/// production prelude. Production code cannot construct the prepared witness
+/// from independently assembled maps.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn expand_same_config_deferred_for<E: Clone>(
+pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
     data_source_states: &HashMap<ResourceId, State>,
-    schemas: &carina_core::schema::SchemaRegistry,
+    schemas: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2543,48 +3033,30 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
+    let moved_pairs = moved_targets
+        .iter()
+        .map(|target| {
+            let target = ResolvedResourceId::new(target.clone());
+            (target.clone(), target)
+        })
+        .collect();
+    let prepared = PreparedDeferredForExpansion(DeferredForExpansionInputs {
+        sorted_resources: sorted_resources.to_vec(),
+        saved_attrs: saved_attrs.clone(),
+        prev_explicit: prev_explicit.clone(),
+        wait_aliases: wait_aliases.to_vec(),
+        moved_pairs,
+        already_refreshed: already_refreshed.clone(),
+        managed_current: managed_current.clone(),
+        data_source_states: data_source_states.clone(),
+        orphans: Orphans::new(),
+    });
     let mut expanded = parsed.clone();
-    expand_same_config_deferred_for_target(
+    prepared.expand_parsed(
         &mut expanded,
-        sorted_resources,
-        managed_current,
-        data_source_states,
         schemas,
-        saved_attrs,
-        prev_explicit,
         remote_bindings,
-        wait_aliases,
-        moved_targets,
-        already_refreshed,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn expand_canonical_same_config_deferred_for<E: Clone>(
-    canonical_resources: &mut CanonicalResourcePair<E>,
-    sorted_resources: &[Resource],
-    managed_current: &HashMap<ResourceId, Current>,
-    data_source_states: &HashMap<ResourceId, State>,
-    schemas: &carina_core::schema::SchemaRegistry,
-    saved_attrs: &LiftedSavedAttrs,
-    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[WaitAliasSpec],
-    moved_targets: &HashSet<ResourceId>,
-    already_refreshed: &HashSet<ResourceId>,
-) -> Result<DeferredForExpansion, AppError> {
-    expand_same_config_deferred_for_target(
-        canonical_resources,
-        sorted_resources,
-        managed_current,
-        data_source_states,
-        schemas,
-        saved_attrs,
-        prev_explicit,
-        remote_bindings,
-        wait_aliases,
-        moved_targets,
-        already_refreshed,
+        DeferredForWarningPolicy::Print,
     )
 }
 
@@ -2596,8 +3068,9 @@ pub(crate) fn expand_canonical_same_config_deferred_for<E: Clone>(
 /// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
 /// Every call site that needs a post-expansion view of `sorted_resources`
 /// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) MUST
-/// obtain it via [`expand_refresh_and_lift_states`], and the constructor
-/// performs the complete post-expansion sequence:
+/// obtain it via [`expand_refresh_and_lift_states`] or
+/// [`expand_canonical_refresh_and_lift_states`], and those constructors perform
+/// the complete post-expansion sequence:
 ///
 /// 1. `expand_same_config_deferred_for` — synthesise for-loop children
 ///    and re-sort the augmented set.
@@ -2615,7 +3088,10 @@ pub(crate) fn expand_canonical_same_config_deferred_for<E: Clone>(
 /// inside this operation prevents a refresh path from transforming only one
 /// part of prior state.
 #[non_exhaustive]
-pub struct ExpandedRefreshState {
+pub struct ExpandedRefreshState<R> {
+    /// The resource witness selected by the constructor: `()` for raw-file
+    /// state refresh, or [`ExpandedCanonicalResources`] for plan/apply.
+    pub(crate) canonical_resources: R,
     pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -2624,87 +3100,79 @@ pub struct ExpandedRefreshState {
     pub printed_warnings: bool,
 }
 
-/// Inputs for [`expand_refresh_and_lift_states`].
+/// Shared inputs for the refresh-and-lift constructors.
 ///
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
-pub(crate) enum ExpandRefreshConfig<'a, E> {
-    Parsed(&'a carina_core::parser::File<E>),
-    Canonical(&'a mut CanonicalResourcePair<E>),
-}
-
-pub(crate) struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
-    pub config: ExpandRefreshConfig<'a, E>,
+pub(crate) struct ExpandRefreshAndLiftInputs<'a, P: Provider + ProviderNormalizer> {
     pub provider: &'a P,
-    pub sorted_resources: &'a [Resource],
-    pub managed_current: &'a mut HashMap<ResourceId, Current>,
-    pub data_source_states: &'a mut HashMap<ResourceId, State>,
-    /// Orphans refreshed before deferred `for` expansion. Persisted loop
-    /// children can remain here after materialisation: the differ owns the
-    /// late same-id promotion rule, while every provider transform operates
-    /// on the joined prior-state view.
-    pub orphans: &'a mut Orphans,
+    /// Address/metadata parity witness produced by the shared I/O-free
+    /// prelude. Expansion cannot be invoked with independently assembled
+    /// saved attributes, aliases, or exclusion sets.
+    pub expansion: &'a mut PreparedDeferredForExpansion,
+    pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
-    pub wait_aliases: &'a [WaitAliasSpec],
-    pub moved_targets: &'a HashSet<ResourceId>,
-    pub already_refreshed: &'a HashSet<ResourceId>,
     pub state_file: &'a Option<StateFile>,
     pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
-    /// Saved attribute values to carry forward to materialised children
-    /// via `provider.hydrate_read_state` after their initial read. Pass
-    /// the same lifted saved attributes the caller built once at the head of
-    /// its pipeline — `hydrate_read_state` is idempotent, so passing it here
-    /// and re-hydrating downstream of this function is safe.
-    pub saved_attrs: &'a LiftedSavedAttrs,
-    pub prev_explicit: &'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub progress: &'a ProgressBackend<ResourceId>,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
 /// Run the expand → child-refresh → hydrate → lift quartet in
-/// lock-step.
+/// lock-step for address-preserving raw-file state refresh.
 ///
-/// See [`ExpandedRefreshState`] for why this is a single function.
+/// The unit resource witness makes the raw-file variant distinct from the
+/// canonical plan/apply result at the type level.
 pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
-    mut inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
-) -> Result<ExpandedRefreshState, AppError> {
-    // Phase 1: expand for-loops.
-    let expansion = match &mut inputs.config {
-        ExpandRefreshConfig::Parsed(parsed) => expand_same_config_deferred_for(
-            parsed,
-            inputs.sorted_resources,
-            inputs.managed_current,
-            inputs.data_source_states,
-            inputs.schemas,
-            inputs.saved_attrs,
-            inputs.prev_explicit,
-            inputs.remote_bindings,
-            inputs.wait_aliases,
-            inputs.moved_targets,
-            inputs.already_refreshed,
-        ),
-        ExpandRefreshConfig::Canonical(resources) => expand_canonical_same_config_deferred_for(
-            resources,
-            inputs.sorted_resources,
-            inputs.managed_current,
-            inputs.data_source_states,
-            inputs.schemas,
-            inputs.saved_attrs,
-            inputs.prev_explicit,
-            inputs.remote_bindings,
-            inputs.wait_aliases,
-            inputs.moved_targets,
-            inputs.already_refreshed,
-        ),
-    }?;
+    parsed: &mut carina_core::parser::File<E>,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<()>, AppError> {
+    let expansion = inputs.expansion.expand_parsed(
+        parsed,
+        inputs.schemas,
+        inputs.remote_bindings,
+        inputs.warning_policy,
+    )?;
+    finish_expanded_refresh_state((), expansion, inputs).await
+}
+
+/// Run the expand → child-refresh → hydrate → lift quartet in lock-step for a
+/// canonical plan/apply resource pair.
+///
+/// The returned state always owns the branded canonical expansion witness; no
+/// optional field or variant-dependent assertion is needed by its caller.
+pub(crate) async fn expand_canonical_refresh_and_lift_states<
+    E: Clone,
+    P: Provider + ProviderNormalizer,
+>(
+    canonical_resources: CanonicalResourcePair<E>,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<ExpandedCanonicalResources<E>>, AppError> {
+    let (canonical_resources, expansion) = inputs.expansion.expand(
+        canonical_resources,
+        inputs.schemas,
+        inputs.remote_bindings,
+        inputs.warning_policy,
+    )?;
+    finish_expanded_refresh_state(canonical_resources, expansion, inputs).await
+}
+
+async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
+    canonical_resources: R,
+    expansion: DeferredForExpansion,
+    inputs: ExpandRefreshAndLiftInputs<'_, P>,
+) -> Result<ExpandedRefreshState<R>, AppError> {
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
+        #[cfg(test)]
+            residual_warnings: _,
         deferred_create_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
+        _expanded: _,
     } = expansion;
     if printed_warnings {
         inputs.progress.note_external_line();
@@ -2718,8 +3186,15 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
     // 2nd `hydrate_read_state` call apply ran by hand
     // (apply/mod.rs ~1098); collapsing it into this constructor stops
     // the next caller from forgetting it.
+    let DeferredForExpansionInputs {
+        managed_current,
+        data_source_states,
+        orphans,
+        saved_attrs,
+        ..
+    } = &mut inputs.expansion.0;
     if !new_child_ids.is_empty() {
-        let children = refreshable_child_ids.select(&sorted_resources, inputs.orphans);
+        let children = refreshable_child_ids.select(&sorted_resources, orphans);
         refresh_resource_set(
             inputs.provider,
             inputs.progress,
@@ -2727,15 +3202,15 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
             inputs.state_file,
             inputs.schemas,
             inputs.saved_dep_bindings,
-            inputs.managed_current,
+            managed_current,
         )
         .await?;
         hydrate_prior_states(
-            inputs.managed_current,
-            inputs.data_source_states,
-            inputs.orphans,
+            managed_current,
+            data_source_states,
+            orphans,
             inputs.provider,
-            inputs.saved_attrs,
+            saved_attrs,
             inputs.state_file.as_ref(),
         )
         .await?;
@@ -2745,14 +3220,10 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
     // pre-existing managed resources and the new for-loop children
     // need this so enum-typed attrs aren't surfaced as phantom case
     // diffs (carina#3272).
-    lift_prior_state_enum_leaves(
-        inputs.managed_current,
-        inputs.orphans,
-        &sorted_resources,
-        inputs.schemas,
-    );
+    lift_prior_state_enum_leaves(managed_current, orphans, &sorted_resources, inputs.schemas);
 
     Ok(ExpandedRefreshState {
+        canonical_resources,
         sorted_resources,
         residual_deferred_for,
         deferred_create_targets,
@@ -2765,7 +3236,7 @@ pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + Provi
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
-    canonical_resources: &mut CanonicalResourcePair<E>,
+    canonical_resources: CanonicalResourcePair<E>,
     provider_configs: &ResolvedProviderConfigs,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -2773,7 +3244,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
-) -> Result<PlanContext, AppError> {
+) -> Result<ExpandedPlanContext<E>, AppError> {
     let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
@@ -2787,8 +3258,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // managed resources participate in the dependency sort; data sources
     // are refreshed in a later phase against the already-populated
     // `managed_current`.
-    let mut sorted_resources =
-        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+    let expansion_prelude =
+        DeferredForExpansionPrelude::new(&canonical_resources, state_file, ctx.schemas())?;
+    // Refresh phases borrow the exact list retained by the typed prelude; no
+    // second owned resource graph can diverge before the transition below.
+    let sorted_resources = expansion_prelude.sorted_resources();
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
@@ -2797,32 +3271,10 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
 
-    // Build state-file-derived maps up front so anonymous → let-bound
-    // rename transfer (#1685) can run between refresh phases 1 and 2.
-    // These maps only depend on `state_file`, not on refresh output.
-    // awscc#251: state files written before a provider promoted an
-    // attribute from `Custom` to `Enum` (e.g. awscc#250 for IAM
-    // policy `version`/`effect`) store enum values as plain JSON
-    // strings. `build_saved_attrs` bridges those through the
-    // schema-blind `PersistedValue` decoder into `ConcreteValue::String`,
-    // which the strict carina#2986 Phase 4 validator then rejects at
-    // the now-`Enum` position. Lift recognized members to
-    // `ConcreteValue::EnumIdentifier` against each resource's current
-    // schema before any diff/validation consumes the loaded state.
-    // carina-state stays schema-free; the registry only exists here.
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default()
-        .lift(ctx.schemas());
-    let mut prev_explicit = state_file
-        .as_ref()
-        .map(|sf| sf.build_explicit())
-        .unwrap_or_default();
-    // `moved_pairs` accumulates explicit `moved` block transfers and
-    // detected anonymous → let-bound renames. Populated inside the
-    // refresh block so the later plan-building code sees them.
-    let mut moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)> = Vec::new();
+    // The prelude owns lifted saved attributes, authoring metadata, wait
+    // aliases, and the pre-expansion resource order. It is consumed only
+    // after refresh/hydration, when the shared I/O-free transition applies
+    // moves/renames and seals the inputs accepted by expansion.
     // Ids the phase-1 orphan pass already performed a live provider read
     // for this run. A for-loop child applied on a previous run is in the
     // state file but not yet a desired resource at orphan time (expansion
@@ -2837,9 +3289,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let mut deferred_data_source_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
     let mut refresh_module_constraint_errors = Vec::new();
-
     let progress_backend = ProgressBackend::new();
-    if refresh {
+    let prepared_expansion = if refresh {
         RefreshProgress::start_header();
 
         // Read states for all resources concurrently using the identifier from
@@ -2921,7 +3372,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             &mut data_source_states,
             &mut orphans,
             &provider,
-            &saved_attrs,
+            expansion_prelude.saved_attrs(),
             state_file.as_ref(),
         )
         .await?;
@@ -2933,51 +3384,40 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // is sufficient for the common case of literal create-only
         // attributes; resources with ResourceRef create-only values are
         // an orthogonal edge case that pre-dates this fix.
-        moved_pairs.extend(materialize_moved_states(
-            &mut managed_current,
-            &mut orphans,
-            &mut prev_explicit,
-            &mut saved_attrs,
-            &parsed.state_blocks,
-            state_file,
-        )?);
-        moved_pairs.extend(apply_anonymous_to_named_renames(
-            ctx,
-            &sorted_resources,
-            raw_provider_configs,
-            &mut managed_current,
-            &mut orphans,
-            &mut prev_explicit,
-            &mut saved_attrs,
-            state_file,
-            state_block_claims,
-        )?);
+        let mut reconciled_expansion = expansion_prelude.reconcile_addresses(
+            ReconcileDeferredForExpansionInputs {
+                ctx,
+                parsed,
+                provider_configs: raw_provider_configs,
+                state_block_claims,
+                managed_current,
+                data_source_states,
+                orphans,
+                already_refreshed: orphan_refreshed_ids,
+            },
+            DeferredForWarningPolicy::Print,
+        )?;
         // Phase 2: resolve data source refs against the consolidated
         // managed and data-source state, then refresh each via `read_data_source`.
-        let ds_wait_aliases: Vec<WaitAliasSpec> = parsed
-            .wait_bindings
-            .iter()
-            .map(WaitAliasSpec::from)
-            .collect();
         let data_source_bindings = data_source_refresh_bindings(
-            &sorted_resources,
+            reconciled_expansion.sorted_resources(),
             &parsed.compositions,
             &data_sources,
-            &managed_current,
-            &data_source_states,
+            reconciled_expansion.managed_current(),
+            reconciled_expansion.data_source_states(),
             remote_bindings,
             ctx.schemas(),
-            &ds_wait_aliases,
+            reconciled_expansion.wait_aliases(),
         );
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
-            &sorted_resources,
+            reconciled_expansion.sorted_resources(),
             &parsed.compositions,
             &data_sources,
-            &managed_current,
-            &data_source_states,
+            reconciled_expansion.managed_current(),
+            reconciled_expansion.data_source_states(),
             remote_bindings,
             ctx.schemas(),
-            &ds_wait_aliases,
+            reconciled_expansion.wait_aliases(),
         )?;
         let mut resolved_data_sources = Vec::new();
         for resolution in data_source_refreshes {
@@ -3026,12 +3466,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             };
         for result in phase2_results {
             let (id, state) = result?;
-            data_source_states.insert(id, state);
+            reconciled_expansion.insert_data_source_state(id, state);
         }
+        reconciled_expansion.seal()
     } else {
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
-            for resource in &sorted_resources {
+            for resource in sorted_resources {
                 let current = sf.build_state_for_resource(&resource.id);
                 managed_current.insert(resource.id.clone(), current);
             }
@@ -3050,42 +3491,32 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &mut data_source_states,
                 &mut orphans,
                 &provider,
-                &saved_attrs,
+                expansion_prelude.saved_attrs(),
                 state_file.as_ref(),
             )
             .await?;
-            moved_pairs.extend(materialize_moved_states(
-                &mut managed_current,
-                &mut orphans,
-                &mut prev_explicit,
-                &mut saved_attrs,
-                &parsed.state_blocks,
-                state_file,
-            )?);
-            moved_pairs.extend(apply_anonymous_to_named_renames(
-                ctx,
-                &sorted_resources,
-                raw_provider_configs,
-                &mut managed_current,
-                &mut orphans,
-                &mut prev_explicit,
-                &mut saved_attrs,
-                state_file,
-                state_block_claims,
-            )?);
         } else {
             // No state file: all resources are new (not found)
-            for resource in &sorted_resources {
+            for resource in sorted_resources {
                 managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
             }
         }
-    }
-
-    let wait_aliases: Vec<WaitAliasSpec> = parsed
-        .wait_bindings
-        .iter()
-        .map(WaitAliasSpec::from)
-        .collect();
+        expansion_prelude
+            .reconcile_addresses(
+                ReconcileDeferredForExpansionInputs {
+                    ctx,
+                    parsed,
+                    provider_configs: raw_provider_configs,
+                    state_block_claims,
+                    managed_current,
+                    data_source_states,
+                    orphans,
+                    already_refreshed: orphan_refreshed_ids,
+                },
+                DeferredForWarningPolicy::Print,
+            )?
+            .seal()
+    };
 
     // carina#3132: expand same-config deferred-for loops after refresh,
     // against the same post-refresh `ResolvedBindings` view every
@@ -3094,32 +3525,42 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // here we perform the I/O half — targeted-refresh of the children
     // so a re-plan after they were applied sees their live state
     // instead of a phantom Create.
-    let moved_targets: HashSet<ResourceId> = moved_pairs
-        .iter()
-        .map(|(_, to)| to.as_inner().clone())
-        .collect();
+    let (expanded_canonical_resources, expansion) = prepared_expansion.expand(
+        canonical_resources,
+        ctx.schemas(),
+        remote_bindings,
+        DeferredForWarningPolicy::Print,
+    )?;
     let DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
+        #[cfg(test)]
+            residual_warnings: _,
         deferred_create_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
-    } = expand_canonical_same_config_deferred_for(
-        canonical_resources,
-        &sorted_resources,
-        &managed_current,
-        &data_source_states,
-        ctx.schemas(),
-        &saved_attrs,
-        &prev_explicit,
-        remote_bindings,
-        &wait_aliases,
-        &moved_targets,
-        &orphan_refreshed_ids,
-    )?;
-    sorted_resources = resorted;
-    let parsed = canonical_resources.parsed();
+        _expanded: _,
+    } = expansion;
+    let sorted_resources = resorted;
+    let PreparedDeferredForExpansionParts {
+        mut managed_current,
+        mut data_source_states,
+        mut orphans,
+        saved_attrs,
+        prev_explicit,
+        wait_aliases,
+        moved_pairs,
+    } = prepared_expansion.into_parts();
+    let parsed = expanded_canonical_resources.parsed();
+
+    // A printed `⚠` warning is newline-terminated and is written on top of
+    // indicatif's open spinner bar line, so it closes the bar region the
+    // refresh phases above left open — the cursor is no longer parked on an
+    // unterminated `✓` line. Clear the flag so `finish_refresh_bar_region`
+    // does not add a second, spurious blank line on the
+    // deferred-for-with-warnings TTY path (#3150 Round-4 finding). The
+    // child-refresh phase below may re-open the region if it draws bars.
     if printed_warnings {
         progress_backend.note_external_line();
     }
@@ -3214,7 +3655,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     );
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            canonical_resources,
+            expanded_canonical_resources.as_pair(),
             state_file.as_ref(),
             PreApplyInputs {
                 managed: &[],
@@ -3284,24 +3725,27 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
         let managed_current = into_all_prior_states(orphans, managed_current);
-        return Ok(PlanContext {
-            plan,
-            provider,
-            // Error plans are aborted before any resolved-resource consumer,
-            // including plan-image rendering. Do not weaken the successful
-            // path's type invariant to retain unusable pending resources.
-            sorted_resources: Vec::new(),
-            unresolved_resources: Vec::new(),
-            compositions: prepared_compositions,
-            data_sources: data_sources_for_plan,
-            managed_current,
-            data_source_states,
-            moved_origins,
-            upstream_snapshot: remote_bindings.clone(),
-            prev_explicit,
-            residual_deferred_for,
-            expansion_trace: parsed.expansion_trace.clone(),
-        });
+        return Ok(ExpandedPlanContext::new(
+            PlanContext {
+                plan,
+                provider,
+                // Error plans are aborted before any resolved-resource consumer,
+                // including plan-image rendering. Do not weaken the successful
+                // path's type invariant to retain unusable pending resources.
+                sorted_resources: Vec::new(),
+                unresolved_resources: Vec::new(),
+                compositions: prepared_compositions,
+                data_sources: data_sources_for_plan,
+                managed_current,
+                data_source_states,
+                moved_origins,
+                upstream_snapshot: remote_bindings.clone(),
+                prev_explicit,
+                residual_deferred_for,
+                expansion_trace: parsed.expansion_trace.clone(),
+            },
+            expanded_canonical_resources,
+        ));
     }
 
     // Anonymous resources whose identity attributes include ResourceRefs can
@@ -3422,28 +3866,31 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .map(ResolvedResource::into_inner)
         .map(UnresolvedResource::from_pre_resolve)
         .collect();
-    Ok(PlanContext {
-        plan,
-        provider,
-        // Keep the evaluated desired view distinct from the authored
-        // pre-resolution snapshot. Before carina#3861 this field was filled
-        // with `paired_unresolved_resources`; for let-bound resources that
-        // pairing deliberately prefers `unresolved_parsed` and therefore
-        // restored unevaluated calls such as `secret("...")`. Anonymous
-        // resources have no binding and kept this evaluated view, producing
-        // the bound/anonymous saved-plan divergence.
-        sorted_resources: resolved_resources,
-        unresolved_resources,
-        compositions: prepared_compositions,
-        data_sources: data_sources_for_plan,
-        managed_current,
-        data_source_states,
-        moved_origins,
-        upstream_snapshot: remote_bindings.clone(),
-        prev_explicit,
-        residual_deferred_for,
-        expansion_trace: parsed.expansion_trace.clone(),
-    })
+    Ok(ExpandedPlanContext::new(
+        PlanContext {
+            plan,
+            provider,
+            // Keep the evaluated desired view distinct from the authored
+            // pre-resolution snapshot. Before carina#3861 this field was filled
+            // with `paired_unresolved_resources`; for let-bound resources that
+            // pairing deliberately prefers `unresolved_parsed` and therefore
+            // restored unevaluated calls such as `secret("...")`. Anonymous
+            // resources have no binding and kept this evaluated view, producing
+            // the bound/anonymous saved-plan divergence.
+            sorted_resources: resolved_resources,
+            unresolved_resources,
+            compositions: prepared_compositions,
+            data_sources: data_sources_for_plan,
+            managed_current,
+            data_source_states,
+            moved_origins,
+            upstream_snapshot: remote_bindings.clone(),
+            prev_explicit,
+            residual_deferred_for,
+            expansion_trace: parsed.expansion_trace.clone(),
+        },
+        expanded_canonical_resources,
+    ))
 }
 
 fn resolved_state_row_id(
@@ -3472,7 +3919,8 @@ fn resolved_state_row_id(
 ///
 /// Returns a list of active Move pairs (from, to) where the `from` resource
 /// existed in state. Callers use this to add Move effects to the plan.
-pub fn materialize_moved_states(
+#[cfg(test)]
+fn materialize_moved_states(
     managed_current: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,

@@ -1896,7 +1896,7 @@ pub async fn run_plan(
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &wiring,
-        &mut canonical_resources,
+        canonical_resources,
         provider_inputs.configs(),
         &state_file,
         refresh,
@@ -1906,7 +1906,7 @@ pub async fn run_plan(
         base_dir,
     )
     .await?;
-    let parsed = canonical_resources.parsed();
+    let parsed = ctx.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
     // above was being computed. Re-read state now and compare against
