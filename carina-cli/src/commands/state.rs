@@ -47,7 +47,7 @@ use crate::commands::plan::{
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
-use crate::commands::shared::progress::ProgressBackend;
+use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -1190,10 +1190,17 @@ async fn run_state_refresh_locked_with_ctx(
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
-    let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
+    let provider = get_provider_with_ctx(
+        ctx,
+        provider_inputs.configs(),
+        base_dir,
+        ProgressSink::Human,
+    )
+    .await?;
 
     println!();
-    println!("{}", "Refreshing state...".cyan().bold());
+    let progress = ProgressBackend::new(ProgressSink::Human);
+    let refresh_phase = RefreshPhase::start(&progress);
 
     // Read states for all resources using identifier from state.
     // Cancel stops dispatching new reads, then waits for in-flight reads to finish
@@ -1314,7 +1321,6 @@ async fn run_state_refresh_locked_with_ctx(
             already_refreshed,
         })
         .seal();
-    let progress = ProgressBackend::new();
     let crate::wiring::ExpandedRefreshState {
         canonical_resources: _,
         sorted_resources: resorted,
@@ -1332,7 +1338,7 @@ async fn run_state_refresh_locked_with_ctx(
             remote_bindings: &HashMap::new(),
             state_file: &state_file,
             saved_dep_bindings: &saved_dep_bindings,
-            progress: &progress,
+            refresh_phase: &refresh_phase,
             schemas: ctx.schemas(),
         },
     )
@@ -1484,7 +1490,7 @@ async fn run_state_refresh_locked_with_ctx(
 
     let mut state = state_file.take().unwrap();
 
-    println!();
+    drop(refresh_phase);
 
     let mut refresh_counts = StateRefreshCounts::default();
 
@@ -3392,6 +3398,7 @@ mod tests {
             })
             .seal();
         let progress = ProgressBackend::plain(std::io::sink());
+        let refresh_phase = RefreshPhase::start(&progress);
         let expanded = crate::wiring::expand_refresh_and_lift_states(
             &mut parsed,
             crate::wiring::ExpandRefreshAndLiftInputs {
@@ -3401,7 +3408,7 @@ mod tests {
                 remote_bindings: &HashMap::new(),
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
-                progress: &progress,
+                refresh_phase: &refresh_phase,
                 schemas: &schemas,
             },
         )

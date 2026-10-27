@@ -320,6 +320,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         provider_configs,
         state_file,
         refresh,
+        ProgressSink::Human,
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
@@ -828,9 +829,16 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let configs = validated_provider_configs(vec![config]);
     let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
-    let error = instantiate_provider_into_router(&ctx, &mut router, config, Path::new("."), None)
-        .await
-        .expect_err("normalizer creation failure must abort provider router setup");
+    let error = instantiate_provider_into_router(
+        &ctx,
+        &mut router,
+        config,
+        Path::new("."),
+        None,
+        ProgressSink::Human,
+    )
+    .await
+    .expect_err("normalizer creation failure must abort provider router setup");
 
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
@@ -904,6 +912,7 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
         configs.iter().next().unwrap(),
         Path::new("."),
         None,
+        ProgressSink::Human,
     )
     .await
     .expect_err("provider initialization must fail");
@@ -1039,6 +1048,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &provider_configs,
         &None,
         false,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
@@ -1066,7 +1076,14 @@ async fn apply_provider_construction_revalidates_resolved_upstream_config() {
     );
     let temp = tempfile::tempdir().unwrap();
 
-    let error = match get_provider_with_ctx(&ctx, &provider_configs, temp.path()).await {
+    let error = match get_provider_with_ctx(
+        &ctx,
+        &provider_configs,
+        temp.path(),
+        ProgressSink::Human,
+    )
+    .await
+    {
         Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
         Err(error) => error,
     };
@@ -1496,6 +1513,7 @@ let shared = read test.shared.Type {}
         &provider_configs,
         &state_file,
         true,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
@@ -3866,6 +3884,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &provider_configs,
         &Some(state_file),
         false,
+        ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
@@ -7275,7 +7294,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     assert!(load_error.contains("version 0.5.0"), "{load_error}");
 
     let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
-    let router = get_provider_with_ctx(&ctx, &configs, base)
+    let router = get_provider_with_ctx(&ctx, &configs, base, ProgressSink::Human)
         .await
         .expect("artifact load errors are rendered by the plan/apply wiring boundary");
     assert!(router.is_empty());
@@ -8201,6 +8220,7 @@ exports { team_prefix: String = "x" }"#,
             &provider_configs,
             &None,
             true,
+            ProgressSink::Human,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
@@ -8276,6 +8296,7 @@ exports { team_prefix: String = "x" }"#,
             &provider_configs,
             &None,
             true,
+            ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
