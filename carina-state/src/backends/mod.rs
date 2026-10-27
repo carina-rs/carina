@@ -61,22 +61,6 @@ pub async fn create_remote_backend(config: &BackendConfig) -> BackendResult<Box<
     }
 }
 
-/// Resolve a backend from an optional parser BackendConfig for read-only use.
-///
-/// If a config is provided, converts it to a StateBackendConfig and creates the
-/// appropriate backend. If no config is provided, falls back to a local backend.
-pub async fn resolve_backend_for_read(
-    backend_config: Option<&carina_core::parser::BackendConfig>,
-    base_dir: &Path,
-) -> BackendResult<Box<dyn StateBackend>> {
-    if let Some(config) = backend_config {
-        let state_config = BackendConfig::try_from(config)?;
-        create_backend(Some(&state_config), base_dir).await
-    } else {
-        create_backend(None, base_dir).await
-    }
-}
-
 /// Resolve a local backend's state file path, anchoring a relative
 /// `path` (or the unset default) at `base_dir`.
 pub fn anchored_local_path(config: &LocalBackendSettings, base_dir: &Path) -> std::path::PathBuf {
@@ -113,37 +97,5 @@ mod tests {
             BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))
                 if name == "unsupported"
         ));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_backend_for_read_none_returns_local() {
-        let base_dir = tempfile::tempdir().unwrap();
-        let backend = resolve_backend_for_read(None, base_dir.path()).await;
-        assert!(backend.is_ok(), "None config should return a local backend");
-        // Local backend read_state returns Ok(None) when no state file exists
-        let state = backend.unwrap().read_state().await;
-        assert!(state.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_backend_for_read_invalid_config_returns_error() {
-        use carina_core::parser::BackendConfig as ParserBackendConfig;
-
-        let config = ParserBackendConfig {
-            backend_type: "unsupported".to_string(),
-            attributes: HashMap::new(),
-            attribute_spans: Default::default(),
-        };
-
-        let result = resolve_backend_for_read(Some(&config), Path::new(".")).await;
-        assert!(result.is_err());
-
-        if let Err(BackendError::InvalidConfig(BackendConfigError::UnsupportedBackend(name))) =
-            result
-        {
-            assert_eq!(name, "unsupported");
-        } else {
-            panic!("Expected typed unsupported-backend config error");
-        }
     }
 }

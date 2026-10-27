@@ -13,6 +13,10 @@ fn carina(project: &std::path::Path, args: &[&str]) -> Output {
     cmd.current_dir(project)
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
+        .env(
+            "CARINA_MOCK_STATE_FILE",
+            project.join("mock-provider-state.json"),
+        )
         .args(args)
         .output()
         .expect("failed to execute carina")
@@ -115,6 +119,63 @@ fn write_clean_fixture(include_resource: bool) -> TempDir {
     write_project(project, "state.json", include_resource);
     local_backend_lock("state.json").save(project).unwrap();
     tmp
+}
+
+fn write_applied_read_drift_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"state-a.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("main.crn"),
+        r#"let from_a = mock.test.resource {
+  name = "resource-from-a"
+}
+
+exports {
+  from_a_name: String = from_a.name
+}
+"#,
+    )
+    .unwrap();
+
+    let init = carina(project, &["init", "."]);
+    assert!(
+        init.status.success(),
+        "fixture init failed.\nstdout: {}\nstderr: {}",
+        stdout(&init),
+        stderr(&init),
+    );
+    let apply = carina(project, &["apply", "--auto-approve", "--lock=false", "."]);
+    assert!(
+        apply.status.success(),
+        "fixture apply failed.\nstdout: {}\nstderr: {}",
+        stdout(&apply),
+        stderr(&apply),
+    );
+    assert!(project.join("state-a.json").is_file());
+
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"state-b.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    assert!(!project.join("state-b.json").exists());
+
+    tmp
+}
+
+fn assert_read_drift_warning(output: &Output) {
+    let stderr = stderr(output);
+    assert!(
+        stderr.contains("Backend configuration changed")
+            && stderr.contains("reads state from the OLD backend recorded in carina-backend.lock")
+            && stderr.contains("carina init --migrate-state"),
+        "read command must explain that it selected the locked old backend.\nstderr:\n{stderr}",
+    );
 }
 
 fn lock_json(project: &std::path::Path) -> String {
@@ -330,6 +391,75 @@ mod backend_drift_gate {
             Some("legacy/state.json"),
             "saved plan must record the locked backend that supplied state:\n{plan_json:#}",
         );
+    }
+
+    #[test]
+    fn state_list_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["state", "list", "."]);
+
+        assert!(
+            output.status.success(),
+            "state list should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert!(
+            stdout(&output).contains("mock.test.resource from_a"),
+            "state list did not list the resource applied to backend A.\nstdout:\n{}",
+            stdout(&output),
+        );
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn state_show_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["state", "show", "--json", "."]);
+
+        assert!(
+            output.status.success(),
+            "state show should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        let shown: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("state show --json must emit valid JSON");
+        assert_eq!(shown["resources"][0]["binding"], "from_a");
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn state_lookup_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(
+            tmp.path(),
+            &["state", "lookup", "from_a.name", "--json", "."],
+        );
+
+        assert!(
+            output.status.success(),
+            "state lookup should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert_eq!(stdout(&output).trim(), r#""resource-from-a""#);
+        assert_read_drift_warning(&output);
+    }
+
+    #[test]
+    fn export_warns_and_uses_locked_backend() {
+        let tmp = write_applied_read_drift_fixture();
+        let output = carina(tmp.path(), &["export", "from_a_name", "--raw"]);
+
+        assert!(
+            output.status.success(),
+            "export should read backend A while migration to B is pending.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        assert_eq!(stdout(&output).trim(), "resource-from-a");
+        assert_read_drift_warning(&output);
     }
 
     #[test]

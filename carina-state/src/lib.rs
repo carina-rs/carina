@@ -77,7 +77,7 @@ pub use backend_config::{
 pub use backend_lock::BackendLock;
 pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,
-    load_published_exports_from_url, load_state_from_url, resolve_backend_for_read,
+    load_published_exports_from_url, load_state_from_url,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;

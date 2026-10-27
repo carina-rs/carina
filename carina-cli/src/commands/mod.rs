@@ -25,9 +25,10 @@ use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, BackendLock, S3BackendSettings,
-    StateBackend, create_backend,
+    BackendConfig as StateBackendConfig, BackendError, BackendLock, BackendResult, LoadedState,
+    PublishedExports, S3BackendSettings, StateBackend, create_backend,
 };
+use colored::Colorize;
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
@@ -43,7 +44,7 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 
-#[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
+#[must_use = "Drifted must be handled explicitly — mutators refuse, while read paths select the locked backend and warn"]
 #[derive(Debug, PartialEq)]
 pub enum BackendDriftStatus {
     Fresh,
@@ -85,6 +86,133 @@ pub fn inspect_backend_drift(
             existing,
             configured,
         },
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadBackendLockStatus {
+    Missing,
+    Current,
+    MigrationPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendLockRequirement {
+    AllowMissing,
+    RequirePresent,
+}
+
+/// A backend selected for a read-only state operation.
+///
+/// The raw [`StateBackend`] is deliberately private: read paths can only obtain
+/// this type through [`resolve_backend_for_read`], which compares the current
+/// configuration with `carina-backend.lock` before constructing the backend.
+/// This prevents a read command from accidentally opening the configured new
+/// backend while a migration from the locked old backend is still pending.
+pub(crate) struct ReadBackend {
+    backend: Box<dyn StateBackend>,
+    state_config: Option<StateBackendConfig>,
+    parser_config: Option<BackendConfig>,
+    lock_status: ReadBackendLockStatus,
+}
+
+impl ReadBackend {
+    pub(crate) async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+        self.backend.read_state().await
+    }
+
+    pub(crate) async fn read_published_exports(&self) -> BackendResult<Option<PublishedExports>> {
+        carina_state::read_published_exports(self.backend.as_ref()).await
+    }
+
+    pub(crate) async fn bucket_exists(&self) -> BackendResult<bool> {
+        self.backend.bucket_exists().await
+    }
+
+    pub(crate) fn provider_name(&self) -> Option<&str> {
+        self.backend.provider_name()
+    }
+
+    pub(crate) fn resource_type(&self) -> Option<&str> {
+        self.backend.resource_type()
+    }
+
+    pub(crate) fn state_config(&self) -> Option<&StateBackendConfig> {
+        self.state_config.as_ref()
+    }
+
+    pub(crate) fn parser_config(&self) -> Option<&BackendConfig> {
+        self.parser_config.as_ref()
+    }
+
+    pub(crate) fn migration_pending(&self) -> bool {
+        self.lock_status == ReadBackendLockStatus::MigrationPending
+    }
+}
+
+/// Resolve the backend for a read-only state operation.
+///
+/// Every project-backed read goes through this function. If the configured
+/// backend differs from `carina-backend.lock`, the returned [`ReadBackend`]
+/// points at the locked old backend and this function emits the shared drift
+/// warning. [`BackendLockRequirement`] makes each caller state explicitly
+/// whether a missing lock is accepted, without changing drift selection.
+pub(crate) async fn resolve_backend_for_read(
+    base_dir: &Path,
+    command_path: &Path,
+    backend_config: Option<&BackendConfig>,
+    lock_requirement: BackendLockRequirement,
+) -> Result<ReadBackend, AppError> {
+    let (state_config, parser_config, lock_status) =
+        match inspect_backend_drift(base_dir, backend_config)? {
+            BackendDriftStatus::Fresh => {
+                if lock_requirement == BackendLockRequirement::RequirePresent {
+                    return Err(AppError::Config(format!(
+                        "Backend lock file not found. Run `{}` to initialize the project.",
+                        ProjectCommand::new("init", command_path)
+                    )));
+                }
+                (
+                    backend_config
+                        .map(StateBackendConfig::try_from)
+                        .transpose()
+                        .map_err(BackendError::from)?,
+                    backend_config.cloned(),
+                    ReadBackendLockStatus::Missing,
+                )
+            }
+            BackendDriftStatus::Unchanged => (
+                backend_config
+                    .map(StateBackendConfig::try_from)
+                    .transpose()
+                    .map_err(BackendError::from)?,
+                backend_config.cloned(),
+                ReadBackendLockStatus::Current,
+            ),
+            BackendDriftStatus::Drifted {
+                existing,
+                configured,
+            } => {
+                eprintln!(
+                    "{}",
+                    drift_warning(&existing, &configured, command_path).yellow()
+                );
+                let state_config = existing.to_state_config()?;
+                let parser_config = state_config.to_parser_config();
+                (
+                    Some(state_config),
+                    Some(parser_config),
+                    ReadBackendLockStatus::MigrationPending,
+                )
+            }
+        };
+
+    let backend = create_backend(state_config.as_ref(), base_dir).await?;
+    Ok(ReadBackend {
+        backend,
+        state_config,
+        parser_config,
+        lock_status,
     })
 }
 
@@ -153,7 +281,7 @@ pub fn drift_warning(
     project_dir: &Path,
 ) -> String {
     format!(
-        "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
+        "{}\n\n    Until migration completes, Carina reads state from the OLD backend recorded in carina-backend.lock.\n    \
          Before running apply, destroy, or state refresh, run `{}`\n    \
          to migrate state from the OLD backend to the new one.\n\n    \
          To revert instead, restore the backend block to match the lock.",

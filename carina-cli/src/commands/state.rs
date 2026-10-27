@@ -33,10 +33,13 @@ use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LoadedOrphans,
     ResourceState, RowBasis, StateBackend, StateFile, StateUrl, create_backend,
-    create_remote_backend, load_state_from_url, resolve_backend_for_read,
+    create_remote_backend, load_state_from_url,
 };
 
-use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
+use super::{
+    BackendDriftStatus, BackendLockRequirement, DriftCommand, inspect_backend_drift,
+    resolve_backend_for_read, verify_for_mutation,
+};
 use crate::commands::plan::{
     ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
     load_and_resolve_provider_configs,
@@ -417,10 +420,13 @@ async fn load_state_file(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let backend: Box<dyn StateBackend> =
-        resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
-            .await
-            .map_err(AppError::Backend)?;
+    let backend = resolve_backend_for_read(
+        base_dir,
+        path,
+        parsed.backend.as_ref(),
+        BackendLockRequirement::AllowMissing,
+    )
+    .await?;
 
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
     state_file
