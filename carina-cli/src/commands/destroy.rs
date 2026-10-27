@@ -345,7 +345,7 @@ async fn run_destroy_locked_with_ctx_owned(
     if !refresh {
         eprintln!(
             "{}",
-            "Warning: using cached state (--refresh=false). Plan may not reflect actual infrastructure.".yellow()
+            "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow()
         );
     }
 
@@ -574,7 +574,6 @@ async fn run_destroy_locked_with_ctx_owned(
                 return Err(AppError::Interrupted);
             }
         }
-        drop(refresh_phase);
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.

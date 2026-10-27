@@ -1,0 +1,3 @@
+let roles = read mock.iam.Roles {
+  name_regex = "seed"
+}

@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 
 use serde_json::json;
 
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::Effect;
 use carina_core::executor::{AcceptedRequest, Applied};
 use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
@@ -28,7 +29,9 @@ use crate::commands::apply::{
     ApplyResult, ApplyTarget, detect_drift, finalize_apply, refresh_pending_states,
     save_state_locked,
 };
-use crate::commands::plan::{CurrentStateEntry, MovedOrigins, PlanFile, ReloadedCurrentStateEntry};
+use crate::commands::plan::{
+    CurrentStateEntry, MovedOrigins, PlanFile, ReloadedCurrentStateEntry, SavedDataSourceValue,
+};
 use crate::commands::shared::finalize::StatePersistence;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::state_writeback::{
@@ -448,11 +451,8 @@ fn plan_file_serde_round_trip() {
             missing_id.clone(),
             State::existing(missing_id.clone(), HashMap::new()),
         ),
-        CurrentStateEntry::data_source(
-            data_source_id.clone(),
-            State::existing(data_source_id.clone(), HashMap::new()),
-        ),
     ];
+    let data_source = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
 
     let plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
@@ -493,10 +493,12 @@ fn plan_file_serde_round_trip() {
         unresolved_resources: sorted_resources,
         current_states,
         compositions: vec![],
-        // The entry tag, not membership in this list, owns the saved row's
-        // managed-vs-data-source classification.
-        data_sources: vec![],
+        data_sources: vec![data_source],
         data_source_origins: vec![],
+        data_source_values: vec![SavedDataSourceValue {
+            id: data_source_id.clone(),
+            value: DataSourceValue::read(State::existing(data_source_id.clone(), HashMap::new())),
+        }],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
@@ -505,7 +507,7 @@ fn plan_file_serde_round_trip() {
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(24));
+    assert_eq!(wire["version"], serde_json::json!(25));
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");
@@ -515,7 +517,8 @@ fn plan_file_serde_round_trip() {
         wire["current_states"][2]["current"]["status"],
         "missing_identifier"
     );
-    assert_eq!(wire["current_states"][3]["kind"], "data_source");
+    assert_eq!(wire["current_states"].as_array().unwrap().len(), 3);
+    assert_eq!(wire["data_source_values"][0]["value"]["kind"], "read");
     let mut invalid_present = wire.clone();
     invalid_present["current_states"][1]["current"]["state"]["identifier"] =
         serde_json::Value::Null;
@@ -560,10 +563,6 @@ fn plan_file_serde_round_trip() {
                 id: loaded_missing_id,
                 current: loaded_missing,
             },
-            ReloadedCurrentStateEntry::DataSource {
-                id: loaded_data_source_id,
-                state: data_source_state,
-            },
         ] => {
             assert!(matches!(loaded_absent.as_ref(), Current::Absent(_absent)));
             let Current::Present(present) = loaded_present.as_ref() else {
@@ -577,8 +576,6 @@ fn plan_file_serde_round_trip() {
             assert_eq!(loaded_present_id, &present_id);
             assert_eq!(present.identifier().as_str(), "present-provider-id");
             assert_eq!(loaded_missing_id, &missing_id);
-            assert_eq!(loaded_data_source_id, &data_source_id);
-            assert!(data_source_state.identifier.is_none());
         }
         entries => panic!("unexpected typed current-state entries: {entries:?}"),
     }
@@ -1778,7 +1775,7 @@ async fn lock_released_on_write_state_failure() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -1924,7 +1921,7 @@ async fn finalize_apply_uses_write_state_locked() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -2251,7 +2248,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: state_lock.as_ref(),
             export_params: Some(&checked_exports(&[])),
@@ -2322,6 +2319,9 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
             path: AccessPath::new("lookup", "answer"),
         })),
     }];
+    let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
+        DataSourceValue::read(result.data_source_states[&data_source.id].clone())
+    });
 
     let _ = finalize_apply(
         FinalizeApplyInput {
@@ -2330,7 +2330,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &data_sources,
+            data_source_values: &data_source_values,
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),
@@ -2935,8 +2935,11 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         None,
     )
     .unwrap();
-    let reloaded =
-        PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &saved);
+    let reloaded = PostApplyStates::from_current_and_state(
+        &HashMap::new(),
+        &DataSourceValues::empty(),
+        &saved,
+    );
 
     let resources = [resource];
     let plan = create_plan(
@@ -3104,6 +3107,7 @@ fn plan_file_serialization_redacts_secrets() {
         compositions: vec![],
         data_sources: vec![],
         data_source_origins: vec![],
+        data_source_values: vec![],
         current_states: vec![CurrentStateEntry::managed(
             ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
             redact_secrets_in_state(&state_with_secret).unwrap(),
@@ -3156,6 +3160,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -3194,6 +3199,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -3255,6 +3261,7 @@ fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![CurrentStateEntry::managed(
             target_id.clone(),
             State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
@@ -3279,6 +3286,10 @@ fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
         DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
     let mut plan_file = plan_file_with_unchanged_managed_wait_target();
     plan_file.data_sources.push(data_source.clone());
+    plan_file.data_source_values.push(SavedDataSourceValue {
+        id: data_source.id.clone(),
+        value: DataSourceValue::deferred_to_apply(Vec::new()),
+    });
     assert!(plan_file.data_source_origins.is_empty());
 
     let decoded = replace_saved_wait_target(plan_file, &data_source.id);
@@ -3319,6 +3330,62 @@ fn plan_file_validation_accepts_unchanged_managed_wait_target() {
     decoded
         .validate_resource_identities()
         .expect("a wait-only plan may target an unchanged managed resource");
+}
+
+#[test]
+fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
+    let data_source =
+        DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+    let mut plan = Plan::new();
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-28T00:00:00Z".to_string(),
+        source_path: "main.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(Vec::new()),
+        backend_config: None,
+        plan,
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: vec![data_source.clone()],
+        data_source_origins: Vec::new(),
+        data_source_values: vec![SavedDataSourceValue {
+            id: data_source.id,
+            value: DataSourceValue::blocked_by_plan_error(),
+        }],
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+        schema_fingerprints: Default::default(),
+    };
+
+    let error = plan_file
+        .validate_resource_identities()
+        .expect_err("a blocked outcome cannot enter execution without its plan error");
+    assert!(
+        error.contains("blocked_by_plan_error") && error.contains("no plan errors"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn plan_file_decode_requires_data_source_values_field() {
+    let mut encoded = serde_json::to_value(plan_file_with_unchanged_managed_wait_target()).unwrap();
+    encoded
+        .as_object_mut()
+        .expect("saved plan object")
+        .remove("data_source_values");
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("format 25 must require the total data-source outcome field");
+    assert!(error.to_string().contains("data_source_values"), "{error}");
 }
 
 /// Backend that captures the state written to it.
@@ -3393,12 +3460,11 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         StateLockRef::Held(&lock),
         Some(state_in),
         &[],
-        &[],
+        &DataSourceValues::empty(),
         &[],
         &checked_exports(&[]),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
-        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &ProviderContext::default(),
     )
@@ -3439,12 +3505,11 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         StateLockRef::Held(&lock),
         Some(StateFile::new()),
         &[],
-        &[],
+        &DataSourceValues::empty(),
         &[],
         &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
-        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &ProviderContext::default(),
     )
@@ -3489,12 +3554,11 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         StateLockRef::Held(&lock),
         Some(state_in),
         &[],
-        &[],
+        &DataSourceValues::empty(),
         &[],
         &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
-        &HashMap::new(),
         &HashMap::new(),
         &ProviderContext::default(),
     )
@@ -3567,7 +3631,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
                 Some(state_in),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -3631,7 +3695,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
                 Some(state_in),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: None,
@@ -3723,7 +3787,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&sorted_resources),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),
@@ -3824,7 +3888,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&sorted_resources),
-            data_sources: &[],
+            data_source_values: &DataSourceValues::empty(),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),

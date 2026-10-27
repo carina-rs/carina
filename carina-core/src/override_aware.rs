@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use crate::data_source_value::DataSourceValues;
 use crate::deps::sort_resources_by_dependencies;
 use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
@@ -284,9 +285,8 @@ pub struct OverrideAwareResources {
 /// rebuilt view always uses the resource set owned by the receiver.
 pub struct RebuildBindingsInputs<'a> {
     pub compositions: &'a [crate::resource::Composition],
-    pub data_sources: &'a [crate::resource::DataSource],
     pub managed_current: &'a HashMap<ResourceId, crate::resource::PlanInputCurrent>,
-    pub data_source_states: &'a HashMap<ResourceId, crate::resource::State>,
+    pub data_source_values: &'a DataSourceValues,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [crate::binding_index::WaitAliasSpec],
 }
@@ -326,9 +326,8 @@ impl OverrideAwareResources {
             PreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
-                data_sources: inputs.data_sources,
                 managed_current: inputs.managed_current,
-                data_source_states: inputs.data_source_states,
+                data_source_values: inputs.data_source_values,
                 remote_bindings: inputs.remote_bindings,
                 wait_aliases: inputs.wait_aliases,
             },
@@ -375,9 +374,8 @@ impl OverrideAwareResources {
             PreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
-                data_sources: inputs.data_sources,
                 managed_current: inputs.managed_current,
-                data_source_states: inputs.data_source_states,
+                data_source_values: inputs.data_source_values,
                 remote_bindings: inputs.remote_bindings,
                 wait_aliases: inputs.wait_aliases,
             },
@@ -519,9 +517,8 @@ impl OverrideAwareResources {
     ) {
         let RebuildBindingsInputs {
             compositions,
-            data_sources,
             managed_current,
-            data_source_states,
+            data_source_values,
             remote_bindings,
             wait_aliases,
         } = inputs;
@@ -529,9 +526,8 @@ impl OverrideAwareResources {
             PreApplyInputs {
                 managed: &self.resources,
                 compositions,
-                data_sources,
                 managed_current,
-                data_source_states,
+                data_source_values,
                 remote_bindings,
                 wait_aliases,
             },
@@ -553,17 +549,15 @@ impl OverrideAwareResources {
         unresolved_resources: Vec<Resource>,
     ) -> Self {
         let compositions = [];
-        let data_sources = [];
         let managed_current = HashMap::new();
-        let data_source_states = HashMap::new();
+        let data_source_values = DataSourceValues::empty();
         let remote_bindings = HashMap::new();
         let wait_aliases = [];
         let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
             compositions: &compositions,
-            data_sources: &data_sources,
             managed_current: &managed_current,
-            data_source_states: &data_source_states,
+            data_source_values: &data_source_values,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         });
@@ -711,7 +705,7 @@ mod tests {
         overrides: &HashMap<ResourceId, HashMap<String, NameOverride>>,
     ) -> OverrideAwareResources {
         let compositions = [];
-        let data_sources = [];
+        let data_source_values = DataSourceValues::empty();
         let managed_current: HashMap<ResourceId, PlanInputCurrent> = HashMap::new();
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
@@ -729,9 +723,8 @@ mod tests {
             PreApplyInputs {
                 managed: &[],
                 compositions: &compositions,
-                data_sources: &data_sources,
                 managed_current: &managed_current,
-                data_source_states: &HashMap::new(),
+                data_source_values: &data_source_values,
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },

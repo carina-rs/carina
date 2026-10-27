@@ -4613,9 +4613,8 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[resource],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })

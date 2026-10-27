@@ -8301,9 +8301,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &managed,
             compositions: &[],
-            data_sources: &[],
             managed_current: &current_states,
-            data_source_states: &std::collections::HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote_bindings,
             wait_aliases: &[],
         });

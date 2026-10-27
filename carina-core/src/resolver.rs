@@ -37,9 +37,8 @@ pub fn resolve_refs_with_state(
         crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
-            data_sources: &[],
             managed_current,
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -856,9 +855,8 @@ mod tests {
         ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })
@@ -1108,9 +1106,8 @@ mod tests {
             crate::binding_index::PreApplyInputs {
                 managed: std::slice::from_ref(&resource),
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &current,
-                data_source_states: &HashMap::new(),
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
             },
@@ -1236,9 +1233,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &current,
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -1387,9 +1383,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &plan_input_states,
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings,
             wait_aliases,
         });
@@ -1412,9 +1407,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
-            data_sources: &[],
             managed_current: &plan_input_states,
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings,
             wait_aliases,
         });
@@ -3376,9 +3370,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &[cert],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),
@@ -3406,9 +3399,8 @@ mod tests {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),

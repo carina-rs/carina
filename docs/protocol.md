@@ -118,6 +118,14 @@ Saved-plan format 24 removes `target_schema_kind` from serialized
 schema kind is always `Resource`; data sources are rejected as wait targets
 (carina#3916).
 
+Saved-plan format 25 persists exactly one typed phase-2 outcome for every
+configured data source: either its read state, its apply-time deferral reasons,
+or a structured-plan-error blocker. Apply validates that this outcome set
+matches the saved plan's data-source set exactly and restores it directly; it
+does not reclassify reads from a partial dependency view. Read state lives only
+in this outcome field; `current_states` contains managed resources only, so
+secret verification cannot observe a second, divergent copy (carina#3993).
+
 Hosts and providers must both use protocol v10. The minimum supported protocol
 version is 10.
 

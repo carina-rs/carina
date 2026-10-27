@@ -86,7 +86,7 @@ produce a fresh saved plan.
 
 When `--auto-approve` is not set, Carina follows this flow:
 
-1. Refreshes state from the cloud provider for all managed resources
+1. Refreshes state from the cloud provider for all managed resources and reads all data sources
 2. Computes and displays the execution plan
 3. If no changes are needed, prints "No changes needed." and exits
 4. Prompts: "Do you want to perform these actions?"
@@ -94,6 +94,8 @@ When `--auto-approve` is not set, Carina follows this flow:
 6. Executes the effects concurrently (up to `--parallelism` at a time, default 8) with progress spinners, saving state to the backend as effects complete
 7. Saves the final state to the backend
 8. Prints a summary of results
+
+When `carina apply` creates a plan directly from a configuration directory, data sources are always read. Likewise, `carina plan --refresh=false` skips only managed-resource refresh before writing a saved plan; it still reads every data source.
 
 ## Error Handling
 

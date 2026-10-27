@@ -7,12 +7,10 @@ use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::data_source_value::DataSourceValue;
 #[cfg(test)]
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{
-    Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves,
-    transform_prior_provider_states,
-};
+use carina_core::differ::{Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves};
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
@@ -51,11 +49,10 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
-    DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
-    data_source_refresh_bindings, get_provider_with_ctx, prepare_default_provider_ready_config,
-    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
-    resolve_data_source_refs_for_refresh,
+    AddressedDataSourceReadInputs, WiringContext, build_factories_from_providers,
+    get_provider_with_ctx, prepare_default_provider_ready_config,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1206,7 +1203,6 @@ async fn run_state_refresh_locked_with_ctx(
     // Cancel stops dispatching new reads, then waits for in-flight reads to finish
     // so provider futures are not dropped mid-call.
     let mut managed_current = HashMap::new();
-    let mut data_source_states = HashMap::new();
     let mut managed_reads = Vec::new();
     let mut missing_provider_identifier_ids = HashSet::new();
     if let Some(state_file) = state_file.as_ref() {
@@ -1287,9 +1283,8 @@ async fn run_state_refresh_locked_with_ctx(
     // carina#3739: `build_saved_attrs` returns raw persisted values; consuming
     // them through `lift` is required before the typed expansion input accepts
     // the map for Phase 2.5 hydration.
-    crate::wiring::hydrate_prior_states(
+    crate::wiring::hydrate_prior_managed_states(
         &mut managed_current,
-        &mut data_source_states,
         &mut orphans,
         &provider,
         expansion_prelude.saved_attrs(),
@@ -1313,14 +1308,34 @@ async fn run_state_refresh_locked_with_ctx(
                 .collect()
         })
         .unwrap_or_default();
-    let mut prepared_expansion = expansion_prelude
-        .preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
+    let addressed_expansion =
+        expansion_prelude.preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
             managed_current,
-            data_source_states,
             orphans,
             already_refreshed,
+        });
+    let empty_remote_bindings = HashMap::new();
+    let data_source_values = addressed_expansion
+        .read_data_sources_phase2(AddressedDataSourceReadInputs {
+            provider: &provider,
+            refresh_phase: Some(&refresh_phase),
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            remote_bindings: &empty_remote_bindings,
+            schemas: ctx.schemas(),
+            saved_dep_bindings: &saved_dep_bindings,
+            factories: ctx.factories(),
+            cancel: Some(&cancel),
         })
-        .seal();
+        .await?
+        .into_values()?;
+    match cancel.phase() {
+        ShutdownPhase::Running => {}
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            return Err(AppError::Interrupted);
+        }
+    }
+    let mut prepared_expansion = addressed_expansion.seal(data_source_values);
     let crate::wiring::ExpandedRefreshState {
         canonical_resources: _,
         sorted_resources: resorted,
@@ -1346,11 +1361,40 @@ async fn run_state_refresh_locked_with_ctx(
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
         mut managed_current,
-        mut data_source_states,
+        mut data_source_values,
         orphans,
         saved_attrs: saved_attrs_for_expansion,
+        wait_aliases,
         ..
     } = prepared_expansion.into_parts();
+    data_source_values = crate::wiring::read_expanded_data_sources_phase2(
+        data_source_values,
+        crate::wiring::ExpandedDataSourceReadInputs {
+            provider: &provider,
+            refresh_phase: Some(&refresh_phase),
+            managed: &sorted_resources,
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            managed_current: &managed_current,
+            orphans: &orphans,
+            remote_bindings: &empty_remote_bindings,
+            schemas: ctx.schemas(),
+            wait_aliases: &wait_aliases,
+            saved_dep_bindings: &saved_dep_bindings,
+            factories: ctx.factories(),
+            cancel: Some(&cancel),
+        },
+    )
+    .await?
+    .into_values()?;
+    for (resource, value) in data_source_values.iter() {
+        if let DataSourceValue::DeferredToApply(unresolved) = value {
+            eprintln!(
+                "{}",
+                format_deferred_state_refresh_warning(resource, unresolved).yellow()
+            );
+        }
+    }
     match cancel.phase() {
         ShutdownPhase::Running => {}
         ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1369,111 +1413,25 @@ async fn run_state_refresh_locked_with_ctx(
         .collect();
     managed_current = into_all_prior_states(orphans, managed_current);
 
-    // carina#3271: re-read every `read aws.*` data source. Without
-    // this, `data_source_states` has no entry for any data source and
-    // the downstream post-apply export resolver (after #3266) cannot resolve
-    // `<data_source>.<attr>` references in `exports {}`, so
-    // `state.exports` keeps the pre-refresh literal for any export
-    // whose value depends on a data source.
-    //
-    // Mirrors the data-source phase of `run_apply_locked`
-    // (`resolve_data_source_refs_for_refresh` + `read_data_source_with_retry`):
-    // resolve input attribute `ResourceRef`s against the
-    // already-refreshed `managed_current`, then read each
-    // data source through the provider.
-    if !parsed.data_sources.is_empty() {
-        let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
-            .wait_bindings
-            .iter()
-            .map(carina_core::binding_index::WaitAliasSpec::from)
-            .collect();
-        let empty_remote_bindings = HashMap::new();
-        let data_source_bindings = data_source_refresh_bindings(
-            &sorted_resources,
-            &parsed.compositions,
-            &parsed.data_sources,
-            &managed_current,
-            &data_source_states,
-            &empty_remote_bindings,
-            ctx.schemas(),
-            &wait_aliases,
-        );
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
-        // Check the shared module gate before any data-source dispatch so a
-        // violation remains attributed to its composition instead of being
-        // wrapped as a provider failure on whichever read happened to expose it.
-        module_gate.check(&data_source_bindings)?;
-        let data_source_refreshes = resolve_data_source_refs_for_refresh(
-            &sorted_resources,
-            &parsed.compositions,
-            &parsed.data_sources,
-            &managed_current,
-            &data_source_states,
-            &empty_remote_bindings,
-            ctx.schemas(),
-            &wait_aliases,
-        )?;
-        for resolution in data_source_refreshes {
-            let resource = match resolution {
-                DataSourceRefreshResolution::Resolved(resource) => resource,
-                DataSourceRefreshResolution::DeferredToApply {
-                    resource,
-                    unresolved,
-                } => {
-                    eprintln!(
-                        "{}",
-                        format_deferred_state_refresh_warning(&resource, &unresolved).yellow()
-                    );
-                    continue;
-                }
-            };
-            match cancel.phase() {
-                ShutdownPhase::Running => {}
-                ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
-                    return Err(AppError::Interrupted);
-                }
-            }
-            let fresh_state = read_data_source_with_retry(
-                &provider,
-                &resource,
-                &data_source_bindings,
-                &module_gate,
-                ctx.factories(),
-                ctx.schemas(),
-            )
-            .await?;
-            match cancel.phase() {
-                ShutdownPhase::Running => {}
-                ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
-                    return Err(AppError::Interrupted);
-                }
-            }
-            data_source_states.insert(resource.id.clone(), fresh_state);
-        }
-    }
-
     // Restore managed attributes from the same lifted map used by the
     // expansion hydration above (CloudControl doesn't always return them).
     // Data sources have no persisted rows and therefore hydrate against an
     // empty saved-attribute set even when a managed orphan shares their ID.
     let saved_attrs = saved_attrs_for_expansion;
-    transform_prior_provider_states(
+    crate::wiring::hydrate_prior_data_source_values(
         &mut managed_current,
-        &mut data_source_states,
+        &mut data_source_values,
         &mut Orphans::new(),
-        async |states| {
-            provider
-                .hydrate_read_state(states, saved_attrs.as_provider_saved_attrs())
-                .await
-        },
-        async |states| {
-            let empty_saved_attrs = carina_core::provider::SavedAttrs::new();
-            provider
-                .hydrate_read_state(states, &empty_saved_attrs)
-                .await
-        },
+        &provider,
+        &saved_attrs,
+        state_file.as_ref(),
     )
     .await?;
+    crate::wiring::lift_data_source_value_enum_leaves(
+        &mut data_source_values,
+        &parsed.data_sources,
+        ctx.schemas(),
+    );
     // awscc#251: also lift the provider-read managed current states (not just
     // `saved_attrs`) — the values read at the refresh loop above arrive
     // as plain `String` for IAM enum fields and must be lifted before
@@ -1562,7 +1520,7 @@ async fn run_state_refresh_locked_with_ctx(
         let post_apply_states =
             crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
                 &managed_current,
-                &data_source_states,
+                &data_source_values,
                 &state,
             );
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
@@ -1575,7 +1533,6 @@ async fn run_state_refresh_locked_with_ctx(
             crate::commands::shared::state_writeback::ResolveExportValuesPostApplyInput {
                 export_params: &checked_exports,
                 sorted_resources: &sorted_resources,
-                data_sources: &parsed.data_sources,
                 pre_resolve_compositions: &parsed.compositions,
                 post_apply_states: &post_apply_states,
                 schemas: ctx.schemas(),
@@ -2766,6 +2723,16 @@ mod tests {
         reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    struct CancellingDataSourceRefreshFactory {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        trigger: carina_core::shutdown::GracefulShutdownTrigger,
+    }
+
+    struct CancellingDataSourceRefreshProvider {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        trigger: carina_core::shutdown::GracefulShutdownTrigger,
+    }
+
     impl carina_core::provider::ProviderFactory for ModuleConstraintRefreshFactory {
         fn name(&self) -> &str {
             "test"
@@ -2881,8 +2848,183 @@ mod tests {
         }
     }
 
+    impl carina_core::provider::ProviderFactory for CancellingDataSourceRefreshFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "cancelling state refresh provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            let reads = self.reads.clone();
+            let trigger = self.trigger.clone();
+            Box::pin(async move {
+                Ok(
+                    Box::new(CancellingDataSourceRefreshProvider { reads, trigger })
+                        as Box<dyn Provider>,
+                )
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            vec![ResourceSchema::new("lookup").as_data_source()]
+        }
+    }
+
+    impl Provider for CancellingDataSourceRefreshProvider {
+        fn name(&self) -> &str {
+            "cancelling-state-refresh"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(carina_core::provider::ReadOutcome::not_found(id)) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let call = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.trigger.request_graceful_shutdown();
+            }
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            attempt: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            Box::pin(
+                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
+            )
+        }
+
+        fn resume_create(
+            &self,
+            _request: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            Box::pin(async { panic!("unexpected resume_create") })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &carina_core::provider::AppliedIdentifier,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &carina_core::provider::AppliedIdentifier,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
-    async fn state_refresh_reports_module_constraint_without_dispatching_data_source() {
+    async fn state_refresh_stops_dispatching_data_sources_after_cancellation() {
+        let provider_config = carina_core::parser::ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(provider_config);
+        parsed
+            .data_sources
+            .push(DataSource::with_provider("test", "lookup", "first", None));
+        parsed
+            .data_sources
+            .push(DataSource::with_provider("test", "lookup", "second", None));
+        let backend = non_empty_refresh_backend("test");
+        let root = ShutdownToken::running();
+        let (trigger, cancel) = root.with_graceful_shutdown_trigger();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = WiringContext::new(
+            vec![Box::new(CancellingDataSourceRefreshFactory {
+                reads: reads.clone(),
+                trigger,
+            })],
+            &parsed.providers,
+        );
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            StateLock::disabled_for_test().as_ref(),
+            temp.path(),
+            &ProviderContext::default(),
+            cancel,
+            &ctx,
+        )
+        .await
+        .expect_err("graceful cancellation must interrupt state refresh");
+
+        assert!(matches!(error, AppError::Interrupted), "{error:?}");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no data-source read may be dispatched after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_refresh_ignores_module_constraint_unrelated_to_data_source() {
         let composition = Composition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
@@ -2950,7 +3092,7 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
 
-        let error = run_state_refresh_locked_with_ctx(
+        run_state_refresh_locked_with_ctx(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2960,16 +3102,82 @@ mod tests {
             &ctx,
         )
         .await
-        .expect_err("state refresh must reject the module constraint");
+        .expect("an unrelated module constraint must not block a data-source read");
 
-        assert!(matches!(error, AppError::ModuleConstraint(_)), "{error:?}");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("module 'checked_module' (call 'checked')"),
-            "{rendered}"
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn state_refresh_ignores_module_constraint_when_there_are_no_data_sources() {
+        let composition = Composition {
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", "checked",
+            )),
+            signature: Signature {
+                arguments: IndexMap::from([(
+                    "value".to_string(),
+                    CompositionArgument::from_value(
+                        Value::Concrete(ConcreteValue::String("bad".into())),
+                        TypeExpr::String,
+                    ),
+                )]),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![PendingModuleConstraint {
+                    id: ModuleConstraintId::argument_validation("value", 0),
+                    expression: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("value".to_string())),
+                        op: CompareOp::Ne,
+                        rhs: Box::new(ValidateExpr::String("bad".to_string())),
+                    },
+                    message: "value must not be bad".to_string(),
+                }],
+            },
+            binding: Some("checked".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "checked_module".to_string(),
+            instance: "root.checked".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(carina_core::parser::ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        });
+        parsed.compositions.push(composition);
+
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("orphan", "old", "test", "old-id")
+                    .expect("fixture identifier is non-empty"),
+            )
+            .unwrap();
+        let backend = ModuleConstraintRefreshBackend { state };
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = WiringContext::new(
+            vec![Box::new(ModuleConstraintRefreshFactory { reads })],
+            &parsed.providers,
         );
-        assert!(!rendered.contains("unrelated"), "{rendered}");
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let temp = tempfile::tempdir().unwrap();
+
+        run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            StateLock::disabled_for_test().as_ref(),
+            temp.path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        .expect("an unrelated module constraint cannot block an absent data-source phase");
     }
 
     #[test]
@@ -3319,7 +3527,7 @@ mod tests {
             &parsed,
             &sorted_resources,
             &current_states,
-            &HashMap::new(),
+            &carina_core::data_source_value::DataSourceValues::empty(),
             &SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -3396,11 +3604,10 @@ mod tests {
         let mut prepared_expansion = expansion_prelude
             .preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
                 managed_current: current_states,
-                data_source_states: HashMap::new(),
                 orphans,
                 already_refreshed,
             })
-            .seal();
+            .seal(carina_core::data_source_value::DataSourceValues::empty());
         let progress = ProgressBackend::plain(std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
         let expanded = crate::wiring::expand_refresh_and_lift_states(

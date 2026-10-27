@@ -6,6 +6,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
 use carina_core::effect::{Effect, EffectGeneration};
@@ -111,6 +112,17 @@ pub(crate) struct PlanSchemaFingerprintMismatch {
     pub(crate) providers: BTreeMap<String, Vec<String>>,
 }
 
+/// Saved, typed phase-2 outcome for one configured data source.
+///
+/// The address is stored alongside the outcome so saved-plan loading can
+/// validate that the set is exactly the plan's configured data-source set
+/// before constructing [`carina_core::data_source_value::DataSourceValues`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedDataSourceValue {
+    pub id: ResourceId,
+    pub value: carina_core::data_source_value::DataSourceValue,
+}
+
 /// Saved plan file for `plan --out` / `apply <plan-file>`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFile {
@@ -120,6 +132,8 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 25 adds the mandatory typed `data_source_values` outcomes
+    /// and removes duplicate data-source rows from `current_states`.
     /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
     /// format 21 explicitly tags managed and data-source current-state entries,
     /// and explicitly tags each managed [`Current`] variant. A serialized
@@ -201,7 +215,13 @@ pub struct PlanFile {
     /// rechecking canonicalized literals as authored values.
     #[serde(default)]
     pub data_source_origins: Vec<carina_core::resource::DataSource>,
-    /// Current states (for binding_map + state saving)
+    /// One plan-time phase-2 outcome for every entry in `data_sources`.
+    ///
+    /// Format 25 persists this total collection so saved-plan apply never
+    /// reclassifies deferred reads from an incomplete dependency view.
+    pub data_source_values: Vec<SavedDataSourceValue>,
+    /// Managed current states (for binding construction and state saving).
+    /// Data-source read state lives only in `data_source_values`.
     pub current_states: Vec<CurrentStateEntry>,
     /// `upstream_state` bindings as resolved at plan time (#2303).
     ///
@@ -237,7 +257,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 24;
+    pub const CURRENT_VERSION: u32 = 25;
 
     /// Capture the exact schema type inventory reached by this plan.
     pub fn record_schema_fingerprints(&mut self, schemas: &carina_core::schema::SchemaRegistry) {
@@ -351,18 +371,15 @@ impl PlanFile {
         for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
             insert(&mut references, &data_source.id, SchemaKind::DataSource);
         }
+        for saved in &self.data_source_values {
+            insert(&mut references, &saved.id, SchemaKind::DataSource);
+        }
         for current in &self.current_states {
-            match current {
-                CurrentStateEntry::Managed {
-                    id,
-                    current: _current,
-                } => {
-                    insert(&mut references, id, SchemaKind::Resource);
-                }
-                CurrentStateEntry::DataSource { id, state: _state } => {
-                    insert(&mut references, id, SchemaKind::DataSource);
-                }
-            }
+            let CurrentStateEntry::Managed {
+                id,
+                current: _current,
+            } = current;
+            insert(&mut references, id, SchemaKind::Resource);
         }
         PlanSchemaReferences(references)
     }
@@ -385,8 +402,7 @@ impl PlanFile {
                 CurrentStateEntry::Managed {
                     id: _id,
                     current: _,
-                }
-                | CurrentStateEntry::DataSource { id: _id, state: _ } => None,
+                } => None,
             })
             .collect();
 
@@ -463,9 +479,6 @@ impl PlanFile {
                         (ReloadSavedManagedCurrent::Snapshot(saved), _locked) => saved,
                     };
                     current_states.push(ReloadedCurrentStateEntry::Managed { id, current });
-                }
-                CurrentStateEntry::DataSource { id, state } => {
-                    current_states.push(ReloadedCurrentStateEntry::DataSource { id, state });
                 }
             }
         }
@@ -551,11 +564,14 @@ impl PlanFile {
         }
 
         fn current_state_contains(entry: &CurrentStateEntry) -> bool {
-            match entry {
-                CurrentStateEntry::Managed { id: _id, current } => {
-                    current.contains_redacted_secret(state_contains)
-                }
-                CurrentStateEntry::DataSource { id: _id, state } => state_contains(state),
+            let CurrentStateEntry::Managed { id: _id, current } = entry;
+            current.contains_redacted_secret(state_contains)
+        }
+
+        fn data_source_value_contains(saved: &SavedDataSourceValue) -> bool {
+            match &saved.value {
+                DataSourceValue::Read(state) => state_contains(state),
+                DataSourceValue::DeferredToApply(_) | DataSourceValue::BlockedByPlanError => false,
             }
         }
 
@@ -574,6 +590,7 @@ impl PlanFile {
             compositions,
             data_sources,
             data_source_origins,
+            data_source_values,
             current_states,
             upstream_snapshot,
             upstream_sources: _upstream_sources,
@@ -598,6 +615,7 @@ impl PlanFile {
             || compositions.iter().any(composition_contains)
             || data_sources.iter().any(data_source_contains)
             || data_source_origins.iter().any(data_source_contains)
+            || data_source_values.iter().any(data_source_value_contains)
             || current_states.iter().any(current_state_contains)
             || upstream_snapshot.values().any(|attributes| {
                 attributes
@@ -631,17 +649,68 @@ impl PlanFile {
         for (index, data_source) in self.data_source_origins.iter().enumerate() {
             require_identity(&data_source.id, &format!("data_source_origins[{index}]"))?;
         }
-        for (index, entry) in self.current_states.iter().enumerate() {
-            require_identity(entry.id(), &format!("current_states[{index}].id"))?;
-            match entry {
-                CurrentStateEntry::Managed { id: _id, current } => {
-                    if let Some(nested_id) = current.nested_id() {
-                        require_identity(nested_id, &format!("current_states[{index}].state.id"))?;
+        let configured_data_source_ids = self
+            .data_sources
+            .iter()
+            .map(|data_source| &data_source.id)
+            .collect::<HashSet<_>>();
+        if configured_data_source_ids.len() != self.data_sources.len() {
+            return Err(
+                "Invalid saved plan: data_sources contains a duplicate address".to_string(),
+            );
+        }
+        let mut outcome_ids = HashSet::with_capacity(self.data_source_values.len());
+        let mut has_blocked_outcome = false;
+        for (index, saved) in self.data_source_values.iter().enumerate() {
+            require_identity(&saved.id, &format!("data_source_values[{index}].id"))?;
+            if !outcome_ids.insert(&saved.id) {
+                return Err(format!(
+                    "Invalid saved plan: data_source_values contains duplicate outcomes for `{}`",
+                    saved.id
+                ));
+            }
+            if !configured_data_source_ids.contains(&saved.id) {
+                return Err(format!(
+                    "Invalid saved plan: data_source_values contains an outcome for unknown data source `{}`",
+                    saved.id
+                ));
+            }
+            match &saved.value {
+                DataSourceValue::Read(state) => {
+                    require_identity(
+                        &state.id,
+                        &format!("data_source_values[{index}].value.state.id"),
+                    )?;
+                    if state.id != saved.id {
+                        return Err(format!(
+                            "Invalid saved plan: data_source_values[{index}] address `{}` does not match nested state address `{}`",
+                            saved.id, state.id
+                        ));
                     }
                 }
-                CurrentStateEntry::DataSource { id: _id, state } => {
-                    require_identity(&state.id, &format!("current_states[{index}].state.id"))?;
-                }
+                DataSourceValue::DeferredToApply(_) => {}
+                DataSourceValue::BlockedByPlanError => has_blocked_outcome = true,
+            }
+        }
+        if has_blocked_outcome && !self.plan.has_errors() {
+            return Err(
+                "Invalid saved plan: data_source_values contains blocked_by_plan_error but the plan has no plan errors"
+                    .to_string(),
+            );
+        }
+        if let Some(missing) = configured_data_source_ids
+            .iter()
+            .find(|id| !outcome_ids.contains(*id))
+        {
+            return Err(format!(
+                "Invalid saved plan: data_source_values has no outcome for data source `{missing}`"
+            ));
+        }
+        for (index, entry) in self.current_states.iter().enumerate() {
+            require_identity(entry.id(), &format!("current_states[{index}].id"))?;
+            let CurrentStateEntry::Managed { id: _id, current } = entry;
+            if let Some(nested_id) = current.nested_id() {
+                require_identity(nested_id, &format!("current_states[{index}].state.id"))?;
             }
         }
 
@@ -1257,10 +1326,6 @@ pub enum CurrentStateEntry {
         #[serde(with = "managed_current_serde")]
         current: SavedManagedCurrent,
     },
-    DataSource {
-        id: ResourceId,
-        state: Box<State>,
-    },
 }
 
 /// Current-state snapshots after every create-in-flight marker has been
@@ -1271,10 +1336,6 @@ pub(crate) enum ReloadedCurrentStateEntry {
     Managed {
         id: ResourceId,
         current: Box<Current>,
-    },
-    DataSource {
-        id: ResourceId,
-        state: Box<State>,
     },
 }
 
@@ -1371,6 +1432,14 @@ impl ReloadedPlanFile {
 
     pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
         &mut self.plan_file.data_source_origins
+    }
+
+    pub(crate) fn data_source_values(&self) -> &[SavedDataSourceValue] {
+        &self.plan_file.data_source_values
+    }
+
+    pub(crate) fn data_source_values_mut(&mut self) -> &mut [SavedDataSourceValue] {
+        &mut self.plan_file.data_source_values
     }
 
     pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
@@ -1586,6 +1655,7 @@ mod managed_current_serde_tests {
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
             current_states: vec![CurrentStateEntry::Managed { id, current }],
             upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
@@ -1644,10 +1714,6 @@ mod managed_current_serde_tests {
                     }
                 }
             }
-            CurrentStateEntry::DataSource {
-                id: decoded_id,
-                state,
-            } => panic!("Managed serialized as DataSource: {decoded_id:?} {state:?}"),
         }
     }
 
@@ -1761,9 +1827,7 @@ mod managed_current_serde_tests {
         let plan = plan
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved continuation must reload from its source row");
-        let ReloadedCurrentStateEntry::Managed { id, current } = &plan.current_states()[0] else {
-            panic!("fixture current state must remain managed");
-        };
+        let ReloadedCurrentStateEntry::Managed { id, current } = &plan.current_states()[0];
         assert_eq!(id, &destination);
         let Current::CreateInFlight(pending) = current.as_ref() else {
             panic!("moved marker must reload the state-owned continuation");
@@ -1784,20 +1848,12 @@ impl CurrentStateEntry {
         }
     }
 
-    pub fn data_source(id: ResourceId, state: State) -> Self {
-        Self::DataSource {
-            id,
-            state: Box::new(state),
-        }
-    }
-
     pub fn id(&self) -> &ResourceId {
         match self {
             Self::Managed {
                 id,
                 current: _current,
             } => id,
-            Self::DataSource { id, state: _state } => id,
         }
     }
 }
@@ -1908,8 +1964,8 @@ fn build_plan_file<E>(
         })
         .collect::<HashMap<_, _>>();
     let redacted_data_source_states = ctx
-        .data_source_states
-        .iter()
+        .data_source_values
+        .read_states()
         .map(|(id, state)| Ok((id.clone(), redact_current_state(id, state)?)))
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
     let redacted_sorted_resources = ctx
@@ -2058,6 +2114,22 @@ fn build_plan_file<E>(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?,
+        data_source_values: ctx
+            .data_source_values
+            .iter()
+            .map(|(data_source, value)| SavedDataSourceValue {
+                id: data_source.id.clone(),
+                value: match value {
+                    DataSourceValue::Read(_) => {
+                        DataSourceValue::read(redacted_data_source_states[&data_source.id].clone())
+                    }
+                    DataSourceValue::DeferredToApply(unresolved) => {
+                        DataSourceValue::deferred_to_apply(unresolved.clone())
+                    }
+                    DataSourceValue::BlockedByPlanError => DataSourceValue::blocked_by_plan_error(),
+                },
+            })
+            .collect(),
         current_states: ctx
             .managed_current
             .keys()
@@ -2065,14 +2137,6 @@ fn build_plan_file<E>(
                 id: id.clone(),
                 current: SavedManagedCurrent::from_current(redacted_managed_current[id].clone()),
             })
-            .chain(
-                ctx.data_source_states
-                    .keys()
-                    .map(|id| CurrentStateEntry::DataSource {
-                        id: id.clone(),
-                        state: Box::new(redacted_data_source_states[id].clone()),
-                    }),
-            )
             .collect(),
         upstream_snapshot,
         upstream_sources: parsed
@@ -2422,7 +2486,7 @@ pub async fn run_plan(
     if !refresh {
         eprintln!(
             "{}",
-            "Warning: using cached state (--refresh=false). Plan may not reflect actual infrastructure.".yellow()
+            "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.".yellow()
         );
     }
 
@@ -2515,9 +2579,8 @@ pub async fn run_plan(
         export_params: &parsed.export_params,
         resources: &resources_for_exports,
         compositions: &parsed.compositions,
-        data_sources: &parsed.data_sources,
         managed_current: &ctx.managed_current,
-        data_source_states: &ctx.data_source_states,
+        data_source_values: &ctx.data_source_values,
         state_file: state_file.as_ref(),
         plan: &ctx.plan,
         schemas: wiring.schemas(),
@@ -2801,9 +2864,8 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
     pub export_params: &'a [carina_core::parser::InferredExportParam],
     pub resources: &'a [Resource],
     pub compositions: &'a [carina_core::resource::Composition],
-    pub data_sources: &'a [carina_core::resource::DataSource],
     pub managed_current: &'a HashMap<ResourceId, Current>,
-    pub data_source_states: &'a HashMap<ResourceId, State>,
+    pub data_source_values: &'a carina_core::data_source_value::DataSourceValues,
     /// Persisted secret shapes that classify provider-returned plaintext before
     /// it enters export resolution.
     pub state_file: Option<&'a StateFile>,
@@ -2856,9 +2918,8 @@ pub(crate) fn check_exports_pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: input.resources,
             compositions: input.compositions,
-            data_sources: input.data_sources,
             managed_current: &plan_input_current,
-            data_source_states: input.data_source_states,
+            data_source_values: input.data_source_values,
             remote_bindings: &HashMap::new(),
             wait_aliases: input.wait_aliases,
         },
@@ -4128,14 +4189,17 @@ exports { region: String = "ap-northeast-1" }"#,
         );
 
         let managed_current = HashMap::new();
-        let data_source_states = HashMap::new();
+        let data_source_values =
+            carina_core::data_source_value::DataSourceValues::from_data_sources(
+                &parsed.data_sources,
+                |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
+            );
         let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
             carina_core::binding_index::PreApplyInputs {
                 managed: &parsed.resources,
                 compositions: &parsed.compositions,
-                data_sources: &parsed.data_sources,
                 managed_current: &managed_current,
-                data_source_states: &data_source_states,
+                data_source_values: &data_source_values,
                 remote_bindings: &bindings,
                 wait_aliases: &[],
             },
@@ -4298,7 +4362,7 @@ mod run_plan_out_tests {
             compositions: Vec::new(),
             data_sources: Vec::new(),
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
@@ -4645,6 +4709,11 @@ mod run_plan_out_tests {
                 path: AccessPath::new("target_role", "role_name"),
             }),
         );
+        let data_source_values =
+            carina_core::data_source_value::DataSourceValues::from_data_sources(
+                std::slice::from_ref(&deferred_data_source),
+                |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
+            );
 
         let parsed = carina_core::parser::ParsedFile {
             data_sources: vec![parsed_data_source],
@@ -4658,7 +4727,7 @@ mod run_plan_out_tests {
             compositions: Vec::new(),
             data_sources: vec![deferred_data_source],
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
+            data_source_values,
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
@@ -4746,7 +4815,7 @@ mod run_plan_out_tests {
             compositions: vec![prepared],
             data_sources: Vec::new(),
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
@@ -4799,7 +4868,7 @@ mod run_plan_out_tests {
             compositions: Vec::new(),
             data_sources: Vec::new(),
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::from([(
                 "network".to_string(),
@@ -4938,9 +5007,8 @@ mod export_diff_tests {
             carina_core::binding_index::PreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &HashMap::new(),
-                data_source_states: &HashMap::new(),
+                data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
             },
@@ -4971,9 +5039,8 @@ mod export_diff_tests {
             carina_core::binding_index::PreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
-                data_sources: &[],
                 managed_current: &HashMap::new(),
-                data_source_states: &HashMap::new(),
+                data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
                 remote_bindings: &HashMap::new(),
                 wait_aliases: &[],
             },
