@@ -81,8 +81,8 @@ pub use backend_config::{
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
     BackendDrift, BackendDriftStatus, BackendSelection, BucketDeleteBackendSelection,
-    MigrationBackends, MutationBackendSelection, ReadBackendSelection, ResolvedReadBackend,
-    VerifiedMutationBackendSelection, inspect_backend_drift,
+    BucketDeleteSelectionError, MigrationBackends, MutationBackendSelection, ReadBackendSelection,
+    ResolvedReadBackend, VerifiedMutationBackendSelection, inspect_backend_drift,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::local_backend_for_test;

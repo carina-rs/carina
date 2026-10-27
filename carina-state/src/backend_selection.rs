@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::BackendConfig as ParserBackendConfig;
+use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
 use crate::backend_config::{BackendConfig, S3BackendSettings};
@@ -192,6 +193,19 @@ pub struct BucketDeleteBackendSelection {
     _private: (),
 }
 
+/// The requested bucket does not match the configured state bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct BucketDeleteSelectionError {
+    message: String,
+}
+
+impl BucketDeleteSelectionError {
+    pub fn into_message(self) -> String {
+        self.message
+    }
+}
+
 impl BucketDeleteBackendSelection {
     pub fn provider_name(&self) -> &'static str {
         S3_BACKEND_PROVIDER_NAME
@@ -304,16 +318,18 @@ impl BackendSelection {
     pub fn for_bucket_delete(
         settings: &S3BackendSettings,
         requested_bucket: &str,
-    ) -> BackendResult<BucketDeleteBackendSelection> {
+    ) -> Result<BucketDeleteBackendSelection, BucketDeleteSelectionError> {
         if settings.bucket() != requested_bucket {
             let configured_bucket = match settings.bucket_diagnostic_literal() {
                 Some(bucket) => format!("'{bucket}'"),
                 None => "value from env()".to_string(),
             };
-            return Err(BackendError::Configuration(format!(
-                "Bucket name '{requested_bucket}' does not match backend configuration bucket \
-                 {configured_bucket}."
-            )));
+            return Err(BucketDeleteSelectionError {
+                message: format!(
+                    "Bucket name '{requested_bucket}' does not match backend configuration bucket \
+                     {configured_bucket}."
+                ),
+            });
         }
 
         Ok(BucketDeleteBackendSelection { _private: () })

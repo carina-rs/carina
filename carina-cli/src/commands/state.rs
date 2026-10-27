@@ -902,12 +902,8 @@ async fn run_state_bucket_delete(
     // Bucket deletion intentionally targets the configured NEW backend during
     // pending migration. This typed selection proves that the requested name
     // is that configured bucket; delete an orphaned OLD bucket out of band.
-    let selection = BackendSelection::for_bucket_delete(settings, bucket_name).map_err(
-        |error| match error {
-            BackendError::Configuration(message) => AppError::Config(message),
-            error => AppError::Backend(error),
-        },
-    )?;
+    let selection = BackendSelection::for_bucket_delete(settings, bucket_name)
+        .map_err(|error| AppError::Config(error.into_message()))?;
 
     println!(
         "{}",
