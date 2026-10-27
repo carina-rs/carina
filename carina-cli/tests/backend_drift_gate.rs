@@ -878,12 +878,11 @@ mod backend_drift_gate {
             !output.status.success(),
             "bucket-delete should reject the locked old bucket name when configured bucket differs",
         );
-        assert!(
-            stderr(&output).contains(
-                "Bucket name 'old-bucket' does not match backend configuration bucket 'new-bucket'"
-            ),
-            "bucket-delete should be pinned to the configured bucket guard.\nstderr:\n{}",
+        assert_eq!(
             stderr(&output),
+            "Error: Bucket name 'old-bucket' does not match backend configuration bucket \
+             'new-bucket'.\n",
+            "bucket-delete mismatch must retain its configuration-error CLI rendering",
         );
     }
 

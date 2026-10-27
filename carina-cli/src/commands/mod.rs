@@ -27,10 +27,10 @@ use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendResult,
     BackendSelection, LoadedState, MutationBackendSelection, PublishedExports,
-    ReadBackendSelection, StateBackend, VerifiedMutationBackendSelection,
+    ReadBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
 };
 #[cfg(test)]
-use carina_state::{BackendError, create_backend};
+use carina_state::{BackendError, StateBackend};
 use colored::Colorize;
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
@@ -87,13 +87,11 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
 
 /// A backend selected for a read-only state operation.
 ///
-/// The raw [`StateBackend`] is deliberately private: read paths can only obtain
-/// this type through [`resolve_backend_for_read`], which compares the current
-/// configuration with `carina-backend.lock` before constructing the backend.
-/// This prevents a read command from accidentally opening the configured new
-/// backend while a migration from the locked old backend is still pending.
+/// The state crate exposes only read capabilities through
+/// [`ResolvedReadBackend`]. This CLI wrapper also retains the selection
+/// metadata needed for plan and diagnostics.
 pub(crate) struct ReadBackend {
-    backend: Box<dyn StateBackend>,
+    backend: ResolvedReadBackend,
     selection: ReadBackendSelection,
 }
 
@@ -103,7 +101,7 @@ impl ReadBackend {
     }
 
     pub(crate) async fn read_published_exports(&self) -> BackendResult<Option<PublishedExports>> {
-        carina_state::read_published_exports(self.backend.as_ref()).await
+        self.backend.read_published_exports().await
     }
 
     pub(crate) async fn bucket_exists(&self) -> BackendResult<bool> {
@@ -210,15 +208,10 @@ fn upstream_backend_drift_warning(drift: &BackendDrift, source: &Path) -> String
     )
 }
 
-/// Build a local backend for CLI unit tests through the same explicit-URL
-/// selection seam available to production callers.
+/// Build a local backend through carina-state's feature-gated test utility.
 #[cfg(test)]
 pub(crate) fn local_backend_for_test(path: impl AsRef<Path>) -> Box<dyn StateBackend> {
-    let raw = path.as_ref().to_string_lossy();
-    let url = carina_state::StateUrl::parse(&raw).expect("test state path must be a valid URL");
-    let selection = BackendSelection::explicit_url(&url);
-    futures::executor::block_on(create_backend(selection.backend_selection()))
-        .expect("test local backend must be constructible")
+    carina_state::local_backend_for_test(path.as_ref().to_path_buf())
 }
 
 fn backend_drift_header(existing: &BackendLock, configured: &BackendLock) -> String {

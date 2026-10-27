@@ -33,7 +33,7 @@ use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
     DeposedKey, LoadedOrphans, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
-    create_backend, create_remote_backend, load_state_from_url,
+    create_remote_backend, load_state_from_url,
 };
 
 use super::{
@@ -360,14 +360,11 @@ pub async fn run_force_unlock(
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
     let selection = BackendSelection::for_force_unlock(base_dir, parsed.backend.as_ref())?;
-    let backend: Box<dyn StateBackend> = create_backend(selection.backend_selection())
-        .await
-        .map_err(AppError::Backend)?;
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
 
-    match backend.force_unlock(lock_id).await {
+    match selection.force_unlock(lock_id).await {
         Ok(()) => {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
@@ -904,7 +901,15 @@ async fn run_state_bucket_delete(
     let settings = state_config
         .as_s3()
         .ok_or("The configured backend does not manage an S3 bucket")?;
-    let selection = BackendSelection::for_bucket_delete(settings, bucket_name)?;
+    // Bucket deletion intentionally targets the configured NEW backend during
+    // pending migration. This typed selection proves that the requested name
+    // is that configured bucket; delete an orphaned OLD bucket out of band.
+    let selection = BackendSelection::for_bucket_delete(settings, bucket_name).map_err(
+        |error| match error {
+            BackendError::Configuration(message) => AppError::Config(message),
+            error => AppError::Backend(error),
+        },
+    )?;
 
     println!(
         "{}",
@@ -932,15 +937,10 @@ async fn run_state_bucket_delete(
         }
     }
 
-    // Explicitly bypasses lock selection by design. The configured-bucket-name
-    // guard pins this to the NEW backend; delete an orphaned OLD bucket via the
-    // cloud console.
     let base_dir = get_base_dir(path);
     let backend = create_remote_backend(&selection)
         .await
         .map_err(AppError::Backend)?;
-
-    // Get provider metadata from backend
     let backend_provider_name = backend
         .provider_name()
         .ok_or("Backend does not specify a provider name")?;

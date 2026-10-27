@@ -20,7 +20,9 @@ use crate::backend_selection::{BackendSelection, BackendTarget, BucketDeleteBack
 ///
 /// Raw backend configuration is deliberately not accepted. Callers must first
 /// choose one of the named selection paths on [`BackendSelection`].
-pub async fn create_backend(selection: &BackendSelection) -> BackendResult<Box<dyn StateBackend>> {
+pub(crate) async fn create_backend(
+    selection: &BackendSelection,
+) -> BackendResult<Box<dyn StateBackend>> {
     match selection.target() {
         BackendTarget::Configured { config, base_dir } => match config {
             Some(config) => create_configured_backend(config, base_dir).await,
@@ -35,6 +37,13 @@ pub async fn create_backend(selection: &BackendSelection) -> BackendResult<Box<d
             Ok(Box::new(LocalBackend::with_path(path.clone())))
         }
     }
+}
+
+/// Construct a local backend for tests that need to exercise the full backend
+/// contract without weakening production selection capabilities.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn local_backend_for_test(state_path: impl Into<std::path::PathBuf>) -> Box<dyn StateBackend> {
+    Box::new(LocalBackend::with_path(state_path.into()))
 }
 
 async fn create_configured_backend(
@@ -53,16 +62,29 @@ async fn create_configured_backend(
     }
 }
 
-/// Create the S3 backend authorized by a bucket-delete selection.
-///
-/// The narrow token proves that the requested bucket matched the configured
-/// bucket before backend construction became possible.
+/// An S3 backend narrowed to the metadata needed by state bucket deletion.
+pub struct BucketDeleteBackend {
+    backend: Box<dyn StateBackend>,
+}
+
+impl BucketDeleteBackend {
+    pub fn provider_name(&self) -> Option<&str> {
+        self.backend.provider_name()
+    }
+
+    pub fn resource_type(&self) -> Option<&str> {
+        self.backend.resource_type()
+    }
+}
+
+/// Construct the purpose-limited backend authorized by a bucket-delete
+/// selection.
 pub async fn create_remote_backend(
     selection: &BucketDeleteBackendSelection,
-) -> BackendResult<Box<dyn StateBackend>> {
-    Ok(Box::new(
-        S3Backend::from_config(selection.s3_settings()).await?,
-    ))
+) -> BackendResult<BucketDeleteBackend> {
+    Ok(BucketDeleteBackend {
+        backend: Box::new(S3Backend::from_config(selection.s3_settings()).await?),
+    })
 }
 
 /// Resolve a local backend's state file path, anchoring a relative

@@ -77,20 +77,47 @@ impl ReadBackendSelection {
         self.drift.as_ref()
     }
 
-    /// Construct the selected backend, invoking `warn` on pending migration
-    /// drift before the backend becomes available to the caller.
+    /// Construct the selected read capability, invoking `warn` on pending
+    /// migration drift before that capability becomes available to the caller.
     ///
     /// The underlying [`BackendSelection`] is intentionally not exposed: a
     /// project-backed reader must cross this warning acknowledgement seam.
     pub async fn resolve_with_drift_warning(
         &self,
         warn: impl FnOnce(&BackendDrift),
-    ) -> BackendResult<Box<dyn crate::StateBackend>> {
+    ) -> BackendResult<ResolvedReadBackend> {
         let backend = crate::backends::create_backend(&self.selection).await?;
         if let Some(drift) = self.drift() {
             warn(drift);
         }
-        Ok(backend)
+        Ok(ResolvedReadBackend { backend })
+    }
+}
+
+/// A backend narrowed to the operations used by read-only commands.
+pub struct ResolvedReadBackend {
+    backend: Box<dyn crate::StateBackend>,
+}
+
+impl ResolvedReadBackend {
+    pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+        self.backend.read_state().await
+    }
+
+    pub async fn read_published_exports(&self) -> BackendResult<Option<crate::PublishedExports>> {
+        crate::backend::read_published_exports(self.backend.as_ref()).await
+    }
+
+    pub async fn bucket_exists(&self) -> BackendResult<bool> {
+        self.backend.bucket_exists().await
+    }
+
+    pub fn provider_name(&self) -> Option<&str> {
+        self.backend.provider_name()
+    }
+
+    pub fn resource_type(&self) -> Option<&str> {
+        self.backend.resource_type()
     }
 }
 
@@ -102,10 +129,6 @@ pub struct VerifiedMutationBackendSelection {
 }
 
 impl VerifiedMutationBackendSelection {
-    pub fn backend_selection(&self) -> &BackendSelection {
-        &self.selection
-    }
-
     pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
         self.selection
             .configured_config()
@@ -113,7 +136,7 @@ impl VerifiedMutationBackendSelection {
     }
 
     pub async fn resolve(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
-        crate::backends::create_backend(self.backend_selection()).await
+        crate::backends::create_backend(&self.selection).await
     }
 }
 
@@ -133,20 +156,46 @@ pub struct MigrationBackendSelection {
 }
 
 impl MigrationBackendSelection {
-    pub fn source(&self) -> &BackendSelection {
-        &self.source
+    /// Resolve the two migration endpoints without exposing either as a
+    /// general-purpose backend.
+    pub async fn resolve(self) -> BackendResult<MigrationBackends> {
+        let source_config = self.source.configured_config().cloned();
+        let source = crate::backends::create_backend(&self.source).await?;
+        let target = crate::backends::create_backend(&self.target).await?;
+        Ok(MigrationBackends {
+            source,
+            target,
+            source_config,
+        })
+    }
+}
+
+/// Backends resolved for one state migration.
+///
+/// Only the operations required by migration are exposed: read the source,
+/// inspect/write/verify the target, and inspect the source configuration for
+/// post-commit local cleanup.
+pub struct MigrationBackends {
+    source: Box<dyn crate::StateBackend>,
+    target: Box<dyn crate::StateBackend>,
+    source_config: Option<BackendConfig>,
+}
+
+impl MigrationBackends {
+    pub async fn read_source_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+        self.source.read_state().await
     }
 
-    pub fn target(&self) -> &BackendSelection {
-        &self.target
+    pub async fn read_target_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+        self.target.read_state().await
+    }
+
+    pub async fn write_target_state(&self, state: &crate::StateFile) -> BackendResult<()> {
+        self.target.write_state(state).await
     }
 
     pub fn source_config(&self) -> Option<&BackendConfig> {
-        self.source.configured_config()
-    }
-
-    pub fn target_config(&self) -> Option<&BackendConfig> {
-        self.target.configured_config()
+        self.source_config.as_ref()
     }
 }
 
@@ -158,7 +207,7 @@ pub struct BucketDeleteBackendSelection {
 }
 
 impl BucketDeleteBackendSelection {
-    pub fn s3_settings(&self) -> &S3BackendSettings {
+    pub(crate) fn s3_settings(&self) -> &S3BackendSettings {
         &self.settings
     }
 }
@@ -170,8 +219,16 @@ pub struct ExplicitUrlBackendSelection {
 }
 
 impl ExplicitUrlBackendSelection {
-    pub fn backend_selection(&self) -> &BackendSelection {
-        &self.selection
+    pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
+        crate::backends::create_backend(&self.selection)
+            .await?
+            .read_state()
+            .await
+    }
+
+    pub async fn read_published_exports(&self) -> BackendResult<Option<crate::PublishedExports>> {
+        let backend = crate::backends::create_backend(&self.selection).await?;
+        crate::backend::read_published_exports(backend.as_ref()).await
     }
 }
 
@@ -184,8 +241,11 @@ pub struct ForceUnlockBackendSelection {
 }
 
 impl ForceUnlockBackendSelection {
-    pub fn backend_selection(&self) -> &BackendSelection {
-        &self.selection
+    pub async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
+        crate::backends::create_backend(&self.selection)
+            .await?
+            .force_unlock(lock_id)
+            .await
     }
 }
 
@@ -484,10 +544,10 @@ mod tests {
 
         let selected = BackendSelection::for_migration(&drift).unwrap();
 
-        let Some(BackendConfig::Local(source)) = selected.source_config() else {
+        let Some(BackendConfig::Local(source)) = selected.source.configured_config() else {
             panic!("migration source must be the locked local backend")
         };
-        let Some(BackendConfig::Local(target)) = selected.target_config() else {
+        let Some(BackendConfig::Local(target)) = selected.target.configured_config() else {
             panic!("migration target must be the newly configured local backend")
         };
         assert_eq!(source.path(), Some("old.json"));
@@ -495,14 +555,14 @@ mod tests {
         let BackendTarget::Configured {
             base_dir: source_base,
             ..
-        } = selected.source().target()
+        } = selected.source.target()
         else {
             panic!("migration source must be a configured target")
         };
         let BackendTarget::Configured {
             base_dir: target_base,
             ..
-        } = selected.target().target()
+        } = selected.target.target()
         else {
             panic!("migration target must be a configured target")
         };
