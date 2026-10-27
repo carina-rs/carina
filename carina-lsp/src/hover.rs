@@ -510,28 +510,25 @@ impl HoverProvider {
 
     fn schema_hover(&self, resource_name: &str, schema: &ResourceSchema) -> Option<Hover> {
         let description = convert_markdown_links_to_plain_text(
-            schema
-                .description
-                .as_deref()
-                .unwrap_or("No description available"),
+            schema.description().unwrap_or("No description available"),
         );
 
         let mut content = format!("## {}\n\n{}\n", resource_name, description);
 
         // Split attributes into arguments (writable) and attributes (read-only)
         let mut arguments: Vec<&carina_core::schema::AttributeSchema> = schema
-            .attributes
+            .attributes()
             .values()
             .filter(|a| !a.is_read_only())
             .collect();
-        arguments.sort_by_key(|a| &a.name);
+        arguments.sort_by_key(|a| a.name());
 
         let mut read_only_attrs: Vec<&carina_core::schema::AttributeSchema> = schema
-            .attributes
+            .attributes()
             .values()
             .filter(|a| a.is_read_only())
             .collect();
-        read_only_attrs.sort_by_key(|a| &a.name);
+        read_only_attrs.sort_by_key(|a| a.name());
 
         if !arguments.is_empty() {
             content.push_str("\n### Arguments\n\n");
@@ -541,16 +538,18 @@ impl HoverProvider {
                 } else {
                     ""
                 };
-                let create_only = if attr.create_only {
+                let create_only = if attr.is_create_only() {
                     " _(create-only)_"
                 } else {
                     ""
                 };
-                let desc =
-                    convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
+                let desc = convert_markdown_links_to_plain_text(attr.description().unwrap_or(""));
                 content.push_str(&format!(
                     "- `{}`: {}{}{}\n",
-                    attr.name, desc, required, create_only
+                    attr.name(),
+                    desc,
+                    required,
+                    create_only
                 ));
             }
         }
@@ -558,9 +557,8 @@ impl HoverProvider {
         if !read_only_attrs.is_empty() {
             content.push_str("\n### Attributes\n\n");
             for attr in &read_only_attrs {
-                let desc =
-                    convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
-                content.push_str(&format!("- `{}`: {}\n", attr.name, desc));
+                let desc = convert_markdown_links_to_plain_text(attr.description().unwrap_or(""));
+                content.push_str(&format!("- `{}`: {}\n", attr.name(), desc));
             }
         }
 
@@ -656,25 +654,27 @@ impl HoverProvider {
             lookup("", key)
         }?;
         schema
-            .attributes
+            .attributes()
             .get(word)
             .and_then(|attr| self.build_attribute_hover(attr))
     }
 
     fn build_attribute_hover(&self, attr: &carina_core::schema::AttributeSchema) -> Option<Hover> {
-        let description = convert_markdown_links_to_plain_text(
-            attr.description.as_deref().unwrap_or("No description"),
-        );
+        let description =
+            convert_markdown_links_to_plain_text(attr.description().unwrap_or("No description"));
         let required = if attr.is_required() {
             "Required"
         } else {
             "Optional"
         };
-        let type_name = format!("{}", attr.attr_type);
+        let type_name = format!("{}", attr.attr_type());
 
         let content = format!(
             "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
-            attr.name, description, type_name, required
+            attr.name(),
+            description,
+            type_name,
+            required
         );
 
         Some(Hover {

@@ -90,13 +90,13 @@ fn rule_value(name: &str, child_count: usize) -> Value {
 #[test]
 fn cyclic_schema_validates_a_two_level_nested_value() {
     let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = &schema.attributes["rules"].attr_type;
+    let rule_attr_type = schema.attributes()["rules"].attr_type();
 
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)]));
 
     let s = Schema {
         root: AttributeType::string(), // unused for this call
-        defs: schema.defs.clone(),
+        defs: schema.defs().clone(),
     };
     s.validate_attr(rule_attr_type, &rules_value)
         .expect("well-formed cyclic value must validate against schema.defs");
@@ -105,7 +105,7 @@ fn cyclic_schema_validates_a_two_level_nested_value() {
 #[test]
 fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
     let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = &schema.attributes["rules"].attr_type;
+    let rule_attr_type = schema.attributes()["rules"].attr_type();
 
     let mut bad_statement = indexmap::IndexMap::new();
     bad_statement.insert(
@@ -127,7 +127,7 @@ fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
 
     let s = Schema {
         root: AttributeType::string(),
-        defs: schema.defs.clone(),
+        defs: schema.defs().clone(),
     };
     let err = s
         .validate_attr(rule_attr_type, &rules_value)
@@ -219,8 +219,8 @@ fn resource_schema_defs_field_default_is_empty() {
     // call.
     let schema = ResourceSchema::new("aws.s3.Bucket")
         .attribute(AttributeSchema::new("bucket", AttributeType::string()));
-    assert!(schema.defs.is_empty(), "defs default must be empty");
-    let _: &BTreeMap<String, AttributeType> = &schema.defs;
+    assert!(schema.defs().is_empty(), "defs default must be empty");
+    let _: &BTreeMap<String, AttributeType> = schema.defs();
 }
 
 /// Regression for carina#3345: `ResourceSchema::validate` must route a
@@ -287,7 +287,7 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
         ))
         .with_def("Selectors", selectors_def);
 
-    let attr_type = &schema.attributes["selectors"].attr_type;
+    let attr_type = schema.attributes()["selectors"].attr_type();
 
     // Construct the value with a bare `String` under `tags`, which
     // host state canonicalization must collapse to `StringList`
@@ -358,7 +358,7 @@ fn dangling_ref_surfaces_clean_validation_error() {
 #[test]
 fn cyclic_ref_terminates_on_finite_value() {
     let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = &schema.attributes["rules"].attr_type;
+    let rule_attr_type = schema.attributes()["rules"].attr_type();
 
     // 3-level nesting: outer rule contains a statement whose
     // `and_statement` carries two statements, each of which has
@@ -367,7 +367,7 @@ fn cyclic_ref_terminates_on_finite_value() {
 
     let s = carina_core::schema::Schema {
         root: AttributeType::string(),
-        defs: schema.defs.clone(),
+        defs: schema.defs().clone(),
     };
     s.validate_attr(rule_attr_type, &rules_value)
         .expect("finite cyclic value must validate (carina#3345)");

@@ -3043,7 +3043,7 @@ impl ResourceState {
                 .chain(
                     schema
                         .into_iter()
-                        .flat_map(|schema| schema.attributes.keys()),
+                        .flat_map(|schema| schema.attributes().keys()),
                 )
                 .filter(|key| !attributes.contains_key(key))
                 .cloned()

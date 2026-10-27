@@ -620,7 +620,7 @@ fn collect_enum_provider_namespaces(
         }
         RawShape::Struct { fields, .. } => {
             for field in fields {
-                collect_enum_provider_namespaces(&field.field_type, namespaces);
+                collect_enum_provider_namespaces(field.field_type(), namespaces);
             }
         }
         RawShape::Union(members) => {

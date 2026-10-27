@@ -126,9 +126,9 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
         };
         if let Some(schema) = schema {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
-            for (attr_name, attr_schema) in &schema.attributes {
-                if let Some(bn) = &attr_schema.block_name {
-                    block_name_suggestions.insert(attr_name.clone(), bn.clone());
+            for (attr_name, attr_schema) in schema.attributes() {
+                if let Some(block_name) = attr_schema.block_name() {
+                    block_name_suggestions.insert(attr_name.clone(), block_name.to_string());
                 }
             }
         }

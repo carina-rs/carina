@@ -3263,8 +3263,8 @@ impl WasmProvider {
     ) -> std::time::Duration {
         self.schemas
             .iter()
-            .find(|schema| schema.resource_type == id.resource_type)
-            .and_then(|schema| schema.operation_config.as_ref())
+            .find(|schema| schema.resource_type() == id.resource_type)
+            .and_then(|schema| schema.operation_config())
             .map_or(
                 carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
                 |config| config.budget(kind),

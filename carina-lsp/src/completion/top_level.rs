@@ -233,18 +233,14 @@ impl CompletionProvider {
             } else {
                 format!("{}.{}", provider, resource_type)
             };
-            let description = schema
-                .description
-                .as_deref()
-                .unwrap_or("Resource")
-                .to_string();
+            let description = schema.description().unwrap_or("Resource").to_string();
 
             // Build snippet with required attributes
             let mut snippet = format!("{} {{\n", key);
             let mut tab_stop = 1;
-            for attr in schema.attributes.values() {
+            for attr in schema.attributes().values() {
                 if attr.is_required() {
-                    snippet.push_str(&format!("    {} = ${{{}}}\n", attr.name, tab_stop));
+                    snippet.push_str(&format!("    {} = ${{{}}}\n", attr.name(), tab_stop));
                     tab_stop += 1;
                 }
             }

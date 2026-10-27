@@ -527,25 +527,67 @@ impl InputMode {
 
 /// A field within a Struct type.
 ///
-/// Like [`InputMode`] (carina#3772), the fields remain public so provider
-/// adapters can convert this record exhaustively. The [`Self::write_only`] and
-/// [`Self::read_only`] builders panic on conflicting modes, resource schema
-/// construction rechecks manually assembled fields, and host wire decoding
-/// rejects `read_only && write_only` before admitting the schema.
+/// Construction and mutation go through builders so conflicting input modes
+/// cannot be assembled by assigning fields directly.
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+///
+/// let _ = StructField {
+///     write_only: true,
+///     ..StructField::new("client_secret", AttributeType::string())
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+///
+/// let mut field = StructField::new("client_secret", AttributeType::string());
+/// field.write_only = true;
+/// ```
+///
+/// The read-only view remains exhaustively destructurable for conversion
+/// seams:
+///
+/// ```
+/// use carina_core::schema::{AttributeType, StructField, StructFieldParts};
+///
+/// let field = StructField::new("client_secret", AttributeType::string());
+/// let StructFieldParts {
+///     name,
+///     field_type,
+///     input_mode,
+///     description,
+///     provider_name,
+///     block_name,
+///     deferred_populate,
+///     write_only,
+/// } = field.parts();
+/// let _ = (
+///     name,
+///     field_type,
+///     input_mode,
+///     description,
+///     provider_name,
+///     block_name,
+///     deferred_populate,
+///     write_only,
+/// );
+/// ```
 #[derive(Debug, Clone)]
 pub struct StructField {
     /// Field name (snake_case, e.g., "ip_protocol")
-    pub name: String,
+    pub(crate) name: String,
     /// Field type
-    pub field_type: AttributeType,
+    pub(crate) field_type: AttributeType,
     /// Whether user input for this field is optional, required, or forbidden.
-    pub input_mode: InputMode,
+    pub(crate) input_mode: InputMode,
     /// Description of this field
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Provider-side property name (e.g., "IpProtocol")
-    pub provider_name: Option<String>,
+    pub(crate) provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
-    pub block_name: Option<String>,
+    pub(crate) block_name: Option<String>,
     /// Whether the value of this nested field is populated by the
     /// provider asynchronously *after* the Create call returns.
     /// Reached when a chained access traverses a `Struct` (e.g.
@@ -553,9 +595,25 @@ pub struct StructField {
     /// the inner struct field is the deferred-populate one, not the
     /// outer list attribute). See `AttributeSchema::deferred_populate`
     /// (carina#3034).
-    pub deferred_populate: bool,
+    pub(crate) deferred_populate: bool,
     /// Whether this nested field is accepted on write but omitted from reads.
     /// This describes provider observability, not secrecy.
+    pub(crate) write_only: bool,
+}
+
+/// Exhaustive read-only view of a [`StructField`].
+///
+/// This deliberately has no `#[non_exhaustive]`: conversion seams should
+/// destructure every field so additions become compile errors.
+#[derive(Debug, Clone, Copy)]
+pub struct StructFieldParts<'a> {
+    pub name: &'a str,
+    pub field_type: &'a AttributeType,
+    pub input_mode: InputMode,
+    pub description: Option<&'a str>,
+    pub provider_name: Option<&'a str>,
+    pub block_name: Option<&'a str>,
+    pub deferred_populate: bool,
     pub write_only: bool,
 }
 
@@ -571,6 +629,51 @@ impl StructField {
             deferred_populate: false,
             write_only: false,
         }
+    }
+
+    pub fn parts(&self) -> StructFieldParts<'_> {
+        StructFieldParts {
+            name: &self.name,
+            field_type: &self.field_type,
+            input_mode: self.input_mode,
+            description: self.description.as_deref(),
+            provider_name: self.provider_name.as_deref(),
+            block_name: self.block_name.as_deref(),
+            deferred_populate: self.deferred_populate,
+            write_only: self.write_only,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn field_type(&self) -> &AttributeType {
+        &self.field_type
+    }
+
+    pub fn input_mode(&self) -> InputMode {
+        self.input_mode
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider_name.as_deref()
+    }
+
+    pub fn block_name(&self) -> Option<&str> {
+        self.block_name.as_deref()
+    }
+
+    pub fn is_deferred_populate(&self) -> bool {
+        self.deferred_populate
+    }
+
+    pub fn is_write_only(&self) -> bool {
+        self.write_only
     }
 
     pub fn required(mut self) -> Self {
@@ -6039,51 +6142,96 @@ impl CompletionValue {
 
 /// Schema for one top-level resource attribute.
 ///
-/// Required user input and provider-populated output are mutually exclusive.
-/// Constructing the former two-boolean state is intentionally a compile error:
+/// Construction and mutation go through builders so conflicting flags and
+/// input modes cannot be assembled by assigning fields directly.
 ///
 /// ```compile_fail
 /// use carina_core::schema::{AttributeSchema, AttributeType};
 ///
 /// let _ = AttributeSchema {
-///     required: true,
-///     read_only: true,
+///     write_only: true,
 ///     ..AttributeSchema::new("arn", AttributeType::string())
 /// };
 /// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeSchema, AttributeType};
+///
+/// let mut attribute = AttributeSchema::new("arn", AttributeType::string());
+/// attribute.write_only = true;
+/// ```
+///
+/// The read-only view remains exhaustively destructurable for conversion
+/// seams:
+///
+/// ```
+/// use carina_core::schema::{AttributeSchema, AttributeSchemaParts, AttributeType};
+///
+/// let attribute = AttributeSchema::new("arn", AttributeType::string());
+/// let AttributeSchemaParts {
+///     name,
+///     attr_type,
+///     input_mode,
+///     default,
+///     description,
+///     completions,
+///     provider_name,
+///     create_only,
+///     removable,
+///     block_name,
+///     write_only,
+///     identity,
+///     deferred_populate,
+/// } = attribute.parts();
+/// let _ = (
+///     name,
+///     attr_type,
+///     input_mode,
+///     default,
+///     description,
+///     completions,
+///     provider_name,
+///     create_only,
+///     removable,
+///     block_name,
+///     write_only,
+///     identity,
+///     deferred_populate,
+/// );
+/// ```
 #[derive(Debug, Clone)]
 pub struct AttributeSchema {
-    pub name: String,
-    pub attr_type: AttributeType,
+    pub(crate) name: String,
+    pub(crate) attr_type: AttributeType,
     /// Whether user input for this attribute is optional, required, or forbidden.
-    pub input_mode: InputMode,
-    pub default: Option<Value>,
-    pub description: Option<String>,
+    pub(crate) input_mode: InputMode,
+    pub(crate) default: Option<Value>,
+    pub(crate) description: Option<String>,
     /// Completion values for this attribute (used by LSP)
-    pub completions: Option<Vec<CompletionValue>>,
+    pub(crate) completions: Option<Vec<CompletionValue>>,
     /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
-    pub provider_name: Option<String>,
+    pub(crate) provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
-    pub create_only: bool,
+    pub(crate) create_only: bool,
     /// Override for removability detection.
     /// `None` = auto-detect: removable when optional, mutable, and writable.
     /// `Some(false)` = explicitly non-removable (e.g., region inherited from provider).
     /// Only removable attributes trigger removal detection in the differ.
-    pub removable: Option<bool>,
+    pub(crate) removable: Option<bool>,
     /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
-    pub block_name: Option<String>,
+    pub(crate) block_name: Option<String>,
     /// Whether this attribute is write-only (not returned by the provider's read API).
     /// Write-only attributes are sent to the provider during create/update but may not
     /// appear in read responses. This is NOT related to sensitive/secret values — it
     /// indicates a CloudFormation `writeOnlyProperties` attribute.
-    pub write_only: bool,
+    pub(crate) write_only: bool,
     /// Whether this attribute contributes to anonymous resource identity.
     /// Identity attributes are included in the hash when computing anonymous resource
     /// identifiers, alongside create-only attributes. Use this for attributes that
     /// distinguish resources of the same type that share the same create-only values
     /// (e.g., Route 53 RecordSet `type` differentiates A vs AAAA records with the
     /// same name and hosted zone).
-    pub identity: bool,
+    pub(crate) identity: bool,
     /// Whether the value of this attribute is populated by the provider
     /// asynchronously *after* the Create call returns. Downstream
     /// resources that read this attribute via a chained access
@@ -6098,6 +6246,27 @@ pub struct AttributeSchema {
     /// also be `read_only` (the user cannot set it), but a `read_only`
     /// attribute is not necessarily deferred-populate (it may be
     /// populated synchronously, e.g. an ARN echoed back by Create).
+    pub(crate) deferred_populate: bool,
+}
+
+/// Exhaustive read-only view of an [`AttributeSchema`].
+///
+/// This deliberately has no `#[non_exhaustive]`: conversion seams should
+/// destructure every field so additions become compile errors.
+#[derive(Debug, Clone, Copy)]
+pub struct AttributeSchemaParts<'a> {
+    pub name: &'a str,
+    pub attr_type: &'a AttributeType,
+    pub input_mode: InputMode,
+    pub default: Option<&'a Value>,
+    pub description: Option<&'a str>,
+    pub completions: Option<&'a [CompletionValue]>,
+    pub provider_name: Option<&'a str>,
+    pub create_only: bool,
+    pub removable: Option<bool>,
+    pub block_name: Option<&'a str>,
+    pub write_only: bool,
+    pub identity: bool,
     pub deferred_populate: bool,
 }
 
@@ -6120,6 +6289,76 @@ impl AttributeSchema {
         }
     }
 
+    pub fn parts(&self) -> AttributeSchemaParts<'_> {
+        AttributeSchemaParts {
+            name: &self.name,
+            attr_type: &self.attr_type,
+            input_mode: self.input_mode,
+            default: self.default.as_ref(),
+            description: self.description.as_deref(),
+            completions: self.completions.as_deref(),
+            provider_name: self.provider_name.as_deref(),
+            create_only: self.create_only,
+            removable: self.removable,
+            block_name: self.block_name.as_deref(),
+            write_only: self.write_only,
+            identity: self.identity,
+            deferred_populate: self.deferred_populate,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn attr_type(&self) -> &AttributeType {
+        &self.attr_type
+    }
+
+    pub fn input_mode(&self) -> InputMode {
+        self.input_mode
+    }
+
+    pub fn default_value(&self) -> Option<&Value> {
+        self.default.as_ref()
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn completions(&self) -> Option<&[CompletionValue]> {
+        self.completions.as_deref()
+    }
+
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider_name.as_deref()
+    }
+
+    pub fn is_create_only(&self) -> bool {
+        self.create_only
+    }
+
+    pub fn removability_override(&self) -> Option<bool> {
+        self.removable
+    }
+
+    pub fn block_name(&self) -> Option<&str> {
+        self.block_name.as_deref()
+    }
+
+    pub fn is_write_only(&self) -> bool {
+        self.write_only
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.identity
+    }
+
+    pub fn is_deferred_populate(&self) -> bool {
+        self.deferred_populate
+    }
+
     pub fn required(mut self) -> Self {
         self.input_mode.transition_to(InputMode::Required);
         self
@@ -6135,6 +6374,10 @@ impl AttributeSchema {
     }
 
     pub fn read_only(mut self) -> Self {
+        assert!(
+            !self.write_only,
+            "attribute cannot be both write-only and provider-populated"
+        );
         self.input_mode.transition_to(InputMode::ProviderPopulated);
         self
     }
@@ -6144,6 +6387,10 @@ impl AttributeSchema {
     }
 
     pub fn write_only(mut self) -> Self {
+        assert!(
+            !self.input_mode.is_provider_populated(),
+            "attribute cannot be both write-only and provider-populated"
+        );
         self.write_only = true;
         self
     }
@@ -6298,35 +6545,70 @@ pub enum UniqueNameSpec {
     Conflicting,
 }
 
-/// Resource schema
+/// Resource schema.
+///
+/// Construction and mutation go through chained builders. The read-only view
+/// remains exhaustively destructurable for conversion seams:
+///
+/// ```
+/// use carina_core::schema::{ResourceSchema, ResourceSchemaParts};
+///
+/// let schema = ResourceSchema::new("test.Widget");
+/// let ResourceSchemaParts {
+///     resource_type,
+///     attributes,
+///     description,
+///     validation,
+///     kind,
+///     unique_name,
+///     operation_config,
+///     exclusive_required,
+///     default_wait_timeout,
+///     default_wait_interval,
+///     defs,
+/// } = schema.parts();
+/// let _ = (
+///     resource_type,
+///     attributes,
+///     description,
+///     validation,
+///     kind,
+///     unique_name,
+///     operation_config,
+///     exclusive_required,
+///     default_wait_timeout,
+///     default_wait_interval,
+///     defs,
+/// );
+/// ```
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
-    pub resource_type: String,
-    pub attributes: HashMap<String, AttributeSchema>,
-    pub description: Option<String>,
+    pub(crate) resource_type: String,
+    pub(crate) attributes: HashMap<String, AttributeSchema>,
+    pub(crate) description: Option<String>,
     /// Cross-attribute validation, including its fingerprintable source.
-    pub validation: ResourceValidation,
+    pub(crate) validation: ResourceValidation,
     /// Whether this is a managed resource or a data source.
     /// Data sources must be used with the `read` keyword.
-    pub kind: SchemaKind,
+    pub(crate) kind: SchemaKind,
     /// How this resource handles create-before-destroy name conflicts.
-    pub unique_name: UniqueNameSpec,
+    pub(crate) unique_name: UniqueNameSpec,
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
-    pub operation_config: Option<OperationConfig>,
+    pub(crate) operation_config: Option<OperationConfig>,
     /// Declarative "exactly one of" groups. Each inner vec is a group of
     /// attribute names where exactly one must be specified. Unlike an
     /// in-process validator, this is plain data and survives the WASM plugin
     /// boundary.
-    pub exclusive_required: Vec<Vec<String>>,
+    pub(crate) exclusive_required: Vec<Vec<String>>,
     /// Default total timeout for `wait <target> { ... }` polling against
     /// this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_TIMEOUT`].
-    pub default_wait_timeout: Option<std::time::Duration>,
+    pub(crate) default_wait_timeout: Option<std::time::Duration>,
     /// Default poll cadence between `read()` calls for `wait <target>`
     /// against this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_INTERVAL`].
-    pub default_wait_interval: Option<std::time::Duration>,
+    pub(crate) default_wait_interval: Option<std::time::Duration>,
     /// Named definitions reachable via [`AttrTypeKind::Ref`] from this
     /// resource's attribute types. Empty for resources whose attribute
     /// graph contains no cycles (the common case).
@@ -6337,7 +6619,26 @@ pub struct ResourceSchema {
     /// `Map(String, String)` blobs. Walk-sites that traverse
     /// `AttributeType` (differ, detail_rows, LSP) MUST consult `defs`
     /// to resolve `Ref` variants rather than fall through a wildcard.
-    pub defs: std::collections::BTreeMap<String, AttributeType>,
+    pub(crate) defs: std::collections::BTreeMap<String, AttributeType>,
+}
+
+/// Exhaustive read-only view of a [`ResourceSchema`].
+///
+/// This deliberately has no `#[non_exhaustive]`: conversion seams should
+/// destructure every field so additions become compile errors.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceSchemaParts<'a> {
+    pub resource_type: &'a str,
+    pub attributes: &'a HashMap<String, AttributeSchema>,
+    pub description: Option<&'a str>,
+    pub validation: &'a ResourceValidation,
+    pub kind: SchemaKind,
+    pub unique_name: &'a UniqueNameSpec,
+    pub operation_config: Option<&'a OperationConfig>,
+    pub exclusive_required: &'a [Vec<String>],
+    pub default_wait_timeout: Option<std::time::Duration>,
+    pub default_wait_interval: Option<std::time::Duration>,
+    pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
 }
 
 /// Source of a resource's executable cross-attribute validation.
@@ -6488,15 +6789,15 @@ enum WriteOnlySchemaConflictKind {
     NestedFieldReadWrite,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WriteOnlySchemaConflict<'a> {
-    attribute: &'a str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOnlySchemaConflict {
+    attribute: String,
     kind: WriteOnlySchemaConflictKind,
 }
 
-impl WriteOnlySchemaConflict<'_> {
+impl WriteOnlySchemaConflict {
     pub fn attribute(&self) -> &str {
-        self.attribute
+        &self.attribute
     }
 
     pub fn message(&self) -> &'static str {
@@ -6512,6 +6813,34 @@ impl WriteOnlySchemaConflict<'_> {
             }
         }
     }
+}
+
+fn first_write_only_conflict_in(
+    attributes: &HashMap<String, AttributeSchema>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Option<WriteOnlySchemaConflict> {
+    let mut attributes = attributes.iter().collect::<Vec<_>>();
+    attributes.sort_unstable_by_key(|(name, _)| *name);
+
+    attributes.into_iter().find_map(|(name, attribute)| {
+        let analysis = type_write_only_analysis(&attribute.attr_type, defs, &mut Vec::new());
+        if analysis.field_mode_conflict {
+            return Some(WriteOnlySchemaConflict {
+                attribute: name.clone(),
+                kind: WriteOnlySchemaConflictKind::NestedFieldReadWrite,
+            });
+        }
+        if attribute.write_only && analysis.contains_write_only {
+            return Some(WriteOnlySchemaConflict {
+                attribute: name.clone(),
+                kind: WriteOnlySchemaConflictKind::TopLevelAndNested,
+            });
+        }
+        analysis.union_conflict.then(|| WriteOnlySchemaConflict {
+            attribute: name.clone(),
+            kind: WriteOnlySchemaConflictKind::UnionMemberBearing,
+        })
+    })
 }
 
 fn project_write_only_leaves<'schema>(
@@ -6809,6 +7138,66 @@ impl ResourceSchema {
         }
     }
 
+    pub fn parts(&self) -> ResourceSchemaParts<'_> {
+        ResourceSchemaParts {
+            resource_type: &self.resource_type,
+            attributes: &self.attributes,
+            description: self.description.as_deref(),
+            validation: &self.validation,
+            kind: self.kind,
+            unique_name: &self.unique_name,
+            operation_config: self.operation_config.as_ref(),
+            exclusive_required: &self.exclusive_required,
+            default_wait_timeout: self.default_wait_timeout,
+            default_wait_interval: self.default_wait_interval,
+            defs: &self.defs,
+        }
+    }
+
+    pub fn resource_type(&self) -> &str {
+        &self.resource_type
+    }
+
+    pub fn attributes(&self) -> &HashMap<String, AttributeSchema> {
+        &self.attributes
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn validation(&self) -> &ResourceValidation {
+        &self.validation
+    }
+
+    pub fn kind(&self) -> SchemaKind {
+        self.kind
+    }
+
+    pub fn unique_name(&self) -> &UniqueNameSpec {
+        &self.unique_name
+    }
+
+    pub fn operation_config(&self) -> Option<&OperationConfig> {
+        self.operation_config.as_ref()
+    }
+
+    pub fn exclusive_required_groups(&self) -> &[Vec<String>] {
+        &self.exclusive_required
+    }
+
+    pub fn default_wait_timeout(&self) -> Option<std::time::Duration> {
+        self.default_wait_timeout
+    }
+
+    pub fn default_wait_interval(&self) -> Option<std::time::Duration> {
+        self.default_wait_interval
+    }
+
+    pub fn defs(&self) -> &std::collections::BTreeMap<String, AttributeType> {
+        &self.defs
+    }
+
     /// Attach a named definition reachable via [`AttrTypeKind::Ref`].
     ///
     /// Used by codegen to register cyclic CFN struct definitions
@@ -6833,10 +7222,24 @@ impl ResourceSchema {
         self
     }
 
-    pub fn attribute(mut self, schema: AttributeSchema) -> Self {
+    pub fn attribute(self, schema: AttributeSchema) -> Self {
+        self.try_attribute(schema)
+            .unwrap_or_else(|conflict| panic!("{}", conflict.message()))
+    }
+
+    /// Add an attribute while preserving schema invariants without panicking.
+    ///
+    /// Provider wire decoders use this form to turn an invalid schema into a
+    /// typed decode error. Ordinary schema declarations use [`Self::attribute`].
+    pub fn try_attribute(
+        mut self,
+        schema: AttributeSchema,
+    ) -> Result<Self, WriteOnlySchemaConflict> {
         self.attributes.insert(schema.name.clone(), schema);
-        self.assert_write_only_invariants();
-        self
+        match self.first_write_only_conflict() {
+            Some(conflict) => Err(conflict),
+            None => Ok(self),
+        }
     }
 
     fn assert_write_only_invariants(&self) {
@@ -6847,30 +7250,8 @@ impl ResourceSchema {
 
     /// Return the first schema shape that cannot safely represent nested
     /// write-only provenance.
-    pub fn first_write_only_conflict(&self) -> Option<WriteOnlySchemaConflict<'_>> {
-        let mut attributes = self.attributes.iter().collect::<Vec<_>>();
-        attributes.sort_unstable_by_key(|(name, _)| *name);
-
-        attributes.into_iter().find_map(|(name, attribute)| {
-            let analysis =
-                type_write_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new());
-            if analysis.field_mode_conflict {
-                return Some(WriteOnlySchemaConflict {
-                    attribute: name,
-                    kind: WriteOnlySchemaConflictKind::NestedFieldReadWrite,
-                });
-            }
-            if attribute.write_only && analysis.contains_write_only {
-                return Some(WriteOnlySchemaConflict {
-                    attribute: name,
-                    kind: WriteOnlySchemaConflictKind::TopLevelAndNested,
-                });
-            }
-            analysis.union_conflict.then_some(WriteOnlySchemaConflict {
-                attribute: name,
-                kind: WriteOnlySchemaConflictKind::UnionMemberBearing,
-            })
-        })
+    pub fn first_write_only_conflict(&self) -> Option<WriteOnlySchemaConflict> {
+        first_write_only_conflict_in(&self.attributes, &self.defs)
     }
 
     /// Return whether a top-level attribute contains a nested write-only field.
@@ -7095,6 +7476,12 @@ impl ResourceSchema {
 
     pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
         self.validation = ResourceValidation::InProcess(validator);
+        self
+    }
+
+    /// Attach portable validator declarations received from a provider.
+    pub fn with_declared_validators(mut self, validators: Vec<ValidatorType>) -> Self {
+        self.validation = ResourceValidation::Declared(validators);
         self
     }
 

@@ -85,8 +85,8 @@ impl CompletionProvider {
 
         // Get schema for specific resource type
         if let Some(schema) = self.lookup_schema(resource_type) {
-            for attr in schema.attributes.values().filter(|a| !a.is_read_only()) {
-                let detail = attr.description.clone();
+            for attr in schema.attributes().values().filter(|a| !a.is_read_only()) {
+                let detail = attr.description().map(str::to_owned);
                 let required_marker = if attr.is_required() {
                     " (required)"
                 } else {
@@ -94,10 +94,10 @@ impl CompletionProvider {
                 };
 
                 completions.push(CompletionItem {
-                    label: attr.name.clone(),
+                    label: attr.name().to_string(),
                     kind: Some(CompletionItemKind::PROPERTY),
                     detail: detail.map(|d| format!("{}{}", d, required_marker)),
-                    insert_text: Some(format!("{} = ", attr.name)),
+                    insert_text: Some(format!("{} = ", attr.name())),
                     command: Some(trigger_suggest.clone()),
                     ..Default::default()
                 });
@@ -109,9 +109,9 @@ impl CompletionProvider {
                 // `Ref("LifecycleConfiguration") -> Struct { rules:
                 // List<Ref<Struct>> with block_name("rule") }`. Same bug
                 // class as carina#3349.
-                if let Some(bn) = &attr.block_name
+                if let Some(bn) = attr.block_name()
                     && matches!(
-                        schema.shape_of(&attr.attr_type),
+                        schema.shape_of(attr.attr_type()),
                         Shape::List { element_type: inner, .. } if matches!(
                             schema.shape_of(inner),
                             Shape::Struct { .. }
@@ -119,9 +119,9 @@ impl CompletionProvider {
                     )
                 {
                     completions.push(CompletionItem {
-                        label: bn.clone(),
+                        label: bn.to_string(),
                         kind: Some(CompletionItemKind::SNIPPET),
-                        detail: Some(format!("Block syntax for '{}'", attr.name)),
+                        detail: Some(format!("Block syntax for '{}'", attr.name())),
                         insert_text: Some(format!("{} {{\n  $0\n}}", bn)),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         ..Default::default()
@@ -215,9 +215,9 @@ impl CompletionProvider {
         // `InsideUpstreamStateBlock`), so the self-skip is unreachable
         // for upstream bindings and intentionally omitted.
         if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(attr_schema) = schema.attributes().get(attr_name)
         {
-            if let Some(target_name) = Self::extract_custom_type_name(&attr_schema.attr_type) {
+            if let Some(target_name) = Self::extract_custom_type_name(attr_schema.attr_type()) {
                 for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
                     if binding_resource_type.is_empty() {
                         continue;
@@ -226,18 +226,20 @@ impl CompletionProvider {
                         continue;
                     }
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
-                        for binding_attr in binding_schema.attributes.values() {
+                        for binding_attr in binding_schema.attributes().values() {
                             if let Some(binding_type_name) =
-                                Self::extract_custom_type_name(&binding_attr.attr_type)
+                                Self::extract_custom_type_name(binding_attr.attr_type())
                                 && binding_type_name == target_name
                             {
-                                let full_ref = format!("{}.{}", binding_name, binding_attr.name);
+                                let full_ref = format!("{}.{}", binding_name, binding_attr.name());
                                 completions.push(CompletionItem {
                                     label: full_ref.clone(),
                                     kind: Some(CompletionItemKind::REFERENCE),
                                     detail: Some(format!(
                                         "Reference to {}'s {} ({})",
-                                        binding_name, binding_attr.name, target_name
+                                        binding_name,
+                                        binding_attr.name(),
+                                        target_name
                                     )),
                                     text_edit: Some(
                                         tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
@@ -267,8 +269,8 @@ impl CompletionProvider {
                     };
                     if !type_expr_source_is_assignable_to(
                         export_type,
-                        &attr_schema.attr_type,
-                        &schema.defs,
+                        attr_schema.attr_type(),
+                        schema.defs(),
                     ) {
                         continue;
                     }
@@ -298,9 +300,9 @@ impl CompletionProvider {
         // target while directional assignability resolves any schema `Ref`.
         let target_schema = self.lookup_schema(resource_type);
         let target_attr_type = target_schema
-            .and_then(|s| s.attributes.get(attr_name))
-            .map(|a| &a.attr_type);
-        let target_defs = target_schema.map(|s| &s.defs);
+            .and_then(|s| s.attributes().get(attr_name))
+            .map(|a| a.attr_type());
+        let target_defs = target_schema.map(|schema| schema.defs());
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -377,14 +379,14 @@ impl CompletionProvider {
 
         // Look up the attribute type from schema
         if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(attr_schema) = schema.attributes().get(attr_name)
         {
             // Struct types: offer `{ }` snippet only, no built-in functions.
             // Use `Shape` (Ref-peeled) so a Ref-typed struct attribute
             // (cyclic-CFN case) also gets the snippet (same bug class as
             // carina#3349).
             if matches!(
-                schema.shape_of(&attr_schema.attr_type),
+                schema.shape_of(attr_schema.attr_type()),
                 Shape::Struct { .. }
             ) {
                 completions.push(CompletionItem {
@@ -414,7 +416,7 @@ impl CompletionProvider {
             // if we want explicit completion for that intent. (#2643)
 
             // First check if schema defines completions for this attribute
-            if let Some(schema_completions) = &attr_schema.completions {
+            if let Some(schema_completions) = attr_schema.completions() {
                 completions.extend(schema_completions.iter().map(|c| CompletionItem {
                     label: c.value.clone(),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
@@ -426,7 +428,7 @@ impl CompletionProvider {
             }
             // Fall back to type-based completions
             completions
-                .extend(self.completions_for_type(&attr_schema.attr_type, Some(resource_type)));
+                .extend(self.completions_for_type(attr_schema.attr_type(), Some(resource_type)));
             return completions;
         }
 
@@ -502,12 +504,12 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(binding_resource_type) {
-            for attr in schema.attributes.values() {
-                let full_ref = format!("{}.{}", binding_name, attr.name);
+            for attr in schema.attributes().values() {
+                let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
-                    detail: attr.description.clone(),
+                    detail: attr.description().map(str::to_owned),
                     text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                         range: edit_range,
                         new_text: full_ref,
@@ -1473,19 +1475,19 @@ impl CompletionProvider {
             let Some(schema) = self.lookup_schema(&resource_type) else {
                 continue;
             };
-            for attr in schema.attributes.values() {
-                let source_type = schema.type_in_schema(&attr.attr_type);
+            for attr in schema.attributes().values() {
+                let source_type = schema.type_in_schema(attr.attr_type());
                 if !source_type.is_assignable_to(target) {
                     continue;
                 }
-                let full_ref = format!("{}.{}", binding_name, attr.name);
+                let full_ref = format!("{}.{}", binding_name, attr.name());
                 items.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some(format!(
                         "Reference to {}'s {} ({})",
                         binding_name,
-                        attr.name,
+                        attr.name(),
                         source_type.resolved_type_name()
                     )),
                     insert_text: Some(full_ref),
@@ -1752,10 +1754,7 @@ impl CompletionProvider {
                 } else {
                     format!("{}.{}", provider, resource_type)
                 };
-                let description = schema
-                    .description
-                    .as_deref()
-                    .unwrap_or("Resource reference");
+                let description = schema.description().unwrap_or("Resource reference");
                 type_completion_item(key, format!("{} reference", description), replacement_range)
             });
 

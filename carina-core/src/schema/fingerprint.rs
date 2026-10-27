@@ -15,7 +15,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v2";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v3";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -363,6 +363,7 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
         provider_name,
         block_name,
         deferred_populate,
+        write_only,
     } = field;
     encoder.string(name);
     encode_attribute_type(encoder, field_type);
@@ -370,6 +371,7 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
     encoder.option(provider_name.as_deref(), CanonicalEncoder::string);
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*deferred_populate);
+    encoder.bool(*write_only);
 }
 
 fn encode_schema_kind(encoder: &mut CanonicalEncoder, kind: SchemaKind) {
@@ -572,10 +574,9 @@ mod tests {
 
     #[test]
     fn duplicate_declared_validators_do_not_change_the_fingerprint() {
-        let mut once = ResourceSchema::new("test.Widget");
-        once.validation = ResourceValidation::Declared(vec![ValidatorType::TagsKeyValueCheck]);
-        let mut repeated = ResourceSchema::new("test.Widget");
-        repeated.validation = ResourceValidation::Declared(vec![
+        let once = ResourceSchema::new("test.Widget")
+            .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck]);
+        let repeated = ResourceSchema::new("test.Widget").with_declared_validators(vec![
             ValidatorType::TagsKeyValueCheck,
             ValidatorType::TagsKeyValueCheck,
         ]);

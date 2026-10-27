@@ -319,8 +319,8 @@ async fn test_wasm_mock_provider_factory() {
     let schemas = factory.schemas();
     let short_budget = schemas
         .iter()
-        .find(|schema| schema.resource_type == "test.short_budget")
-        .and_then(|schema| schema.operation_config.as_ref())
+        .find(|schema| schema.resource_type() == "test.short_budget")
+        .and_then(|schema| schema.operation_config())
         .expect("mock provider should expose the short-budget schema");
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));

@@ -170,11 +170,8 @@ fn type_aware_custom_delegates_to_base() {
 fn type_aware_diff_no_change_with_schema() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let mut schema = ResourceSchema::new("test.resource");
-    schema.attributes.insert(
-        "port".to_string(),
-        AttributeSchema::new("port", AttributeType::float()),
-    );
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("port", AttributeType::float()));
 
     let desired = Resource::new("test.resource", "test")
         .with_attribute("port", Value::Concrete(ConcreteValue::Int(443)));
@@ -1649,9 +1646,7 @@ fn dependent_nested_post_create_read_unknown_cannot_force_replacement() {
             )]))),
         )]),
     );
-    let mut schema = ResourceSchema::new("test.Consumer");
-    schema.attributes.insert(
-        "tags".to_string(),
+    let schema = ResourceSchema::new("test.Consumer").attribute(
         AttributeSchema::new("tags", AttributeType::map(AttributeType::string())).create_only(),
     );
 
@@ -2106,11 +2101,10 @@ fn union_string_or_list_compares_string_list() {
 fn into_plan_input_current_map_from_states_canonicalizes_string_or_list_state() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let mut schema = ResourceSchema::new("iam.policy");
-    schema.attributes.insert(
-        "action".to_string(),
-        AttributeSchema::new("action", string_or_list_of_strings_type()),
-    );
+    let schema = ResourceSchema::new("iam.policy").attribute(AttributeSchema::new(
+        "action",
+        string_or_list_of_strings_type(),
+    ));
     let mut registry = SchemaRegistry::new();
     registry.insert("aws", schema);
 
@@ -2161,9 +2155,7 @@ fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_s
  {
     use crate::schema::{AttributeSchema, ResourceSchema, enum_identity};
 
-    let mut schema = ResourceSchema::new("acm.Certificate");
-    schema.attributes.insert(
-        "key_algorithm".to_string(),
+    let schema = ResourceSchema::new("acm.Certificate").attribute(
         AttributeSchema::new(
             "key_algorithm",
             AttributeType::enum_(
@@ -2244,11 +2236,8 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         ),
         AttributeType::string(),
     ]);
-    let mut schema = ResourceSchema::new("iam.policy");
-    schema.attributes.insert(
-        "principal".to_string(),
-        AttributeSchema::new("principal", principal),
-    );
+    let schema =
+        ResourceSchema::new("iam.policy").attribute(AttributeSchema::new("principal", principal));
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("aws", schema.clone());
 
@@ -2323,11 +2312,8 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
             ),
         ],
     );
-    let mut schema = ResourceSchema::new("iam.policy");
-    schema.attributes.insert(
-        "statement".to_string(),
-        AttributeSchema::new("statement", statement),
-    );
+    let schema =
+        ResourceSchema::new("iam.policy").attribute(AttributeSchema::new("statement", statement));
     let mut registry = SchemaRegistry::new();
     registry.insert("aws", schema.clone());
 
@@ -2568,11 +2554,10 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
                 .with_provider_name("DefaultCacheBehavior"),
         ],
     );
-    let mut schema = ResourceSchema::new("cloudfront.Distribution");
-    schema.attributes.insert(
-        "distribution_config".to_string(),
-        AttributeSchema::new("distribution_config", distribution_config),
-    );
+    let schema = ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
+        "distribution_config",
+        distribution_config,
+    ));
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("awscc", schema.clone());
 
@@ -2801,11 +2786,10 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
                 .with_provider_name("DefaultCacheBehavior"),
         ],
     );
-    let mut schema = ResourceSchema::new("cloudfront.Distribution");
-    schema.attributes.insert(
-        "distribution_config".to_string(),
-        AttributeSchema::new("distribution_config", distribution_config),
-    );
+    let schema = ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
+        "distribution_config",
+        distribution_config,
+    ));
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("awscc", schema.clone());
 

@@ -425,13 +425,11 @@ async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
 async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() {
     let mut planned_schema = carina_provider_mock::builtin_schemas()
         .into_iter()
-        .find(|schema| schema.resource_type == "test.resource")
+        .find(|schema| schema.resource_type() == "test.resource")
         .expect("built-in test.resource schema");
-    planned_schema
-        .attributes
-        .get_mut("comment")
-        .expect("comment attribute")
-        .write_only = true;
+    let comment_type = planned_schema.attributes()["comment"].attr_type().clone();
+    planned_schema = planned_schema
+        .attribute(carina_core::schema::AttributeSchema::new("comment", comment_type).write_only());
     let planning_schemas = mock_schema_registry([planned_schema]);
 
     let (result, operations) = run_saved_plan_schema_fingerprint_case(

@@ -105,18 +105,6 @@ fn struct_field_conflicting_read_only_then_write_only_is_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
-fn resource_schema_rejects_mutated_read_only_write_only_struct_field() {
-    let mut field = StructField::new("client_secret", AttributeType::string()).read_only();
-    field.write_only = true;
-
-    let _ = ResourceSchema::new("listener").attribute(AttributeSchema::new(
-        "authenticate_oidc_config",
-        AttributeType::struct_("AuthenticateOidcConfig", vec![field]),
-    ));
-}
-
-#[test]
 #[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
 fn attribute_schema_conflicting_input_mode_required_then_read_only_is_rejected() {
     let _ = AttributeSchema::new("arn", AttributeType::string())
@@ -130,6 +118,22 @@ fn attribute_schema_conflicting_input_mode_read_only_then_required_is_rejected()
     let _ = AttributeSchema::new("arn", AttributeType::string())
         .read_only()
         .required();
+}
+
+#[test]
+#[should_panic(expected = "attribute cannot be both write-only and provider-populated")]
+fn attribute_schema_conflicting_write_only_then_read_only_is_rejected() {
+    let _ = AttributeSchema::new("client_secret", AttributeType::string())
+        .write_only()
+        .read_only();
+}
+
+#[test]
+#[should_panic(expected = "attribute cannot be both write-only and provider-populated")]
+fn attribute_schema_conflicting_read_only_then_write_only_is_rejected() {
+    let _ = AttributeSchema::new("client_secret", AttributeType::string())
+        .read_only()
+        .write_only();
 }
 
 #[test]
@@ -160,12 +164,26 @@ fn top_level_write_only_attribute_cannot_also_bear_write_only_fields() {
 }
 
 #[test]
+#[should_panic(expected = "top-level attribute cannot be both write-only and write-only-bearing")]
+fn adding_a_def_rechecks_top_level_write_only_bearing_conflicts() {
+    let _ = ResourceSchema::new("listener")
+        .attribute(AttributeSchema::new("config", AttributeType::ref_("Config")).write_only())
+        .with_def(
+            "Config",
+            AttributeType::struct_(
+                "Config",
+                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
+            ),
+        );
+}
+
+#[test]
 fn first_write_only_conflict_reports_lexicographically_first_attribute() {
     for _ in 0..8 {
-        let mut schema = ResourceSchema::new("listener");
+        let mut attributes = HashMap::new();
         for index in 0..32 {
             let name = format!("conflict_{index:02}");
-            schema.attributes.insert(
+            attributes.insert(
                 name.clone(),
                 AttributeSchema::new(
                     name,
@@ -181,8 +199,7 @@ fn first_write_only_conflict_reports_lexicographically_first_attribute() {
         }
 
         assert_eq!(
-            schema
-                .first_write_only_conflict()
+            first_write_only_conflict_in(&attributes, &BTreeMap::new())
                 .expect("the fixture contains conflicts")
                 .attribute(),
             "conflict_00"
@@ -203,6 +220,26 @@ fn union_member_cannot_bear_write_only_fields() {
             ),
         ]),
     ));
+}
+
+#[test]
+#[should_panic(expected = "union members cannot be write-only-bearing")]
+fn adding_a_def_rechecks_union_write_only_bearing_conflicts() {
+    let _ = ResourceSchema::new("listener")
+        .attribute(AttributeSchema::new(
+            "authentication",
+            AttributeType::ref_("Authentication"),
+        ))
+        .with_def(
+            "Authentication",
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::struct_(
+                    "OidcConfig",
+                    vec![StructField::new("client_secret", AttributeType::string()).write_only()],
+                ),
+            ]),
+        );
 }
 
 #[test]
@@ -10754,7 +10791,42 @@ fn raw_shape_passes_through_non_ref_variants() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FingerprintChange {
+    ResourceType,
+    AttributeType,
+    InputMode,
+    Default,
+    ProviderName,
+    CreateOnly,
+    Removable,
+    BlockName,
+    WriteOnly,
+    Identity,
+    DeferredPopulate,
+    SchemaKind,
+    UniqueName,
+    OperationConfig,
+    ExclusiveRequired,
+    WaitTimeout,
+    WaitInterval,
+    Definition,
+    DeclarativeValidator,
+    ResourceValidator,
+}
+
+fn fingerprint_reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    Err(Vec::new())
+}
+
 fn schema_fingerprint_fixture(reverse_attributes: bool) -> ResourceSchema {
+    schema_fingerprint_fixture_with(reverse_attributes, None)
+}
+
+fn schema_fingerprint_fixture_with(
+    reverse_attributes: bool,
+    change: Option<FingerprintChange>,
+) -> ResourceSchema {
     let mut default_map = indexmap::IndexMap::new();
     if reverse_attributes {
         default_map.insert("second".to_string(), Value::Concrete(ConcreteValue::Int(2)));
@@ -10764,7 +10836,12 @@ fn schema_fingerprint_fixture(reverse_attributes: bool) -> ResourceSchema {
         default_map.insert("second".to_string(), Value::Concrete(ConcreteValue::Int(2)));
     }
 
-    let first = AttributeSchema::new(
+    let default = if change == Some(FingerprintChange::Default) {
+        Value::Concrete(ConcreteValue::Bool(true))
+    } else {
+        Value::Concrete(ConcreteValue::Map(default_map))
+    };
+    let mut first = AttributeSchema::new(
         "first",
         AttributeType::list(AttributeType::struct_(
             "Nested",
@@ -10772,36 +10849,130 @@ fn schema_fingerprint_fixture(reverse_attributes: bool) -> ResourceSchema {
         )),
     )
     .required()
-    .with_default(Value::Concrete(ConcreteValue::Map(default_map)))
-    .with_provider_name("First")
-    .with_block_name("first_block")
-    .create_only()
-    .write_only()
-    .identity()
-    .deferred_populate();
-    let second = AttributeSchema::new("second", AttributeType::int()).non_removable();
-
-    let mut schema = ResourceSchema::new("test.Widget")
-        .with_unique_name_attribute("first")
-        .with_operation_config(OperationConfig {
-            delete_timeout_secs: Some(11),
-            delete_max_retries: Some(2),
-            create_timeout_secs: Some(13),
-            create_max_retries: Some(3),
-            update_timeout_secs: Some(17),
-        })
-        .with_default_wait_timeout(std::time::Duration::from_secs(19))
-        .with_default_wait_interval(std::time::Duration::from_secs(23))
-        .with_def("Alias", AttributeType::string());
-    schema.exclusive_required = vec![vec!["first".to_string(), "second".to_string()]];
-    if reverse_attributes {
-        schema.attributes.insert(second.name.clone(), second);
-        schema.attributes.insert(first.name.clone(), first);
+    .with_default(default)
+    .with_provider_name(if change == Some(FingerprintChange::ProviderName) {
+        "Other"
     } else {
-        schema.attributes.insert(first.name.clone(), first);
-        schema.attributes.insert(second.name.clone(), second);
+        "First"
+    })
+    .with_block_name(if change == Some(FingerprintChange::BlockName) {
+        "other"
+    } else {
+        "first_block"
+    });
+    if change != Some(FingerprintChange::CreateOnly) {
+        first = first.create_only();
     }
-    schema
+    if change != Some(FingerprintChange::WriteOnly) {
+        first = first.write_only();
+    }
+    if change != Some(FingerprintChange::Identity) {
+        first = first.identity();
+    }
+    if change != Some(FingerprintChange::DeferredPopulate) {
+        first = first.deferred_populate();
+    }
+
+    let mut second = AttributeSchema::new(
+        "second",
+        if change == Some(FingerprintChange::AttributeType) {
+            AttributeType::bool()
+        } else {
+            AttributeType::int()
+        },
+    );
+    if change == Some(FingerprintChange::InputMode) {
+        second = second.required();
+    }
+    second = if change == Some(FingerprintChange::Removable) {
+        second.removable()
+    } else {
+        second.non_removable()
+    };
+
+    let operation_config = OperationConfig {
+        delete_timeout_secs: Some(11),
+        delete_max_retries: Some(2),
+        create_timeout_secs: Some(13),
+        create_max_retries: Some(3),
+        update_timeout_secs: if change == Some(FingerprintChange::OperationConfig) {
+            None
+        } else {
+            Some(17)
+        },
+    };
+    let mut schema = ResourceSchema::new(if change == Some(FingerprintChange::ResourceType) {
+        "test.WidgetV2"
+    } else {
+        "test.Widget"
+    })
+    .with_operation_config(operation_config)
+    .with_default_wait_timeout(std::time::Duration::from_secs(
+        if change == Some(FingerprintChange::WaitTimeout) {
+            29
+        } else {
+            19
+        },
+    ))
+    .with_default_wait_interval(std::time::Duration::from_secs(
+        if change == Some(FingerprintChange::WaitInterval) {
+            31
+        } else {
+            23
+        },
+    ))
+    .with_def(
+        "Alias",
+        if change == Some(FingerprintChange::Definition) {
+            AttributeType::bool()
+        } else {
+            AttributeType::string()
+        },
+    )
+    .exclusive_required(&["first", "second"]);
+    schema = if change == Some(FingerprintChange::UniqueName) {
+        schema.with_coexisting_replacement()
+    } else {
+        schema.with_unique_name_attribute("first")
+    };
+    if change == Some(FingerprintChange::ExclusiveRequired) {
+        schema = schema.exclusive_required(&["first"]);
+    }
+    if change == Some(FingerprintChange::SchemaKind) {
+        schema = schema.as_data_source();
+    }
+    schema = match change {
+        Some(FingerprintChange::DeclarativeValidator) => {
+            schema.with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+        }
+        Some(FingerprintChange::ResourceValidator) => schema.with_validator(fingerprint_reject_all),
+        Some(
+            FingerprintChange::ResourceType
+            | FingerprintChange::AttributeType
+            | FingerprintChange::InputMode
+            | FingerprintChange::Default
+            | FingerprintChange::ProviderName
+            | FingerprintChange::CreateOnly
+            | FingerprintChange::Removable
+            | FingerprintChange::BlockName
+            | FingerprintChange::WriteOnly
+            | FingerprintChange::Identity
+            | FingerprintChange::DeferredPopulate
+            | FingerprintChange::SchemaKind
+            | FingerprintChange::UniqueName
+            | FingerprintChange::OperationConfig
+            | FingerprintChange::ExclusiveRequired
+            | FingerprintChange::WaitTimeout
+            | FingerprintChange::WaitInterval
+            | FingerprintChange::Definition,
+        )
+        | None => schema,
+    };
+    if reverse_attributes {
+        schema.attribute(second).attribute(first)
+    } else {
+        schema.attribute(first).attribute(second)
+    }
 }
 
 #[test]
@@ -10813,6 +10984,30 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
         forward.semantic_fingerprint(),
         reverse.semantic_fingerprint(),
         "hash-map and nested map insertion order must not affect a schema fingerprint",
+    );
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_nested_write_only() {
+    let observable = ResourceSchema::new("test.Widget").attribute(AttributeSchema::new(
+        "config",
+        AttributeType::struct_(
+            "Config",
+            vec![StructField::new("client_secret", AttributeType::string())],
+        ),
+    ));
+    let write_only = ResourceSchema::new("test.Widget").attribute(AttributeSchema::new(
+        "config",
+        AttributeType::struct_(
+            "Config",
+            vec![StructField::new("client_secret", AttributeType::string()).write_only()],
+        ),
+    ));
+
+    assert_ne!(
+        observable.semantic_fingerprint(),
+        write_only.semantic_fingerprint(),
+        "nested write-only observability changes saved-plan compatibility",
     );
 }
 
@@ -10851,131 +11046,35 @@ fn in_process_validator_fingerprint_uses_a_fixed_marker() {
 
 #[test]
 fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
-    type SchemaMutation = (&'static str, Box<dyn Fn(&mut ResourceSchema)>);
-
-    fn reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        Err(Vec::new())
-    }
-
     let baseline = schema_fingerprint_fixture(false).semantic_fingerprint();
-    let mut changes: Vec<SchemaMutation> = vec![
-        (
-            "resource_type",
-            Box::new(|schema| schema.resource_type.push_str("V2")),
-        ),
-        (
-            "attribute type",
-            Box::new(|schema| {
-                schema.attributes.get_mut("second").unwrap().attr_type = AttributeType::bool();
-            }),
-        ),
-        (
-            "input mode",
-            Box::new(|schema| {
-                schema.attributes.get_mut("second").unwrap().input_mode = InputMode::Required;
-            }),
-        ),
-        (
-            "default",
-            Box::new(|schema| {
-                schema.attributes.get_mut("first").unwrap().default =
-                    Some(Value::Concrete(ConcreteValue::Bool(true)));
-            }),
-        ),
-        (
-            "provider name",
-            Box::new(|schema| {
-                schema.attributes.get_mut("first").unwrap().provider_name = Some("Other".into());
-            }),
-        ),
-        (
-            "create_only",
-            Box::new(|schema| schema.attributes.get_mut("first").unwrap().create_only = false),
-        ),
-        (
-            "removable",
-            Box::new(|schema| schema.attributes.get_mut("second").unwrap().removable = Some(true)),
-        ),
-        (
-            "block_name",
-            Box::new(|schema| {
-                schema.attributes.get_mut("first").unwrap().block_name = Some("other".into());
-            }),
-        ),
-        (
-            "write_only",
-            Box::new(|schema| schema.attributes.get_mut("first").unwrap().write_only = false),
-        ),
-        (
-            "identity",
-            Box::new(|schema| schema.attributes.get_mut("first").unwrap().identity = false),
-        ),
-        (
-            "deferred_populate",
-            Box::new(|schema| {
-                schema
-                    .attributes
-                    .get_mut("first")
-                    .unwrap()
-                    .deferred_populate = false;
-            }),
-        ),
-        (
-            "schema kind",
-            Box::new(|schema| schema.kind = SchemaKind::DataSource),
-        ),
-        (
-            "unique name",
-            Box::new(|schema| schema.unique_name = UniqueNameSpec::Coexisting),
-        ),
-        (
-            "operation config",
-            Box::new(|schema| {
-                schema
-                    .operation_config
-                    .as_mut()
-                    .unwrap()
-                    .update_timeout_secs = None
-            }),
-        ),
-        (
-            "exclusive required",
-            Box::new(|schema| schema.exclusive_required.push(vec!["first".into()])),
-        ),
-        (
-            "wait timeout",
-            Box::new(|schema| {
-                schema.default_wait_timeout = Some(std::time::Duration::from_secs(29));
-            }),
-        ),
-        (
-            "wait interval",
-            Box::new(|schema| {
-                schema.default_wait_interval = Some(std::time::Duration::from_secs(31));
-            }),
-        ),
-        (
-            "definition",
-            Box::new(|schema| {
-                schema.defs.insert("Alias".into(), AttributeType::bool());
-            }),
-        ),
+    let changes = [
+        ("resource_type", FingerprintChange::ResourceType),
+        ("attribute type", FingerprintChange::AttributeType),
+        ("input mode", FingerprintChange::InputMode),
+        ("default", FingerprintChange::Default),
+        ("provider name", FingerprintChange::ProviderName),
+        ("create_only", FingerprintChange::CreateOnly),
+        ("removable", FingerprintChange::Removable),
+        ("block_name", FingerprintChange::BlockName),
+        ("write_only", FingerprintChange::WriteOnly),
+        ("identity", FingerprintChange::Identity),
+        ("deferred_populate", FingerprintChange::DeferredPopulate),
+        ("schema kind", FingerprintChange::SchemaKind),
+        ("unique name", FingerprintChange::UniqueName),
+        ("operation config", FingerprintChange::OperationConfig),
+        ("exclusive required", FingerprintChange::ExclusiveRequired),
+        ("wait timeout", FingerprintChange::WaitTimeout),
+        ("wait interval", FingerprintChange::WaitInterval),
+        ("definition", FingerprintChange::Definition),
         (
             "declarative validator",
-            Box::new(|schema| {
-                schema.validation =
-                    ResourceValidation::Declared(vec![ValidatorType::TagsKeyValueCheck]);
-            }),
+            FingerprintChange::DeclarativeValidator,
         ),
-        (
-            "resource validator",
-            Box::new(|schema| schema.validation = ResourceValidation::InProcess(reject_all)),
-        ),
+        ("resource validator", FingerprintChange::ResourceValidator),
     ];
 
-    for (field, change) in changes.drain(..) {
-        let mut changed = schema_fingerprint_fixture(false);
-        change(&mut changed);
+    for (field, change) in changes {
+        let changed = schema_fingerprint_fixture_with(false, Some(change));
         assert_ne!(
             changed.semantic_fingerprint(),
             baseline,
