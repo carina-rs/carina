@@ -1183,7 +1183,7 @@ async fn run_state_refresh_locked_with_ctx(
 
     let expansion_prelude =
         crate::wiring::DeferredForExpansionPrelude::new(parsed, &state_file, ctx.schemas())?;
-    let sorted_resources = expansion_prelude.sorted_resources().to_vec();
+    let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
     let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
@@ -1199,7 +1199,7 @@ async fn run_state_refresh_locked_with_ctx(
     let mut managed_reads = Vec::new();
     let mut missing_provider_identifier_ids = HashSet::new();
     if let Some(state_file) = state_file.as_ref() {
-        for resource in &sorted_resources {
+        for resource in sorted_resources {
             match state_file.build_state_for_resource(&resource.id) {
                 Current::Present(present) => {
                     managed_reads.push((resource.id.clone(), present.identifier().clone()));
@@ -1267,10 +1267,9 @@ async fn run_state_refresh_locked_with_ctx(
     // skip the Enum lift, surfacing snake_case ↔ SCREAMING_CASE
     // as a phantom `~` diff.
     //
-    // The shared prelude derives any active moved targets from the same state
-    // view as plan/apply. `already_refreshed` carries the ids the managed read
-    // loop above already populated, so the post-expansion refresh below does
-    // not redundantly re-read them.
+    // Unlike plan/apply, refresh uses the prelude's address-preserving typed
+    // transition: pending moves and renames remain unapplied. The
+    // `already_refreshed` set still prevents redundant child reads.
     // carina#3278: route the expand → child-refresh → hydrate(2nd) →
     // lift quartet through the shared constructor so this path and
     // `run_apply_locked` cannot drift on the sequence again.
@@ -1286,18 +1285,6 @@ async fn run_state_refresh_locked_with_ctx(
         state_file.as_ref(),
     )
     .await?;
-    let mut prepared_expansion = expansion_prelude
-        .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
-            ctx,
-            parsed,
-            provider_configs: provider_inputs.configs().as_provider_configs(),
-            state_block_claims: &state_block_claims,
-            managed_current,
-            data_source_states,
-            orphans,
-            already_refreshed,
-        })?
-        .seal();
     let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
         .as_ref()
         .map(|sf| {
@@ -1315,6 +1302,14 @@ async fn run_state_refresh_locked_with_ctx(
                 .collect()
         })
         .unwrap_or_default();
+    let mut prepared_expansion = expansion_prelude
+        .preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
+            managed_current,
+            data_source_states,
+            orphans,
+            already_refreshed,
+        })
+        .seal();
     let multi = indicatif::MultiProgress::new();
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
@@ -3375,28 +3370,16 @@ mod tests {
         .expect("production orphan refresh should succeed");
         let orphans = orphans.into_plan_orphans();
         let state_file = Some(state_file);
-        let wiring = WiringContext::new(Vec::new(), &[]);
-        let state_block_claims = crate::wiring::resolve_state_block_claims(
-            &parsed.state_blocks,
-            &state_file,
-            &parsed.resources,
-            &schemas,
-        );
         let expansion_prelude =
             crate::wiring::DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
                 .expect("expansion prelude");
         let mut prepared_expansion = expansion_prelude
-            .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: &wiring,
-                parsed: &parsed,
-                provider_configs: &[],
-                state_block_claims: &state_block_claims,
+            .preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
                 managed_current: current_states,
                 data_source_states: HashMap::new(),
                 orphans,
                 already_refreshed,
             })
-            .expect("prepare expansion")
             .seal();
         let multi =
             indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());

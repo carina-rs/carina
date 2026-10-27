@@ -2023,13 +2023,18 @@ impl DeferredCreateTarget {
 /// I/O-free state derived from the identity-reconciled configuration/state
 /// view before managed and data-source refreshes run.
 ///
-/// The only production route to [`PreparedDeferredForExpansion`] is
-/// [`DeferredForExpansionPrelude::reconcile`] followed by
-/// [`ReconciledDeferredForExpansion::seal`]. That transition remaps both
-/// prior-state ownership and persisted planning metadata for explicit moves
-/// and anonymous-to-named renames before deferred `for` expansion can run.
-/// Consequently a caller cannot obtain the expansion witness from raw
-/// `saved_attrs` / `prev_explicit` maps keyed to a different address view.
+/// A caller must choose one of two typed transitions before it can obtain a
+/// [`PreparedDeferredForExpansion`]:
+///
+/// - [`DeferredForExpansionPrelude::reconcile_addresses`] for planning/apply
+///   views, which applies explicit moves and anonymous-to-named renames;
+/// - [`DeferredForExpansionPrelude::preserve_addresses`] for `state refresh`,
+///   which must refresh the rows at their persisted addresses without applying
+///   pending configuration transitions.
+///
+/// Both transitions own the exact state/metadata view accepted by expansion,
+/// so a future caller cannot silently choose the wrong behavior with a flag or
+/// substitute independently keyed maps.
 pub struct DeferredForExpansionPrelude<'state> {
     state_file: &'state Option<StateFile>,
     sorted_resources: Vec<Resource>,
@@ -2050,6 +2055,16 @@ pub struct ReconcileDeferredForExpansionInputs<'a, E> {
     /// Addresses already read by the pre-expansion refresh pass. The prepared
     /// expansion owns this exact set so no later caller can substitute an
     /// empty/default set at the expansion seam.
+    pub already_refreshed: HashSet<ResourceId>,
+}
+
+/// State snapshots for the address-preserving `state refresh` transition.
+/// Deliberately excludes move/rename inputs: that operation is not authorized
+/// to change state-row ownership.
+pub struct PreserveDeferredForExpansionInputs {
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_states: HashMap<ResourceId, State>,
+    pub orphans: Orphans,
     pub already_refreshed: HashSet<ResourceId>,
 }
 
@@ -2099,19 +2114,27 @@ impl<'state> DeferredForExpansionPrelude<'state> {
         &self.wait_aliases
     }
 
-    /// Apply every address-changing state transition once and seal the exact
+    /// Apply every address-changing state transition once and retain the exact
     /// metadata/alias/exclusion inputs used by expansion.
-    pub fn reconcile<E>(
+    pub fn reconcile_addresses<E>(
         mut self,
         mut inputs: ReconcileDeferredForExpansionInputs<'_, E>,
+        warning_policy: DeferredForWarningPolicy,
     ) -> Result<ReconciledDeferredForExpansion, AppError> {
-        let mut moved_pairs = materialize_moved_states(
+        let mut print_warning = |warning: String| eprintln!("{}", warning.yellow());
+        let mut suppress_warning = |_: String| {};
+        let warning_sink: &mut dyn FnMut(String) = match warning_policy {
+            DeferredForWarningPolicy::Print => &mut print_warning,
+            DeferredForWarningPolicy::Suppress => &mut suppress_warning,
+        };
+        let mut moved_pairs = materialize_moved_states_with_warning_sink(
             &mut inputs.managed_current,
             &mut inputs.orphans,
             &mut self.prev_explicit,
             &mut self.saved_attrs,
             &inputs.parsed.state_blocks,
             self.state_file,
+            warning_sink,
         )?;
         moved_pairs.extend(apply_anonymous_to_named_renames(
             inputs.ctx,
@@ -2124,23 +2147,37 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             self.state_file,
             inputs.state_block_claims,
         )?);
-        let moved_targets = moved_pairs
-            .iter()
-            .map(|(_, to)| to.as_inner().clone())
-            .collect();
-
         Ok(ReconciledDeferredForExpansion(DeferredForExpansionInputs {
             sorted_resources: self.sorted_resources,
             saved_attrs: self.saved_attrs,
             prev_explicit: self.prev_explicit,
             wait_aliases: self.wait_aliases,
             moved_pairs,
-            moved_targets,
             already_refreshed: inputs.already_refreshed,
             managed_current: inputs.managed_current,
             data_source_states: inputs.data_source_states,
             orphans: inputs.orphans,
         }))
+    }
+
+    /// Preserve persisted addresses for `state refresh`. This transition is a
+    /// different type from [`ReconciledDeferredForExpansion`] so the command
+    /// cannot accidentally begin applying pending move/rename declarations.
+    pub fn preserve_addresses(
+        self,
+        inputs: PreserveDeferredForExpansionInputs,
+    ) -> AddressPreservingDeferredForExpansion {
+        AddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
+            sorted_resources: self.sorted_resources,
+            saved_attrs: self.saved_attrs,
+            prev_explicit: self.prev_explicit,
+            wait_aliases: self.wait_aliases,
+            moved_pairs: Vec::new(),
+            already_refreshed: inputs.already_refreshed,
+            managed_current: inputs.managed_current,
+            data_source_states: inputs.data_source_states,
+            orphans: inputs.orphans,
+        })
     }
 }
 
@@ -2150,7 +2187,6 @@ struct DeferredForExpansionInputs {
     prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     wait_aliases: Vec<WaitAliasSpec>,
     moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
-    moved_targets: HashSet<ResourceId>,
     already_refreshed: HashSet<ResourceId>,
     managed_current: HashMap<ResourceId, Current>,
     data_source_states: HashMap<ResourceId, State>,
@@ -2163,6 +2199,18 @@ struct DeferredForExpansionInputs {
 pub struct ReconciledDeferredForExpansion(DeferredForExpansionInputs);
 
 impl ReconciledDeferredForExpansion {
+    pub fn sorted_resources(&self) -> &[Resource] {
+        &self.0.sorted_resources
+    }
+
+    pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
+        &self.0.saved_attrs
+    }
+
+    pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
+        &self.0.prev_explicit
+    }
+
     pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
         &self.0.managed_current
     }
@@ -2183,8 +2231,21 @@ impl ReconciledDeferredForExpansion {
         &self.0.wait_aliases
     }
 
+    pub fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
+        &self.0.moved_pairs
+    }
+
     /// Seal the reconciled managed/data-source/orphan snapshots into the only
     /// state accepted by deferred `for` expansion.
+    pub fn seal(self) -> PreparedDeferredForExpansion {
+        PreparedDeferredForExpansion(self.0)
+    }
+}
+
+/// Address-preserving state prepared specifically for `state refresh`.
+pub struct AddressPreservingDeferredForExpansion(DeferredForExpansionInputs);
+
+impl AddressPreservingDeferredForExpansion {
     pub fn seal(self) -> PreparedDeferredForExpansion {
         PreparedDeferredForExpansion(self.0)
     }
@@ -2210,46 +2271,6 @@ pub(crate) struct PreparedDeferredForExpansionParts {
 }
 
 impl PreparedDeferredForExpansion {
-    pub fn sorted_resources(&self) -> &[Resource] {
-        &self.0.sorted_resources
-    }
-
-    pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
-        &self.0.saved_attrs
-    }
-
-    pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
-        &self.0.prev_explicit
-    }
-
-    pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
-        &self.0.wait_aliases
-    }
-
-    pub fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
-        &self.0.moved_pairs
-    }
-
-    pub fn moved_targets(&self) -> &HashSet<ResourceId> {
-        &self.0.moved_targets
-    }
-
-    pub fn already_refreshed(&self) -> &HashSet<ResourceId> {
-        &self.0.already_refreshed
-    }
-
-    pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
-        &self.0.managed_current
-    }
-
-    pub fn data_source_states(&self) -> &HashMap<ResourceId, State> {
-        &self.0.data_source_states
-    }
-
-    pub fn orphans(&self) -> &Orphans {
-        &self.0.orphans
-    }
-
     pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
         PreparedDeferredForExpansionParts {
             managed_current: self.0.managed_current,
@@ -2405,8 +2426,9 @@ pub fn derive_managed_binding_stability<E>(
 
 impl PreparedDeferredForExpansion {
     /// Expand against the exact addressed state/metadata view sealed by
-    /// [`DeferredForExpansionPrelude::reconcile`]. This is the only production
-    /// constructor for [`DeferredForExpansion`] and its private witness.
+    /// one of the prelude's typed address transitions. This is the only
+    /// production constructor for [`DeferredForExpansion`] and its private
+    /// witness.
     pub fn expand<E: Clone>(
         &self,
         parsed: &carina_core::parser::File<E>,
@@ -2424,7 +2446,7 @@ impl PreparedDeferredForExpansion {
             &self.0.prev_explicit,
             remote_bindings,
             &self.0.wait_aliases,
-            &self.0.moved_targets,
+            &self.0.moved_pairs,
             &self.0.already_refreshed,
             warning_policy,
         )
@@ -2447,11 +2469,11 @@ impl PreparedDeferredForExpansion {
 /// calls exactly this function, then targeted-refreshes
 /// `refreshable_child_ids`.
 ///
-/// `moved_targets` is the set of `moved` block `to` ResourceIds (already
-/// materialized by `materialize_moved_states` on both the plan and apply
-/// paths before this call). Children whose id is in this set are kept
-/// out of `refreshable_child_ids` so their migrated state survives
-/// (carina#3141).
+/// `moved_targets` is derived here from the active `moved_pairs` already
+/// materialized on plan/apply paths. Children whose id is in this set are
+/// kept out of `refreshable_child_ids` so their migrated state survives
+/// (carina#3141). Keeping only the pairs in the prepared value prevents the
+/// two representations from diverging.
 ///
 /// `already_refreshed` is the set of ResourceIds the phase-1 orphan pass
 /// already performed a live provider read for *this run*. A for-loop
@@ -2476,7 +2498,7 @@ fn expand_same_config_deferred_for_prepared<E: Clone>(
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
-    moved_targets: &HashSet<ResourceId>,
+    moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     already_refreshed: &HashSet<ResourceId>,
     warning_policy: DeferredForWarningPolicy,
 ) -> Result<DeferredForExpansion, AppError> {
@@ -2613,6 +2635,10 @@ fn expand_same_config_deferred_for_prepared<E: Clone>(
     //   live-read it under the same state name the child resolves to.
     //   Reading it again here is a redundant second provider call for
     //   the same address.
+    let moved_targets: HashSet<ResourceId> = moved_pairs
+        .iter()
+        .map(|(_, to)| to.as_inner().clone())
+        .collect();
     let refreshable_child_ids = RefreshableChildIds(
         new_child_ids
             .iter()
@@ -2651,13 +2677,19 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
+    let moved_pairs = moved_targets
+        .iter()
+        .map(|target| {
+            let target = ResolvedResourceId::new(target.clone());
+            (target.clone(), target)
+        })
+        .collect();
     PreparedDeferredForExpansion(DeferredForExpansionInputs {
         sorted_resources: sorted_resources.to_vec(),
         saved_attrs: saved_attrs.clone(),
         prev_explicit: prev_explicit.clone(),
         wait_aliases: wait_aliases.to_vec(),
-        moved_pairs: Vec::new(),
-        moved_targets: moved_targets.clone(),
+        moved_pairs,
         already_refreshed: already_refreshed.clone(),
         managed_current: managed_current.clone(),
         data_source_states: data_source_states.clone(),
@@ -2832,9 +2864,9 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // are refreshed in a later phase against the already-populated
     // `managed_current`.
     let expansion_prelude = DeferredForExpansionPrelude::new(parsed, state_file, ctx.schemas())?;
-    // Refresh phases need an owned iteration list while the prelude retains
-    // the identical list for the sealed expansion transition below.
-    let sorted_resources = expansion_prelude.sorted_resources().to_vec();
+    // Refresh phases borrow the exact list retained by the typed prelude; no
+    // second owned resource graph can diverge before the transition below.
+    let sorted_resources = expansion_prelude.sorted_resources();
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
@@ -2967,8 +2999,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // is sufficient for the common case of literal create-only
         // attributes; resources with ResourceRef create-only values are
         // an orthogonal edge case that pre-dates this fix.
-        let mut reconciled_expansion =
-            expansion_prelude.reconcile(ReconcileDeferredForExpansionInputs {
+        let mut reconciled_expansion = expansion_prelude.reconcile_addresses(
+            ReconcileDeferredForExpansionInputs {
                 ctx,
                 parsed,
                 provider_configs: raw_provider_configs,
@@ -2977,11 +3009,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 data_source_states,
                 orphans,
                 already_refreshed: orphan_refreshed_ids,
-            })?;
+            },
+            DeferredForWarningPolicy::Print,
+        )?;
         // Phase 2: resolve data source refs against the consolidated
         // managed and data-source state, then refresh each via `read_data_source`.
         let data_source_bindings = data_source_refresh_bindings(
-            &sorted_resources,
+            reconciled_expansion.sorted_resources(),
             &parsed.compositions,
             &data_sources,
             reconciled_expansion.managed_current(),
@@ -2991,7 +3025,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             reconciled_expansion.wait_aliases(),
         );
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
-            &sorted_resources,
+            reconciled_expansion.sorted_resources(),
             &parsed.compositions,
             &data_sources,
             reconciled_expansion.managed_current(),
@@ -3055,7 +3089,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     } else {
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
-            for resource in &sorted_resources {
+            for resource in sorted_resources {
                 let current = sf.build_state_for_resource(&resource.id);
                 managed_current.insert(resource.id.clone(), current);
             }
@@ -3080,21 +3114,24 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .await?;
         } else {
             // No state file: all resources are new (not found)
-            for resource in &sorted_resources {
+            for resource in sorted_resources {
                 managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
             }
         }
         expansion_prelude
-            .reconcile(ReconcileDeferredForExpansionInputs {
-                ctx,
-                parsed,
-                provider_configs: raw_provider_configs,
-                state_block_claims,
-                managed_current,
-                data_source_states,
-                orphans,
-                already_refreshed: orphan_refreshed_ids,
-            })?
+            .reconcile_addresses(
+                ReconcileDeferredForExpansionInputs {
+                    ctx,
+                    parsed,
+                    provider_configs: raw_provider_configs,
+                    state_block_claims,
+                    managed_current,
+                    data_source_states,
+                    orphans,
+                    already_refreshed: orphan_refreshed_ids,
+                },
+                DeferredForWarningPolicy::Print,
+            )?
             .seal()
     };
 

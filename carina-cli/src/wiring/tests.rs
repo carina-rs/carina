@@ -5702,16 +5702,19 @@ mod expand_same_config_deferred_for_tests {
         );
         let prepared = DeferredForExpansionPrelude::new(&parsed, &state_file, &schemas)
             .expect("build expansion prelude")
-            .reconcile(ReconcileDeferredForExpansionInputs {
-                ctx: &wiring,
-                parsed: &parsed,
-                provider_configs: &[],
-                state_block_claims: &claims,
-                managed_current: HashMap::new(),
-                data_source_states: HashMap::new(),
-                orphans: Orphans::new(),
-                already_refreshed: HashSet::new(),
-            })
+            .reconcile_addresses(
+                ReconcileDeferredForExpansionInputs {
+                    ctx: &wiring,
+                    parsed: &parsed,
+                    provider_configs: &[],
+                    state_block_claims: &claims,
+                    managed_current: HashMap::new(),
+                    data_source_states: HashMap::new(),
+                    orphans: Orphans::new(),
+                    already_refreshed: HashSet::new(),
+                },
+                DeferredForWarningPolicy::Suppress,
+            )
             .expect("prepare expansion")
             .seal();
 

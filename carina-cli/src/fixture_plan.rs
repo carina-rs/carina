@@ -285,13 +285,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let expansion_prelude =
         crate::wiring::DeferredForExpansionPrelude::new(&parsed, &state_file, wiring.schemas())
             .expect("fixture deferred-for prelude must resolve");
-    let sorted_resources = expansion_prelude.sorted_resources().to_vec();
+    let sorted_resources = expansion_prelude.sorted_resources();
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
     let mut orphans = Orphans::new();
     if let Some(sf) = state_file.as_ref() {
-        for resource in &sorted_resources {
+        for resource in sorted_resources {
             let current = sf.build_state_for_resource(&resource.id);
             managed_current.insert(resource.id.clone(), current);
         }
@@ -308,7 +308,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .collect();
         orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
     } else {
-        for resource in &sorted_resources {
+        for resource in sorted_resources {
             managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
         }
         for ds in &data_sources {
@@ -355,11 +355,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         wiring.schemas(),
-        &sorted_resources,
+        sorted_resources,
     );
     let managed_stability = crate::wiring::derive_managed_binding_stability(
         &parsed,
-        &sorted_resources,
+        sorted_resources,
         &managed_current,
         &data_source_states,
         wiring.schemas(),
@@ -370,7 +370,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture managed binding stability must resolve");
     let mut override_aware_resources = OverrideAwareResources::build_for_plan_with_stability(
-        sorted_resources.clone(),
+        sorted_resources.to_vec(),
         state_file.as_ref(),
         carina_core::binding_index::PreApplyInputs {
             managed: &[],
@@ -521,30 +521,37 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("fixture late anonymous identities must resolve uniquely");
 
-    let prepared_expansion = expansion_prelude
-        .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
-            ctx: &wiring,
-            parsed: &parsed,
-            provider_configs: raw_provider_configs,
-            state_block_claims: &state_block_claims,
-            managed_current,
-            data_source_states,
-            orphans,
-            already_refreshed: HashSet::new(),
-        })
-        .expect("fixture move routes must match their loaded current states")
-        .seal();
+    let managed_bindings: HashSet<String> = expansion_prelude
+        .sorted_resources()
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect();
+    let reconciled_expansion = expansion_prelude
+        .reconcile_addresses(
+            crate::wiring::ReconcileDeferredForExpansionInputs {
+                ctx: &wiring,
+                parsed: &parsed,
+                provider_configs: raw_provider_configs,
+                state_block_claims: &state_block_claims,
+                managed_current,
+                data_source_states,
+                orphans,
+                already_refreshed: HashSet::new(),
+            },
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
+        .expect("fixture move routes must match their loaded current states");
     crate::wiring::validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
-        prepared_expansion.moved_pairs(),
+        reconciled_expansion.moved_pairs(),
         &resolved_state_block_targets,
         &state_file,
     )
     .expect("state block collision validation failed");
 
     let reconciled_provider_states = provider_states_for(
-        prepared_expansion.managed_current(),
-        prepared_expansion.orphans(),
+        reconciled_expansion.managed_current(),
+        reconciled_expansion.orphans(),
         override_aware_resources.resources(),
     );
     let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
@@ -560,21 +567,22 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &stability_resources,
         &reconciled_input_current,
         wiring.schemas(),
-        prepared_expansion.saved_attrs(),
-        prepared_expansion.prev_explicit(),
+        reconciled_expansion.saved_attrs(),
+        reconciled_expansion.prev_explicit(),
     );
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
             data_sources: &data_sources,
             managed_current: &reconciled_input_current,
-            data_source_states: prepared_expansion.data_source_states(),
+            data_source_states: reconciled_expansion.data_source_states(),
             remote_bindings: &remote_bindings,
-            wait_aliases: prepared_expansion.wait_aliases(),
+            wait_aliases: reconciled_expansion.wait_aliases(),
         },
         &managed_stability,
     );
 
+    let prepared_expansion = reconciled_expansion.seal();
     let deferred_for_expansion = prepared_expansion
         .expand(
             &parsed,
@@ -592,10 +600,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wait_aliases: _,
         moved_pairs,
     } = prepared_expansion.into_parts();
-    let managed_bindings: HashSet<String> = sorted_resources
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()

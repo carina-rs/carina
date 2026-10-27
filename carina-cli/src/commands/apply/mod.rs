@@ -1808,7 +1808,7 @@ async fn run_apply_locked_owned(
                 &state_file,
                 ctx.schemas(),
             )?;
-            let sorted_resources = expansion_prelude.sorted_resources().to_vec();
+            let sorted_resources = expansion_prelude.sorted_resources();
             let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
             // Read states for all resources using identifier from state
@@ -1939,7 +1939,7 @@ async fn run_apply_locked_owned(
                 state_file.as_ref(),
             )
             .await?;
-            let mut reconciled_expansion = expansion_prelude.reconcile(
+            let mut reconciled_expansion = expansion_prelude.reconcile_addresses(
                 crate::wiring::ReconcileDeferredForExpansionInputs {
                     ctx,
                     parsed,
@@ -1950,12 +1950,13 @@ async fn run_apply_locked_owned(
                     orphans,
                     already_refreshed: orphan_refreshed_ids,
                 },
+                crate::wiring::DeferredForWarningPolicy::Print,
             )?;
 
             // Phase 2: resolve data source inputs against the consolidated state
             // and refresh them via `read_data_source` (#1683, #1685).
             let data_source_bindings = data_source_refresh_bindings(
-                &sorted_resources,
+                reconciled_expansion.sorted_resources(),
                 &parsed.compositions,
                 &data_sources,
                 reconciled_expansion.managed_current(),
@@ -1967,7 +1968,7 @@ async fn run_apply_locked_owned(
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
             let data_source_refreshes = resolve_data_source_refs_for_refresh(
-                &sorted_resources,
+                reconciled_expansion.sorted_resources(),
                 &parsed.compositions,
                 &data_sources,
                 reconciled_expansion.managed_current(),
@@ -2837,16 +2838,19 @@ async fn prepare_saved_plan_secret_candidates(
     let prior_states = pending_plan
         .expansion_prior_states(expansion_prelude.sorted_resources(), &parsed.data_sources);
     let prepared_expansion = expansion_prelude
-        .reconcile(crate::wiring::ReconcileDeferredForExpansionInputs {
-            ctx: &wiring,
-            parsed: &parsed,
-            provider_configs: provider_inputs.configs().as_provider_configs(),
-            state_block_claims: &state_blocks.claims,
-            managed_current: prior_states.managed,
-            data_source_states: prior_states.data_sources,
-            orphans: Orphans::new(),
-            already_refreshed: prior_states.already_refreshed,
-        })?
+        .reconcile_addresses(
+            crate::wiring::ReconcileDeferredForExpansionInputs {
+                ctx: &wiring,
+                parsed: &parsed,
+                provider_configs: provider_inputs.configs().as_provider_configs(),
+                state_block_claims: &state_blocks.claims,
+                managed_current: prior_states.managed,
+                data_source_states: prior_states.data_sources,
+                orphans: Orphans::new(),
+                already_refreshed: prior_states.already_refreshed,
+            },
+            crate::wiring::DeferredForWarningPolicy::Suppress,
+        )?
         .seal();
     let expansion = prepared_expansion.expand(
         &parsed,

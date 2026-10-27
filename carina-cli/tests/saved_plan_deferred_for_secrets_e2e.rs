@@ -341,3 +341,34 @@ let moved_children = for rule in renamed_seed.generated_rules {
     assert_no_plaintext("moved-source saved apply output", &output_text(&apply));
     assert_no_plaintext("moved-source state", &scenario.state_text());
 }
+
+#[test]
+fn saved_plan_verification_does_not_repeat_unapplied_move_warning() {
+    let scenario = Scenario::new();
+    scenario.write_project_file(
+        "missing-move.crn",
+        r#"moved {
+  from = mock.test.resource 'missing_source'
+  to   = mock.test.resource 'missing_target'
+}
+"#,
+    );
+
+    let plan = scenario.plan();
+    assert_success("saved plan with unapplied move", &plan);
+    let plan_output = output_text(&plan);
+    assert_eq!(
+        plan_output.matches("was not applied").count(),
+        1,
+        "planning should render the unapplied-move warning once:\n{plan_output}",
+    );
+
+    let apply = scenario.apply(Some(PLANNED_SECRET));
+    assert_success("saved apply with unapplied move", &apply);
+    let apply_output = output_text(&apply);
+    assert_eq!(
+        apply_output.matches("was not applied").count(),
+        0,
+        "saved-plan verification must suppress an already-rendered move warning:\n{apply_output}",
+    );
+}
