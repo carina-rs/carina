@@ -39,7 +39,8 @@ use crate::error::AppError;
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
 use crate::plan_image::{
-    PlanImageInput, PlanImageTarget, StateMetadata, render_plan_image, write_plan_image,
+    InlineImageProtocol, InlineImageRequest, PlanImageInput, PlanImageTarget, RenderedInlineImage,
+    StateMetadata, render_plan_outputs, terminal_size, write_inline_image, write_plan_image,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -1708,6 +1709,7 @@ pub async fn run_plan(
     path: &Path,
     out: Option<&Path>,
     image: Option<&PlanImageTarget>,
+    inline_image: Option<InlineImageProtocol>,
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
@@ -2104,21 +2106,24 @@ pub async fn run_plan(
         lineage: &state.lineage,
         serial: state.serial,
     });
-    write_plan_artifacts(
+    let inline_image = inline_image.map(|protocol| InlineImageRequest {
+        protocol,
+        terminal: terminal_size(),
+    });
+    let rendered_inline_image = write_plan_artifacts(
         out.zip(plan_output.as_deref()),
-        image.map(|image_target| {
-            (
-                image_target,
-                PlanImageInput {
-                    plan: &ctx.plan,
-                    desired_resources: &ctx.sorted_resources,
-                    unresolved_resources: &ctx.unresolved_resources,
-                    compositions: &ctx.compositions,
-                    expansion_trace: Some(&ctx.expansion_trace),
-                    state,
-                    summary: &summary,
-                },
-            )
+        (image.is_some() || inline_image.is_some()).then_some(PlanImageArtifactRequest {
+            file: image,
+            inline: inline_image,
+            input: PlanImageInput {
+                plan: &ctx.plan,
+                desired_resources: &ctx.sorted_resources,
+                unresolved_resources: &ctx.unresolved_resources,
+                compositions: &ctx.compositions,
+                expansion_trace: Some(&ctx.expansion_trace),
+                state,
+                summary: &summary,
+            },
         }),
     )?;
 
@@ -2144,20 +2149,35 @@ pub async fn run_plan(
         eprintln!("Plan image written to {}", image_target.path().display());
     }
 
+    if let Some(rendered_inline_image) = rendered_inline_image {
+        // End command-wide cursor hiding before the image so the guard's
+        // restore sequence cannot become trailing stdout after the protocol
+        // bytes. The later guard/exit restores are claim-once no-ops.
+        crate::cursor::restore_cursor();
+        write_inline_image(rendered_inline_image, std::io::stdout().lock())?;
+    }
+
     Ok(has_changes)
 }
 
-/// Render the image before touching either destination, then preserve the
-/// command's commit order: saved plan first, image last. Consequently render
-/// failures leave no fresh artifacts, while the only fallible operation after
-/// a successful `--out` write is the final image I/O write.
+struct PlanImageArtifactRequest<'a> {
+    file: Option<&'a PlanImageTarget>,
+    inline: Option<InlineImageRequest>,
+    input: PlanImageInput<'a>,
+}
+
+/// Render all requested images before touching either destination, then write
+/// the saved plan followed by the file image. The returned terminal image is
+/// already protocol-encoded, but is emitted by `run_plan` only after status
+/// messages so its escape bytes remain the final command output.
 fn write_plan_artifacts(
     out: Option<(&Path, &str)>,
-    image: Option<(&PlanImageTarget, PlanImageInput<'_>)>,
-) -> Result<(), AppError> {
-    let rendered_image = image
-        .map(|(target, input)| render_plan_image(target, input))
-        .transpose()?;
+    images: Option<PlanImageArtifactRequest<'_>>,
+) -> Result<Option<RenderedInlineImage>, AppError> {
+    let (rendered_image, rendered_inline_image) = match images {
+        Some(images) => render_plan_outputs(images.file, images.inline, images.input)?,
+        None => (None, None),
+    };
 
     if let Some((out_path, contents)) = out {
         fs::write(out_path, contents)
@@ -2168,7 +2188,7 @@ fn write_plan_artifacts(
         write_plan_image(rendered_image)?;
     }
 
-    Ok(())
+    Ok(rendered_inline_image)
 }
 
 /// The state-aware identity and provider-input preparation shared by normal
@@ -3478,6 +3498,7 @@ exports { region: String = "ap-northeast-1" }"#,
             &dir_b,
             None,
             None,
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3567,6 +3588,7 @@ exports { region: String = "ap-northeast-1" }"#,
 
         run_plan(
             &project,
+            None,
             None,
             None,
             DetailLevel::None,
@@ -3778,6 +3800,7 @@ mod run_plan_out_tests {
             dir,
             Some(&plan_path),
             None,
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3820,6 +3843,7 @@ mod run_plan_out_tests {
             dir,
             Some(&plan_path),
             None,
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3858,6 +3882,7 @@ mod run_plan_out_tests {
             dir,
             Some(&missing_parent_out),
             Some(&image),
+            None,
             DetailLevel::None,
             false,
             false,
@@ -3900,9 +3925,10 @@ mod run_plan_out_tests {
 
         let result = write_plan_artifacts(
             Some((&out_path, "{}\n")),
-            Some((
-                &image_target,
-                PlanImageInput {
+            Some(PlanImageArtifactRequest {
+                file: Some(&image_target),
+                inline: None,
+                input: PlanImageInput {
                     plan: &plan,
                     desired_resources: &desired_resources,
                     unresolved_resources: &unresolved_resources,
@@ -3911,7 +3937,7 @@ mod run_plan_out_tests {
                     state: None,
                     summary: &summary,
                 },
-            )),
+            }),
         );
 
         assert!(
@@ -3925,6 +3951,74 @@ mod run_plan_out_tests {
         assert!(
             !image_path.exists(),
             "render failure must not write --image"
+        );
+    }
+
+    #[test]
+    fn inline_png_render_failure_writes_and_emits_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("plan.json");
+        let image_path = tmp.path().join("plan.svg");
+        let image_target = PlanImageTarget::try_from(image_path.clone()).unwrap();
+
+        let mut plan = Plan::new();
+        for index in 0..300 {
+            let identity =
+                carina_core::resource::ResourceIdentity::try_from(format!("resource_{index:04}"))
+                    .unwrap();
+            plan.add(Effect::Create(ResolvedResource::new(Resource::new(
+                "test.Resource",
+                identity,
+            ))));
+        }
+        let summary = PlanChangeSummary::new(&plan, &[], &[]);
+        let desired_resources = Vec::new();
+        let unresolved_resources = Vec::new();
+        let compositions = Vec::new();
+        let expansion_trace = carina_core::resource::ExpansionTrace::new();
+
+        let mut inline_output = Vec::new();
+        let result: Result<(), AppError> = (|| {
+            let rendered_inline_image = write_plan_artifacts(
+                Some((&out_path, "{}\n")),
+                Some(PlanImageArtifactRequest {
+                    file: Some(&image_target),
+                    inline: Some(InlineImageRequest {
+                        protocol: InlineImageProtocol::Kitty,
+                        terminal: None,
+                    }),
+                    input: PlanImageInput {
+                        plan: &plan,
+                        desired_resources: &desired_resources,
+                        unresolved_resources: &unresolved_resources,
+                        compositions: &compositions,
+                        expansion_trace: Some(&expansion_trace),
+                        state: None,
+                        summary: &summary,
+                    },
+                }),
+            )?;
+            if let Some(rendered_inline_image) = rendered_inline_image {
+                write_inline_image(rendered_inline_image, &mut inline_output)?;
+            }
+            Ok(())
+        })();
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::PlanImage(PlanImageError::PngPixelBudget { .. }))
+            ),
+            "oversized inline PNG rendering must fail before any artifact is written"
+        );
+        assert!(!out_path.exists(), "render failure must not write --out");
+        assert!(
+            !image_path.exists(),
+            "inline render failure must not write --image"
+        );
+        assert!(
+            inline_output.is_empty(),
+            "inline render failure must not emit terminal escape bytes"
         );
     }
 

@@ -5,6 +5,10 @@ plan-image:
 	$(if $(strip $(OUT)),,$(error OUT is required, for example OUT=/tmp/plan.png))
 	$(PLAN_FIXTURE) $(FIXTURE) --image "$(OUT)"
 
+plan-image-inline:
+	$(if $(strip $(FIXTURE)),,$(error FIXTURE is required, for example FIXTURE=mixed_operations))
+	$(PLAN_FIXTURE) $(FIXTURE) --image-inline
+
 plan-all-create:
 	$(PLAN_FIXTURE) all_create
 plan-no-changes:

@@ -158,6 +158,24 @@ endpoint answers `404` to it even with `contents`, `issues`, and
 the `repo` scope, from a user with write access to the repository, as a secret
 (`PLAN_COMMENT_TOKEN` above).
 
+### `--image-inline`
+
+Display the dependency graph directly in an image-capable terminal after the
+normal text plan. Carina renders the graph as PNG and uses the Kitty graphics
+protocol in Kitty and Ghostty, or the iTerm2 inline-image protocol in iTerm2
+and WezTerm. In Kitty-compatible terminals, an image wider than the terminal
+is scaled down to the available columns.
+
+Any other terminal, including tmux, and output that is not a terminal are
+rejected before planning starts; use `--image <FILE>` there. `--image-inline`
+cannot be combined with `--json`, which keeps stdout as JSON, or `--tui`,
+which owns the terminal. It can be combined with `--image <FILE>` to display
+the graph and save it in one run.
+
+```bash
+carina plan --image-inline
+```
+
 ## Examples
 
 Plan from the current directory:

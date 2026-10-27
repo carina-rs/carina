@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -19,7 +19,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
-use carina_cli::plan_image::PlanImageTarget;
+use carina_cli::plan_image::{PlanImageTarget, detect_inline_image_protocol};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
@@ -62,6 +62,10 @@ enum Commands {
         /// Write the dependency graph as SVG or PNG (selected by extension)
         #[arg(long, value_parser = carina_cli::plan_image::parse_output_target)]
         image: Option<PlanImageTarget>,
+
+        /// Display the dependency graph in a supported image-capable terminal
+        #[arg(long, conflicts_with_all = ["json", "tui"])]
+        image_inline: bool,
 
         /// Return exit code 2 when changes are present
         #[arg(long = "detailed-exitcode")]
@@ -358,11 +362,24 @@ async fn main() {
     // `CursorGuard`'s `Drop` cannot reach (#3153, #3158).
     carina_cli::cursor::install_panic_restore_hook();
 
+    let cli = Cli::parse();
+
+    let inline_image_protocol = match &cli.command {
+        Commands::Plan {
+            image_inline: true, ..
+        } => match detect_inline_image_protocol(
+            |name| std::env::var(name).ok(),
+            std::io::stdout().is_terminal(),
+        ) {
+            Ok(protocol) => Some(protocol),
+            Err(error) => handle_app_error(error.into()),
+        },
+        _ => None,
+    };
+
     // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
     let provider_context = create_provider_context();
-
-    let cli = Cli::parse();
 
     // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
     // after `Cli::parse()` because that exits the process itself on
@@ -376,6 +393,7 @@ async fn main() {
             path,
             out,
             image,
+            image_inline: _,
             detailed_exitcode,
             detail,
             tui,
@@ -389,6 +407,7 @@ async fn main() {
                 &path,
                 out.as_deref(),
                 image.as_ref(),
+                inline_image_protocol,
                 detail,
                 tui,
                 refresh,
@@ -998,6 +1017,51 @@ mod error_format_tests {
             }
             _ => panic!("expected plan command"),
         }
+    }
+
+    #[test]
+    fn plan_image_inline_can_be_combined_with_image() {
+        let cli =
+            Cli::try_parse_from(["carina", "plan", "--image-inline", "--image", "review.png"])
+                .expect("--image-inline and --image should be composable");
+
+        match cli.command {
+            Commands::Plan {
+                image_inline,
+                image,
+                ..
+            } => {
+                assert!(image_inline);
+                assert_eq!(image.unwrap().path(), Path::new("review.png"));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_image_inline_conflicts_with_json() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-inline", "--json"]) {
+            Ok(_) => panic!("inline terminal output must not corrupt JSON stdout"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--image-inline"), "{message}");
+        assert!(message.contains("--json"), "{message}");
+    }
+
+    #[test]
+    fn plan_image_inline_conflicts_with_tui() {
+        let error = match Cli::try_parse_from(["carina", "plan", "--image-inline", "--tui"]) {
+            Ok(_) => panic!("the TUI must retain exclusive ownership of the terminal"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--image-inline"), "{message}");
+        assert!(message.contains("--tui"), "{message}");
     }
 
     #[test]

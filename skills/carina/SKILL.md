@@ -104,6 +104,7 @@ carina plan --detailed-exitcode
 
 ```bash
 carina plan --image plan.png   # or plan.svg
+carina plan --image-inline     # show the graph in Kitty, Ghostty, iTerm2, or WezTerm
 # Dependency graph in apply order, effect-colored cards, blast-radius halos
 ```
 

@@ -5,14 +5,16 @@
 //! the `make plan-*` targets for visual confirmation of plan display.
 //!
 //! Usage:
-//!   cargo run --example plan-fixture -- <fixture_name> [--detail <level>] [--destroy] [--tui] [--image <path>]
+//!   cargo run --example plan-fixture -- <fixture_name> [--detail <level>] [--destroy] [--tui] [--image <path>] [--image-inline]
 //!
 //! Flags:
 //!   --detail <full|explicit|none>   Detail level (default: full)
 //!   --destroy                       Render as destroy plan (uses state's live resources)
 //!   --tui                           Launch interactive TUI instead of printing
 //!   --image <path>                  Also write the plan graph as SVG or PNG
+//!   --image-inline                  Display the plan graph in the terminal
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use carina_cli::DetailLevel;
@@ -22,13 +24,14 @@ use carina_cli::fixture_plan::{
     delete_instance_attributes_from_plan,
 };
 use carina_cli::plan_image::{
-    PlanImageInput, PlanImageTarget, StateMetadata, parse_output_target, render_plan_image,
-    write_plan_image,
+    InlineImageRequest, PlanImageInput, PlanImageTarget, StateMetadata,
+    detect_inline_image_protocol, parse_output_target, render_plan_outputs, terminal_size,
+    write_inline_image, write_plan_image,
 };
 
 fn print_usage() {
     eprintln!(
-        "usage: plan-fixture <fixture_name> [--detail <full|explicit|none>] [--destroy] [--tui] [--image <path>]"
+        "usage: plan-fixture <fixture_name> [--detail <full|explicit|none>] [--destroy] [--tui] [--image <path>] [--image-inline]"
     );
 }
 
@@ -53,6 +56,7 @@ fn main() -> ExitCode {
     let mut destroy = false;
     let mut tui = false;
     let mut image: Option<PlanImageTarget> = None;
+    let mut image_inline = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -71,6 +75,7 @@ fn main() -> ExitCode {
             }
             "--destroy" => destroy = true,
             "--tui" => tui = true,
+            "--image-inline" => image_inline = true,
             "--image" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -106,18 +111,43 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    if image_inline && tui {
+        eprintln!("error: --image-inline cannot be used with --tui");
+        return ExitCode::from(2);
+    }
+
+    let inline_protocol = if image_inline {
+        match detect_inline_image_protocol(
+            |name| std::env::var(name).ok(),
+            std::io::stdout().is_terminal(),
+        ) {
+            Ok(protocol) => Some(protocol),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let fp = build_plan_from_fixture_name(&fixture);
     let historical_display =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
 
-    if let Some(image_target) = image.as_ref() {
+    let inline_request = inline_protocol.map(|protocol| InlineImageRequest {
+        protocol,
+        terminal: terminal_size(),
+    });
+    let (rendered_image, rendered_inline_image) = if image.is_some() || inline_request.is_some() {
         let state = fp.state_file.as_ref().map(|state| StateMetadata {
             lineage: &state.lineage,
             serial: state.serial,
         });
-        let rendered = match render_plan_image(
-            image_target,
+        match render_plan_outputs(
+            image.as_ref(),
+            inline_request,
             PlanImageInput {
                 plan: &fp.plan,
                 desired_resources: &fp.desired_resources,
@@ -133,12 +163,24 @@ fn main() -> ExitCode {
                 eprintln!("error: {error}");
                 return ExitCode::from(1);
             }
-        };
-        if let Err(error) = write_plan_image(rendered) {
+        }
+    } else {
+        (None, None)
+    };
+
+    if let Some(rendered_image) = rendered_image {
+        if let Err(error) = write_plan_image(rendered_image) {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
-        eprintln!("Plan image written to {}", image_target.path().display());
+        eprintln!(
+            "Plan image written to {}",
+            image
+                .as_ref()
+                .expect("a rendered file image has a target")
+                .path()
+                .display()
+        );
     }
 
     if tui {
@@ -170,6 +212,13 @@ fn main() -> ExitCode {
             Some(&fp.prev_explicit),
             None,
         );
+    }
+
+    if let Some(rendered_inline_image) = rendered_inline_image
+        && let Err(error) = write_inline_image(rendered_inline_image, std::io::stdout().lock())
+    {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
     }
 
     ExitCode::SUCCESS

@@ -1062,6 +1062,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "colored",
+ "crossterm",
  "env_logger",
  "futures",
  "indexmap 2.13.0",
