@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position, Range};
 
+use crate::attribute_path::{resolve_attribute_path, struct_fields_of};
 use crate::document::Document;
+use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, enclosing_block};
 use carina_core::schema::{
-    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape, StructField,
+    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape,
 };
 
 pub struct CompletionProvider {
@@ -25,7 +27,7 @@ pub struct CompletionProvider {
     region_completions_data: Vec<CompletionValue>,
     /// Resource type patterns sorted longest-first for matching.
     /// Each pattern is `"<provider>.<resource_type>"` for both Managed and DataSource entries.
-    resource_type_patterns: Vec<String>,
+    resource_type_patterns: ResourceTypePatterns,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
 }
@@ -37,20 +39,7 @@ impl CompletionProvider {
         region_completions_data: Vec<CompletionValue>,
         custom_type_names: Vec<String>,
     ) -> Self {
-        // Build sorted resource type patterns from registry entries (longest first).
-        let mut resource_type_patterns: Vec<String> = schemas
-            .iter()
-            .map(|(provider, resource_type, _kind, _schema)| {
-                if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{}.{}", provider, resource_type)
-                }
-            })
-            .collect();
-        resource_type_patterns.sort();
-        resource_type_patterns.dedup();
-        resource_type_patterns.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        let resource_type_patterns = ResourceTypePatterns::from_schemas(&schemas);
 
         Self {
             schemas,
@@ -212,6 +201,7 @@ impl CompletionProvider {
         let current_line = lines[line_idx];
         let col = position.character as usize;
         let prefix: String = current_line.chars().take(col).collect();
+        let block_context = enclosing_block(text, position, &self.resource_type_patterns);
 
         // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
         // block-context walk because a `for` header sits at brace_depth 0 and
@@ -252,8 +242,6 @@ impl CompletionProvider {
         // position (depth 1 for top-level, depth 2+ for nested map/list).
         // Cleared when the entry closes or a new one starts.
         let mut exports_entry_type: Option<String> = None;
-        // Track nested block names at each depth level (index 0 = depth 1, etc.)
-        let mut nested_block_names: Vec<String> = Vec::new();
         // Depth-of-for-bodies currently open. A `for ... { <body> }` stacks a
         // resource_block-free brace level that should be transparent when we
         // look for enclosing resource types, so a resource declaration at
@@ -353,25 +341,6 @@ impl CompletionProvider {
                     crate::let_parse::parse_let_header(trimmed).map(|(n, _)| n.to_string());
             }
 
-            // At brace_depth >= 1, detect nested block in two forms:
-            //   - block syntax: "identifier {"
-            //   - assignment syntax: "identifier = {"
-            if brace_depth >= 1 && trimmed.ends_with('{') && !resource_type.is_empty() {
-                let before_brace = trimmed.trim_end_matches('{').trim();
-                let name = if before_brace.contains('=') {
-                    // Assignment syntax: "name = {" → extract name before "="
-                    before_brace.split('=').next().unwrap_or("").trim()
-                } else {
-                    // Block syntax: "name {"
-                    before_brace
-                };
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    let depth_index = (brace_depth - 1) as usize;
-                    nested_block_names.truncate(depth_index);
-                    nested_block_names.push(name.to_string());
-                }
-            }
-
             // Inside an `exports` block, capture the type annotation of
             // the current entry: `<name>: <type> = ...`. Recorded at
             // depth 1 (the exports block body itself). Used by value-
@@ -411,7 +380,6 @@ impl CompletionProvider {
                         in_upstream_state_block = false;
                         in_use_block = false;
                         exports_entry_type = None;
-                        nested_block_names.clear();
                     } else if brace_depth == 1 && in_exports_block {
                         // Closing a nested `{ ... }` inside an exports
                         // map/list value — the next entry starts fresh.
@@ -423,12 +391,6 @@ impl CompletionProvider {
                         resource_type.clear();
                         current_binding = None;
                         module_name = None;
-                    } else {
-                        // Truncate to current depth
-                        let depth_index = (brace_depth - 1) as usize;
-                        if nested_block_names.len() > depth_index {
-                            nested_block_names.truncate(depth_index);
-                        }
                     }
                 }
             }
@@ -458,12 +420,23 @@ impl CompletionProvider {
             }
         }
 
+        let resource_block = match &block_context {
+            EnclosingBlock::Resource {
+                resource_type,
+                struct_path,
+            } => Some((resource_type.as_str(), struct_path.as_slice())),
+            EnclosingBlock::ModuleCall {
+                module_name: _module_name,
+                arg_path: _arg_path,
+            } => None,
+            EnclosingBlock::Other => None,
+        };
+
         // `directives { ... }` is the meta-arg block, not a struct
         // attribute — short-circuit before the struct router runs (#2873).
-        if !nested_block_names.is_empty()
-            && nested_block_names.last().map(String::as_str) == Some("directives")
-            && brace_depth >= 2
-        {
+        if resource_block.is_some_and(|(_, struct_path)| {
+            struct_path.first().map(String::as_str) == Some("directives")
+        }) {
             // Cursor inside `depends_on = [...]` → list-element completion.
             if let Some(after_eq) = prefix.split('=').next_back()
                 && let Some(open) = after_eq.rfind('[')
@@ -491,23 +464,28 @@ impl CompletionProvider {
             }
         }
 
-        // Check if we're inside a nested struct block (brace_depth > 1)
-        if !nested_block_names.is_empty() && brace_depth > 1 && !resource_type.is_empty() {
-            if prefix.contains('=') {
-                let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
+        if let Some((enclosing_resource_type, struct_path)) = resource_block
+            && !struct_path.is_empty()
+        {
+            let current_segment = prefix
+                .rsplit(['{', '}', '[', ','])
+                .next()
+                .unwrap_or(prefix.as_str());
+            if current_segment.contains('=') {
+                let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
                 if !after_eq.starts_with('"') || after_eq == "\"" {
-                    let field_name = self.extract_attr_name(&prefix);
+                    let field_name = self.extract_attr_name(current_segment);
                     return CompletionContext::AfterEqualsInStruct {
-                        resource_type: resource_type.clone(),
-                        attr_path: nested_block_names,
+                        resource_type: enclosing_resource_type.to_string(),
+                        attr_path: struct_path.to_vec(),
                         field_name,
                         current_binding: current_binding.clone(),
                     };
                 }
             }
             return CompletionContext::InsideStructBlock {
-                resource_type: resource_type.clone(),
-                attr_path: nested_block_names,
+                resource_type: enclosing_resource_type.to_string(),
+                attr_path: struct_path.to_vec(),
             };
         }
 
@@ -634,113 +612,15 @@ impl CompletionProvider {
     pub(super) fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 
-        // Match against schema keys (sorted longest first for correct matching)
-        for pattern in &self.resource_type_patterns {
-            if trimmed.contains(pattern.as_str()) {
-                return Some(pattern.clone());
-            }
-        }
-        None
+        self.resource_type_patterns
+            .find_in(trimmed)
+            .map(str::to_string)
     }
 
     /// Extract attribute name from a line prefix like "    enable_dns_hostnames = "
     fn extract_attr_name(&self, prefix: &str) -> String {
         let before_eq = prefix.split('=').next().unwrap_or("").trim();
         before_eq.to_string()
-    }
-
-    fn extract_struct_fields<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_type: &'a AttributeType,
-    ) -> Option<&'a [StructField]> {
-        let mut budget = carina_core::schema::ShapeWalkBudget::new(64);
-        self.extract_struct_fields_with_budget(schema, attr_type, &mut budget)
-    }
-
-    fn extract_struct_fields_with_budget<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_type: &'a AttributeType,
-        budget: &mut carina_core::schema::ShapeWalkBudget,
-    ) -> Option<&'a [StructField]> {
-        use carina_core::schema::Shape;
-        // Project onto `Shape` so any `Ref` chain is peeled at the
-        // type level (carina#3349). The cyclic-CFN case
-        // (`Statement -> AndStatement -> List<Statement>`) descends
-        // because `shape_of` walks `Ref` against the schema's defs.
-        match schema.shape_of(attr_type) {
-            Shape::Struct { .. } => schema.struct_fields_with_budget(attr_type, budget),
-            Shape::List {
-                element_type: inner,
-                ..
-            } => match schema.shape_of(inner) {
-                Shape::Struct { .. } => schema.struct_fields_with_budget(inner, budget),
-                _ => None,
-            },
-            Shape::Union => schema
-                .union_members_with_budget(attr_type, budget)?
-                .iter()
-                .flatten()
-                .find_map(|member| {
-                    self.extract_struct_fields_with_budget(schema, member.as_attr(), budget)
-                }),
-            _ => None,
-        }
-    }
-
-    /// Look up attribute schema by name, falling back to block_name match.
-    fn find_attr_schema<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_name: &str,
-    ) -> Option<&'a carina_core::schema::AttributeSchema> {
-        if let Some(attr_schema) = schema.attributes().get(attr_name) {
-            return Some(attr_schema);
-        }
-        // Fallback: check if attr_name matches a block_name
-        schema
-            .attributes()
-            .values()
-            .find(|a| a.block_name().is_some_and(|bn| bn == attr_name))
-    }
-
-    /// Provide completions for struct fields inside a nested block
-    /// Resolve struct fields by walking down a path of nested block names.
-    /// For a single-element path like ["versioning_configuration"], looks up the attribute directly.
-    /// For multi-element paths like ["assume_role_policy_document", "statement"],
-    /// walks down the struct hierarchy.
-    /// Resolve the AttributeType at the given attr_path within a resource schema.
-    fn resolve_type_for_path<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_path: &[String],
-    ) -> Option<&'a AttributeType> {
-        if attr_path.is_empty() {
-            return None;
-        }
-
-        let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
-        let mut current_type = attr_schema.attr_type();
-
-        for name in &attr_path[1..] {
-            let fields = self.extract_struct_fields(schema, current_type)?;
-            let field = fields
-                .iter()
-                .find(|f| f.name() == *name || f.block_name() == Some(name))?;
-            current_type = field.field_type();
-        }
-
-        Some(current_type)
-    }
-
-    fn resolve_struct_fields_for_path<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_path: &[String],
-    ) -> Option<&'a [StructField]> {
-        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        self.extract_struct_fields(schema, attr_type)
     }
 
     fn struct_field_completions(
@@ -756,7 +636,9 @@ impl CompletionProvider {
 
         if let Some(schema) = self.lookup_schema(resource_type) {
             // Try struct field completions first
-            if let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path) {
+            if let Some(resolved) = resolve_attribute_path(schema, attr_path)
+                && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
+            {
                 return fields
                     .iter()
                     .filter(|field| !field.is_read_only())
@@ -804,7 +686,8 @@ impl CompletionProvider {
         schema: &'a ResourceSchema,
         attr_path: &[String],
     ) -> Option<&'a AttributeType> {
-        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
+        let resolved = resolve_attribute_path(schema, attr_path)?;
+        let attr_type = resolved.attr_type();
         if let Shape::Map { key, .. } = schema.shape_of(attr_type) {
             Some(key)
         } else {
@@ -853,7 +736,8 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
+            && let Some(resolved) = resolve_attribute_path(schema, attr_path)
+            && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
             && let Some(field) = fields.iter().find(|f| f.name() == field_name)
         {
             if field.is_read_only() {

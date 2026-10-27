@@ -139,6 +139,39 @@ outer {
 }
 
 #[test]
+fn round2_completion_inside_multiline_list_of_struct_uses_shared_path() {
+    let provider = test_provider_with_list_of_structs();
+    let text = r#"test.Policy {
+  rules = [
+    {
+
+    }
+  ]
+}
+"#;
+    let position = Position::new(3, 0);
+
+    let completions = provider.complete(&create_document(text), position, None);
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"name"), "{labels:?}");
+    assert!(labels.contains(&"enabled"), "{labels:?}");
+    assert!(!labels.contains(&"rules"), "{labels:?}");
+}
+
+#[test]
+fn round2_completion_after_same_line_resource_and_struct_openers_uses_shared_path() {
+    let provider = test_provider_with_nested_structs();
+    let text = "test.nested.resource { outer = { ";
+    let position = Position::new(0, text.chars().count() as u32);
+
+    let completions = provider.complete(&create_document(text), position, None);
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"inner"), "{labels:?}");
+    assert!(labels.contains(&"outer_field"), "{labels:?}");
+    assert!(!labels.contains(&"outer"), "{labels:?}");
+}
+
+#[test]
 fn nested_struct_after_equals_depth_2() {
     let provider = test_provider_with_nested_structs();
     let text = r#"let r = test.nested.resource {
