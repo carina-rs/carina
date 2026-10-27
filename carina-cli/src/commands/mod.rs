@@ -16,21 +16,21 @@ pub mod state;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use carina_core::config_loader::DuplicateDeclaration;
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
-#[cfg(test)]
-use carina_state::BackendError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendResult,
     BackendSelection, LoadedState, MutationBackendSelection, PublishedExports,
-    ReadBackendSelection, StateBackend, VerifiedMutationBackendSelection, create_backend,
+    ReadBackendSelection, StateBackend, VerifiedMutationBackendSelection,
 };
+#[cfg(test)]
+use carina_state::{BackendError, create_backend};
 use colored::Colorize;
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
@@ -70,6 +70,19 @@ impl DriftCommand {
 pub(crate) enum BackendLockRequirement {
     AllowMissing,
     RequirePresent,
+}
+
+/// Required warning behavior for a lock-aware backend read.
+///
+/// Making this an argument to [`resolve_backend_for_read`] prevents callers
+/// from obtaining a readable backend before choosing how pending-migration
+/// drift is surfaced.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReadBackendWarningPolicy<'a> {
+    /// A top-level command reading the current project's state.
+    CommandBoundary { project_dir: &'a Path },
+    /// An `upstream_state` read, deduplicated by canonical source directory.
+    UpstreamSource { source_dir: &'a Path },
 }
 
 /// A backend selected for a read-only state operation.
@@ -112,23 +125,20 @@ impl ReadBackend {
     pub(crate) fn migration_pending(&self) -> bool {
         self.selection.drift().is_some()
     }
-
-    pub(crate) fn drift(&self) -> Option<&BackendDrift> {
-        self.selection.drift()
-    }
 }
 
 /// Resolve the backend for a read-only state operation.
 ///
 /// Every project-backed read goes through this function. If the configured
 /// backend differs from `carina-backend.lock`, the returned [`ReadBackend`]
-/// points at the locked old backend. Warning policy remains at the command
-/// layer, using the drift metadata carried by the returned value.
+/// points at the locked old backend. A warning policy is mandatory and is
+/// applied before the readable backend is returned.
 pub(crate) async fn resolve_backend_for_read(
     base_dir: &Path,
     command_path: &Path,
     backend_config: Option<&BackendConfig>,
     lock_requirement: BackendLockRequirement,
+    warning_policy: ReadBackendWarningPolicy<'_>,
 ) -> Result<ReadBackend, AppError> {
     let selection = BackendSelection::for_read(base_dir, backend_config)?;
     if lock_requirement == BackendLockRequirement::RequirePresent && !selection.lock_present() {
@@ -137,7 +147,11 @@ pub(crate) async fn resolve_backend_for_read(
             ProjectCommand::new("init", command_path)
         )));
     }
-    let backend = create_backend(selection.backend_selection()).await?;
+    let backend = selection
+        .resolve_with_drift_warning(|drift| {
+            emit_read_backend_drift_warning(drift, warning_policy);
+        })
+        .await?;
     Ok(ReadBackend { backend, selection })
 }
 
@@ -162,13 +176,49 @@ pub fn verify_for_mutation(
     }
 }
 
-pub(crate) fn warn_for_read_backend_drift(backend: &ReadBackend, project_dir: &Path) {
-    if let Some(drift) = backend.drift() {
-        eprintln!(
-            "{}",
-            drift_warning(drift.existing(), drift.configured(), project_dir).yellow()
-        );
-    }
+static WARNED_UPSTREAM_BACKEND_DRIFT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn emit_read_backend_drift_warning(drift: &BackendDrift, policy: ReadBackendWarningPolicy<'_>) {
+    let warning = match policy {
+        ReadBackendWarningPolicy::CommandBoundary { project_dir } => {
+            drift_warning(drift.existing(), drift.configured(), project_dir)
+        }
+        ReadBackendWarningPolicy::UpstreamSource { source_dir } => {
+            let warned = WARNED_UPSTREAM_BACKEND_DRIFT.get_or_init(|| Mutex::new(HashSet::new()));
+            let mut warned = warned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !warned.insert(source_dir.to_path_buf()) {
+                return;
+            }
+            drop(warned);
+
+            upstream_backend_drift_warning(drift, source_dir)
+        }
+    };
+
+    eprintln!("{}", warning.yellow());
+}
+
+fn upstream_backend_drift_warning(drift: &BackendDrift, source: &Path) -> String {
+    format!(
+        "upstream_state source {} has a pending backend migration; reading its OLD backend \
+         recorded in carina-backend.lock.\n{}\nRun `{}` to migrate that upstream state.",
+        source.display(),
+        drift.existing().describe_diff(drift.configured()),
+        ProjectCommand::new("init --migrate-state", source),
+    )
+}
+
+/// Build a local backend for CLI unit tests through the same explicit-URL
+/// selection seam available to production callers.
+#[cfg(test)]
+pub(crate) fn local_backend_for_test(path: impl AsRef<Path>) -> Box<dyn StateBackend> {
+    let raw = path.as_ref().to_string_lossy();
+    let url = carina_state::StateUrl::parse(&raw).expect("test state path must be a valid URL");
+    let selection = BackendSelection::explicit_url(&url);
+    futures::executor::block_on(create_backend(selection.backend_selection()))
+        .expect("test local backend must be constructible")
 }
 
 fn backend_drift_header(existing: &BackendLock, configured: &BackendLock) -> String {

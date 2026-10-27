@@ -2,8 +2,8 @@
 //!
 //! Backend construction accepts only the opaque [`BackendSelection`] token.
 //! Callers obtain that token through an operation-specific selector, making
-//! lock-aware reads, verified mutations, explicit URLs, and deliberately
-//! unlocked configuration access distinct at the call site.
+//! lock-aware reads, verified mutations, explicit URLs, migrations, and
+//! state-bucket deletion distinct at the call site.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,7 @@ use crate::backends::StateUrl;
 /// The old and new backend addresses involved in a pending migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendDrift {
+    project_dir: PathBuf,
     existing: BackendLock,
     configured: BackendLock,
 }
@@ -64,10 +65,6 @@ pub struct ReadBackendSelection {
 }
 
 impl ReadBackendSelection {
-    pub fn backend_selection(&self) -> &BackendSelection {
-        &self.selection
-    }
-
     pub fn selected_config(&self) -> Option<&BackendConfig> {
         self.selection.configured_config()
     }
@@ -78,6 +75,22 @@ impl ReadBackendSelection {
 
     pub fn drift(&self) -> Option<&BackendDrift> {
         self.drift.as_ref()
+    }
+
+    /// Construct the selected backend, invoking `warn` on pending migration
+    /// drift before the backend becomes available to the caller.
+    ///
+    /// The underlying [`BackendSelection`] is intentionally not exposed: a
+    /// project-backed reader must cross this warning acknowledgement seam.
+    pub async fn resolve_with_drift_warning(
+        &self,
+        warn: impl FnOnce(&BackendDrift),
+    ) -> BackendResult<Box<dyn crate::StateBackend>> {
+        let backend = crate::backends::create_backend(&self.selection).await?;
+        if let Some(drift) = self.drift() {
+            warn(drift);
+        }
+        Ok(backend)
     }
 }
 
@@ -112,17 +125,41 @@ pub enum MutationBackendSelection {
     Drifted(BackendDrift),
 }
 
-/// Explicit opt-out from backend-lock selection for operations whose contract
-/// intentionally targets the supplied configuration, such as migration
-/// endpoints and state-bucket deletion.
+/// The paired old and new backends for a proven pending migration.
 #[derive(Debug, Clone)]
-pub struct UnlockedConfiguredBackendSelection {
-    selection: BackendSelection,
+pub struct MigrationBackendSelection {
+    source: BackendSelection,
+    target: BackendSelection,
 }
 
-impl UnlockedConfiguredBackendSelection {
-    pub fn backend_selection(&self) -> &BackendSelection {
-        &self.selection
+impl MigrationBackendSelection {
+    pub fn source(&self) -> &BackendSelection {
+        &self.source
+    }
+
+    pub fn target(&self) -> &BackendSelection {
+        &self.target
+    }
+
+    pub fn source_config(&self) -> Option<&BackendConfig> {
+        self.source.configured_config()
+    }
+
+    pub fn target_config(&self) -> Option<&BackendConfig> {
+        self.target.configured_config()
+    }
+}
+
+/// Selection proving that a requested state bucket is the configured S3
+/// backend bucket.
+#[derive(Debug, Clone)]
+pub struct BucketDeleteBackendSelection {
+    settings: S3BackendSettings,
+}
+
+impl BucketDeleteBackendSelection {
+    pub fn s3_settings(&self) -> &S3BackendSettings {
+        &self.settings
     }
 }
 
@@ -140,7 +177,7 @@ impl ExplicitUrlBackendSelection {
 
 /// Lock-aware backend selection for the administrative force-unlock path.
 /// It uses the same old-backend-on-drift rule as reads but deliberately leaves
-/// warning policy to the caller.
+/// drift unreported because force-unlock intentionally targets that backend.
 #[derive(Debug, Clone)]
 pub struct ForceUnlockBackendSelection {
     selection: BackendSelection,
@@ -212,20 +249,38 @@ impl BackendSelection {
         }
     }
 
-    /// Select the configured address without consulting the backend lock.
-    ///
-    /// This is intentionally conspicuous: use it only when the operation is
-    /// defined to target a migration endpoint or the newly configured backend.
-    pub fn unlocked_configured(
-        project_dir: &Path,
-        configured: Option<&BackendConfig>,
-    ) -> UnlockedConfiguredBackendSelection {
-        UnlockedConfiguredBackendSelection {
-            selection: Self::configured_target(
-                configured.cloned(),
-                canonical_project_dir(project_dir),
+    /// Pair the old and new backend addresses carried by a proven drift.
+    pub fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackendSelection> {
+        let project_dir = canonical_project_dir(&drift.project_dir);
+        Ok(MigrationBackendSelection {
+            source: Self::configured_target(
+                Some(drift.existing.to_state_config()?),
+                project_dir.clone(),
             ),
+            target: Self::configured_target(Some(drift.configured.to_state_config()?), project_dir),
+        })
+    }
+
+    /// Select the configured S3 backend only when the requested bucket is the
+    /// same bucket the command is authorized to delete.
+    pub fn for_bucket_delete(
+        settings: &S3BackendSettings,
+        requested_bucket: &str,
+    ) -> BackendResult<BucketDeleteBackendSelection> {
+        if settings.bucket() != requested_bucket {
+            let configured_bucket = match settings.bucket_diagnostic_literal() {
+                Some(bucket) => format!("'{bucket}'"),
+                None => "value from env()".to_string(),
+            };
+            return Err(BackendError::Configuration(format!(
+                "Bucket name '{requested_bucket}' does not match backend configuration bucket \
+                 {configured_bucket}."
+            )));
         }
+
+        Ok(BucketDeleteBackendSelection {
+            settings: settings.clone(),
+        })
     }
 
     /// Select the exact URL supplied by the user, bypassing project backend
@@ -294,6 +349,7 @@ fn inspect(
         None => BackendDriftStatus::Fresh,
         Some(existing) if existing == configured_lock => BackendDriftStatus::Unchanged,
         Some(existing) => BackendDriftStatus::Drifted(BackendDrift {
+            project_dir: project_dir.clone(),
             existing,
             configured: configured_lock,
         }),
@@ -330,6 +386,27 @@ mod tests {
         }
     }
 
+    fn s3_config(bucket: &str) -> ParserBackendConfig {
+        ParserBackendConfig {
+            backend_type: "s3".to_string(),
+            attributes: HashMap::from([
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String("us-east-1".into())),
+                ),
+            ]),
+            attribute_spans: HashMap::new(),
+        }
+    }
+
     #[test]
     fn read_selection_uses_locked_config_on_drift() {
         let project = tempfile::tempdir().unwrap();
@@ -346,6 +423,33 @@ mod tests {
         };
         assert_eq!(settings.path(), Some("old.json"));
         assert!(selected.drift().is_some());
+    }
+
+    #[tokio::test]
+    async fn drifted_read_resolves_only_through_warning_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let project = tempfile::tempdir().unwrap();
+        BackendLock::for_config(Some(&local_config("old.json")))
+            .unwrap()
+            .save(project.path())
+            .unwrap();
+        let selected =
+            BackendSelection::for_read(project.path(), Some(&local_config("new.json"))).unwrap();
+        let warned = AtomicBool::new(false);
+
+        let _backend = selected
+            .resolve_with_drift_warning(|drift| {
+                assert_eq!(
+                    drift.existing(),
+                    &BackendLock::for_config(Some(&local_config("old.json"))).unwrap()
+                );
+                warned.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+
+        assert!(warned.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -365,6 +469,66 @@ mod tests {
         assert!(matches!(selected, MutationBackendSelection::Drifted(_)));
     }
 
+    #[test]
+    fn migration_selection_pairs_the_proven_old_and_new_backends() {
+        let project = tempfile::tempdir().unwrap();
+        BackendLock::for_config(Some(&local_config("old.json")))
+            .unwrap()
+            .save(project.path())
+            .unwrap();
+        let BackendDriftStatus::Drifted(drift) =
+            inspect_backend_drift(project.path(), Some(&local_config("new.json"))).unwrap()
+        else {
+            panic!("fixture must have pending backend migration")
+        };
+
+        let selected = BackendSelection::for_migration(&drift).unwrap();
+
+        let Some(BackendConfig::Local(source)) = selected.source_config() else {
+            panic!("migration source must be the locked local backend")
+        };
+        let Some(BackendConfig::Local(target)) = selected.target_config() else {
+            panic!("migration target must be the newly configured local backend")
+        };
+        assert_eq!(source.path(), Some("old.json"));
+        assert_eq!(target.path(), Some("new.json"));
+        let BackendTarget::Configured {
+            base_dir: source_base,
+            ..
+        } = selected.source().target()
+        else {
+            panic!("migration source must be a configured target")
+        };
+        let BackendTarget::Configured {
+            base_dir: target_base,
+            ..
+        } = selected.target().target()
+        else {
+            panic!("migration target must be a configured target")
+        };
+        let canonical_project = project.path().canonicalize().unwrap();
+        assert_eq!(source_base, &canonical_project);
+        assert_eq!(target_base, &canonical_project);
+    }
+
+    #[test]
+    fn bucket_delete_selection_requires_the_requested_configured_bucket() {
+        let config = BackendConfig::try_from(&s3_config("configured-bucket")).unwrap();
+        let settings = config.as_s3().unwrap();
+
+        let selected = BackendSelection::for_bucket_delete(settings, "configured-bucket").unwrap();
+        assert_eq!(selected.s3_settings().bucket(), "configured-bucket");
+
+        let error = BackendSelection::for_bucket_delete(settings, "different-bucket")
+            .expect_err("a bucket-delete token must prove the CLI target matches config");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match backend configuration bucket 'configured-bucket'"),
+            "{error}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_selection_canonicalizes_the_backend_base_directory() {
@@ -377,8 +541,7 @@ mod tests {
         symlink(&project, &alias).unwrap();
 
         let selected = BackendSelection::for_read(&alias, None).unwrap();
-        let BackendTarget::Configured { base_dir, .. } = selected.backend_selection().target()
-        else {
+        let BackendTarget::Configured { base_dir, .. } = selected.selection.target() else {
             panic!("project read must select a configured backend target")
         };
         assert_eq!(base_dir, &project.canonicalize().unwrap());

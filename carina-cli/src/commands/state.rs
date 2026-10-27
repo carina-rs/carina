@@ -36,7 +36,10 @@ use carina_state::{
     create_backend, create_remote_backend, load_state_from_url,
 };
 
-use super::{BackendLockRequirement, DriftCommand, resolve_backend_for_read, verify_for_mutation};
+use super::{
+    BackendLockRequirement, DriftCommand, ReadBackendWarningPolicy, resolve_backend_for_read,
+    verify_for_mutation,
+};
 use crate::commands::plan::{
     ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
     load_and_resolve_provider_configs,
@@ -414,9 +417,9 @@ async fn load_state_file(
         path,
         parsed.backend.as_ref(),
         BackendLockRequirement::AllowMissing,
+        ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
     )
     .await?;
-    super::warn_for_read_backend_drift(&backend, path);
 
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
     state_file
@@ -901,18 +904,7 @@ async fn run_state_bucket_delete(
     let settings = state_config
         .as_s3()
         .ok_or("The configured backend does not manage an S3 bucket")?;
-
-    // Verify the bucket name matches the backend configuration
-    if settings.bucket() != bucket_name {
-        let configured_bucket = match settings.bucket_diagnostic_literal() {
-            Some(bucket) => format!("'{bucket}'"),
-            None => "value from env()".to_string(),
-        };
-        return Err(AppError::Config(format!(
-            "Bucket name '{bucket_name}' does not match backend configuration bucket \
-             {configured_bucket}."
-        )));
-    }
+    let selection = BackendSelection::for_bucket_delete(settings, bucket_name)?;
 
     println!(
         "{}",
@@ -944,7 +936,6 @@ async fn run_state_bucket_delete(
     // guard pins this to the NEW backend; delete an orphaned OLD bucket via the
     // cloud console.
     let base_dir = get_base_dir(path);
-    let selection = BackendSelection::unlocked_configured(base_dir, Some(&state_config));
     let backend = create_remote_backend(&selection)
         .await
         .map_err(AppError::Backend)?;
@@ -2596,11 +2587,11 @@ mod tests {
         )
         .unwrap();
         let backend =
-            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+            crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         run_state_refresh_locked(
             &mut parsed,
-            &backend,
+            backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),

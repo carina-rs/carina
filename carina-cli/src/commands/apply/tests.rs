@@ -476,7 +476,8 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
-    let backend = Arc::new(carina_state::LocalBackend::with_path(state_path.clone()));
+    let backend =
+        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
     unsafe {
         std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
     }
@@ -729,7 +730,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         )],
         &reloaded.providers,
     );
-    let backend = Arc::new(carina_state::LocalBackend::with_path(
+    let backend = Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(
         downstream.join("apply.state.json"),
     ));
 
@@ -2787,7 +2788,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
     );
 
     let state = fixture.read_state().await;
-    assert!(fixture.backend().state_path().exists());
+    assert!(fixture.state_path().exists());
     assert_eq!(
         state.resources().len(),
         1,
@@ -4627,9 +4628,9 @@ impl Provider for BootstrapRecordingProvider {
     }
 }
 
-fn bootstrap_test_backend() -> (tempfile::TempDir, carina_state::LocalBackend) {
+fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
     let temp = tempfile::tempdir().expect("bootstrap state tempdir");
-    let backend = carina_state::LocalBackend::with_path(temp.path().join("carina.state.json"));
+    let backend = crate::commands::local_backend_for_test(temp.path().join("carina.state.json"));
     (temp, backend)
 }
 
@@ -4739,7 +4740,7 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
         .await
         .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
@@ -4773,7 +4774,7 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
         behavior: BootstrapCreateBehavior::PartialSuccess,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
         .await
         .expect("partial-success bootstrap must seed state");
     let id = resource.id.clone();
@@ -4864,7 +4865,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, schemas) = bootstrap_declared_state_bucket(&provider, &backend)
+    let (resource, schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
         .await
         .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
@@ -4980,7 +4981,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         &provider,
         resource,
         BootstrapCreateContext {
-            backend: &backend,
+            backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -5048,7 +5049,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
         &provider,
         resource,
         BootstrapCreateContext {
-            backend: &backend,
+            backend: backend.as_ref(),
             parsed: &carina_core::parser::InferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -5101,7 +5102,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         &provider,
         resource,
         BootstrapCreateContext {
-            backend: &backend,
+            backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -5147,7 +5148,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
         &provider,
         resource,
         BootstrapCreateContext {
-            backend: &backend,
+            backend: backend.as_ref(),
             parsed: &carina_core::parser::InferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -5219,7 +5220,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
         &provider,
         resource,
         BootstrapCreateContext {
-            backend: &backend,
+            backend: backend.as_ref(),
             parsed: &carina_core::parser::InferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,

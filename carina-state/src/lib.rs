@@ -80,9 +80,10 @@ pub use backend_config::{
 };
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
-    BackendDrift, BackendDriftStatus, BackendSelection, ExplicitUrlBackendSelection,
-    ForceUnlockBackendSelection, MutationBackendSelection, ReadBackendSelection,
-    UnlockedConfiguredBackendSelection, VerifiedMutationBackendSelection, inspect_backend_drift,
+    BackendDrift, BackendDriftStatus, BackendSelection, BucketDeleteBackendSelection,
+    ExplicitUrlBackendSelection, ForceUnlockBackendSelection, MigrationBackendSelection,
+    MutationBackendSelection, ReadBackendSelection, VerifiedMutationBackendSelection,
+    inspect_backend_drift,
 };
 pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,

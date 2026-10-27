@@ -69,8 +69,11 @@ impl LocalBackend {
     /// Default state file name
     pub const DEFAULT_STATE_FILE: &'static str = "carina.state.json";
 
-    /// Create a new LocalBackend with a specific state file path
-    pub fn with_path(state_path: PathBuf) -> Self {
+    /// Create a new LocalBackend with a specific state file path.
+    ///
+    /// Backend construction outside this crate must go through a typed
+    /// [`BackendSelection`](crate::BackendSelection).
+    pub(crate) fn with_path(state_path: PathBuf) -> Self {
         let lock_path = state_path.with_extension("lock");
         Self {
             state_path,

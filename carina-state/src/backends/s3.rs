@@ -161,7 +161,7 @@ impl S3Backend {
     /// not touch the AWS SDK config chain; the `region` argument is used
     /// verbatim (it still drives the `create_bucket` location
     /// constraint).
-    pub fn from_client(
+    pub(crate) fn from_client(
         client: Client,
         bucket: String,
         key: String,

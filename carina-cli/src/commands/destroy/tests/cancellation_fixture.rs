@@ -1,6 +1,6 @@
 use carina_core::parser::ProviderContext;
 use carina_core::shutdown::ShutdownToken;
-use carina_state::{LocalBackend, ResourceState, StateFile};
+use carina_state::{ResourceState, StateFile};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -275,16 +275,16 @@ impl DestroyCancellationFixture {
         self.base.lock_path()
     }
 
+    pub(super) fn state_path(&self) -> &std::path::Path {
+        self.base.state_path()
+    }
+
     pub(super) fn provider_context(&self) -> &ProviderContext {
         &self.provider_context
     }
 
     pub(super) fn config_path(&self) -> &std::path::Path {
         self.base.config_path()
-    }
-
-    pub(super) fn backend(&self) -> &LocalBackend {
-        self.base.backend()
     }
 
     pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {

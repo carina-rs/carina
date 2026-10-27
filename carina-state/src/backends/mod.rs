@@ -2,6 +2,8 @@
 
 mod local;
 mod s3;
+#[cfg(test)]
+mod s3_winterbaume_tests;
 mod url;
 
 pub use local::LocalBackend;
@@ -10,11 +12,9 @@ pub use url::{StateUrl, load_published_exports_from_url, load_state_from_url};
 
 use std::path::Path;
 
-use crate::backend::{BackendError, BackendResult, StateBackend};
+use crate::backend::{BackendResult, StateBackend};
 use crate::backend_config::{BackendConfig, LocalBackendSettings};
-use crate::backend_selection::{
-    BackendSelection, BackendTarget, UnlockedConfiguredBackendSelection,
-};
+use crate::backend_selection::{BackendSelection, BackendTarget, BucketDeleteBackendSelection};
 
 /// Create the backend named by an opaque, operation-specific selection token.
 ///
@@ -53,24 +53,16 @@ async fn create_configured_backend(
     }
 }
 
-/// Create a non-local backend from configuration.
+/// Create the S3 backend authorized by a bucket-delete selection.
 ///
-/// Use this for metadata-only paths, such as backend bucket management, where
-/// the operation is meaningful only for remote backends and should reject a
-/// local backend instead of constructing one.
+/// The narrow token proves that the requested bucket matched the configured
+/// bucket before backend construction became possible.
 pub async fn create_remote_backend(
-    selection: &UnlockedConfiguredBackendSelection,
+    selection: &BucketDeleteBackendSelection,
 ) -> BackendResult<Box<dyn StateBackend>> {
-    let BackendTarget::Configured { config, base_dir } = selection.backend_selection().target()
-    else {
-        unreachable!("unlocked configured selections always target configuration")
-    };
-    match config {
-        None | Some(BackendConfig::Local(_)) => Err(BackendError::Configuration(
-            "Local backend does not manage a remote state bucket".to_string(),
-        )),
-        Some(config @ BackendConfig::S3(_)) => create_configured_backend(config, base_dir).await,
-    }
+    Ok(Box::new(
+        S3Backend::from_config(selection.s3_settings()).await?,
+    ))
 }
 
 /// Resolve a local backend's state file path, anchoring a relative
@@ -90,6 +82,7 @@ pub fn anchored_local_path(config: &LocalBackendSettings, base_dir: &Path) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackendError;
     use crate::backend_config::BackendConfigError;
     use std::collections::HashMap;
 
