@@ -193,7 +193,10 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("\"{inner}\"")
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => {
             let arg_strs: Vec<_> = args
                 .iter()
                 .map(|argument| format_value(argument.walker_value()))
@@ -520,6 +523,7 @@ impl RootConfigSignature {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
@@ -1053,6 +1057,7 @@ impl ModuleSignature {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
@@ -1474,6 +1479,26 @@ mod tests {
             format_value(&Value::Concrete(ConcreteValue::enum_identifier(value))),
             format!("{}あ…", "a".repeat(46))
         );
+    }
+
+    #[test]
+    fn format_value_renders_unavailable_like_the_equivalent_function_call() {
+        let args = vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
+        let call = Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: args.clone(),
+            source_line: 1.into(),
+        });
+        let unavailable = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args,
+            reason: crate::resource::UnavailableReason::from_builtin_error(
+                "environment variable is not set".to_string(),
+            ),
+            source_line: 2.into(),
+        });
+
+        assert_eq!(format_value(&unavailable), format_value(&call));
     }
 
     #[test]

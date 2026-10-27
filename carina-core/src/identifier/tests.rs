@@ -19,6 +19,38 @@ fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
     );
 }
 
+#[test]
+fn unavailable_identifier_material_matches_function_call_and_ignores_diagnostics() {
+    let unavailable = |argument: &str, reason: &str, source_line: usize| {
+        Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::Concrete(ConcreteValue::String(argument.into())).into()],
+            reason: crate::resource::UnavailableReason::from_builtin_error(reason.to_string()),
+            source_line: source_line.into(),
+        })
+    };
+    let function_call = |argument: &str| {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::Concrete(ConcreteValue::String(argument.into())).into()],
+            source_line: 0.into(),
+        })
+    };
+
+    assert_eq!(
+        deterministic_value_string(&unavailable("X", "first wording", 1)),
+        deterministic_value_string(&unavailable("X", "revised wording", 99)),
+    );
+    assert_eq!(
+        deterministic_value_string(&unavailable("X", "diagnostic only", 7)),
+        deterministic_value_string(&function_call("X")),
+    );
+    assert_ne!(
+        deterministic_value_string(&unavailable("X", "same function", 7)),
+        deterministic_value_string(&function_call("Y")),
+    );
+}
+
 fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,

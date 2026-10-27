@@ -557,6 +557,7 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
@@ -571,7 +572,22 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
             contains_post_create_read_incomplete(value)
                 || contains_post_create_read_incomplete(default)
         }
-        _ => false,
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => false,
     }
 }
 

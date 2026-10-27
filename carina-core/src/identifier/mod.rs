@@ -593,7 +593,10 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Interpolation([{}])", strs.join(", "))
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => {
             let arg_strs: Vec<String> = args
                 .iter()
                 .map(|argument| deterministic_value_string(argument.walker_value()))

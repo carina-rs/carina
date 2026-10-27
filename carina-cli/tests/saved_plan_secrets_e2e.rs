@@ -43,6 +43,10 @@ impl Scenario {
         fs::write(self.project.join("main.crn"), main).expect("rewrite main.crn");
     }
 
+    fn write_root_file(&self, name: &str, source: &str) {
+        fs::write(self.project.join(name), source).expect("write root configuration file");
+    }
+
     fn write_module(&self, name: &str, source: &str) {
         let directory = self.project.join(name);
         fs::create_dir_all(&directory).expect("create module directory");
@@ -100,6 +104,30 @@ impl Scenario {
     fn provider_json(&self) -> Value {
         read_json(&self.mock_state)
     }
+}
+
+const ISSUE_3974_ENV: &str = "SAVED_PLAN_BUILTIN_SECRET_3974";
+
+fn issue_3974_scenario(label: &str, expression: &str, env_value: &str) -> Scenario {
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+        &[(ISSUE_3974_ENV, env_value)],
+    );
+    scenario.write_root_file(
+        "resources.crn",
+        &format!(
+            r#"let origin = mock.test.resource {{ name = "{label}-origin" }}
+
+let dependent = mock.test.resource {{
+  name    = "{label}-dependent"
+  comment = {expression}
+}}
+"#,
+        ),
+    );
+    scenario
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -757,6 +785,199 @@ let dependent = mock.test.resource {
     );
     assert_secret_hash(
         &state_resource_by_name(&scenario.state_json(), "dependent")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_secret_inside_builtin_with_runtime_reference() {
+    const PLAINTEXT: &str = "builtin_secret_plaintext_3974";
+    let scenario = issue_3974_scenario(
+        "builtin",
+        r#"upper("${origin.identifier}-${secret(env("SAVED_PLAN_BUILTIN_SECRET_3974"))}")"#,
+        PLAINTEXT,
+    );
+
+    let plan = scenario.plan_with_env(&[(ISSUE_3974_ENV, PLAINTEXT)]);
+    assert_success("builtin-wrapped secret saved plan", &plan);
+    assert_output_has_no_plaintext("builtin-wrapped secret saved plan", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    let apply = scenario.apply_plan_with_env(&[(ISSUE_3974_ENV, PLAINTEXT)]);
+    assert_success("apply builtin-wrapped secret saved plan", &apply);
+    assert_output_has_no_plaintext(
+        "apply builtin-wrapped secret saved plan",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let provider = scenario.provider_json();
+    let comment = provider_resource_by_name(&provider, "builtin-dependent")["comment"]
+        .as_str()
+        .expect("provider comment");
+    assert!(
+        comment.ends_with("-BUILTIN_SECRET_PLAINTEXT_3974"),
+        "provider must receive the resolved upper-case secret interpolation, got {comment:?}",
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "builtin-dependent")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_secret_inside_builtin_with_deferred_coalesce() {
+    const PLAINTEXT: &str = "coalesce_secret_plaintext_3974";
+    let scenario = issue_3974_scenario(
+        "coalesce",
+        r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+        PLAINTEXT,
+    );
+
+    let plan = scenario.plan_with_env(&[(ISSUE_3974_ENV, PLAINTEXT)]);
+    assert_success("coalesced builtin secret saved plan", &plan);
+    assert_output_has_no_plaintext("coalesced builtin secret saved plan", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    let apply = scenario.apply_plan_with_env(&[(ISSUE_3974_ENV, PLAINTEXT)]);
+    assert_success("apply coalesced builtin secret saved plan", &apply);
+    assert_output_has_no_plaintext(
+        "apply coalesced builtin secret saved plan",
+        &apply,
+        &[PLAINTEXT],
+    );
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "coalesce-dependent")["comment"],
+        "COALESCE_SECRET_PLAINTEXT_3974",
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "coalesce-dependent")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn saved_plan_builtin_wrapped_deferred_secrets_reject_changed_values() {
+    const PLANNED: &str = "planned_secret_plaintext_3974";
+    const CHANGED: &str = "changed_secret_plaintext_3974";
+    for (label, expression) in [
+        (
+            "changed-interpolation",
+            r#"upper("${origin.identifier}-${secret(env("SAVED_PLAN_BUILTIN_SECRET_3974"))}")"#,
+        ),
+        (
+            "changed-coalesce",
+            r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+        ),
+    ] {
+        let scenario = issue_3974_scenario(label, expression, PLANNED);
+        let plan = scenario.plan_with_env(&[(ISSUE_3974_ENV, PLANNED)]);
+        assert_success(&format!("{label} saved plan"), &plan);
+        assert_plan_is_redacted(&scenario, &[PLANNED]);
+        let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+        let provider_before = fs::read(&scenario.mock_state).ok();
+
+        let apply = scenario.apply_plan_with_env(&[(ISSUE_3974_ENV, CHANGED)]);
+        assert_secret_verification_rejected_without_mutation(
+            &scenario,
+            &apply,
+            &[PLANNED, CHANGED],
+            "secret changed since the plan",
+            state_before,
+            provider_before,
+        );
+    }
+}
+
+#[test]
+fn saved_plan_builtin_wrapped_deferred_secrets_reject_unavailable_values() {
+    const PLANNED: &str = "available_secret_plaintext_3974";
+    for (label, expression, expected, unexpected) in [
+        (
+            "unavailable-interpolation",
+            r#"upper("${origin.identifier}-${secret(env("SAVED_PLAN_BUILTIN_SECRET_3974"))}")"#,
+            "current secret could not be evaluated",
+            "current configuration could not be evaluated",
+        ),
+        (
+            "unavailable-coalesce",
+            r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+            "current secret could not be evaluated",
+            "current configuration could not be evaluated",
+        ),
+    ] {
+        let scenario = issue_3974_scenario(label, expression, PLANNED);
+        let plan = scenario.plan_with_env(&[(ISSUE_3974_ENV, PLANNED)]);
+        assert_success(&format!("{label} saved plan"), &plan);
+        assert_plan_is_redacted(&scenario, &[PLANNED]);
+        let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+        let provider_before = fs::read(&scenario.mock_state).ok();
+
+        let apply = scenario
+            .command(&["apply", "--auto-approve", "--lock=false", "plan.json"])
+            .env_remove(ISSUE_3974_ENV)
+            .output()
+            .expect("run saved-plan apply without secret environment variable");
+        assert_secret_verification_rejected_without_mutation(
+            &scenario,
+            &apply,
+            &[PLANNED],
+            expected,
+            state_before,
+            provider_before,
+        );
+        assert!(
+            !output_text(&apply).contains(unexpected),
+            "{label} used the wrong saved-plan verification error variant: {}",
+            output_text(&apply),
+        );
+    }
+}
+
+#[test]
+fn saved_plan_unselected_coalesce_fallback_reports_secret_evaluation_unavailable() {
+    const PLANNED: &str = "coalesce_unavailable_plaintext_3974";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource { name = "unselected-coalesce-origin" }
+let dependent = mock.test.resource {
+  name    = "unselected-coalesce-dependent"
+  comment = upper(r.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))
+}
+"#,
+        &[(ISSUE_3974_ENV, PLANNED)],
+    );
+
+    let plan = scenario.plan_with_env(&[(ISSUE_3974_ENV, PLANNED)]);
+    assert_success("unselected coalesce fallback saved plan", &plan);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    // `r.comment` is still unknown while the saved-plan candidate is built,
+    // so the fallback is retained without being selected. Its explicit
+    // Unavailable leaf must still win over hash comparison.
+    let apply = scenario
+        .command(&["apply", "--auto-approve", "--lock=false", "plan.json"])
+        .env_remove(ISSUE_3974_ENV)
+        .output()
+        .expect("run saved-plan apply without coalesce fallback environment variable");
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED],
+        "current secret could not be evaluated",
+        state_before,
+        provider_before,
+    );
+    assert!(
+        !output_text(&apply).contains("current configuration could not be evaluated"),
+        "an unavailable coalesce fallback must be a per-secret verification error",
+    );
+    assert!(
+        !output_text(&apply).contains("secret changed since the plan"),
+        "an unavailable coalesce fallback must not be reported as a hash mismatch",
     );
 }
 

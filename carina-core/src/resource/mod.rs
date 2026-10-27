@@ -2490,6 +2490,40 @@ impl PartialEq for DiagnosticSourceLine {
 
 impl Eq for DiagnosticSourceLine {}
 
+/// Diagnostic-safe explanation retained after a built-in was attempted and
+/// failed during permissive resolution.
+///
+/// The inner string has no public constructor. Built-in handlers are the
+/// diagnostic-safety boundary: values derived from sensitive inputs must be
+/// masked before their errors reach the resolver (as `env()` and `decrypt()`
+/// do). Keeping the constructor crate-private prevents downstream callers from
+/// attaching arbitrary, potentially sensitive payloads to an unavailable
+/// value.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct UnavailableReason(String);
+
+impl UnavailableReason {
+    pub(crate) fn from_builtin_error(message: String) -> Self {
+        Self(message)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for UnavailableReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("UnavailableReason").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for UnavailableReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
@@ -2514,6 +2548,19 @@ pub enum DeferredValue {
         /// One-based authored line, or `None` for a synthetic/deserialized
         /// call. Diagnostic metadata is excluded from equality and serde by
         /// [`DiagnosticSourceLine`].
+        source_line: DiagnosticSourceLine,
+    },
+    /// A built-in whose arguments were ready and whose evaluation was
+    /// attempted, but failed while the resolver was operating in a
+    /// permissive mode. Unlike [`Self::FunctionCall`], this is not pending
+    /// work. Persistence deliberately encodes it as the equivalent
+    /// [`Self::FunctionCall`], so the runtime-only failure is re-derived when
+    /// the saved expression is evaluated again.
+    Unavailable {
+        name: crate::builtins::BuiltinFunction,
+        args: Vec<FunctionArgument>,
+        reason: UnavailableReason,
+        /// One-based authored line, or `None` for a synthetic node.
         source_line: DiagnosticSourceLine,
     },
     /// A deferred user-function call whose lexical definition has already
@@ -2545,6 +2592,23 @@ pub enum DeferredValue {
     RedactedSecret { hash: RedactedSecretHash },
     /// A value not known at plan time. RFC #2371.
     Unknown(UnknownReason),
+}
+
+impl DeferredValue {
+    /// Project a pending or unsuccessfully attempted built-in call onto the
+    /// representation shared by persistence, identity, and display.
+    ///
+    /// `Unavailable`'s diagnostic reason and source line are runtime-only;
+    /// the function and resolved arguments are its stable value material.
+    pub fn as_function_call_parts(
+        &self,
+    ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument])> {
+        match self {
+            Self::FunctionCall { name, args, .. } => Some((*name, args)),
+            Self::Unavailable { name, args, .. } => Some((*name, args)),
+            _ => None,
+        }
+    }
 }
 
 /// A sealed postfix-access node.  Its fields are read-only outside this
@@ -2712,6 +2776,7 @@ impl Value {
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::Unknown(_),
@@ -2773,11 +2838,13 @@ impl Serialize for DeferredValue {
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
             }
-            Self::FunctionCall { name, args, .. } => SerializableDeferredValue::FunctionCall {
-                name: name.as_str(),
-                args,
+            Self::FunctionCall { name, args, .. } | Self::Unavailable { name, args, .. } => {
+                SerializableDeferredValue::FunctionCall {
+                    name: name.as_str(),
+                    args,
+                }
+                .serialize(serializer)
             }
-            .serialize(serializer),
             Self::ResolvedFunctionCall { function, .. } => Err(serde::ser::Error::custom(format!(
                 "deferred user-function call '{}' cannot be serialized before evaluation",
                 function.name
@@ -2890,6 +2957,18 @@ impl fmt::Debug for DeferredValue {
                 .debug_struct("FunctionCall")
                 .field("name", name)
                 .field("args", args)
+                .field("source_line", source_line)
+                .finish(),
+            Self::Unavailable {
+                name,
+                args,
+                reason,
+                source_line,
+            } => f
+                .debug_struct("Unavailable")
+                .field("name", name)
+                .field("args", args)
+                .field("reason", reason)
                 .field("source_line", source_line)
                 .finish(),
             Self::ResolvedFunctionCall {
@@ -3707,6 +3786,12 @@ pub enum DeferredValueRef<'a> {
         args: &'a [FunctionArgument],
         source_line: Option<NonZeroUsize>,
     },
+    Unavailable {
+        name: crate::builtins::BuiltinFunction,
+        args: &'a [FunctionArgument],
+        reason: &'a UnavailableReason,
+        source_line: Option<NonZeroUsize>,
+    },
     Access {
         base: &'a Value,
         step: &'a PathSegment,
@@ -3740,6 +3825,7 @@ impl Value {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => args.iter().any(|argument| {
                 argument
@@ -3828,6 +3914,17 @@ impl Value {
                 } => DeferredValueRef::FunctionCall {
                     name,
                     args,
+                    source_line: source_line.nonzero(),
+                },
+                DeferredValue::Unavailable {
+                    name,
+                    args,
+                    reason,
+                    source_line,
+                } => DeferredValueRef::Unavailable {
+                    name: *name,
+                    args,
+                    reason,
                     source_line: source_line.nonzero(),
                 },
                 DeferredValue::ResolvedFunctionCall {
@@ -3940,6 +4037,15 @@ pub enum InterpolationPart {
 /// always substituted before values reach the differ. See RFC #2371.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let (Value::Deferred(left), Value::Deferred(right)) = (self, other)
+            && let (Some((left_name, left_args)), Some((right_name, right_args))) = (
+                left.as_function_call_parts(),
+                right.as_function_call_parts(),
+            )
+        {
+            return left_name == right_name && left_args == right_args;
+        }
+
         match (self, other) {
             (
                 Value::Deferred(DeferredValue::Unknown(a @ UnknownReason::ModuleArgument { .. })),
@@ -4020,18 +4126,6 @@ impl PartialEq for Value {
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
-            (
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: an,
-                    args: aa,
-                    source_line: al,
-                }),
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: bn,
-                    args: ba,
-                    source_line: bl,
-                }),
-            ) => an == bn && aa == ba && al == bl,
             (
                 Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: af,
@@ -4188,6 +4282,7 @@ impl Value {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
@@ -4309,6 +4404,7 @@ impl Value {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
@@ -4384,6 +4480,7 @@ impl Value {
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
@@ -4457,6 +4554,7 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         }),
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
@@ -4468,6 +4566,106 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether unavailable-value searches inspect a coalesce default before the
+/// left operand has selected it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnavailableCoalescePolicy {
+    ExcludeDefault,
+    IncludeDefault,
+}
+
+/// How unavailable-value searches treat typed secret wrappers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnavailableSecretPolicy {
+    Exclude,
+    Include,
+    OnlyInside,
+}
+
+/// Find the first built-in evaluation that was attempted and definitively
+/// failed, using the caller's explicit coalesce and secret traversal policy.
+pub(crate) fn find_unavailable_evaluation(
+    value: &Value,
+    coalesce_policy: UnavailableCoalescePolicy,
+    secret_policy: UnavailableSecretPolicy,
+) -> Option<(
+    crate::builtins::BuiltinFunction,
+    &UnavailableReason,
+    DiagnosticSourceLine,
+)> {
+    fn find(
+        value: &Value,
+        coalesce_policy: UnavailableCoalescePolicy,
+        secret_policy: UnavailableSecretPolicy,
+        inside_secret: bool,
+    ) -> Option<(
+        crate::builtins::BuiltinFunction,
+        &UnavailableReason,
+        DiagnosticSourceLine,
+    )> {
+        let recurse = |value| find(value, coalesce_policy, secret_policy, inside_secret);
+        match value {
+            Value::Deferred(DeferredValue::Unavailable {
+                name,
+                reason,
+                source_line,
+                ..
+            }) if secret_policy != UnavailableSecretPolicy::OnlyInside || inside_secret => {
+                Some((*name, reason, *source_line))
+            }
+            Value::Deferred(DeferredValue::Unavailable { args, .. }) => args
+                .iter()
+                .find_map(|argument| recurse(argument.walker_value())),
+            Value::Concrete(ConcreteValue::List(items)) => items.iter().find_map(recurse),
+            Value::Concrete(ConcreteValue::Map(map)) => map.values().find_map(recurse),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().find_map(|part| {
+                if let InterpolationPart::Expr(value) = part {
+                    recurse(value)
+                } else {
+                    None
+                }
+            }),
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => args
+                .iter()
+                .find_map(|argument| recurse(argument.walker_value())),
+            Value::Deferred(DeferredValue::Access(access)) => recurse(access.base()),
+            Value::Deferred(DeferredValue::Secret(inner)) => match secret_policy {
+                UnavailableSecretPolicy::Exclude => None,
+                UnavailableSecretPolicy::Include | UnavailableSecretPolicy::OnlyInside => {
+                    find(inner, coalesce_policy, secret_policy, true)
+                }
+            },
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                recurse(value).or_else(|| match coalesce_policy {
+                    UnavailableCoalescePolicy::ExcludeDefault => None,
+                    UnavailableCoalescePolicy::IncludeDefault => recurse(default),
+                })
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ) => None,
+        }
+    }
+
+    find(value, coalesce_policy, secret_policy, false)
 }
 
 impl Value {
@@ -4577,7 +4775,10 @@ impl Value {
                     }
                 }
             }
-            Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+            Value::Deferred(
+                DeferredValue::FunctionCall { name, args, .. }
+                | DeferredValue::Unavailable { name, args, .. },
+            ) => {
                 name.hash(hasher);
                 args.len().hash(hasher);
                 for arg in args {
@@ -6851,12 +7052,12 @@ pub(crate) fn assert_value_fully_resolved(
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(crate::value::SerializationError::UnresolvedInterpolation { context })
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-            Err(crate::value::SerializationError::UnresolvedFunctionCall {
-                name: name.to_string(),
-                context,
-            })
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+        ) => Err(crate::value::SerializationError::UnresolvedFunctionCall {
+            name: name.to_string(),
+            context,
+        }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(crate::value::SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),

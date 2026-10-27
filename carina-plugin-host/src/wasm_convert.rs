@@ -320,7 +320,7 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// Returns `Err(SerializationError)` for an unresolved `EnumIdentifier` and
 /// for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
-/// `Value::Deferred(DeferredValue::FunctionCall)`. The scoped transport wrapper in
+/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
 /// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
 /// attributes before conversion and restores them after the guest call, so
 /// reaching any of these arms is a producer-side bug — the diagnostic
@@ -417,12 +417,12 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: name.to_string(),
-                context: SerializationContext::WasmBoundary,
-            })
-        }
+        CoreValue::Deferred(
+            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+        ) => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.to_string(),
+            context: SerializationContext::WasmBoundary,
+        }),
         CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),
@@ -774,12 +774,12 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: name.to_string(),
-                context: SerializationContext::WasmBoundary,
-            })
-        }
+        CoreValue::Deferred(
+            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
+        ) => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.to_string(),
+            context: SerializationContext::WasmBoundary,
+        }),
         CoreValue::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             Err(SerializationError::UnresolvedFunctionCall {
                 name: function.name.clone(),

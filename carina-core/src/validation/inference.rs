@@ -453,7 +453,10 @@ pub(crate) fn infer_type_from_value_without_bindings(
                 Err(error) => Err(error),
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => {
             let return_type = builtin_functions()
                 .iter()
                 .find(|function| function.name == name.as_str())
@@ -589,9 +592,10 @@ fn infer_type_from_value_with_visiting(
                 Err(error) => Err(error),
             }
         }
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-            infer_function_call(name, args, bindings, schemas, visiting)
-        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { name, args, .. }
+            | DeferredValue::Unavailable { name, args, .. },
+        ) => infer_function_call(name.as_str(), args, bindings, schemas, visiting),
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => function
             .return_type
             .clone()

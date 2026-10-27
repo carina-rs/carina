@@ -334,6 +334,7 @@ impl Unsealer {
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::Unknown(_),
@@ -461,6 +462,7 @@ fn preserve_equal_json_subtrees(
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::Secret(_)
