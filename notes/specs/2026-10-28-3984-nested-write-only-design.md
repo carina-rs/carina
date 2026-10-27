@@ -172,20 +172,38 @@ Applied to the current cache, this marks:
 
 Both `generate-schemas.sh` and `generate-docs.sh` are rerun.
 
-### 5. Protocol
+### 5. Protocol: bump to v12 and make the field required
 
-- **No protocol version bump.** Schemas cross the WASM boundary as JSON
-  through `schemas()`. The new `write_only` field on the protocol
-  `StructField` is `#[serde(default)]`, the record has no
-  `deny_unknown_fields`, and `PatchOp` and WIT do not change.
-- **Version-mismatch combinations behave as today.** An older v11 host with a
-  new provider ignores the field. A new host with an older provider sees
-  `false`. In both cases nested write-only members are not represented, which
-  is what happens now; neither combination is worse than today.
-- **Conversions still break compilation on purpose.** The host and SDK
-  conversions destructure `StructField` exhaustively, so adding the field
-  stops compilation until it is carried across. No `_` or `..` arm is
-  allowed.
+**The protocol goes to v12, with `MIN_SUPPORTED_PROTOCOL_VERSION = 12`.** The
+`write_only` field on the protocol `StructField` is required in the schema
+JSON, with no `#[serde(default)]`.
+
+An optional field would make a mismatched host and provider "behave as
+today". That means silently falling back to the bug this design fixes:
+
+- **A new host with an old provider.** The old provider never marks nested
+  write-only members. The OIDC listener update would keep failing, and its
+  plan would keep failing to converge, with no warning.
+- **An old host with a new provider.** The old host would drop the field, so
+  the same bug would come back.
+
+carina#3364 and awscc#346 were this failure mode. A provider pinned to an
+older revision degraded silently. infra now pins carina (infra#284 and
+infra#285), so a host/provider skew is a realistic state, not a hypothetical
+one.
+
+With v12 and minimum 12, a skewed pair fails loudly at provider load, through
+the existing handshake (`protocol_version` from the SDK, checked by the host
+before `schemas()` is used). With the field required, a schema JSON that lacks
+it also fails to decode instead of defaulting to `false`.
+
+The WIT world carries no version and does not change. The version lives in
+carina-provider-protocol and is stamped by the SDK, so no carina-plugin-wit PR
+is needed. `PatchOp` does not change.
+
+The host and SDK conversions destructure `StructField` exhaustively. Adding
+the field stops compilation until it is carried across, and no `_` or `..` arm
+is allowed. `docs/protocol.md` gets a "Version 12" section.
 
 ### 6. Other providers
 
@@ -205,14 +223,22 @@ Both `generate-schemas.sh` and `generate-docs.sh` are rerun.
 
 1. carina: the `StructField.write_only` field, the derived bearing check and
    leaf projection, the widened reassert condition, and the leaf-provenance
-   comparison. Also state v18 and its migration, the protocol `StructField`
-   field, and the exhaustive conversions. No protocol bump.
-2. carina-provider-awscc: the codegen change, with schemas and docs
-   regenerated, and a rev bump to the carina commit from step 1. Before this
-   PR merges, the acceptance tests for the Listener OIDC update and its
+   comparison. Also state v18 and its migration, the required protocol
+   `StructField` field, the exhaustive conversions, protocol v12 with minimum
+   12, and the `docs/protocol.md` v12 section. The WIT does not change.
+2. carina-provider-aws: a rev bump to the carina commit from step 1. The
+   provider sets `write_only: false` explicitly on every nested field it
+   serializes, which the required field forces.
+3. carina-provider-awscc: the codegen change, with schemas and docs
+   regenerated, and a rev bump to the carina commit from step 1. Its
+   `carina-aws-types` pin moves to the step 2 merge commit. Before this PR
+   merges, the acceptance tests for the Listener OIDC update and its
    convergence, below, run against real AWS.
-3. carina-provider-aws: a rev bump that only adds the new field to
-   exhaustive matches, if any exist.
+
+Between steps 1 and 3, a v12 host refuses the v11 providers. That is
+intended, and both bumps follow immediately, as with #3981. Anything that
+installs carina main unpinned breaks until the providers are bumped. infra is
+pinned (infra#285).
 
 ## Tests
 
@@ -237,7 +263,10 @@ Both `generate-schemas.sh` and `generate-docs.sh` are rerun.
 - The record is written on Add, Replace and Reassert, and cleared on Remove.
 - Secrets are stored hashed.
 
-**Conversions:** host↔JSON round trip of `StructField.write_only`.
+**Conversions and protocol:**
+- A host↔JSON round trip of `StructField.write_only`.
+- Schema JSON that omits `write_only` on a struct field fails to decode.
+- A v11 provider is rejected at load with a version error.
 
 **awscc:**
 - Codegen marks the Listener, SecurityGroup and S3 paths.
