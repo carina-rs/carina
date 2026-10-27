@@ -44,18 +44,26 @@ pub(crate) fn struct_fields_of<'a>(
     attr_type: &'a AttributeType,
 ) -> Option<&'a [StructField]> {
     let mut budget = ShapeWalkBudget::new(SHAPE_WALK_BUDGET);
-    struct_fields_of_with_budget(schema, attr_type, &mut budget)
+    struct_field_candidates_with_budget(schema, attr_type, &mut budget)
+        .into_iter()
+        .next()
 }
 
-fn struct_fields_of_with_budget<'a>(
+fn struct_field_candidates_with_budget<'a>(
     schema: &'a ResourceSchema,
     attr_type: &'a AttributeType,
     budget: &mut ShapeWalkBudget,
-) -> Option<&'a [StructField]> {
+) -> Vec<&'a [StructField]> {
     match schema.shape_of(attr_type) {
-        Shape::Struct { .. } => schema.struct_fields_with_budget(attr_type, budget),
+        Shape::Struct { .. } => schema
+            .struct_fields_with_budget(attr_type, budget)
+            .into_iter()
+            .collect(),
         Shape::List { element_type, .. } => match schema.shape_of(element_type) {
-            Shape::Struct { .. } => schema.struct_fields_with_budget(element_type, budget),
+            Shape::Struct { .. } => schema
+                .struct_fields_with_budget(element_type, budget)
+                .into_iter()
+                .collect(),
             Shape::String { .. }
             | Shape::Int { .. }
             | Shape::Float { .. }
@@ -64,20 +72,29 @@ fn struct_fields_of_with_budget<'a>(
             | Shape::Enum { .. }
             | Shape::List { .. }
             | Shape::Map { .. }
-            | Shape::Union => None,
+            | Shape::Union => Vec::new(),
         },
-        Shape::Union => schema
-            .union_members_with_budget(attr_type, budget)?
-            .iter()
-            .flatten()
-            .find_map(|member| struct_fields_of_with_budget(schema, member.as_attr(), budget)),
+        Shape::Union => {
+            let Some(members) = schema.union_members_with_budget(attr_type, budget) else {
+                return Vec::new();
+            };
+            let mut candidates = Vec::new();
+            for member in members.iter().flatten() {
+                candidates.extend(struct_field_candidates_with_budget(
+                    schema,
+                    member.as_attr(),
+                    budget,
+                ));
+            }
+            candidates
+        }
         Shape::String { .. }
         | Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool
         | Shape::Duration
         | Shape::Enum { .. }
-        | Shape::Map { .. } => None,
+        | Shape::Map { .. } => Vec::new(),
     }
 }
 
@@ -115,52 +132,13 @@ fn find_struct_field<'a>(
     field_name: &str,
 ) -> Option<&'a StructField> {
     let mut budget = ShapeWalkBudget::new(SHAPE_WALK_BUDGET);
-    find_struct_field_with_budget(schema, attr_type, field_name, &mut budget)
-}
-
-fn find_struct_field_with_budget<'a>(
-    schema: &'a ResourceSchema,
-    attr_type: &'a AttributeType,
-    field_name: &str,
-    budget: &mut ShapeWalkBudget,
-) -> Option<&'a StructField> {
     let matching_field = |fields: &'a [StructField]| {
         fields
             .iter()
             .find(|field| field.name() == field_name || field.block_name() == Some(field_name))
     };
 
-    match schema.shape_of(attr_type) {
-        Shape::Struct { .. } => {
-            matching_field(schema.struct_fields_with_budget(attr_type, budget)?)
-        }
-        Shape::List { element_type, .. } => match schema.shape_of(element_type) {
-            Shape::Struct { .. } => {
-                matching_field(schema.struct_fields_with_budget(element_type, budget)?)
-            }
-            Shape::String { .. }
-            | Shape::Int { .. }
-            | Shape::Float { .. }
-            | Shape::Bool
-            | Shape::Duration
-            | Shape::Enum { .. }
-            | Shape::List { .. }
-            | Shape::Map { .. }
-            | Shape::Union => None,
-        },
-        Shape::Union => schema
-            .union_members_with_budget(attr_type, budget)?
-            .iter()
-            .flatten()
-            .find_map(|member| {
-                find_struct_field_with_budget(schema, member.as_attr(), field_name, budget)
-            }),
-        Shape::String { .. }
-        | Shape::Int { .. }
-        | Shape::Float { .. }
-        | Shape::Bool
-        | Shape::Duration
-        | Shape::Enum { .. }
-        | Shape::Map { .. } => None,
-    }
+    struct_field_candidates_with_budget(schema, attr_type, &mut budget)
+        .into_iter()
+        .find_map(matching_field)
 }

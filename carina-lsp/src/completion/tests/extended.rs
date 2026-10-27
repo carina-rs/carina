@@ -286,6 +286,64 @@ fn review_round1_assignment_expressions_and_control_blocks_keep_struct_context()
 }
 
 #[test]
+fn review_round2_else_branches_keep_assignment_struct_context() {
+    let provider = test_provider_with_nested_structs();
+    for text in [
+        r#"test.nested.resource {
+  outer = if true {
+    {
+      outer_field = 'a'
+    }
+  } else {
+    {
+      "#,
+        r#"test.nested.resource {
+  outer = if false {
+    {
+      outer_field = 'a'
+    }
+  } else if true {
+    {
+      "#,
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"inner"), "{text:?}: {labels:?}");
+        assert!(labels.contains(&"outer_field"), "{text:?}: {labels:?}");
+        assert!(!labels.contains(&"outer"), "{text:?}: {labels:?}");
+    }
+}
+
+#[test]
+fn review_round2_quoted_map_key_does_not_fall_back_to_resource_attributes() {
+    let provider = test_provider_with_nested_structs();
+    for text in [
+        r#"test.nested.resource {
+  outer = {
+    "k" = {
+      "#,
+        r#"test.nested.resource {
+  outer = {
+    'k' = {
+      "#,
+        r#"test.nested.resource {
+  outer = {
+    "k=v" = {
+      "#,
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        assert!(
+            completions.is_empty(),
+            "quoted map-key context must resolve to no schema fields: {:?}",
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn nested_struct_after_equals_depth_2() {
     let provider = test_provider_with_nested_structs();
     let text = r#"let r = test.nested.resource {

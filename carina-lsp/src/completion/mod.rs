@@ -427,10 +427,7 @@ impl CompletionProvider {
                 resource_type,
                 struct_path,
             } => Some((resource_type.as_str(), struct_path.as_slice())),
-            EnclosingBlock::ModuleCall {
-                module_name: _module_name,
-                arg_path: _arg_path,
-            } => None,
+            EnclosingBlock::ModuleCall { .. } => None,
             EnclosingBlock::Other => None,
         };
 

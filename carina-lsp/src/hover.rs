@@ -1563,6 +1563,88 @@ EOT
     }
 
     #[test]
+    fn review_round2_else_branch_keeps_nested_attribute_hover() {
+        let provider = issue_3835_hover_provider();
+        let text = r#"aws.route53.RecordSet {
+  alias_target = if true {
+    {
+      hosted_zone_id = 'a'
+    }
+  } else {
+    {
+      hosted_zone_id = 'b'
+    }
+  }
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let content = hover_markdown(
+            &provider,
+            &doc,
+            hover_position(text, "hosted_zone_id", 1),
+            None,
+        )
+        .expect("the else branch field should retain nested hover");
+        assert!(content.contains("NESTED alias zone"), "{content}");
+        assert!(!content.contains("TOP-LEVEL zone"), "{content}");
+    }
+
+    #[test]
+    fn review_round2_else_if_chain_keeps_nested_attribute_hover() {
+        let provider = issue_3835_hover_provider();
+        let text = r#"aws.route53.RecordSet {
+  alias_target = if first {
+    {
+      hosted_zone_id = 'a'
+    }
+  } else if second {
+    {
+      hosted_zone_id = 'b'
+    }
+  } else {
+    {
+      hosted_zone_id = 'c'
+    }
+  }
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        for occurrence in [1, 2] {
+            let content = hover_markdown(
+                &provider,
+                &doc,
+                hover_position(text, "hosted_zone_id", occurrence),
+                None,
+            )
+            .expect("every else-if branch field should retain nested hover");
+            assert!(content.contains("NESTED alias zone"), "{content}");
+            assert!(!content.contains("TOP-LEVEL zone"), "{content}");
+        }
+    }
+
+    #[test]
+    fn review_round2_quoted_map_key_has_no_attribute_hover() {
+        let provider = issue_3835_hover_provider();
+        let text = r#"aws.route53.RecordSet {
+  alias_target = {
+    "k" = {
+      hosted_zone_id = 'a'
+    }
+  }
+}
+"#;
+        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+
+        let hover = provider.hover(&doc, hover_position(text, "hosted_zone_id", 0));
+        assert!(
+            hover.is_none(),
+            "quoted map-key fields have no schema: {hover:?}"
+        );
+    }
+
+    #[test]
     fn test_builtin_function_hover_join() {
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new("join".to_string(), Arc::new(ProviderContext::default()));

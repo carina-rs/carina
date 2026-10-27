@@ -61,6 +61,26 @@ enum LineOpener {
     Parenthesis,
 }
 
+#[derive(Clone, Copy)]
+enum SegmentScanMode {
+    BeforeOpener,
+    AtCursor,
+}
+
+struct LineSegment {
+    raw: String,
+    code: String,
+}
+
+enum BraceOpener {
+    Resource(String),
+    Path(PathSegment),
+    Else,
+    ControlFlow,
+    Anonymous,
+    Other,
+}
+
 struct PathSegment {
     name: String,
     syntax: SegmentSyntax,
@@ -88,6 +108,8 @@ pub(crate) fn enclosing_block(
     let mut bracket_depth = 0_usize;
     let mut reverse_path = Vec::new();
     let mut crossed_list_element = false;
+    let mut awaiting_previous_branch_closer = false;
+    let mut reclassify_previous_branch_opener = false;
 
     for line_index in (0..=current_line).rev() {
         let source_chars: Vec<char> = source_lines[line_index].chars().collect();
@@ -105,35 +127,53 @@ pub(crate) fn enclosing_block(
             }
 
             match source_chars[char_index] {
-                '}' => brace_depth += 1,
-                '{' if brace_depth > 0 => brace_depth -= 1,
+                '}' => {
+                    brace_depth += 1;
+                    if awaiting_previous_branch_closer {
+                        awaiting_previous_branch_closer = false;
+                        reclassify_previous_branch_opener = true;
+                    }
+                }
                 '{' => {
-                    let segment = code_segment_before(&source_chars, classified, char_index);
-                    if let Some(resource_type) = resource_types.find_in(&segment) {
-                        let mut struct_path: Vec<String> = reverse_path
-                            .into_iter()
-                            .map(|segment: PathSegment| segment.name)
-                            .collect();
-                        struct_path.reverse();
-                        return EnclosingBlock::Resource {
-                            resource_type: resource_type.to_string(),
-                            struct_path,
-                        };
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                        if !reclassify_previous_branch_opener || brace_depth != 0 {
+                            continue;
+                        }
+                        reclassify_previous_branch_opener = false;
                     }
 
-                    if is_control_flow_segment(&segment) {
-                        continue;
-                    }
-                    if let Some(path_segment) = parse_path_segment(&segment, true) {
-                        reverse_path.push(path_segment);
-                        crossed_list_element = false;
-                    } else if segment.trim().is_empty() {
-                        // A nameless `{` after `[` or `,` is a transparent
-                        // element wrapper. Remember it until the matching
-                        // list opener supplies the attribute name.
-                        crossed_list_element = true;
-                    } else if !segment.trim().is_empty() {
-                        return EnclosingBlock::Other;
+                    let segment = scan_line_segment(
+                        &source_chars,
+                        classified,
+                        char_index,
+                        SegmentScanMode::BeforeOpener,
+                    );
+                    match classify_brace_opener(&segment, resource_types) {
+                        BraceOpener::Resource(resource_type) => {
+                            let mut struct_path: Vec<String> = reverse_path
+                                .into_iter()
+                                .map(|segment: PathSegment| segment.name)
+                                .collect();
+                            struct_path.reverse();
+                            return EnclosingBlock::Resource {
+                                resource_type,
+                                struct_path,
+                            };
+                        }
+                        BraceOpener::Path(path_segment) => {
+                            reverse_path.push(path_segment);
+                            crossed_list_element = false;
+                        }
+                        BraceOpener::Else => awaiting_previous_branch_closer = true,
+                        BraceOpener::ControlFlow => {}
+                        BraceOpener::Anonymous => {
+                            // A nameless `{` after `[` or `,` is a transparent
+                            // element wrapper. Remember it until the matching
+                            // list opener supplies the attribute name.
+                            crossed_list_element = true;
+                        }
+                        BraceOpener::Other => return EnclosingBlock::Other,
                     }
                 }
                 ']' => bracket_depth += 1,
@@ -144,13 +184,17 @@ pub(crate) fn enclosing_block(
                     // cursor is inside one of its struct elements. Directly
                     // inside `[value, |]`, the list is a value expression and
                     // must not masquerade as a struct block.
-                    let segment = code_segment_before(&source_chars, classified, char_index);
+                    let segment = scan_line_segment(
+                        &source_chars,
+                        classified,
+                        char_index,
+                        SegmentScanMode::BeforeOpener,
+                    );
                     if let Some(path_segment) = parse_path_segment(&segment, false) {
                         reverse_path.push(path_segment);
                         crossed_list_element = false;
                     }
                 }
-                '[' => {}
                 _ => {}
             }
         }
@@ -159,15 +203,16 @@ pub(crate) fn enclosing_block(
     classify_non_resource(reverse_path)
 }
 
-fn code_segment_before(
+fn scan_line_segment(
     source_chars: &[char],
     classified: &[crate::lex::ClassifiedChar],
-    opener_index: usize,
-) -> String {
+    limit: usize,
+    mode: SegmentScanMode,
+) -> LineSegment {
     let mut segment_start = 0;
     let mut openers = Vec::new();
 
-    for index in 0..opener_index {
+    for index in 0..limit {
         if classified[index].kind() != LexKind::Code {
             continue;
         }
@@ -182,24 +227,39 @@ fn code_segment_before(
             }
             '[' => {
                 openers.push(LineOpener::Bracket);
-                segment_start = index + 1;
+                match mode {
+                    SegmentScanMode::BeforeOpener => segment_start = index + 1,
+                    SegmentScanMode::AtCursor => {}
+                }
             }
             ']' => pop_line_opener(&mut openers, LineOpener::Bracket),
             '(' => openers.push(LineOpener::Parenthesis),
             ')' => pop_line_opener(&mut openers, LineOpener::Parenthesis),
-            ',' => match openers.last() {
-                Some(LineOpener::Parenthesis) => {}
-                Some(LineOpener::Brace) | Some(LineOpener::Bracket) | None => {
+            ',' => {
+                let starts_segment = match (mode, openers.last()) {
+                    (SegmentScanMode::BeforeOpener, Some(LineOpener::Parenthesis)) => false,
+                    (
+                        SegmentScanMode::BeforeOpener,
+                        Some(LineOpener::Brace) | Some(LineOpener::Bracket) | None,
+                    ) => true,
+                    (
+                        SegmentScanMode::AtCursor,
+                        Some(LineOpener::Bracket) | Some(LineOpener::Parenthesis),
+                    ) => false,
+                    (SegmentScanMode::AtCursor, Some(LineOpener::Brace) | None) => true,
+                };
+                if starts_segment {
                     segment_start = index + 1;
                 }
-            },
+            }
             _ => {}
         }
     }
 
-    source_chars[segment_start..opener_index]
+    let raw = source_chars[segment_start..limit].iter().collect();
+    let code = source_chars[segment_start..limit]
         .iter()
-        .zip(&classified[segment_start..opener_index])
+        .zip(&classified[segment_start..limit])
         .map(|(character, classified)| {
             if classified.kind() == LexKind::Code {
                 *character
@@ -207,7 +267,8 @@ fn code_segment_before(
                 ' '
             }
         })
-        .collect()
+        .collect();
+    LineSegment { raw, code }
 }
 
 /// Return the current field/value segment on the cursor line.
@@ -232,35 +293,7 @@ pub(crate) fn cursor_line_segment(text: &str, position: Position) -> String {
     let classified = lexed_line.chars();
     debug_assert_eq!(source_chars.len(), classified.len());
     let limit = (position.character as usize).min(source_chars.len());
-    let mut segment_start = 0;
-    let mut openers = Vec::new();
-
-    for index in 0..limit {
-        if classified[index].kind() != LexKind::Code {
-            continue;
-        }
-        match source_chars[index] {
-            '{' => {
-                openers.push(LineOpener::Brace);
-                segment_start = index + 1;
-            }
-            '}' => {
-                pop_line_opener(&mut openers, LineOpener::Brace);
-                segment_start = index + 1;
-            }
-            '[' => openers.push(LineOpener::Bracket),
-            ']' => pop_line_opener(&mut openers, LineOpener::Bracket),
-            '(' => openers.push(LineOpener::Parenthesis),
-            ')' => pop_line_opener(&mut openers, LineOpener::Parenthesis),
-            ',' => match openers.last() {
-                Some(LineOpener::Brace) | None => segment_start = index + 1,
-                Some(LineOpener::Bracket) | Some(LineOpener::Parenthesis) => {}
-            },
-            _ => {}
-        }
-    }
-
-    source_chars[segment_start..limit].iter().collect()
+    scan_line_segment(&source_chars, classified, limit, SegmentScanMode::AtCursor).raw
 }
 
 fn pop_line_opener(openers: &mut Vec<LineOpener>, expected: LineOpener) {
@@ -269,31 +302,92 @@ fn pop_line_opener(openers: &mut Vec<LineOpener>, expected: LineOpener) {
     }
 }
 
-fn parse_path_segment(segment: &str, allow_bare: bool) -> Option<PathSegment> {
-    let trimmed = segment.trim();
-    let (candidate, syntax) = match trimmed.split_once('=') {
-        Some((_before_equals, expression)) if expression.trim_start().starts_with('=') => {
+fn parse_path_segment(segment: &LineSegment, allow_bare: bool) -> Option<PathSegment> {
+    let equals_index = segment.code.chars().position(|character| character == '=');
+    let (name, syntax) = match equals_index {
+        Some(index)
+            if segment
+                .code
+                .chars()
+                .skip(index + 1)
+                .collect::<String>()
+                .trim_start()
+                .starts_with('=') =>
+        {
             return None;
         }
-        Some((before_equals, _expression)) => (before_equals.trim(), SegmentSyntax::Assignment),
-        None if allow_bare => (trimmed, SegmentSyntax::Bare),
+        Some(index) => {
+            let code_candidate: String = segment.code.chars().take(index).collect();
+            let raw_candidate: String = segment.raw.chars().take(index).collect();
+            let code_candidate = code_candidate.trim();
+            let raw_candidate = raw_candidate.trim();
+            let name = if is_identifier(code_candidate) {
+                code_candidate.to_string()
+            } else if code_candidate.is_empty() && is_string_literal(raw_candidate) {
+                raw_candidate.to_string()
+            } else {
+                return None;
+            };
+            (name, SegmentSyntax::Assignment)
+        }
+        None if allow_bare => {
+            let candidate = segment.code.trim();
+            if !is_identifier(candidate) {
+                return None;
+            }
+            (candidate.to_string(), SegmentSyntax::Bare)
+        }
         None => return None,
     };
 
-    is_identifier(candidate).then(|| PathSegment {
-        name: candidate.to_string(),
-        syntax,
-    })
+    Some(PathSegment { name, syntax })
+}
+
+fn classify_brace_opener(
+    segment: &LineSegment,
+    resource_types: &ResourceTypePatterns,
+) -> BraceOpener {
+    if let Some(resource_type) = resource_types.find_in(&segment.code) {
+        BraceOpener::Resource(resource_type.to_string())
+    } else if is_else_segment(&segment.code) {
+        BraceOpener::Else
+    } else if is_control_flow_segment(&segment.code) {
+        BraceOpener::ControlFlow
+    } else if let Some(path_segment) = parse_path_segment(segment, true) {
+        BraceOpener::Path(path_segment)
+    } else if segment.code.trim().is_empty() {
+        BraceOpener::Anonymous
+    } else {
+        BraceOpener::Other
+    }
+}
+
+fn is_else_segment(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    trimmed == "else" || trimmed.starts_with("else ")
 }
 
 fn is_control_flow_segment(segment: &str) -> bool {
     let trimmed = segment.trim();
-    trimmed == "else"
-        || trimmed.starts_with("else ")
-        || trimmed == "if"
+    trimmed == "if"
         || trimmed.starts_with("if ")
         || trimmed == "for"
         || trimmed.starts_with("for ") && trimmed.contains(" in ")
+}
+
+fn is_string_literal(candidate: &str) -> bool {
+    let mut characters = candidate.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    let Some(last) = characters.next_back() else {
+        return false;
+    };
+    match first {
+        '\'' => last == '\'',
+        '"' => last == '"',
+        _ => false,
+    }
 }
 
 fn is_identifier(candidate: &str) -> bool {
