@@ -148,8 +148,13 @@ pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
         .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
         .attribute(AttributeSchema::new("status", AttributeType::string()))
         .attribute(AttributeSchema::new("enum_status", status_enum));
+    let data_source_schema = ResourceSchema::new("acm.Certificate")
+        .as_data_source()
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("status", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
+    schemas.insert("aws", data_source_schema);
     DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
 }
 

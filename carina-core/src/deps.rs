@@ -229,11 +229,9 @@ mod tests {
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: crate::schema::SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "acm.Certificate",
-                "cert",
-            )),
+            target_id: crate::wait::ManagedWaitTarget::new(
+                &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
+            ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(crate::resource::ConcreteValue::String("ISSUED".into())),

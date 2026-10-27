@@ -2991,8 +2991,8 @@ fn wait_binding_lowers_to_wait_effect() {
         unreachable!();
     };
     assert_eq!(identity.as_str(), "cert_issued");
-    assert_eq!(target_id.identity_str(), "cert");
-    assert_eq!(target_id.resource_type, "acm.Certificate");
+    assert_eq!(target_id.id().identity_str(), "cert");
+    assert_eq!(target_id.id().resource_type(), "acm.Certificate");
     assert_eq!(
         until,
         &WaitPredicate::equals(
@@ -3363,13 +3363,14 @@ let renewed = wait cert {
 }
 
 #[test]
-fn data_source_wait_uses_the_data_source_schema_for_enum_resolution() {
+fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::resource::DataSource;
-    use crate::schema::{AttributeSchema, ResourceSchema, TypeIdentity};
 
     let lookup =
         DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
+    let identity_collision =
+        Resource::with_provider("test", "managed.Job", "lookup", None).with_binding("managed");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_binding("consumer");
     consumer
@@ -3389,191 +3390,33 @@ fn data_source_wait_uses_the_data_source_schema_for_enum_resolution() {
         depends_on: vec![],
         line: 1,
     };
-    let managed_status = AttributeType::enum_(
-        TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
-        Some(vec!["READY".to_string()]),
-        vec![("READY".to_string(), "ready".to_string())],
-        None,
-        None,
-    );
-    let data_source_status = AttributeType::enum_(
-        TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
-        Some(vec!["FOUND".to_string()]),
-        vec![("FOUND".to_string(), "found".to_string())],
-        None,
-        None,
-    );
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "test",
-        ResourceSchema::new("lookup.Job").attribute(AttributeSchema::new("status", managed_status)),
-    );
-    schemas.insert(
-        "test",
-        ResourceSchema::new("lookup.Job")
-            .as_data_source()
-            .attribute(AttributeSchema::new("status", data_source_status)),
-    );
 
     let plan = create_plan(
-        &[consumer],
+        &[identity_collision, consumer],
         &[lookup],
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &schemas,
+        &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
         &[wait],
     );
 
+    assert_eq!(plan.errors().len(), 1);
     assert!(
-        plan.errors().is_empty(),
-        "unexpected errors: {:?}",
+        matches!(
+            &plan.errors()[0].kind,
+            PlanErrorKind::WaitTargetIsDataSource {
+                wait_binding,
+                target,
+            } if wait_binding == "lookup_found" && target == "lookup"
+        ),
+        "expected a data-source target error, got: {:?}",
         plan.errors()
     );
-    let Effect::Wait { until, .. } = plan
-        .effects()
-        .iter()
-        .find(|effect| effect.is_wait())
-        .expect("data-source wait should be emitted")
-    else {
-        unreachable!();
-    };
-    assert!(matches!(
-        until.value(),
-        Value::Concrete(ConcreteValue::CanonicalEnum(value))
-            if value.api_value() == "FOUND"
-    ));
-}
-
-#[test]
-fn data_source_wait_uses_separate_cached_state_when_deciding_work() {
-    use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::resource::{DataSource, ResolvedResource};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let lookup =
-        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
-    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
-        .with_binding("consumer");
-    consumer
-        .dependency_bindings
-        .insert("lookup_found".to_string());
-    let wait = WaitBinding {
-        binding: "lookup_found".into(),
-        target: "lookup".into(),
-        until_raw: "lookup.status == \"READY\"".to_string(),
-        until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("READY".into())),
-        },
-        timeout_secs: None,
-        depends_on: vec![],
-        line: 1,
-    };
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "test",
-        ResourceSchema::new("lookup.Job")
-            .as_data_source()
-            .attribute(AttributeSchema::new("status", AttributeType::string())),
-    );
-    let data_source_states = HashMap::from([(
-        lookup.id.clone(),
-        State::existing(
-            lookup.id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("READY".into())),
-            )]),
-        ),
-    )]);
-    let managed = ResolvedResource::collect_resolved(vec![consumer]).unwrap();
-    let managed_current = HashMap::new();
-    let orphans = Orphans::new();
-
-    let plan = super::plan::create_plan(
-        &managed,
-        &[lookup],
-        &HintProvider { hints: Vec::new() },
-        PlanPriorStates::new(&managed_current, &data_source_states, &orphans),
-        &HashMap::new(),
-        &schemas,
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &[wait],
-    )
-    .expect("test provider hints should succeed");
-
-    assert!(plan.errors().is_empty());
-    assert!(
-        !plan.effects().iter().any(Effect::is_wait),
-        "an unchanged data source whose cached state satisfies the predicate has no wait work"
-    );
-}
-
-#[test]
-fn data_source_wait_evaluates_cached_state_even_when_not_found() {
-    use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::resource::{DataSource, ResolvedResource};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let lookup =
-        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
-    let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
-        .with_binding("consumer");
-    consumer
-        .dependency_bindings
-        .insert("lookup_found".to_string());
-    let wait = WaitBinding {
-        binding: "lookup_found".into(),
-        target: "lookup".into(),
-        until_raw: "lookup.status == \"READY\"".to_string(),
-        until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("READY".into())),
-        },
-        timeout_secs: None,
-        depends_on: vec![],
-        line: 1,
-    };
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "test",
-        ResourceSchema::new("lookup.Job")
-            .as_data_source()
-            .attribute(AttributeSchema::new("status", AttributeType::string())),
-    );
-    let mut cached_state = State::not_found(lookup.id.clone());
-    cached_state.attributes.insert(
-        "status".to_string(),
-        Value::Concrete(ConcreteValue::String("READY".into())),
-    );
-    let data_source_states = HashMap::from([(lookup.id.clone(), cached_state)]);
-    let managed = ResolvedResource::collect_resolved(vec![consumer]).unwrap();
-    let managed_current = HashMap::new();
-    let orphans = Orphans::new();
-
-    let plan = super::plan::create_plan(
-        &managed,
-        &[lookup],
-        &HintProvider { hints: Vec::new() },
-        PlanPriorStates::new(&managed_current, &data_source_states, &orphans),
-        &HashMap::new(),
-        &schemas,
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &[wait],
-    )
-    .expect("test provider hints should succeed");
-
-    assert!(plan.errors().is_empty());
-    assert!(
-        !plan.effects().iter().any(Effect::is_wait),
-        "the cached data-source attributes must be evaluated regardless of the exists flag"
-    );
+    assert!(!plan.effects().iter().any(Effect::is_wait));
 }
 
 #[test]

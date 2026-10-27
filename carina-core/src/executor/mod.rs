@@ -806,8 +806,7 @@ impl ExecutionAccumulator {
             applied_states.is_empty(),
             "execution accumulator must start without applied states"
         );
-        let wait_identifiers =
-            wait::initial_wait_identifiers(&managed_current, &data_source_states);
+        let wait_identifiers = wait::initial_wait_identifiers(&managed_current);
         let accumulator = Self {
             fields: ExecutionResultFields {
                 success_count,
@@ -848,16 +847,29 @@ impl ExecutionAccumulator {
     }
 
     pub(super) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {
-        self.wait_identifiers
-            .lock()
-            .expect("wait identifier map poisoned")
-            .insert(
-                id.clone(),
-                state
-                    .identifier
-                    .as_deref()
-                    .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
-            );
+        match &applied {
+            Applied::Complete {
+                state: _,
+                request: _,
+            }
+            | Applied::Observed(_)
+            | Applied::CreateInFlight(_)
+            | Applied::CreateEnded
+            | Applied::Imported(_)
+            | Applied::WaitSnapshot(_) => {
+                self.wait_identifiers
+                    .lock()
+                    .expect("wait identifier map poisoned")
+                    .insert(
+                        id.clone(),
+                        state
+                            .identifier
+                            .as_deref()
+                            .and_then(|identifier| AppliedIdentifier::new(identifier).ok()),
+                    );
+            }
+            Applied::DataSource(_) => {}
+        }
         self.applied_states.insert(id, applied);
         self.dirty = true;
     }

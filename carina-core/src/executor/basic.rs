@@ -1182,19 +1182,48 @@ mod process_basic_result_tests {
     }
 
     #[test]
-    fn applied_state_insertion_keeps_wait_identifier_registry_in_sync() {
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "waited", None);
-        let identifier = crate::provider::AppliedIdentifier::new("waited-id").unwrap();
-        let state = State::existing(id.clone(), HashMap::new()).with_identifier("waited-id");
+    fn published_non_data_source_state_overwrites_wait_identifier() {
+        let managed_id =
+            ResourceId::with_provider_identity("mock", "test.resource", "waited", None);
+        let managed_identifier = crate::provider::AppliedIdentifier::new("waited-id").unwrap();
+        let managed_state =
+            State::existing(managed_id.clone(), HashMap::new()).with_identifier("waited-id");
+        let data_source_id =
+            ResourceId::with_provider_identity("mock", "test.lookup", "lookup", None);
+        let data_source_state =
+            State::existing(data_source_id.clone(), HashMap::new()).with_identifier("lookup-id");
         let (mut accumulator, wait_identifiers) =
             ExecutionAccumulator::new(empty_execution_result());
 
-        accumulator.insert_published(id.clone(), Applied::DataSource(state.clone()), &state);
+        accumulator.insert_published(
+            managed_id.clone(),
+            Applied::Imported(managed_state.clone()),
+            &managed_state,
+        );
+        accumulator.insert_published(
+            data_source_id.clone(),
+            Applied::DataSource(data_source_state.clone()),
+            &data_source_state,
+        );
 
         assert_eq!(
-            crate::executor::wait::resolve_wait_identifier(&wait_identifiers, &id),
-            Some(identifier),
-            "every applied-state insertion must update the Wait identifier registry"
+            crate::executor::wait::resolve_wait_identifier(&wait_identifiers, &managed_id),
+            Some(managed_identifier),
+            "managed publication must update the wait identifier registry"
+        );
+
+        let ended_state = State::existing(managed_id.clone(), HashMap::new());
+        accumulator.insert_published(managed_id.clone(), Applied::CreateEnded, &ended_state);
+        assert_eq!(
+            crate::executor::wait::resolve_wait_identifier(&wait_identifiers, &managed_id),
+            None,
+            "ended create publication must clear a stale wait identifier"
+        );
+
+        assert_eq!(
+            crate::executor::wait::resolve_wait_identifier(&wait_identifiers, &data_source_id),
+            None,
+            "data-source publication must not update the managed wait identifier registry"
         );
     }
 

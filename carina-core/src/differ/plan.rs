@@ -22,8 +22,8 @@ use crate::schema::{
     WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
-use crate::wait::find_wait_target_with_schema_kind;
 use crate::wait::predicate::resolve_wait_predicate;
+use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{PlanPriorStates, PresentDiff, diff_present};
 
@@ -238,7 +238,7 @@ pub fn generate_temporary_name(
 ///     &compositions,
 ///     &[],
 ///     &carina_core::provider::ProviderRouter::new(),
-///     PlanPriorStates::new(&plan_states, &HashMap::new(), &orphans),
+///     PlanPriorStates::new(&plan_states, &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &saved_attrs,
@@ -295,7 +295,7 @@ pub fn generate_temporary_name(
 ///     &resources,
 ///     &[],
 ///     &ProviderRouter::new(),
-///     PlanPriorStates::new(&plan_states, &HashMap::new(), &orphans),
+///     PlanPriorStates::new(&plan_states, &orphans),
 ///     &HashMap::new(),
 ///     &registry,
 ///     &raw_saved_attrs,
@@ -316,13 +316,11 @@ pub fn create_plan(
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
-    let data_source_states = prior_states.data_source_states();
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
         &managed_current,
-        data_source_states,
         registry,
         saved_attrs,
         prev_explicit,
@@ -348,13 +346,11 @@ pub fn create_plan_with_cascades(
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
-    let data_source_states = prior_states.data_source_states();
     let mut build = create_plan_parts(
         managed,
         data_sources,
         provider,
         &managed_current,
-        data_source_states,
         registry,
         saved_attrs,
         prev_explicit,
@@ -384,7 +380,6 @@ fn create_plan_parts(
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
-    data_source_states: &HashMap<ResourceId, State>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
@@ -568,50 +563,46 @@ fn create_plan_parts(
     // wait is skipped with a plan-level error so downstream resources
     // referencing the wait binding still fail loudly.
     for wb in wait_bindings {
-        // Wait targets resolve over managed + data-source bindings.
-        // compositions are post-apply attribute containers and don't carry
-        // `until`-pollable state, so excluding them (by construction
-        // via the typed-slice split) matches the runtime invariant.
-        let resolved = find_wait_target_with_schema_kind(
-            wb.target.as_str(),
-            managed
-                .iter()
-                .map(|resource| {
-                    (
-                        &resource.id,
-                        resource.binding.as_deref(),
-                        SchemaKind::Resource,
-                    )
-                })
-                .chain(data_sources.iter().map(|resource| {
-                    (
-                        &resource.id,
-                        resource.binding.as_deref(),
-                        SchemaKind::DataSource,
-                    )
-                })),
-        );
-        let Some((target_id_resolved, target_schema_kind)) = resolved else {
-            plan.add_error(PlanError::new(
-                ResourceId::with_identity("__wait", ResourceIdentity::new(wb.binding.to_string())),
-                PlanErrorKind::WaitTargetMissing {
-                    wait_binding: wb.binding.to_string(),
-                    target: wb.target.to_string(),
-                },
-            ));
-            continue;
+        let target = match resolve_wait_target(wb.target.as_str(), managed, data_sources) {
+            WaitTargetLookup::Managed(target) => target,
+            WaitTargetLookup::DataSource => {
+                plan.add_error(PlanError::new(
+                    ResourceId::with_identity(
+                        "__wait",
+                        ResourceIdentity::new(wb.binding.to_string()),
+                    ),
+                    PlanErrorKind::WaitTargetIsDataSource {
+                        wait_binding: wb.binding.to_string(),
+                        target: wb.target.to_string(),
+                    },
+                ));
+                continue;
+            }
+            WaitTargetLookup::Missing => {
+                plan.add_error(PlanError::new(
+                    ResourceId::with_identity(
+                        "__wait",
+                        ResourceIdentity::new(wb.binding.to_string()),
+                    ),
+                    PlanErrorKind::WaitTargetMissing {
+                        wait_binding: wb.binding.to_string(),
+                        target: wb.target.to_string(),
+                    },
+                ));
+                continue;
+            }
         };
-        let target_id_resolved = target_id_resolved.clone();
-        let diagnostic_id = target_id_resolved.clone();
+        let target_id = target.id();
+        let diagnostic_id = target_id.as_inner().clone();
 
-        // Once the target is known, resolve against the exact schema kind and
-        // the full nested attribute path. The same function drives validation
-        // (and therefore LSP diagnostics), so resolution and wording cannot
-        // drift between those entry points.
+        // Once the managed target is known, resolve the full nested attribute
+        // path. The same function drives validation (and therefore LSP
+        // diagnostics), so resolution and wording cannot drift between those
+        // entry points.
         let schema = registry.get(
-            &target_id_resolved.provider,
-            &target_id_resolved.resource_type,
-            target_schema_kind,
+            target_id.provider(),
+            target_id.resource_type(),
+            SchemaKind::Resource,
         );
         let until = match resolve_wait_predicate(
             &wb.until_predicate.lhs_segments,
@@ -665,7 +656,6 @@ fn create_plan_parts(
         if !gates_a_pending_change {
             continue;
         }
-        let target_id = target_id_resolved;
         let schema_timeout = schema.and_then(|s| s.default_wait_timeout);
         let schema_interval = schema.and_then(|s| s.default_wait_interval);
         let timeout = wb
@@ -689,25 +679,21 @@ fn create_plan_parts(
         //      attributes are stale, must re-poll; or
         //   3. the target is unchanged but its cached state does not yet
         //      satisfy the predicate (missing state ⇒ treat as work).
-        let cached_state = match target_schema_kind {
-            SchemaKind::Resource => {
-                current_states
-                    .get(&target_id)
-                    .and_then(|current| match current.current() {
-                        Current::Absent(_absent) => None,
-                        Current::Present(present) => Some(present.state()),
-                        Current::CreateInFlight(_pending) => None,
-                        Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
-                    })
-            }
-            SchemaKind::DataSource => data_source_states.get(&target_id),
-        };
+        let cached_state =
+            current_states
+                .get(target_id.as_inner())
+                .and_then(|current| match current.current() {
+                    Current::Absent(_absent) => None,
+                    Current::Present(present) => Some(present.state()),
+                    Current::CreateInFlight(_pending) => None,
+                    Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
+                });
         let wait_has_work = cached_state
             .map(|state| {
                 let target_is_mutating = plan
                     .effects()
                     .iter()
-                    .any(|e| e.resource_id() == &target_id && e.is_mutating());
+                    .any(|e| e.resource_id() == target_id.as_inner() && e.is_mutating());
                 let target_needs_wait = !until.evaluate(&state.attributes);
 
                 target_is_mutating || target_needs_wait
@@ -726,15 +712,14 @@ fn create_plan_parts(
         // weakened by provider-derived knowledge.
         explicit_dependencies.extend(satisfier_augmentation(
             provider,
-            &target_id,
+            target_id.as_inner(),
             &attr,
             &known_bindings,
         )?);
 
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new(wb.binding.as_str()),
-            target_id: ResolvedResourceId::new(target_id),
-            target_schema_kind,
+            target_id: target,
             until,
             until_surface: wb.until_raw.clone(),
             timeout,

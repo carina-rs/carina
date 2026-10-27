@@ -4592,7 +4592,7 @@ mod tests {
             &[],
             &[],
             &carina_core::provider::ProviderRouter::new(),
-            carina_core::differ::PlanPriorStates::new(&HashMap::new(), &HashMap::new(), &orphans),
+            carina_core::differ::PlanPriorStates::new(&HashMap::new(), &orphans),
             &state.build_directives(),
             &schemas,
             &RawSavedAttrs::default().lift(&schemas),

@@ -25,11 +25,16 @@ use crate::resource::{
     DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State,
 };
-use crate::schema::SchemaKind;
+use crate::wait::ManagedWaitTarget;
 use crate::wait::predicate::WaitPredicate;
 
 #[cfg(test)]
 pub(crate) use crate::provider::fixture_applied_identifier;
+
+#[cfg(test)]
+fn fixture_managed_wait_target(id: ResourceId) -> ManagedWaitTarget {
+    ManagedWaitTarget::new(&ResolvedResource::from_id(ResolvedResourceId::new(id)))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOp {
@@ -579,11 +584,9 @@ pub enum Effect {
     Wait {
         /// The wait's own identity (e.g. `"cert_issued"`).
         identity: ResourceIdentity,
-        /// Resolved id of the target resource (`wait cert { ... }` →
-        /// `cert`'s `ResourceId`).
-        target_id: ResolvedResourceId,
-        /// Schema namespace resolved for the target by the differ.
-        target_schema_kind: SchemaKind,
+        /// Managed target selected by the differ (`wait cert { ... }` →
+        /// `cert`'s resolved resource id).
+        target_id: ManagedWaitTarget,
         /// Typed predicate evaluated against each `read()` snapshot.
         until: WaitPredicate,
         /// Surface form of the `until` expression as the user wrote it
@@ -815,8 +818,7 @@ impl Effect {
             (
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
-                    target_schema_kind: SchemaKind::Resource,
-                    target_id: crate::resource::ResolvedResourceId::new(id.clone()),
+                    target_id: fixture_managed_wait_target(id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
                         Value::Concrete(ConcreteValue::String("ready".into())),
@@ -1076,7 +1078,7 @@ impl Effect {
             Effect::Import { id, .. } => id,
             Effect::Remove { id, .. } => id,
             Effect::Move { to, .. } => to,
-            Effect::Wait { target_id, .. } => target_id,
+            Effect::Wait { target_id, .. } => target_id.id(),
             Effect::DeferredCreate { id, .. } => id,
             Effect::DeferredReplace(payload) => &payload.id,
         }
@@ -1310,7 +1312,7 @@ impl Effect {
                 explicit_dependencies,
                 ..
             } => {
-                let target_binding = target_id.identity_str();
+                let target_binding = target_id.id().identity_str();
                 let mut out = Vec::with_capacity(1 + explicit_dependencies.len());
                 out.push(target_binding.to_string());
                 out.extend(
@@ -1640,8 +1642,7 @@ mod tests {
                 "Wait",
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
-                    target_schema_kind: SchemaKind::Resource,
-                    target_id: crate::resource::ResolvedResourceId::new(rid),
+                    target_id: fixture_managed_wait_target(rid),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
                         Value::Concrete(ConcreteValue::String("ready".into())),
@@ -2197,8 +2198,7 @@ mod tests {
 
         let _ = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
             )),
@@ -2222,8 +2222,7 @@ mod tests {
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
             )),
@@ -2248,8 +2247,7 @@ mod tests {
 
         let e = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
             )),
@@ -2269,17 +2267,15 @@ mod tests {
 
     #[test]
     fn wait_serde_round_trip() {
-        use crate::resource::{ConcreteValue, Value};
+        use crate::resource::{ConcreteValue, ResolvedResource, Resource, Value};
+        use crate::wait::ManagedWaitTarget;
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
+        let target = ResolvedResource::new(Resource::new("acm.Certificate", "cert"));
         let original = Effect::Wait {
             identity: ResourceIdentity::new("cert_issued"),
-            target_schema_kind: SchemaKind::DataSource,
-            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "acm.Certificate",
-                "cert",
-            )),
+            target_id: ManagedWaitTarget::new(&target),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
                 Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -2299,9 +2295,13 @@ mod tests {
             json
         );
         assert!(json.contains("\"identity\":\"cert_issued\""), "got: {json}");
-        assert!(
-            json.contains("\"target_schema_kind\":\"data_source\""),
-            "got: {json}"
+        assert!(!json.contains("target_schema_kind"), "got: {json}");
+        assert!(json.contains("\"target_id\":"), "got: {json}");
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("decode JSON value");
+        assert_eq!(
+            wire["Wait"]["target_id"],
+            serde_json::to_value(target.resolved_id()).expect("serialize resolved target id"),
+            "ManagedWaitTarget must be transparent on the wire"
         );
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, original);
@@ -2375,8 +2375,7 @@ mod tests {
         };
         let wait = Effect::Wait {
             identity: ResourceIdentity::new("w"),
-            target_schema_kind: SchemaKind::Resource,
-            target_id: crate::resource::ResolvedResourceId::new(rid.clone()),
+            target_id: fixture_managed_wait_target(rid.clone()),
             until: WaitPredicate::equals(
                 crate::wait::predicate::AttrPath::single("status"),
                 crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(

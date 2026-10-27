@@ -638,7 +638,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider_router,
-        PlanPriorStates::new(&plan_input_current, &data_source_states, &orphans),
+        PlanPriorStates::new(&plan_input_current, &orphans),
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
