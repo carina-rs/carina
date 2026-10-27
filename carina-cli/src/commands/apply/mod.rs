@@ -75,9 +75,10 @@ use crate::wiring::read_with_retry;
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
     build_factories_from_providers, create_normalizers_from_configs_with_ctx,
-    create_providers_from_configs_with_ctx, data_source_refresh_bindings, get_provider_with_ctx,
-    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    prepare_desired_side_for_plan, read_data_source_with_retry, read_managed_state_with_retry,
+    create_providers_from_configs_with_ctx, data_source_refresh_bindings,
+    expand_same_config_deferred_for, get_provider_with_ctx, prepare_data_sources_for_plan,
+    prepare_default_provider_ready_config, prepare_desired_side_for_plan,
+    read_data_source_with_retry, read_managed_state_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
     resolve_data_source_refs_for_refresh,
@@ -85,7 +86,7 @@ use crate::wiring::{
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
     DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, RehydratedPlanFile,
-    ReloadedInspectedPlanFile,
+    ReloadedInspectedPlanFile, ReloadedPendingPlanFile, SavedPlanSecretCandidates,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -2839,10 +2840,11 @@ fn import_identifiers_from_current_config(
 /// has been verified.
 async fn prepare_saved_plan_secret_candidates(
     parsed: &mut carina_core::parser::InferredFile,
+    pending_plan: &ReloadedPendingPlanFile,
     state_file: &Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
-) -> Result<(ResolvedProviderInputs, WiringContext), AppError> {
+) -> Result<(SavedPlanSecretCandidates, WiringContext), AppError> {
     let mut candidate_state = state_file.clone();
     let PreparedPlanIdentityInputs {
         wiring,
@@ -2856,11 +2858,52 @@ async fn prepare_saved_plan_secret_candidates(
         UpstreamMissingStatePolicy::Strict,
     )
     .await?;
+
+    // Plan recording expands deferred `for` expressions against its
+    // post-refresh binding view before normalizing and persisting desired
+    // resources. Rebuild that same addressed view from the saved plan's
+    // plan-time current-state snapshots; using `parsed.resources` directly
+    // would omit every materialized child (carina#3990).
+    let sorted_resources =
+        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+    let (managed_current, data_source_states) = pending_plan.expansion_prior_states();
+    let saved_attrs = state_file
+        .as_ref()
+        .map(StateFile::build_saved_attrs)
+        .unwrap_or_default()
+        .lift(wiring.schemas());
+    let prev_explicit = state_file
+        .as_ref()
+        .map(StateFile::build_explicit)
+        .unwrap_or_default();
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
+    let expansion = expand_same_config_deferred_for(
+        parsed,
+        &sorted_resources,
+        &managed_current,
+        &data_source_states,
+        wiring.schemas(),
+        &saved_attrs,
+        &prev_explicit,
+        provider_inputs.remote_bindings(),
+        &wait_aliases,
+        &HashSet::new(),
+        &HashSet::new(),
+    )?;
+    let mut candidates =
+        SavedPlanSecretCandidates::from_expansion(parsed, provider_inputs, expansion);
+
     let normalizers =
-        create_normalizers_from_configs_with_ctx(&wiring, provider_inputs.configs()).await?;
+        create_normalizers_from_configs_with_ctx(&wiring, candidates.provider_inputs().configs())
+            .await?;
+    let (resources, data_sources, provider_inputs) = candidates.normalization_inputs();
     prepare_desired_side_for_plan(
-        &mut parsed.resources,
-        &mut parsed.data_sources,
+        resources,
+        data_sources,
         provider_inputs.configs().as_provider_configs(),
         &normalizers,
         &wiring,
@@ -2868,15 +2911,16 @@ async fn prepare_saved_plan_secret_candidates(
     .await
     .map_err(AppError::Provider)?;
 
-    Ok((provider_inputs, wiring))
+    Ok((candidates, wiring))
 }
 
 fn rehydrate_desired_plan_file(
     plan_file: &mut PlanFile,
-    parsed: &carina_core::parser::InferredFile,
-    provider_inputs: &ResolvedProviderInputs,
+    candidates: &SavedPlanSecretCandidates,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
+    let parsed = candidates.parsed();
+    let provider_inputs = candidates.provider_inputs();
     let mut resource_candidates = HashMap::new();
     for saved in &plan_file.sorted_resources {
         if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
@@ -3404,18 +3448,16 @@ async fn run_apply_from_plan_locked_owned(
                             apply_target,
                         )
                     })?;
-                    let (provider_inputs, wiring) = prepare_saved_plan_secret_candidates(
+                    let (candidates, wiring) = prepare_saved_plan_secret_candidates(
                         parsed,
+                        &plan,
                         &state_file,
                         project_dir,
                         provider_context,
                     )
                     .await
                     .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-                    (
-                        plan.verify_desired(parsed, &provider_inputs, apply_target)?,
-                        Some(wiring),
-                    )
+                    (plan.verify_desired(candidates, apply_target)?, Some(wiring))
                 }
             };
 

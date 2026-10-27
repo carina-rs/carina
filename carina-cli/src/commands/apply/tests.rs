@@ -370,6 +370,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .await
     .expect("resolve empty provider config");
+    let candidates = SavedPlanSecretCandidates::from_test_parts(parsed, provider_inputs);
     let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -393,8 +394,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let result = rehydrate_desired_plan_file(
         &mut plan_file,
-        &parsed,
-        &provider_inputs,
+        &candidates,
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),

@@ -2020,6 +2020,10 @@ impl DeferredCreateTarget {
     }
 }
 
+/// Private proof that the addressed resource view came from the shared
+/// deferred-`for` expansion step.
+struct DeferredForExpansionWitness;
+
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
@@ -2048,6 +2052,17 @@ pub struct DeferredForExpansion {
     /// this to avoid adding a second, spurious blank line on the
     /// deferred-for-with-warnings TTY path (#3150 Round-4 finding).
     pub printed_warnings: bool,
+    /// Prevent callers from fabricating a post-expansion resource view. A
+    /// saved-plan verifier may only obtain this witness by running the shared
+    /// deferred-`for` expansion step.
+    _expanded: DeferredForExpansionWitness,
+}
+
+impl DeferredForExpansion {
+    /// Consume the expansion witness and return its addressed resource view.
+    pub(crate) fn into_sorted_resources(self) -> Vec<Resource> {
+        self.sorted_resources
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2176,6 +2191,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
             printed_warnings,
+            _expanded: DeferredForExpansionWitness,
         });
     }
 
@@ -2305,6 +2321,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
+        _expanded: DeferredForExpansionWitness,
     })
 }
 
@@ -2392,6 +2409,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
+        _expanded: _,
     } = expand_same_config_deferred_for(
         inputs.parsed,
         inputs.sorted_resources,
@@ -2815,6 +2833,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
+        _expanded: _,
     } = expand_same_config_deferred_for(
         parsed,
         &sorted_resources,

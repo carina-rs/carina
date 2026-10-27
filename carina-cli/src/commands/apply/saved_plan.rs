@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use carina_core::parser::{BackendConfig, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
-use carina_core::resource::{Composition, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{Composition, Current, DataSource, Resource, ResourceId, State, Value};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -11,6 +11,7 @@ use crate::commands::plan::{
     ResolvedProviderInputs, UpstreamSource,
 };
 use crate::error::AppError;
+use crate::wiring::DeferredForExpansion;
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -199,22 +200,92 @@ pub(super) struct ReloadedPendingPlanFile {
     plan_file: ReloadedPlanFile,
 }
 
+/// Fresh source values whose managed-resource slice is proven to have crossed
+/// the same deferred-`for` expansion seam as plan recording.
+///
+/// The fields are private and the production constructor requires the opaque
+/// [`DeferredForExpansion`] witness, so a pending saved plan cannot be
+/// verified accidentally against the parser's pre-expansion resource view.
+pub(super) struct SavedPlanSecretCandidates {
+    parsed: carina_core::parser::InferredFile,
+    provider_inputs: ResolvedProviderInputs,
+}
+
+impl SavedPlanSecretCandidates {
+    pub(super) fn from_expansion(
+        parsed: &carina_core::parser::InferredFile,
+        provider_inputs: ResolvedProviderInputs,
+        expansion: DeferredForExpansion,
+    ) -> Self {
+        let mut parsed = parsed.clone();
+        parsed.resources = expansion.into_sorted_resources();
+        Self {
+            parsed,
+            provider_inputs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_test_parts(
+        parsed: carina_core::parser::InferredFile,
+        provider_inputs: ResolvedProviderInputs,
+    ) -> Self {
+        Self {
+            parsed,
+            provider_inputs,
+        }
+    }
+
+    pub(super) fn normalization_inputs(
+        &mut self,
+    ) -> (&mut [Resource], &mut [DataSource], &ResolvedProviderInputs) {
+        (
+            &mut self.parsed.resources,
+            &mut self.parsed.data_sources,
+            &self.provider_inputs,
+        )
+    }
+
+    pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
+        &self.parsed
+    }
+
+    pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
+        &self.provider_inputs
+    }
+}
+
 impl ReloadedPendingPlanFile {
+    /// Reconstruct the exact plan-time prior-state ownership view used by
+    /// deferred-`for` expansion. These snapshots were captured in the saved
+    /// plan and have already crossed the locked in-flight reload boundary.
+    pub(super) fn expansion_prior_states(
+        &self,
+    ) -> (HashMap<ResourceId, Current>, HashMap<ResourceId, State>) {
+        let mut managed = HashMap::new();
+        let mut data_sources = HashMap::new();
+        for entry in self.plan_file.current_states() {
+            match entry {
+                ReloadedCurrentStateEntry::Managed { id, current } => {
+                    managed.insert(id.clone(), current.as_ref().clone());
+                }
+                ReloadedCurrentStateEntry::DataSource { id, state } => {
+                    data_sources.insert(id.clone(), state.as_ref().clone());
+                }
+            }
+        }
+        (managed, data_sources)
+    }
+
     pub(super) fn verify_desired(
         self,
-        parsed: &carina_core::parser::InferredFile,
-        provider_inputs: &ResolvedProviderInputs,
+        candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
     ) -> Result<DesiredPlanFile, AppError> {
         let planned_secret_hashes =
             planned_secret_hashes(&self.plan_file.plan_file().sorted_resources);
         let mut plan_file = self.plan_file;
-        super::rehydrate_desired_plan_file(
-            plan_file.plan_file_mut(),
-            parsed,
-            provider_inputs,
-            apply_target,
-        )?;
+        super::rehydrate_desired_plan_file(plan_file.plan_file_mut(), &candidates, apply_target)?;
         Ok(DesiredPlanFile::NeedsHistoricalVerification(
             DesiredVerifiedPlanFile {
                 plan_file,
