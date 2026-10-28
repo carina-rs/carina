@@ -575,6 +575,17 @@ pub enum AppError {
         provider_source: String,
     },
 
+    /// A source trusted for one provider identity was selected by an
+    /// incompatible provider block kind.
+    #[error(
+        "Provider block kind '{configured}' does not match trusted provider identity '{expected}' from source '{provider_source}'."
+    )]
+    SourceProviderTrustMismatch {
+        configured: String,
+        expected: String,
+        provider_source: String,
+    },
+
     /// A parsed provider expression could not be evaluated.
     #[error("Provider attribute resolution error: {0}")]
     ProviderAttributeResolution(Box<carina_core::parser::ParseError>),

@@ -48,7 +48,7 @@ use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
-use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass};
+use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
 
 use crate::{secret_seal, wasm_convert};
 use carina_provider_protocol::types as proto;
@@ -2373,7 +2373,7 @@ struct ConfiguredProvider {
 }
 
 impl ConfiguredProvider {
-    fn new(identity: ProviderLoadIdentity) -> Self {
+    fn new(identity: &ProviderLoadIdentity) -> Self {
         let kind = match identity.trust().class() {
             ProviderTrustClass::Aws => ProviderKind::Aws,
             ProviderTrustClass::GitHub => ProviderKind::GitHub,
@@ -2381,6 +2381,10 @@ impl ConfiguredProvider {
         };
         let name = identity.configured_name().to_string();
         Self { name, kind }
+    }
+
+    fn initialized_instance_kind(&self) -> Option<ProviderKind> {
+        Some(self.kind)
     }
 }
 
@@ -2443,20 +2447,34 @@ fn env_keys_for_kind(kind: Option<ProviderKind>) -> Vec<&'static str> {
 ///
 /// See [`env_keys_for_kind`] for the partitioning rule.
 fn build_sandboxed_wasi_ctx(provider_kind: Option<ProviderKind>) -> WasiCtx {
+    build_sandboxed_wasi_ctx_with(
+        provider_kind,
+        |key| std::env::var(key).ok(),
+        is_metadata_available,
+    )
+}
+
+fn build_sandboxed_wasi_ctx_with(
+    provider_kind: Option<ProviderKind>,
+    mut env_value: impl FnMut(&str) -> Option<String>,
+    metadata_available: impl FnOnce() -> bool,
+) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stderr();
     let keys = env_keys_for_kind(provider_kind);
+    let mut metadata_disabled_is_set = false;
     for key in &keys {
-        if let Ok(val) = std::env::var(key) {
+        if let Some(val) = env_value(key) {
             builder.env(key, &val);
+            metadata_disabled_is_set |= *key == "AWS_EC2_METADATA_DISABLED";
         }
     }
     // Auto-disable IMDS if metadata endpoints are unreachable, unless the
     // user has explicitly set the variable. Only relevant for the AWS
     // partition, which is the only one carrying AWS_EC2_METADATA_DISABLED.
     if keys.contains(&"AWS_EC2_METADATA_DISABLED")
-        && std::env::var("AWS_EC2_METADATA_DISABLED").is_err()
-        && !is_metadata_available()
+        && !metadata_disabled_is_set
+        && !metadata_available()
     {
         builder.env("AWS_EC2_METADATA_DISABLED", "true");
     }
@@ -2916,15 +2934,14 @@ impl WasmProviderFactory {
 
     /// Load provider bytes using the default precompile cache at `~/.carina/cache/`.
     ///
-    /// The load identity carries the configured name and resolver-owned trust
-    /// classification. An artifact reporting a different name is rejected.
+    /// The verified load binds the resolver-retained bytes to their configured
+    /// name and trust classification. An artifact reporting a different name
+    /// is rejected.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn from_bytes(
-        wasm_bytes: &[u8],
-        identity: ProviderLoadIdentity,
-    ) -> Result<Self, WasmProviderLoadError> {
-        let configured = ConfiguredProvider::new(identity);
+    pub async fn from_bytes(load: VerifiedLoad) -> Result<Self, WasmProviderLoadError> {
+        let configured = ConfiguredProvider::new(load.identity());
+        let wasm_bytes = load.bytes().as_bytes();
         match Self::default_cache_dir() {
             Some(cache_dir) => {
                 Self::from_bytes_with_cache_dir_configured(wasm_bytes, &cache_dir, configured).await
@@ -2935,16 +2952,12 @@ impl WasmProviderFactory {
 
     /// Load provider bytes with an explicit precompile cache directory.
     pub async fn from_bytes_with_cache_dir(
-        wasm_bytes: &[u8],
-        identity: ProviderLoadIdentity,
+        load: VerifiedLoad,
         cache_dir: &Path,
     ) -> Result<Self, WasmProviderLoadError> {
-        Self::from_bytes_with_cache_dir_configured(
-            wasm_bytes,
-            cache_dir,
-            ConfiguredProvider::new(identity),
-        )
-        .await
+        let configured = ConfiguredProvider::new(load.identity());
+        Self::from_bytes_with_cache_dir_configured(load.bytes().as_bytes(), cache_dir, configured)
+            .await
     }
 
     async fn from_bytes_with_cache_dir_configured(
@@ -2999,7 +3012,7 @@ impl WasmProviderFactory {
         wasm_bytes: &[u8],
         identity: ProviderLoadIdentity,
     ) -> Result<Self, WasmProviderLoadError> {
-        Self::new_uncached_configured(wasm_bytes, ConfiguredProvider::new(identity)).await
+        Self::new_uncached_configured(wasm_bytes, ConfiguredProvider::new(&identity)).await
     }
 
     async fn new_uncached_configured(
@@ -3065,6 +3078,7 @@ impl WasmProviderFactory {
     /// # Safety
     /// The .cwasm file must have been produced by `precompile()` using the same
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn from_precompiled(
         cwasm_path: &Path,
         identity: ProviderLoadIdentity,
@@ -3078,7 +3092,7 @@ impl WasmProviderFactory {
             engine,
             component,
             epoch_ticker,
-            ConfiguredProvider::new(identity),
+            ConfiguredProvider::new(&identity),
         )
         .await
     }
@@ -3091,7 +3105,7 @@ impl WasmProviderFactory {
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
         // guest metadata was read, so the guest receives only that partition.
-        let kind = Some(self.configured.kind);
+        let kind = self.configured.initialized_instance_kind();
         let world = if self.enable_http {
             InstantiationWorld::HttpEnabled
         } else {
@@ -7052,7 +7066,7 @@ mod tests {
     fn untrusted_identity_gets_no_credential_or_metadata_partition() {
         // An untrusted source receives only the shared group and no metadata
         // endpoint access, even when its configured name is "aws".
-        let configured = ConfiguredProvider::new(ProviderLoadIdentity::for_test(
+        let configured = ConfiguredProvider::new(&ProviderLoadIdentity::for_test(
             "aws",
             ProviderTrustClass::Untrusted,
         ));
@@ -7091,7 +7105,7 @@ mod tests {
     #[test]
     fn provider_kind_comes_from_resolver_trust_identity() {
         let kind = |configured_name: &str, class| {
-            ConfiguredProvider::new(ProviderLoadIdentity::for_test(configured_name, class)).kind
+            ConfiguredProvider::new(&ProviderLoadIdentity::for_test(configured_name, class)).kind
         };
 
         assert_eq!(kind("renamed", ProviderTrustClass::Aws), ProviderKind::Aws);
@@ -7103,6 +7117,56 @@ mod tests {
             kind("aws", ProviderTrustClass::Untrusted),
             ProviderKind::Untrusted
         );
+    }
+
+    #[test]
+    fn initialized_instance_wasi_ctx_uses_configured_kind() {
+        use wasmtime_wasi::p2::bindings::cli::environment::Host as _;
+
+        struct TestWasiState {
+            ctx: WasiCtx,
+            table: ResourceTable,
+        }
+
+        impl WasiView for TestWasiState {
+            fn ctx(&mut self) -> WasiCtxView<'_> {
+                WasiCtxView {
+                    ctx: &mut self.ctx,
+                    table: &mut self.table,
+                }
+            }
+        }
+
+        fn guest_env_keys(configured: &ConfiguredProvider) -> HashSet<String> {
+            let ctx = build_sandboxed_wasi_ctx_with(
+                configured.initialized_instance_kind(),
+                |_| Some("test-value".to_string()),
+                || panic!("an explicit AWS_EC2_METADATA_DISABLED value skips the probe"),
+            );
+            let mut state = TestWasiState {
+                ctx,
+                table: ResourceTable::new(),
+            };
+            state
+                .cli()
+                .get_environment()
+                .unwrap()
+                .into_iter()
+                .map(|(key, _value)| key)
+                .collect()
+        }
+
+        let aws = ConfiguredProvider::new(&ProviderLoadIdentity::for_test(
+            "aws",
+            ProviderTrustClass::Aws,
+        ));
+        let untrusted = ConfiguredProvider::new(&ProviderLoadIdentity::for_test(
+            "aws",
+            ProviderTrustClass::Untrusted,
+        ));
+
+        assert!(guest_env_keys(&aws).contains("AWS_ACCESS_KEY_ID"));
+        assert!(!guest_env_keys(&untrusted).contains("AWS_ACCESS_KEY_ID"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! must not compete with the real HTTP-path cause.
 
 use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
-use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass};
+use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
 
 /// Minimal component that imports both wasi:http and a fake interface. The
 /// HTTP-enabled binding path rejects it as an invalid provider component; the
@@ -30,8 +30,10 @@ const NON_WASI_BOGUS_COMPONENT_WAT: &str = r#"
 async fn render_instantiation_error(wat: &str) -> String {
     let cache_dir = tempfile::tempdir().expect("cache dir");
     let err = match WasmProviderFactory::from_bytes_with_cache_dir(
-        wat.as_bytes(),
-        ProviderLoadIdentity::for_test("fixture", ProviderTrustClass::Untrusted),
+        VerifiedLoad::for_test(
+            wat.as_bytes(),
+            ProviderLoadIdentity::for_test("fixture", ProviderTrustClass::Untrusted),
+        ),
         cache_dir.path(),
     )
     .await

@@ -18,11 +18,104 @@ use carina_core::resource::{
 use carina_core::schema::StructField;
 use carina_core::value::canonicalize_resources_with_schemas;
 
-#[test]
-fn invalid_trusted_local_inputs_are_not_parsed_until_provider_load() {
-    let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("mock-provider.wasm");
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/mock-provider/mock-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"mock fixture").unwrap();
+    std::fs::write(&installed_path, b"mock fixture").unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
 
-    assert!(inputs.parsed.get().is_none());
+    let invalid = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+    let loader_called = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&loader_called);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[],
+        tmp.path(),
+        false,
+        &invalid,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "unexpected load".into(),
+                ))
+            }
+        },
+    )
+    .unwrap();
+    assert!(factories.is_empty());
+    assert!(errors.is_empty());
+    assert!(invalid.parsed.get().is_none());
+
+    let called = Arc::clone(&loader_called);
+    let result = build_factories_from_providers_impl_using(
+        std::slice::from_ref(&config),
+        tmp.path(),
+        false,
+        &invalid,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "unexpected load".into(),
+                ))
+            }
+        },
+    );
+    let Err(error) = result else {
+        panic!("invalid grants must fail when the first provider load begins")
+    };
+    assert!(matches!(
+        error,
+        carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+    ));
+    assert!(!loader_called.load(Ordering::SeqCst));
+
+    let valid = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
+    let saw_aws = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&saw_aws);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[config],
+        tmp.path(),
+        false,
+        &valid,
+        move |verified| {
+            observed.store(
+                verified.identity().trust().class()
+                    == carina_provider_resolver::ProviderTrustClass::Aws,
+                Ordering::SeqCst,
+            );
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "stop after trust observation".into(),
+                ))
+            }
+        },
+    )
+    .unwrap();
+
+    assert!(factories.is_empty());
+    assert!(
+        errors
+            .get("aws")
+            .is_some_and(|message| message.contains("stop after trust observation")),
+        "the injected loader error should prove the production path was reached: {errors:?}"
+    );
+    assert!(saw_aws.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -365,15 +458,87 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
     }
 }
 
-#[test]
-fn source_provider_kind_mismatch_is_rejected() {
-    let source = "file:///tmp/provider.wasm".parse().unwrap();
-    let error = ensure_source_provider_kind_matches("configured", "reported", &source)
-        .expect_err("a source provider must report the configured block kind");
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wasm_path = tmp.path().join("provider.wasm");
+    std::fs::write(&wasm_path, b"fixture").unwrap();
+    let source: ProviderSource = format!("file://{}", wasm_path.display()).parse().unwrap();
+    let config = ProviderConfig {
+        name: "configured".into(),
+        source: Some(source.clone()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let installed =
+        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
 
+    let reported_mismatch = installed.with_load_error(
+        carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+            configured: "configured".into(),
+            reported: "reported".into(),
+        },
+    );
+    let reported = source_provider_kind_mismatch_from_load_error(&source, &reported_mismatch)
+        .expect("an artifact-reported name mismatch must be fatal");
     assert_eq!(
-        error.to_string(),
-        "Provider block kind 'configured' does not match loaded provider name 'reported' from source 'file:///tmp/provider.wasm'."
+        reported.to_string(),
+        format!(
+            "Provider block kind 'configured' does not match loaded provider name 'reported' from source '{source}'."
+        )
+    );
+
+    let grants = carina_provider_resolver::TrustedLocalGrants::parse(
+        &[format!("{}=aws", wasm_path.display())],
+        None,
+    )
+    .unwrap();
+    let identity_mismatch = installed
+        .load_with(&grants, |_verified| async {
+            Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
+        })
+        .await
+        .unwrap_err();
+    let identity = source_provider_kind_mismatch_from_load_error(&source, &identity_mismatch)
+        .expect("a trusted-identity name mismatch must be fatal");
+    assert_eq!(
+        identity.to_string(),
+        format!(
+            "Provider block kind 'configured' does not match trusted provider identity 'aws or awscc' from source '{source}'."
+        )
+    );
+
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/provider/provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&installed_path, b"fixture").unwrap();
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[config],
+        tmp.path(),
+        false,
+        &inputs,
+        |_verified| async {
+            Err(
+                carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+                    configured: "configured".into(),
+                    reported: "reported".into(),
+                },
+            )
+        },
+    )
+    .unwrap();
+    assert!(factories.is_empty());
+    assert!(
+        errors
+            .get("configured")
+            .is_some_and(|message| message.contains("artifact-reported name 'reported'")),
+        "the factory-discovery path must retain mismatches as load diagnostics: {errors:?}"
     );
 }
 
@@ -7230,10 +7395,9 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let error = match load_installed_wasm_provider_using(
         &installed,
         trusted_local_grants().unwrap(),
-        |bytes, identity| async move {
+        |verified| async move {
             carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-                bytes.as_bytes(),
-                identity,
+                verified,
                 &cache_path,
             )
             .await

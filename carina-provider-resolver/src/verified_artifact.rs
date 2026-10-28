@@ -12,6 +12,7 @@ use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, NoRegistryLock, RegistryLock,
     RegistrySignatureProtection, WasmArtifactPath, cache_path_wasm, sha256_file,
 };
+use crate::provider_trust::ProviderLoadIdentity;
 use crate::revision_resolver::cache_path_revision;
 
 /// Provider artifact bytes captured by the resolver.
@@ -37,6 +38,40 @@ impl fmt::Debug for ProviderArtifactBytes {
             .debug_struct("ProviderArtifactBytes")
             .field("len", &self.0.len())
             .finish()
+    }
+}
+
+/// Resolver-owned provider bytes bound to the load identity derived for those
+/// exact bytes.
+///
+/// The private fields prevent callers from pairing an identity with arbitrary
+/// bytes. Production values are constructed only by [`crate::InstalledProvider`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedLoad {
+    bytes: ProviderArtifactBytes,
+    identity: ProviderLoadIdentity,
+}
+
+impl VerifiedLoad {
+    pub fn bytes(&self) -> &ProviderArtifactBytes {
+        &self.bytes
+    }
+
+    pub fn identity(&self) -> &ProviderLoadIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn new(bytes: ProviderArtifactBytes, identity: ProviderLoadIdentity) -> Self {
+        Self { bytes, identity }
+    }
+
+    /// Construct a bound load for host tests that do not run the resolver.
+    #[cfg(feature = "test-utils")]
+    pub fn for_test(bytes: impl AsRef<[u8]>, identity: ProviderLoadIdentity) -> Self {
+        Self {
+            bytes: ProviderArtifactBytes(Arc::from(bytes.as_ref())),
+            identity,
+        }
     }
 }
 

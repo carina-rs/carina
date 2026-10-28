@@ -404,6 +404,36 @@ fn build_factories_from_providers_impl(
     (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>),
     carina_provider_resolver::GrantParseError,
 > {
+    let grant_inputs =
+        TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
+    build_factories_from_providers_impl_using(
+        providers,
+        base_dir,
+        report_errors,
+        grant_inputs,
+        |verified| async move { carina_plugin_host::WasmProviderFactory::from_bytes(verified).await },
+    )
+}
+
+fn build_factories_from_providers_impl_using<L, Fut>(
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+    report_errors: bool,
+    grant_inputs: &TrustedLocalGrantInputs,
+    mut loader: L,
+) -> Result<
+    (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>),
+    carina_provider_resolver::GrantParseError,
+>
+where
+    L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                carina_plugin_host::WasmProviderFactory,
+                carina_plugin_host::WasmProviderLoadError,
+            >,
+        >,
+{
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
 
@@ -422,10 +452,10 @@ fn build_factories_from_providers_impl(
             }
         };
 
-        let grants = trusted_local_grants()?;
+        let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(load_installed_wasm_provider(&installed, grants))
+                .block_on(installed.load_with(grants, |verified| loader(verified)))
         });
 
         match factory_result {
@@ -467,8 +497,8 @@ async fn load_installed_wasm_provider(
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 > {
-    load_installed_wasm_provider_using(installed, grants, |bytes, identity| async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes(), identity).await
+    load_installed_wasm_provider_using(installed, grants, |verified| async move {
+        carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
     })
     .await
 }
@@ -482,10 +512,7 @@ async fn load_installed_wasm_provider_using<F, Fut>(
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 >
 where
-    F: FnOnce(
-        carina_provider_resolver::ProviderArtifactBytes,
-        carina_provider_resolver::ProviderLoadIdentity,
-    ) -> Fut,
+    F: FnOnce(carina_provider_resolver::VerifiedLoad) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 carina_plugin_host::WasmProviderFactory,
@@ -2144,20 +2171,31 @@ fn source_provider_initialization_error(provider_name: &str, error: ProviderErro
     AppError::Provider(error.for_provider(provider_name.to_string()))
 }
 
-fn ensure_source_provider_kind_matches(
-    configured: &str,
-    loaded: &str,
+fn source_provider_kind_mismatch_from_load_error(
     source: &ProviderSource,
-) -> Result<(), AppError> {
-    if configured == loaded {
-        return Ok(());
+    error: &carina_provider_resolver::ProviderArtifactLoadError<
+        carina_plugin_host::WasmProviderLoadError,
+    >,
+) -> Option<AppError> {
+    if let Some(identity) = error.identity_error() {
+        return Some(AppError::SourceProviderTrustMismatch {
+            configured: identity.configured_name().to_string(),
+            expected: identity.expected().to_string(),
+            provider_source: source.to_string(),
+        });
     }
 
-    Err(AppError::SourceProviderKindMismatch {
-        configured: configured.to_string(),
-        loaded: loaded.to_string(),
-        provider_source: source.to_string(),
-    })
+    match error.loader_error()? {
+        carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+            configured,
+            reported,
+        } => Some(AppError::SourceProviderKindMismatch {
+            configured: configured.clone(),
+            loaded: reported.clone(),
+            provider_source: source.to_string(),
+        }),
+        _ => None,
+    }
 }
 
 /// Failure mode for `load_source_provider`. Distinguishing between a
@@ -2207,14 +2245,17 @@ async fn load_source_provider(
             .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
 
     let grants = trusted_local_grants().map_err(LoadSourceError::TrustedLocalGrant)?;
-    let factory: Box<dyn ProviderFactory> = Box::new(
-        load_installed_wasm_provider(&installed, grants)
-            .await
-            .map_err(LoadSourceError::Wasm)?,
-    );
+    let factory = match load_installed_wasm_provider(&installed, grants).await {
+        Ok(factory) => factory,
+        Err(error) => {
+            if let Some(mismatch) = source_provider_kind_mismatch_from_load_error(source, &error) {
+                return Err(LoadSourceError::KindMismatch(mismatch));
+            }
+            return Err(LoadSourceError::Wasm(error));
+        }
+    };
+    let factory: Box<dyn ProviderFactory> = Box::new(factory);
     let name = factory.name().to_string();
-    ensure_source_provider_kind_matches(config.name(), &name, source)
-        .map_err(LoadSourceError::KindMismatch)?;
 
     let ready_config =
         prepare_provider_ready_config(factory.as_ref(), config).map_err(LoadSourceError::Config)?;

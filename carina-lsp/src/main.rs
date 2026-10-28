@@ -99,9 +99,8 @@ fn build_factories(
         match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
                 grants,
-                |bytes, identity| async move {
-                    carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes(), identity)
-                        .await
+                |verified| async move {
+                    carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
                 },
             ))
         }) {
@@ -124,22 +123,29 @@ fn build_factories(
     (factories, errors, fingerprint)
 }
 
+fn trusted_local_grants_from_env(
+    env_value: Option<&std::ffi::OsStr>,
+    report_error: impl FnOnce(&carina_provider_resolver::GrantParseError),
+) -> carina_provider_resolver::TrustedLocalGrants {
+    match carina_provider_resolver::TrustedLocalGrants::parse_os(&[], env_value) {
+        Ok(grants) => grants,
+        Err(error) => {
+            report_error(&error);
+            carina_provider_resolver::TrustedLocalGrants::parse_os(&[], None)
+                .expect("an empty trusted-local grant set is valid")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    let trusted_local_env = std::env::var("CARINA_TRUST_LOCAL_PROVIDER").ok();
-    let trusted_local_grants = match carina_provider_resolver::TrustedLocalGrants::parse(
-        &[],
-        trusted_local_env.as_deref(),
-    ) {
-        Ok(grants) => grants,
-        Err(error) => {
+    let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
+    let trusted_local_grants =
+        trusted_local_grants_from_env(trusted_local_env.as_deref(), |error| {
             log::error!("Ignoring invalid CARINA_TRUST_LOCAL_PROVIDER: {error}");
-            carina_provider_resolver::TrustedLocalGrants::parse(&[], None)
-                .expect("an empty trusted-local grant set is valid")
-        }
-    };
+        });
     let trusted_local_grants = std::sync::Arc::new(trusted_local_grants);
 
     let stdin = tokio::io::stdin();
@@ -186,6 +192,26 @@ mod tests {
 
     fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
         carina_provider_resolver::TrustedLocalGrants::parse(&[], None).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_trusted_local_env_is_reported_and_ignored() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+        let mut reported = None;
+        let grants = trusted_local_grants_from_env(Some(&value), |error| {
+            reported = Some(error.to_string());
+        });
+
+        assert_eq!(grants, no_local_grants());
+        assert!(
+            reported
+                .as_deref()
+                .is_some_and(|message| message.contains("must be valid UTF-8")),
+            "the non-UTF-8 parse error must reach the LSP log boundary: {reported:?}"
+        );
     }
 
     fn cfg(name: &str, source: Option<&str>, binding: Option<&str>) -> (PathBuf, ProviderConfig) {

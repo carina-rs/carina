@@ -34,7 +34,7 @@ use crate::signing;
 use crate::trusted_local::TrustedLocalGrants;
 use crate::verified_artifact::{
     DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
-    VerifiedArtifactError, VersionArtifactPin, lock_artifact_selection,
+    VerifiedArtifactError, VerifiedLoad, VersionArtifactPin, lock_artifact_selection,
     lookup_version_artifact_pin, publish_download,
 };
 
@@ -4026,9 +4026,10 @@ impl WasmArtifactPath {
 }
 
 /// An installed provider artifact together with the resolution provenance that
-/// selected it. [`InstalledProvider::load_with`] gives the loader only the
-/// bytes retained from lookup (and verified there for lock-controlled
-/// artifacts). [`InstalledProvider::path`] is for display and provenance only.
+/// selected it. [`InstalledProvider::load_with`] gives the loader a single
+/// [`VerifiedLoad`] that binds the bytes retained from lookup (and verified
+/// there for lock-controlled artifacts) to their resolver-derived identity.
+/// [`InstalledProvider::path`] is for display and provenance only.
 ///
 /// Lock provenance also has no public attachment constructor:
 ///
@@ -4177,8 +4178,8 @@ impl InstalledProvider {
         }
     }
 
-    /// Load through a caller-supplied async function, supplying both the
-    /// verified artifact bytes and the resolver-owned load identity while
+    /// Load through a caller-supplied async function, supplying one value that
+    /// binds verified artifact bytes to the resolver-owned load identity while
     /// making provenance attachment mandatory on the error path.
     pub async fn load_with<T, E, F, Fut>(
         &self,
@@ -4186,7 +4187,7 @@ impl InstalledProvider {
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(ProviderArtifactBytes, ProviderLoadIdentity) -> Fut,
+        F: FnOnce(VerifiedLoad) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
         self.load_with_notice_sink(grants, |line| eprintln!("{line}"), loader)
@@ -4200,14 +4201,14 @@ impl InstalledProvider {
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(ProviderArtifactBytes, ProviderLoadIdentity) -> Fut,
+        F: FnOnce(VerifiedLoad) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
         S: FnMut(&str),
     {
         let identity = self
             .load_identity(grants, &mut notice_sink)
             .map_err(|error| self.with_identity_error(error))?;
-        loader(self.artifact_bytes(), identity)
+        loader(VerifiedLoad::new(self.artifact_bytes(), identity))
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -4337,6 +4338,13 @@ impl<E> ProviderArtifactLoadError<E> {
         match &self.error {
             ProviderArtifactLoadFailure::Identity(error) => Some(error),
             ProviderArtifactLoadFailure::Loader(_) => None,
+        }
+    }
+
+    pub fn loader_error(&self) -> Option<&E> {
+        match &self.error {
+            ProviderArtifactLoadFailure::Identity(_) => None,
+            ProviderArtifactLoadFailure::Loader(error) => Some(error),
         }
     }
 }
@@ -17678,8 +17686,8 @@ transparency_log_present = false
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(&no_local_grants(), |bytes, _identity| async move {
-                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
             })
             .await
             .unwrap();
@@ -17702,8 +17710,8 @@ transparency_log_present = false
         fs::write(&source_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(&no_local_grants(), |bytes, _identity| async move {
-                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
             })
             .await
             .unwrap();
@@ -17717,6 +17725,33 @@ transparency_log_present = false
     }
 
     #[tokio::test]
+    async fn load_with_binds_identity_to_retained_artifact_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let artifact_bytes = b"resolver-owned local provider";
+        fs::write(&source_path, artifact_bytes).unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+
+        let (loaded_bytes, configured_name, trust_class) = installed
+            .load_with(&grants, |verified| async move {
+                Ok::<_, std::convert::Infallible>((
+                    verified.bytes().as_bytes().to_vec(),
+                    verified.identity().configured_name().to_string(),
+                    verified.identity().trust().class(),
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded_bytes, artifact_bytes);
+        assert_eq!(configured_name, "awscc");
+        assert_eq!(trust_class, ProviderTrustClass::Aws);
+    }
+
+    #[tokio::test]
     async fn file_provider_without_grant_is_untrusted() {
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
@@ -17725,8 +17760,8 @@ transparency_log_present = false
         let installed = find_file_provider_source(project.path(), &config).unwrap();
 
         let class = installed
-            .load_with(&no_local_grants(), |_bytes, identity| async move {
-                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
             .unwrap();
@@ -17750,8 +17785,8 @@ transparency_log_present = false
             .load_with_notice_sink(
                 &grants,
                 |line| emitted.push(line.to_string()),
-                |_bytes, identity| async move {
-                    Ok::<_, std::convert::Infallible>(identity.trust().class())
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
                 },
             )
             .await
@@ -17783,8 +17818,8 @@ transparency_log_present = false
             TrustedLocalGrants::parse(&[format!("{}=aws", target.display())], None).unwrap();
 
         let class = installed
-            .load_with(&grants, |_bytes, identity| async move {
-                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            .load_with(&grants, |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
             .unwrap();
@@ -17809,8 +17844,8 @@ transparency_log_present = false
             TrustedLocalGrants::parse(&[format!("{}=aws", granted_path.display())], None).unwrap();
 
         let class = installed
-            .load_with(&grants, |_bytes, identity| async move {
-                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            .load_with(&grants, |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
             .unwrap();
@@ -17840,8 +17875,8 @@ transparency_log_present = false
             .load_with_notice_sink(
                 &grants,
                 |line| emitted.push(line.to_string()),
-                |_bytes, identity| async move {
-                    Ok::<_, std::convert::Infallible>(identity.trust().class())
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
                 },
             )
             .await
@@ -17869,7 +17904,7 @@ transparency_log_present = false
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
         let error = installed
-            .load_with(&grants, |_bytes, _identity| async move {
+            .load_with(&grants, |_verified| async move {
                 Ok::<_, std::convert::Infallible>(())
             })
             .await
@@ -17905,7 +17940,7 @@ transparency_log_present = false
         let called = std::sync::Arc::clone(&loader_called);
 
         let error = installed
-            .load_with(&no_local_grants(), move |_bytes, _identity| async move {
+            .load_with(&no_local_grants(), move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, std::convert::Infallible>(())
             })
@@ -17949,8 +17984,8 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
 
         let class = installed
-            .load_with(&no_local_grants(), |_bytes, identity| async move {
-                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
             .unwrap();
@@ -17984,8 +18019,8 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
 
         let class = installed
-            .load_with(&no_local_grants(), |_bytes, identity| async move {
-                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
             .unwrap();
@@ -18251,10 +18286,10 @@ transparency_log_present = false
         .unwrap();
 
         let (loaded_bytes, configured_name) = installed
-            .load_with(&no_local_grants(), |bytes, identity| async move {
+            .load_with(&no_local_grants(), |verified| async move {
                 Ok::<_, std::convert::Infallible>((
-                    bytes.as_bytes().to_vec(),
-                    identity.configured_name().to_string(),
+                    verified.bytes().as_bytes().to_vec(),
+                    verified.identity().configured_name().to_string(),
                 ))
             })
             .await

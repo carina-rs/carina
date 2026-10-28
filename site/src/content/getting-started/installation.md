@@ -61,7 +61,7 @@ provider awscc {
 carina init
 ```
 
-`carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing.
+`carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing. Remote-provider trust is decided from the project's lock entry and the installed artifact that matches it, so treat both `carina-providers.lock` and `.carina/` as trusted inputs and review them in repositories you did not write.
 
 `source` takes one of three forms:
 
@@ -137,6 +137,8 @@ For a sequence of commands, set `CARINA_TRUST_LOCAL_PROVIDER` instead. It accept
 ```bash
 CARINA_TRUST_LOCAL_PROVIDER='/abs/path/carina-provider-aws.wasm=aws' carina plan
 ```
+
+The LSP reads only `CARINA_TRUST_LOCAL_PROVIDER`; it cannot receive `--trust-local-provider` from a Carina CLI invocation.
 
 The other supported kind is `github`, for a local build of the GitHub provider. Grants last only for the current process; Carina never writes them to the provider lock, cache, saved plan, or state.
 

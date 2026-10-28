@@ -4,12 +4,16 @@ use std::path::{Path, PathBuf};
 
 use carina_core::provider::ProviderFactory;
 use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
-use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass};
+use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{ManglingAndAbi, Resolve};
 
 fn test_identity(name: &str) -> ProviderLoadIdentity {
     ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
+}
+
+fn test_load(bytes: &[u8], name: &str) -> VerifiedLoad {
+    VerifiedLoad::for_test(bytes, test_identity(name))
 }
 
 /// A valid component that cannot be brought up as a Carina provider because
@@ -210,13 +214,10 @@ async fn from_bytes_loads_mock_provider_fixture() {
     let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("create cache temp dir");
 
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("provider bytes should load");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("provider bytes should load");
 
     assert_eq!(factory.name(), "mock");
 }
@@ -235,15 +236,13 @@ async fn precompile_cache_key_depends_only_on_content() {
     let first_bytes = std::fs::read(first_path).expect("read first provider path");
     let second_bytes = std::fs::read(second_path).expect("read second provider path");
     WasmProviderFactory::from_bytes_with_cache_dir(
-        &first_bytes,
-        test_identity("mock"),
+        test_load(&first_bytes, "mock"),
         cache_dir.path(),
     )
     .await
     .expect("first provider should load");
     WasmProviderFactory::from_bytes_with_cache_dir(
-        &second_bytes,
-        test_identity("mock"),
+        test_load(&second_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -260,8 +259,7 @@ async fn precompile_cache_key_depends_only_on_content() {
     );
 
     let distinct_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(),
-        test_identity("mock"),
+        test_load(NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(), "mock"),
         cache_dir.path(),
     )
     .await
@@ -290,23 +288,17 @@ async fn test_from_bytes_uses_cache() {
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First call: compiles and caches
-    let factory1 = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("first byte load should succeed");
+    let factory1 =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("first byte load should succeed");
     assert_eq!(factory1.name(), "mock");
 
     // Second call: uses cache
-    let factory2 = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("second byte load (cache hit) should succeed");
+    let factory2 =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("second byte load (cache hit) should succeed");
     assert_eq!(factory2.name(), "mock");
 
     // Both factories should report the mock provider's schemas.
@@ -327,13 +319,10 @@ async fn test_from_bytes_recovers_from_stale_cache() {
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First, create a valid cache so we know the filename
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("initial byte load should succeed");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("initial byte load should succeed");
     assert_eq!(factory.name(), "mock");
 
     // Find the .cwasm file before dropping the factory (path only, no access).
@@ -355,13 +344,10 @@ async fn test_from_bytes_recovers_from_stale_cache() {
     std::fs::write(&cwasm_path, corrupt_contents).expect("Failed to write stale cache file");
 
     // The byte loader should detect invalid cache, recompile, and succeed.
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("byte loader should recover from stale cache");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("byte loader should recover from stale cache");
 
     assert_eq!(factory.name(), "mock");
     assert_ne!(
@@ -379,8 +365,7 @@ async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
     // A cold load still precompiles the component before its deterministic
     // bring-up failure, leaving a valid cache artifact for the next attempt.
     let cold_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        wasm_bytes,
-        test_identity("mock"),
+        test_load(wasm_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -397,8 +382,7 @@ async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
     let artifact_before = snapshot_cache_artifact(&cwasm_path);
 
     let warm_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        wasm_bytes,
-        test_identity("mock"),
+        test_load(wasm_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -441,8 +425,7 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     }
     let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
     let cold_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        &component_bytes,
-        test_identity("mock"),
+        test_load(&component_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -462,8 +445,7 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     let artifact_before = snapshot_cache_artifact(&cwasm_path);
 
     let warm_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        &component_bytes,
-        test_identity("mock"),
+        test_load(&component_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -488,8 +470,7 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
     let component_bytes = build_protocol_v2_component();
 
     let error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        &component_bytes,
-        test_identity("old-v2"),
+        test_load(&component_bytes, "old-v2"),
         cache_dir.path(),
     )
     .await
@@ -584,13 +565,10 @@ async fn test_byte_constructor_uses_explicit_cache() {
     // Use a temporary directory as the cache location to avoid polluting the real cache
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("byte constructor should succeed");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("byte constructor should succeed");
 
     assert_eq!(factory.name(), "mock");
 
@@ -614,13 +592,10 @@ async fn test_byte_constructor_uses_explicit_cache() {
         .modified()
         .expect("modified");
 
-    let factory2 = WasmProviderFactory::from_bytes_with_cache_dir(
-        &wasm,
-        test_identity("mock"),
-        cache_dir.path(),
-    )
-    .await
-    .expect("second byte constructor should succeed");
+    let factory2 =
+        WasmProviderFactory::from_bytes_with_cache_dir(test_load(&wasm, "mock"), cache_dir.path())
+            .await
+            .expect("second byte constructor should succeed");
 
     assert_eq!(factory2.name(), "mock");
 
