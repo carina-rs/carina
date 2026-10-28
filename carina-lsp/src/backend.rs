@@ -6,7 +6,7 @@ use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
-use carina_provider_resolver::ProviderArtifactFingerprint;
+use carina_provider_resolver::{LegacyLockEntryError, ProviderArtifactFingerprint};
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -59,7 +59,7 @@ struct ProviderState {
     /// `.carina/` deletions the editor's file watcher did not report
     /// (issue #2023 follow-up: VS Code excludes dot-prefixed directories
     /// from its watcher by default).
-    install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
+    install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
 }
 
 impl ProviderState {
@@ -68,7 +68,7 @@ impl ProviderState {
         provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
         prober: Option<ProviderInstallProber>,
-        install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
+        install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
             configs.iter().map(|(_, config)| config),
@@ -144,17 +144,18 @@ impl ProviderState {
 /// Injected from `main.rs` so the poller and factory builder share resolver
 /// path-selection behavior.
 pub type ProviderInstallProber = Arc<
-    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderArtifactFingerprint
-        + Send
-        + Sync,
+    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderInstallFingerprint + Send + Sync,
 >;
+
+pub type ProviderInstallFingerprint =
+    std::result::Result<ProviderArtifactFingerprint, LegacyLockEntryError>;
 
 /// Compute `(provider_name, metadata)` pairs for a list of configs.
 /// Ordered to match the input so equality comparisons are stable.
 fn probe_install_fingerprint(
     prober: &ProviderInstallProber,
     configs: &[(PathBuf, carina_core::parser::ProviderConfig)],
-) -> Vec<(String, ProviderArtifactFingerprint)> {
+) -> Vec<(String, ProviderInstallFingerprint)> {
     configs
         .iter()
         .map(|(dir, cfg)| (cfg.name.clone(), prober(dir, cfg)))
@@ -237,7 +238,7 @@ impl ProviderStates {
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
     HashMap<String, String>, // provider name -> error reason
-    Vec<(String, ProviderArtifactFingerprint)>, // install fingerprint
+    Vec<(String, ProviderInstallFingerprint)>, // install fingerprint
 );
 
 /// Function type for building provider factories from configs with their source directories.
@@ -1006,7 +1007,10 @@ mock.test.Thing {
             HashMap::new(),
             configs,
             None,
-            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
         );
         let document = Document::new(
             main.to_string(),
@@ -1065,7 +1069,10 @@ mock.test.Thing {
             )]),
             configs,
             None,
-            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
         );
         let document = Document::new(
             main.to_string(),
@@ -1254,10 +1261,10 @@ mock.test.Thing {
                     _ => None,
                 })
                 .and_then(|p| test_file_fingerprint(std::path::Path::new(p)));
-            ProviderArtifactFingerprint {
+            Ok(ProviderArtifactFingerprint {
                 artifact,
                 lock_file: test_file_fingerprint(&dir.join("carina-providers.lock")),
-            }
+            })
         })
     }
 
@@ -1298,14 +1305,14 @@ mock.test.Thing {
 
         let before = probe_install_fingerprint(&prober, &configs);
         assert!(
-            before[0].1.artifact.is_some(),
+            before[0].1.as_ref().unwrap().artifact.is_some(),
             "initial probe should see the installed binary metadata"
         );
 
         std::fs::remove_file(&installed).unwrap();
         let after = probe_install_fingerprint(&prober, &configs);
         assert!(
-            after[0].1.artifact.is_none(),
+            after[0].1.as_ref().unwrap().artifact.is_none(),
             "probe after delete must record missing artifact metadata"
         );
         assert_ne!(before, after);

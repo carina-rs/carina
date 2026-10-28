@@ -89,7 +89,7 @@ fn formatting_factory_builder() -> FactoryBuilder {
             .map(|(_, config)| {
                 (
                     config.name.clone(),
-                    carina_provider_resolver::ProviderArtifactFingerprint::default(),
+                    Ok(carina_provider_resolver::ProviderArtifactFingerprint::default()),
                 )
             })
             .collect();

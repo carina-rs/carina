@@ -29,6 +29,7 @@ pub async fn run_init(
         |install_lock, providers, mode| {
             carina_provider_resolver::resolve_all(install_lock, providers, mode)
                 .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
         },
     )
     .await
@@ -270,6 +271,7 @@ mod tests {
                     &http,
                 )
                 .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
             },
         )
         .await

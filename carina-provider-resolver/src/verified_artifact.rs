@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock, WasmArtifactPath,
-    cache_path_wasm, sha256_file,
+    cache_path_github_release, cache_path_wasm, sha256_file,
 };
 use crate::revision_resolver::cache_path_revision;
 
@@ -99,8 +99,7 @@ impl<P, R> ArtifactPin<'_, P, R> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VersionArtifactPin {
-    pub(crate) version: String,
+pub(crate) struct GithubReleaseArtifactPin {
     pub(crate) constraint: Option<String>,
 }
 
@@ -309,26 +308,38 @@ impl VerifiedArtifact {
     }
 }
 
-pub(crate) fn lookup_version_artifact_pin<'a>(
+pub(crate) fn lookup_github_release_artifact_pin<'a>(
     lock_file: &'a LockFile,
     source: &RemoteSourceKey,
-    version: &str,
+    version: &semver::Version,
     provider_name: &'a str,
-) -> ArtifactPin<'a, VersionArtifactPin> {
+) -> ArtifactPin<'a, GithubReleaseArtifactPin> {
+    let version_string = version.to_string();
     let pinned = lock_file
-        .find_by_source_key_and_version(source, version)
+        .find_by_source_key_and_version(source, &version_string)
         .and_then(|entry| match &entry.kind {
-            LockEntryKind::Version {
+            LockEntryKind::GithubRelease {
                 version: locked_version,
+                tag: _,
+                asset_id: _,
                 constraint,
-            } => Some((
+            } if locked_version == version => Some((
                 entry,
-                VersionArtifactPin {
-                    version: locked_version.clone(),
+                GithubReleaseArtifactPin {
                     constraint: constraint.clone(),
                 },
             )),
-            LockEntryKind::Revision {
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
             }
@@ -374,6 +385,12 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
             }
             | LockEntryKind::Version {
                 version: _,
+                constraint: _,
+            }
+            | LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
                 constraint: _,
             }
             | LockEntryKind::RegistryRevision {
@@ -492,6 +509,37 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
                 constraint: constraint.clone(),
             },
         ),
+        (
+            LockEntryKind::GithubRelease {
+                version,
+                tag,
+                asset_id,
+                constraint,
+            },
+            RemoteSource::GithubDirect(source),
+        ) => (
+            cache_path_github_release(project_dir, &source.source_key(), version),
+            version.to_string(),
+            LockedProviderPin::GithubRelease {
+                version: version.to_string(),
+                tag: tag.clone(),
+                asset_id: *asset_id,
+                constraint: constraint.clone(),
+            },
+        ),
+        (
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            },
+            RemoteSource::Registry(_source),
+        ) => {
+            return Err(format!(
+                "Provider '{provider_name}' has a GitHub release lock pin for a registry source"
+            ));
+        }
         (LockEntryKind::RegistryRevision { revision, version }, source) => (
             cache_path_wasm(project_dir, &source.source_key(), version),
             version.clone(),

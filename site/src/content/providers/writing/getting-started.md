@@ -355,7 +355,9 @@ provider hello {
 }
 ```
 
-`version` is a semver constraint, as for any provider. `carina init` lists the repository's releases through the GitHub API, picks the newest version that matches, and downloads the release asset named `<repo>-v<version>.wasm` from the tag `v<version>`, for example `carina-provider-hello-v0.1.0.wasm` from `v0.1.0`. Tag releases with the `v` prefix, and attach the built component to the release under that name: `target/wasm32-wasip2/release/carina-provider-hello.wasm` renamed to `carina-provider-hello-v0.1.0.wasm`. This lookup sends no token, so the repository must be public, and only the 100 most recent releases are considered.
+`version` is a semver constraint, as for any provider. `carina init` considers all of the repository's releases, picks the newest matching version, and preserves the release's exact tag. Tags may be either `v0.1.0` or `0.1.0`. The release must contain exactly one asset whose name ends in `.wasm`; the asset may otherwise have any name. The lookup uses `GITHUB_TOKEN` when set or the token from a logged-in `gh` when available, so it also works with private repositories. `carina-providers.lock` records the exact tag and GitHub asset ID, alongside the semver version and checksum, so later installs fetch and verify the same asset.
+
+Lock files written by older Carina versions for `github.com/...` version sources do not record the release tag. Run `carina init` once to rewrite those entries; `carina init --locked`, plan, and apply report the legacy entry until it has been rewritten.
 
 With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit. For that, a GitHub Actions workflow in the repository must upload the built component as an artifact named `<repo>.wasm`, for example `carina-provider-hello.wasm`. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
 
