@@ -2657,10 +2657,13 @@ impl WasmProviderFactory {
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
     pub async fn from_bytes(wasm_bytes: &[u8]) -> Result<Self, WasmProviderLoadError> {
-        match Self::default_cache_dir() {
-            Some(cache_dir) => Self::from_bytes_with_cache_dir(wasm_bytes, &cache_dir).await,
-            None => Self::new_uncached(wasm_bytes).await,
-        }
+        let load: BoxFuture<'_, Result<Self, WasmProviderLoadError>> = Box::pin(async move {
+            match Self::default_cache_dir() {
+                Some(cache_dir) => Self::from_bytes_with_cache_dir(wasm_bytes, &cache_dir).await,
+                None => Self::new_uncached(wasm_bytes).await,
+            }
+        });
+        load.await
     }
 
     /// Load provider bytes with an explicit precompile cache directory.
