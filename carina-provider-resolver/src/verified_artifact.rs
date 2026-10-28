@@ -1618,18 +1618,19 @@ mod tests {
     }
 
     #[test]
-    fn origin_download_checksum_mismatch_is_typed_and_preserves_destination() {
-        let _env_guard = crate::test_env_guard();
+    fn origin_download_checksum_mismatch_preserves_destination_and_user_trust() {
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
-        let source = match "github.com/carina-rs/carina-provider-aws"
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
+        std::fs::create_dir_all(user_dirs.trust_record_dir()).unwrap();
+        let github = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
         {
-            ProviderSource::Remote(source) => source.source_key(),
-            ProviderSource::File(_) => unreachable!(),
+            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
+            source => panic!("expected GitHub source: {source}"),
         };
+        let source = github.source_key();
         let version = semver::Version::parse("1.0.0").unwrap();
         let tag = ReleaseTag::from_lock("v1.0.0".into());
         let asset_id = AssetId::from_lock(42);
@@ -1660,13 +1661,21 @@ mod tests {
             registry: None,
         });
         let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
+        let location = GithubReleaseDownloadLocation::for_test(
+            RepoSlug::try_from(&github).unwrap(),
+            tag,
+            asset_id,
+        );
 
-        let error = publish_download_verified(staged, pin)
+        let error = publish_download(&user_dirs, staged, pin, FetchedLocation::for_test(location))
             .expect_err("origin bytes must match the existing lock pin");
 
-        assert!(matches!(error, VerifiedArtifactError::ChecksumMismatch(_)));
+        assert!(
+            error.contains("does not match the sha256 pinned"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(destination.as_path()).unwrap(), locked_bytes);
-        assert!(trust_record_files(trust.path()).is_empty());
+        assert!(trust_record_files(user_dirs.trust_record_dir()).is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub struct UserDirs {
     trust_record_dir: PathBuf,
     plugin_cache_dir: PathBuf,
     compiled_wasm_cache_dir: PathBuf,
-    agents_skills_dir: PathBuf,
+    agents_skills_root: PathBuf,
 }
 
 impl UserDirs {
@@ -46,7 +46,7 @@ impl UserDirs {
             trust_record_dir: carina.join("trust"),
             plugin_cache_dir: carina.join("plugin-cache"),
             compiled_wasm_cache_dir: carina.join("cache"),
-            agents_skills_dir: root.join(".agents").join("skills").join("carina"),
+            agents_skills_root: root.join(".agents").join("skills"),
         }
     }
 
@@ -65,9 +65,9 @@ impl UserDirs {
         &self.compiled_wasm_cache_dir
     }
 
-    /// Install directory for Carina's Agent Skill.
-    pub fn agents_skills_dir(&self) -> &Path {
-        &self.agents_skills_dir
+    /// Root directory containing user-installed Agent Skills.
+    pub fn agents_skills_root(&self) -> &Path {
+        &self.agents_skills_root
     }
 
     fn from_home_and_environment(
@@ -77,7 +77,7 @@ impl UserDirs {
         in_nextest: bool,
         test_home: Option<OsString>,
     ) -> Result<Self, UserDirsError> {
-        if in_nextest {
+        let nextest_test_home = if in_nextest {
             let Some(test_home) = test_home else {
                 return Err(UserDirsError::NextestTestHomeMissing { home });
             };
@@ -85,7 +85,10 @@ impl UserDirs {
             if home != test_home {
                 return Err(UserDirsError::NextestHomeMismatch { home, test_home });
             }
-        }
+            Some(test_home)
+        } else {
+            None
+        };
 
         let mut dirs = Self::under(&home);
         if let Some(value) = trust_record_override {
@@ -98,7 +101,57 @@ impl UserDirs {
         if let Some(path) = plugin_cache_override {
             dirs.plugin_cache_dir = path;
         }
+        if let Some(test_home) = nextest_test_home {
+            if !dirs.trust_record_dir.starts_with(&test_home) {
+                return Err(UserDirsError::NextestTrustRecordDirectoryOutsideTestHome {
+                    path: dirs.trust_record_dir,
+                    test_home,
+                });
+            }
+            if !dirs.plugin_cache_dir.starts_with(&test_home) {
+                return Err(UserDirsError::NextestPluginCacheDirectoryOutsideTestHome {
+                    path: dirs.plugin_cache_dir,
+                    test_home,
+                });
+            }
+        }
         Ok(dirs)
+    }
+}
+
+/// Owned, automatically cleaned user-directory fixture for tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct TestUserDirs {
+    user_dirs: UserDirs,
+    _root: tempfile::TempDir,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl TestUserDirs {
+    /// Create an isolated user home that remains alive for this fixture's lifetime.
+    pub fn new() -> Self {
+        let root = tempfile::tempdir().expect("create isolated test user home");
+        let user_dirs = UserDirs::under(root.path());
+        Self {
+            user_dirs,
+            _root: root,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for TestUserDirs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl std::ops::Deref for TestUserDirs {
+    type Target = UserDirs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.user_dirs
     }
 }
 
@@ -120,6 +173,16 @@ pub enum UserDirsError {
         "nextest home isolation guard: resolved home {home:?} does not match {TEST_HOME_ENV} {test_home:?}"
     )]
     NextestHomeMismatch { home: PathBuf, test_home: PathBuf },
+
+    #[error(
+        "nextest home isolation guard: effective trust record directory {path:?} is outside {TEST_HOME_ENV} {test_home:?}"
+    )]
+    NextestTrustRecordDirectoryOutsideTestHome { path: PathBuf, test_home: PathBuf },
+
+    #[error(
+        "nextest home isolation guard: effective plugin cache directory {path:?} is outside {TEST_HOME_ENV} {test_home:?}"
+    )]
+    NextestPluginCacheDirectoryOutsideTestHome { path: PathBuf, test_home: PathBuf },
 }
 
 #[cfg(test)]
@@ -200,5 +263,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dirs.trust_record_dir(), home.join(".carina/trust"));
+    }
+
+    #[test]
+    fn nextest_rejects_trust_record_override_outside_test_home() {
+        let home = PathBuf::from("/tmp/nextest-home");
+        let error = UserDirs::from_home_and_environment(
+            home.clone(),
+            Some(OsString::from("/tmp/outside/trust")),
+            None,
+            true,
+            Some(home.clone().into_os_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            UserDirsError::NextestTrustRecordDirectoryOutsideTestHome {
+                path: PathBuf::from("/tmp/outside/trust"),
+                test_home: home,
+            }
+        );
+    }
+
+    #[test]
+    fn nextest_rejects_plugin_cache_override_outside_test_home() {
+        let home = PathBuf::from("/tmp/nextest-home");
+        let error = UserDirs::from_home_and_environment(
+            home.clone(),
+            None,
+            Some(PathBuf::from("/tmp/outside/plugin-cache")),
+            true,
+            Some(home.clone().into_os_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            UserDirsError::NextestPluginCacheDirectoryOutsideTestHome {
+                path: PathBuf::from("/tmp/outside/plugin-cache"),
+                test_home: home,
+            }
+        );
     }
 }

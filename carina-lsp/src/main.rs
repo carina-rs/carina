@@ -66,7 +66,7 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
 /// Each entry is (source_directory, provider_config) so providers are installed
 /// in the directory containing the `.crn` file, not at the workspace root.
 fn build_factories(
-    user_dirs: &carina_core::UserDirs,
+    user_dirs: Result<&carina_core::UserDirs, &str>,
     providers: &[(PathBuf, ProviderConfig)],
     grants: &carina_provider_resolver::TrustedLocalGrants,
 ) -> FactoryBuildResult {
@@ -95,6 +95,19 @@ fn build_factories(
                 {
                     errors.insert(config.name.clone(), rejection.to_string());
                 }
+                continue;
+            }
+        };
+        let user_dirs = match user_dirs {
+            Ok(user_dirs) => user_dirs,
+            Err(error) => {
+                errors.insert(
+                    config.name.clone(),
+                    format!(
+                        "Could not resolve user directories required to load provider '{}': {error}",
+                        config.name
+                    ),
+                );
                 continue;
             }
         };
@@ -142,13 +155,17 @@ fn trusted_local_grants_from_env(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), carina_core::UserDirsError> {
+async fn main() {
     env_logger::init();
 
-    // User-owned paths are resolved once at the binary boundary, then passed
-    // explicitly through the LSP's library code.
+    // Provider loading needs user-owned storage, but the rest of the language
+    // server remains useful when that storage cannot be resolved.
     #[allow(clippy::disallowed_methods)]
-    let user_dirs = carina_core::UserDirs::from_real_home()?;
+    let user_dirs = carina_core::UserDirs::from_real_home().map_err(|error| {
+        let message = error.to_string();
+        log::error!("LSP provider loading disabled: {message}");
+        message
+    });
     let user_dirs = std::sync::Arc::new(user_dirs);
 
     let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
@@ -180,7 +197,11 @@ async fn main() -> Result<(), carina_core::UserDirsError> {
         let user_dirs = std::sync::Arc::clone(&user_dirs);
         let factory_builder: carina_lsp::backend::FactoryBuilder =
             std::sync::Arc::new(move |providers| {
-                build_factories(&user_dirs, providers, &trusted_local_grants)
+                build_factories(
+                    user_dirs.as_ref().as_ref().map_err(String::as_str),
+                    providers,
+                    &trusted_local_grants,
+                )
             });
 
         // Provider install prober: used by the drift poller to notice selected
@@ -194,7 +215,6 @@ async fn main() -> Result<(), carina_core::UserDirsError> {
         )
     });
     Server::new(stdin, stdout, socket).serve(service).await;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -263,7 +283,7 @@ mod tests {
             cfg("aws", None, Some("us")),
         ];
         let (_factories, errors, fingerprint) =
-            build_factories(&user_dirs, &providers, &no_local_grants());
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
         assert_eq!(
             fingerprint.len(),
             providers.len(),
@@ -291,7 +311,7 @@ mod tests {
         let providers = vec![(tmp.path().to_path_buf(), config)];
 
         let (factories, errors, fingerprint) =
-            build_factories(&user_dirs, &providers, &no_local_grants());
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
 
         assert!(factories.is_empty());
         assert!(
@@ -304,6 +324,31 @@ mod tests {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )]
+        );
+    }
+
+    #[test]
+    fn user_dirs_resolution_failure_is_reported_as_a_provider_load_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("local-provider.wasm");
+        std::fs::write(&wasm, b"fixture").unwrap();
+        let providers = vec![cfg(
+            "local",
+            Some(&format!("file://{}", wasm.display())),
+            None,
+        )];
+        let guard_error = "nextest home isolation guard rejected user directories";
+
+        let (factories, errors, fingerprint) =
+            build_factories(Err(guard_error), &providers, &no_local_grants());
+
+        assert!(factories.is_empty());
+        assert_eq!(fingerprint.len(), 1);
+        assert_eq!(
+            errors.get("local").map(String::as_str),
+            Some(
+                "Could not resolve user directories required to load provider 'local': nextest home isolation guard rejected user directories"
+            )
         );
     }
 
@@ -408,7 +453,7 @@ mod tests {
         let (_, config) = cfg("aws", Some(source), None);
 
         let (factories, errors, _) = build_factories(
-            &user_dirs,
+            Ok(&user_dirs),
             &[(tmp.path().to_path_buf(), config)],
             &no_local_grants(),
         );
@@ -465,7 +510,7 @@ mod tests {
         let providers = vec![(tmp.path().to_path_buf(), config.clone())];
         let user_dirs = carina_core::UserDirs::under(&tmp.path().join("user"));
         let (_factories, errors, fingerprint) =
-            build_factories(&user_dirs, &providers, &no_local_grants());
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(

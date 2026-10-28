@@ -281,6 +281,7 @@ mod tests {
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let temp = tempfile::tempdir().unwrap();
         let module_dir = temp.path().join("broken");
         std::fs::create_dir_all(&module_dir).unwrap();
@@ -291,12 +292,8 @@ mod tests {
         .unwrap();
         std::fs::write(module_dir.join("main.crn"), "let =\n").unwrap();
 
-        let error = run_lint(
-            crate::test_user_dirs(),
-            temp.path(),
-            &ProviderContext::default(),
-        )
-        .expect_err("invalid imported module syntax must fail lint");
+        let error = run_lint(&user_dirs, temp.path(), &ProviderContext::default())
+            .expect_err("invalid imported module syntax must fail lint");
         let rendered = error.to_string();
 
         assert!(rendered.contains("Module resolution error"), "{rendered}");

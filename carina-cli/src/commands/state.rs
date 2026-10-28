@@ -2540,6 +2540,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -2553,7 +2554,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         run_state_refresh_locked(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
@@ -2567,11 +2568,12 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
 
         run_state_refresh_locked(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2585,11 +2587,12 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
 
         run_state_refresh_locked(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3415,6 +3418,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
         let fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
@@ -3460,7 +3464,7 @@ mod tests {
 
         let provider_context = ProviderContext::default();
         let refresh = run_state_refresh(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             &provider_context,

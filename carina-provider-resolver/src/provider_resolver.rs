@@ -9826,12 +9826,12 @@ sha256 = "def"
         release: serde_json::Value,
         expected_error: &str,
     ) {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let tag = "v0.1.0";
@@ -9852,11 +9852,10 @@ sha256 = "def"
         let lock_path = provider_lock_path(project.path());
         lock.save(&lock_path).unwrap();
         let lock_before = fs::read(&lock_path).unwrap();
-        let global_before = snapshot_tree(global.path());
-        let trust_before = snapshot_tree(trust.path());
+        let global_before = snapshot_tree(global);
+        let trust_before = snapshot_tree(trust);
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
-        let global_wasm =
-            global_cache_path_wasm(crate::test_user_dirs(), &source_key(source), version).unwrap();
+        let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
         let release_url = github_release_by_tag_url(source, tag);
         let asset_url = github_asset_url(source, 42);
         let github_http = FixtureGithubHttp::default()
@@ -9864,7 +9863,8 @@ sha256 = "def"
             .bytes(&asset_url, locked_bytes);
         let github = GithubApi::new(&github_http, None);
 
-        let error = resolve_all_with_github(
+        let error = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Normal,
@@ -9889,12 +9889,13 @@ sha256 = "def"
             !global_wasm.as_path().exists(),
             "global cache must stay untouched"
         );
-        assert_eq!(snapshot_tree(global.path()), global_before);
-        assert_eq!(snapshot_tree(trust.path()), trust_before);
+        assert_eq!(snapshot_tree(global), global_before);
+        assert_eq!(snapshot_tree(trust), trust_before);
         assert_eq!(github_http.requested_urls(), [release_url]);
     }
 
     fn resolve_github_provider_with_client<G: GithubHttp + ?Sized>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         source: &str,
         version: &str,
@@ -9903,13 +9904,7 @@ sha256 = "def"
         github: &GithubApi<'_, G>,
     ) -> Result<WasmArtifactPath, String> {
         resolve_github_provider_with_client_in(
-            crate::test_user_dirs(),
-            base_dir,
-            source,
-            version,
-            name,
-            lock_file,
-            github,
+            user_dirs, base_dir, source, version, name, lock_file, github,
         )
     }
 
@@ -9956,6 +9951,7 @@ sha256 = "def"
     }
 
     fn resolve_provider_with_http<H: RegistryHttp>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         source: &RemoteSource,
         version: &str,
@@ -9963,15 +9959,7 @@ sha256 = "def"
         lock_file: &mut LockFile,
         http: &H,
     ) -> Result<WasmArtifactPath, String> {
-        resolve_provider_with_http_in(
-            crate::test_user_dirs(),
-            base_dir,
-            source,
-            version,
-            name,
-            lock_file,
-            http,
-        )
+        resolve_provider_with_http_in(user_dirs, base_dir, source, version, name, lock_file, http)
     }
 
     fn resolve_provider_with_http_in<H: RegistryHttp>(
@@ -10011,6 +9999,7 @@ sha256 = "def"
     }
 
     fn resolve_single_config_with_http<H: RegistryHttp>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         config: &ProviderConfig,
         http: &H,
@@ -10026,7 +10015,7 @@ sha256 = "def"
             .as_ref()
             .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
         let path = super::resolve_config_with_clients(
-            crate::test_user_dirs(),
+            user_dirs,
             config,
             source,
             &mut lock_file,
@@ -10041,6 +10030,7 @@ sha256 = "def"
     }
 
     fn resolve_all_with_http<H: RegistryHttp>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         providers: &[ProviderConfig],
         mode: LockMode,
@@ -10049,32 +10039,19 @@ sha256 = "def"
         let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
         let github_http = FixtureGithubHttp::default();
         let github = GithubApi::new(&github_http, None);
-        super::resolve_all_with_http(
-            crate::test_user_dirs(),
-            &install_lock,
-            providers,
-            mode,
-            http,
-            &github,
-        )
-        .map_err(|error| error.to_string())
+        super::resolve_all_with_http(user_dirs, &install_lock, providers, mode, http, &github)
+            .map_err(|error| error.to_string())
     }
 
     fn resolve_all_with_github<R: RegistryHttp, G: GithubHttp + ?Sized>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         providers: &[ProviderConfig],
         mode: LockMode,
         registry_http: &R,
         github: &GithubApi<'_, G>,
     ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-        resolve_all_with_github_in(
-            crate::test_user_dirs(),
-            base_dir,
-            providers,
-            mode,
-            registry_http,
-            github,
-        )
+        resolve_all_with_github_in(user_dirs, base_dir, providers, mode, registry_http, github)
     }
 
     fn resolve_all_with_github_in<R: RegistryHttp, G: GithubHttp + ?Sized>(
@@ -10097,7 +10074,11 @@ sha256 = "def"
         .map_err(|error| error.to_string())
     }
 
+    // This test adapter mirrors the resolver entry point while adding the
+    // project path needed to acquire its real install lock.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_registry_revision_with_http<H: RegistryHttp>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         source: &RegistrySource,
         revision: &str,
@@ -10109,18 +10090,16 @@ sha256 = "def"
         let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             super::resolve_registry_revision_with_http(
-                crate::test_user_dirs(),
-                source,
-                revision,
-                name,
-                lock_file,
-                mode,
-                http,
+                user_dirs, source, revision, name, lock_file, mode, http,
             )
         })
     }
 
+    // This test adapter mirrors the resolver entry point while adding the
+    // project path needed to acquire its real install lock.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_registry_version_with_http<H: RegistryHttp>(
+        user_dirs: &UserDirs,
         base_dir: &Path,
         source: &RegistrySource,
         source_key: &RemoteSourceKey,
@@ -10132,7 +10111,7 @@ sha256 = "def"
         let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             super::resolve_registry_version_with_http(
-                crate::test_user_dirs(),
+                user_dirs,
                 source,
                 source_key,
                 provider_name,
@@ -10217,9 +10196,10 @@ sha256 = "def"
             )
     }
 
-    fn signed_fixture_legacy_lock(base_dir: &Path) -> LockFile {
+    fn signed_fixture_legacy_lock(user_dirs: &UserDirs, base_dir: &Path) -> LockFile {
         let mut lock = LockFile::default();
         resolve_provider_with_http(
+            user_dirs,
             base_dir,
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -10572,8 +10552,9 @@ sha256 = "def"
 
     #[test]
     fn legacy_pin_converts_from_locked_version_artifact_before_candidate_is_evaluated() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(dir.path());
+        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         fs::remove_file(cache_path_wasm(
             dir.path(),
             &source_key("carina-rs/aws"),
@@ -10583,6 +10564,7 @@ sha256 = "def"
 
         let http = signed_fixture_registry();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10643,6 +10625,7 @@ sha256 = "def"
 
     #[test]
     fn unavailable_legacy_metadata_bundle_or_artifact_keeps_the_legacy_gate() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unsigned_candidate = serde_json::to_vec(&serde_json::json!({
             "protocols": ["1"],
@@ -10671,7 +10654,7 @@ sha256 = "def"
             .map(|http| http.json(SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL, &unsigned_candidate))
         {
             let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(dir.path());
+            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
                 dir.path(),
                 &source_key("carina-rs/aws"),
@@ -10680,6 +10663,7 @@ sha256 = "def"
             .unwrap();
 
             let error = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10701,8 +10685,9 @@ sha256 = "def"
 
     #[test]
     fn downloaded_legacy_artifact_hash_mismatch_fails_closed_and_removes_cache_file() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(dir.path());
+        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         let locked_path = cache_path_wasm(
             dir.path(),
             &source_key("carina-rs/aws"),
@@ -10713,6 +10698,7 @@ sha256 = "def"
             .downloadable_bytes(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, b"tampered".to_vec());
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10741,8 +10727,9 @@ sha256 = "def"
 
     #[test]
     fn cached_legacy_artifact_is_hash_checked_before_signature_verification() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(dir.path());
+        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         let locked_path = cache_path_wasm(
             dir.path(),
             &source_key("carina-rs/aws"),
@@ -10752,6 +10739,7 @@ sha256 = "def"
         let http = signed_fixture_registry();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10779,6 +10767,7 @@ sha256 = "def"
 
     #[test]
     fn obtained_invalid_legacy_evidence_fails_before_candidate_evaluation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let mut invalid_metadata: serde_json::Value = serde_json::from_slice(
             &signed_fixture_download(SIGNED_FIXTURE_VERSION, SIGNED_FIXTURE_LOCKED_ARTIFACT_URL),
         )
@@ -10841,7 +10830,7 @@ sha256 = "def"
 
         for (http, expected_error) in scenarios {
             let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(dir.path());
+            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
                 dir.path(),
                 &source_key("carina-rs/aws"),
@@ -10850,6 +10839,7 @@ sha256 = "def"
             .unwrap();
 
             let error = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10878,6 +10868,7 @@ sha256 = "def"
 
     #[test]
     fn legacy_locked_content_refusals_name_no_recovery_operation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let locked_download: serde_json::Value = serde_json::from_slice(&signed_fixture_download(
             SIGNED_FIXTURE_VERSION,
             SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
@@ -10897,7 +10888,7 @@ sha256 = "def"
 
         for (download, expected_reason) in scenarios {
             let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(dir.path());
+            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
                 dir.path(),
                 &source_key("carina-rs/aws"),
@@ -10910,6 +10901,7 @@ sha256 = "def"
             );
 
             let error = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_CANDIDATE_VERSION,
@@ -10982,6 +10974,7 @@ sha256 = "def"
 
     #[test]
     fn registry_revision_response_without_version_is_rejected_before_download() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let endpoint =
             "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/revisions/main/download";
@@ -10994,6 +10987,7 @@ sha256 = "def"
         let mut lock = LockFile::default();
 
         let error = resolve_registry_revision_with_http(
+            &user_dirs,
             dir.path(),
             &source,
             "main",
@@ -11777,6 +11771,7 @@ transparency_log_present = false
 
     #[test]
     fn legacy_revision_lock_is_reselected_in_normal_mode_and_rejected_in_locked_mode() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let serialized = format!(
             r#"version = {}
@@ -11826,7 +11821,7 @@ sha256 = "legacy"
         fs::write(provider_lock_path(project.path()), &serialized).unwrap();
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let error = resolve_all(
-            crate::test_user_dirs(),
+            &user_dirs,
             &install_lock,
             &[provider_config(source, Some("main"))],
             LockMode::Locked,
@@ -12147,10 +12142,10 @@ sha256 = "malformed"
     /// the in-memory lock so a subsequent save cannot silently wipe the pin.
     #[test]
     fn resolve_upserts_lock_entry_when_wasm_cache_is_hit() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let base = dir.path();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
@@ -12167,14 +12162,10 @@ sha256 = "malformed"
         let mut lock_entry = github_release_entry(source, version);
         lock_entry.sha256 = cached_sha256.clone();
         lock_file.upsert(lock_entry);
-        record_test_github_origin_download(
-            crate::test_user_dirs(),
-            &source_key(source),
-            &cached_sha256,
-            None,
-        )
-        .unwrap();
+        record_test_github_origin_download(&user_dirs, &source_key(source), &cached_sha256, None)
+            .unwrap();
         resolve_provider_with_http(
+            &user_dirs,
             base,
             &provider_source(source),
             version,
@@ -14394,18 +14385,14 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
 
     #[test]
     fn resolve_all_string_boundary_preserves_lock_parse_source() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("carina-providers.lock"), "version = [\n").unwrap();
         let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
 
-        let rendered = resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &[],
-            LockMode::Normal,
-        )
-        .expect_err("a malformed lock must fail before provider resolution")
-        .to_string();
+        let rendered = resolve_all(&user_dirs, &install_lock, &[], LockMode::Normal)
+            .expect_err("a malformed lock must fail before provider resolution")
+            .to_string();
 
         assert!(rendered.contains("Failed to parse"), "{rendered}");
         assert!(
@@ -15619,6 +15606,7 @@ transparency_log_present = false
 
     #[test]
     fn no_recovery_operation_clears_a_disappeared_yanked_flag() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"unchanged yanked-state artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -15644,6 +15632,7 @@ transparency_log_present = false
                     .unwrap(),
             }
             let error = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 "0.5.0",
@@ -15665,6 +15654,7 @@ transparency_log_present = false
             .unwrap()
             .commit();
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -16809,6 +16799,7 @@ transparency_log_present = true
 
     #[test]
     fn resolve_all_copies_file_provider() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let wasm_path = tmp.path().join("my-provider.wasm");
         fs::write(&wasm_path, b"fake wasm content").unwrap();
@@ -16826,13 +16817,7 @@ transparency_log_present = true
         }];
         let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
 
-        let result = resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &providers,
-            LockMode::Normal,
-        )
-        .unwrap();
+        let result = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal).unwrap();
         let dest = result.get("test").expect("provider should be resolved");
         assert!(dest.as_path().exists());
         assert!(
@@ -16850,6 +16835,7 @@ transparency_log_present = true
 
     #[test]
     fn resolve_all_locked_saves_file_provider_lock_state() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let wasm_path = tmp.path().join("locked-file-provider.wasm");
         let wasm = b"locked file provider";
@@ -16859,13 +16845,7 @@ transparency_log_present = true
         let config = provider_config(&source, None);
         let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
 
-        resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &[config],
-            LockMode::Locked,
-        )
-        .unwrap();
+        resolve_all(&user_dirs, &install_lock, &[config], LockMode::Locked).unwrap();
 
         let lock = load_lock_file_for_test(&provider_lock_path(tmp.path()))
             .unwrap()
@@ -16877,6 +16857,7 @@ transparency_log_present = true
 
     #[test]
     fn resolve_all_replaces_existing_file_provider_artifact() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let source_path = tmp.path().join("my-provider.wasm");
         fs::write(&source_path, b"first artifact").unwrap();
@@ -16884,7 +16865,7 @@ transparency_log_present = true
         let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
 
         let first = resolve_all(
-            crate::test_user_dirs(),
+            &user_dirs,
             &install_lock,
             std::slice::from_ref(&config),
             LockMode::Normal,
@@ -16894,13 +16875,7 @@ transparency_log_present = true
 
         fs::remove_file(&source_path).unwrap();
         fs::write(&source_path, b"second complete artifact").unwrap();
-        let second = resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &[config],
-            LockMode::Normal,
-        )
-        .unwrap();
+        let second = resolve_all(&user_dirs, &install_lock, &[config], LockMode::Normal).unwrap();
 
         assert_eq!(second.get("awscc").unwrap().as_path(), destination);
         assert_eq!(fs::read(&destination).unwrap(), b"second complete artifact");
@@ -16913,6 +16888,7 @@ transparency_log_present = true
 
     #[test]
     fn resolve_all_errors_on_missing_file_provider() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let providers = vec![ProviderConfig {
             name: "test".into(),
@@ -16925,18 +16901,13 @@ transparency_log_present = true
             default_tags: IndexMap::new(),
         }];
         let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
-        let err = resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &providers,
-            LockMode::Normal,
-        )
-        .unwrap_err();
+        let err = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn non_wasm_file_provider_is_rejected_at_resolver_boundary() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let native_path = tmp.path().join("native-provider");
         fs::write(&native_path, b"native provider fixture").unwrap();
@@ -16953,7 +16924,7 @@ transparency_log_present = true
 
         let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
         let error = resolve_all(
-            crate::test_user_dirs(),
+            &user_dirs,
             &install_lock,
             std::slice::from_ref(&config),
             LockMode::Normal,
@@ -17167,6 +17138,7 @@ transparency_log_present = true
 
     #[test]
     fn interrupted_registry_download_never_exposes_partial_final_artifact() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
         let source = source_key("carina-rs/aws");
@@ -17180,7 +17152,7 @@ transparency_log_present = true
 
         let error = obtain_registry_artifact(
             RegistryArtifactRequest {
-                user_dirs: crate::test_user_dirs(),
+                user_dirs: &user_dirs,
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
@@ -17200,6 +17172,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_hash_mismatch_leaves_no_final_artifact_or_temp_residue() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
         let source = source_key("carina-rs/aws");
@@ -17210,7 +17183,7 @@ transparency_log_present = true
 
         let error = obtain_registry_artifact(
             RegistryArtifactRequest {
-                user_dirs: crate::test_user_dirs(),
+                user_dirs: &user_dirs,
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
@@ -17230,6 +17203,7 @@ transparency_log_present = true
 
     #[test]
     fn wasm_download_failure_does_not_request_native_tarball() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let source = "github.com/carina-test-only/provider";
         let version = "1.2.3";
@@ -17239,6 +17213,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let error = resolve_github_provider_with_client(
+            &user_dirs,
             dir.path(),
             source,
             version,
@@ -17413,10 +17388,12 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_storage_successful_resolve_has_single_location() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
 
         resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &config,
             &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
@@ -17450,12 +17427,14 @@ transparency_log_present = true
     }
 
     fn assert_resolve_all_verifies_signed_provider_inside_tokio_runtime() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
 
-        let resolved = resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http)
-            .expect("signed provider resolution should succeed inside a Tokio runtime");
+        let resolved =
+            resolve_all_with_http(&user_dirs, dir.path(), &[config], LockMode::Normal, &http)
+                .expect("signed provider resolution should succeed inside a Tokio runtime");
 
         assert_eq!(
             fs::read(resolved.get("awscc").unwrap().as_path()).unwrap(),
@@ -17471,9 +17450,11 @@ transparency_log_present = true
 
     #[test]
     fn deleting_registry_entry_drops_the_security_baseline() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
         resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &config,
             &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
@@ -17499,7 +17480,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":10000000,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(dir.path(), &config, &unsigned_http)
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &unsigned_http)
             .expect("manual entry deletion demonstrates why recovery must preserve ratchets");
 
         assert_eq!(fs::read(path.as_path()).unwrap(), SIGNED_FIXTURE_ARTIFACT);
@@ -17511,6 +17492,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_honest_high_sequence_first_contact_is_accepted() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"honest high-sequence artifact";
         let shasum = sha256_bytes(ARTIFACT);
 
@@ -17522,6 +17504,7 @@ transparency_log_present = true
             let http = registry_http_with_listing(ARTIFACT, &shasum, &listing);
 
             let path = resolve_single_config_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_config("carina-rs/aws", None),
                 &http,
@@ -17540,6 +17523,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_established_zero_sequence_is_not_first_contact() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"established zero-sequence artifact";
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
@@ -17549,7 +17533,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":0,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
             RegistrySequenceAnchor::Established(0)
@@ -17560,8 +17544,8 @@ transparency_log_present = true
             r#"{{"sequence":{hostile_sequence},"versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let hostile_http = registry_http_with_listing(ARTIFACT, &shasum, &listing);
-        let error =
-            resolve_single_config_with_http(dir.path(), &config, &hostile_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
 
         assert!(error.contains("sequence fast-forward"), "{error}");
         assert_eq!(
@@ -17576,6 +17560,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_failed_first_contact_sequence_is_not_an_anchor() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"honest first-contact artifact";
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
@@ -17590,8 +17575,8 @@ transparency_log_present = true
             )
             .json(REGISTRY_VERSIONS_URL, &hostile_listing);
 
-        let error =
-            resolve_single_config_with_http(dir.path(), &config, &hostile_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
             Some(hostile_sequence),
@@ -17611,7 +17596,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":42,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
             .expect("an unpinned observation must not become a rollback floor");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
         assert_eq!(
@@ -17627,6 +17612,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_sequence_ceiling_cannot_walk_by_maximum_steps() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"sequence ceiling walk artifact";
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
@@ -17636,7 +17622,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let accepted_sequence = 10 + MAX_SEQUENCE_FAST_FORWARD;
         let accepted_listing = format!(
@@ -17646,7 +17632,8 @@ transparency_log_present = true
         let accepted_http =
             registry_http_with_listing(ARTIFACT, &hostile_shasum, &accepted_listing);
         let error =
-            resolve_single_config_with_http(dir.path(), &config, &accepted_http).unwrap_err();
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &accepted_http)
+                .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
 
         for attempt in 1..=4 {
@@ -17657,7 +17644,8 @@ transparency_log_present = true
             let hostile_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &listing);
 
             let error =
-                resolve_single_config_with_http(dir.path(), &config, &hostile_http).unwrap_err();
+                resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+                    .unwrap_err();
             assert!(
                 error.contains("sequence fast-forward"),
                 "attempt {attempt}: {error}"
@@ -17678,6 +17666,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_sequence_ceiling_is_cumulative_between_successful_resolves() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"cumulative sequence ceiling artifact";
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
@@ -17687,7 +17676,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let accepted_sequence = 10 + MAX_SEQUENCE_FAST_FORWARD;
         let first_listing = format!(
@@ -17695,7 +17684,8 @@ transparency_log_present = true
         );
         let hostile_shasum = sha256_bytes(b"hostile cumulative shasum");
         let first_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &first_listing);
-        let error = resolve_single_config_with_http(dir.path(), &config, &first_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &first_http)
+            .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -17713,7 +17703,8 @@ transparency_log_present = true
             r#"{{"sequence":{walked_sequence},"versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let second_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &second_listing);
-        let error = resolve_single_config_with_http(dir.path(), &config, &second_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &second_http)
+            .unwrap_err();
         assert!(error.contains("sequence fast-forward"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -17728,6 +17719,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_sequence_survives_downstream_shasum_failure() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const EXPECTED_ARTIFACT: &[u8] = b"expected sequence-ratchet artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(EXPECTED_ARTIFACT);
@@ -17738,7 +17730,8 @@ transparency_log_present = true
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let cached_path =
-            resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http)
+                .unwrap();
         fs::remove_file(cached_path.as_path()).unwrap();
 
         let failed_http = registry_http_with_listing(
@@ -17747,7 +17740,8 @@ transparency_log_present = true
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
 
-        let error = resolve_single_config_with_http(dir.path(), &config, &failed_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
         assert!(error.contains("SHA256 mismatch"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -17766,7 +17760,8 @@ transparency_log_present = true
             r#"{"sequence":99,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let error =
-            resolve_single_config_with_http(dir.path(), &config, &rollback_http).unwrap_err();
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &rollback_http)
+                .unwrap_err();
 
         assert!(error.contains("sequence rollback"), "{error}");
         assert!(error.contains("previous 100, got 99"), "{error}");
@@ -17775,20 +17770,22 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_sequence_survives_signature_bundle_failure() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
         let baseline_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
             REGISTRY_VERSIONS_URL,
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let failed_http = signed_registry_http(b"bundle unavailable", 503).json(
             REGISTRY_VERSIONS_URL,
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
 
-        let error = resolve_single_config_with_http(dir.path(), &config, &failed_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
         assert!(error.contains("HTTP 503"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -17808,7 +17805,8 @@ transparency_log_present = true
             r#"{"sequence":99,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let error =
-            resolve_single_config_with_http(dir.path(), &config, &rollback_http).unwrap_err();
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &rollback_http)
+                .unwrap_err();
 
         assert!(error.contains("sequence rollback"), "{error}");
         assert!(error.contains("previous 100, got 99"), "{error}");
@@ -17816,6 +17814,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_refused_sequence_is_not_persisted() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"sequence refusal artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -17825,15 +17824,15 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let hostile_sequence = 100 + MAX_SEQUENCE_FAST_FORWARD + 1;
         let hostile_listing = format!(
             r#"{{"sequence":{hostile_sequence},"valid_until":"2999-01-01T00:00:00Z","versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let hostile_http = registry_http_with_listing(ARTIFACT, &shasum, &hostile_listing);
-        let error =
-            resolve_single_config_with_http(dir.path(), &config, &hostile_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert!(error.contains("sequence fast-forward"), "{error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
@@ -17851,7 +17850,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &legitimate_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &legitimate_http).unwrap();
         let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
@@ -17864,6 +17863,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_rejected_listing_persists_no_observations() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"atomic listing-ratchet artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -17873,16 +17873,20 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":100,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let rollback_with_valid_until = registry_http_with_listing(
             ARTIFACT,
             &shasum,
             r#"{"sequence":5,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let error =
-            resolve_single_config_with_http(dir.path(), &config, &rollback_with_valid_until)
-                .unwrap_err();
+        let error = resolve_single_config_with_http(
+            &user_dirs,
+            dir.path(),
+            &config,
+            &rollback_with_valid_until,
+        )
+        .unwrap_err();
         assert!(error.contains("sequence rollback"), "{error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
@@ -17905,6 +17909,7 @@ transparency_log_present = true
             r#"{"sequence":101,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &config,
             &accepted_sequence_missing_valid_until,
@@ -17928,6 +17933,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_valid_until_presence_survives_failed_resolve() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const EXPECTED_ARTIFACT: &[u8] = b"expected valid-until artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(EXPECTED_ARTIFACT);
@@ -17938,6 +17944,7 @@ transparency_log_present = true
         );
 
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &initial_http,
@@ -17955,6 +17962,7 @@ transparency_log_present = true
             r#"{"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &missing_http,
@@ -17969,6 +17977,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_malformed_valid_until_is_not_recorded() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"malformed valid-until artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -17979,6 +17988,7 @@ transparency_log_present = true
         );
 
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &malformed_http,
@@ -18002,6 +18012,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_malformed_valid_until_does_not_poison_next_listing() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"valid-until recovery artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18013,7 +18024,8 @@ transparency_log_present = true
         );
 
         let error =
-            resolve_single_config_with_http(dir.path(), &config, &malformed_http).unwrap_err();
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &malformed_http)
+                .unwrap_err();
         assert!(
             error.contains("Invalid registry valid_until timestamp"),
             "{error}"
@@ -18024,13 +18036,14 @@ transparency_log_present = true
             &shasum,
             r#"{"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
             .expect("the malformed timestamp must not poison the next listing");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
     #[test]
     fn registry_security_expired_valid_until_is_not_recorded() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"expired valid-until artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18041,6 +18054,7 @@ transparency_log_present = true
         );
 
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &expired_http,
@@ -18058,6 +18072,7 @@ transparency_log_present = true
             r#"{"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &honest_http,
@@ -18067,6 +18082,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_ratchet_transparency_log_presence_survives_failed_resolve() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const EXPECTED_ARTIFACT: &[u8] = b"expected transparency-log artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(EXPECTED_ARTIFACT);
@@ -18081,6 +18097,7 @@ transparency_log_present = true
         .json(REGISTRY_DOWNLOAD_URL, &download);
 
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &initial_http,
@@ -18098,6 +18115,7 @@ transparency_log_present = true
             r#"{"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let error = resolve_single_config_with_http(
+            &user_dirs,
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &missing_http,
@@ -18115,6 +18133,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_rejected_download_pin_does_not_promote_transparency_log() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"transparency-log validation artifact";
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
@@ -18124,7 +18143,7 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(dir.path(), &config, &baseline_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let hostile_shasum = sha256_bytes(b"hostile transparency-log shasum");
         let hostile_download = format!(
@@ -18136,8 +18155,8 @@ transparency_log_present = true
             r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         )
         .json(REGISTRY_DOWNLOAD_URL, &hostile_download);
-        let error =
-            resolve_single_config_with_http(dir.path(), &config, &hostile_http).unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
         let ratchets = saved_registry_ratchets(dir.path());
         assert_eq!(ratchets.sequence.value(), Some(11));
@@ -18151,16 +18170,18 @@ transparency_log_present = true
             &shasum,
             r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(dir.path(), &config, &honest_http)
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
             .expect("the rejected download response must not poison the honest registry");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
     #[test]
     fn registry_ratchet_verified_signature_is_durable_without_caller_save() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18187,6 +18208,7 @@ transparency_log_present = true
             ),
         );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18202,6 +18224,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_sequence_observation_is_durable_from_version_selection_entry_point() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"version-selection ratchet artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18216,6 +18239,7 @@ transparency_log_present = true
         );
 
         let selected = resolve_registry_version_with_http(
+            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -18241,6 +18265,7 @@ transparency_log_present = true
             r#"{"sequence":5,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let selected = resolve_registry_version_with_http(
+            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -18265,6 +18290,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_warns_but_resolves_lock_pinned_yanked_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const CHILD_ENV: &str = "CARINA_TEST_YANKED_LOCK_PIN_WARNING";
         const TEST_NAME: &str = "provider_resolver::tests::registry_source_warns_but_resolves_lock_pinned_yanked_version";
         const ARTIFACT: &[u8] = b"lock-pinned yanked provider";
@@ -18293,6 +18319,7 @@ transparency_log_present = true
             );
 
             let path = resolve_single_config_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_config("carina-rs/aws", None),
                 &http,
@@ -18323,6 +18350,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_refuses_to_newly_pin_exact_yanked_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"new yanked provider pin";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18333,6 +18361,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -18350,6 +18379,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_yank_ratchet_survives_a_refused_resolve() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"strip after refusal";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18369,6 +18399,7 @@ transparency_log_present = true
                 &download_040,
             );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.4.0",
@@ -18393,6 +18424,7 @@ transparency_log_present = true
                 &download_040,
             );
         let result = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.4.0",
@@ -18409,6 +18441,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_records_yanks_stickily_per_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"sticky yank registry provider";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18420,6 +18453,7 @@ transparency_log_present = true
         );
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -18444,6 +18478,7 @@ transparency_log_present = true
             r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.4.0","protocols":["1"],"yanked":true},{"version":"0.3.0","protocols":["1"],"yanked":true}]}"#,
         );
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -18471,6 +18506,7 @@ transparency_log_present = true
             r#"{"sequence":9,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.4.0","protocols":["1"]},{"version":"0.3.0","protocols":["1"],"yanked":true}]}"#,
         );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -18487,6 +18523,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_yank_observation_survives_between_selection_and_pin_fetches() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"selection-to-pin yank ratchet";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -18500,6 +18537,7 @@ transparency_log_present = true
         );
 
         let selected = resolve_registry_version_with_http(
+            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -18516,6 +18554,7 @@ transparency_log_present = true
             r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.4.0","protocols":["1"]}]}"#,
         );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             &selected,
@@ -18532,11 +18571,13 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_verifies_signature_and_pins_identity() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock_file = LockFile::default();
 
         let path = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18719,14 +18760,12 @@ transparency_log_present = true
 
     #[test]
     fn third_party_registry_init_skips_user_trust_and_reuses_cache() {
-        let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
-        let trust_parent = tempfile::tempdir().unwrap();
-        let unavailable_trust_dir = trust_parent.path().join("not-a-directory");
-        fs::write(&unavailable_trust_dir, b"sentinel").unwrap();
-        let trust_before = snapshot_tree(trust_parent.path());
-        let _trust_env =
-            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", &unavailable_trust_dir);
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
+        fs::create_dir_all(user_dirs.trust_record_dir().parent().unwrap()).unwrap();
+        fs::write(user_dirs.trust_record_dir(), b"sentinel").unwrap();
+        let trust_before = fs::read(user_dirs.trust_record_dir()).unwrap();
         let source = "example/widget";
         let version = SIGNED_FIXTURE_VERSION;
         let versions_url = "https://registry.carina-rs.dev/v1/providers/example/widget/versions";
@@ -18766,7 +18805,8 @@ transparency_log_present = true
         let mut lock = LockFile::default();
 
         for _ in 0..2 {
-            resolve_provider_with_http(
+            resolve_provider_with_http_in(
+                &user_dirs,
                 project.path(),
                 &provider_source(source),
                 version,
@@ -18778,11 +18818,16 @@ transparency_log_present = true
         }
 
         assert_eq!(http.request_count(artifact_url), 1);
-        assert_eq!(snapshot_tree(trust_parent.path()), trust_before);
+        assert_eq!(
+            fs::read(user_dirs.trust_record_dir()).unwrap(),
+            trust_before
+        );
+        assert!(user_dirs.trust_record_dir().is_file());
     }
 
     #[test]
     fn registry_source_prints_first_use_pin_notice_once() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const CHILD_ENV: &str = "CARINA_TEST_FIRST_USE_PIN_NOTICE";
         const TEST_NAME: &str =
             "provider_resolver::tests::registry_source_prints_first_use_pin_notice_once";
@@ -18792,6 +18837,7 @@ transparency_log_present = true
             let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
             let mut lock_file = LockFile::default();
             resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
@@ -18801,6 +18847,7 @@ transparency_log_present = true
             )
             .unwrap();
             resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
@@ -18825,11 +18872,13 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_reverifies_cached_artifact_against_pinned_identity() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock_file = LockFile::default();
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18839,6 +18888,7 @@ transparency_log_present = true
         )
         .unwrap();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18857,6 +18907,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_ignores_declared_identity_and_uses_verified_certificate() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
@@ -18868,6 +18919,7 @@ transparency_log_present = true
         );
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -18888,6 +18940,7 @@ transparency_log_present = true
 
     #[test]
     fn fresh_registry_artifact_stays_staged_when_real_verifier_rejects_signer() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let aws = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
         let aws_source = SourcePin {
@@ -18974,6 +19027,7 @@ transparency_log_present = true
         };
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19016,6 +19070,7 @@ transparency_log_present = true
             .commit()
             .unwrap();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19029,10 +19084,12 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_rejects_signature_downgrade_when_identity_is_pinned() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19067,6 +19124,7 @@ transparency_log_present = true
                     .unwrap(),
             }
             let error = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
@@ -19087,6 +19145,7 @@ transparency_log_present = true
             .unwrap()
             .commit();
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19111,6 +19170,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_reuses_existing_signature_identity_pin() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let mut lock_file = LockFile::default();
@@ -19140,6 +19200,7 @@ transparency_log_present = true
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19165,12 +19226,14 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_rejects_oversized_signature_bundle_and_drops_staged_download() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let oversized = vec![b' '; MAX_SIGNATURE_BUNDLE_BYTES + 1];
         let http = signed_registry_http(&oversized, 200);
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19197,6 +19260,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_rejects_non_https_signature_bundle_url() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let bundle_url = "http://downloads.example.test/aws.sigstore.json";
@@ -19209,6 +19273,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19232,6 +19297,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_rejects_non_https_download_url_before_requesting_it() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -19243,6 +19309,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19261,6 +19328,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_rejects_download_url_with_userinfo_before_requesting_it() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -19272,6 +19340,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19288,6 +19357,7 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_allows_cross_origin_https_download_url() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"cross-origin registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -19296,6 +19366,7 @@ transparency_log_present = true
         let mut lock_file = LockFile::default();
 
         let path = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19359,6 +19430,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_tampered_signature_bundle_and_removes_download() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut bundle: serde_json::Value = serde_json::from_slice(SIGNED_FIXTURE_BUNDLE).unwrap();
         let encoded = bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"]
@@ -19373,6 +19445,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19402,6 +19475,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_unknown_signature_type() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
@@ -19413,6 +19487,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19428,6 +19503,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_ratchet_unsupported_signature_type_records_transparency_log_presence() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
@@ -19439,6 +19515,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19460,10 +19537,12 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_signature_bundle_http_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock_file = LockFile::default();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19475,6 +19554,7 @@ transparency_log_present = false
         let http = signed_registry_http(b"not found", 404);
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19518,6 +19598,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_signature_bundle_transport_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unavailable_bundle_url = "https://downloads.example.test/unavailable.sigstore.json";
@@ -19530,6 +19611,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19570,6 +19652,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_malformed_signature_block() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
@@ -19581,6 +19664,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19597,6 +19681,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_does_not_treat_null_signature_as_absent() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
@@ -19608,6 +19693,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
@@ -19628,6 +19714,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_resolves_sections_1_2_3_and_verifies_registry_shasum() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -19635,6 +19722,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let path = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19671,11 +19759,13 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_pin_ignores_document_reserialization() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
         let api_base_url = "https://registry.carina-rs.dev/v1/providers/";
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19686,6 +19776,7 @@ transparency_log_present = false
         .unwrap();
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19701,11 +19792,13 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_pin_ignores_unconsumed_fields() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
         let api_base_url = "https://registry.carina-rs.dev/v1/providers/";
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19716,6 +19809,7 @@ transparency_log_present = false
         .unwrap();
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19731,10 +19825,12 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_pin_rejects_relocated_providers_api_with_repin_remediation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19752,6 +19848,7 @@ transparency_log_present = false
             "https://registry.carina-rs.dev/v2/providers/",
         );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19782,6 +19879,7 @@ transparency_log_present = false
             .unwrap()
             .commit();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19841,6 +19939,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_redirect_is_fetch_failure_without_repin_remediation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         const DISCOVERY_URL: &str = "https://registry.carina-rs.dev/.well-known/carina.json";
         const REDIRECT_TARGET: &str =
             "https://redirect.example.test/relocated-caring-discovery.json";
@@ -19849,6 +19948,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
         let api_base_url = "https://registry.carina-rs.dev/v1/providers/";
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19868,6 +19968,7 @@ transparency_log_present = false
             "{\n  \"providers.v1\": \"/v1/providers/\"\n}\n",
         );
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19891,10 +19992,12 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_pin_compares_resolved_values_by_bytes() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let mut lock_file = LockFile::default();
 
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19908,6 +20011,7 @@ transparency_log_present = false
         .unwrap();
 
         let error = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -19938,6 +20042,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_resolves_to_version_download_and_records_revision_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry revision wasm bytes";
         let shasum = sha256_bytes(body);
@@ -19976,7 +20081,7 @@ transparency_log_present = false
             binding: None,
         };
 
-        let path = resolve_single_config_with_http(dir.path(), &config, &http).unwrap();
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &http).unwrap();
 
         assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert!(http.was_requested("/.well-known/carina.json"));
@@ -20001,6 +20106,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_upgrade_re_resolves_newer_branch_prerelease() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let old_body = b"old registry revision wasm bytes";
         let old_shasum = sha256_bytes(old_body);
@@ -20060,7 +20166,8 @@ transparency_log_present = false
         };
 
         let resolved =
-            resolve_all_with_http(dir.path(), &[config], LockMode::Upgrade, &http).unwrap();
+            resolve_all_with_http(&user_dirs, dir.path(), &[config], LockMode::Upgrade, &http)
+                .unwrap();
 
         assert_eq!(
             fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
@@ -20082,6 +20189,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_reinit_reuses_locked_version_without_reselecting() {
+        let user_dirs = carina_core::TestUserDirs::new();
         for mode in [LockMode::Normal, LockMode::Locked] {
             let dir = tempfile::tempdir().unwrap();
             let body = b"locked registry revision wasm bytes";
@@ -20139,7 +20247,8 @@ transparency_log_present = false
                 binding: None,
             };
 
-            let resolved = resolve_all_with_http(dir.path(), &[config], mode, &http).unwrap();
+            let resolved =
+                resolve_all_with_http(&user_dirs, dir.path(), &[config], mode, &http).unwrap();
 
             assert_eq!(
                 fs::read(resolved.get("aws").unwrap().as_path()).unwrap(),
@@ -20153,6 +20262,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_reinit_refuses_changed_shasum_for_locked_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let locked_shasum = sha256_bytes(b"locked registry revision wasm bytes");
         let replacement_body = b"replacement registry revision wasm bytes";
@@ -20215,8 +20325,9 @@ transparency_log_present = false
             binding: None,
         };
 
-        let error = resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http)
-            .expect_err("the locked version's registry shasum must remain pinned");
+        let error =
+            resolve_all_with_http(&user_dirs, dir.path(), &[config], LockMode::Normal, &http)
+                .expect_err("the locked version's registry shasum must remain pinned");
 
         assert!(error.contains("registry shasum pin mismatch"), "{error}");
         assert!(error.contains(&locked_shasum), "{error}");
@@ -20226,6 +20337,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_revision_upgrade_refuses_a_stale_unsigned_branch_response() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"locked registry revision wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20282,8 +20394,9 @@ transparency_log_present = false
             binding: None,
         };
 
-        let error = resolve_all_with_http(dir.path(), &[config], LockMode::Upgrade, &http)
-            .expect_err("an unsigned branch response must return the highest listed build");
+        let error =
+            resolve_all_with_http(&user_dirs, dir.path(), &[config], LockMode::Upgrade, &http)
+                .expect_err("an unsigned branch response must return the highest listed build");
 
         assert!(error.contains("highest listed build"), "{error}");
         assert!(http.was_requested("/revisions/main/download"));
@@ -20291,6 +20404,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_wasm_when_registry_shasum_mismatches() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let http = registry_http(
             b"tampered wasm bytes",
@@ -20299,6 +20413,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20320,10 +20435,10 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_removes_cached_wasm_when_registry_shasum_mismatches() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let body = b"expected wasm bytes";
         let shasum = sha256_bytes(body);
         let http = registry_http(body, &shasum);
@@ -20338,7 +20453,7 @@ transparency_log_present = false
             "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml",
         );
         record_verified_registry_origin_download(
-            crate::test_user_dirs(),
+            &user_dirs,
             &source_key("carina-rs/aws"),
             "https://downloads.example.test/aws.wasm",
             &shasum,
@@ -20351,6 +20466,7 @@ transparency_log_present = false
         fs::write(&cached_path, b"stale cached wasm bytes").unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20373,6 +20489,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_lower_sequence_than_lock_pin() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20418,6 +20535,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20441,6 +20559,7 @@ transparency_log_present = false
             .commit()
             .unwrap();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20453,6 +20572,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_missing_previously_present_sequence() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20486,6 +20606,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20509,6 +20630,7 @@ transparency_log_present = false
             .commit()
             .unwrap();
         resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20521,6 +20643,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_missing_previously_present_valid_until() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20554,6 +20677,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20567,6 +20691,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_absurd_sequence_fast_forward() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20600,6 +20725,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20620,6 +20746,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_missing_previously_present_signature() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -20655,6 +20782,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -20682,6 +20810,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_signature_downgrade_across_version_change() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let old_body = b"old registry wasm bytes";
         let old_shasum = sha256_bytes(old_body);
@@ -20730,6 +20859,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.6.0",
@@ -20743,6 +20873,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_signature_downgrade_across_default_host_spellings() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let old_body = b"old registry wasm bytes";
         let old_shasum = sha256_bytes(old_body);
@@ -20790,6 +20921,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("registry.carina-rs.dev/carina-rs/aws"),
             "0.6.0",
@@ -20831,6 +20963,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_default_host_install_and_find_share_canonical_cache_path() {
+        let user_dirs = carina_core::TestUserDirs::new();
         for (installed_source, requested_source) in [
             ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
             ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
@@ -20842,6 +20975,7 @@ transparency_log_present = false
             let mut lock_file = LockFile::default();
 
             let installed_path = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source(installed_source),
                 "0.5.0",
@@ -20870,6 +21004,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_default_host_resolve_single_writes_constraint_to_canonical_entry() {
+        let user_dirs = carina_core::TestUserDirs::new();
         for (installed_source, requested_source) in [
             ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
             ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
@@ -20881,6 +21016,7 @@ transparency_log_present = false
             let mut lock_file = LockFile::default();
 
             let installed_path = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source(installed_source),
                 "0.5.0",
@@ -20894,6 +21030,7 @@ transparency_log_present = false
                 .unwrap();
 
             let resolved_path = resolve_single_config_with_http(
+                &user_dirs,
                 dir.path(),
                 &versioned_config(requested_source, "~0.5.0"),
                 &http,
@@ -20919,6 +21056,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_default_host_resolve_all_writes_constraint_to_canonical_entry() {
+        let user_dirs = carina_core::TestUserDirs::new();
         for (installed_source, requested_source) in [
             ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
             ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
@@ -20930,6 +21068,7 @@ transparency_log_present = false
             let mut lock_file = LockFile::default();
 
             let installed_path = resolve_provider_with_http(
+                &user_dirs,
                 dir.path(),
                 &provider_source(installed_source),
                 "0.5.0",
@@ -20943,6 +21082,7 @@ transparency_log_present = false
                 .unwrap();
 
             let resolved = resolve_all_with_http(
+                &user_dirs,
                 dir.path(),
                 &[versioned_config(requested_source, "~0.5.0")],
                 LockMode::Normal,
@@ -20969,6 +21109,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_missing_previously_present_transparency_log() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -21004,6 +21145,7 @@ transparency_log_present = false
             .unwrap();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -21017,6 +21159,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_expired_valid_until() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
         let shasum = sha256_bytes(body);
@@ -21027,6 +21170,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -21040,6 +21184,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_default_discovery_cross_origin_base() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let http = FakeRegistryHttp::default().json(
             "https://registry.carina-rs.dev/.well-known/carina.json",
@@ -21048,6 +21193,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -21157,6 +21303,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_treats_hostname_case_insensitively() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let http = FakeRegistryHttp::default().json(
             "https://registry.carina-rs.dev/.well-known/carina.json",
@@ -21165,6 +21312,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let err = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("Registry.Carina-RS.dev/carina-rs/aws"),
             "0.5.0",
@@ -21178,6 +21326,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_streams_large_wasm_instead_of_using_capped_get() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         let body = vec![b'w'; 10 * 1024 * 1024 + 1];
         let shasum = sha256_bytes(&body);
@@ -21200,6 +21349,7 @@ transparency_log_present = false
         let mut lock_file = LockFile::default();
 
         let path = resolve_provider_with_http(
+            &user_dirs,
             dir.path(),
             &provider_source("carina-rs/aws"),
             "0.5.0",
@@ -21218,10 +21368,10 @@ transparency_log_present = false
 
     #[test]
     fn github_release_lock_reinstall_uses_pinned_asset_id_without_listing() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let version = "0.1.0";
         let tag = ReleaseTag::from_lock("0.1.0".into());
@@ -21250,7 +21400,8 @@ transparency_log_present = false
             .bytes(&asset_url, bytes);
         let github = GithubApi::new(&github_http, None);
 
-        let resolved = resolve_all_with_github(
+        let resolved = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Normal,
@@ -21332,12 +21483,12 @@ transparency_log_present = false
 
     #[test]
     fn github_release_lock_accepts_verified_asset_and_writes_trust_record() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let tag = "v0.1.0";
@@ -21368,6 +21519,7 @@ transparency_log_present = false
         let github = GithubApi::new(&github_http, None);
 
         let resolved = resolve_all_with_github(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Normal,
@@ -21378,7 +21530,7 @@ transparency_log_present = false
 
         assert_eq!(fs::read(resolved["awscc"].as_path()).unwrap(), bytes);
         assert!(
-            load_user_verified_identity(crate::test_user_dirs(), &sha256, &source_key(source))
+            load_user_verified_identity(&user_dirs, &sha256, &source_key(source))
                 .unwrap()
                 .is_some(),
             "the verified origin download must write a user trust record"
@@ -21388,6 +21540,7 @@ transparency_log_present = false
 
     #[test]
     fn github_direct_crn_revision_rejects_injection_before_request() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source = "github.com/acme/widget";
         let github_http = FixtureGithubHttp::default();
@@ -21395,6 +21548,7 @@ transparency_log_present = false
 
         for revision in ["%2e%2e", "..", "/", "?", "#", "%2F", " ", ""] {
             let error = resolve_all_with_github(
+                &user_dirs,
                 project.path(),
                 &[provider_config(source, Some(revision))],
                 LockMode::Normal,
@@ -21413,10 +21567,10 @@ transparency_log_present = false
 
     #[test]
     fn authenticated_github_release_lock_reinstall_uses_only_pinned_asset_id() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let version = "0.1.0";
         let tag = ReleaseTag::from_lock("v0.1.0".into());
@@ -21448,7 +21602,8 @@ transparency_log_present = false
         };
         let github = GithubApi::with_token_provider(&github_http, &tokens);
 
-        resolve_all_with_github(
+        resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Normal,
@@ -21478,10 +21633,10 @@ transparency_log_present = false
 
     #[test]
     fn production_resolve_loop_does_not_resolve_token_for_locked_cache_hit() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let version = "0.1.0";
         let bytes = b"already cached and pinned";
@@ -21510,7 +21665,7 @@ transparency_log_present = false
         let github = GithubApi::with_token_provider(&github_http, &tokens);
 
         super::resolve_all_with_http(
-            crate::test_user_dirs(),
+            &user_dirs,
             &install_lock,
             &[provider_config(source, None)],
             LockMode::Normal,
@@ -21525,10 +21680,10 @@ transparency_log_present = false
 
     #[test]
     fn normal_init_re_resolves_legacy_github_lock_at_exact_pinned_version() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let legacy_bytes = b"legacy-pinned provider";
         let mut lock = LockFile::default();
@@ -21562,7 +21717,8 @@ transparency_log_present = false
             );
         let github = GithubApi::new(&github_http, None);
 
-        let resolved = resolve_all_with_github(
+        let resolved = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0")],
             LockMode::Normal,
@@ -21598,6 +21754,7 @@ transparency_log_present = false
 
     #[test]
     fn orphan_legacy_entry_survives_normal_init_save() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let lock_path = provider_lock_path(project.path());
         let legacy_source = "github.com/acme/orphan";
@@ -21622,6 +21779,7 @@ future_protection_field = "retain-me"
         let local_source = format!("file://{}", local_wasm.display());
 
         resolve_all_with_http(
+            &user_dirs,
             project.path(),
             &[provider_config(&local_source, None)],
             LockMode::Normal,
@@ -21640,10 +21798,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn failed_github_step_does_not_drop_legacy_entry_after_registry_persistence() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let lock_path = provider_lock_path(project.path());
         let legacy_source = "github.com/acme/widget";
         fs::write(
@@ -21668,7 +21826,8 @@ future_protection_field = "retain-me"
         let github_http = FixtureGithubHttp::default();
         let github = GithubApi::new(&github_http, None);
 
-        resolve_all_with_github(
+        resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[
                 versioned_config("carina-rs/aws", "^0.5"),
@@ -21691,10 +21850,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn normal_init_rejects_changed_bytes_against_legacy_checksum() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
@@ -21720,7 +21879,8 @@ future_protection_field = "retain-me"
             .bytes(asset_url, b"changed legacy bytes");
         let github = GithubApi::new(&github_http, None);
 
-        let error = resolve_all_with_github(
+        let error = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0")],
             LockMode::Normal,
@@ -21738,10 +21898,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn upgrade_may_move_legacy_github_lock_to_newer_version() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
@@ -21768,7 +21928,8 @@ future_protection_field = "retain-me"
             .bytes(asset_url, b"newer provider bytes");
         let github = GithubApi::new(&github_http, None);
 
-        resolve_all_with_github(
+        resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0")],
             LockMode::Upgrade,
@@ -21793,10 +21954,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn latest_github_release_downloads_single_wasm_asset_by_id() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let latest_url = "https://api.github.com/repos/acme/widget/releases/latest";
         let asset_url = "https://api.github.com/repos/acme/widget/releases/assets/77";
@@ -21808,7 +21969,8 @@ future_protection_field = "retain-me"
             .bytes(asset_url, b"latest provider");
         let github = GithubApi::new(&github_http, None);
 
-        let resolved = resolve_all_with_github(
+        let resolved = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[provider_config(source, None)],
             LockMode::Normal,
@@ -21845,10 +22007,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn private_github_release_download_uses_authenticated_asset_api() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
         let asset_url = "https://api.github.com/repos/acme/widget/releases/assets/42";
@@ -21863,7 +22025,8 @@ future_protection_field = "retain-me"
         };
         let github = GithubApi::with_token_provider(&github_http, &tokens);
 
-        let resolved = resolve_all_with_github(
+        let resolved = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Normal,
@@ -21894,10 +22057,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn upgrade_cache_hit_records_the_newly_resolved_release_identity() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let version = "1.0.0";
         let bytes = b"identical release bytes";
@@ -21925,7 +22088,8 @@ future_protection_field = "retain-me"
         );
         let github = GithubApi::new(&github_http, None);
 
-        resolve_all_with_github(
+        resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^1")],
             LockMode::Upgrade,
@@ -21959,10 +22123,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn reuploaded_asset_for_locked_version_keeps_checksum_pin() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/acme/widget";
         let locked_bytes = b"original release bytes";
         let changed_bytes = b"reuploaded different bytes";
@@ -21992,7 +22156,8 @@ future_protection_field = "retain-me"
             .bytes(asset_url, changed_bytes);
         let github = GithubApi::new(&github_http, None);
 
-        let error = resolve_all_with_github(
+        let error = resolve_all_with_github_in(
+            &user_dirs,
             project.path(),
             &[versioned_config(source, "^0.1")],
             LockMode::Upgrade,
@@ -22018,12 +22183,12 @@ future_protection_field = "retain-me"
 
     #[test]
     fn github_version_global_cache_mismatch_preserves_project_and_lock() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let expected_bytes = b"locked provider bytes";
@@ -22046,20 +22211,15 @@ future_protection_field = "retain-me"
         let lock_path = provider_lock_path(project.path());
         lock.save(&lock_path).unwrap();
         let lock_before = fs::read(&lock_path).unwrap();
-        let global_wasm =
-            global_cache_path_wasm(crate::test_user_dirs(), &source_key(source), version).unwrap();
+        let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
-        record_test_github_origin_download(
-            crate::test_user_dirs(),
-            &source_key(source),
-            &expected_sha256,
-            None,
-        )
-        .unwrap();
+        record_test_github_origin_download(&user_dirs, &source_key(source), &expected_sha256, None)
+            .unwrap();
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
 
         let error = resolve_all_with_http(
+            &user_dirs,
             project.path(),
             &[provider_config(source, None)],
             LockMode::Normal,
@@ -22093,6 +22253,7 @@ future_protection_field = "retain-me"
             .bytes(&asset_url, expected_bytes);
         let github = GithubApi::new(&github_http, None);
         let rerun = resolve_all_with_github(
+            &user_dirs,
             project.path(),
             &[provider_config(source, None)],
             LockMode::Normal,
@@ -22155,16 +22316,14 @@ future_protection_field = "retain-me"
 
     #[test]
     fn third_party_github_init_skips_user_trust_and_reuses_cache() {
-        let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust_parent = tempfile::tempdir().unwrap();
-        let unavailable_trust_dir = trust_parent.path().join("not-a-directory");
-        fs::write(&unavailable_trust_dir, b"sentinel").unwrap();
-        let trust_before = snapshot_tree(trust_parent.path());
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env =
-            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", &unavailable_trust_dir);
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        fs::create_dir_all(user_dirs.trust_record_dir().parent().unwrap()).unwrap();
+        fs::write(user_dirs.trust_record_dir(), b"sentinel").unwrap();
+        let trust_before = fs::read(user_dirs.trust_record_dir()).unwrap();
         let source = "github.com/carina-test-only/provider";
         let version = "1.2.3";
         let origin_bytes = b"third-party provider";
@@ -22174,7 +22333,8 @@ future_protection_field = "retain-me"
         let mut lock = LockFile::default();
 
         for _ in 0..2 {
-            resolve_github_provider_with_client(
+            resolve_github_provider_with_client_in(
+                &user_dirs,
                 project.path(),
                 source,
                 version,
@@ -22186,7 +22346,11 @@ future_protection_field = "retain-me"
         }
 
         assert_eq!(github_http.requests().len(), 1);
-        assert_eq!(snapshot_tree(trust_parent.path()), trust_before);
+        assert_eq!(
+            fs::read(user_dirs.trust_record_dir()).unwrap(),
+            trust_before
+        );
+        assert!(user_dirs.trust_record_dir().is_file());
     }
 
     #[test]
@@ -22239,12 +22403,12 @@ future_protection_field = "retain-me"
 
     #[test]
     fn origin_mismatch_without_user_trust_preserves_lock_artifacts_caches_and_records() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let locked_bytes = b"repository-installed locked provider";
@@ -22253,8 +22417,7 @@ future_protection_field = "retain-me"
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, locked_bytes).unwrap();
-        let global_wasm =
-            global_cache_path_wasm(crate::test_user_dirs(), &source_key(source), version).unwrap();
+        let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), locked_bytes).unwrap();
         let mut lock = LockFile::default();
@@ -22275,7 +22438,7 @@ future_protection_field = "retain-me"
         let lock_before = fs::read(&lock_path).unwrap();
         let project_before = fs::read(&project_wasm).unwrap();
         let global_before = fs::read(global_wasm.as_path()).unwrap();
-        let trust_before = snapshot_tree(trust.path());
+        let trust_before = snapshot_tree(trust);
         let release_url = github_release_by_tag_url(source, "v0.1.0");
         let asset_url = github_asset_url(source, 42);
         let github_http = FixtureGithubHttp::default()
@@ -22289,6 +22452,7 @@ future_protection_field = "retain-me"
         config.name = "aws".into();
 
         let error = resolve_all_with_github(
+            &user_dirs,
             project.path(),
             &[config],
             LockMode::Normal,
@@ -22303,18 +22467,18 @@ future_protection_field = "retain-me"
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         assert_eq!(fs::read(&project_wasm).unwrap(), project_before);
         assert_eq!(fs::read(global_wasm.as_path()).unwrap(), global_before);
-        assert_eq!(snapshot_tree(trust.path()), trust_before);
+        assert_eq!(snapshot_tree(trust), trust_before);
         assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
     }
 
     #[test]
     fn github_version_project_cache_mismatch_is_removed_and_reruns_from_origin() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let locked_bytes = b"locked provider bytes";
@@ -22336,18 +22500,14 @@ future_protection_field = "retain-me"
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, tampered_bytes).unwrap();
-        record_test_github_origin_download(
-            crate::test_user_dirs(),
-            &source_key(source),
-            &expected_sha256,
-            None,
-        )
-        .unwrap();
+        record_test_github_origin_download(&user_dirs, &source_key(source), &expected_sha256, None)
+            .unwrap();
         let asset_url = github_asset_url(source, 42);
         let github_http = FixtureGithubHttp::default().bytes(&asset_url, locked_bytes);
         let github = GithubApi::new(&github_http, None);
 
         let error = resolve_github_provider_with_client(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22382,6 +22542,7 @@ future_protection_field = "retain-me"
         ));
 
         let resolved = resolve_github_provider_with_client(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22460,16 +22621,15 @@ future_protection_field = "retain-me"
 
     #[test]
     fn github_version_global_cache_without_lock_is_replaced_from_origin() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let cached_bytes = b"untrusted global provider bytes";
         let origin_bytes = b"fresh origin provider bytes";
-        let global_wasm =
-            global_cache_path_wasm(crate::test_user_dirs(), &source_key(source), version).unwrap();
+        let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         let asset_url = github_asset_url(source, 42);
@@ -22478,6 +22638,7 @@ future_protection_field = "retain-me"
         let mut lock = LockFile::default();
 
         let resolved = resolve_github_provider_with_client(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22498,10 +22659,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn github_version_project_cache_without_lock_is_replaced_from_origin() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let cached_bytes = b"untrusted project-local provider bytes";
@@ -22514,7 +22675,8 @@ future_protection_field = "retain-me"
         let github = GithubApi::new(&github_http, None);
         let mut lock = LockFile::default();
 
-        let resolved = resolve_github_provider_with_client(
+        let resolved = resolve_github_provider_with_client_in(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22535,10 +22697,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn github_version_fresh_download_mismatch_is_not_published_or_repinned() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let locked_bytes = b"locked origin provider bytes";
@@ -22563,7 +22725,8 @@ future_protection_field = "retain-me"
         let github = GithubApi::new(&github_http, None);
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
 
-        let error = resolve_github_provider_with_client(
+        let error = resolve_github_provider_with_client_in(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22589,10 +22752,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn github_version_fresh_download_match_preserves_existing_pin() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let downloaded_bytes = b"lock-matching origin provider bytes";
@@ -22614,7 +22777,8 @@ future_protection_field = "retain-me"
         let github_http = FixtureGithubHttp::default().bytes(&asset_url, downloaded_bytes);
         let github = GithubApi::new(&github_http, None);
 
-        let resolved = resolve_github_provider_with_client(
+        let resolved = resolve_github_provider_with_client_in(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -22667,7 +22831,6 @@ future_protection_field = "retain-me"
     /// local `.carina/`. The project-local directory is the source of truth.
     #[test]
     fn find_installed_provider_revision_requires_local_install_not_global_cache() {
-        let _guard = crate::test_env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
 
@@ -22701,7 +22864,6 @@ future_protection_field = "retain-me"
 
     #[test]
     fn find_installed_provider_version_requires_local_install_not_global_cache() {
-        let _guard = crate::test_env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
 
@@ -22860,6 +23022,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn load_with_keeps_lock_verified_bytes_after_artifact_is_replaced() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source = "github.com/example/carina-provider-awscc";
         let version = "0.1.0";
@@ -22888,13 +23051,9 @@ future_protection_field = "retain-me"
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(
-                crate::test_user_dirs(),
-                &no_local_grants(),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
-                },
-            )
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
+            })
             .await
             .unwrap();
 
@@ -22904,6 +23063,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn load_with_keeps_file_source_bytes_after_source_is_replaced() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         let original_bytes = b"local provider at lookup";
@@ -22916,13 +23076,9 @@ future_protection_field = "retain-me"
         fs::write(&source_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(
-                crate::test_user_dirs(),
-                &no_local_grants(),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
-                },
-            )
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
+            })
             .await
             .unwrap();
 
@@ -22932,6 +23088,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn file_load_identity_hashes_the_retained_bytes() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         let retained_bytes = b"local provider retained at lookup";
@@ -22940,17 +23097,12 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(project.path(), &config).unwrap();
         fs::write(&source_path, b"different bytes after lookup").unwrap();
 
-        let artifact =
-            installed
-                .load_with(
-                    crate::test_user_dirs(),
-                    &no_local_grants(),
-                    |verified| async move {
-                        Ok::<_, std::convert::Infallible>(verified.artifact().clone())
-                    },
-                )
-                .await
-                .unwrap();
+        let artifact = installed
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.artifact().clone())
+            })
+            .await
+            .unwrap();
 
         assert_eq!(
             artifact.sha256(),
@@ -22965,6 +23117,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn load_with_binds_identity_to_retained_artifact_bytes() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         let artifact_bytes = b"resolver-owned local provider";
@@ -22975,7 +23128,7 @@ future_protection_field = "retain-me"
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
         let (loaded_bytes, configured_name, trust_class) = installed
-            .load_with(crate::test_user_dirs(), &grants, |verified| async move {
+            .load_with(&user_dirs, &grants, |verified| async move {
                 Ok::<_, std::convert::Infallible>((
                     verified.bytes().as_bytes().to_vec(),
                     verified.identity().configured_name().to_string(),
@@ -22992,6 +23145,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn file_provider_without_grant_is_untrusted() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
@@ -22999,13 +23153,9 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(project.path(), &config).unwrap();
 
         let class = installed
-            .load_with(
-                crate::test_user_dirs(),
-                &no_local_grants(),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-                },
-            )
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            })
             .await
             .unwrap();
 
@@ -23014,6 +23164,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn matching_local_grant_applies_aws_trust_and_emits_notice_once() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
@@ -23026,7 +23177,7 @@ future_protection_field = "retain-me"
 
         let class = installed
             .load_with_notice_sink(
-                crate::test_user_dirs(),
+                &user_dirs,
                 &grants,
                 |line| emitted.push(line.to_string()),
                 |verified| async move {
@@ -23049,6 +23200,7 @@ future_protection_field = "retain-me"
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_file_source_matches_grant_for_canonical_target() {
+        let user_dirs = carina_core::TestUserDirs::new();
         use std::os::unix::fs::symlink;
 
         let project = tempfile::tempdir().unwrap();
@@ -23062,7 +23214,7 @@ future_protection_field = "retain-me"
             TrustedLocalGrants::parse(&[format!("{}=aws", target.display())], None).unwrap();
 
         let class = installed
-            .load_with(crate::test_user_dirs(), &grants, |verified| async move {
+            .load_with(&user_dirs, &grants, |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
@@ -23073,6 +23225,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn relative_file_source_does_not_match_grant_for_different_path() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let relative_root = tempfile::tempdir_in(".").unwrap();
         let source_path = relative_root.path().join("evil.wasm");
         fs::write(&source_path, b"evil provider").unwrap();
@@ -23088,7 +23241,7 @@ future_protection_field = "retain-me"
             TrustedLocalGrants::parse(&[format!("{}=aws", granted_path.display())], None).unwrap();
 
         let class = installed
-            .load_with(crate::test_user_dirs(), &grants, |verified| async move {
+            .load_with(&user_dirs, &grants, |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
@@ -23099,6 +23252,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn matching_grant_with_different_cached_bytes_is_untrusted() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         let cached_path = project.path().join("cached-provider.wasm");
@@ -23117,7 +23271,7 @@ future_protection_field = "retain-me"
 
         let class = installed
             .load_with_notice_sink(
-                crate::test_user_dirs(),
+                &user_dirs,
                 &grants,
                 |line| emitted.push(line.to_string()),
                 |verified| async move {
@@ -23139,6 +23293,7 @@ future_protection_field = "retain-me"
 
     #[tokio::test]
     async fn trusted_local_grant_rejects_incompatible_configured_name() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
@@ -23149,7 +23304,7 @@ future_protection_field = "retain-me"
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
         let error = installed
-            .load_with(crate::test_user_dirs(), &grants, |_verified| async move {
+            .load_with(&user_dirs, &grants, |_verified| async move {
                 Ok::<_, std::convert::Infallible>(())
             })
             .await
@@ -23163,12 +23318,12 @@ future_protection_field = "retain-me"
 
     #[test]
     fn trusted_remote_source_rejects_disagreeing_configured_name_before_loader() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"verified provider";
@@ -23189,6 +23344,7 @@ future_protection_field = "retain-me"
         let github_http = FixtureGithubHttp::default().bytes(&asset_url, bytes);
         let github = GithubApi::new(&github_http, None);
         resolve_github_provider_with_client(
+            &user_dirs,
             project.path(),
             source,
             version,
@@ -23204,7 +23360,7 @@ future_protection_field = "retain-me"
         let called = std::sync::Arc::clone(&loader_called);
 
         let error = block_on(installed.load_with(
-            crate::test_user_dirs(),
+            &user_dirs,
             &no_local_grants(),
             move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -23220,10 +23376,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn official_remote_without_user_trust_fails_before_loader() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"repository-controlled provider";
@@ -23251,7 +23407,7 @@ future_protection_field = "retain-me"
         let called = std::sync::Arc::clone(&loader_called);
 
         let error = block_on(installed.load_with(
-            crate::test_user_dirs(),
+            &user_dirs,
             &no_local_grants(),
             move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -23420,10 +23576,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn official_github_revision_without_user_trust_fails_before_loader() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/carina-rs/carina-provider-aws";
         let revision = "main";
         let resolved_sha =
@@ -23459,7 +23615,7 @@ future_protection_field = "retain-me"
         let called = std::sync::Arc::clone(&loader_called);
 
         let error = block_on(installed.load_with(
-            crate::test_user_dirs(),
+            &user_dirs,
             &no_local_grants(),
             move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -23483,14 +23639,15 @@ future_protection_field = "retain-me"
 
     #[test]
     fn load_identity_uses_user_record_signer_instead_of_lock_signer() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "carina-rs/aws";
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock = LockFile::default();
         resolve_provider_with_http(
+            &user_dirs,
             project.path(),
             &provider_source(source),
             SIGNED_FIXTURE_VERSION,
@@ -23516,7 +23673,7 @@ future_protection_field = "retain-me"
         let called = std::sync::Arc::clone(&loader_called);
 
         let error = block_on(installed.load_with(
-            crate::test_user_dirs(),
+            &user_dirs,
             &no_local_grants(),
             move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -23535,10 +23692,10 @@ future_protection_field = "retain-me"
 
     #[test]
     fn third_party_remote_without_user_trust_is_untrusted_and_loads() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = "github.com/example/provider-widget";
         let version = "1.2.3";
         let bytes = b"third-party provider";
@@ -23563,14 +23720,13 @@ future_protection_field = "retain-me"
         config.name = "widget".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
 
-        let class = block_on(installed.load_with(
-            crate::test_user_dirs(),
-            &no_local_grants(),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            },
-        ))
-        .unwrap();
+        let class =
+            block_on(
+                installed.load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                }),
+            )
+            .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
     }
@@ -23947,6 +24103,7 @@ sha256 = "{}"
 
     #[tokio::test]
     async fn installed_provider_loader_receives_host_configured_name() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let provider_path = tmp.path().join("provider.wasm");
         fs::write(&provider_path, b"fixture").unwrap();
@@ -23959,16 +24116,12 @@ sha256 = "{}"
         .unwrap();
 
         let (loaded_bytes, configured_name) = installed
-            .load_with(
-                crate::test_user_dirs(),
-                &no_local_grants(),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>((
-                        verified.bytes().as_bytes().to_vec(),
-                        verified.identity().configured_name().to_string(),
-                    ))
-                },
-            )
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>((
+                    verified.bytes().as_bytes().to_vec(),
+                    verified.identity().configured_name().to_string(),
+                ))
+            })
             .await
             .unwrap();
 
@@ -24239,6 +24392,7 @@ sha256 = "{sha256}"
 
     #[test]
     fn locked_init_returns_typed_error_for_filtered_legacy_entry() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let mut lock = LockFile::default();
         lock.upsert(version_entry(SRC, "0.5.2"));
@@ -24246,7 +24400,7 @@ sha256 = "{sha256}"
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
 
         let error = resolve_all(
-            crate::test_user_dirs(),
+            &user_dirs,
             &install_lock,
             &[versioned_config(SRC, "~0.5.0")],
             LockMode::Locked,
@@ -24319,6 +24473,7 @@ sha256 = "{sha256}"
     /// lock file untouched. That's the invariant the whole fix is built on.
     #[test]
     fn resolve_all_errors_on_mismatch_without_touching_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         let lock_path = base.join("carina-providers.lock");
@@ -24333,13 +24488,8 @@ sha256 = "{sha256}"
         // network fetch, and not rewrite the lock.
         let providers = vec![versioned_config(SRC, "~0.5.0")];
         let install_lock = ProviderInstallLock::acquire(base).unwrap();
-        let err = resolve_all(
-            crate::test_user_dirs(),
-            &install_lock,
-            &providers,
-            LockMode::Normal,
-        )
-        .expect_err("mismatched lock must abort resolve_all");
+        let err = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal)
+            .expect_err("mismatched lock must abort resolve_all");
         assert!(err.to_string().contains("--upgrade"), "{err}");
 
         let after = fs::read_to_string(&lock_path).unwrap();

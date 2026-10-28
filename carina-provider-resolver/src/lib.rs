@@ -29,32 +29,6 @@ pub use verified_artifact::{
 };
 
 #[cfg(test)]
-pub(crate) fn test_user_dirs() -> &'static carina_core::UserDirs {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    use std::thread::ThreadId;
-
-    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-    static USER_DIRS: OnceLock<Mutex<HashMap<ThreadId, &'static carina_core::UserDirs>>> =
-        OnceLock::new();
-
-    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("create resolver test user root"));
-    let mut by_thread = USER_DIRS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let thread_id = std::thread::current().id();
-    if let Some(user_dirs) = by_thread.get(&thread_id) {
-        return user_dirs;
-    }
-
-    let test_root = root.path().join(by_thread.len().to_string());
-    let user_dirs = Box::leak(Box::new(carina_core::UserDirs::under(&test_root)));
-    by_thread.insert(thread_id, user_dirs);
-    user_dirs
-}
-
-#[cfg(test)]
 pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))

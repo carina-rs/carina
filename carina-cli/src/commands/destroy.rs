@@ -1332,8 +1332,9 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let user_dirs = carina_core::TestUserDirs::new();
     let outcome = run_destroy_locked_owned(
-        crate::test_user_dirs(),
+        &user_dirs,
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -2348,13 +2349,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_destroy_cancelled_after_partial_execution_persists_deletions_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["first", "second"])
             .cancel_after_successes(1);
         let token = fixture.cancel_token();
 
         let err = run_destroy(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             true,
@@ -2396,6 +2398,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
             .lock()
             .await;
@@ -2411,7 +2414,7 @@ mod tests {
         let mut parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
         crate::commands::validate_and_resolve_with_config(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             base_dir,
             true,
@@ -2420,7 +2423,7 @@ mod tests {
         )
         .expect("fixture must validate");
         let (factories, _) =
-            build_factories_from_providers(crate::test_user_dirs(), &parsed.providers, base_dir)
+            build_factories_from_providers(&user_dirs, &parsed.providers, base_dir)
                 .expect("mock factory must load");
         let ctx = WiringContext::new(factories, &parsed.providers);
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
@@ -2451,6 +2454,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_managed_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
             .lock()
             .await;
@@ -2461,7 +2465,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             true,
@@ -2511,6 +2515,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_orphan_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
             .lock()
             .await;
@@ -2521,7 +2526,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             true,
@@ -2571,6 +2576,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_cleanup_priority_persists_completed_deletion_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
             .lock()
             .await;
@@ -2580,7 +2586,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             true,
@@ -2620,13 +2626,14 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_harvests_ready_deletion_before_cleanup_priority() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["ready"])
             .with_delete_result_barrier();
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            crate::test_user_dirs(),
+            &user_dirs,
             fixture.config_path(),
             true,
             true,

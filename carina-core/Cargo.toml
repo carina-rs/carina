@@ -10,7 +10,7 @@ homepage.workspace = true
 
 [features]
 test-shutdown = []
-test-utils = []
+test-utils = ["dep:tempfile"]
 
 [dependencies]
 carina-provider-protocol = { path = "../carina-provider-protocol" }
@@ -35,6 +35,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 chrono = "0.4"
 dirs = "6"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

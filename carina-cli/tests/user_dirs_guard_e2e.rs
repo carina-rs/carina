@@ -60,3 +60,32 @@ fn spawned_carina_uses_the_nextest_setup_home_when_the_marker_matches() {
     );
     assert!(installed.starts_with(&home));
 }
+
+#[test]
+fn command_without_user_storage_ignores_an_invalid_nextest_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("actual-home");
+    let marker = temp.path().join("different-test-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["completions", "bash"])
+        .env("HOME", &home)
+        .env("NEXTEST_RUN_ID", "user-dirs-lazy-e2e")
+        .env("CARINA_TEST_HOME", &marker)
+        .env("CARINA_TRUST_RECORD_DIR", temp.path().join("outside/trust"))
+        .env(
+            "CARINA_PLUGIN_CACHE_DIR",
+            temp.path().join("outside/plugin-cache"),
+        )
+        .output()
+        .expect("spawn carina completions");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("complete"));
+}

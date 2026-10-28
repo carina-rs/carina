@@ -11,12 +11,12 @@ fn user_dirs_under_keeps_every_user_owned_path_beneath_the_supplied_home() {
     assert_eq!(dirs.trust_record_dir(), home.join(".carina/trust"));
     assert_eq!(dirs.plugin_cache_dir(), home.join(".carina/plugin-cache"));
     assert_eq!(dirs.compiled_wasm_cache_dir(), home.join(".carina/cache"));
-    assert_eq!(dirs.agents_skills_dir(), home.join(".agents/skills/carina"));
+    assert_eq!(dirs.agents_skills_root(), home.join(".agents/skills"));
     for path in [
         dirs.trust_record_dir(),
         dirs.plugin_cache_dir(),
         dirs.compiled_wasm_cache_dir(),
-        dirs.agents_skills_dir(),
+        dirs.agents_skills_root(),
     ] {
         assert!(
             path.starts_with(home),

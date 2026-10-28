@@ -128,27 +128,32 @@ pub fn run_skills_list() -> String {
 
 /// `carina skills install` — install SKILL.md to `~/.agents/skills/carina/`.
 pub fn run_skills_install(user_dirs: &UserDirs) -> Result<String, AppError> {
-    install_to(user_dirs.agents_skills_dir())
+    install_to(&user_dirs.agents_skills_root().join(SKILL_NAME))
 }
 
 /// `carina skills uninstall` — remove managed skills.
 pub fn run_skills_uninstall(user_dirs: &UserDirs) -> Result<String, AppError> {
-    uninstall_from(user_dirs.agents_skills_dir())
+    uninstall_from(&user_dirs.agents_skills_root().join(SKILL_NAME))
 }
 
 /// `carina skills status` — show install status and version comparison.
 pub fn run_skills_status(user_dirs: &UserDirs) -> Result<String, AppError> {
-    status_of(&user_dirs.agents_skills_dir().join("SKILL.md"))
+    status_of(
+        &user_dirs
+            .agents_skills_root()
+            .join(SKILL_NAME)
+            .join("SKILL.md"),
+    )
 }
 
 /// `carina skills update` — update installed skill if versions differ.
 pub fn run_skills_update(user_dirs: &UserDirs) -> Result<String, AppError> {
-    update_to(user_dirs.agents_skills_dir())
+    update_to(&user_dirs.agents_skills_root().join(SKILL_NAME))
 }
 
 /// `carina skills reinstall` — force reinstall regardless of version.
 pub fn run_skills_reinstall(user_dirs: &UserDirs) -> Result<String, AppError> {
-    install_to(user_dirs.agents_skills_dir())
+    install_to(&user_dirs.agents_skills_root().join(SKILL_NAME))
 }
 
 #[cfg(test)]

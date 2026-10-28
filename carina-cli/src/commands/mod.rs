@@ -1156,6 +1156,7 @@ mod tests {
 
     #[test]
     fn backend_validation_keeps_the_typed_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
@@ -1170,14 +1171,8 @@ mod tests {
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
 
-        let errors = validate_and_resolve_errors(
-            crate::test_user_dirs(),
-            &mut parsed,
-            base.path(),
-            false,
-            &[],
-            &[],
-        );
+        let errors =
+            validate_and_resolve_errors(&user_dirs, &mut parsed, base.path(), false, &[], &[]);
 
         assert!(errors.iter().any(|error| {
             matches!(
@@ -1195,6 +1190,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provider_load_error_shows_actual_reason() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         let source_path = base.path().join("local-provider.wasm");
         let installed_path = base
@@ -1215,15 +1211,9 @@ mod tests {
             binding: None,
         });
 
-        let error = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
-            &mut parsed,
-            base.path(),
-            false,
-            &[],
-            &[],
-        )
-        .unwrap_err();
+        let error =
+            validate_and_resolve_with_config(&user_dirs, &mut parsed, base.path(), false, &[], &[])
+                .unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -1243,6 +1233,7 @@ mod tests {
 
     #[test]
     fn test_provider_without_source_shows_source_hint() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // A provider without source should tell the user to add source config.
         let mut parsed = empty_parsed_file();
         parsed.providers.push(ProviderConfig {
@@ -1256,14 +1247,8 @@ mod tests {
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
-            &mut parsed,
-            base_dir,
-            false,
-            &[],
-            &[],
-        );
+        let result =
+            validate_and_resolve_with_config(&user_dirs, &mut parsed, base_dir, false, &[], &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -1276,6 +1261,7 @@ mod tests {
 
     #[test]
     fn upstream_field_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // `destroy` and `state` subcommands pass `skip_resource_validation =
         // true` so they can run on projects whose upstream has drifted.
         // The static upstream-exports check must respect that gate;
@@ -1314,7 +1300,7 @@ exports {
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed.clone(),
             &base,
             false,
@@ -1327,7 +1313,7 @@ exports {
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
         let result = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             &base,
             true,
@@ -1343,6 +1329,7 @@ exports {
 
     #[test]
     fn duplicate_declaration_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         std::fs::write(
             base.path().join("a.crn"),
@@ -1366,7 +1353,7 @@ exports {
         let mut parsed = loaded.parsed;
 
         let err = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed.clone(),
             base.path(),
             false,
@@ -1377,7 +1364,7 @@ exports {
         assert!(err.to_string().contains("duplicate export 'x'"));
 
         let result = validate_and_resolve_with_config(
-            crate::test_user_dirs(),
+            &user_dirs,
             &mut parsed,
             base.path(),
             true,

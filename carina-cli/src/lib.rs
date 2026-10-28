@@ -39,59 +39,6 @@ pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_user_dirs() -> &'static carina_core::UserDirs {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    use std::thread::ThreadId;
-
-    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-    static USER_DIRS: OnceLock<Mutex<HashMap<ThreadId, &'static carina_core::UserDirs>>> =
-        OnceLock::new();
-
-    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("create CLI test user root"));
-    let mut by_thread = USER_DIRS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let thread_id = std::thread::current().id();
-    if let Some(user_dirs) = by_thread.get(&thread_id) {
-        return user_dirs;
-    }
-
-    let test_root = root.path().join(by_thread.len().to_string());
-    let user_dirs = Box::leak(Box::new(carina_core::UserDirs::under(&test_root)));
-    by_thread.insert(thread_id, user_dirs);
-    user_dirs
-}
-
-#[cfg(test)]
-pub(crate) struct ScopedTestEnvVar {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl ScopedTestEnvVar {
-    pub(crate) fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(name);
-        // SAFETY: callers hold test_env_guard while this process-wide override is active.
-        unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScopedTestEnvVar {
-    fn drop(&mut self) {
-        // SAFETY: the test still holds test_env_guard while this guard is dropped.
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.name, value) },
-            None => unsafe { std::env::remove_var(self.name) },
-        }
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new())

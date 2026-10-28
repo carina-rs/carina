@@ -8,7 +8,7 @@ matches=$(
     --include='*.rs' \
     --exclude-dir=target \
     --exclude-dir=.worktrees \
-    'env::(var|var_os)[[:space:]]*\([[:space:]]*"HOME"[[:space:]]*\)' \
+    'var(_os)?[[:space:]]*\([[:space:]]*"(HOME|USERPROFILE)"[[:space:]]*\)' \
     "$repo_root" || true
 )
 

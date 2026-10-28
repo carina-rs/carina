@@ -5,6 +5,8 @@
 mod user_dirs;
 mod value_description;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub use user_dirs::TestUserDirs;
 pub use user_dirs::{UserDirs, UserDirsError};
 pub use value_description::ValueDescription;
 
