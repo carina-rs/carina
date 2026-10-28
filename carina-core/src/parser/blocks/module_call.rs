@@ -15,9 +15,10 @@ pub(crate) fn parse_module_call(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
-    let call_span = SourceSpan::from_pest(span, preprocessed_file);
+    let call_span = SourceSpan::from_pest(&pair, preprocessed_file);
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -35,14 +36,12 @@ pub(crate) fn parse_module_call(
         if arg.as_rule() == Rule::module_call_arg {
             let mut arg_inner = arg.into_inner();
             let key_pair = next_pair(&mut arg_inner, "argument name", "module call argument")?;
-            let key_span = key_pair.as_span();
+            let key_source_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
             let key = key_pair.as_str().to_string();
             let value_pair = next_pair(&mut arg_inner, "argument value", "module call argument")?;
-            let value_span = value_pair.as_span();
+            let value_source_span = SourceSpan::from_pest(&value_pair, preprocessed_file);
             let value_line = value_pair.line_col().0;
             let eval = parse_expression_eval(value_pair, ctx)?;
-            let key_source_span = SourceSpan::from_pest(key_span, preprocessed_file);
-            let value_source_span = SourceSpan::from_pest(value_span, preprocessed_file);
             let argument = match &eval {
                 crate::eval_value::EvalValue::StructuralHandle(handle) => {
                     ModuleArgument::from_handle(handle.clone())
@@ -65,10 +64,11 @@ pub(crate) fn parse_module_call(
         }
     }
 
-    Ok(ModuleCall::from_authored_arguments(
+    Ok(ModuleCall::from_authored_arguments_in_source(
         module_name,
         None,
         call_span,
         arguments,
+        source_file.to_path_buf(),
     ))
 }

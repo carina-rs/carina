@@ -1390,10 +1390,17 @@ pub fn validate_composition_ref_types_with_bindings(
             continue;
         };
         for (argument_name, argument) in &composition.signature.arguments {
+            let Some((declared_type, origin)) = argument.validation_metadata() else {
+                // Value-only saved-plan arguments cannot occur on the normal
+                // live expansion path. If a caller manually combines one
+                // with live provenance, it still cannot provide a source
+                // origin for a diagnostic.
+                continue;
+            };
             let mut reference_position = 0;
             visit_refs_with_sink(
                 argument.value(),
-                argument.declared_type().map(RefSink::TypeExpr),
+                Some(RefSink::TypeExpr(declared_type)),
                 &mut |path, sink, usage| {
                     let current_position = reference_position;
                     reference_position += 1;
@@ -1409,11 +1416,7 @@ pub fn validate_composition_ref_types_with_bindings(
                     errors.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
-                            origin: Box::new(
-                                composition
-                                    .diagnostic_argument_origin(argument_name)
-                                    .expect("live composition arguments retain resolver origin"),
-                            ),
+                            origin: Box::new(origin),
                             path: path.to_owned(),
                             kind,
                             call: call.clone(),
@@ -2923,18 +2926,12 @@ pub fn validate_module_calls(
                 let value_span = authored.value_span();
                 if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
                     let line = value_span.start_line();
-                    let context = match source_file {
-                        Some(file) => format!(
-                            "module {} argument '{}' in {} at line {line}",
-                            call.module_name,
-                            arg_name,
-                            file.display(),
-                        ),
-                        None => format!(
-                            "module {} argument '{}' at line {line}",
-                            call.module_name, arg_name,
-                        ),
-                    };
+                    let context = format!(
+                        "module {} argument '{}' in {} at line {line}",
+                        call.module_name,
+                        arg_name,
+                        source_file.display(),
+                    );
                     let resolved_parameter =
                         match resolve_parameter_type_for_check(&arg_param.type_expr, config) {
                             Ok(Some(resolved)) => resolved,

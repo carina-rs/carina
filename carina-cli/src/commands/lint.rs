@@ -304,8 +304,12 @@ mod tests {
         for name in calls {
             source.push_str(&format!("{name} {{}}\n"));
         }
-        carina_core::parser::parse(&source, &ProviderContext::default())
-            .expect("test fixture must parse")
+        carina_core::parser::parse_file(
+            &source,
+            std::path::Path::new("lint_fixture.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("test fixture must parse")
     }
 
     #[test]

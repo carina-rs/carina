@@ -311,7 +311,7 @@ impl SemanticLookup for ModuleCall {
     ) -> Option<&'a Self> {
         let authored_span = self.source_span();
         merged.module_calls.iter().find(|candidate| {
-            candidate.source_file() == Some(current_file)
+            candidate.source_file() == current_file
                 && candidate.source_span() == authored_span
                 && candidate.expansion_key().is_none()
         })
@@ -334,8 +334,7 @@ impl SemanticLookup for AttributeParameter {
     ) -> Option<&'a Self> {
         let authored_span = self.source_span();
         merged.attribute_params.iter().find(|candidate| {
-            candidate.source_file() == Some(current_file)
-                && candidate.source_span() == authored_span
+            candidate.source_file() == current_file && candidate.source_span() == authored_span
         })
     }
 
@@ -354,8 +353,7 @@ impl SemanticLookup for ParsedExportParam {
     ) -> Option<&'a Self> {
         let authored_span = self.source_span();
         merged.export_params.iter().find(|candidate| {
-            candidate.source_file() == Some(current_file)
-                && candidate.source_span() == authored_span
+            candidate.source_file() == current_file && candidate.source_span() == authored_span
         })
     }
 
@@ -1260,9 +1258,12 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         error: &carina_core::module_resolver::ModuleError,
         base_path: &std::path::Path,
-        current_file_name: Option<&str>,
+        current_source: Option<&std::path::Path>,
     ) -> Option<Diagnostic> {
-        let current_source = current_file_name.map(|name| base_path.join(name));
+        // Resolver identities are always file-backed. Without a current-file
+        // identity there is no safe way to distinguish coincidentally equal
+        // spans from different directory members.
+        let current_source = current_source?;
         let call_source = error.call_source();
         let error = error.root_cause();
 
@@ -1271,9 +1272,7 @@ impl DiagnosticEngine {
             carina_core::module_resolver::ModuleError::BareStructuralHandleArgument { .. }
         ) && match call_source {
             carina_core::module_resolver::ModuleErrorCallSource::Failing(identity) => {
-                current_source
-                    .as_deref()
-                    .is_some_and(|current| identity.source_file() == current)
+                identity.source_file() == current_source
             }
             carina_core::module_resolver::ModuleErrorCallSource::Owners(_)
             | carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
@@ -1351,16 +1350,11 @@ impl DiagnosticEngine {
         let call = parsed.module_calls.iter().find(|call| {
             let matches_identity =
                 |identity: &carina_core::module_resolver::ModuleCallSystemIdentity| {
-                    if let Some(current_source) = &current_source {
-                        identity
-                            == &carina_core::module_resolver::ModuleCallSystemIdentity::for_authored_call(
-                                current_source.clone(),
-                                call,
-                            )
-                    } else {
-                        identity.call_span() == call.source_span()
-                            && identity.expansion_key() == call.expansion_key()
-                    }
+                    identity
+                        == &carina_core::module_resolver::ModuleCallSystemIdentity::for_authored_call(
+                            current_source.to_path_buf(),
+                            call,
+                        )
                 };
             match call_source {
                 carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
@@ -1384,7 +1378,7 @@ impl DiagnosticEngine {
             } else {
                 base_path.join(error_source)
             };
-            if current_source.as_deref() == Some(error_source.as_path()) {
+            if current_source == error_source.as_path() {
                 let line = (line as u32).saturating_sub(1);
                 let width = doc
                     .text()
@@ -1638,7 +1632,9 @@ impl DiagnosticEngine {
                     Err(_) => continue,
                 },
             };
-            let Ok(parsed) = carina_core::parser::parse(&content, &self.provider_context) else {
+            let Ok(parsed) =
+                carina_core::parser::parse_file(&content, &file, &self.provider_context)
+            else {
                 continue;
             };
             out.extend(

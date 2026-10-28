@@ -55,23 +55,38 @@ fn escape_double_quoted_literal_part(
     let mut rendered = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => rendered.push_str("\\\\"),
-            '"' => rendered.push_str("\\\""),
-            '\n' => rendered.push_str("\\n"),
-            '\r' => rendered.push_str("\\r"),
-            '\t' => rendered.push_str("\\t"),
-            '$' if escape_interpolation && chars.peek() == Some(&'{') => rendered.push_str("\\$"),
-            ch if ch.is_control() => match unrepresentable {
+        if let Some(escaped) =
+            escape_double_quoted_character(ch, chars.peek().copied(), escape_interpolation)
+        {
+            rendered.push_str(escaped);
+        } else if ch.is_control() {
+            match unrepresentable {
                 UnrepresentableControl::EscapeForDisplay => {
                     rendered.push_str(&format!("\\u{{{:x}}}", ch as u32));
                 }
                 UnrepresentableControl::PreserveAuthored => rendered.push(ch),
-            },
-            _ => rendered.push(ch),
+            }
+        } else {
+            rendered.push(ch);
         }
     }
     rendered
+}
+
+pub(crate) fn escape_double_quoted_character(
+    ch: char,
+    next: Option<char>,
+    escape_interpolation: bool,
+) -> Option<&'static str> {
+    match ch {
+        '\\' => Some("\\\\"),
+        '"' => Some("\\\""),
+        '\n' => Some("\\n"),
+        '\r' => Some("\\r"),
+        '\t' => Some("\\t"),
+        '$' if escape_interpolation && next == Some('{') => Some("\\$"),
+        _ => None,
+    }
 }
 
 pub(crate) fn display_double_quoted_literal_part(value: &str) -> String {

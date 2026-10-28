@@ -504,13 +504,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                 let owning_calls = module_calls
                     .iter()
                     .filter(|call| call.module_name == import.alias)
-                    .filter_map(|call| {
-                        call.source_file().map(|source_file| {
-                            ModuleCallSystemIdentity::for_authored_call(
-                                source_file.to_path_buf(),
-                                call,
-                            )
-                        })
+                    .map(|call| {
+                        ModuleCallSystemIdentity::for_authored_call(
+                            call.source_file().to_path_buf(),
+                            call,
+                        )
                     })
                     .collect();
                 error.with_owning_calls(owning_calls)
@@ -695,7 +693,10 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
 }
 
 /// Resolve all modules in a parsed file
-pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
+pub fn resolve_modules(
+    parsed: &mut crate::parser::ParsedFile,
+    base_dir: &Path,
+) -> Result<(), ModuleError> {
     resolve_modules_with_config(
         parsed,
         base_dir,

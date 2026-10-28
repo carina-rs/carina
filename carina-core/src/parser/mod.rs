@@ -28,10 +28,8 @@ pub use ast::{
     ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
-#[cfg(test)]
-pub(crate) use entry::parse_with_seeded_bindings;
 pub use entry::{
-    AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse, parse_and_resolve,
+    AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
     top_level_anonymous_resource_spans, top_level_backend_block_spans,
     top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
 };
@@ -39,12 +37,16 @@ pub(crate) use entry::{
     BindingSeed, parse_with_directory_context, top_level_argument_names,
     top_level_let_binding_names, top_level_user_functions_in_files,
 };
+#[cfg(test)]
+pub(crate) use entry::{parse, parse_and_resolve, parse_with_seeded_bindings};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
-pub(crate) use expressions::string_literal::{display_double_quoted_literal_part, unescape_string};
+pub(crate) use expressions::string_literal::{
+    display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
+};
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
 pub use functions::{contains_function_call, provider_context_lookup, validate_custom_type};
 pub(crate) use functions::{evaluate_resolved_user_function, function_argument_as_eval};

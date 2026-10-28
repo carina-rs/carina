@@ -116,6 +116,7 @@ pub(crate) fn parse_for_expr(
     ctx: &mut ParseContext,
     binding_name: &str,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
@@ -207,8 +208,13 @@ pub(crate) fn parse_for_expr(
                     var,
                     EvalValue::computed(item.clone(), metadata),
                 );
-                let result =
-                    parse_for_body(body_pair.clone(), &iter_ctx, &address, preprocessed_file)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -239,8 +245,13 @@ pub(crate) fn parse_for_expr(
                     val_var,
                     EvalValue::computed(item.clone(), metadata),
                 );
-                let result =
-                    parse_for_body(body_pair.clone(), &iter_ctx, &address, preprocessed_file)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -275,8 +286,13 @@ pub(crate) fn parse_for_expr(
                     val_var,
                     EvalValue::computed(val.clone(), metadata),
                 );
-                let result =
-                    parse_for_body(body_pair.clone(), &iter_ctx, &address, preprocessed_file)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -344,9 +360,13 @@ pub(crate) fn parse_for_expr(
             }
 
             let address = format!("{}[?]", binding_name);
-            if let Ok(ForBodyResult::Resource(resource)) =
-                parse_for_body(body_pair, &template_ctx, &address, preprocessed_file)
-            {
+            if let Ok(ForBodyResult::Resource(resource)) = parse_for_body(
+                body_pair,
+                &template_ctx,
+                &address,
+                preprocessed_file,
+                source_file,
+            ) {
                 let attrs: Vec<(String, Value)> = resource
                     .attributes
                     .iter()
@@ -420,9 +440,13 @@ pub(crate) fn parse_for_expr(
                     }
                 }
                 let address = format!("{}[?]", binding_name);
-                if let Ok(ForBodyResult::Resource(resource)) =
-                    parse_for_body(body_pair, &template_ctx, &address, preprocessed_file)
-                {
+                if let Ok(ForBodyResult::Resource(resource)) = parse_for_body(
+                    body_pair,
+                    &template_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                ) {
                     let attrs: Vec<(String, Value)> = resource
                         .attributes
                         .iter()
@@ -614,6 +638,7 @@ pub(crate) fn parse_for_body(
     ctx: &ParseContext,
     address: &str,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<ForBodyResult, ParseError> {
     let mut local_ctx = ctx.clone();
 
@@ -639,7 +664,8 @@ pub(crate) fn parse_for_body(
                 return Ok(ForBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
-                let mut call = parse_module_call(inner, &local_ctx, preprocessed_file)?;
+                let mut call =
+                    parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = Some(address.to_string());
                 return Ok(ForBodyResult::ModuleCall(call));
             }

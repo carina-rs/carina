@@ -14,7 +14,7 @@
 //! This file walks every `Value` in a representative parsed file and
 //! asserts the invariants hold for every interpolation found.
 
-use carina_core::parser::parse_and_resolve;
+use carina_core::parser::parse_file_and_resolve;
 use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
 fn check_value(v: &Value, path: &str) {
@@ -116,7 +116,8 @@ fn parse_resolve_yields_canonical_interpolations() {
         }
     "#;
 
-    let parsed = parse_and_resolve(src).expect("parse should succeed");
+    let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
+        .expect("parse should succeed");
 
     for resource in &parsed.resources {
         for (k, v) in &resource.attributes {
@@ -156,7 +157,8 @@ fn double_quoted_literal_is_canonical_string() {
           name  = "no-interpolation-here"
         }
     "#;
-    let parsed = parse_and_resolve(src).expect("parse should succeed");
+    let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
+        .expect("parse should succeed");
     let resource = &parsed.resources[0];
     let value = resource.attributes.get("name").expect("name attribute");
     assert!(

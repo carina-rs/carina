@@ -198,16 +198,21 @@ pub(in crate::parser) fn parse_require_statement(
     pair: pest::iterators::Pair<Rule>,
     ctx: &crate::parser::ParseContext,
     preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<RequireBlock, ParseError> {
     let mut inner = pair.into_inner();
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
     // Constraint diagnostics belong to the offending expression, not to the
     // beginning of a potentially multi-line `require` statement.
-    let source_span =
-        crate::parser::SourceSpan::from_pest(condition_pair.as_span(), preprocessed_file);
+    let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
     let condition = parse_validate_expr(condition_pair, ctx)?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
     let raw = message_pair.as_str();
     let error_message = raw[1..raw.len() - 1].to_string();
-    Ok(RequireBlock::new(condition, error_message, source_span))
+    Ok(RequireBlock::new_in_source(
+        condition,
+        error_message,
+        source_span,
+        source_file.to_path_buf(),
+    ))
 }

@@ -29,16 +29,13 @@ pub(in crate::parser) fn parse_backend_block(
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
-            let key_span = key_pair.as_span();
+            let key_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
             let key = key_pair.as_str().to_string();
             let value = parse_expression(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
             )?;
-            attribute_spans.insert(
-                key.clone(),
-                SourceSpan::from_pest(key_span, preprocessed_file),
-            );
+            attribute_spans.insert(key.clone(), key_span);
             attributes.insert(key, value);
         }
     }

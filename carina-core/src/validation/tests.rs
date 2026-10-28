@@ -1015,11 +1015,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
-        provenance: Box::new(CompositionProvenance::expanded(
-            call.clone(),
-            call,
-            IndexMap::new(),
-        )),
+        provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
         quoted_string_attrs: Default::default(),
     }
 }
@@ -1033,29 +1029,7 @@ fn set_composition_module(composition: &mut Composition, module_name: &str) {
         module_source: None,
         module_directory: None,
     };
-    *composition.provenance = CompositionProvenance::expanded(call.clone(), call, IndexMap::new());
-}
-
-fn set_composition_argument_origin(
-    composition: &mut Composition,
-    argument: &str,
-    origin: ArgumentOrigin,
-) {
-    let call = composition
-        .diagnostic_call()
-        .expect("test composition has live call provenance")
-        .clone();
-    let root_call = composition
-        .diagnostic_root_call()
-        .expect("test composition has live root-call provenance")
-        .clone();
-    let mut origins = composition
-        .provenance
-        .argument_origins()
-        .expect("test composition has live argument provenance")
-        .clone();
-    origins.insert(argument.to_string(), origin);
-    *composition.provenance = CompositionProvenance::expanded(call, root_call, origins);
+    *composition.provenance = CompositionProvenance::expanded(call.clone(), call);
 }
 
 #[test]
@@ -3715,9 +3689,9 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         CompositionArgument::from_value(
             Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
+            ArgumentOrigin::Defaulted,
         ),
     );
-    set_composition_argument_origin(&mut consumer, "vpc_id", ArgumentOrigin::Defaulted);
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
     let schemas = SchemaRegistry::new();
@@ -3910,9 +3884,9 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
         CompositionArgument::from_value(
             Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
+            ArgumentOrigin::Defaulted,
         ),
     );
-    set_composition_argument_origin(&mut consumer, "vpc_id", ArgumentOrigin::Defaulted);
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
     let schemas = SchemaRegistry::new();

@@ -3743,8 +3743,9 @@ mod load_upstream_states_tests {
         )
         .unwrap();
 
-        let old_backend = carina_core::parser::parse(
+        let old_backend = carina_core::parser::parse_file(
             r#"backend local { path = "old.state.json" }"#,
+            std::path::Path::new("backend.crn"),
             &ProviderContext::default(),
         )
         .unwrap()

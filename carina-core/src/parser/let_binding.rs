@@ -116,6 +116,7 @@ pub(super) fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<
     (
         String,
@@ -159,7 +160,13 @@ pub(super) fn parse_let_binding_extended(
 
     // Check if it's a module call, resource expression, or for expression
     let (value, expanded_resources, data_sources, module_calls, maybe_import, binding_kind) =
-        parse_expression_with_resource_or_module(rhs_pair, ctx, &name, preprocessed_file)?;
+        parse_expression_with_resource_or_module(
+            rhs_pair,
+            ctx,
+            &name,
+            preprocessed_file,
+            source_file,
+        )?;
 
     Ok((
         name,
@@ -212,6 +219,7 @@ fn parse_expression_with_resource_or_module(
     ctx: &mut ParseContext,
     binding_name: &str,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
     let coalesce = first_inner(pair, "expression", "expression with resource or module")?;
     if coalesce.clone().into_inner().nth(1).is_some() {
@@ -226,7 +234,7 @@ fn parse_expression_with_resource_or_module(
         ));
     }
     let pipe = first_inner(coalesce, "pipe expression", "coalesce expression")?;
-    parse_pipe_expr_with_resource_or_module(pipe, ctx, binding_name, preprocessed_file)
+    parse_pipe_expr_with_resource_or_module(pipe, ctx, binding_name, preprocessed_file, source_file)
 }
 
 fn parse_pipe_expr_with_resource_or_module(
@@ -234,6 +242,7 @@ fn parse_pipe_expr_with_resource_or_module(
     ctx: &mut ParseContext,
     binding_name: &str,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let compose_pair = next_pair(&mut inner, "compose expression", "pipe expression")?;
@@ -253,7 +262,13 @@ fn parse_pipe_expr_with_resource_or_module(
         "postfix expression",
     )?;
     let (mut value, expanded_resources, data_sources, module_calls, maybe_import, mut binding_kind) =
-        parse_primary_with_resource_or_module(primary, ctx, binding_name, preprocessed_file)?;
+        parse_primary_with_resource_or_module(
+            primary,
+            ctx,
+            binding_name,
+            preprocessed_file,
+            source_file,
+        )?;
     if !postfix_inner.is_empty() {
         if matches!(
             binding_kind,
@@ -347,6 +362,7 @@ fn parse_primary_with_resource_or_module(
     ctx: &mut ParseContext,
     binding_name: &str,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
     let inner = first_inner(pair, "value", "primary expression")?;
 
@@ -466,7 +482,7 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::for_expr => {
             let (resources, data_sources, module_calls) =
-                parse_for_expr(inner, ctx, binding_name, preprocessed_file)?;
+                parse_for_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
             Ok((
                 for_structural_handle(binding_name),
                 resources,
@@ -478,7 +494,7 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::if_expr => {
             let (value, resources, data_sources, module_calls, import, binding_kind) =
-                parse_if_expr(inner, ctx, binding_name, preprocessed_file)?;
+                parse_if_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
             Ok((
                 value,
                 resources,
@@ -489,7 +505,7 @@ fn parse_primary_with_resource_or_module(
             ))
         }
         Rule::module_call => {
-            let call = parse_module_call(inner, ctx, preprocessed_file)?;
+            let call = parse_module_call(inner, ctx, preprocessed_file, source_file)?;
             Ok((
                 module_structural_handle(binding_name),
                 vec![],

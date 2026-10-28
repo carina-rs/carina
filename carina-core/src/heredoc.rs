@@ -9,6 +9,8 @@
 //! - `<<'MARKER'` — literal heredoc (`${...}` is NOT expanded)
 //! - `<<-'MARKER'` — literal + indented
 
+use crate::parser::escape_double_quoted_character;
+
 /// Result of preprocessing: the transformed source and a list of heredoc
 /// replacements (for the formatter to restore them in the output).
 #[derive(Debug)]
@@ -454,19 +456,11 @@ fn escape_mapped_heredoc_body(body: &MappedText, preserve_interpolation: bool) -
     let mut unescaped_start = 0;
     while let Some((start, ch)) = chars.next() {
         let end = start + ch.len_utf8();
-        let rendered = match ch {
-            '\\' => Some("\\\\"),
-            '"' => Some("\\\""),
-            '\n' => Some("\\n"),
-            '\r' => Some("\\r"),
-            '\t' => Some("\\t"),
-            '$' if !preserve_interpolation
-                && chars.peek().is_some_and(|(_, next)| *next == '{') =>
-            {
-                Some("\\$")
-            }
-            _ => None,
-        };
+        let rendered = escape_double_quoted_character(
+            ch,
+            chars.peek().map(|(_, next)| *next),
+            !preserve_interpolation,
+        );
         if let Some(rendered) = rendered {
             escaped.push_mapped_range(body, unescaped_start, start);
             escaped.push_transformed(rendered, body.original_byte(start), body.original_byte(end));

@@ -234,17 +234,27 @@ impl AuthoredBindingView {
 
     /// Parse one in-memory source as an authored binding view.
     ///
-    /// This is the single-source counterpart to the directory loader, used by
-    /// editor buffers that have no base directory. It deliberately runs the
-    /// same directory parser as the multi-file loading paths.
-    pub fn parse_source(
+    /// This is the single-source counterpart to the directory loader. Editor
+    /// buffers may lack directory context, but still supply their real file
+    /// identity so any authored declarations remain file-backed. It deliberately
+    /// runs the same directory parser as the multi-file loading paths.
+    pub fn parse_file_source(
         source: &str,
+        source_file: &Path,
         config: &ProviderContext,
     ) -> Result<Self, parser::ParseError> {
-        let files = vec![(PathBuf::from("buffer.crn"), source.to_string())];
+        let files = vec![(source_file.to_path_buf(), source.to_string())];
         let parsed_files =
             parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
         Ok(Self::from_directory_files(&parsed_files))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_source(
+        source: &str,
+        config: &ProviderContext,
+    ) -> Result<Self, parser::ParseError> {
+        Self::parse_file_source(source, Path::new("test.crn"), config)
     }
 
     pub(crate) fn parsed(&self) -> &ParsedFile {
@@ -1086,6 +1096,7 @@ pub(crate) fn parse_directory_files_located(
     for (path, content) in files {
         let parsed = parser::parse_with_directory_context(
             content,
+            path,
             config,
             &provisional_seeds,
             &directory_functions,
@@ -1165,13 +1176,14 @@ pub(crate) fn parse_directory_files_located(
     for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
         let mut parsed = parser::parse_with_directory_context(
             content,
+            path,
             config,
             &final_seeds,
             &directory_functions,
             true,
         )
         .map_err(|error| LocatedParseError::in_file(path, error))?;
-        stamp_parsed_file_source(&mut parsed, path);
+        record_parsed_file_source_metadata(&mut parsed, path);
         out.push((
             path.clone(),
             DirectoryResolvedFile {
@@ -1183,7 +1195,7 @@ pub(crate) fn parse_directory_files_located(
     Ok(out)
 }
 
-fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
+fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
     parsed
         .parser_binding_metadata
         .set_pending_function_source_file(path);
@@ -1208,23 +1220,6 @@ fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
         parsed
             .parser_binding_metadata
             .insert_resource_source_file(id, path.to_path_buf());
-    }
-    for call in &mut parsed.module_calls {
-        call.set_source_file(path.to_path_buf());
-    }
-    for parameter in &mut parsed.attribute_params {
-        parameter.set_source_file(path.to_path_buf());
-    }
-    for parameter in &mut parsed.export_params {
-        parameter.set_source_file(path.to_path_buf());
-    }
-    for parameter in &mut parsed.arguments {
-        for validation in &mut parameter.validations {
-            validation.set_source_file(path.to_path_buf());
-        }
-    }
-    for requirement in &mut parsed.requires {
-        requirement.set_source_file(path.to_path_buf());
     }
     for function in parsed.user_functions.values_mut() {
         function.body.source_file = Some(path.to_path_buf());
@@ -1257,9 +1252,15 @@ fn parse_local_variable_union(
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserBindingMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
-        let mut parsed =
-            parser::parse_with_directory_context(content, config, seeds, user_functions, false)
-                .map_err(|error| LocatedParseError::in_file(path, error))?;
+        let mut parsed = parser::parse_with_directory_context(
+            content,
+            path,
+            config,
+            seeds,
+            user_functions,
+            false,
+        )
+        .map_err(|error| LocatedParseError::in_file(path, error))?;
         parsed
             .variables
             .retain(|name, _| local_variables.contains(name));
@@ -2324,13 +2325,21 @@ awscc.ec2.SecurityGroup {
     }
 
     #[test]
-    fn shared_directory_parse_stamps_parameter_diagnostic_sources() {
+    fn shared_directory_parse_assigns_diagnostic_sources_during_parsing() {
         let temp = tempfile::tempdir().unwrap();
         let attributes_path = temp.path().join("attributes.crn");
         let exports_path = temp.path().join("exports.crn");
         fs::write(
             &attributes_path,
-            "attributes {\n    output: String = 'value'\n}\n",
+            "let child = use { source = './child' }\n\
+             arguments {\n\
+               input: String {\n\
+                 validation { condition = input != 'invalid' }\n\
+               }\n\
+             }\n\
+             require input != 'invalid', \"input is required\"\n\
+             child {}\n\
+             attributes {\n    output: String = 'value'\n}\n",
         )
         .unwrap();
         fs::write(
@@ -2353,11 +2362,23 @@ awscc.ec2.SecurityGroup {
             parse_directory_files(&files, &ProviderContext::default()).expect("directory parse");
         let attribute_file = parsed[0].1.parsed();
         let attribute = &attribute_file.attribute_params[0];
-        assert_eq!(attribute.source_file(), Some(attributes_path.as_path()));
-        assert_eq!(attribute.source_span().start_line(), 2);
+        assert_eq!(attribute.source_file(), attributes_path.as_path());
+        assert_eq!(attribute.source_span().start_line(), 10);
+        assert_eq!(
+            attribute_file.module_calls[0].source_file(),
+            attributes_path.as_path()
+        );
+        assert_eq!(
+            attribute_file.arguments[0].validations[0].source_file(),
+            attributes_path.as_path()
+        );
+        assert_eq!(
+            attribute_file.requires[0].source_file(),
+            attributes_path.as_path()
+        );
         let export_file = parsed[1].1.parsed();
         let export = &export_file.export_params[0];
-        assert_eq!(export.source_file(), Some(exports_path.as_path()));
+        assert_eq!(export.source_file(), exports_path.as_path());
         assert_eq!(export.source_span().start_line(), 2);
     }
 

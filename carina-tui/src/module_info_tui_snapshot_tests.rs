@@ -4,7 +4,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use carina_core::module::FileSignature;
-use carina_core::parser::{ProviderContext, parse};
+use carina_core::parser::{ProviderContext, parse_file};
 
 use crate::module_info_app::ModuleInfoApp;
 use crate::module_info_ui::draw;
@@ -64,7 +64,12 @@ fn build_module_signature() -> FileSignature {
             to_port           = 80
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse_file(
+        input,
+        std::path::Path::new("web_tier.crn"),
+        &ProviderContext::default(),
+    )
+    .unwrap();
     FileSignature::from_parsed_file_with_name(&parsed, "web_tier")
 }
 
@@ -85,7 +90,12 @@ fn build_root_config_signature() -> FileSignature {
             cidr_block = "10.0.1.0/24"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse_file(
+        input,
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .unwrap();
     FileSignature::from_parsed_file_with_name(&parsed, "main")
 }
 

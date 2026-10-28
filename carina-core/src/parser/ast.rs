@@ -517,33 +517,35 @@ pub struct ValidationBlock {
 }
 
 impl ValidationBlock {
-    pub fn new(
+    pub(crate) fn new_in_source(
         condition: ValidateExpr,
         error_message: Option<String>,
         source_span: SourceSpan,
+        source_file: PathBuf,
     ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span),
+            source: DeclarationSource::authored(source_span, source_file),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn dummy(condition: ValidateExpr, error_message: Option<String>) -> Self {
-        Self::new(condition, error_message, SourceSpan::dummy())
-    }
-
-    pub(crate) fn set_source_file(&mut self, file: PathBuf) {
-        self.source.file = Some(file);
+        Self::new_in_source(
+            condition,
+            error_message,
+            SourceSpan::dummy(),
+            PathBuf::from("test.crn"),
+        )
     }
 
     pub fn source_span(&self) -> SourceSpan {
         self.source.span
     }
 
-    pub fn source_file(&self) -> Option<&std::path::Path> {
-        self.source.file.as_deref()
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
     }
 }
 
@@ -612,29 +614,35 @@ pub struct RequireBlock {
 }
 
 impl RequireBlock {
-    pub fn new(condition: ValidateExpr, error_message: String, source_span: SourceSpan) -> Self {
+    pub(crate) fn new_in_source(
+        condition: ValidateExpr,
+        error_message: String,
+        source_span: SourceSpan,
+        source_file: PathBuf,
+    ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span),
+            source: DeclarationSource::authored(source_span, source_file),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn dummy(condition: ValidateExpr, error_message: String) -> Self {
-        Self::new(condition, error_message, SourceSpan::dummy())
-    }
-
-    pub(crate) fn set_source_file(&mut self, file: PathBuf) {
-        self.source.file = Some(file);
+        Self::new_in_source(
+            condition,
+            error_message,
+            SourceSpan::dummy(),
+            PathBuf::from("test.crn"),
+        )
     }
 
     pub fn source_span(&self) -> SourceSpan {
         self.source.span
     }
 
-    pub fn source_file(&self) -> Option<&std::path::Path> {
-        self.source.file.as_deref()
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
     }
 }
 
@@ -648,42 +656,38 @@ pub struct AttributeParameter {
 }
 
 impl AttributeParameter {
-    /// Authored declarations must include their parser-assigned source span.
-    ///
-    /// ```compile_fail
-    /// use carina_core::parser::AttributeParameter;
-    ///
-    /// let _ = AttributeParameter::new("name".to_string(), None, None);
-    /// ```
-    pub fn new(
+    pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<Value>,
         source_span: SourceSpan,
+        source_file: PathBuf,
     ) -> Self {
         Self {
             name,
             type_expr,
             value,
-            source: DeclarationSource::authored(source_span),
+            source: DeclarationSource::authored(source_span, source_file),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn dummy(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
-        Self::new(name, type_expr, value, SourceSpan::dummy())
-    }
-
-    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
-        self.source.file = Some(file);
+        Self::new_in_source(
+            name,
+            type_expr,
+            value,
+            SourceSpan::dummy(),
+            PathBuf::from("test.crn"),
+        )
     }
 
     pub fn source_span(&self) -> SourceSpan {
         self.source.span
     }
 
-    pub fn source_file(&self) -> Option<&std::path::Path> {
-        self.source.file.as_deref()
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
     }
 }
 
@@ -703,35 +707,38 @@ pub struct ParsedExportParam {
 }
 
 impl ParsedExportParam {
-    pub fn new(
+    pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<Value>,
         source_span: SourceSpan,
+        source_file: PathBuf,
     ) -> Self {
         Self {
             name,
             type_expr,
             value,
-            source: DeclarationSource::authored(source_span),
+            source: DeclarationSource::authored(source_span, source_file),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn dummy(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
-        Self::new(name, type_expr, value, SourceSpan::dummy())
-    }
-
-    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
-        self.source.file = Some(file);
+        Self::new_in_source(
+            name,
+            type_expr,
+            value,
+            SourceSpan::dummy(),
+            PathBuf::from("test.crn"),
+        )
     }
 
     pub fn source_span(&self) -> SourceSpan {
         self.source.span
     }
 
-    pub fn source_file(&self) -> Option<&std::path::Path> {
-        self.source.file.as_deref()
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
     }
 }
 
@@ -1168,18 +1175,19 @@ pub struct ModuleCall {
 }
 
 impl ModuleCall {
-    pub(crate) fn from_authored_arguments(
+    pub(crate) fn from_authored_arguments_in_source(
         module_name: impl Into<String>,
         binding_name: Option<String>,
         call_span: SourceSpan,
         arguments: HashMap<String, AuthoredModuleArgument>,
+        source_file: PathBuf,
     ) -> Self {
         Self {
             module_name: module_name.into(),
             binding_name,
             arguments,
             source: Box::new(ModuleCallSite {
-                file: None,
+                file: source_file,
                 call_span,
                 expansion_key: None,
             }),
@@ -1193,7 +1201,7 @@ impl ModuleCall {
         arguments: HashMap<String, ModuleArgument>,
     ) -> Self {
         let span = SourceSpan::dummy();
-        Self::from_authored_arguments(
+        Self::from_authored_arguments_in_source(
             module_name,
             binding_name,
             span,
@@ -1201,20 +1209,17 @@ impl ModuleCall {
                 .into_iter()
                 .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
                 .collect(),
+            PathBuf::from("test.crn"),
         )
-    }
-
-    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
-        self.source.file = Some(file);
     }
 
     pub(crate) fn set_expansion_key(&mut self, expansion_key: String) {
         self.source.expansion_key = Some(expansion_key);
     }
 
-    /// Source file attached by directory parsing, if this call has one.
-    pub fn source_file(&self) -> Option<&std::path::Path> {
-        self.source.file.as_deref()
+    /// Source file assigned before this call was parsed.
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
     }
 
     /// Concrete expansion identity for calls expanded from an authored site.
@@ -1274,12 +1279,12 @@ impl ModuleCall {
     }
 
     /// Source identity retained by a directory-loaded module call.
-    pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
-        Some(ModuleCallDiagnosticSource {
-            file: self.source.file.clone()?,
+    pub fn diagnostic_source(&self) -> ModuleCallDiagnosticSource {
+        ModuleCallDiagnosticSource {
+            file: self.source.file.clone(),
             call_span: self.source.call_span,
             expansion_key: self.source.expansion_key.clone(),
-        })
+        }
     }
 }
 
@@ -1333,20 +1338,20 @@ impl AuthoredModuleArgument {
 
 #[derive(Debug, Clone)]
 struct ModuleCallSite {
-    file: Option<std::path::PathBuf>,
+    file: PathBuf,
     call_span: SourceSpan,
     expansion_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct DeclarationSource {
-    file: Option<std::path::PathBuf>,
+    file: PathBuf,
     span: SourceSpan,
 }
 
 impl DeclarationSource {
-    fn authored(span: SourceSpan) -> Self {
-        Self { file: None, span }
+    fn authored(span: SourceSpan, file: PathBuf) -> Self {
+        Self { file, span }
     }
 }
 
@@ -1377,16 +1382,41 @@ pub enum ArgumentOrigin {
 }
 
 impl SourceSpan {
-    /// Build a parser-authored span while restoring heredoc-collapsed positions.
+    /// Build a parser-authored span and restore heredoc-collapsed positions.
+    ///
+    /// Pest's implicit skip may extend wrapper pairs through trailing trivia.
+    /// The flattened inner tree still exposes leaf tokens and delimiter-ended
+    /// compound tokens (including strings); their maximum end is the authored
+    /// source end without lexing comments out of the raw source again.
     pub(in crate::parser) fn from_pest(
-        span: pest::Span<'_>,
+        pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
         file: &crate::parser::PreprocessedFile,
     ) -> Self {
-        // Pest's implicit WHITESPACE can be consumed while expression
-        // repetitions probe for another operand. Canonicalize the tail for
-        // every authored span instead of special-casing individual parsers.
+        let span = pair.as_span();
         let start = span.start();
-        let end = start + span.as_str().trim_end().len();
+        let token_end = pair
+            .clone()
+            .into_inner()
+            .flatten()
+            .filter(|inner| {
+                inner.clone().into_inner().next().is_none()
+                    || matches!(
+                        inner.as_str().as_bytes().last(),
+                        Some(b'\'' | b'"' | b')' | b']' | b'}')
+                    )
+            })
+            .map(|inner| inner.as_span().end())
+            .max()
+            .unwrap_or_else(|| span.end());
+        // A module call's closing brace is grammar punctuation rather than an
+        // inner pair. The module-call pair itself ends exactly at that brace;
+        // unlike declaration/value pairs, it cannot absorb trailing trivia
+        // outside the block.
+        let end = if pair.as_rule() == crate::parser::Rule::module_call {
+            span.end()
+        } else {
+            token_end
+        };
         Self::from_preprocessed_range(start, end, file)
     }
 

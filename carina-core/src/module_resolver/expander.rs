@@ -68,22 +68,20 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     ) -> Result<ParsedFile, ModuleError> {
-        let result = self.expand_module_call_inner(
+        let source_file = call.source_file();
+        self.expand_module_call_inner(
             call,
             instance_prefix,
             ref_check,
             binding_index,
             resolved_bindings,
-        );
-        match call.source_file() {
-            Some(source_file) => result.map_err(|error| {
-                error.with_failing_call(ModuleCallSystemIdentity::for_authored_call(
-                    source_file.to_path_buf(),
-                    call,
-                ))
-            }),
-            None => result,
-        }
+        )
+        .map_err(|error| {
+            error.with_failing_call(ModuleCallSystemIdentity::for_authored_call(
+                source_file.to_path_buf(),
+                call,
+            ))
+        })
     }
 
     fn expand_module_call_inner(
@@ -99,10 +97,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .get(&call.module_name)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
         let call_source_file = call.source_file();
-        let call_source_path = call_source_file
-            .map(crate::utils::normalize_source_path)
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<unknown source>".to_string());
+        let call_source_path = crate::utils::normalize_source_path(call_source_file)
+            .display()
+            .to_string();
         let contextualize_access_error = |error: ArgumentSubstitutionError| {
             let ArgumentSubstitutionError {
                 source_file,
@@ -128,7 +125,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                                 .to_string()
                         })
                     })
-                    .unwrap_or_else(|| "<unknown module source>".to_string()),
+                    .unwrap_or_else(|| call_source_path.clone()),
                 line,
                 message,
             }
@@ -345,9 +342,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             ModuleConstraints::pending(&bound_constraints),
             &argument_values,
         );
-        if self.records_constraint_reports()
-            && let Some(source) = call.diagnostic_source()
-        {
+        if self.records_constraint_reports() {
+            let source = call.diagnostic_source();
             let outcomes = evaluated_constraints
                 .iter()
                 .map(|evaluated| {
@@ -466,7 +462,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 &intra_module_bindings,
                 argument_substitutions,
             )
-            .map_err(|error| contextualize_access_error(error.with_source_file(source_file)))?;
+            .map_err(|error| {
+                contextualize_access_error(error.with_optional_source_file(source_file))
+            })?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -488,7 +486,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 &intra_module_bindings,
                 argument_substitutions,
             )
-            .map_err(|error| contextualize_access_error(error.with_source_file(source_file)))?;
+            .map_err(|error| {
+                contextualize_access_error(error.with_optional_source_file(source_file))
+            })?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -587,14 +587,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // call-site argument was a value or a structural handle.
             let mut signature_arguments: IndexMap<String, crate::resource::CompositionArgument> =
                 IndexMap::new();
-            let mut signature_argument_origins = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
                     let recorded = match argument.value_ref() {
                         StructuralOperandRef::Value(value) => {
-                            crate::resource::CompositionArgument::from_resolved_value(
+                            crate::resource::CompositionArgument::from_value(
                                 value.clone(),
                                 arg.type_expr.clone(),
+                                argument.origin,
                             )
                         }
                         StructuralOperandRef::Handle {
@@ -604,16 +604,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                             access_base.clone(),
                             arg.type_expr.clone(),
                             handle.clone(),
+                            argument.origin,
                         ),
                         StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::CompositionArgument::from_resolved_value(
+                            crate::resource::CompositionArgument::from_value(
                                 access_base.clone(),
                                 arg.type_expr.clone(),
+                                argument.origin,
                             )
                         }
                     };
                     signature_arguments.insert(arg.name.clone(), recorded);
-                    signature_argument_origins.insert(arg.name.clone(), argument.origin);
                 }
             }
 
@@ -634,7 +635,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 provenance: Box::new(CompositionProvenance::expanded(
                     expanded_call.clone(),
                     expanded_call.clone(),
-                    signature_argument_origins,
                 )),
                 quoted_string_attrs: HashSet::new(),
             };
@@ -671,7 +671,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     &intra_module_bindings,
                     argument_substitutions,
                 )
-                .map_err(|error| error.with_source_file(source_file))
+                .map_err(|error| error.with_optional_source_file(source_file))
             })
             .collect::<Result<_, _>>()
             .map_err(contextualize_access_error)?;
@@ -882,10 +882,8 @@ fn prefix_directive_dependency(
                     Ok(handle.canonical_binding_name().to_string())
                 } else {
                     Err(ArgumentSubstitutionError {
-                        source_file: arguments
-                            .caller_source_file
-                            .map(std::path::Path::to_path_buf),
-                        line: arguments.source_line(binding),
+                        source_file: Some(arguments.caller_source_file.to_path_buf()),
+                        line: argument.source_line(arguments.default_line),
                         message: format!(
                             "directives.depends_on: '{}' is {} and cannot be used as a dependency target",
                             handle
@@ -898,10 +896,8 @@ fn prefix_directive_dependency(
                 }
             }
             StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
-                source_file: arguments
-                    .caller_source_file
-                    .map(std::path::Path::to_path_buf),
-                line: arguments.source_line(binding),
+                source_file: Some(arguments.caller_source_file.to_path_buf()),
+                line: argument.source_line(arguments.default_line),
                 message: format!(
                     "directives.depends_on parameter '{binding}' received a value, not a resource handle"
                 ),
@@ -1033,38 +1029,22 @@ impl std::ops::Deref for ResolvedArgument {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ArgumentSubstitutions<'a> {
-    arguments: &'a HashMap<String, ResolvedArgument>,
-    default_line: usize,
-    caller_source_file: Option<&'a std::path::Path>,
-    binding_index: Option<&'a BindingIndex<'a>>,
-    config: &'a crate::parser::ProviderContext,
-}
-
-impl<'a> ArgumentSubstitutions<'a> {
-    fn contains(self, name: &str) -> bool {
-        self.arguments.contains_key(name)
-    }
-
-    fn source_line(self, name: &str) -> usize {
-        match self.arguments.get(name).map(|argument| argument.origin) {
-            Some(ArgumentOrigin::Authored { value_span, .. }) => value_span.start_line(),
-            Some(ArgumentOrigin::Defaulted) | None => self.default_line,
+impl ResolvedArgument {
+    fn source_line(&self, default_line: usize) -> usize {
+        match self.origin {
+            ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
+            ArgumentOrigin::Defaulted => default_line,
         }
     }
 
-    fn get(
-        self,
+    fn substitution(
+        &self,
         name: &str,
         position: ArgumentSubstitutionPosition,
-    ) -> Result<Option<StructuralOperandRef<'a>>, String> {
-        let Some(argument) = self.arguments.get(name) else {
-            return Ok(None);
-        };
-        match (position, argument.value_ref()) {
+    ) -> Result<StructuralOperandRef<'_>, String> {
+        match (position, self.value_ref()) {
             (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Value(value)) => {
-                Ok(Some(StructuralOperandRef::Value(value)))
+                Ok(StructuralOperandRef::Value(value))
             }
             (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Handle { .. }) => {
                 Err(BareStructuralHandle {
@@ -1076,10 +1056,19 @@ impl<'a> ArgumentSubstitutions<'a> {
             (
                 ArgumentSubstitutionPosition::Value,
                 operand @ StructuralOperandRef::Parameter { .. },
-            ) => Ok(Some(operand)),
-            (ArgumentSubstitutionPosition::AccessBase, _) => Ok(Some(argument.access_ref())),
+            ) => Ok(operand),
+            (ArgumentSubstitutionPosition::AccessBase, _) => Ok(self.access_ref()),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ArgumentSubstitutions<'a> {
+    arguments: &'a HashMap<String, ResolvedArgument>,
+    default_line: usize,
+    caller_source_file: &'a std::path::Path,
+    binding_index: Option<&'a BindingIndex<'a>>,
+    config: &'a crate::parser::ProviderContext,
 }
 
 #[derive(Clone, Copy)]
@@ -1139,7 +1128,7 @@ fn bind_constraint_expression(
     arguments: ArgumentSubstitutions<'_>,
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     line: usize,
-    source_file: Option<&std::path::Path>,
+    source_file: &std::path::Path,
 ) -> Result<crate::parser::ValidateExpr, ArgumentSubstitutionError> {
     use crate::parser::ValidateExpr;
 
@@ -1147,24 +1136,24 @@ fn bind_constraint_expression(
                       position: ArgumentSubstitutionPosition,
                       path: &[PathSegment]|
      -> Result<ValidateExpr, ArgumentSubstitutionError> {
-        let Some(substitution) =
-            arguments
-                .get(argument, position)
+        let Some(resolved_argument) = arguments.arguments.get(argument) else {
+            return Ok(expression.clone());
+        };
+        let substitution =
+            resolved_argument
+                .substitution(argument, position)
                 .map_err(|message| ArgumentSubstitutionError {
-                    source_file: source_file.map(std::path::Path::to_path_buf),
+                    source_file: Some(source_file.to_path_buf()),
                     line,
                     message,
                     parse_error: None,
-                })?
-        else {
-            return Ok(expression.clone());
-        };
+                })?;
         let mut value = substitution.value().clone();
         for step in path {
             value = apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
                 .and_then(ValuePathSegmentResult::into_value)
                 .map_err(|error| ArgumentSubstitutionError {
-                    source_file: source_file.map(std::path::Path::to_path_buf),
+                    source_file: Some(source_file.to_path_buf()),
                     line,
                     message: error.to_string(),
                     parse_error: None,
@@ -1571,13 +1560,7 @@ fn prefix_module_composition(
     if let Some(binding) = &call.binding {
         call.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
-    let argument_origins = composition
-        .provenance
-        .argument_origins()
-        .expect("nested compositions are produced by live expansion")
-        .clone();
-    *new_virtual.provenance =
-        CompositionProvenance::expanded(call, root_call.clone(), argument_origins);
+    *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
 
     let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
     new_virtual.id = composition
@@ -1593,42 +1576,28 @@ fn prefix_module_composition(
         IndexMap::new();
     for (key, argument) in &new_virtual.signature.arguments {
         if let Some(parameter) = argument.forwarded_parameter()
-            && let Some(substitution) = arguments
-                .get(parameter, ArgumentSubstitutionPosition::AccessBase)
+            && let Some(resolved_parameter) = arguments.arguments.get(parameter)
+        {
+            let source_line = resolved_parameter.source_line(arguments.default_line);
+            let substitution = resolved_parameter
+                .substitution(parameter, ArgumentSubstitutionPosition::AccessBase)
                 .map_err(|message| ArgumentSubstitutionError {
                     source_file: None,
-                    line: arguments.source_line(parameter),
+                    line: source_line,
                     message,
                     parse_error: None,
-                })?
-        {
+                })?;
             let mut value = substitution.value().clone();
             value.canonicalize_in_place();
-            let declared_type = argument
-                .declared_type()
-                .cloned()
-                .expect("live composition arguments retain their declared type");
             let resolved = match substitution {
                 StructuralOperandRef::Handle { handle, .. } => {
-                    crate::resource::CompositionArgument::from_handle(
-                        value,
-                        declared_type,
-                        handle.clone().with_alias(parameter),
-                    )
+                    argument.with_handle(value, handle.clone().with_alias(parameter))
                 }
-                StructuralOperandRef::Value(_) => {
-                    crate::resource::CompositionArgument::from_resolved_value(value, declared_type)
-                }
-                StructuralOperandRef::Parameter { .. } => {
-                    crate::resource::CompositionArgument::from_resolved_value(value, declared_type)
+                StructuralOperandRef::Value(_) | StructuralOperandRef::Parameter { .. } => {
+                    argument.with_value(value)
                 }
             };
-            check_composition_argument_type(
-                key,
-                &resolved,
-                config,
-                arguments.source_line(parameter),
-            )?;
+            check_composition_argument_type(key, &resolved, config, source_line)?;
             substituted_arguments.insert(key.clone(), resolved);
             continue;
         }
@@ -1873,16 +1842,23 @@ pub(super) struct ArgumentSubstitutionError {
 }
 
 impl ArgumentSubstitutionError {
-    fn with_source_file(mut self, source_file: Option<&std::path::Path>) -> Self {
-        if self.source_file.is_none() {
-            self.source_file = source_file.map(std::path::Path::to_path_buf);
+    fn with_optional_source_file(self, source_file: Option<&std::path::Path>) -> Self {
+        match source_file {
+            Some(source_file) => self.with_source_file(source_file),
+            None => self,
         }
-        if let (Some(path), Some(error)) = (source_file, self.parse_error.take()) {
+    }
+
+    fn with_source_file(mut self, source_file: &std::path::Path) -> Self {
+        if self.source_file.is_none() {
+            self.source_file = Some(source_file.to_path_buf());
+        }
+        if let Some(error) = self.parse_error.take() {
             let error = *error;
             self.parse_error = Some(Box::new(if error.source_file().is_some() {
                 error
             } else {
-                error.in_file(path.to_path_buf())
+                error.in_file(source_file.to_path_buf())
             }));
         }
         self
@@ -1919,7 +1895,7 @@ pub(super) fn substitute_arguments(
         ArgumentSubstitutions {
             arguments: &arguments,
             default_line: 1,
-            caller_source_file: None,
+            caller_source_file: std::path::Path::new("test.crn"),
             binding_index: None,
             config: &config,
         },
@@ -1979,16 +1955,14 @@ fn substitute_arguments_with_position(
                 source_line,
                 diagnostic_name,
             },
-        )) if arguments.contains(name) => {
+        )) => {
+            let Some(argument) = arguments.arguments.get(name) else {
+                return Ok(value.clone());
+            };
             let line = source_line
                 .get()
-                .unwrap_or_else(|| arguments.source_line(name));
-            match arguments
-                .arguments
-                .get(name)
-                .expect("known module argument has a substitution")
-                .value_ref()
-            {
+                .unwrap_or_else(|| argument.source_line(arguments.default_line));
+            match argument.value_ref() {
                 StructuralOperandRef::Value(value) => value.clone(),
                 StructuralOperandRef::Handle { .. }
                     if matches!(position, ArgumentSubstitutionPosition::Value) =>
@@ -2023,31 +1997,35 @@ fn substitute_arguments_with_position(
                 }
             }
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) if arguments.contains(binding) => {
-            arguments
-                .get(binding, ArgumentSubstitutionPosition::Value)
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            let Some(argument) = arguments.arguments.get(binding) else {
+                return Ok(value.clone());
+            };
+            let source_line = argument.source_line(arguments.default_line);
+            argument
+                .substitution(binding, ArgumentSubstitutionPosition::Value)
                 .map_err(|message| ArgumentSubstitutionError {
                     source_file: None,
-                    line: arguments.source_line(binding),
+                    line: source_line,
                     message,
                     parse_error: None,
                 })?
-                .map(|substitution| substitution.value().clone())
-                .unwrap_or_else(|| value.clone())
+                .value()
+                .clone()
         }
-        Value::Deferred(DeferredValue::ResourceRef { path })
-            if arguments.contains(path.binding()) =>
-        {
-            let substitution = arguments
-                .get(path.binding(), ArgumentSubstitutionPosition::AccessBase)
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            let Some(argument) = arguments.arguments.get(path.binding()) else {
+                return Ok(value.clone());
+            };
+            let source_line = argument.source_line(arguments.default_line);
+            let substitution = argument
+                .substitution(path.binding(), ArgumentSubstitutionPosition::AccessBase)
                 .map_err(|message| ArgumentSubstitutionError {
                     source_file: None,
-                    line: arguments.source_line(path.binding()),
+                    line: source_line,
                     message,
                     parse_error: None,
-                })?
-                .unwrap_or(StructuralOperandRef::Value(value));
-            let source_line = arguments.source_line(path.binding());
+                })?;
             let mut substituted = apply_value_path_segment(
                 substitution.value().clone(),
                 PathSegment::Field {
@@ -2202,9 +2180,7 @@ fn substitute_arguments_with_position(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
+            DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => value.clone(),
@@ -2811,7 +2787,7 @@ mod tests {
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
             default_line: 1,
-            caller_source_file: None,
+            caller_source_file: std::path::Path::new("test.crn"),
             binding_index: None,
             config: &config,
         };
@@ -2858,7 +2834,7 @@ mod tests {
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
             default_line: 1,
-            caller_source_file: None,
+            caller_source_file: std::path::Path::new("test.crn"),
             binding_index: None,
             config: &config,
         };
@@ -2898,7 +2874,7 @@ mod tests {
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
             default_line: 1,
-            caller_source_file: None,
+            caller_source_file: std::path::Path::new("test.crn"),
             binding_index: None,
             config: &config,
         };

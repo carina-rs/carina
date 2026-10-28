@@ -25,6 +25,7 @@ pub(in crate::parser) fn parse_arguments_block(
     config: &ProviderContext,
     ctx: &mut ParseContext,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
@@ -83,7 +84,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validation_condition_attr",
                                                     )?;
                                                     let source_span = SourceSpan::from_pest(
-                                                        validate_pair.as_span(),
+                                                        &validate_pair,
                                                         preprocessed_file,
                                                     );
                                                     rule = Some((
@@ -111,10 +112,11 @@ pub(in crate::parser) fn parse_arguments_block(
                                         }
                                     }
                                     if let Some((condition, source_span)) = rule {
-                                        validations.push(ValidationBlock::new(
+                                        validations.push(ValidationBlock::new_in_source(
                                             condition,
                                             error_msg,
                                             source_span,
+                                            source_file.to_path_buf(),
                                         ));
                                     }
                                 }
@@ -175,13 +177,14 @@ pub(in crate::parser) fn parse_attributes_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<AttributeParameter>, ParseError> {
     let mut attribute_params = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::attributes_param {
-            let source_span = SourceSpan::from_pest(param.as_span(), preprocessed_file);
+            let source_span = SourceSpan::from_pest(&param, preprocessed_file);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
@@ -205,7 +208,13 @@ pub(in crate::parser) fn parse_attributes_block(
                 (None, value)
             };
 
-            attribute_params.push(AttributeParameter::new(name, type_expr, value, source_span));
+            attribute_params.push(AttributeParameter::new_in_source(
+                name,
+                type_expr,
+                value,
+                source_span,
+                source_file.to_path_buf(),
+            ));
         }
     }
 
@@ -216,13 +225,14 @@ pub(in crate::parser) fn parse_exports_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ExportParameter>, ParseError> {
     let mut export_params = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::exports_param {
-            let source_span = SourceSpan::from_pest(param.as_span(), preprocessed_file);
+            let source_span = SourceSpan::from_pest(&param, preprocessed_file);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "exports block")?
                 .as_str()
@@ -239,7 +249,13 @@ pub(in crate::parser) fn parse_exports_block(
                 (None, value)
             };
 
-            export_params.push(ExportParameter::new(name, type_expr, value, source_span));
+            export_params.push(ExportParameter::new_in_source(
+                name,
+                type_expr,
+                value,
+                source_span,
+                source_file.to_path_buf(),
+            ));
         }
     }
 

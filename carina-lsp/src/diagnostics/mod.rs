@@ -161,22 +161,24 @@ impl DiagnosticEngine {
         self
     }
 
-    pub fn analyze(&self, doc: &Document, base_path: Option<&Path>) -> Vec<Diagnostic> {
-        self.analyze_with_filename(doc, None, base_path)
-    }
-
-    /// Like [`analyze`] but lets the caller pass the current document's file
-    /// name (basename, e.g. `"main.crn"`). LSP uses this to feed the open
-    /// buffer into directory-scoped parses that would otherwise only see
-    /// on-disk content — so diagnostics update on keystrokes.
-    pub fn analyze_with_filename(
-        &self,
-        doc: &Document,
-        current_file_name: Option<&str>,
-        base_path: Option<&Path>,
-    ) -> Vec<Diagnostic> {
+    /// Analyze an open document in its directory context.
+    ///
+    /// `current_file_path` is the document's full path. It is the sole source
+    /// of file identity; the directory and basename used for merged parsing
+    /// are derived from it rather than inferred from buffer contents.
+    pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
+        let base_path = current_file_path.map(|path| {
+            path.parent()
+                .expect("a current file path must have a parent directory")
+        });
+        let current_file_name = current_file_path.map(|path| {
+            path.file_name()
+                .expect("a current file path must name a file")
+                .to_string_lossy()
+        });
+        let current_file_name = current_file_name.as_deref();
 
         // Empty `${}` interpolation hint. Runs even when other parses
         // succeeded — and especially before the buffer-only checks
@@ -193,11 +195,11 @@ impl DiagnosticEngine {
         // keystrokes.
         let merged_attempt =
             base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
-        let directory_error_emitted = if let (Some(Err(error)), Some(base), Some(file_name)) =
-            (merged_attempt.as_ref(), base_path, current_file_name)
+        let directory_error_emitted = if let (Some(Err(error)), Some(current_file_path)) =
+            (merged_attempt.as_ref(), current_file_path)
             && error
                 .source_file()
-                .is_some_and(|source_file| source_file == base.join(file_name))
+                .is_some_and(|source_file| source_file == current_file_path)
             && let Some(parse_error) = error.parse_error()
         {
             // The directory parse has the classified sibling bindings and is
@@ -209,15 +211,12 @@ impl DiagnosticEngine {
             false
         };
         let merged_result = merged_attempt.and_then(Result::ok);
-        let current_file_path = base_path
-            .zip(current_file_name)
-            .map(|(base, file_name)| base.join(file_name));
         // A buffer parsed by itself cannot resolve sibling user functions.
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
         let current_parsed = doc.parsed().or_else(|| {
-            current_file_path.as_deref().and_then(|path| {
+            current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
                     .and_then(|result| result.directory.semantic_file(path))
@@ -242,8 +241,7 @@ impl DiagnosticEngine {
         // sibling call that binds a structural handle and then uses the
         // parameter bare). `ParseError::Located` keeps the diagnostic on the
         // function document rather than the caller document.
-        if let (Some(result), Some(base), Some(file_name)) =
-            (merged_result.as_ref(), base_path, current_file_name)
+        if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
         {
             let mut strict = result.directory.parsed.clone();
             if let Err(error) = carina_core::parser::resolve_resource_refs_with_config(
@@ -251,7 +249,7 @@ impl DiagnosticEngine {
                 &self.provider_context,
             ) && error
                 .source_file()
-                .is_some_and(|source_file| source_file == base.join(file_name))
+                .is_some_and(|source_file| source_file == current_file_path)
             {
                 diagnostics.push(parse_error_to_diagnostic(&error));
             }
@@ -268,9 +266,8 @@ impl DiagnosticEngine {
             // declaration multiplicity. Reuse the loader extractor so export,
             // argument, and module-attribute duplicates remain visible without
             // recreating directory provenance that is unavailable in this mode.
-            let file_name = current_file_name.unwrap_or("<buffer>.crn");
             let duplicates = carina_core::config_loader::find_duplicate_declarations_in_parsed_file(
-                Path::new(file_name),
+                current_file_path.unwrap_or_else(|| Path::new("<buffer>.crn")),
                 parsed,
             );
             diagnostics.extend(self.duplicate_declaration_diagnostics(
@@ -524,7 +521,7 @@ impl DiagnosticEngine {
             let semantic_view = checks::SemanticView::for_analysis(
                 parsed,
                 merged,
-                current_file_path.as_deref(),
+                current_file_path,
                 base_path.is_some(),
             );
             let empty_upstream_exports = Default::default();
@@ -549,7 +546,7 @@ impl DiagnosticEngine {
             );
             let inference_bindings =
                 carina_core::validation::inference::bindings_from_parsed(binding_input);
-            let semantic_file = current_file_path.as_deref().and_then(|path| {
+            let semantic_file = current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
                     .and_then(|result| result.directory.semantic_file(path))
@@ -565,11 +562,11 @@ impl DiagnosticEngine {
                     &module_signatures,
                     &inference_bindings,
                 ));
-                let constraint_diagnostics = current_file_name
+                let constraint_diagnostics = current_file_path
                     .zip(merged_result.as_ref())
-                    .map(|(file_name, result)| {
+                    .map(|(current_file_path, result)| {
                         self.module_constraint_diagnostics(
-                            &base_path.join(file_name),
+                            current_file_path,
                             &result.module_constraint_reports,
                         )
                     })
@@ -585,7 +582,7 @@ impl DiagnosticEngine {
                         parsed,
                         error,
                         base_path,
-                        current_file_name,
+                        current_file_path,
                     )
                 {
                     diagnostics.push(diagnostic);
@@ -1194,7 +1191,7 @@ impl DiagnosticEngine {
                             // Struct field validation. The wrapper borrows
                             // the schema's `AttributeType` directly so we
                             // don't deep-clone the field set on every
-                            // keystroke (LSP `analyze_with_filename` is on
+                            // keystroke (LSP `analyze` is on
                             // the per-keystroke hot path).
                             //
                             // Use `Shape` (Ref-peeled) so cyclic-CFN
@@ -1376,8 +1373,9 @@ impl DiagnosticEngine {
                     .filter(|b| current_file_bindings.contains(b))
                     .collect()
                 }
-                (None, None) => carina_core::config_loader::AuthoredBindingView::parse_source(
+                (None, None) => carina_core::config_loader::AuthoredBindingView::parse_file_source(
                     &text,
+                    current_file_path.unwrap_or_else(|| doc.source_file()),
                     &self.provider_context,
                 )
                 .map(|view| {

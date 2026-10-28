@@ -8867,6 +8867,85 @@ fn authored_spans_share_trailing_whitespace_semantics_across_sites() {
 }
 
 #[test]
+fn authored_value_spans_exclude_trailing_comments() {
+    for comment in ["# note", "// note", "/* note */"] {
+        let input = format!(
+            "let inst = m {{\n  arg = value {comment}\n}}\n\
+             attributes {{\n  attr = value {comment}\n}}\n\
+             exports {{\n  out = value {comment}\n}}\n"
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let value_ends = input
+            .match_indices("value")
+            .map(|(start, value)| start + value.len())
+            .collect::<Vec<_>>();
+
+        let argument = parsed.module_calls[0]
+            .authored_argument("arg")
+            .expect("authored argument")
+            .value_span();
+        let attribute = parsed.attribute_params[0].source_span();
+        let export = parsed.export_params[0].source_span();
+
+        assert_eq!(argument.end_byte(), value_ends[0], "comment: {comment}");
+        assert_eq!(
+            (argument.end_line(), argument.end_column()),
+            (2, 14),
+            "comment: {comment}"
+        );
+        assert_eq!(attribute.end_byte(), value_ends[1], "comment: {comment}");
+        assert_eq!(
+            (attribute.end_line(), attribute.end_column()),
+            (5, 15),
+            "comment: {comment}"
+        );
+        assert_eq!(export.end_byte(), value_ends[2], "comment: {comment}");
+        assert_eq!(
+            (export.end_line(), export.end_column()),
+            (8, 14),
+            "comment: {comment}"
+        );
+    }
+}
+
+#[test]
+fn nested_string_comment_markers_do_not_truncate_authored_spans() {
+    for value in [
+        r##""${coalesce(x, "#fragment")}""##,
+        r#""${coalesce(x, "https://a")}""#,
+    ] {
+        let call_source = format!("m {{ url = {value} }}");
+        let input = format!(
+            "fn coalesce(x: String, fallback: String): String {{ fallback }}\n\
+             let x = \"x\"\n\
+             {call_source}"
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let call = parsed.module_calls.first().expect("module call");
+        let value_span = call
+            .authored_argument("url")
+            .expect("url argument")
+            .value_span();
+        let call_start = input.find(&call_source).expect("call in source");
+        let value_start = input.find(value).expect("value in source");
+
+        assert_eq!(
+            (
+                call.source_span().start_byte(),
+                call.source_span().end_byte()
+            ),
+            (call_start, input.len()),
+            "call span for {value}"
+        );
+        assert_eq!(
+            (value_span.start_byte(), value_span.end_byte()),
+            (value_start, value_start + value.len()),
+            "value span for {value}"
+        );
+    }
+}
+
+#[test]
 fn parse_single_quoted_string_escape_sequences() {
     let input = r#"
         let vpc = aws.ec2.Vpc {

@@ -23,6 +23,19 @@ use crate::resource::{
 };
 use crate::schema::TypeIdentity;
 
+fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
+    super::resolve_modules(parsed, base_dir)
+}
+
+fn resolve_modules_with_config(
+    parsed: &mut ParsedFile,
+    base_dir: &std::path::Path,
+    config: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+) -> Result<(), ModuleError> {
+    super::resolve_modules_with_config(parsed, base_dir, config, schemas)
+}
+
 fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
     compositions: &mut [crate::resource::Composition],
@@ -43,6 +56,41 @@ fn module_arguments(
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
         .collect()
+}
+
+#[test]
+fn resolver_error_from_parsed_call_retains_call_identity() {
+    let source = "let missing = use { source = './missing' }\nmissing {}\n";
+    let base = tempfile::tempdir().expect("temporary module root");
+    let source_file = base.path().join("main.crn");
+    let mut parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
+        .expect("fixture must parse");
+    let expected_span = parsed.module_calls[0].source_span();
+    assert_eq!(
+        (
+            expected_span.start_line(),
+            expected_span.start_column(),
+            expected_span.end_line(),
+            expected_span.end_column(),
+        ),
+        (2, 1, 2, 11),
+        "fixture must pin the authored call range",
+    );
+
+    let error = super::resolve_modules_with_config(
+        &mut parsed,
+        base.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("missing imported module must fail");
+
+    let ModuleErrorCallSource::Owners(owners) = error.call_source() else {
+        panic!("parsed call must own the resolver error: {error:?}");
+    };
+    assert_eq!(owners.len(), 1, "parsed call identity must not be dropped");
+    assert_eq!(owners[0].source_file(), source_file);
+    assert_eq!(owners[0].call_span(), expected_span);
 }
 
 fn create_test_module() -> ParsedFile {
@@ -1510,6 +1558,7 @@ thing { name = 'after-edit' }
                 vec![],
             ),
             TypeExpr::String,
+            ArgumentOrigin::Defaulted,
         ),
     );
     parsed.compositions.push(nested);
@@ -3057,6 +3106,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
                         binding: "outer_port".to_string(),
                     }),
                     TypeExpr::String,
+                    ArgumentOrigin::Defaulted,
                 ),
             )]),
             attributes: IndexMap::new(),
@@ -3080,7 +3130,6 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         provenance: Box::new(CompositionProvenance::expanded(
             inner_call.clone(),
             inner_call,
-            IndexMap::from([("port".to_string(), ArgumentOrigin::Defaulted)]),
         )),
         quoted_string_attrs: HashSet::new(),
     };
@@ -6818,10 +6867,10 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
 
     let parsed = load_directory_module(temp.path()).expect("directory module");
     let attribute = &parsed.attribute_params[0];
-    assert_eq!(attribute.source_file(), Some(attributes_path.as_path()));
+    assert_eq!(attribute.source_file(), attributes_path.as_path());
     assert_eq!(attribute.source_span().start_line(), 2);
     let export = &parsed.export_params[0];
-    assert_eq!(export.source_file(), Some(exports_path.as_path()));
+    assert_eq!(export.source_file(), exports_path.as_path());
     assert_eq!(export.source_span().start_line(), 2);
 }
 

@@ -18,6 +18,13 @@ use carina_core::resource::{
 use carina_core::schema::StructField;
 use carina_core::value::canonicalize_resources_with_schemas;
 
+fn parse(
+    input: &str,
+    config: &carina_core::parser::ProviderContext,
+) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
+    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+}
+
 macro_rules! unexpected_resume_create {
     () => {
         fn resume_create(
@@ -1548,7 +1555,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
 
 #[tokio::test]
 async fn plan_deletes_managed_orphan_and_reads_same_id_data_source() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::ResourceState;
 
     let parsed = parse(
@@ -2197,7 +2204,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
 #[test]
 fn same_type_moved_block_parses_and_materializes_state() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -2263,7 +2270,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
 #[test]
 fn moved_in_flight_rebinds_resume_to_destination() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_core::provider::Sent;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -2346,7 +2353,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
 #[test]
 fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     let parsed = parse(
@@ -3038,7 +3045,7 @@ fn assert_collision_contains(result: Result<(), AppError>, needle: &str) {
 
 #[tokio::test]
 async fn test_plan_fails_on_moved_from_colliding_with_desired() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
 
     let source = r#"
 let live = awscc.s3.Bucket {
@@ -3095,7 +3102,7 @@ moved {
 
 #[tokio::test]
 async fn test_plan_fails_on_removed_from_colliding_with_expanded_loop_child() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     let source = r#"
@@ -3878,7 +3885,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
 async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_identity_reconcile() {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     fn string(value: &str) -> Value {
@@ -4097,7 +4104,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 #[tokio::test]
 async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     // This plan-level fixture pins moved materialization and Move-effect
@@ -5451,7 +5458,7 @@ fn validate_rejects_empty_interpolation_in_export_value() {
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let mut parsed = carina_core::parser::parse(
+    let mut parsed = parse(
         "exports { url = 'placeholder' }\n",
         &carina_core::parser::ProviderContext::default(),
     )
@@ -5483,7 +5490,7 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let mut parsed = carina_core::parser::parse(
+    let mut parsed = parse(
         "attributes { region = 'placeholder' }\n",
         &carina_core::parser::ProviderContext::default(),
     )
@@ -5908,7 +5915,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
 mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;
-    use carina_core::parser::{ProviderContext, WarningKind, parse};
+    use carina_core::parser::{ProviderContext, WarningKind};
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::{HashMap, HashSet};
 
