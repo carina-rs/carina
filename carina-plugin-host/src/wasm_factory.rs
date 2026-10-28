@@ -1312,24 +1312,6 @@ fn trace_http_enabled() -> bool {
 /// - `http_handshake_ms` — hyper http/1.1 protocol handshake
 /// - `send_request_ms` — request headers/body sent, response head arrived
 ///
-/// Errors follow the upstream `ErrorCode` mapping except that an HTTP/1
-/// handshake failure is reported as `ConnectionRefused`: no request bytes
-/// exist at that point, so the guest must be able to distinguish it from a
-/// post-handoff `HttpProtocolError`.
-fn http1_handshake_failure_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode {
-    // Hyper has not received a request at this point, so the guest may safely
-    // retry even though wasi:http has no dedicated HTTP-handshake error code.
-    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::ConnectionRefused
-}
-
-/// Map a carina-host TLS connector handshake failure to its wasi:http code.
-///
-/// The SDK classifies `TlsProtocolError` as NotSent on the invariant that this
-/// host emits it only before the HTTP/1 handshake and request transmission.
-fn tls_handshake_failure_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode {
-    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::TlsProtocolError
-}
-
 async fn send_request_handler(
     mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
     config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
@@ -1399,10 +1381,11 @@ async fn send_request_handler(
                 },
             )
         })?;
-        let stream = connector
-            .connect(domain, tcp_stream)
-            .await
-            .map_err(|_| tls_handshake_failure_code())?;
+        let stream = connector.connect(domain, tcp_stream).await.map_err(|_| {
+            // The SDK classifies TlsProtocolError as NotSent because the
+            // carina host emits it only here, during the TLS handshake.
+            ErrorCode::TlsProtocolError
+        })?;
         let tls_handshake_ms = ms(phase_start);
 
         let stream = TokioIo::new(stream);
@@ -1412,7 +1395,11 @@ async fn send_request_handler(
         )
         .await
         .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|_| http1_handshake_failure_code())?;
+        .map_err(|_| {
+            // Hyper has not received a request yet, so this is pre-send even
+            // though wasi:http has no dedicated HTTP-handshake error code.
+            ErrorCode::ConnectionRefused
+        })?;
         let http_handshake_ms = ms(phase_start);
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
@@ -1427,7 +1414,11 @@ async fn send_request_handler(
         )
         .await
         .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|_| http1_handshake_failure_code())?;
+        .map_err(|_| {
+            // Hyper has not received a request yet, so this is pre-send even
+            // though wasi:http has no dedicated HTTP-handshake error code.
+            ErrorCode::ConnectionRefused
+        })?;
         let http_handshake_ms = ms(phase_start);
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
@@ -8069,16 +8060,21 @@ mod tests {
             .boxed_unsync()
     }
 
+    fn test_outgoing_request_config(
+        use_tls: bool,
+    ) -> wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls,
+            connect_timeout: std::time::Duration::from_secs(1),
+            first_byte_timeout: std::time::Duration::from_secs(1),
+            between_bytes_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
     #[test]
     fn denied_and_invalid_requests_are_reported_as_pre_send() {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
-        let config = || wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(1),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
-        };
         let mut hooks = AllowListHttpHooks::with_resolver(
             Some(ProviderKind::Untrusted),
             Arc::new(StubResolver {
@@ -8090,9 +8086,12 @@ mod tests {
             .uri("http://example.invalid/")
             .body(empty_outgoing_body())
             .unwrap();
-        let denied =
-            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, denied, config())
-                .expect_err("a denied host should fail before spawning a request");
+        let denied = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            denied,
+            test_outgoing_request_config(false),
+        )
+        .expect_err("a denied host should fail before spawning a request");
         assert!(matches!(
             denied.downcast_ref(),
             Some(ErrorCode::HttpRequestDenied)
@@ -8102,9 +8101,12 @@ mod tests {
             .uri("/relative")
             .body(empty_outgoing_body())
             .unwrap();
-        let invalid =
-            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, invalid, config())
-                .expect_err("a URI without a host should fail before spawning a request");
+        let invalid = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            invalid,
+            test_outgoing_request_config(false),
+        )
+        .expect_err("a URI without a host should fail before spawning a request");
         assert!(matches!(
             invalid.downcast_ref(),
             Some(ErrorCode::HttpRequestUriInvalid)
@@ -8127,12 +8129,7 @@ mod tests {
             .uri("https://phase-test.invalid:4443/")
             .body(empty_outgoing_body())
             .unwrap();
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: true,
-            connect_timeout: std::time::Duration::from_secs(1),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
-        };
+        let config = test_outgoing_request_config(true);
 
         let error =
             wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
@@ -8140,26 +8137,6 @@ mod tests {
         assert!(matches!(
             error.downcast_ref(),
             Some(ErrorCode::HttpRequestDenied)
-        ));
-    }
-
-    #[test]
-    fn http1_handshake_failure_is_reported_as_pre_send() {
-        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
-
-        assert!(matches!(
-            http1_handshake_failure_code(),
-            ErrorCode::ConnectionRefused
-        ));
-    }
-
-    #[test]
-    fn tls_handshake_failure_is_reported_as_pre_send() {
-        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
-
-        assert!(matches!(
-            tls_handshake_failure_code(),
-            ErrorCode::TlsProtocolError
         ));
     }
 
@@ -8177,10 +8154,8 @@ mod tests {
             .body(empty_outgoing_body())
             .unwrap();
         let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
             connect_timeout: std::time::Duration::from_millis(10),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
+            ..test_outgoing_request_config(false)
         };
 
         let mut response =
@@ -8214,12 +8189,7 @@ mod tests {
             .uri("http://service.amazonaws.com/")
             .body(empty_outgoing_body())
             .unwrap();
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(1),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
-        };
+        let config = test_outgoing_request_config(false);
 
         let mut response =
             wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
@@ -8265,12 +8235,7 @@ mod tests {
             ))
             .body(empty_outgoing_body())
             .unwrap();
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(1),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
-        };
+        let config = test_outgoing_request_config(false);
 
         let mut response =
             wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
@@ -8313,12 +8278,7 @@ mod tests {
             ))
             .body(empty_outgoing_body())
             .unwrap();
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(1),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
-        };
+        let config = test_outgoing_request_config(false);
         let destination = VettedDestination {
             host: "phase-test.invalid".to_string(),
             first: server_address,

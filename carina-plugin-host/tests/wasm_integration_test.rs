@@ -603,6 +603,93 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-first-byte-timeout",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-first-byte-timeout",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
+    );
+
+    let (release_server, wait_for_release) = std::sync::mpsc::channel();
+    // Start both the accept deadline and the silent-server lifetime only after
+    // component compilation and provider initialization have completed.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = [0_u8; 4096];
+        let bytes_read = stream
+            .read(&mut request)
+            .expect("read request bytes before waiting");
+        assert!(bytes_read > 0, "the server must receive request bytes");
+        wait_for_release
+            .recv_timeout(Duration::from_secs(10))
+            .expect("guest did not finish before the silent-server deadline");
+        bytes_read
+    });
+
+    let outcome = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await;
+    release_server
+        .send(())
+        .expect("silent server should still be waiting");
+    let bytes_read = server.join().expect("loopback server should finish");
+    let state = create_state_for_writeback(
+        outcome.expect("the mock transport probe should report its phase"),
+    );
+
+    assert!(bytes_read > 0, "the server must receive request bytes");
+    assert_eq!(
+        http_probe_outcome(&state),
+        "maybe_sent:ConnectionReadTimeout"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_pending_create_polls_until_success() {
     const PENDING_POLLS: u32 = 2;
 

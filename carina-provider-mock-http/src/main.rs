@@ -78,7 +78,9 @@ impl MockHttpProvider {
                 .expect("HTTP probe runtime components must be valid");
             let settings = HttpConnectorSettings::builder()
                 .connect_timeout(Duration::from_secs(1))
-                .read_timeout(Duration::from_secs(5))
+                // Keep the first-byte timeout short for the silent-server
+                // host/guest contract test.
+                .read_timeout(Duration::from_secs(1))
                 .build();
             let connector = WasiHttpClient::new().http_connector(&settings, &components);
             let mut request = HttpRequest::get(url).expect("HTTP probe URL must be valid");
