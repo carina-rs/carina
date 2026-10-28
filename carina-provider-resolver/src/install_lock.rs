@@ -178,7 +178,7 @@ impl ProviderInstallLock {
 
     pub(crate) fn remove_project_artifact(&self, artifact: &WasmArtifactPath) -> io::Result<()> {
         validate_project_target(self, artifact.as_path())?;
-        fs::remove_file(artifact.as_path())
+        crate::revision_resolver::remove_revision_artifact_cache_entry(artifact.as_path())
     }
 }
 

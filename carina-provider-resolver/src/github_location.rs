@@ -141,6 +141,14 @@ impl RepoSlug {
         self.url_with_segments(&["actions", "artifacts", &artifact_id, "zip"])
     }
 
+    pub(crate) fn artifact_url(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<url::Url, GithubLocationError> {
+        let artifact_id = artifact_id.to_string();
+        self.url_with_segments(&["actions", "artifacts", &artifact_id])
+    }
+
     pub(crate) fn validate_url(&self, raw: &str) -> Result<url::Url, GithubLocationError> {
         let url = url::Url::parse(raw).map_err(|error| GithubLocationError::InvalidApiUrl {
             detail: error.to_string(),

@@ -197,6 +197,18 @@ struct GithubArtifactWireResponse {
     size_in_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct GithubArtifactMetadataResponse {
+    #[serde(default)]
+    pub(crate) workflow_run: Option<GithubArtifactWorkflowRunResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct GithubArtifactWorkflowRunResponse {
+    #[serde(default)]
+    pub(crate) head_sha: Option<CommitSha>,
+}
+
 #[derive(Deserialize)]
 struct GithubCommitResponse {
     sha: String,
@@ -240,6 +252,12 @@ pub(crate) enum GithubApiError {
         url: String,
         limit: u64,
     },
+    RateLimited {
+        status: u16,
+        endpoint: String,
+        message: Option<String>,
+        retry_after: Option<String>,
+    },
     Status {
         status: u16,
         endpoint: String,
@@ -262,6 +280,24 @@ impl std::fmt::Display for GithubApiError {
             Self::Http(error) | Self::Authentication(error) => formatter.write_str(error),
             Self::ResponseBodyTooLarge { url, limit } => {
                 formatter.write_str(&response_body_limit_error(url, *limit))
+            }
+            Self::RateLimited {
+                status,
+                endpoint,
+                message,
+                retry_after,
+            } => {
+                write!(
+                    formatter,
+                    "GitHub API rate limit returned status {status} for {endpoint}"
+                )?;
+                if let Some(message) = message {
+                    write!(formatter, ": {message}")?;
+                }
+                if let Some(retry_after) = retry_after {
+                    write!(formatter, ". Retry-After: {retry_after}")?;
+                }
+                Ok(())
             }
             Self::Status {
                 status,
@@ -427,6 +463,16 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         )
     }
 
+    pub(crate) fn artifact(
+        &self,
+        repo: &RepoSlug,
+        artifact_id: ArtifactId,
+    ) -> Result<GithubArtifactMetadataResponse, GithubApiError> {
+        let url = repo.artifact_url(artifact_id)?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
+        parse_json(&response.body, &url)
+    }
+
     pub(crate) fn download_artifact_zip(
         &self,
         repo: &RepoSlug,
@@ -560,6 +606,20 @@ fn github_status_error(
     let message = serde_json::from_slice::<GithubErrorResponse>(&response.body)
         .ok()
         .map(|error| error.message);
+    let retry_after = response.header("retry-after").map(str::to_string);
+    let primary_rate_limited = response.status == 403
+        && response
+            .header("x-ratelimit-remaining")
+            .is_some_and(|remaining| remaining.trim() == "0");
+    let secondary_rate_limited = matches!(response.status, 403 | 429) && retry_after.is_some();
+    if response.status == 429 || primary_rate_limited || secondary_rate_limited {
+        return GithubApiError::RateLimited {
+            status: response.status,
+            endpoint: endpoint_label(url),
+            message,
+            retry_after,
+        };
+    }
     GithubApiError::Status {
         status: response.status,
         endpoint: endpoint_label(url),
@@ -960,6 +1020,30 @@ mod tests {
         assert_eq!(artifacts[0].id.get(), 42);
         assert_eq!(artifacts[0].size_in_bytes, None);
         assert_eq!(http.requests()[0].url(), url);
+    }
+
+    #[test]
+    fn artifact_metadata_uses_typed_url_and_deserializes_workflow_head_sha() {
+        let sha = CommitSha::new("abcdef0123456789abcdef0123456789abcdef01".into()).unwrap();
+        let url = "https://api.github.com/repos/acme/widget/actions/artifacts/42";
+        let http = FixtureGithubHttp::default().json(
+            url,
+            r#"{"id":42,"workflow_run":{"head_repository_id":1,"repository_id":1,"head_sha":"abcdef0123456789abcdef0123456789abcdef01"}}"#,
+        );
+        let api = GithubApi::new(&http, Some("token"));
+
+        let artifact = api
+            .artifact(&repo_slug(), ArtifactId::from_lock(42))
+            .unwrap();
+
+        assert_eq!(
+            artifact.workflow_run.and_then(|run| run.head_sha),
+            Some(sha)
+        );
+        let requests = http.requests();
+        assert_eq!(requests[0].url(), url);
+        assert_eq!(requests[0].accept(), "application/vnd.github+json");
+        assert_eq!(requests[0].authorization(), Some("Bearer token"));
     }
 
     #[test]
