@@ -149,6 +149,11 @@ impl WasiHttpView for HostState {
 
 /// A Wasmtime store whose raw inner store cannot escape this module except
 /// through [`GuestStore::call`].
+///
+/// A wall timeout leaves the store mid-call: neither the call hook's
+/// `host_depth` nor the component instance state is unwound. The store must
+/// not be reused afterward. Current owners enforce that by either poisoning
+/// the shared store (`LockedStore`) or discarding an unshared store.
 pub(super) struct GuestStore {
     store: Store<HostState>,
 }
@@ -156,11 +161,13 @@ pub(super) struct GuestStore {
 impl GuestStore {
     /// Create a store with every invariant needed for guest calls.
     ///
-    /// The call hook accounts for all guest-resident intervals in one
-    /// top-level call while excluding time parked in host imports. It also
-    /// re-arms before nested guest code used to lower host results, so epochs
-    /// accumulated during a long host wait cannot interrupt that lowering
-    /// step.
+    /// The call hook charges guest-resident intervals outside host imports to
+    /// one top-level call while excluding time parked in host imports. Nested
+    /// guest code entered while a host import is in flight (such as realloc or
+    /// post-return during result lowering) is re-armed from the remaining
+    /// budget, so epochs accumulated during a long host wait cannot interrupt
+    /// it, but that nested interval is not subtracted from the remaining
+    /// compute time.
     pub(super) fn new(
         engine: &Engine,
         wasi_ctx: WasiCtx,
@@ -223,7 +230,9 @@ impl GuestStore {
     /// Run guest code under this store's wall-clock budget.
     ///
     /// This is the only API that exposes the raw Wasmtime store, and the
-    /// closure cannot outlive the timeout future.
+    /// closure cannot outlive the timeout future. The timeout is observed at
+    /// await points; it cannot interrupt a host import that blocks its runtime
+    /// thread synchronously.
     pub(super) async fn call<'s, T, F>(
         &'s mut self,
         f: impl FnOnce(&'s mut Store<HostState>) -> F,
@@ -233,7 +242,8 @@ impl GuestStore {
         F: Future<Output = T> + 's,
     {
         let wall = self.store.data().guest.budget.wall;
-        tokio::time::timeout(wall, f(&mut self.store))
+        let store = &mut self.store;
+        tokio::time::timeout(wall, async move { f(store).await })
             .await
             .map_err(|_elapsed| WallBudgetExceeded { wall })
     }
@@ -257,6 +267,34 @@ fn compute_epoch_ticks(remaining: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wall_budget_includes_synchronous_guest_call_setup() {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new().build();
+        let limits = wasmtime::StoreLimitsBuilder::new().build();
+        let mut store = GuestStore::new(
+            &engine,
+            wasi_ctx,
+            None,
+            limits,
+            GuestCallBudget::new(Duration::from_secs(30), Duration::from_millis(20)),
+        );
+
+        let result = store
+            .call(|_store| {
+                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(1))
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "synchronous setup before the returned future must consume the wall budget"
+        );
+    }
 
     #[test]
     fn guest_compute_budget_epoch_ticks_do_not_expire_early() {
