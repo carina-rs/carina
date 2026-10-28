@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -23,9 +25,14 @@ use carina_core::version_constraint::VersionConstraint;
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
     global_cache_artifact_path, install_global_artifact_atomically,
-    install_project_artifact_atomically,
+    install_project_artifact_atomically, install_project_artifact_from_global_cache,
 };
 use crate::signing;
+use crate::verified_artifact::{
+    DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
+    VerifiedArtifactError, VersionArtifactPin, lock_artifact_selection,
+    lookup_version_artifact_pin, publish_download,
+};
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
 
@@ -4011,26 +4018,102 @@ impl WasmArtifactPath {
 }
 
 /// An installed provider artifact together with the resolution provenance that
-/// selected it. The path is private so load callers must retain this wrapper
-/// and therefore cannot accidentally separate an artifact from its lock mode.
+/// selected it. [`InstalledProvider::load_with`] gives the loader only the
+/// bytes retained from lookup (and verified there for lock-controlled
+/// artifacts). [`InstalledProvider::path`] is for display and provenance only.
+///
+/// Lock provenance also has no public attachment constructor:
+///
+/// ```compile_fail,E0624
+/// use carina_provider_resolver::{InstalledProvider, VerifiedArtifact};
+/// # let artifact: VerifiedArtifact = panic!();
+/// let installed = InstalledProvider::from_verified(artifact, "aws".to_string());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledProvider {
-    path: WasmArtifactPath,
+    artifact: InstalledArtifact,
     provider_name: String,
-    provenance: ProviderArtifactProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstalledArtifact {
+    LockFile(VerifiedArtifact),
+    File {
+        path: WasmArtifactPath,
+        bytes: ProviderArtifactBytes,
+        source: String,
+    },
 }
 
 impl InstalledProvider {
     pub fn path(&self) -> &WasmArtifactPath {
-        &self.path
+        match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => artifact.path(),
+            InstalledArtifact::File {
+                path,
+                bytes: _,
+                source: _,
+            } => path,
+        }
     }
 
-    pub fn provenance(&self) -> &ProviderArtifactProvenance {
-        &self.provenance
+    pub fn provenance(&self) -> ProviderArtifactProvenance {
+        match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => ProviderArtifactProvenance::LockFile {
+                project_dir: artifact.project_dir().to_path_buf(),
+                pin: artifact.pin().clone(),
+            },
+            InstalledArtifact::File {
+                path: _,
+                bytes: _,
+                source,
+            } => ProviderArtifactProvenance::File {
+                source: source.clone(),
+            },
+        }
     }
 
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    pub(crate) fn from_verified(artifact: VerifiedArtifact, provider_name: String) -> Self {
+        Self {
+            artifact: InstalledArtifact::LockFile(artifact),
+            provider_name,
+        }
+    }
+
+    pub(crate) fn file_source(
+        path: WasmArtifactPath,
+        provider_name: String,
+        source: String,
+    ) -> Result<Self, String> {
+        let bytes = ProviderArtifactBytes::read(path.as_path()).map_err(|error| {
+            format!(
+                "Failed to read provider artifact {}: {error}",
+                path.as_path().display()
+            )
+        })?;
+        Ok(Self {
+            artifact: InstalledArtifact::File {
+                path,
+                bytes,
+                source,
+            },
+            provider_name,
+        })
+    }
+
+    fn artifact_bytes(&self) -> ProviderArtifactBytes {
+        match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => artifact.bytes().clone(),
+            InstalledArtifact::File {
+                path: _,
+                bytes,
+                source: _,
+            } => bytes.clone(),
+        }
     }
 
     /// Attach this artifact's provenance to a load failure without flattening
@@ -4039,7 +4122,8 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error,
             provider_name: self.provider_name.clone(),
-            provenance: Box::new(self.provenance.clone()),
+            artifact_path: self.path().as_path().to_path_buf(),
+            provenance: Box::new(self.provenance()),
         }
     }
 
@@ -4050,10 +4134,10 @@ impl InstalledProvider {
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(PathBuf) -> Fut,
+        F: FnOnce(ProviderArtifactBytes) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        loader(self.path.as_path().to_path_buf())
+        loader(self.artifact_bytes())
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -4142,6 +4226,7 @@ impl fmt::Display for ProviderArtifactProvenance {
 pub struct ProviderArtifactLoadError<E> {
     error: E,
     provider_name: String,
+    artifact_path: PathBuf,
     provenance: Box<ProviderArtifactProvenance>,
 }
 
@@ -4149,8 +4234,11 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}\nProvider: {}\n{}",
-            self.error, self.provider_name, self.provenance
+            "{}\nProvider: {}\nArtifact: {}\n{}",
+            self.error,
+            self.provider_name,
+            self.artifact_path.display(),
+            self.provenance
         )
     }
 }
@@ -5705,55 +5793,22 @@ fn verify_and_decide_signer(
     Ok((identity, acceptance))
 }
 
-/// Validate a cached version-mode WASM component and ensure the lock file records it.
-///
-/// When a previous `carina init` left a component in `.carina/providers/`, the
-/// next run must still upsert a matching lock entry before the caller saves
-/// the lock. Otherwise an empty in-memory `LockFile` gets written back to
-/// disk and stomps the on-disk record (issue #2032).
-fn verify_or_record_version_cache(
-    wasm_path: &Path,
-    source: &RemoteSourceKey,
-    version: &str,
-    name: &str,
+fn record_verified_version_pin(
     lock_file: &mut LockFile,
-    project_dir: &Path,
-) -> Result<(), String> {
-    let actual_hash =
-        sha256_file(wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-    // Preserve any constraint already recorded; the resolver callers
-    // overwrite it afterwards when the `.crn` specifies one.
-    let existing_constraint = match lock_file.find_by_source_key_and_version(source, version) {
-        Some(entry) => {
-            if actual_hash != entry.sha256 {
-                return Err(format!(
-                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `{}` to re-download.",
-                    name,
-                    source,
-                    version,
-                    entry.sha256,
-                    actual_hash,
-                    ProjectCommand::new("init", project_dir)
-                ));
-            }
-            match &entry.kind {
-                LockEntryKind::Version { constraint, .. } => constraint.clone(),
-                _ => None,
-            }
-        }
-        None => None,
-    };
+    artifact: &VerifiedArtifact,
+    pin: VersionArtifactPin,
+    name: &str,
+) {
     lock_file.upsert(LockEntry {
         name: name.to_string(),
-        source: source.to_string(),
+        source: artifact.source().to_string(),
         kind: LockEntryKind::Version {
-            version: version.to_string(),
-            constraint: existing_constraint,
+            version: pin.version,
+            constraint: pin.constraint,
         },
-        sha256: actual_hash,
+        sha256: artifact.sha256().to_string(),
         registry: None,
     });
-    Ok(())
 }
 
 struct VerifiedRegistryLockPin {
@@ -6234,46 +6289,59 @@ fn resolve_provider_with_http<H: RegistryHttp>(
         RemoteSource::GithubDirect(github_source) => github_source,
     };
 
-    // 1. Check local WASM cache first.
+    let artifact_pin = lookup_version_artifact_pin(lock_file, &source_key, version, name);
+
+    // Machine-local caches are accelerators, not trust anchors. Without a
+    // matching lock pin, both project and global cache entries are skipped and
+    // the artifact is downloaded from its origin before first-use pinning.
+    // This deliberately preserves issue #2032 only for lock-backed cache hits.
     let wasm_path =
         WasmArtifactPath::new(cache_path_wasm(project_dir, &source_key, version), name)?;
-    if wasm_path.as_path().exists() {
-        verify_or_record_version_cache(
-            wasm_path.as_path(),
-            &source_key,
-            version,
-            name,
-            lock_file,
-            project_dir,
-        )?;
-        return Ok(wasm_path);
+    if wasm_path.as_path().exists()
+        && let Some((lock_entry, pin)) = artifact_pin.pinned()
+    {
+        let pin = pin.clone();
+        let verified = match VerifiedArtifact::from_existing(lock_entry, name, project_dir) {
+            Ok(verified) => verified,
+            Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
+                let removal = install_lock.remove_project_artifact(&wasm_path);
+                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+            }
+            Err(VerifiedArtifactError::Other(message)) => return Err(message),
+        };
+        record_verified_version_pin(lock_file, &verified, pin, name);
+        return Ok(verified.path().clone());
     }
 
-    // 2. Check global plugin cache for WASM.
-    if let Some(global_wasm) = global_cache_path_wasm(&source_key, version)
+    // A global cache hit is usable only with the same existing lock pin.
+    if let Some((lock_entry, pin)) = artifact_pin.pinned()
+        && let Some(global_wasm) = global_cache_path_wasm(&source_key, version)
         && global_wasm.as_path().exists()
     {
-        let hash =
-            install_project_artifact_atomically(install_lock, global_wasm.as_path(), &wasm_path)
-                .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        lock_file.upsert(LockEntry {
-            name: name.to_string(),
-            source: source_key.to_string(),
-            kind: LockEntryKind::Version {
-                version: version.to_string(),
-                constraint: None,
-            },
-            sha256: hash,
-            registry: None,
-        });
+        let pin = pin.clone();
+        let verified = match install_project_artifact_from_global_cache(
+            install_lock,
+            global_wasm.as_path(),
+            &wasm_path,
+            lock_entry,
+            name,
+        ) {
+            Ok(verified) => verified,
+            Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
+                let removal = fs::remove_file(global_wasm.as_path());
+                return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
+            }
+            Err(VerifiedArtifactError::Other(message)) => return Err(message),
+        };
+        record_verified_version_pin(lock_file, &verified, pin, name);
         eprintln!(
             "Installed WASM provider '{}' from global cache ({}@{})",
             name, source_key, version
         );
-        return Ok(wasm_path);
+        return Ok(verified.path().clone());
     }
 
-    // 3. Download the WASM component.
+    // Downloading from the origin is the only GitHub-direct first-use trust seam.
     let wasm_url = download_url_wasm(github_source, version);
     let wasm_download_url = parse_registry_resource_url(&wasm_url, "provider download URL")?;
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
@@ -6285,33 +6353,34 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     })?;
     match http.download_into(&wasm_download_url, &mut staged) {
         Ok(()) => {
-            let hash = sha256_file(staged.path())
-                .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-            staged.publish().map_err(|error| {
-                format!(
-                    "Failed to publish provider artifact {}: {error}",
-                    wasm_path.as_path().display()
-                )
-            })?;
-            lock_file.upsert(LockEntry {
-                name: name.to_string(),
-                source: source_key.to_string(),
-                kind: LockEntryKind::Version {
-                    version: version.to_string(),
-                    constraint: None,
-                },
-                sha256: hash,
-                registry: None,
-            });
+            let installed_path = match publish_download(staged, artifact_pin)? {
+                DownloadedArtifact::Verified { artifact, pin } => {
+                    record_verified_version_pin(lock_file, &artifact, pin, name);
+                    artifact.path().clone()
+                }
+                DownloadedArtifact::FirstUse { path, sha256 } => {
+                    lock_file.upsert(LockEntry {
+                        name: name.to_string(),
+                        source: source_key.to_string(),
+                        kind: LockEntryKind::Version {
+                            version: version.to_string(),
+                            constraint: None,
+                        },
+                        sha256,
+                        registry: None,
+                    });
+                    path
+                }
+            };
             // Save to global cache
             if let Some(global_wasm) = global_cache_path_wasm(&source_key, version) {
-                let _ = install_global_artifact_atomically(wasm_path.as_path(), &global_wasm);
+                let _ = install_global_artifact_atomically(installed_path.as_path(), &global_wasm);
             }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
                 name, source_key, version
             );
-            Ok(wasm_path)
+            Ok(installed_path)
         }
         Err(e) => Err(e.to_string()),
     }
@@ -6492,13 +6561,163 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
         return Err(format!("file not found: {file_path}"));
     }
     let path = WasmArtifactPath::new(path, &config.name)?;
-    Ok(InstalledProvider {
-        path,
-        provider_name: config.name.clone(),
-        provenance: ProviderArtifactProvenance::File {
-            source: source.to_string(),
-        },
+    InstalledProvider::file_source(path, config.name.clone(), source.to_string())
+}
+
+fn select_locked_artifact<'lock>(
+    base_dir: &Path,
+    config: &ProviderConfig,
+    remote_source: &RemoteSource,
+    lock_file: &'lock LockFile,
+) -> Result<Option<LockArtifactSelection<'lock>>, String> {
+    let source_key = remote_source.source_key();
+    let selected =
+        if let Some(requested_revision) = &config.revision {
+            match remote_source {
+                RemoteSource::Registry(_) => {
+                    lock_file
+                        .find_by_source_key(&source_key)
+                        .and_then(|lock_entry| match &lock_entry.kind {
+                            LockEntryKind::RegistryRevision {
+                                revision,
+                                version: _,
+                            } if revision == requested_revision => Some(lock_entry),
+                            LockEntryKind::RegistryRevision {
+                                revision: _,
+                                version: _,
+                            }
+                            | LockEntryKind::Version {
+                                version: _,
+                                constraint: _,
+                            }
+                            | LockEntryKind::Revision {
+                                revision: _,
+                                resolved_sha: _,
+                            }
+                            | LockEntryKind::File => None,
+                        })
+                }
+                RemoteSource::GithubDirect(_) => lock_file
+                    .find_by_source_key(&source_key)
+                    .and_then(|lock_entry| match &lock_entry.kind {
+                        LockEntryKind::Revision {
+                            revision: _,
+                            resolved_sha: _,
+                        } => Some(lock_entry),
+                        LockEntryKind::Version {
+                            version: _,
+                            constraint: _,
+                        }
+                        | LockEntryKind::RegistryRevision {
+                            revision: _,
+                            version: _,
+                        }
+                        | LockEntryKind::File => None,
+                    }),
+            }
+        } else {
+            lock_file
+                .find_by_source_key(&source_key)
+                .and_then(|lock_entry| match &lock_entry.kind {
+                    LockEntryKind::Version {
+                        version: _,
+                        constraint: _,
+                    } => Some(lock_entry),
+                    LockEntryKind::Revision {
+                        revision: _,
+                        resolved_sha: _,
+                    }
+                    | LockEntryKind::RegistryRevision {
+                        revision: _,
+                        version: _,
+                    }
+                    | LockEntryKind::File => None,
+                })
+        };
+
+    selected
+        .map(|lock_entry| lock_artifact_selection(base_dir, lock_entry, &config.name))
+        .transpose()
+}
+
+fn installed_provider_from_lock(
+    provider_name: &str,
+    selection: LockArtifactSelection<'_>,
+    project_dir: &Path,
+) -> Result<InstalledProvider, String> {
+    // Registry pins are recorded only after registry shasum and signature
+    // verification. Matching the installed bytes to that lock SHA is the
+    // offline proof, so runtime loading never needs a signature-bundle fetch.
+    let verified = VerifiedArtifact::from_selection(selection, provider_name, project_dir)
+        .map_err(|error| error.to_string())?;
+    Ok(InstalledProvider::from_verified(
+        verified,
+        provider_name.to_string(),
+    ))
+}
+
+/// Cheap filesystem metadata used to detect in-place provider changes without
+/// hashing provider bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMetadataFingerprint {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    pub dev: u64,
+    #[cfg(unix)]
+    pub ino: u64,
+}
+
+/// Metadata for the selected provider artifact and its project lock file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderArtifactFingerprint {
+    pub artifact: Option<FileMetadataFingerprint>,
+    pub lock_file: Option<FileMetadataFingerprint>,
+}
+
+fn file_metadata_fingerprint(path: &Path) -> Option<FileMetadataFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(FileMetadataFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        dev: metadata.dev(),
+        #[cfg(unix)]
+        ino: metadata.ino(),
     })
+}
+
+/// Observe the artifact selected for `config` and `carina-providers.lock`.
+///
+/// This intentionally does not hash bytes or construct an [`InstalledProvider`].
+/// It is suitable for frequent drift polling; actual loads still go through
+/// [`find_installed_provider`] and lock-pin verification.
+pub fn provider_artifact_fingerprint(
+    base_dir: &Path,
+    config: &ProviderConfig,
+) -> ProviderArtifactFingerprint {
+    let lock_file = file_metadata_fingerprint(&provider_lock_path(base_dir));
+    let artifact = config.source.as_ref().and_then(|source| match source {
+        ProviderSource::File(file_source) => {
+            WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)
+                .ok()
+                .and_then(|path| file_metadata_fingerprint(path.as_path()))
+        }
+        ProviderSource::Remote(remote_source) => {
+            let loaded_lock = load_lock_file(base_dir).ok().flatten()?;
+            select_locked_artifact(base_dir, config, remote_source, &loaded_lock)
+                .ok()
+                .flatten()
+                .and_then(|selection| file_metadata_fingerprint(selection.path.as_path()))
+        }
+    });
+    ProviderArtifactFingerprint {
+        artifact,
+        lock_file,
+    }
 }
 
 /// Find an already-installed provider without downloading.
@@ -6521,13 +6740,11 @@ pub fn find_installed_provider(
             let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
             if dest.as_path().exists() {
-                return Ok(InstalledProvider {
-                    path: dest,
-                    provider_name: config.name.clone(),
-                    provenance: ProviderArtifactProvenance::File {
-                        source: source.to_string(),
-                    },
-                });
+                return InstalledProvider::file_source(
+                    dest,
+                    config.name.clone(),
+                    source.to_string(),
+                );
             }
             return Err(format!(
                 "not installed. Run `{}`",
@@ -6536,8 +6753,6 @@ pub fn find_installed_provider(
         }
         ProviderSource::Remote(remote_source) => remote_source,
     };
-    let source_key = remote_source.source_key();
-
     let lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
@@ -6547,100 +6762,22 @@ pub fn find_installed_provider(
     // runtime source lets validate/plan/apply silently succeed when a prior
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
-    if let Some(revision) = &config.revision {
-        match remote_source {
-            RemoteSource::Registry(_) => {
-                if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
-                    && let LockEntryKind::RegistryRevision {
-                        version,
-                        revision: locked_revision,
-                    } = &lock_entry.kind
-                    && locked_revision == revision
-                {
-                    let wasm_path = cache_path_wasm(base_dir, &source_key, version);
-                    let pin = LockedProviderPin::RegistryRevision {
-                        revision: locked_revision.clone(),
-                        version: version.clone(),
-                    };
-                    if wasm_path.exists() {
-                        return Ok(InstalledProvider {
-                            path: WasmArtifactPath::new(wasm_path, &config.name)?,
-                            provider_name: config.name.clone(),
-                            provenance: ProviderArtifactProvenance::LockFile {
-                                project_dir: base_dir.to_path_buf(),
-                                pin,
-                            },
-                        });
-                    }
-                    return Err(missing_locked_artifact_error(
-                        base_dir,
-                        &pin,
-                        Some(revision),
-                    ));
-                }
-            }
-            RemoteSource::GithubDirect(github_source) => {
-                if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
-                    && let LockEntryKind::Revision {
-                        revision: locked_revision,
-                        resolved_sha,
-                    } = &lock_entry.kind
-                {
-                    let wasm_path = crate::revision_resolver::cache_path_revision(
-                        base_dir,
-                        github_source,
-                        resolved_sha,
-                    );
-                    let pin = LockedProviderPin::Revision {
-                        revision: locked_revision.clone(),
-                        resolved_sha: resolved_sha.clone(),
-                    };
-                    if wasm_path.exists() {
-                        return Ok(InstalledProvider {
-                            path: WasmArtifactPath::new(wasm_path, &config.name)?,
-                            provider_name: config.name.clone(),
-                            provenance: ProviderArtifactProvenance::LockFile {
-                                project_dir: base_dir.to_path_buf(),
-                                pin,
-                            },
-                        });
-                    }
-                    return Err(missing_locked_artifact_error(
-                        base_dir,
-                        &pin,
-                        Some(revision),
-                    ));
-                }
-            }
+    if let Some(selection) = select_locked_artifact(base_dir, config, remote_source, &lock_file)? {
+        if selection.path.as_path().exists() {
+            return installed_provider_from_lock(&config.name, selection, base_dir);
         }
+        return Err(missing_locked_artifact_error(
+            base_dir,
+            &selection.pin,
+            config.revision.as_deref(),
+        ));
+    }
+
+    if let Some(revision) = &config.revision {
         return Err(format!(
             "not installed. Run `{}` to install (revision: {revision})",
             ProjectCommand::new("init", base_dir)
         ));
-    }
-
-    if let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
-        && let LockEntryKind::Version {
-            version,
-            constraint,
-        } = &lock_entry.kind
-    {
-        let wasm_path = cache_path_wasm(base_dir, &source_key, version);
-        let pin = LockedProviderPin::Version {
-            version: version.clone(),
-            constraint: constraint.clone(),
-        };
-        if wasm_path.exists() {
-            return Ok(InstalledProvider {
-                path: WasmArtifactPath::new(wasm_path, &config.name)?,
-                provider_name: config.name.clone(),
-                provenance: ProviderArtifactProvenance::LockFile {
-                    project_dir: base_dir.to_path_buf(),
-                    pin,
-                },
-            });
-        }
-        return Err(missing_locked_artifact_error(base_dir, &pin, None));
     }
 
     Err(format!(
@@ -8936,10 +9073,8 @@ transparency_log_present = false
         }
     }
 
-    /// Issue #2032: when `resolve_provider` hits the project-local WASM cache,
-    /// it must still upsert a lock entry before returning. Otherwise the caller
-    /// writes an empty `LockFile` back to disk on subsequent `carina init` runs
-    /// and silently wipes the existing entry.
+    /// Issue #2032: a lock-backed project-cache hit must remain represented in
+    /// the in-memory lock so a subsequent save cannot silently wipe the pin.
     #[test]
     fn resolve_upserts_lock_entry_when_wasm_cache_is_hit() {
         let dir = tempfile::tempdir().unwrap();
@@ -8954,7 +9089,18 @@ transparency_log_present = false
             .write_all(b"fake wasm content")
             .unwrap();
 
+        let cached_sha256 = sha256_file(&wasm_path).unwrap();
         let mut lock_file = LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: cached_sha256.clone(),
+            registry: None,
+        });
         resolve_provider(
             base,
             &provider_source(source),
@@ -8973,7 +9119,7 @@ transparency_log_present = false
             } => assert_eq!(locked, version),
             other => panic!("expected Version variant, got {other:?}"),
         }
-        assert!(!entry.sha256.is_empty(), "entry must record a sha256");
+        assert_eq!(entry.sha256, cached_sha256);
     }
 
     /// Round-trip a version-mode entry through TOML. The serialized form carries
@@ -12673,26 +12819,27 @@ transparency_log_present = true
     #[test]
     fn version_cache_checksum_mismatch_hint_uses_project_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let artifact = dir
-            .path()
-            .join("infra/foo/.carina/providers/github.com/acme/aws/1.0.0/aws.wasm");
+        let project_dir = dir.path().join("infra/foo");
+        let artifact = cache_path_wasm(&project_dir, &source_key("github.com/acme/aws"), "1.0.0");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, b"tampered").unwrap();
         let mut lock = LockFile::default();
         lock.upsert(version_entry("github.com/acme/aws", "1.0.0"));
 
-        let error = verify_or_record_version_cache(
-            &artifact,
-            &source_key("github.com/acme/aws"),
-            "1.0.0",
+        let error = VerifiedArtifact::from_existing(
+            lock.find_by_source_key_and_version(&source_key("github.com/acme/aws"), "1.0.0")
+                .unwrap(),
             "aws",
-            &mut lock,
-            Path::new("infra/foo"),
+            &project_dir,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
         assert!(
-            error.contains("Re-run `carina init infra/foo` to re-download"),
+            error.contains(&format!(
+                "Run `carina init {}` to discard the mismatched copy, then run it again to download a verified one.",
+                project_dir.display()
+            )),
             "{error}"
         );
     }
@@ -16791,24 +16938,385 @@ transparency_log_present = false
         );
     }
 
-    /// Serialize env-var tests in this module. `CARINA_PLUGIN_CACHE_DIR` is
-    /// process-wide state and cargo test runs threads, so tests that touch it
-    /// must hold this lock for their whole body.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    #[test]
+    fn github_version_global_cache_mismatch_preserves_project_and_lock() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let expected_bytes = b"locked provider bytes";
+        let cached_bytes = b"tampered global provider bytes";
+        let expected_sha256 = sha256_bytes(expected_bytes);
+        let actual_sha256 = sha256_bytes(cached_bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: expected_sha256.clone(),
+            registry: None,
+        });
+        let lock_path = provider_lock_path(project.path());
+        lock.save(&lock_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+
+        let error = resolve_all_with_http(
+            project.path(),
+            &[provider_config(source, None)],
+            LockMode::Normal,
+            &FakeRegistryHttp::default(),
+        )
+        .expect_err("a global cache entry must match the existing lock pin");
+
+        assert!(
+            error.contains("SHA256 mismatch for provider 'awscc'"),
+            "{error}"
+        );
+        assert!(error.contains(&expected_sha256), "{error}");
+        assert!(error.contains(&actual_sha256), "{error}");
+        assert!(
+            !project_wasm.exists(),
+            "mismatched bytes must not be published"
+        );
+        assert!(
+            !global_wasm.as_path().exists(),
+            "a mismatched global cache entry must be removed so the next init can download"
+        );
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, expected_bytes);
+        let rerun = resolve_all_with_http(
+            project.path(),
+            &[provider_config(source, None)],
+            LockMode::Normal,
+            &http,
+        )
+        .expect("a rerun must download the lock-matching origin artifact");
+
+        assert_eq!(rerun.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(fs::read(&project_wasm).unwrap(), expected_bytes);
+        assert_eq!(fs::read(global_wasm.as_path()).unwrap(), expected_bytes);
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        assert!(http.was_requested(&wasm_url));
+    }
+
+    #[test]
+    fn github_version_project_cache_mismatch_is_removed_and_reruns_from_origin() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let locked_bytes = b"locked provider bytes";
+        let tampered_bytes = b"tampered project provider bytes";
+        let expected_sha256 = sha256_bytes(locked_bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: Some("^0.1".into()),
+            },
+            sha256: expected_sha256.clone(),
+            registry: None,
+        });
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
+        fs::write(&project_wasm, tampered_bytes).unwrap();
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, locked_bytes);
+
+        let error = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .expect_err("a project cache entry must match the existing lock pin");
+
+        assert_eq!(
+            error,
+            format!(
+                "SHA256 mismatch for provider 'awscc' ({source}@{version}). Expected: {expected_sha256}, got: {}. The mismatched cached copy was removed; re-run `carina init {}` to download it again.",
+                sha256_bytes(tampered_bytes),
+                project.path().display(),
+            )
+        );
+        assert!(
+            !project_wasm.exists(),
+            "the mismatched project artifact must be removed before returning"
+        );
+        let entry = lock.find_by_source(source).unwrap();
+        assert_eq!(entry.sha256, expected_sha256);
+        assert!(matches!(
+            &entry.kind,
+            LockEntryKind::Version {
+                version: locked_version,
+                constraint: Some(constraint),
+            } if locked_version == version && constraint == "^0.1"
+        ));
+
+        let resolved = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .expect("a rerun must download the lock-matching origin artifact");
+
+        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(fs::read(resolved.as_path()).unwrap(), locked_bytes);
+        assert!(http.was_requested(&wasm_url));
+    }
+
+    #[test]
+    fn github_version_global_cache_match_installs_without_repinning() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let cached_bytes = b"lock-matching global provider bytes";
+        let sha256 = sha256_bytes(cached_bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256.clone(),
+            registry: None,
+        });
+        let lock_path = provider_lock_path(project.path());
+        lock.save(&lock_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        #[cfg(unix)]
+        let global_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(global_wasm.as_path()).unwrap().ino()
+        };
+
+        let resolved = resolve_all_with_http(
+            project.path(),
+            &[provider_config(source, None)],
+            LockMode::Normal,
+            &FakeRegistryHttp::default(),
+        )
+        .unwrap();
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+
+        assert_eq!(resolved.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(fs::read(&project_wasm).unwrap(), cached_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&project_wasm).unwrap().ino(),
+                global_inode,
+                "a same-filesystem global cache hit should be installed by hard link"
+            );
+        }
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        let saved = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+        assert_eq!(saved.find_by_source(source).unwrap().sha256, sha256);
+    }
+
+    #[test]
+    fn github_version_global_cache_without_lock_is_replaced_from_origin() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let cached_bytes = b"untrusted global provider bytes";
+        let origin_bytes = b"fresh origin provider bytes";
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut lock = LockFile::default();
+
+        let resolved = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(resolved.as_path()).unwrap(), origin_bytes);
+        assert_eq!(fs::read(global_wasm.as_path()).unwrap(), origin_bytes);
+        assert_eq!(
+            lock.find_by_source(source).unwrap().sha256,
+            sha256_bytes(origin_bytes)
+        );
+        assert!(http.was_requested(&wasm_url));
+    }
+
+    #[test]
+    fn github_version_project_cache_without_lock_is_replaced_from_origin() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let cached_bytes = b"untrusted project-local provider bytes";
+        let origin_bytes = b"fresh origin bytes for local replacement";
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
+        fs::write(&project_wasm, cached_bytes).unwrap();
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut lock = LockFile::default();
+
+        let resolved = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(fs::read(&project_wasm).unwrap(), origin_bytes);
+        assert_eq!(
+            lock.find_by_source(source).unwrap().sha256,
+            sha256_bytes(origin_bytes)
+        );
+        assert!(http.was_requested(&wasm_url));
+    }
+
+    #[test]
+    fn github_version_fresh_download_mismatch_is_not_published_or_repinned() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let locked_bytes = b"locked origin provider bytes";
+        let downloaded_bytes = b"unexpected replacement origin bytes";
+        let expected_sha256 = sha256_bytes(locked_bytes);
+        let actual_sha256 = sha256_bytes(downloaded_bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: expected_sha256.clone(),
+            registry: None,
+        });
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, downloaded_bytes);
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+
+        let error = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .expect_err("a fresh download must not replace an existing lock pin");
+
+        assert_eq!(
+            error,
+            format!(
+                "Downloaded provider 'awscc' ({source}@{version}) does not match the sha256 pinned in carina-providers.lock. Expected: {expected_sha256}, got: {actual_sha256}. The origin artifact changed after it was pinned; if the change is legitimate, remove the '{source}' entry from carina-providers.lock and re-run `carina init {}`.",
+                project.path().display(),
+            )
+        );
+        assert!(
+            !project_wasm.exists(),
+            "mismatched bytes must not be published"
+        );
+        assert_eq!(lock.find_by_source(source).unwrap().sha256, expected_sha256);
+    }
+
+    #[test]
+    fn github_version_fresh_download_match_preserves_existing_pin() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let downloaded_bytes = b"lock-matching origin provider bytes";
+        let expected_sha256 = sha256_bytes(downloaded_bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: Some("^0.1".into()),
+            },
+            sha256: expected_sha256.clone(),
+            registry: None,
+        });
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, downloaded_bytes);
+
+        let resolved = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(resolved.as_path()).unwrap(), downloaded_bytes);
+        let entry = lock.find_by_source(source).unwrap();
+        assert_eq!(entry.sha256, expected_sha256);
+        assert!(matches!(
+            &entry.kind,
+            LockEntryKind::Version {
+                version: locked_version,
+                constraint: Some(constraint),
+            } if locked_version == version && constraint == "^0.1"
+        ));
     }
 
     #[test]
     fn global_cache_path_wasm_preserves_github_and_registry_layouts() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env_guard();
         let root = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("CARINA_PLUGIN_CACHE_DIR");
-        // SAFETY: env_lock() serializes every test in this module that mutates
-        // CARINA_PLUGIN_CACHE_DIR.
-        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", root.path()) };
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", root.path());
 
         for (source, relative) in [
             (
@@ -16828,26 +17336,18 @@ transparency_log_present = false
                 root.path().join(relative)
             );
         }
-
-        // SAFETY: still holding env_lock().
-        match previous {
-            Some(value) => unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", value) },
-            None => unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") },
-        }
     }
 
     /// Issue #2018: a lock file + global-cache hit must not mask a missing
     /// local `.carina/`. The project-local directory is the source of truth.
     #[test]
     fn find_installed_provider_revision_requires_local_install_not_global_cache() {
-        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
 
         let global = tmp.path().join("_global_cache");
-        // SAFETY: env_lock() above serializes access with any other test that
-        // touches CARINA_PLUGIN_CACHE_DIR in this process.
-        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", &global) };
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", &global);
 
         let source = "github.com/carina-rs/carina-provider-awscc";
         let sha = "deadbeefcafe1234567890";
@@ -16870,20 +17370,16 @@ transparency_log_present = false
         let err = find_installed_provider(base, &config)
             .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.contains("carina init"), "got: {err}");
-
-        // SAFETY: still holding env_lock.
-        unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
     }
 
     #[test]
     fn find_installed_provider_version_requires_local_install_not_global_cache() {
-        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
 
         let global = tmp.path().join("_global_cache");
-        // SAFETY: env_lock() serializes.
-        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", &global) };
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", &global);
 
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
@@ -16904,9 +17400,186 @@ transparency_log_present = false
         let err = find_installed_provider(base, &config)
             .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.contains("carina init"), "got: {err}");
+    }
 
-        // SAFETY: still holding env_lock.
-        unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
+    #[test]
+    fn find_installed_provider_rejects_artifact_that_mismatches_lock_sha256() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let artifact_bytes = b"tampered installed provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, artifact_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(b"locked installed provider"),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        let fingerprint =
+            provider_artifact_fingerprint(project.path(), &provider_config(source, None));
+        assert!(
+            fingerprint.artifact.is_some(),
+            "the drift probe must observe artifact metadata without hashing provider bytes"
+        );
+        assert!(
+            fingerprint.lock_file.is_some(),
+            "the drift probe must observe lock-file metadata"
+        );
+        let error = find_installed_provider(project.path(), &provider_config(source, None))
+            .expect_err("the runtime loader must verify lock-controlled provider bytes");
+
+        assert!(
+            error.contains(&format!(
+                "installed artifact {source}@{version} does not match carina-providers.lock"
+            )),
+            "{error}"
+        );
+        assert!(error.contains(&sha256_bytes(artifact_bytes)), "{error}");
+        assert!(error.contains("carina init"), "{error}");
+    }
+
+    #[test]
+    fn provider_artifact_fingerprint_checks_direct_file_path_and_wasm_extension() {
+        let project = tempfile::tempdir().unwrap();
+        let wasm = project.path().join("local.wasm");
+        let native = project.path().join("local-provider");
+        fs::write(&wasm, b"local wasm").unwrap();
+        fs::write(&native, b"native binary").unwrap();
+
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", wasm.display()), None),
+            )
+            .artifact
+            .is_some()
+        );
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", native.display()), None),
+            )
+            .artifact
+            .is_none()
+        );
+        fs::remove_file(&wasm).unwrap();
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", wasm.display()), None),
+            )
+            .artifact
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn find_installed_provider_accepts_artifact_that_matches_lock_sha256() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let artifact_bytes = b"verified installed provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, artifact_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(artifact_bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        let installed = find_installed_provider(project.path(), &provider_config(source, None))
+            .expect("the lock-matching provider should be loadable");
+
+        assert_eq!(installed.path().as_path(), wasm_path);
+        assert_eq!(
+            installed.provenance(),
+            ProviderArtifactProvenance::LockFile {
+                project_dir: project.path().to_path_buf(),
+                pin: LockedProviderPin::Version {
+                    version: version.into(),
+                    constraint: None,
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn load_with_keeps_lock_verified_bytes_after_artifact_is_replaced() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let original_bytes = b"verified installed provider";
+        let swapped_bytes = b"provider swapped after verification";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, original_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(original_bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        let installed = find_installed_provider(project.path(), &provider_config(source, None))
+            .expect("the lock-matching provider should be loadable");
+        fs::write(&wasm_path, swapped_bytes).unwrap();
+
+        let loaded = installed
+            .load_with(|bytes| async move {
+                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, original_bytes);
+        assert_ne!(loaded, swapped_bytes);
+    }
+
+    #[tokio::test]
+    async fn load_with_keeps_file_source_bytes_after_source_is_replaced() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let original_bytes = b"local provider at lookup";
+        let swapped_bytes = b"local provider swapped after lookup";
+        fs::write(&source_path, original_bytes).unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+
+        let installed = find_file_provider_source(&config)
+            .expect("the file provider should be loadable at lookup");
+        fs::write(&source_path, swapped_bytes).unwrap();
+
+        let loaded = installed
+            .load_with(|bytes| async move {
+                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, original_bytes);
+        assert_ne!(loaded, swapped_bytes);
     }
 
     #[test]
@@ -17095,7 +17768,7 @@ transparency_log_present = false
                 revision: "main".into(),
                 version: version.into(),
             },
-            sha256: "abc".into(),
+            sha256: sha256_file(&wasm_path).unwrap(),
             registry: None,
         });
         lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -17126,7 +17799,9 @@ transparency_log_present = false
         fs::write(&wasm_path, b"stale provider wasm").unwrap();
 
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(source, revision, resolved_sha));
+        let mut entry = revision_entry(source, revision, resolved_sha);
+        entry.sha256 = sha256_file(&wasm_path).unwrap();
+        lock.upsert(entry);
         lock.save(&base.join("carina-providers.lock")).unwrap();
 
         let installed = find_installed_provider(base, &provider_config(source, Some(revision)))
@@ -17142,6 +17817,7 @@ transparency_log_present = false
         let rendered = error.to_string();
 
         assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
+        assert!(rendered.contains(&format!("Artifact: {}", wasm_path.display())));
         assert!(rendered.contains("provider resolved from"));
         assert!(rendered.contains("carina-providers.lock"));
         assert!(rendered.contains("revision main"));
@@ -17168,6 +17844,7 @@ transparency_log_present = false
             .with_load_error("Failed to instantiate WASM component (HTTP)")
             .to_string();
 
+        assert!(rendered.contains(&format!("Artifact: {}", installed_path.display())));
         assert!(rendered.contains(&format!("provider resolved from {source}")));
         assert!(rendered.contains("not controlled by carina-providers.lock"));
         assert!(!rendered.contains("if this lock is stale"));

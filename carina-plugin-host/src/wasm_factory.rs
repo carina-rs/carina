@@ -2370,8 +2370,6 @@ type ProviderConfigCompletions = HashMap<String, Vec<CompletionValue>>;
 pub struct WasmProviderFactory {
     engine: Engine,
     component: Component,
-    #[allow(dead_code)]
-    wasm_path: PathBuf,
     name: String,
     display_name: String,
     version: String,
@@ -2532,33 +2530,14 @@ impl WasmProviderFactory {
         ))
     }
 
-    /// Compute a cache-safe filename for the given wasm path.
-    ///
-    /// The filename includes a SHA-256 hash of the canonical wasm path and the
-    /// crate version so that different files or crate upgrades never collide.
-    /// Compute a cache-safe filename for the given wasm path.
-    ///
-    /// The filename includes a SHA-256 hash of the file content, canonical path,
-    /// and crate version. Changing any of these produces a different cache key,
-    /// ensuring the precompiled cache is invalidated on provider upgrades.
-    fn cache_key(wasm_path: &Path) -> String {
-        let canonical = wasm_path
-            .canonicalize()
-            .unwrap_or_else(|_| wasm_path.to_path_buf());
+    /// Compute a cache-safe filename for the exact provider bytes.
+    fn cache_key(wasm_bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        // Include file content so replacing a .wasm at the same path invalidates cache.
-        if let Ok(content) = std::fs::read(wasm_path) {
-            hasher.update(&content);
-        }
+        hasher.update(wasm_bytes);
         // Include the crate version so cache is invalidated on host upgrades.
         hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
         let hash = format!("{:x}", hasher.finalize());
-        let stem = wasm_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("provider");
-        format!("{stem}-{}.cwasm", &hash[..16])
+        format!("provider-{}.cwasm", &hash[..16])
     }
 
     fn create_engine() -> Result<Engine, WasmProviderLoadError> {
@@ -2566,17 +2545,12 @@ impl WasmProviderFactory {
         Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}").into())
     }
 
-    fn load_component_from_file(
+    fn load_component_from_bytes(
         engine: &Engine,
-        wasm_path: &Path,
+        wasm_bytes: &[u8],
     ) -> Result<Component, WasmProviderLoadError> {
-        Component::from_file(engine, wasm_path).map_err(|e| {
-            format!(
-                "Failed to load WASM component from {}: {e}",
-                wasm_path.display()
-            )
-            .into()
-        })
+        Component::new(engine, wasm_bytes)
+            .map_err(|e| format!("Failed to load WASM component: {e}").into())
     }
 
     fn deserialize_precompiled_component(
@@ -2636,7 +2610,6 @@ impl WasmProviderFactory {
     async fn bring_up_component(
         engine: Engine,
         component: Component,
-        wasm_path: PathBuf,
         epoch_ticker: EpochTicker,
     ) -> Result<Self, WasmProviderLoadError> {
         let (mut store, bindings, enable_http) =
@@ -2661,7 +2634,6 @@ impl WasmProviderFactory {
         Ok(Self {
             engine,
             component,
-            wasm_path,
             name,
             display_name,
             version,
@@ -2678,41 +2650,45 @@ impl WasmProviderFactory {
         })
     }
 
-    /// Load a WASM provider, using the default precompile cache at `~/.carina/cache/`.
+    /// Load provider bytes using the default precompile cache at `~/.carina/cache/`.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn new(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
+    pub async fn from_bytes(wasm_bytes: &[u8]) -> Result<Self, WasmProviderLoadError> {
         match Self::default_cache_dir() {
-            Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
-            None => Self::new_uncached(wasm_path).await,
+            Some(cache_dir) => Self::from_bytes_with_cache_dir(wasm_bytes, &cache_dir).await,
+            None => Self::new_uncached(wasm_bytes).await,
         }
     }
 
-    /// Load a WASM provider with an explicit cache directory.
-    pub async fn new_with_cache_dir(
-        wasm_path: PathBuf,
+    /// Load provider bytes with an explicit precompile cache directory.
+    pub async fn from_bytes_with_cache_dir(
+        wasm_bytes: &[u8],
         cache_dir: &Path,
     ) -> Result<Self, WasmProviderLoadError> {
-        let cwasm_name = Self::cache_key(&wasm_path);
+        let cwasm_name = Self::cache_key(wasm_bytes);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
         // A cold-cache write can fail because the cache directory is
         // unavailable. Resolve that fallback before creating the runtime so
         // `new_uncached` remains the only runtime owner on this path.
         if !cwasm_path.exists()
-            && let Err(error) = Self::precompile(&wasm_path, &cwasm_path)
+            && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached(wasm_path).await;
+            return Self::new_uncached(wasm_bytes).await;
         }
 
         let engine = Self::create_engine()?;
 
+        // On resolver-backed loads, verified provider bytes select the
+        // `.cwasm` by content hash. The `.cwasm` itself is native code
+        // deserialized unsafely and trusted as user-owned cache state under
+        // the user's home; it is not verified against the provider lock.
         let component = match Self::acquire_cached_component(&engine, &cwasm_path).await {
             CachedComponentAcquisition::Hit(component) => component,
             CachedComponentAcquisition::Miss => {
                 // Try to precompile and cache.
-                match Self::precompile(&wasm_path, &cwasm_path) {
+                match Self::precompile(wasm_bytes, &cwasm_path) {
                     Ok(()) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
                         .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
                     Err(error) => {
@@ -2720,26 +2696,26 @@ impl WasmProviderFactory {
                         // Cache inspection already required this engine. Reuse
                         // it so a stale-cache recovery failure cannot create a
                         // second engine or orphan an epoch ticker.
-                        Self::load_component_from_file(&engine, &wasm_path)?
+                        Self::load_component_from_bytes(&engine, wasm_bytes)?
                     }
                 }
             }
         };
 
         let epoch_ticker = EpochTicker::start(engine.clone());
-        Self::bring_up_component(engine, component, wasm_path, epoch_ticker).await
+        Self::bring_up_component(engine, component, epoch_ticker).await
     }
 
-    /// Load a WASM provider without any precompile caching.
-    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
+    /// Load provider bytes without any precompile caching.
+    async fn new_uncached(wasm_bytes: &[u8]) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
-        let component = Self::load_component_from_file(&engine, &wasm_path)?;
+        let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, wasm_path, epoch_ticker).await
+        Self::bring_up_component(engine, component, epoch_ticker).await
     }
 
-    /// Precompile a .wasm file and save the result to a .cwasm file.
+    /// Precompile provider bytes and save the result to a .cwasm file.
     ///
     /// **Mmap safety invariant:** `deserialize_precompiled_component` loads
     /// `.cwasm` via `Component::deserialize_file`, which keeps the file
@@ -2760,12 +2736,11 @@ impl WasmProviderFactory {
     /// The tempfile path includes the current process ID so that multiple
     /// processes racing to precompile the same component don't clobber each
     /// other's in-progress writes.
-    pub fn precompile(wasm_path: &Path, cwasm_path: &Path) -> Result<(), String> {
+    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), String> {
         let config = build_engine_config();
         let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
-        let wasm_bytes = std::fs::read(wasm_path).map_err(|e| format!("Read error: {e}"))?;
         let serialized = engine
-            .precompile_component(&wasm_bytes)
+            .precompile_component(wasm_bytes)
             .map_err(|e| format!("Precompile error: {e}"))?;
         if let Some(parent) = cwasm_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
@@ -2798,21 +2773,7 @@ impl WasmProviderFactory {
             .map_err(WasmProviderLoadError::PrecompiledDeserialization)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, cwasm_path.to_path_buf(), epoch_ticker).await
-    }
-
-    /// Load from .wasm with automatic precompile caching.
-    ///
-    /// Checks for an existing `.cwasm` in `cache_dir`. If present, attempts to
-    /// load it; if the cache is stale or invalid, recompiles and caches anew.
-    ///
-    /// **Deprecated**: Use `new()` or `new_with_cache_dir()` instead, which
-    /// handle caching automatically.
-    pub async fn from_file_cached(
-        wasm_path: &Path,
-        cache_dir: &Path,
-    ) -> Result<Self, WasmProviderLoadError> {
-        Self::new_with_cache_dir(wasm_path.to_path_buf(), cache_dir).await
+        Self::bring_up_component(engine, component, epoch_ticker).await
     }
 
     async fn create_initialized_instance(
@@ -6350,7 +6311,8 @@ mod tests {
             return;
         };
 
-        let factory = WasmProviderFactory::new_uncached(wasm_path)
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let factory = WasmProviderFactory::new_uncached(&wasm_bytes)
             .await
             .expect("mock WASM provider should load");
         let instance = factory
@@ -6399,7 +6361,8 @@ mod tests {
             return;
         };
 
-        let factory = WasmProviderFactory::new_uncached(wasm_path)
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let factory = WasmProviderFactory::new_uncached(&wasm_bytes)
             .await
             .expect("mock WASM provider should load");
         let instance = factory
@@ -7019,16 +6982,8 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_when_content_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let wasm_path = dir.path().join("provider.wasm");
-
-        // Write initial content
-        std::fs::write(&wasm_path, b"content_v1").unwrap();
-        let key1 = WasmProviderFactory::cache_key(&wasm_path);
-
-        // Change content at same path
-        std::fs::write(&wasm_path, b"content_v2").unwrap();
-        let key2 = WasmProviderFactory::cache_key(&wasm_path);
+        let key1 = WasmProviderFactory::cache_key(b"content_v1");
+        let key2 = WasmProviderFactory::cache_key(b"content_v2");
 
         assert_ne!(
             key1, key2,
@@ -7038,12 +6993,8 @@ mod tests {
 
     #[test]
     fn test_cache_key_stable_for_same_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let wasm_path = dir.path().join("provider.wasm");
-        std::fs::write(&wasm_path, b"same_content").unwrap();
-
-        let key1 = WasmProviderFactory::cache_key(&wasm_path);
-        let key2 = WasmProviderFactory::cache_key(&wasm_path);
+        let key1 = WasmProviderFactory::cache_key(b"same_content");
+        let key2 = WasmProviderFactory::cache_key(b"same_content");
 
         assert_eq!(key1, key2, "cache key should be stable for same content");
     }

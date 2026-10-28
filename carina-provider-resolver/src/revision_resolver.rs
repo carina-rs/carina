@@ -4,15 +4,18 @@ use serde::Deserialize;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::GithubSource;
 
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
     global_cache_artifact_path, install_global_artifact_atomically,
-    install_project_artifact_atomically,
+    install_project_artifact_from_global_cache,
 };
-use crate::provider_resolver::{WasmArtifactPath, sha256_file};
+use crate::provider_resolver::WasmArtifactPath;
+use crate::verified_artifact::{
+    DownloadedArtifact, RevisionArtifactPin, VerifiedArtifact, VerifiedArtifactError,
+    lookup_revision_artifact_pin, publish_download,
+};
 
 /// GitHub Actions artifact metadata (subset used by the resolver).
 #[derive(Deserialize)]
@@ -266,13 +269,13 @@ where
 }
 
 /// Download a GitHub Actions artifact (ZIP) and extract the WASM file.
-fn download_artifact(
-    install_lock: &ProviderInstallLock,
+fn download_artifact<'lock>(
+    install_lock: &'lock ProviderInstallLock,
     source: &GithubSource,
     artifact_id: u64,
     destination: &WasmArtifactPath,
     token: &str,
-) -> Result<String, String> {
+) -> Result<StagedArtifact<'lock>, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url =
@@ -322,15 +325,7 @@ fn download_artifact(
                 })?;
             io::copy(&mut file, &mut staged)
                 .map_err(|e| format!("Failed to write WASM file: {e}"))?;
-            let hash = sha256_file(staged.path())
-                .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-            staged.publish().map_err(|e| {
-                format!(
-                    "Failed to publish provider artifact {}: {e}",
-                    destination.as_path().display()
-                )
-            })?;
-            return Ok(hash);
+            return Ok(staged);
         }
     }
 
@@ -363,23 +358,22 @@ pub(crate) fn global_cache_path_revision(
     )
 }
 
-fn checksum_mismatch_error(
+fn record_verified_revision_pin(
+    lock_file: &mut GuardedLockFile<'_>,
+    artifact: &VerifiedArtifact,
+    pin: RevisionArtifactPin,
     name: &str,
-    source: &GithubSource,
-    sha: &str,
-    expected: &str,
-    actual: &str,
-    project_dir: &Path,
-) -> String {
-    format!(
-        "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `{}` to re-download.",
-        name,
-        source,
-        &sha[..12],
-        expected,
-        actual,
-        ProjectCommand::new("init", project_dir)
-    )
+) {
+    lock_file.upsert(crate::provider_resolver::LockEntry {
+        name: name.to_string(),
+        source: artifact.source().to_string(),
+        kind: crate::provider_resolver::LockEntryKind::Revision {
+            revision: pin.revision,
+            resolved_sha: pin.resolved_sha,
+        },
+        sha256: artifact.sha256().to_string(),
+        registry: None,
+    });
 }
 
 /// Resolve a provider by revision: download from CI artifacts if not cached.
@@ -414,62 +408,55 @@ pub fn resolve_provider_by_revision(
         resolve_ref_to_sha(source, revision, &token)?
     };
 
-    // 2. Check cache
+    let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
+
+    // As in version mode, machine-local artifacts are never first-use trust
+    // anchors. A project or global cache entry without this exact revision pin
+    // is skipped in favor of a fresh origin download.
     let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
-    if wasm_path.as_path().exists() {
-        let actual_hash = super::provider_resolver::sha256_file(wasm_path.as_path())
-            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-        if let Some(lock_entry) = lock_file.find_by_source_key_and_sha(&source_key, &sha)
-            && actual_hash != lock_entry.sha256
-        {
-            return Err(checksum_mismatch_error(
-                name,
-                source,
-                &sha,
-                &lock_entry.sha256,
-                &actual_hash,
-                base_dir,
-            ));
-        }
-        // Record the entry so a caller that subsequently writes the lock
-        // doesn't stomp it with an empty in-memory LockFile (issue #2032).
-        lock_file.upsert(super::provider_resolver::LockEntry {
-            name: name.to_string(),
-            source: source_key.to_string(),
-            kind: super::provider_resolver::LockEntryKind::Revision {
-                revision: revision.to_string(),
-                resolved_sha: sha.clone(),
-            },
-            sha256: actual_hash,
-            registry: None,
-        });
-        return Ok((wasm_path, sha));
+    if wasm_path.as_path().exists()
+        && let Some((lock_entry, pin)) = artifact_pin.pinned()
+    {
+        let pin = pin.clone();
+        let verified = match VerifiedArtifact::from_existing(lock_entry, name, base_dir) {
+            Ok(verified) => verified,
+            Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
+                let removal = install_lock.remove_project_artifact(&wasm_path);
+                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+            }
+            Err(VerifiedArtifactError::Other(message)) => return Err(message),
+        };
+        record_verified_revision_pin(lock_file, &verified, pin, name);
+        return Ok((verified.path().clone(), sha));
     }
 
-    // 2b. Check global plugin cache
-    if let Some(global_wasm) = global_cache_path_revision(source, &sha)
+    if let Some((lock_entry, pin)) = artifact_pin.pinned()
+        && let Some(global_wasm) = global_cache_path_revision(source, &sha)
         && global_wasm.as_path().exists()
     {
-        let hash =
-            install_project_artifact_atomically(install_lock, global_wasm.as_path(), &wasm_path)
-                .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        lock_file.upsert(super::provider_resolver::LockEntry {
-            name: name.to_string(),
-            source: source_key.to_string(),
-            kind: super::provider_resolver::LockEntryKind::Revision {
-                revision: revision.to_string(),
-                resolved_sha: sha.clone(),
-            },
-            sha256: hash,
-            registry: None,
-        });
+        let pin = pin.clone();
+        let verified = match install_project_artifact_from_global_cache(
+            install_lock,
+            global_wasm.as_path(),
+            &wasm_path,
+            lock_entry,
+            name,
+        ) {
+            Ok(verified) => verified,
+            Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
+                let removal = std::fs::remove_file(global_wasm.as_path());
+                return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
+            }
+            Err(VerifiedArtifactError::Other(message)) => return Err(message),
+        };
+        record_verified_revision_pin(lock_file, &verified, pin, name);
         eprintln!(
             "Installed provider '{}' from global cache ({}@{})",
             name,
             source,
             &sha[..sha.len().min(12)]
         );
-        return Ok((wasm_path, sha));
+        return Ok((verified.path().clone(), sha));
     }
 
     // 3. Download from CI artifacts
@@ -485,23 +472,31 @@ pub fn resolve_provider_by_revision(
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
             fetch_run_artifacts(source, run_id, &token)
         })?;
-    let hash = download_artifact(install_lock, source, artifact_id, &wasm_path, &token)?;
+    let staged = download_artifact(install_lock, source, artifact_id, &wasm_path, &token)?;
+    let installed_path = match publish_download(staged, artifact_pin)? {
+        DownloadedArtifact::Verified { artifact, pin } => {
+            record_verified_revision_pin(lock_file, &artifact, pin, name);
+            artifact.path().clone()
+        }
+        DownloadedArtifact::FirstUse { path, sha256 } => {
+            lock_file.upsert(super::provider_resolver::LockEntry {
+                name: name.to_string(),
+                source: source_key.to_string(),
+                kind: super::provider_resolver::LockEntryKind::Revision {
+                    revision: revision.to_string(),
+                    resolved_sha: sha.clone(),
+                },
+                sha256,
+                registry: None,
+            });
+            path
+        }
+    };
 
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(source, &sha) {
-        let _ = install_global_artifact_atomically(wasm_path.as_path(), &global_wasm);
+        let _ = install_global_artifact_atomically(installed_path.as_path(), &global_wasm);
     }
-
-    lock_file.upsert(super::provider_resolver::LockEntry {
-        name: name.to_string(),
-        source: source_key.to_string(),
-        kind: super::provider_resolver::LockEntryKind::Revision {
-            revision: revision.to_string(),
-            resolved_sha: sha.clone(),
-        },
-        sha256: hash,
-        registry: None,
-    });
 
     eprintln!(
         "Installed provider '{}' ({source}@{})",
@@ -509,15 +504,15 @@ pub fn resolve_provider_by_revision(
         &sha[..sha.len().min(12)]
     );
 
-    Ok((wasm_path, sha))
+    Ok((installed_path, sha))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
     use carina_core::provider_source::{ProviderSource, RemoteSource};
-
-    static GITHUB_TOKEN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use std::io::Write as _;
 
     fn github_source(owner: &str, repo: &str) -> GithubSource {
         match format!("github.com/{owner}/{repo}")
@@ -558,40 +553,39 @@ mod tests {
     }
 
     #[test]
-    fn checksum_mismatch_hint_uses_project_dir_and_omits_dot() {
-        let nested = checksum_mismatch_error(
-            "aws",
-            &test_source(),
-            TEST_SHA,
-            "expected",
-            "actual",
-            Path::new("infra/foo"),
-        );
+    fn checksum_mismatch_hint_uses_lock_derived_path_and_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("infra/foo");
+        let source = test_source();
+        let artifact_path = cache_path_revision(&project_dir, &source, TEST_SHA);
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, b"actual").unwrap();
+        let lock_entry = LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+            },
+            sha256: "expected".into(),
+            registry: None::<RegistryLock>,
+        };
+        let nested = VerifiedArtifact::from_existing(&lock_entry, "aws", &project_dir)
+            .unwrap_err()
+            .to_string();
         assert!(
-            nested.contains("Re-run `carina init infra/foo` to re-download"),
+            nested.contains(&format!(
+                "Run `carina init {}` to discard the mismatched copy, then run it again to download a verified one.",
+                project_dir.display()
+            )),
             "{nested}"
         );
-
-        let default = checksum_mismatch_error(
-            "aws",
-            &test_source(),
-            TEST_SHA,
-            "expected",
-            "actual",
-            Path::new("."),
-        );
-        assert!(
-            default.contains("Re-run `carina init` to re-download"),
-            "{default}"
-        );
-        assert!(!default.contains("carina init ."), "{default}");
     }
 
     #[test]
     fn cached_revision_checksum_mismatch_uses_resolver_project_dir() {
-        let _env_guard = GITHUB_TOKEN_ENV.lock().unwrap();
-        let previous_token = std::env::var_os("GITHUB_TOKEN");
-        unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
+        let _env_guard = crate::test_env_guard();
+        let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
 
         let dir = tempfile::tempdir().unwrap();
         let source = test_source();
@@ -613,33 +607,171 @@ mod tests {
         let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
         let mut lock_file = install_lock.guard_lock_file_for_test(lock_file);
         let result = resolve_provider_by_revision(&mut lock_file, &source, "main", "aws", false);
-        match previous_token {
-            Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
-            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
-        }
         let error = result.expect_err("the cached artifact hash must not match its lock pin");
 
         assert!(
             error.contains(&format!(
-                "Re-run `carina init {}` to re-download",
+                "The mismatched cached copy was removed; re-run `carina init {}` to download it again.",
                 dir.path().display()
             )),
             "{error}"
+        );
+        assert!(
+            !wasm_path.exists(),
+            "the mismatched project artifact must be removed before returning"
+        );
+    }
+
+    #[test]
+    fn fresh_revision_download_mismatch_is_rejected_before_publish() {
+        let project = tempfile::tempdir().unwrap();
+        let source = test_source();
+        let destination = WasmArtifactPath::new(
+            cache_path_revision(project.path(), &source, TEST_SHA),
+            "aws",
+        )
+        .unwrap();
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut staged = StagedArtifact::for_project(&install_lock, &destination).unwrap();
+        staged
+            .write_all(b"unexpected revision origin bytes")
+            .unwrap();
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+            },
+            sha256: "locked-revision-sha256".into(),
+            registry: None,
+        });
+        let pin =
+            lookup_revision_artifact_pin(&lock_file, &source.source_key(), "main", TEST_SHA, "aws");
+
+        let error = publish_download(staged, pin)
+            .expect_err("fresh revision bytes must match an existing lock pin");
+
+        assert!(error.contains("Downloaded provider 'aws'"), "{error}");
+        assert!(error.contains("The origin artifact changed after it was pinned"));
+        assert!(!destination.as_path().exists());
+    }
+
+    #[test]
+    fn revision_global_cache_mismatch_is_not_published_or_repinned() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
+        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = test_source();
+        let locked_bytes = b"locked revision provider";
+        let cached_bytes = b"tampered global revision provider";
+        let expected_file = project.path().join("expected.wasm");
+        std::fs::write(&expected_file, locked_bytes).unwrap();
+        let expected_sha256 = sha256_file(&expected_file).unwrap();
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(crate::provider_resolver::LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+            },
+            sha256: expected_sha256.clone(),
+            registry: None,
+        });
+        let lock_path = crate::provider_resolver::provider_lock_path(project.path());
+        lock_file.save(&lock_path).unwrap();
+        let lock_before = std::fs::read(&lock_path).unwrap();
+        let global_wasm = global_cache_path_revision(&source, TEST_SHA).unwrap();
+        std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        let project_wasm = cache_path_revision(project.path(), &source, TEST_SHA);
+        let actual_sha256 = sha256_file(global_wasm.as_path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
+
+        let result = resolve_provider_by_revision(&mut guarded, &source, "main", "aws", false);
+
+        let error = result.expect_err("a global cache entry must match the revision lock pin");
+        assert!(
+            error.contains("SHA256 mismatch for provider 'aws'"),
+            "{error}"
+        );
+        assert!(error.contains(&expected_sha256), "{error}");
+        assert!(error.contains(&actual_sha256), "{error}");
+        assert!(
+            !project_wasm.exists(),
+            "mismatched bytes must not be published"
+        );
+        assert!(
+            !global_wasm.as_path().exists(),
+            "a mismatched global cache entry must be removed so the next init can download"
+        );
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+        assert_eq!(
+            guarded
+                .find_by_source_key_and_sha(&source.source_key(), TEST_SHA)
+                .unwrap()
+                .sha256,
+            expected_sha256
+        );
+    }
+
+    #[test]
+    fn revision_global_cache_match_installs_without_repinning() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
+        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = test_source();
+        let cached_bytes = b"lock-matching global revision provider";
+        let global_wasm = global_cache_path_revision(&source, TEST_SHA).unwrap();
+        std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        let sha256 = sha256_file(global_wasm.as_path()).unwrap();
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(crate::provider_resolver::LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+            },
+            sha256: sha256.clone(),
+            registry: None,
+        });
+        let lock_path = crate::provider_resolver::provider_lock_path(project.path());
+        lock_file.save(&lock_path).unwrap();
+        let lock_before = std::fs::read(&lock_path).unwrap();
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
+
+        let (resolved, resolved_sha) =
+            resolve_provider_by_revision(&mut guarded, &source, "main", "aws", false).unwrap();
+
+        assert_eq!(resolved_sha, TEST_SHA);
+        assert_eq!(std::fs::read(resolved.as_path()).unwrap(), cached_bytes);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+        assert_eq!(
+            guarded
+                .find_by_source_key_and_sha(&source.source_key(), TEST_SHA)
+                .unwrap()
+                .sha256,
+            sha256
         );
     }
 
     #[test]
     fn test_get_github_token_from_env() {
         // This test only verifies the env var path; gh CLI path is harder to unit test
-        let _env_guard = GITHUB_TOKEN_ENV.lock().unwrap();
-        let previous_token = std::env::var_os("GITHUB_TOKEN");
-        unsafe { std::env::set_var("GITHUB_TOKEN", "test-token-123") };
+        let _env_guard = crate::test_env_guard();
+        let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token-123");
         let token = get_github_token().unwrap();
         assert_eq!(token, "test-token-123");
-        match previous_token {
-            Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
-            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
-        }
     }
 
     const TEST_SOURCE: &str = "github.com/carina-rs/carina-provider-aws";

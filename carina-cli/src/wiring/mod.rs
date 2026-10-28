@@ -404,8 +404,10 @@ async fn load_installed_wasm_provider(
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 > {
-    load_installed_wasm_provider_using(installed, carina_plugin_host::WasmProviderFactory::new)
-        .await
+    load_installed_wasm_provider_using(installed, |bytes| async move {
+        carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes()).await
+    })
+    .await
 }
 
 async fn load_installed_wasm_provider_using<F, Fut>(
@@ -416,7 +418,7 @@ async fn load_installed_wasm_provider_using<F, Fut>(
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 >
 where
-    F: FnOnce(std::path::PathBuf) -> Fut,
+    F: FnOnce(carina_provider_resolver::ProviderArtifactBytes) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 carina_plugin_host::WasmProviderFactory,

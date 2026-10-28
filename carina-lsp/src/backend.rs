@@ -6,6 +6,7 @@ use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
+use carina_provider_resolver::ProviderArtifactFingerprint;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -53,12 +54,12 @@ struct ProviderState {
     /// Injected install prober. Kept here so `is_stale()` can recompute the
     /// fingerprint with the same function that built the snapshot.
     prober: Option<ProviderInstallProber>,
-    /// Snapshot of which providers resolved to an installed local binary when
-    /// this state was built. Compared against a fresh probe to detect
+    /// Snapshot of the selected artifacts and lock files when this state was
+    /// built. Compared against a fresh probe to detect replacements or
     /// `.carina/` deletions the editor's file watcher did not report
     /// (issue #2023 follow-up: VS Code excludes dot-prefixed directories
     /// from its watcher by default).
-    install_fingerprint: Vec<(String, bool)>,
+    install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
 }
 
 impl ProviderState {
@@ -67,7 +68,7 @@ impl ProviderState {
         provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
         prober: Option<ProviderInstallProber>,
-        install_fingerprint: Vec<(String, bool)>,
+        install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
             configs.iter().map(|(_, config)| config),
@@ -132,30 +133,28 @@ impl ProviderState {
     /// True when a fresh probe of the configured providers no longer matches
     /// the fingerprint captured at build time.
     fn is_stale(&self) -> bool {
-        probe_install_fingerprint(self.prober.as_ref(), &self.configs) != self.install_fingerprint
+        let Some(prober) = self.prober.as_ref() else {
+            return false;
+        };
+        probe_install_fingerprint(prober, &self.configs) != self.install_fingerprint
     }
 }
 
-/// Checks whether a single provider config resolves to an installed local
-/// binary. Injected from `main.rs` so provider-resolver calls stay out of
-/// the provider-agnostic `carina-lsp` library code.
-pub type ProviderInstallProber =
-    Arc<dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> bool + Send + Sync>;
+/// Captures cheap metadata for a config's selected artifact and lock file.
+/// Injected from `main.rs` so the poller and factory builder share resolver
+/// path-selection behavior.
+pub type ProviderInstallProber = Arc<
+    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderArtifactFingerprint
+        + Send
+        + Sync,
+>;
 
-/// Compute `(provider_name, is_installed)` pairs for a list of configs.
+/// Compute `(provider_name, metadata)` pairs for a list of configs.
 /// Ordered to match the input so equality comparisons are stable.
 fn probe_install_fingerprint(
-    prober: Option<&ProviderInstallProber>,
+    prober: &ProviderInstallProber,
     configs: &[(PathBuf, carina_core::parser::ProviderConfig)],
-) -> Vec<(String, bool)> {
-    let Some(prober) = prober else {
-        // Without a prober we can't tell, so claim every provider is still
-        // installed — the poller falls back to a never-stale snapshot.
-        return configs
-            .iter()
-            .map(|(_, cfg)| (cfg.name.clone(), true))
-            .collect();
-    };
+) -> Vec<(String, ProviderArtifactFingerprint)> {
     configs
         .iter()
         .map(|(dir, cfg)| (cfg.name.clone(), prober(dir, cfg)))
@@ -163,9 +162,8 @@ fn probe_install_fingerprint(
 }
 
 /// How often the background poller checks for `.carina/` drift. Short enough
-/// that deleting the install feels interactive (~seconds), long enough that
-/// the poll cost — one `fs::metadata` per configured provider — is
-/// negligible.
+/// that replacing an install feels interactive (~seconds), long enough that
+/// the poll cost — selected-artifact and lock-file metadata — is negligible.
 const PROVIDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Per-directory provider states keyed by configuration directory.
@@ -231,7 +229,7 @@ impl ProviderStates {
 }
 
 /// Result of building provider factories: loaded factories, per-provider
-/// error messages, and the `(name, is_installed)` observations the builder
+/// error messages, and the `(name, metadata)` observations the builder
 /// made. The fingerprint is returned here (rather than recomputed) so the
 /// stored factories and the drift-poll baseline describe the exact same
 /// filesystem snapshot — any later divergence is a real change, not a
@@ -239,7 +237,7 @@ impl ProviderStates {
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
     HashMap<String, String>, // provider name -> error reason
-    Vec<(String, bool)>,     // install fingerprint
+    Vec<(String, ProviderArtifactFingerprint)>, // install fingerprint
 );
 
 /// Function type for building provider factories from configs with their source directories.
@@ -272,9 +270,9 @@ impl Backend {
         Self::with_install_prober(client, provider_context, factory_builder, None)
     }
 
-    /// Construct a backend with a custom install prober. `main.rs` uses this
-    /// to inject a `carina_provider_resolver::find_installed_provider`-based
-    /// prober without pulling the resolver into the library crate.
+    /// Construct a backend with a custom install prober. `main.rs` injects the
+    /// shared `carina_provider_resolver::provider_artifact_fingerprint` so the
+    /// factory snapshot and background poll use the same probe.
     pub fn with_install_prober(
         client: Client,
         provider_context: ProviderContext,
@@ -1004,7 +1002,7 @@ mock.test.Thing {
             HashMap::new(),
             configs,
             None,
-            vec![("mock".to_string(), false)],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
         );
         let document = Document::new(
             main.to_string(),
@@ -1065,7 +1063,7 @@ mock.test.Thing {
             )]),
             configs,
             None,
-            vec![("mock".to_string(), false)],
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
         );
         let document = Document::new(
             main.to_string(),
@@ -1225,12 +1223,29 @@ mock.test.Thing {
         }
     }
 
-    /// Stub prober for tests: reports a provider as installed iff the
-    /// attribute `_installed_at` points at an existing file. Lets us
-    /// exercise the fingerprint logic without pulling the resolver crate.
+    fn test_file_fingerprint(
+        path: &Path,
+    ) -> Option<carina_provider_resolver::FileMetadataFingerprint> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(carina_provider_resolver::FileMetadataFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Stub prober for tests: selects the file named by `_installed_at`, then
+    /// records the same cheap metadata shape as the production resolver.
     fn test_prober() -> ProviderInstallProber {
-        Arc::new(|_dir, cfg| {
-            cfg.attributes
+        Arc::new(|dir, cfg| {
+            let artifact = cfg
+                .attributes
                 .get("_installed_at")
                 .and_then(|v| match v {
                     carina_core::resource::Value::Concrete(
@@ -1238,8 +1253,11 @@ mock.test.Thing {
                     ) => Some(s.expose_plaintext()),
                     _ => None,
                 })
-                .map(|p| std::path::Path::new(p).exists())
-                .unwrap_or(false)
+                .and_then(|p| test_file_fingerprint(std::path::Path::new(p)));
+            ProviderArtifactFingerprint {
+                artifact,
+                lock_file: test_file_fingerprint(&dir.join("carina-providers.lock")),
+            }
         })
     }
 
@@ -1278,19 +1296,17 @@ mock.test.Thing {
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober();
 
-        let before = probe_install_fingerprint(Some(&prober), &configs);
-        assert_eq!(
-            before,
-            vec![("foo".to_string(), true)],
-            "initial probe should see the installed binary"
+        let before = probe_install_fingerprint(&prober, &configs);
+        assert!(
+            before[0].1.artifact.is_some(),
+            "initial probe should see the installed binary metadata"
         );
 
         std::fs::remove_file(&installed).unwrap();
-        let after = probe_install_fingerprint(Some(&prober), &configs);
-        assert_eq!(
-            after,
-            vec![("foo".to_string(), false)],
-            "probe after delete must flip to false"
+        let after = probe_install_fingerprint(&prober, &configs);
+        assert!(
+            after[0].1.artifact.is_none(),
+            "probe after delete must record missing artifact metadata"
         );
         assert_ne!(before, after);
     }
@@ -1312,8 +1328,8 @@ mock.test.Thing {
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober();
         assert_eq!(
-            probe_install_fingerprint(Some(&prober), &configs),
-            probe_install_fingerprint(Some(&prober), &configs),
+            probe_install_fingerprint(&prober, &configs),
+            probe_install_fingerprint(&prober, &configs),
             "two back-to-back probes with no fs change must agree"
         );
     }

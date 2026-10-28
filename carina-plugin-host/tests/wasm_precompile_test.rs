@@ -182,7 +182,7 @@ macro_rules! skip_if_no_wasm {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_precompile_cache_creation() {
-    let wasm = skip_if_no_wasm!();
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
@@ -201,42 +201,86 @@ async fn test_precompile_cache_creation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_from_file_cached_creates_cache() {
-    let wasm = skip_if_no_wasm!();
-    let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
+async fn from_bytes_loads_mock_provider_fixture() {
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
+    let cache_dir = tempfile::tempdir().expect("create cache temp dir");
 
-    // First call: no cache exists, should compile and cache
-    let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("from_file_cached should succeed");
+        .expect("provider bytes should load");
 
     assert_eq!(factory.name(), "mock");
-
-    // .cwasm should have been created in cache dir
-    // cache_key() includes a content hash, so look for any .cwasm file
-    let cwasm_files: Vec<_> = std::fs::read_dir(cache_dir.path())
-        .expect("read_dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "cwasm"))
-        .collect();
-    assert_eq!(cwasm_files.len(), 1, ".cwasm cache file should be created");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_from_file_cached_uses_cache() {
-    let wasm = skip_if_no_wasm!();
+async fn precompile_cache_key_depends_only_on_content() {
+    let fixture_path = skip_if_no_wasm!();
+    let fixture_bytes = std::fs::read(fixture_path).expect("read mock provider fixture");
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let first_path = source_dir.path().join("first.wasm");
+    let second_path = source_dir.path().join("second.wasm");
+    std::fs::write(&first_path, &fixture_bytes).expect("write first provider path");
+    std::fs::write(&second_path, &fixture_bytes).expect("write second provider path");
+    let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+
+    let first_bytes = std::fs::read(first_path).expect("read first provider path");
+    let second_bytes = std::fs::read(second_path).expect("read second provider path");
+    WasmProviderFactory::from_bytes_with_cache_dir(&first_bytes, cache_dir.path())
+        .await
+        .expect("first provider should load");
+    WasmProviderFactory::from_bytes_with_cache_dir(&second_bytes, cache_dir.path())
+        .await
+        .expect("second provider should load");
+
+    let cwasm_count = std::fs::read_dir(cache_dir.path())
+        .expect("read cache dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .count();
+    assert_eq!(
+        cwasm_count, 1,
+        "identical provider bytes must share one precompile cache entry"
+    );
+
+    let distinct_error = match WasmProviderFactory::from_bytes_with_cache_dir(
+        NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(),
+        cache_dir.path(),
+    )
+    .await
+    {
+        Ok(_) => panic!("different component should fail during provider bring-up"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        distinct_error,
+        WasmProviderLoadError::Instantiation(_)
+    ));
+    let cwasm_count = std::fs::read_dir(cache_dir.path())
+        .expect("read cache dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .count();
+    assert_eq!(
+        cwasm_count, 2,
+        "different provider bytes must use a different precompile cache entry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_from_bytes_uses_cache() {
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First call: compiles and caches
-    let factory1 = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+    let factory1 = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("first from_file_cached should succeed");
+        .expect("first byte load should succeed");
     assert_eq!(factory1.name(), "mock");
 
     // Second call: uses cache
-    let factory2 = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+    let factory2 = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("second from_file_cached (cache hit) should succeed");
+        .expect("second byte load (cache hit) should succeed");
     assert_eq!(factory2.name(), "mock");
 
     // Both factories should report the mock provider's schemas.
@@ -252,14 +296,14 @@ async fn test_from_file_cached_uses_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_from_file_cached_recovers_from_stale_cache() {
-    let wasm = skip_if_no_wasm!();
+async fn test_from_bytes_recovers_from_stale_cache() {
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First, create a valid cache so we know the filename
-    let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("initial from_file_cached should succeed");
+        .expect("initial byte load should succeed");
     assert_eq!(factory.name(), "mock");
 
     // Find the .cwasm file before dropping the factory (path only, no access).
@@ -280,10 +324,10 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
     let corrupt_contents = b"not a valid cwasm file";
     std::fs::write(&cwasm_path, corrupt_contents).expect("Failed to write stale cache file");
 
-    // from_file_cached should detect invalid cache, recompile, and succeed
-    let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+    // The byte loader should detect invalid cache, recompile, and succeed.
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("from_file_cached should recover from stale cache");
+        .expect("byte loader should recover from stale cache");
 
     assert_eq!(factory.name(), "mock");
     assert_ne!(
@@ -295,16 +339,13 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
-    let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
-    let wasm_path = source_dir.path().join("non-instantiable.wasm");
-    std::fs::write(&wasm_path, NON_INSTANTIABLE_COMPONENT_WAT)
-        .expect("Failed to write test component");
+    let wasm_bytes = NON_INSTANTIABLE_COMPONENT_WAT.as_bytes();
     let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
 
     // A cold load still precompiles the component before its deterministic
     // bring-up failure, leaving a valid cache artifact for the next attempt.
     let cold_error =
-        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+        match WasmProviderFactory::from_bytes_with_cache_dir(wasm_bytes, cache_dir.path()).await {
             Ok(_) => panic!("component should fail to instantiate"),
             Err(error) => error,
         };
@@ -317,7 +358,7 @@ async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
     let artifact_before = snapshot_cache_artifact(&cwasm_path);
 
     let warm_error =
-        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+        match WasmProviderFactory::from_bytes_with_cache_dir(wasm_bytes, cache_dir.path()).await {
             Ok(_) => panic!("component should still fail to instantiate"),
             Err(error) => error,
         };
@@ -332,8 +373,6 @@ async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
 #[tokio::test(flavor = "multi_thread")]
 async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     let valid_wasm_path = skip_if_no_wasm!();
-    let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
-    let wasm_path = source_dir.path().join("unsupported-protocol.wasm");
     let mut component_bytes =
         std::fs::read(valid_wasm_path).expect("read valid mock provider component");
 
@@ -356,11 +395,11 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     for offset in field_offsets {
         component_bytes[offset..offset + field_name.len()].copy_from_slice(invalid_field_name);
     }
-    std::fs::write(&wasm_path, component_bytes).expect("write protocol-mismatch component");
-
     let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
     let cold_error =
-        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+        match WasmProviderFactory::from_bytes_with_cache_dir(&component_bytes, cache_dir.path())
+            .await
+        {
             Ok(_) => panic!("component with an unsupported protocol should fail bring-up"),
             Err(error) => error,
         };
@@ -376,7 +415,9 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     let artifact_before = snapshot_cache_artifact(&cwasm_path);
 
     let warm_error =
-        match WasmProviderFactory::new_with_cache_dir(wasm_path, cache_dir.path()).await {
+        match WasmProviderFactory::from_bytes_with_cache_dir(&component_bytes, cache_dir.path())
+            .await
+        {
             Ok(_) => panic!("component with an unsupported protocol should still fail bring-up"),
             Err(error) => error,
         };
@@ -393,15 +434,16 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn protocol_v2_is_rejected_before_current_world_binding() {
-    let source_dir = tempfile::tempdir().expect("create source temp dir");
-    let wasm_path = source_dir.path().join("protocol-v2.wasm");
-    std::fs::write(&wasm_path, build_protocol_v2_component()).expect("write protocol-v2 component");
     let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+    let component_bytes = build_protocol_v2_component();
 
-    let error = match WasmProviderFactory::new_with_cache_dir(wasm_path, cache_dir.path()).await {
-        Ok(_) => panic!("a protocol-v2 component must be rejected"),
-        Err(error) => error,
-    };
+    let error =
+        match WasmProviderFactory::from_bytes_with_cache_dir(&component_bytes, cache_dir.path())
+            .await
+        {
+            Ok(_) => panic!("a protocol-v2 component must be rejected"),
+            Err(error) => error,
+        };
     let rendered = error.to_string();
 
     assert!(
@@ -426,11 +468,8 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
 #[tokio::test(flavor = "multi_thread")]
 async fn from_precompiled_classifies_failure_by_step() {
     let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
-    let wasm_path = source_dir.path().join("non-instantiable.wasm");
-    std::fs::write(&wasm_path, NON_INSTANTIABLE_COMPONENT_WAT)
-        .expect("Failed to write test component");
     let cwasm_path = source_dir.path().join("non-instantiable.cwasm");
-    WasmProviderFactory::precompile(&wasm_path, &cwasm_path)
+    WasmProviderFactory::precompile(NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(), &cwasm_path)
         .expect("test component should precompile");
 
     let bring_up_error = match WasmProviderFactory::from_precompiled(&cwasm_path).await {
@@ -456,7 +495,7 @@ async fn from_precompiled_classifies_failure_by_step() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_precompiled_factory_creates_provider() {
-    let wasm = skip_if_no_wasm!();
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
@@ -484,15 +523,15 @@ async fn test_precompiled_factory_creates_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_new_uses_default_cache() {
-    let wasm = skip_if_no_wasm!();
+async fn test_byte_constructor_uses_explicit_cache() {
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
 
     // Use a temporary directory as the cache location to avoid polluting the real cache
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    let factory = WasmProviderFactory::new_with_cache_dir(wasm.clone(), cache_dir.path())
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("new_with_cache_dir should succeed");
+        .expect("byte constructor should succeed");
 
     assert_eq!(factory.name(), "mock");
 
@@ -516,9 +555,9 @@ async fn test_new_uses_default_cache() {
         .modified()
         .expect("modified");
 
-    let factory2 = WasmProviderFactory::new_with_cache_dir(wasm, cache_dir.path())
+    let factory2 = WasmProviderFactory::from_bytes_with_cache_dir(&wasm, cache_dir.path())
         .await
-        .expect("second new_with_cache_dir should succeed");
+        .expect("second byte constructor should succeed");
 
     assert_eq!(factory2.name(), "mock");
 
@@ -546,7 +585,7 @@ async fn test_new_uses_default_cache() {
 /// runner crashes here.
 #[tokio::test(flavor = "multi_thread")]
 async fn precompile_preserves_prior_factory_mmap() {
-    let wasm = skip_if_no_wasm!();
+    let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
