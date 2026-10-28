@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
+use carina_cli::commands::plan::{CurrentStateEntry, PlanFile, PlanFileContents};
 use carina_cli::wiring::{LoadedProviderFactory, WiringContext};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
@@ -48,7 +48,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
     SavedProviderConfigs::from(&resolved)
 }
 
-fn record_mock_schema_fingerprints(plan_file: &mut PlanFile) {
+fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
     let configs = [ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
@@ -60,7 +60,9 @@ fn record_mock_schema_fingerprints(plan_file: &mut PlanFile) {
         binding: None,
     }];
     let ctx = WiringContext::new(Vec::<LoadedProviderFactory>::new(), &configs);
-    plan_file.record_loaded_providers(&ctx);
+    contents
+        .record(&ctx)
+        .expect("mock plan provider evidence must be valid")
 }
 
 struct Scenario {
@@ -255,7 +257,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         .map(state_not_found)
         .collect::<Vec<_>>();
 
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-06-25T00:00:00Z".to_string(),
@@ -282,11 +284,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         upstream_snapshot: HashMap::new(),
         upstream_sources: vec![],
         wait_bindings: vec![],
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_mock_schema_fingerprints(&mut plan_file);
-    plan_file
+    record_with_mock_provider(contents)
 }
 
 #[test]
@@ -378,7 +377,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-07-03T00:00:00Z".to_string(),
@@ -405,10 +404,8 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: vec![],
         wait_bindings: vec![],
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_mock_schema_fingerprints(&mut plan_file);
+    let plan_file = record_with_mock_provider(contents);
     let plan_path = scenario.project.join("deposed-plan.json");
     fs::write(
         &plan_path,

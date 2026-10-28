@@ -97,6 +97,36 @@ provider mock {}
         fs::write(&self.op_log, "").expect("clear operation log");
     }
 
+    fn remove_provider_config_and_retire_injected_type(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            r#"backend local { path = "carina.state.json" }
+"#,
+        )
+        .expect("remove explicit provider config");
+
+        let state_path = self.project.join("carina.state.json");
+        let mut state = read_json(&state_path);
+        let resources = state["resources"]
+            .as_array_mut()
+            .expect("state resources array");
+        resources.retain(|row| row["resource_type"] == "example.gone");
+        let retired = resources
+            .first_mut()
+            .expect("injected removed type remains in state");
+        retired["provider"] = Value::String("retired".to_string());
+        retired["current"]["kind"] = Value::String("missing_identifier".to_string());
+        retired["current"]
+            .as_object_mut()
+            .expect("current instance object")
+            .remove("identifier");
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("encode retired-provider state"),
+        )
+        .expect("write retired-provider state");
+    }
+
     fn remove_mock_provider_resource(&self, key: &str) {
         let mut provider_state = read_json(&self.mock_state);
         let removed = provider_state["states"]
@@ -148,13 +178,21 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read JSON file")).expect("parse JSON file")
 }
 
-fn saved_schema_entry<'a>(plan: &'a Value, resource_type: &str) -> &'a Value {
-    plan["schema_fingerprints"]["providers"]["mock"]["schemas"]
+fn saved_schema_entry_for_provider<'a>(
+    plan: &'a Value,
+    provider: &str,
+    resource_type: &str,
+) -> &'a Value {
+    plan["schema_fingerprints"]["providers"][provider]["schemas"]
         .as_array()
         .expect("saved schema entries")
         .iter()
         .find(|entry| entry["resource_type"] == resource_type)
         .unwrap_or_else(|| panic!("missing saved fingerprint for {resource_type}"))
+}
+
+fn saved_schema_entry<'a>(plan: &'a Value, resource_type: &str) -> &'a Value {
+    saved_schema_entry_for_provider(plan, "mock", resource_type)
 }
 
 fn assert_absent_saved_fingerprint(plan: &Value, resource_type: &str) {
@@ -196,6 +234,36 @@ fn removed_block_for_removed_provider_type_round_trips_through_saved_plan() {
         provider_state["states"].get("example.gone.g").is_some(),
         "removed must leave provider state untouched"
     );
+}
+
+#[test]
+fn state_only_unloaded_provider_round_trips_without_an_artifact() {
+    let scenario = Scenario::new(SEED_RESOURCE);
+    scenario.seed_state_and_inject_removed_type();
+    scenario.remove_provider_config_and_retire_injected_type();
+    scenario.write_resources("removed {\n  from = retired.example.gone 'g'\n}\n");
+
+    let plan = scenario.plan();
+    assert_success("plan --out with unloaded retired provider", &plan);
+    let saved = scenario.saved_plan_json();
+    assert_eq!(saved["provider_configs"], serde_json::json!([]));
+    assert_eq!(
+        saved["provider_artifacts"]
+            .as_object()
+            .expect("provider artifact object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["mock"],
+        "the providerless fallback must record only the built-in mock: {saved:#}"
+    );
+    assert_eq!(
+        saved_schema_entry_for_provider(&saved, "retired", "example.gone")["fingerprint"],
+        "absent"
+    );
+
+    assert_success("apply saved retired-provider plan", &scenario.apply_plan());
+    assert!(scenario.state_resource_types().is_empty());
 }
 
 #[test]
