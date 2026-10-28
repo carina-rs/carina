@@ -43,7 +43,9 @@ fn resolve_install(
         .as_ref()
         .ok_or(InstallRejection::MissingSource)?;
     let installed = match source {
-        ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(config),
+        ProviderSource::File(_) => {
+            carina_provider_resolver::find_file_provider_source(source_dir, config)
+        }
         ProviderSource::Remote(_) => {
             carina_provider_resolver::find_installed_provider(source_dir, config)
         }

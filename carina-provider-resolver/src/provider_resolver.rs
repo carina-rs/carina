@@ -4045,11 +4045,12 @@ pub struct InstalledProvider {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstalledArtifact {
-    LockFile(VerifiedArtifact),
+    LockFile(Box<VerifiedArtifact>),
     File {
         path: WasmArtifactPath,
         bytes: ProviderArtifactBytes,
         source: FileSource,
+        project_dir: PathBuf,
     },
 }
 
@@ -4061,6 +4062,7 @@ impl InstalledProvider {
                 path,
                 bytes: _,
                 source: _,
+                project_dir: _,
             } => path,
         }
     }
@@ -4075,6 +4077,7 @@ impl InstalledProvider {
                 path: _,
                 bytes: _,
                 source,
+                project_dir: _,
             } => ProviderArtifactProvenance::File {
                 source: format!("file://{}", source.path()),
             },
@@ -4087,7 +4090,7 @@ impl InstalledProvider {
 
     pub(crate) fn from_verified(artifact: VerifiedArtifact, provider_name: String) -> Self {
         Self {
-            artifact: InstalledArtifact::LockFile(artifact),
+            artifact: InstalledArtifact::LockFile(Box::new(artifact)),
             provider_name,
         }
     }
@@ -4096,6 +4099,7 @@ impl InstalledProvider {
         path: WasmArtifactPath,
         provider_name: String,
         source: FileSource,
+        project_dir: &Path,
     ) -> Result<Self, String> {
         let bytes = ProviderArtifactBytes::read(path.as_path()).map_err(|error| {
             format!(
@@ -4108,6 +4112,7 @@ impl InstalledProvider {
                 path,
                 bytes,
                 source,
+                project_dir: project_dir.to_path_buf(),
             },
             provider_name,
         })
@@ -4120,6 +4125,7 @@ impl InstalledProvider {
                 path: _,
                 bytes,
                 source: _,
+                project_dir: _,
             } => bytes.clone(),
         }
     }
@@ -4138,7 +4144,8 @@ impl InstalledProvider {
                 path: _,
                 bytes,
                 source,
-            } => local_provider_trust(source, bytes, grants, notice_sink),
+                project_dir,
+            } => local_provider_trust(source, bytes, project_dir, grants, notice_sink),
         };
         let identity = ProviderLoadIdentity::new(self.provider_name.clone(), trust)?;
         if let Some(notice) = notice {
@@ -4209,6 +4216,7 @@ impl InstalledProvider {
 fn local_provider_trust(
     source: &FileSource,
     installed_bytes: &ProviderArtifactBytes,
+    project_dir: &Path,
     grants: &TrustedLocalGrants,
     notice_sink: &mut impl FnMut(&str),
 ) -> (ProviderTrust, Option<String>) {
@@ -4222,8 +4230,9 @@ fn local_provider_trust(
     let current_sha256 = sha256_file(&canonical_path).ok();
     if current_sha256.as_deref() != Some(installed_sha256.as_str()) {
         notice_sink(&format!(
-            "carina: local provider {} does not match the installed bytes; re-run `carina init` before trusting it",
-            canonical_path.display()
+            "carina: local provider {} does not match the installed bytes; re-run `{}` before trusting it",
+            canonical_path.display(),
+            ProjectCommand::new("init", project_dir),
         ));
         return (ProviderTrust::untrusted(), None);
     }
@@ -6648,7 +6657,10 @@ fn file_provider_cache_path(
 ///
 /// The LSP uses this direct-source view so its drift poll observes the same
 /// file it loads, while still retaining typed file provenance.
-pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledProvider, String> {
+pub fn find_file_provider_source(
+    base_dir: &Path,
+    config: &ProviderConfig,
+) -> Result<InstalledProvider, String> {
     let source = config
         .source
         .as_ref()
@@ -6668,7 +6680,7 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
         return Err(format!("file not found: {file_path}"));
     }
     let path = WasmArtifactPath::new(path, &config.name)?;
-    InstalledProvider::file_source(path, config.name.clone(), file_source)
+    InstalledProvider::file_source(path, config.name.clone(), file_source, base_dir)
 }
 
 fn select_locked_artifact<'lock>(
@@ -6851,6 +6863,7 @@ pub fn find_installed_provider(
                     dest,
                     config.name.clone(),
                     file_source.clone(),
+                    base_dir,
                 );
             }
             return Err(format!(
@@ -13159,7 +13172,7 @@ transparency_log_present = true
         let config = provider_config(&format!("file://{}", native_path.display()), None);
         let expected = "Provider 'awscc': native binaries are no longer supported. Use a .wasm component instead.";
 
-        let direct_error = find_file_provider_source(&config)
+        let direct_error = find_file_provider_source(tmp.path(), &config)
             .expect_err("a direct file lookup must reject native binaries");
         assert_eq!(direct_error, expected);
 
@@ -17684,7 +17697,7 @@ transparency_log_present = false
         fs::write(&source_path, original_bytes).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
 
-        let installed = find_file_provider_source(&config)
+        let installed = find_file_provider_source(project.path(), &config)
             .expect("the file provider should be loadable at lookup");
         fs::write(&source_path, swapped_bytes).unwrap();
 
@@ -17709,7 +17722,7 @@ transparency_log_present = false
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(&config).unwrap();
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
 
         let class = installed
             .load_with(&no_local_grants(), |_bytes, identity| async move {
@@ -17727,7 +17740,7 @@ transparency_log_present = false
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(&config).unwrap();
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
         let canonical = fs::canonicalize(&source_path).unwrap();
@@ -17765,7 +17778,7 @@ transparency_log_present = false
         fs::write(&target, b"local provider").unwrap();
         symlink(&target, &link).unwrap();
         let config = provider_config(&format!("file://{}", link.display()), None);
-        let installed = find_file_provider_source(&config).unwrap();
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", target.display())], None).unwrap();
 
@@ -17791,7 +17804,7 @@ transparency_log_present = false
         let granted_path = granted_root.path().join("aws.wasm");
         fs::write(&granted_path, b"official local provider").unwrap();
         let config = provider_config(&format!("file://./{}", relative_source.display()), None);
-        let installed = find_file_provider_source(&config).unwrap();
+        let installed = find_file_provider_source(relative_root.path(), &config).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", granted_path.display())], None).unwrap();
 
@@ -17816,6 +17829,7 @@ transparency_log_present = false
             WasmArtifactPath::new(cached_path, "awscc").unwrap(),
             "awscc".into(),
             local_file_source(&source_path),
+            project.path(),
         )
         .unwrap();
         let grants =
@@ -17836,7 +17850,10 @@ transparency_log_present = false
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].contains("does not match the installed bytes"));
-        assert!(emitted[0].contains("re-run `carina init`"));
+        assert!(emitted[0].contains(&format!(
+            "re-run `{}`",
+            ProjectCommand::new("init", project.path())
+        )));
         assert!(!emitted[0].contains("trusting local provider"));
     }
 
@@ -17847,7 +17864,7 @@ transparency_log_present = false
         fs::write(&source_path, b"local provider").unwrap();
         let mut config = provider_config(&format!("file://{}", source_path.display()), None);
         config.name = "foo".into();
-        let installed = find_file_provider_source(&config).unwrap();
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
@@ -18229,6 +18246,7 @@ transparency_log_present = false
             WasmArtifactPath::new(provider_path.clone(), "aws").unwrap(),
             "aws".to_string(),
             local_file_source(&provider_path),
+            tmp.path(),
         )
         .unwrap();
 

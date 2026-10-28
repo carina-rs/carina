@@ -130,7 +130,7 @@ pub(crate) struct RevisionArtifactPin {
 #[derive(Debug)]
 pub(crate) enum DownloadedArtifact<P> {
     Verified {
-        artifact: VerifiedArtifact,
+        artifact: Box<VerifiedArtifact>,
         pin: P,
     },
     FirstUse {
@@ -232,6 +232,13 @@ pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
     pub(crate) pin: LockedProviderPin,
 }
 
+struct LockArtifactIdentity<'lock, R> {
+    lock_entry: &'lock LockEntry<R>,
+    source: RemoteSourceKey,
+    locked_identity: &'lock str,
+    pin: LockedProviderPin,
+}
+
 impl VerifiedArtifact {
     pub fn path(&self) -> &WasmArtifactPath {
         &self.path
@@ -286,25 +293,30 @@ impl VerifiedArtifact {
         Self::verify_bytes_at(
             path.as_path(),
             path.clone(),
-            lock_entry,
-            source,
-            &locked_identity,
+            LockArtifactIdentity {
+                lock_entry,
+                source,
+                locked_identity: &locked_identity,
+                pin,
+            },
             provider_name,
             project_dir,
-            pin,
         )
     }
 
     fn verify_bytes_at<R: VerifiedArtifactRegistryLock>(
         bytes_path: &Path,
         published_path: WasmArtifactPath,
-        lock_entry: &LockEntry<R>,
-        source: RemoteSourceKey,
-        locked_identity: &str,
+        identity: LockArtifactIdentity<'_, R>,
         provider_name: &str,
         project_dir: &Path,
-        pin: LockedProviderPin,
     ) -> Result<Self, VerifiedArtifactError> {
+        let LockArtifactIdentity {
+            lock_entry,
+            source,
+            locked_identity,
+            pin,
+        } = identity;
         let bytes = ProviderArtifactBytes::read(bytes_path).map_err(|error| {
             VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
         })?;
@@ -445,12 +457,14 @@ pub(crate) fn publish_cached<R: VerifiedArtifactRegistryLock>(
     let verified = VerifiedArtifact::verify_bytes_at(
         staged.path(),
         path,
-        lock_entry,
-        source,
-        &locked_identity,
+        LockArtifactIdentity {
+            lock_entry,
+            source,
+            locked_identity: &locked_identity,
+            pin,
+        },
         provider_name,
         &project_dir,
-        pin,
     )?;
     let published_path = verified.path.as_path().to_path_buf();
     staged.publish().map_err(|error| {
@@ -472,7 +486,10 @@ pub(crate) fn publish_download<R: VerifiedArtifactRegistryLock, P>(
             provider_name,
             pin,
         } => publish_cached(staged, lock_entry, provider_name)
-            .map(|artifact| DownloadedArtifact::Verified { artifact, pin })
+            .map(|artifact| DownloadedArtifact::Verified {
+                artifact: Box::new(artifact),
+                pin,
+            })
             .map_err(VerifiedArtifactError::into_download_message),
         ArtifactPin::Unpinned(FirstUse(())) => {
             let sha256 = sha256_file(staged.path())

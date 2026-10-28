@@ -847,6 +847,28 @@ mod tests {
     }
 
     #[test]
+    fn trusted_local_grant_error_preserves_canonicalize_source_chain() {
+        let grant_error = carina_provider_resolver::GrantParseError::Canonicalize {
+            value: "/missing/provider.wasm=aws".to_string(),
+            path: PathBuf::from("/missing/provider.wasm"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing provider"),
+        };
+        let app_error = AppError::from(grant_error);
+
+        let mut current: &(dyn std::error::Error + 'static) = &app_error;
+        let mut found_io_error = false;
+        while let Some(source) = current.source() {
+            if source.downcast_ref::<std::io::Error>().is_some() {
+                found_io_error = true;
+                break;
+            }
+            current = source;
+        }
+
+        assert!(found_io_error, "AppError dropped the canonicalize cause");
+    }
+
+    #[test]
     fn saved_plan_schema_mismatch_renders_types_as_readable_lines() {
         let error = AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
             providers: BTreeMap::from([(

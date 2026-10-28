@@ -1099,7 +1099,8 @@ enum AllowedHostTarget {
 /// address has passed the link-local and metadata policy.
 struct VettedDestination {
     host: String,
-    addresses: Vec<SocketAddr>,
+    first: SocketAddr,
+    rest: Vec<SocketAddr>,
     is_metadata: bool,
 }
 
@@ -1179,11 +1180,10 @@ fn vet_resolved_destination(
     allowed_host: AllowedHost,
     resolved: &[SocketAddr],
 ) -> Result<VettedDestination, DestinationDenied> {
-    if resolved.is_empty() {
-        return Err(DestinationDenied::NoResolvedAddresses);
-    }
+    let (first, rest) = resolved
+        .split_first()
+        .ok_or(DestinationDenied::NoResolvedAddresses)?;
 
-    let mut addresses = Vec::with_capacity(resolved.len());
     let mut destination_is_metadata = false;
     for address in resolved {
         let canonical_ip = canonical_policy_address(address.ip());
@@ -1194,7 +1194,6 @@ fn vet_resolved_destination(
             return Err(DestinationDenied::ResolvedAddressDenied(canonical_ip));
         }
         destination_is_metadata |= metadata;
-        addresses.push(*address);
     }
 
     Ok(VettedDestination {
@@ -1202,7 +1201,8 @@ fn vet_resolved_destination(
             AllowedHostTarget::Name(host) => host,
             AllowedHostTarget::Literal(address) => address.to_string(),
         },
-        addresses,
+        first: *first,
+        rest: rest.to_vec(),
         is_metadata: destination_is_metadata,
     })
 }
@@ -1344,7 +1344,7 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             .port_u16()
             .unwrap_or(if config.use_tls { 443 } else { 80 });
         let resolver = Arc::clone(&self.resolver);
-        let trace_context = trace_http_enabled().then(|| {
+        let trace_state = trace_http_enabled().then(|| {
             (
                 request.method().to_string(),
                 request.uri().to_string(),
@@ -1352,31 +1352,33 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             )
         });
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            let trace_state = trace_context.map(|(method, uri, spawn_start)| {
-                (
-                    method,
-                    uri,
-                    spawn_start.elapsed().as_millis(),
-                    std::time::Instant::now(),
-                )
-            });
+            let handler_start = std::time::Instant::now();
             let trace = trace_state.is_some();
             let result = async {
                 let resolved = match &allowed_host.target {
-                    AllowedHostTarget::Name(host) => resolver
-                        .resolve(host.clone(), port)
-                        .await
-                        .map_err(|error| {
-                            log::warn!(
-                                "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                                host,
-                                error,
-                            );
-                            ErrorCode::DnsError(DnsErrorPayload {
-                                rcode: Some("address not available".to_string()),
-                                info_code: Some(0),
-                            })
-                        })?,
+                    AllowedHostTarget::Name(host) => tokio::time::timeout(
+                        config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
+                        resolver.resolve(host.clone(), port),
+                    )
+                    .await
+                    .map_err(|_| {
+                        log::warn!(
+                            "WASM plugin HTTP request timed out resolving host {:?}",
+                            host,
+                        );
+                        ErrorCode::ConnectionTimeout
+                    })?
+                    .map_err(|error| {
+                        log::warn!(
+                            "WASM plugin HTTP request failed to resolve host {:?}: {}",
+                            host,
+                            error,
+                        );
+                        ErrorCode::DnsError(DnsErrorPayload {
+                            rcode: Some("address not available".to_string()),
+                            info_code: Some(0),
+                        })
+                    })?,
                     AllowedHostTarget::Literal(address) => {
                         vec![SocketAddr::new(*address, port)]
                     }
@@ -1402,7 +1404,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 send_request_handler(request, config, vetted, trace).await
             }
             .await;
-            if let Some((method, uri, queue_ms, handler_start)) = trace_state {
+            if let Some((method, uri, spawn_start)) = trace_state {
+                let queue_ms = handler_start.duration_since(spawn_start).as_millis();
                 let handler_ms = handler_start.elapsed().as_millis();
                 eprintln!(
                     "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
@@ -1481,23 +1484,22 @@ async fn send_request_handler(
 
     let VettedDestination {
         host,
-        addresses,
+        first,
+        rest,
         is_metadata: _,
     } = destination;
     let tcp_stream = timeout(connect_timeout, async move {
-        let mut last_error = None;
-        for address in addresses {
+        let mut last_error = match TcpStream::connect(first).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => error,
+        };
+        for address in rest {
             match TcpStream::connect(address).await {
                 Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
+                Err(error) => last_error = error,
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "vetted destination contained no addresses",
-            )
-        }))
+        Err(last_error)
     })
     .await
     .map_err(|_| ErrorCode::ConnectionTimeout)?
@@ -7445,12 +7447,56 @@ mod tests {
         }
     }
 
+    struct NeverResolver;
+
+    impl DestinationResolver for NeverResolver {
+        fn resolve(&self, _host: String, _port: u16) -> ResolveFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
     fn empty_outgoing_body() -> wasmtime_wasi_http::p2::body::HyperOutgoingBody {
         use http_body_util::{BodyExt, Empty};
 
         Empty::<hyper::body::Bytes>::new()
             .map_err(|never| match never {})
             .boxed_unsync()
+    }
+
+    #[tokio::test]
+    async fn dns_resolution_respects_connect_timeout() {
+        use wasmtime_wasi::p2::Pollable;
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            Some(ProviderKind::Untrusted),
+            Arc::new(NeverResolver),
+        );
+        let request = hyper::Request::builder()
+            .uri("http://service.amazonaws.com/")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: std::time::Duration::from_millis(10),
+            first_byte_timeout: std::time::Duration::from_secs(1),
+            between_bytes_timeout: std::time::Duration::from_secs(1),
+        };
+
+        let mut response =
+            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                .expect("an allow-listed hostname should pass the host policy");
+        tokio::time::timeout(std::time::Duration::from_secs(1), response.ready())
+            .await
+            .expect("DNS resolution must be bounded by the connect timeout");
+        let result = response
+            .unwrap_ready()
+            .expect("the request task should not trap");
+
+        assert!(
+            matches!(result, Err(ErrorCode::ConnectionTimeout)),
+            "a DNS timeout returned the wrong result: {result:?}"
+        );
     }
 
     #[tokio::test]

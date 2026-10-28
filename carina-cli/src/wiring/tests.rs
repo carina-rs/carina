@@ -18,6 +18,26 @@ use carina_core::resource::{
 use carina_core::schema::StructField;
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[test]
+fn invalid_trusted_local_inputs_are_not_parsed_until_provider_load() {
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+
+    assert!(inputs.parsed.get().is_none());
+}
+
+#[test]
+fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+
+    let error = inputs.get().unwrap_err();
+
+    assert!(matches!(
+        error,
+        carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+    ));
+    assert!(inputs.parsed.get().is_none());
+}
+
 macro_rules! unexpected_resume_create {
     () => {
         fn resume_create(
@@ -7209,7 +7229,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
 
     let error = match load_installed_wasm_provider_using(
         &installed,
-        trusted_local_grants(),
+        trusted_local_grants().unwrap(),
         |bytes, identity| async move {
             carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
                 bytes.as_bytes(),
@@ -7416,7 +7436,8 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let installed = carina_provider_resolver::find_file_provider_source(&config).unwrap();
+    let installed =
+        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
 
     let error = runtime_instantiation_error_with_provenance(
         &installed,
@@ -7468,7 +7489,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+    let (factories, load_errors) =
+        build_factories_from_providers_for_formatting(&[config], base).unwrap();
 
     assert!(factories.is_empty());
     assert!(!load_errors.is_empty());
@@ -7541,7 +7563,8 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     );
     assert!(std::error::Error::source(&runtime_error).is_none());
 
-    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+    let (factories, load_errors) =
+        build_factories_from_providers_for_formatting(&[config], base).unwrap();
     assert!(factories.is_empty());
     let formatting_error = load_errors
         .get("carina-providers.lock")

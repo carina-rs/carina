@@ -381,16 +381,12 @@ async fn main() {
     carina_cli::cursor::install_panic_restore_hook();
 
     let cli = Cli::parse();
-    let trusted_local_env = std::env::var("CARINA_TRUST_LOCAL_PROVIDER").ok();
-    let trusted_local_grants = match carina_provider_resolver::TrustedLocalGrants::parse(
-        &cli.trust_local_provider,
-        trusted_local_env.as_deref(),
-    ) {
-        Ok(grants) => grants,
-        Err(error) => handle_app_error(error.into()),
-    };
-    carina_cli::wiring::set_trusted_local_grants(trusted_local_grants)
-        .expect("trusted local provider grants are installed once at process startup");
+    let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
+    carina_cli::wiring::set_trusted_local_grant_inputs(
+        cli.trust_local_provider.clone(),
+        trusted_local_env,
+    )
+    .expect("trusted local provider grant inputs are installed once at process startup");
 
     let plan_images = match &cli.command {
         Commands::Plan {
