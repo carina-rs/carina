@@ -67,6 +67,8 @@ struct WorkflowRun {
     #[serde(default)]
     event: Option<String>,
     #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default)]
     head_repository: Option<WorkflowRunHeadRepository>,
 }
 
@@ -88,6 +90,8 @@ enum WorkflowRunRejectionReason {
     EventIsNotPush,
     MissingHeadRepository,
     HeadRepositoryMismatch,
+    MissingHeadSha,
+    HeadShaMismatch,
 }
 
 impl fmt::Display for WorkflowRunRejectionReason {
@@ -97,6 +101,8 @@ impl fmt::Display for WorkflowRunRejectionReason {
             Self::EventIsNotPush => "event is not push",
             Self::MissingHeadRepository => "head repository is missing",
             Self::HeadRepositoryMismatch => "head repository does not match the source repository",
+            Self::MissingHeadSha => "head SHA is missing",
+            Self::HeadShaMismatch => "head SHA does not match the requested SHA",
         })
     }
 }
@@ -106,6 +112,7 @@ struct WorkflowRunRejection {
     run_id: u64,
     event: Option<String>,
     head_repository: Option<String>,
+    head_sha: Option<String>,
     reason: WorkflowRunRejectionReason,
 }
 
@@ -113,9 +120,10 @@ impl fmt::Display for WorkflowRunRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let event = self.event.as_deref().unwrap_or("<missing>");
         let head_repository = self.head_repository.as_deref().unwrap_or("<missing>");
+        let head_sha = self.head_sha.as_deref().unwrap_or("<missing>");
         write!(
             formatter,
-            "run {} (event: {event}, head repository: {head_repository}) [{}]",
+            "run {} (event: {event}, head repository: {head_repository}, head SHA: {head_sha}) [{}]",
             self.run_id, self.reason
         )
     }
@@ -168,6 +176,7 @@ impl fmt::Display for NoEligibleWorkflowRuns {
 
 fn filter_workflow_runs(
     source: &GithubSource,
+    sha: &str,
     workflow_runs: Vec<WorkflowRun>,
 ) -> WorkflowRunSelection {
     let expected_repository = format!("{}/{}", source.owner(), source.repo());
@@ -178,6 +187,7 @@ fn filter_workflow_runs(
         let head_repository = run
             .head_repository
             .and_then(|repository| repository.full_name);
+        let head_sha = run.head_sha;
         let reason = match run.event.as_deref() {
             None => Some(WorkflowRunRejectionReason::MissingEvent),
             Some(event) if event != "push" => Some(WorkflowRunRejectionReason::EventIsNotPush),
@@ -186,7 +196,13 @@ fn filter_workflow_runs(
                 Some(repository) if !repository.eq_ignore_ascii_case(&expected_repository) => {
                     Some(WorkflowRunRejectionReason::HeadRepositoryMismatch)
                 }
-                Some(_) => None,
+                Some(_) => match head_sha.as_deref() {
+                    None => Some(WorkflowRunRejectionReason::MissingHeadSha),
+                    Some(run_sha) if run_sha != sha => {
+                        Some(WorkflowRunRejectionReason::HeadShaMismatch)
+                    }
+                    Some(_) => None,
+                },
             },
         };
 
@@ -195,6 +211,7 @@ fn filter_workflow_runs(
                 run_id: run.id,
                 event: run.event,
                 head_repository,
+                head_sha,
                 reason,
             }),
             None => eligible_run_ids.push(run.id),
@@ -315,7 +332,7 @@ fn find_workflow_run_ids(
     let data: WorkflowRunsResponse =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    filter_workflow_runs(source, data.workflow_runs)
+    filter_workflow_runs(source, sha, data.workflow_runs)
         .into_eligible_run_ids()
         .map_err(|error| {
             format!("No eligible successful workflow runs found for {source}@{sha}. {error}")
@@ -1356,10 +1373,16 @@ mod tests {
         }
     }
 
-    fn workflow_run(id: u64, event: Option<&str>, head_repository: Option<&str>) -> WorkflowRun {
+    fn workflow_run(
+        id: u64,
+        event: Option<&str>,
+        head_repository: Option<&str>,
+        head_sha: Option<&str>,
+    ) -> WorkflowRun {
         WorkflowRun {
             id,
             event: event.map(str::to_string),
+            head_sha: head_sha.map(str::to_string),
             head_repository: head_repository.map(|full_name| WorkflowRunHeadRepository {
                 full_name: Some(full_name.to_string()),
             }),
@@ -1370,10 +1393,12 @@ mod tests {
     fn revision_workflow_run_filter_rejects_fork_pull_request_run() {
         let selection = filter_workflow_runs(
             &test_source(),
+            TEST_SHA,
             vec![workflow_run(
                 101,
                 Some("pull_request"),
                 Some("contributor/carina-provider-aws"),
+                Some(TEST_SHA),
             )],
         );
 
@@ -1390,10 +1415,12 @@ mod tests {
     fn revision_workflow_run_filter_rejects_same_repo_pull_request_run() {
         let selection = filter_workflow_runs(
             &test_source(),
+            TEST_SHA,
             vec![workflow_run(
                 102,
                 Some("pull_request"),
                 Some("carina-rs/carina-provider-aws"),
+                Some(TEST_SHA),
             )],
         );
 
@@ -1406,13 +1433,15 @@ mod tests {
     }
 
     #[test]
-    fn revision_workflow_run_filter_accepts_repository_push_run_case_insensitively() {
+    fn revision_workflow_run_filter_accepts_matching_repository_push_run_case_insensitively() {
         let selection = filter_workflow_runs(
             &test_source(),
+            TEST_SHA,
             vec![workflow_run(
                 103,
                 Some("push"),
                 Some("CARINA-RS/CARINA-PROVIDER-AWS"),
+                Some(TEST_SHA),
             )],
         );
 
@@ -1424,10 +1453,12 @@ mod tests {
     fn revision_workflow_run_filter_rejects_other_repository_push_run() {
         let selection = filter_workflow_runs(
             &test_source(),
+            TEST_SHA,
             vec![workflow_run(
                 104,
                 Some("push"),
                 Some("carina-rs/carina-provider-aws-fork"),
+                Some(TEST_SHA),
             )],
         );
 
@@ -1440,33 +1471,100 @@ mod tests {
     }
 
     #[test]
-    fn revision_workflow_run_filter_mixed_runs_keeps_only_repository_push_run() {
+    fn revision_workflow_run_filter_rejects_different_head_sha() {
         let selection = filter_workflow_runs(
             &test_source(),
+            TEST_SHA,
+            vec![workflow_run(
+                105,
+                Some("push"),
+                Some("carina-rs/carina-provider-aws"),
+                Some("different-sha"),
+            )],
+        );
+
+        assert!(selection.eligible_run_ids.is_empty());
+        assert_eq!(selection.rejected_runs.len(), 1);
+        assert_eq!(
+            selection.rejected_runs[0].reason,
+            WorkflowRunRejectionReason::HeadShaMismatch
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_rejects_missing_head_sha() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            TEST_SHA,
+            vec![workflow_run(
+                106,
+                Some("push"),
+                Some("carina-rs/carina-provider-aws"),
+                None,
+            )],
+        );
+
+        assert!(selection.eligible_run_ids.is_empty());
+        assert_eq!(selection.rejected_runs.len(), 1);
+        assert_eq!(
+            selection.rejected_runs[0].reason,
+            WorkflowRunRejectionReason::MissingHeadSha
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_mixed_runs_keeps_only_matching_run() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            TEST_SHA,
             vec![
                 workflow_run(
-                    105,
+                    107,
                     Some("pull_request"),
                     Some("contributor/carina-provider-aws"),
+                    Some(TEST_SHA),
                 ),
                 workflow_run(
-                    106,
+                    108,
                     Some("pull_request"),
                     Some("carina-rs/carina-provider-aws"),
+                    Some(TEST_SHA),
                 ),
-                workflow_run(107, Some("push"), Some("carina-rs/carina-provider-aws")),
-                workflow_run(108, Some("push"), Some("other/carina-provider-aws")),
+                workflow_run(
+                    109,
+                    Some("push"),
+                    Some("carina-rs/carina-provider-aws"),
+                    Some(TEST_SHA),
+                ),
+                workflow_run(
+                    110,
+                    Some("push"),
+                    Some("other/carina-provider-aws"),
+                    Some(TEST_SHA),
+                ),
+                workflow_run(
+                    111,
+                    Some("push"),
+                    Some("carina-rs/carina-provider-aws"),
+                    Some("different-sha"),
+                ),
+                workflow_run(
+                    112,
+                    Some("push"),
+                    Some("carina-rs/carina-provider-aws"),
+                    None,
+                ),
             ],
         );
 
-        assert_eq!(selection.eligible_run_ids, vec![107]);
+        assert_eq!(selection.eligible_run_ids, vec![109]);
         assert_eq!(
             selection
                 .rejected_runs
                 .iter()
                 .map(|rejection| rejection.run_id)
                 .collect::<Vec<_>>(),
-            vec![105, 106, 108]
+            vec![107, 108, 110, 111, 112]
         );
     }
 
@@ -1479,6 +1577,7 @@ mod tests {
                     {
                         "id": 109,
                         "event": "pull_request",
+                        "head_sha": "abc123def456",
                         "head_repository": {
                             "full_name": "contributor/carina-provider-aws"
                         }
@@ -1486,12 +1585,14 @@ mod tests {
                     {
                         "id": 110,
                         "event": "push",
+                        "head_sha": "abc123def456",
                         "head_repository": {
                             "full_name": "other/carina-provider-aws"
                         }
                     },
                     {
                         "id": 111,
+                        "head_sha": "abc123def456",
                         "head_repository": {
                             "full_name": "carina-rs/carina-provider-aws"
                         }
@@ -1499,13 +1600,14 @@ mod tests {
                     {
                         "id": 112,
                         "event": "push",
+                        "head_sha": "abc123def456",
                         "head_repository": {}
                     }
                 ]
             }"#,
         )
         .unwrap();
-        let selection = filter_workflow_runs(&source, response.workflow_runs);
+        let selection = filter_workflow_runs(&source, TEST_SHA, response.workflow_runs);
 
         let error = selection
             .into_eligible_run_ids()
@@ -1518,22 +1620,26 @@ mod tests {
         );
         assert!(
             error.contains(
-                "run 109 (event: pull_request, head repository: contributor/carina-provider-aws)"
+                "run 109 (event: pull_request, head repository: contributor/carina-provider-aws, head SHA: abc123def456)"
             ),
-            "{error}"
-        );
-        assert!(
-            error.contains("run 110 (event: push, head repository: other/carina-provider-aws)"),
             "{error}"
         );
         assert!(
             error.contains(
-                "run 111 (event: <missing>, head repository: carina-rs/carina-provider-aws)"
+                "run 110 (event: push, head repository: other/carina-provider-aws, head SHA: abc123def456)"
             ),
             "{error}"
         );
         assert!(
-            error.contains("run 112 (event: push, head repository: <missing>)"),
+            error.contains(
+                "run 111 (event: <missing>, head repository: carina-rs/carina-provider-aws, head SHA: abc123def456)"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "run 112 (event: push, head repository: <missing>, head SHA: abc123def456)"
+            ),
             "{error}"
         );
     }
