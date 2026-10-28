@@ -1,0 +1,271 @@
+use std::fmt;
+use std::future::Future;
+use std::time::{Duration, Instant};
+
+use wasmtime::component::ResourceTable;
+use wasmtime::{CallHook, Engine, Store, StoreLimits};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+
+use super::AllowListHttpHooks;
+
+/// Period between increments of the wasmtime engine epoch.
+pub(super) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum total guest computation consumed by one guest call in production.
+const GUEST_COMPUTE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wall-clock backstop for every WASM guest call in production.
+///
+/// This includes guest computation and time parked in host imports. It bounds
+/// host-side waits that never complete, which would otherwise retain a store
+/// lock or a factory initialization guard indefinitely (carina#3106).
+///
+/// # Sizing — why this is 60 minutes, not the 30s compute budget
+///
+/// The largest known single-guest-call worst case is the AWS VPC flow-log
+/// IAM-propagation loop at about 38 minutes. The test
+/// `production_wall_budget_exceeds_each_provider_single_call_worst_case` pins
+/// this value above that loop and every other enumerated provider worst case.
+/// The remaining headroom is a finite backstop for hangs that per-request caps
+/// cannot reach, including an uncapped TLS handshake or a body that keeps
+/// trickling chunks without ever exceeding the between-bytes timeout.
+const WASM_OPERATION_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The compute and wall-clock limits for one WASM guest call.
+///
+/// `compute` bounds the total guest computation of one guest call; time parked
+/// in host imports is excluded. `wall` bounds every guest call, including time
+/// spent in host imports.
+#[derive(Clone, Copy, Debug)]
+pub struct GuestCallBudget {
+    compute: Duration,
+    wall: Duration,
+}
+
+impl GuestCallBudget {
+    pub const PRODUCTION: Self = Self {
+        compute: GUEST_COMPUTE_BUDGET,
+        wall: WASM_OPERATION_HARD_TIMEOUT,
+    };
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub const fn new(compute: Duration, wall: Duration) -> Self {
+        Self { compute, wall }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn compute(self) -> Duration {
+        self.compute
+    }
+
+    #[cfg(test)]
+    pub(super) const fn wall(self) -> Duration {
+        self.wall
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WallBudgetExceeded {
+    wall: Duration,
+}
+
+impl WallBudgetExceeded {
+    pub(super) const fn wall(self) -> Duration {
+        self.wall
+    }
+}
+
+impl fmt::Display for WallBudgetExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "guest call exceeded its {}s wall-clock budget",
+            self.wall.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for WallBudgetExceeded {}
+
+struct GuestComputeState {
+    remaining: Duration,
+    resumed_at: Instant,
+    host_depth: u32,
+}
+
+impl GuestComputeState {
+    fn new() -> Self {
+        Self {
+            remaining: Duration::ZERO,
+            resumed_at: Instant::now(),
+            host_depth: 0,
+        }
+    }
+}
+
+struct GuestStoreState {
+    budget: GuestCallBudget,
+    compute: GuestComputeState,
+}
+
+impl GuestStoreState {
+    fn new(budget: GuestCallBudget) -> Self {
+        Self {
+            budget,
+            compute: GuestComputeState::new(),
+        }
+    }
+}
+
+pub(super) struct HostState {
+    wasi_ctx: WasiCtx,
+    http_ctx: Option<WasiHttpCtx>,
+    table: ResourceTable,
+    http_hooks: AllowListHttpHooks,
+    limits: StoreLimits,
+    guest: GuestStoreState,
+}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for HostState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: self
+                .http_ctx
+                .as_mut()
+                .expect("HTTP not enabled for this provider"),
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
+/// A Wasmtime store whose raw inner store cannot escape this module except
+/// through [`GuestStore::call`].
+pub(super) struct GuestStore {
+    store: Store<HostState>,
+}
+
+impl GuestStore {
+    /// Create a store with every invariant needed for guest calls.
+    ///
+    /// The call hook accounts for all guest-resident intervals in one
+    /// top-level call while excluding time parked in host imports. It also
+    /// re-arms before nested guest code used to lower host results, so epochs
+    /// accumulated during a long host wait cannot interrupt that lowering
+    /// step.
+    pub(super) fn new(
+        engine: &Engine,
+        wasi_ctx: WasiCtx,
+        http_ctx: Option<WasiHttpCtx>,
+        limits: StoreLimits,
+        budget: GuestCallBudget,
+    ) -> Self {
+        let host_state = HostState {
+            wasi_ctx,
+            http_ctx,
+            table: ResourceTable::new(),
+            http_hooks: AllowListHttpHooks,
+            limits,
+            guest: GuestStoreState::new(budget),
+        };
+        let mut store = Store::new(engine, host_state);
+        store.limiter(|state| &mut state.limits);
+        store.call_hook(|mut store, transition| {
+            let now = Instant::now();
+            let remaining_to_arm = {
+                let state = &mut store.data_mut().guest;
+                match transition {
+                    CallHook::CallingWasm => {
+                        if state.compute.host_depth == 0 {
+                            state.compute.remaining = state.budget.compute;
+                            state.compute.resumed_at = now;
+                        }
+                        Some(state.compute.remaining)
+                    }
+                    CallHook::CallingHost => {
+                        if state.compute.host_depth == 0 {
+                            let elapsed = now.saturating_duration_since(state.compute.resumed_at);
+                            state.compute.remaining =
+                                state.compute.remaining.saturating_sub(elapsed);
+                        }
+                        state.compute.host_depth += 1;
+                        None
+                    }
+                    CallHook::ReturningFromHost => {
+                        debug_assert!(state.compute.host_depth > 0);
+                        state.compute.host_depth -= 1;
+                        if state.compute.host_depth == 0 {
+                            state.compute.resumed_at = now;
+                            Some(state.compute.remaining)
+                        } else {
+                            None
+                        }
+                    }
+                    CallHook::ReturningFromWasm => None,
+                }
+            };
+            if let Some(remaining) = remaining_to_arm {
+                store.set_epoch_deadline(compute_epoch_ticks(remaining));
+            }
+            Ok(())
+        });
+        Self { store }
+    }
+
+    /// Run guest code under this store's wall-clock budget.
+    ///
+    /// This is the only API that exposes the raw Wasmtime store, and the
+    /// closure cannot outlive the timeout future.
+    pub(super) async fn call<'s, T, F>(
+        &'s mut self,
+        f: impl FnOnce(&'s mut Store<HostState>) -> F,
+    ) -> Result<T, WallBudgetExceeded>
+    where
+        T: 'static,
+        F: Future<Output = T> + 's,
+    {
+        let wall = self.store.data().guest.budget.wall;
+        tokio::time::timeout(wall, f(&mut self.store))
+            .await
+            .map_err(|_elapsed| WallBudgetExceeded { wall })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn set_budget(&mut self, budget: GuestCallBudget) {
+        self.store.data_mut().guest.budget = budget;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_epoch_deadline_for_test(&mut self, ticks: u64) {
+        self.store.set_epoch_deadline(ticks);
+    }
+}
+
+fn compute_epoch_ticks(remaining: Duration) -> u64 {
+    let ticks = (remaining.as_nanos() / EPOCH_TICK_INTERVAL.as_nanos()).saturating_add(1);
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_compute_budget_epoch_ticks_do_not_expire_early() {
+        assert_eq!(compute_epoch_ticks(Duration::ZERO), 1);
+        assert_eq!(compute_epoch_ticks(Duration::from_millis(1)), 1);
+        assert_eq!(compute_epoch_ticks(Duration::from_secs(1)), 2);
+        assert_eq!(compute_epoch_ticks(Duration::from_millis(1_001)), 2);
+    }
+}

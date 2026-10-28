@@ -475,7 +475,12 @@ impl CarinaProvider for MockProcessProvider {
         HashMap::new()
     }
 
-    fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+        if let Some(Value::Int(delay_millis)) = attrs.get("validate_delay_millis")
+            && let Ok(delay_millis) = u64::try_from(*delay_millis)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(delay_millis));
+        }
         Ok(())
     }
 
@@ -617,6 +622,30 @@ impl CarinaProvider for MockProcessProvider {
                 return Ok(attempt.issued(identifier, sent).pending(token, 1));
             }
             return Ok(attempt.pending(token, sent, 1));
+        }
+        if matches!(
+            request.resource.attributes.get("call_spin_forever"),
+            Some(Value::Bool(true))
+        ) {
+            let mut value = 0_u64;
+            loop {
+                value = std::hint::black_box(value.wrapping_add(1));
+            }
+        }
+        if matches!(
+            request
+                .resource
+                .attributes
+                .get("call_spin_with_host_calls_forever"),
+            Some(Value::Bool(true))
+        ) {
+            let mut value = 0_u64;
+            loop {
+                for _ in 0..16_384 {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+                std::hint::black_box(std::time::Instant::now());
+            }
         }
         if let Some(Value::Int(delay_millis)) = request.resource.attributes.get("call_delay_millis")
             && let Ok(delay_millis) = u64::try_from(*delay_millis)
