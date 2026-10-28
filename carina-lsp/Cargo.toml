@@ -34,4 +34,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }
 tempfile = "3"
