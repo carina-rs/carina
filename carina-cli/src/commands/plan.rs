@@ -1097,7 +1097,7 @@ impl PlanFile {
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
-        use carina_core::resource::{DataSource, SavedComposition, SavedCompositionSignature};
+        use carina_core::resource::{DataSource, SavedComposition};
 
         fn resource_contains(resource: &Resource) -> bool {
             let Resource {
@@ -1129,29 +1129,6 @@ impl PlanFile {
             attributes
                 .values()
                 .any(carina_core::value::contains_redacted_secret)
-        }
-
-        fn composition_contains(composition: &SavedComposition) -> bool {
-            let SavedComposition {
-                id: _id,
-                signature,
-                binding: _binding,
-                dependency_bindings: _dependency_bindings,
-                module_name: _module_name,
-                instance: _instance,
-                origin_id: _origin_id,
-            } = composition;
-            let SavedCompositionSignature {
-                arguments,
-                attributes,
-                pending_constraints: _pending_constraints,
-            } = signature;
-            arguments
-                .values()
-                .any(|argument| argument.contains_redacted_secret_placeholder())
-                || attributes
-                    .values()
-                    .any(|attribute| attribute.contains_redacted_secret_placeholder())
         }
 
         fn state_contains(state: &State) -> bool {
@@ -1216,7 +1193,9 @@ impl PlanFile {
             || plan.contains_redacted_secret_placeholders()
             || sorted_resources.iter().any(resource_contains)
             || unresolved_resources.iter().any(resource_contains)
-            || compositions.iter().any(composition_contains)
+            || compositions
+                .iter()
+                .any(SavedComposition::contains_redacted_secret_placeholder)
             || data_sources.iter().any(data_source_contains)
             || data_source_origins.iter().any(data_source_contains)
             || data_source_values.iter().any(data_source_value_contains)
@@ -2123,16 +2102,11 @@ impl ReloadedPlanFile {
         evaluated: &[LiveComposition],
         source_identities: &mut CompositionSourceIdentityResolver,
     ) -> Result<(), ReloadedCompositionRehydrationError> {
-        let needs_rehydration = self.contents.compositions.iter().any(|composition| {
-            composition
-                .signature
-                .arguments
-                .values()
-                .any(|argument| carina_core::value::contains_redacted_secret(argument.value()))
-                || composition.signature.attributes.values().any(|attribute| {
-                    carina_core::value::contains_redacted_secret(&attribute.to_value())
-                })
-        });
+        let needs_rehydration = self
+            .contents
+            .compositions
+            .iter()
+            .any(SavedComposition::contains_redacted_secret_placeholder);
         if !needs_rehydration {
             return Ok(());
         }
@@ -2149,13 +2123,7 @@ impl ReloadedPlanFile {
             .compositions
             .iter()
             .map(|composition| {
-                let has_placeholder =
-                    composition.signature.arguments.values().any(|argument| {
-                        carina_core::value::contains_redacted_secret(argument.value())
-                    }) || composition.signature.attributes.values().any(|attribute| {
-                        carina_core::value::contains_redacted_secret(&attribute.to_value())
-                    });
-                if !has_placeholder {
+                if !composition.contains_redacted_secret_placeholder() {
                     return Ok(composition.clone());
                 }
                 let candidate = candidates.get(&composition.origin_id).ok_or_else(|| {

@@ -2934,9 +2934,10 @@ fn rehydrate_desired_plan_file(
                 let call_chain = origin_id
                     .calls()
                     .map(|call| {
+                        let source_file = call.source_file().to_string_lossy();
                         format!(
                             "{}:{}:{}",
-                            call.source_file().display(),
+                            source_file.escape_debug(),
                             call.start_line(),
                             call.start_column(),
                         )

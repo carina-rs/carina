@@ -592,14 +592,6 @@ impl CompositionCallPath {
         descendants.extend(previous_descendants);
         Self { root, descendants }
     }
-
-    pub fn saved_origin_id(
-        &self,
-        source_root: &Path,
-    ) -> Result<SavedCompositionOriginId, CompositionSourceIdentityError> {
-        let mut resolver = CompositionSourceIdentityResolver::new(source_root)?;
-        resolver.saved_origin_id(self)
-    }
 }
 
 #[cfg(test)]
@@ -618,10 +610,90 @@ impl Default for CompositionCallPath {
     }
 }
 
+const MAX_SAVED_SOURCE_PATH_BYTES: usize = 4096;
+const MAX_SAVED_SOURCE_PATH_COMPONENTS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "PathBuf", into = "PathBuf")]
+struct SourceRootRelativePath(PathBuf);
+
+/// A saved composition source path violated its portable relative-path
+/// invariant.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SavedCompositionSourcePathError {
+    #[error(
+        "saved composition source path must be relative and contain only normal or parent-directory (`..`) components"
+    )]
+    NotRelative,
+    #[error("saved composition source path must not contain a NUL byte")]
+    ContainsNul,
+    #[error(
+        "saved composition source path exceeds the maximum length of {maximum} bytes (found {length} bytes)"
+    )]
+    TooLong { length: usize, maximum: usize },
+    #[error(
+        "saved composition source path has {count} components; the maximum is {maximum} components"
+    )]
+    TooManyComponents { count: usize, maximum: usize },
+    #[error("saved composition source path must not contain a current-directory (`.`) component")]
+    CurrentDirectory,
+}
+
+impl TryFrom<PathBuf> for SourceRootRelativePath {
+    type Error = SavedCompositionSourcePathError;
+
+    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.contains(&0) {
+            return Err(SavedCompositionSourcePathError::ContainsNul);
+        }
+        if encoded.len() > MAX_SAVED_SOURCE_PATH_BYTES {
+            return Err(SavedCompositionSourcePathError::TooLong {
+                length: encoded.len(),
+                maximum: MAX_SAVED_SOURCE_PATH_BYTES,
+            });
+        }
+        if encoded
+            .split(|byte| byte.is_ascii() && std::path::is_separator(char::from(*byte)))
+            .any(|component| component == b".")
+        {
+            return Err(SavedCompositionSourcePathError::CurrentDirectory);
+        }
+
+        let mut component_count = 0;
+        for component in path.components() {
+            component_count += 1;
+            if component_count > MAX_SAVED_SOURCE_PATH_COMPONENTS {
+                return Err(SavedCompositionSourcePathError::TooManyComponents {
+                    count: component_count,
+                    maximum: MAX_SAVED_SOURCE_PATH_COMPONENTS,
+                });
+            }
+            if !matches!(component, Component::Normal(_) | Component::ParentDir) {
+                return Err(SavedCompositionSourcePathError::NotRelative);
+            }
+        }
+
+        Ok(Self(path))
+    }
+}
+
+impl From<SourceRootRelativePath> for PathBuf {
+    fn from(path: SourceRootRelativePath) -> Self {
+        path.0
+    }
+}
+
+impl SourceRootRelativePath {
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "location", content = "path", rename_all = "snake_case")]
 enum SavedSourceFileId {
-    SourceRootRelative(PathBuf),
+    SourceRootRelative(SourceRootRelativePath),
 }
 
 /// A composition call source could not be converted into a portable saved
@@ -635,6 +707,10 @@ pub enum CompositionSourceIdentityError {
     DifferentRoot {
         path: PathBuf,
         source_root: PathBuf,
+    },
+    InvalidRelativePath {
+        path: PathBuf,
+        source: SavedCompositionSourcePathError,
     },
 }
 
@@ -661,6 +737,11 @@ impl std::fmt::Display for CompositionSourceIdentityError {
                 path.display(),
                 source_root.display(),
             ),
+            Self::InvalidRelativePath { path, source: _ } => write!(
+                formatter,
+                "composition source path `{}` cannot be saved as a source-root-relative path",
+                path.display(),
+            ),
         }
     }
 }
@@ -670,6 +751,7 @@ impl std::error::Error for CompositionSourceIdentityError {
         match self {
             Self::Canonicalize { source, .. } => Some(source),
             Self::DifferentRoot { .. } => None,
+            Self::InvalidRelativePath { source, .. } => Some(source),
         }
     }
 }
@@ -744,6 +826,13 @@ impl CompositionSourceIdentityResolver {
                     source_root: self.canonical_source_root.clone(),
                 }
             })?;
+        let relative_path = relative.clone();
+        let relative = SourceRootRelativePath::try_from(relative).map_err(|source| {
+            CompositionSourceIdentityError::InvalidRelativePath {
+                path: relative_path,
+                source,
+            }
+        })?;
         Ok(SavedSourceFileId::SourceRootRelative(relative))
     }
 
@@ -758,7 +847,7 @@ impl CompositionSourceIdentityResolver {
 impl SavedSourceFileId {
     fn display_path(&self) -> &Path {
         match self {
-            Self::SourceRootRelative(path) => path,
+            Self::SourceRootRelative(path) => path.as_path(),
         }
     }
 }
@@ -998,14 +1087,6 @@ impl LiveComposition {
         &self.call_path
     }
 
-    pub fn into_saved(
-        self,
-        source_root: &Path,
-    ) -> Result<SavedComposition, CompositionSourceIdentityError> {
-        let mut resolver = CompositionSourceIdentityResolver::new(source_root)?;
-        self.into_saved_with_resolver(&mut resolver)
-    }
-
     pub fn into_saved_with_resolver(
         self,
         resolver: &mut CompositionSourceIdentityResolver,
@@ -1105,6 +1186,29 @@ where
 impl SavedComposition {
     pub fn ephemeral_id(&self) -> super::EphemeralId {
         super::EphemeralId::new(self.id.clone())
+    }
+
+    pub fn contains_redacted_secret_placeholder(&self) -> bool {
+        let Self {
+            id: _id,
+            signature,
+            binding: _binding,
+            dependency_bindings: _dependency_bindings,
+            module_name: _module_name,
+            instance: _instance,
+            origin_id: _origin_id,
+        } = self;
+        let SavedCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints: _pending_constraints,
+        } = signature;
+        arguments
+            .values()
+            .any(SavedCompositionArgument::contains_redacted_secret_placeholder)
+            || attributes
+                .values()
+                .any(SavedCompositionAttribute::contains_redacted_secret_placeholder)
     }
 }
 
@@ -1450,8 +1554,10 @@ mod tests {
             quoted_string_attrs: HashSet::new(),
         };
 
+        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
+            .expect("create composition source identity resolver");
         let saved = composition
-            .into_saved(source_root.path())
+            .into_saved_with_resolver(&mut source_identities)
             .expect("save composition identity");
         let redacted = crate::value::redact_secrets_in_saved_composition(&saved)
             .expect("composition redaction must succeed");
@@ -1512,16 +1618,19 @@ mod tests {
         )
         .expect("parse external module call");
         let call = &parsed.module_calls[0];
-        let origin = CompositionCallPath::direct(CompositionCall {
+        let call_path = CompositionCallPath::direct(CompositionCall {
             id: call.id().clone(),
             module_name: call.module_name.clone(),
             binding: call.binding_name.clone(),
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
-        })
-        .saved_origin_id(source_root.path())
-        .expect("save external origin");
+        });
+        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
+            .expect("create composition source identity resolver");
+        let origin = source_identities
+            .saved_origin_id(&call_path)
+            .expect("save external origin");
 
         let relative = origin.root().source_file();
         assert!(
@@ -1571,16 +1680,19 @@ mod tests {
         .expect("parse call with a missing source identity");
         let call = &parsed.module_calls[0];
 
-        let error = CompositionCallPath::direct(CompositionCall {
+        let call_path = CompositionCallPath::direct(CompositionCall {
             id: call.id().clone(),
             module_name: call.module_name.clone(),
             binding: call.binding_name.clone(),
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
-        })
-        .saved_origin_id(source_root.path())
-        .expect_err("a missing source path must not mint a fallback identity");
+        });
+        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
+            .expect("create composition source identity resolver");
+        let error = source_identities
+            .saved_origin_id(&call_path)
+            .expect_err("a missing source path must not mint a fallback identity");
 
         assert_eq!(
             error.to_string(),

@@ -66,7 +66,11 @@ attributes, provider configuration, and deferred templates. The provider then
 receives the rehydrated plaintext, while state stores the exact digest carried
 by the plan placeholder. If a secret changed or can no longer be found, apply stops
 before any planned provider mutation or state write and asks you to run
-`carina plan --out` again. Saved-plan verification may perform additional
+`carina plan --out` again. A secret that came through a module call is matched
+to that call by its position in the source, not by its name. Apply therefore also
+stops if such a call has moved since the plan was made, for example when a line
+was added above it or its file was renamed. The error names the call's file and
+line. Saved-plan verification may perform additional
 provider reads, including reads for resources scheduled for deletion. A saved
 plan without secret placeholders does not revalidate unrelated source
 configuration.

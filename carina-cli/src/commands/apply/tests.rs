@@ -708,7 +708,7 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
 #[tokio::test]
 async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let saved_source = tmp.path().join("saved.crn");
+    let saved_source = tmp.path().join("saved\u{1b}[31m.crn");
     let current_source = tmp.path().join("current.crn");
     std::fs::write(&saved_source, "saved fixture").unwrap();
     std::fs::write(&current_source, "current fixture").unwrap();
@@ -720,8 +720,10 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     ));
     saved.binding = None;
     saved.call_path = crate::test_composition_call_path_in(&saved_source);
+    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
+        .expect("create composition source identity resolver");
     let saved = saved
-        .into_saved(tmp.path())
+        .into_saved_with_resolver(&mut source_identities)
         .expect("save anonymous composition");
     let saved = carina_core::value::redact_secrets_in_saved_composition(&saved)
         .expect("redact saved composition");
@@ -783,9 +785,17 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         },
     );
 
+    let error = result.expect_err(
+        "two anonymous compositions must not match merely because both bindings are None",
+    );
+    let rendered = error.to_string();
     assert!(
-        result.is_err(),
-        "two anonymous compositions must not match merely because both bindings are None"
+        !rendered.contains('\u{1b}'),
+        "a saved source path injected a terminal escape byte: {rendered:?}",
+    );
+    assert!(
+        rendered.contains(r"saved\u{1b}[31m.crn"),
+        "the escaped source path was not retained in the moved-call diagnostic: {rendered:?}",
     );
 
     std::fs::remove_file(&current_source).expect("remove current composition source");
@@ -806,6 +816,91 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
         "apply dropped the composition identity io source: {identity_error:?}",
     );
+}
+
+#[tokio::test]
+async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_corrupt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_file = tmp.path().join("source.crn");
+    std::fs::write(&source_file, "source fixture").expect("write composition source");
+
+    let mut composition = saved_module_composition(string_value("public"), "rejected");
+    composition.call_path = crate::test_composition_call_path_in(&source_file);
+    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
+        .expect("create composition source identity resolver");
+    let saved = composition
+        .into_saved_with_resolver(&mut source_identities)
+        .expect("save composition");
+    let plan_file = record_with_test_context(PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-29T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(Vec::new()),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: vec![saved],
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    });
+    let encoded = serde_json::to_value(plan_file).expect("serialize plan fixture");
+    let overlong = "a".repeat(4097);
+    let too_many_components = (0..257).map(|_| "a").collect::<Vec<_>>().join("/");
+
+    for (case, invalid_path, expected_detail) in [
+        ("absolute", "/tmp/module.crn", "relative"),
+        ("nul", "module\0.crn", "NUL"),
+        ("overlong", overlong.as_str(), "4096 bytes"),
+        ("current-directory", "module/./source.crn", "`.`"),
+        (
+            "too-many-components",
+            too_many_components.as_str(),
+            "256 components",
+        ),
+    ] {
+        let mut malformed = encoded.clone();
+        malformed["compositions"][0]["origin_id"]["root"]["source_file"]["path"] =
+            serde_json::Value::String(invalid_path.to_string());
+        let plan_path = tmp.path().join(format!("{case}.plan.json"));
+        std::fs::write(
+            &plan_path,
+            serde_json::to_vec(&malformed).expect("serialize malformed plan"),
+        )
+        .expect("write malformed plan");
+
+        let error = run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            false,
+            &ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("an invalid saved composition path must reject the plan");
+        let AppError::CorruptPlanFile { error, .. } = error else {
+            panic!("{case}: expected typed corrupt-plan error, got {error:?}");
+        };
+        assert_eq!(
+            error.classify(),
+            serde_json::error::Category::Data,
+            "{case}: path validation must be a typed data error: {error}",
+        );
+        assert!(
+            error.to_string().contains(expected_detail),
+            "{case}: validation detail was missing: {error}",
+        );
+    }
 }
 
 #[tokio::test]
@@ -2888,6 +2983,11 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         Value::resource_ref("producer", "identifier", vec![]),
         "bad-id",
     );
+    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
+        .expect("create composition source identity resolver");
+    let saved_composition = composition
+        .into_saved_with_resolver(&mut source_identities)
+        .expect("save composition");
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Create(resolved(
         producer.clone(),
@@ -2916,11 +3016,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         plan,
         sorted_resources: vec![producer.clone(), consumer.clone()],
         unresolved_resources: vec![producer, consumer],
-        compositions: vec![
-            composition
-                .into_saved(tmp.path())
-                .expect("save composition"),
-        ],
+        compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
@@ -2986,6 +3082,11 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
+        .expect("create composition source identity resolver");
+    let saved_composition = saved_module_composition(string_value("bad"), "bad")
+        .into_saved_with_resolver(&mut source_identities)
+        .expect("save composition");
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -2998,11 +3099,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         plan: Plan::new(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
-        compositions: vec![
-            saved_module_composition(string_value("bad"), "bad")
-                .into_saved(tmp.path())
-                .expect("save composition"),
-        ],
+        compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
