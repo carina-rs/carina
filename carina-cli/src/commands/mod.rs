@@ -258,7 +258,13 @@ fn enrich_provider_context(
                 for factory in factories.iter() {
                     factory
                         .validate_custom_type(identity, value)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            if error.detail().provider_name.is_some() {
+                                error
+                            } else {
+                                error.for_provider(factory.name())
+                            }
+                        })?;
                 }
                 Ok(())
             },

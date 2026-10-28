@@ -1570,7 +1570,7 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "test-utils")]
-async fn test_wasm_repeated_validation_timeout_suspends_same_input_until_context_changes() {
+async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let factory = factory.with_guest_call_budget(GuestCallBudget::new(
@@ -1588,10 +1588,19 @@ async fn test_wasm_repeated_validation_timeout_suspends_same_input_until_context
     carina_core::executor::prepare_provider_ready_config(&factory, &first_config)
         .expect_err("the initial validation instance should time out and become poisoned");
 
+    let clean_config = || resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    let clean_started = Instant::now();
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
+        .expect("a different validation input should rebuild and validate normally");
+    assert!(
+        clean_started.elapsed() < Duration::from_secs(1),
+        "a clean validation input should complete quickly"
+    );
+
     let rebuilt_config = resolved_provider_config(factory.name(), slow_attributes());
     let started = Instant::now();
     let error = carina_core::executor::prepare_provider_ready_config(&factory, &rebuilt_config)
-        .expect_err("the rebuilt validation instance must retain the two-second wall budget");
+        .expect_err("the second timeout for this input must survive an interleaved success");
     let elapsed = started.elapsed();
     let rendered = error.to_string();
 
@@ -1599,8 +1608,11 @@ async fn test_wasm_repeated_validation_timeout_suspends_same_input_until_context
     assert!(rendered.contains("wall-clock budget"), "{rendered}");
     assert!(
         elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
-        "rebuilt validate_config should time out after about 2s; elapsed {elapsed:?}"
+        "the second validate_config call should time out after about 2s; elapsed {elapsed:?}"
     );
+
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
+        .expect("the healthy input should still validate after the second timeout");
 
     let suspended_config = resolved_provider_config(factory.name(), slow_attributes());
     let suspended_started = Instant::now();
@@ -1632,14 +1644,20 @@ async fn test_wasm_repeated_validation_timeout_suspends_same_input_until_context
         "a suspended validation input must fail fast; elapsed {suspended_elapsed:?}"
     );
 
-    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
-    let clean_started = Instant::now();
-    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
-        .expect("a different validation input should rebuild and resume validation");
-    assert!(
-        clean_started.elapsed() < Duration::from_secs(1),
-        "a clean validation input should complete quickly"
-    );
+    for _ in 0..2 {
+        carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
+            .expect("the healthy input must remain usable while the slow input is suspended");
+        let started = Instant::now();
+        carina_core::executor::prepare_provider_ready_config(
+            &factory,
+            &resolved_provider_config(factory.name(), slow_attributes()),
+        )
+        .expect_err("alternating back to the suspended input must keep failing fast");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the slow input must consume at most two wall budgets in total"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

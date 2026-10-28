@@ -15,48 +15,32 @@ use crate::position;
 use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
 };
-use carina_core::provider::{ProviderError, ProviderErrorKind, ProviderFactory};
+use carina_core::provider::{HostErrorCause, ProviderError, ProviderFactory};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{SchemaRegistry, TypeError, TypeIdentity, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
 
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
-    seen: Mutex<HashSet<(String, ProviderErrorKind)>>,
+    suspended_providers: Mutex<HashSet<String>>,
 }
 
 impl ProviderValidationDeduplicator {
     fn should_emit(&self, provider: &str, error: &ProviderError) -> bool {
-        error.kind() != ProviderErrorKind::Timeout
+        error.detail().host_cause() != Some(HostErrorCause::ValidationSuspended)
             || self
-                .seen
+                .suspended_providers
                 .lock()
                 .expect("provider validation diagnostic lock must not be poisoned")
-                .insert((provider.to_string(), error.kind()))
+                .insert(provider.to_string())
     }
-}
 
-fn provider_custom_type_lookup<'a>(
-    factories: &'a [Box<dyn ProviderFactory>],
-    deduplicator: &'a ProviderValidationDeduplicator,
-) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + 'a {
-    let validate = carina_core::executor::provider_ready::provider_custom_type_lookup(factories);
-    move |identity, value| match validate(identity, value) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let provider = error
-                .detail()
-                .provider_name
-                .as_deref()
-                .or(identity.provider.as_deref())
-                .unwrap_or("<unknown>");
-            if deduplicator.should_emit(provider, &error) {
-                Err(TypeError::ValidationFailed {
-                    message: error.to_string(),
-                })
-            } else {
-                Ok(())
-            }
-        }
+    fn should_emit_type_error(&self, error: &TypeError) -> bool {
+        error.host_cause() != Some(HostErrorCause::ValidationSuspended)
+            || self
+                .suspended_providers
+                .lock()
+                .expect("provider validation diagnostic lock must not be poisoned")
+                .insert(error.provider_name().unwrap_or("<unknown>").to_string())
     }
 }
 
@@ -176,7 +160,13 @@ impl DiagnosticEngine {
                     for factory in factories_clone.iter() {
                         factory
                             .validate_custom_type(identity, value)
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| {
+                                if error.detail().provider_name.is_some() {
+                                    error
+                                } else {
+                                    error.for_provider(factory.name())
+                                }
+                            })?;
                     }
                     Ok(())
                 },
@@ -1142,14 +1132,17 @@ impl DiagnosticEngine {
                                         // verbatim. Enum has its own arm below — the
                                         // pre-#3222 `namespace.is_some()` gate is now a
                                         // type-level split.
-                                        let lookup = provider_custom_type_lookup(
-                                            self.factories.as_ref(),
-                                            &provider_validation_deduplicator,
+                                        let lookup = carina_core::parser::provider_context_lookup(
+                                            &self.provider_context,
                                         );
                                         validate(value)
                                             .err()
                                             .or_else(|| lookup(identity, value).err())
-                                            .map(|inner_err| inner_err.to_string())
+                                            .and_then(|inner_err| {
+                                                provider_validation_deduplicator
+                                                    .should_emit_type_error(&inner_err)
+                                                    .then(|| inner_err.to_string())
+                                            })
                                     }
                                 }
                                 // Validate List item types (non-Struct items only;
@@ -1286,10 +1279,8 @@ impl DiagnosticEngine {
                             *value = evaluated;
                         }
                     }
-                    let lookup = provider_custom_type_lookup(
-                        self.factories.as_ref(),
-                        &provider_validation_deduplicator,
-                    );
+                    let lookup =
+                        carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
                         |attr: &str| resource_quoted_string_attrs.contains(attr);
                     if let Err(errors) = schema.validate_with_origins_and_lookup(
@@ -1298,6 +1289,9 @@ impl DiagnosticEngine {
                         &lookup,
                     ) {
                         for error in errors {
+                            if !provider_validation_deduplicator.should_emit_type_error(&error) {
+                                continue;
+                            }
                             if let carina_core::schema::TypeError::ResourceValidationFailed {
                                 attribute: Some(attribute),
                                 ..

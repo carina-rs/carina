@@ -1344,6 +1344,109 @@ let third = mock.test.resource {
 }
 
 #[test]
+fn ordinary_timeouts_are_not_hidden_by_suspension_deduplication() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let doc = create_document(
+        r#"let ordinary_a = mock.test.resource {
+  probe = "ordinary-a"
+}
+let ordinary_b = mock.test.resource {
+  probe = "ordinary-b"
+}
+let unmarked_lookalike = mock.test.resource {
+  probe = "unmarked-lookalike"
+}
+let suspended_a = mock.test.resource {
+  probe = "suspended"
+}
+let suspended_b = mock.test.resource {
+  probe = "suspended"
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let messages = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("ordinary timeout for input a")),
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("ordinary timeout for input b")),
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(|message| message.contains("provider validation is suspended"))
+            .count()
+            > 1,
+        "the unmarked lookalike must not be hidden with the marked suspension: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let lookup = carina_core::parser::provider_context_lookup(&engine.provider_context);
+    let identity =
+        carina_core::schema::TypeIdentity::new(Some("mock"), ["test", "resource"], "Probe");
+    let value = carina_core::resource::Value::Concrete(
+        carina_core::resource::ConcreteValue::String("suspended".into()),
+    );
+
+    let first = lookup(&identity, &value).expect_err("validation must remain an error");
+    let second = lookup(&identity, &value).expect_err("validation must remain an error");
+    assert_eq!(
+        first.host_cause(),
+        Some(carina_core::provider::HostErrorCause::ValidationSuspended)
+    );
+    assert_eq!(
+        second.host_cause(),
+        Some(carina_core::provider::HostErrorCause::ValidationSuspended)
+    );
+
+    let deduplicator = ProviderValidationDeduplicator::default();
+    assert!(deduplicator.should_emit_type_error(&first));
+    assert!(!deduplicator.should_emit_type_error(&second));
+}
+
+#[test]
+fn enum_declared_custom_type_reaches_provider_in_canonical_api_spelling() {
+    let (engine, seen) = test_engine_with_enum_declared_custom_type();
+    let doc = create_document(
+        r#"let consumer = mock.test.consumer {
+  mode = mock.shared.Mode.enabled
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("enum identifier")
+                && !diagnostic.message.contains("canonical enum API spelling")
+        }),
+        "diagnostics: {diagnostics:#?}"
+    );
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|value| value == "ENABLED"),
+        "seen: {seen:?}"
+    );
+}
+
+#[test]
 fn list_item_type_validation() {
     // Use a test engine with a List(Enum) schema to test list item validation
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};

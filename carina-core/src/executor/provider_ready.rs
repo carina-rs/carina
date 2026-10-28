@@ -491,9 +491,7 @@ pub fn validate_and_canonicalize_provider_config(
 
     factory.validate_config(&canonical).map_err(|error| {
         let error = if canonical.values().any(crate::value::contains_secret) {
-            crate::provider::ProviderError::invalid_input(
-                "configuration containing a secret failed validation",
-            )
+            error.with_redacted_message("configuration containing a secret failed validation")
         } else {
             error
         };
@@ -1004,7 +1002,13 @@ mod provider_config_tests {
 
     struct ConfigFactory {
         validate_calls: AtomicUsize,
-        plugin_error: Option<&'static str>,
+        plugin_error: Option<ConfigFailure>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfigFailure {
+        Invalid(&'static str),
+        Timeout(&'static str),
     }
 
     impl ConfigFactory {
@@ -1018,7 +1022,14 @@ mod provider_config_tests {
         fn failing(message: &'static str) -> Self {
             Self {
                 validate_calls: AtomicUsize::new(0),
-                plugin_error: Some(message),
+                plugin_error: Some(ConfigFailure::Invalid(message)),
+            }
+        }
+
+        fn timing_out(message: &'static str) -> Self {
+            Self {
+                validate_calls: AtomicUsize::new(0),
+                plugin_error: Some(ConfigFailure::Timeout(message)),
             }
         }
     }
@@ -1045,7 +1056,9 @@ mod provider_config_tests {
         ) -> crate::provider::ProviderResult<()> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             match self.plugin_error {
-                Some(message) => Err(ProviderError::invalid_input(message)),
+                Some(ConfigFailure::Invalid(message)) => Err(ProviderError::invalid_input(message)),
+                Some(ConfigFailure::Timeout(message)) => Err(ProviderError::timeout(message)
+                    .with_host_cause(crate::provider::HostErrorCause::ValidationSuspended)),
                 None => Ok(()),
             }
         }
@@ -1174,6 +1187,32 @@ mod provider_config_tests {
         assert!(message.contains("provider test"), "{message}");
         assert!(message.contains("secret"), "{message}");
         assert!(!message.contains(plaintext), "{message}");
+    }
+
+    #[test]
+    fn secret_error_redaction_preserves_provider_error_kind() {
+        let plaintext = "plaintext-timeout-must-not-leak";
+        let factory = ConfigFactory::timing_out(plaintext);
+        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String("good-secret".into())),
+        ))));
+        let resolved = resolved_configs(attributes);
+
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect_err("plugin config validation must fail preparation");
+        let provider_error = error
+            .provider_error()
+            .expect("provider validation errors retain their typed error");
+
+        assert_eq!(
+            provider_error.kind(),
+            crate::provider::ProviderErrorKind::Timeout
+        );
+        assert_eq!(
+            provider_error.detail().host_cause(),
+            Some(crate::provider::HostErrorCause::ValidationSuspended)
+        );
+        assert!(!error.to_string().contains(plaintext));
     }
 
     #[test]

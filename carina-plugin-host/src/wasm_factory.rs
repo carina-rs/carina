@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -2493,17 +2494,27 @@ impl ValidationOperation {
 /// Secret-safe identity of one validation call.
 ///
 /// Provider bytes are fixed for the lifetime of a factory, so the operation
-/// and SHA-256 digest of the already-converted WIT arguments are sufficient to
-/// distinguish validation contexts. No cleartext validation value is retained.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// and keyed SHA-256 digest of the already-converted WIT arguments are
+/// sufficient to distinguish validation contexts. No cleartext validation
+/// value is retained.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ValidationContextFingerprint {
     operation: ValidationOperation,
-    input_sha256: [u8; 32],
+    keyed_input_sha256: [u8; 32],
+}
+
+impl fmt::Debug for ValidationContextFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidationContextFingerprint")
+            .field("operation", &self.operation)
+            .field("digest", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ValidationContextFingerprint {
-    fn validate_config(attributes: &[(String, wit_types::Value)]) -> Self {
-        let mut hasher = Sha256::new();
+    fn validate_config(key: &[u8; 32], attributes: &[(String, wit_types::Value)]) -> Self {
+        let mut hasher = validation_fingerprint_hasher(key);
         let mut attributes = attributes.iter().collect::<Vec<_>>();
         attributes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         for (name, value) in attributes {
@@ -2512,16 +2523,20 @@ impl ValidationContextFingerprint {
         }
         Self {
             operation: ValidationOperation::ValidateConfig,
-            input_sha256: hasher.finalize().into(),
+            keyed_input_sha256: hasher.finalize().into_bytes().into(),
         }
     }
 
-    fn validate_custom_type(identity: &wit_types::TypeIdentity, value: &str) -> Self {
-        let mut hasher = Sha256::new();
+    fn validate_custom_type(
+        key: &[u8; 32],
+        identity: &wit_types::TypeIdentity,
+        value: &str,
+    ) -> Self {
+        let mut hasher = validation_fingerprint_hasher(key);
         hash_validation_bytes(&mut hasher, identity.provider.as_bytes());
         let segment_count = u64::try_from(identity.segments.len())
             .expect("validation type segment count must fit in u64");
-        hasher.update(segment_count.to_be_bytes());
+        hasher.update(&segment_count.to_be_bytes());
         for segment in &identity.segments {
             hash_validation_bytes(&mut hasher, segment.as_bytes());
         }
@@ -2529,7 +2544,7 @@ impl ValidationContextFingerprint {
         hash_validation_bytes(&mut hasher, value.as_bytes());
         Self {
             operation: ValidationOperation::ValidateCustomType,
-            input_sha256: hasher.finalize().into(),
+            keyed_input_sha256: hasher.finalize().into_bytes().into(),
         }
     }
 
@@ -2538,44 +2553,58 @@ impl ValidationContextFingerprint {
     }
 }
 
-fn hash_validation_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+type ValidationFingerprintHasher = Hmac<Sha256>;
+
+fn validation_fingerprint_hasher(key: &[u8; 32]) -> ValidationFingerprintHasher {
+    ValidationFingerprintHasher::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts every 32-byte validation fingerprint key")
+}
+
+fn random_validation_fingerprint_key() -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key)
+        .expect("the host must provide randomness for validation fingerprints");
+    key
+}
+
+fn hash_validation_bytes(hasher: &mut ValidationFingerprintHasher, bytes: &[u8]) {
     let len = u64::try_from(bytes.len()).expect("validation input length must fit in u64");
-    hasher.update(len.to_be_bytes());
+    hasher.update(&len.to_be_bytes());
     hasher.update(bytes);
 }
 
-fn hash_wit_validation_value(hasher: &mut Sha256, value: &wit_types::Value) {
+fn hash_wit_validation_value(hasher: &mut ValidationFingerprintHasher, value: &wit_types::Value) {
     match value {
         wit_types::Value::BoolVal(value) => {
-            hasher.update([0]);
-            hasher.update([u8::from(*value)]);
+            hasher.update(&[0]);
+            hasher.update(&[u8::from(*value)]);
         }
         wit_types::Value::IntVal(value) => {
-            hasher.update([1]);
-            hasher.update(value.to_be_bytes());
+            hasher.update(&[1]);
+            hasher.update(&value.to_be_bytes());
         }
         wit_types::Value::FloatVal(value) => {
-            hasher.update([2]);
-            hasher.update(value.to_bits().to_be_bytes());
+            hasher.update(&[2]);
+            hasher.update(&value.to_bits().to_be_bytes());
         }
         wit_types::Value::StrVal(value) => {
-            hasher.update([3]);
+            hasher.update(&[3]);
             hash_validation_bytes(hasher, value.as_bytes());
         }
         wit_types::Value::StringListVal(value) => {
-            hasher.update([4]);
+            hasher.update(&[4]);
             hash_validation_bytes(hasher, value.as_bytes());
         }
         wit_types::Value::ListVal(value) => {
-            hasher.update([5]);
+            hasher.update(&[5]);
             hash_validation_bytes(hasher, value.as_bytes());
         }
         wit_types::Value::MapVal(value) => {
-            hasher.update([6]);
+            hasher.update(&[6]);
             hash_validation_bytes(hasher, value.as_bytes());
         }
         wit_types::Value::SecretVal(value) => {
-            hasher.update([7]);
+            hasher.update(&[7]);
             hash_validation_bytes(hasher, value.as_bytes());
         }
     }
@@ -2796,61 +2825,70 @@ impl FailFastInstance {
     }
 }
 
-/// A validation-instance poison reason with timeout context carried only in
-/// the wall-clock-timeout variant.
+const MAX_VALIDATION_INPUT_HEALTH_ENTRIES: usize = 64;
+
+/// Timeout history for one secret-safe validation input fingerprint.
 #[derive(Clone, Debug)]
-enum RebuildablePoisonReason {
-    Other(PoisonReason),
-    WallClockTimeout {
-        reason: PoisonReason,
-        context: ValidationContextFingerprint,
-    },
+enum InputHealth {
+    TimedOutOnce,
+    Suspended { reason: PoisonReason },
 }
 
-/// How the currently live validation instance was obtained.
+/// Whether the reusable validation instance is safe to enter.
+enum ValidationInstanceState {
+    Live(Box<LiveInstance>),
+    Poisoned { reason: PoisonReason },
+}
+
+/// Complete mutex-protected policy state for factory validation.
 ///
-/// A successful guest call resets this to `Fresh`. Only a wall-clock timeout
-/// on the same context immediately after rebuilding from that context can
-/// transition the slot to `Suspended`.
-#[derive(Clone, Debug)]
-enum RebuildProvenance {
-    Fresh,
-    RebuiltAfterWallClockTimeout {
-        reason: PoisonReason,
-        context: ValidationContextFingerprint,
-    },
+/// Instance health and per-input timeout history deliberately live in one
+/// state object so rebuilding or successfully validating another input cannot
+/// reset a suspended input's history.
+struct RebuildableState {
+    instance: ValidationInstanceState,
+    input_health: IndexMap<ValidationContextFingerprint, InputHealth>,
 }
 
-impl RebuildablePoisonReason {
-    fn original(&self) -> &PoisonReason {
-        match self {
-            Self::Other(reason) | Self::WallClockTimeout { reason, .. } => reason,
+impl RebuildableState {
+    fn new(live: LiveInstance) -> Self {
+        Self {
+            instance: ValidationInstanceState::Live(Box::new(live)),
+            input_health: IndexMap::new(),
         }
     }
 
-    fn rebuild_provenance(&self) -> RebuildProvenance {
-        match self {
-            Self::Other(_) => RebuildProvenance::Fresh,
-            Self::WallClockTimeout { reason, context } => {
-                RebuildProvenance::RebuiltAfterWallClockTimeout {
+    fn suspended_reason(&self, context: &ValidationContextFingerprint) -> Option<&PoisonReason> {
+        match self.input_health.get(context) {
+            Some(InputHealth::Suspended { reason }) => Some(reason),
+            Some(InputHealth::TimedOutOnce) | None => None,
+        }
+    }
+
+    fn record_wall_clock_timeout(
+        &mut self,
+        context: ValidationContextFingerprint,
+        reason: PoisonReason,
+    ) {
+        let previous = self.input_health.shift_remove(&context);
+        let health = match previous {
+            Some(InputHealth::TimedOutOnce | InputHealth::Suspended { .. }) => {
+                InputHealth::Suspended {
                     reason: reason.clone(),
-                    context: context.clone(),
                 }
             }
+            None => InputHealth::TimedOutOnce,
+        };
+        if self.input_health.len() == MAX_VALIDATION_INPUT_HEALTH_ENTRIES {
+            self.input_health.shift_remove_index(0);
         }
+        self.input_health.insert(context, health);
+        self.instance = ValidationInstanceState::Poisoned { reason };
     }
-}
 
-/// Complete policy state for the factory validation instance.
-enum RebuildableSlot {
-    Live(Box<LiveInstance>, RebuildProvenance),
-    Poisoned {
-        reason: RebuildablePoisonReason,
-    },
-    Suspended {
-        reason: PoisonReason,
-        context: ValidationContextFingerprint,
-    },
+    fn record_success(&mut self, context: &ValidationContextFingerprint) {
+        self.input_health.shift_remove(context);
+    }
 }
 
 fn suspended_validation_error(
@@ -2866,6 +2904,7 @@ fn suspended_validation_error(
          {original_operation}; editing the configuration (or using a new provider version) \
          resumes validation"
     ))
+    .with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended)
 }
 
 /// Exclusive, one-call access to a rebuildable validation instance.
@@ -2874,73 +2913,43 @@ fn suspended_validation_error(
 /// call and replaces the live state before releasing it on timeout, trap, or
 /// cancellation. This preserves the carina#3106 lock/drop ordering guarantee.
 struct RebuildableLiveInstanceGuard<'a> {
-    slot: Option<tokio::sync::MutexGuard<'a, RebuildableSlot>>,
+    state: Option<tokio::sync::MutexGuard<'a, RebuildableState>>,
     context: ValidationContextFingerprint,
 }
 
 impl<'a> RebuildableLiveInstanceGuard<'a> {
-    fn from_slot(
-        slot: tokio::sync::MutexGuard<'a, RebuildableSlot>,
+    fn from_state(
+        state: tokio::sync::MutexGuard<'a, RebuildableState>,
         context: ValidationContextFingerprint,
     ) -> ProviderResult<Self> {
-        match &*slot {
-            RebuildableSlot::Live(_, _) => Ok(Self {
-                slot: Some(slot),
+        match &state.instance {
+            ValidationInstanceState::Live(_) => Ok(Self {
+                state: Some(state),
                 context,
             }),
-            RebuildableSlot::Poisoned { reason } => {
-                Err(reason.original().fail_fast_error(context.operation()))
+            ValidationInstanceState::Poisoned { reason } => {
+                Err(reason.fail_fast_error(context.operation()))
             }
-            RebuildableSlot::Suspended {
-                reason,
-                context: suspended_context,
-            } => Err(suspended_validation_error(reason, suspended_context)),
         }
     }
 
     fn poison(mut self, reason: PoisonReason) {
-        let mut slot = self
-            .slot
+        let mut state = self
+            .state
             .take()
-            .expect("an armed RebuildableLiveInstanceGuard always owns its slot");
-        *slot = RebuildableSlot::Poisoned {
-            reason: RebuildablePoisonReason::Other(reason),
-        };
+            .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+        state.instance = ValidationInstanceState::Poisoned { reason };
     }
 
     fn wall_clock_timeout(mut self) {
-        let mut slot = self
-            .slot
+        let mut state = self
+            .state
             .take()
-            .expect("an armed RebuildableLiveInstanceGuard always owns its slot");
-        let repeated_reason = match &*slot {
-            RebuildableSlot::Live(
-                _,
-                RebuildProvenance::RebuiltAfterWallClockTimeout { reason, context },
-            ) if context == &self.context => Some(reason.clone()),
-            RebuildableSlot::Live(_, RebuildProvenance::Fresh)
-            | RebuildableSlot::Live(_, RebuildProvenance::RebuiltAfterWallClockTimeout { .. }) => {
-                None
-            }
-            RebuildableSlot::Poisoned { .. } | RebuildableSlot::Suspended { .. } => {
-                unreachable!("RebuildableLiveInstanceGuard can only hold a live slot")
-            }
+            .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+        let reason = PoisonReason::WallClockTimeout {
+            operation: self.context.operation(),
         };
-        *slot = if let Some(reason) = repeated_reason {
-            RebuildableSlot::Suspended {
-                reason,
-                context: self.context.clone(),
-            }
-        } else {
-            RebuildableSlot::Poisoned {
-                reason: RebuildablePoisonReason::WallClockTimeout {
-                    reason: PoisonReason::WallClockTimeout {
-                        operation: self.context.operation(),
-                    },
-                    context: self.context.clone(),
-                },
-            }
-        };
+        state.record_wall_clock_timeout(self.context.clone(), reason);
     }
 
     async fn call<U, F>(mut self, f: F) -> ProviderResult<U>
@@ -2949,12 +2958,12 @@ impl<'a> RebuildableLiveInstanceGuard<'a> {
         F: AsyncFnOnce(&WasmBindings, &mut Store<HostState>) -> wasmtime::Result<U>,
     {
         let call = {
-            let slot = self
-                .slot
+            let state = self
+                .state
                 .as_mut()
-                .expect("an armed RebuildableLiveInstanceGuard always owns its slot");
-            let RebuildableSlot::Live(live, _) = &mut **slot else {
-                unreachable!("RebuildableLiveInstanceGuard can only hold a live slot");
+                .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+            let ValidationInstanceState::Live(live) = &mut state.instance else {
+                unreachable!("RebuildableLiveInstanceGuard can only hold a live instance");
             };
             let (store, bindings) = (&mut live.store, &live.bindings);
             store.call(|store| f(bindings, store)).await
@@ -2969,15 +2978,12 @@ impl<'a> RebuildableLiveInstanceGuard<'a> {
         };
         match call {
             Ok(value) => {
-                let mut slot = self
-                    .slot
+                let mut state = self
+                    .state
                     .take()
-                    .expect("a successful guest call must still own its slot");
-                let RebuildableSlot::Live(_, provenance) = &mut *slot else {
-                    unreachable!("RebuildableLiveInstanceGuard can only hold a live slot");
-                };
-                *provenance = RebuildProvenance::Fresh;
-                drop(slot);
+                    .expect("a successful guest call must still own its state");
+                state.record_success(&self.context);
+                drop(state);
                 Ok(value)
             }
             Err(error) => {
@@ -2992,9 +2998,9 @@ impl<'a> RebuildableLiveInstanceGuard<'a> {
 
 impl Drop for RebuildableLiveInstanceGuard<'_> {
     fn drop(&mut self) {
-        if let Some(slot) = &mut self.slot {
-            **slot = RebuildableSlot::Poisoned {
-                reason: RebuildablePoisonReason::Other(PoisonReason::Cancelled),
+        if let Some(state) = &mut self.state {
+            state.instance = ValidationInstanceState::Poisoned {
+                reason: PoisonReason::Cancelled,
             };
         }
     }
@@ -3073,59 +3079,58 @@ fn rebuild_provider_error(
     }
 }
 
-/// Factory-validation instance that rebuilds after poisoning and suspends a
-/// validation context after its rebuilt instance repeats a wall-clock timeout.
+/// Factory-validation instance that rebuilds after poisoning and independently
+/// tracks wall-clock timeout history for each validation input.
 ///
 /// Acquisition holds the slot mutex while recreating the instance from the
 /// already verified component and the same engine, selected world, and call
 /// budget. A failed rebuild leaves the slot poisoned, preserves the typed load
-/// error, and is retried by the next validation call. A suspended context
-/// fails fast until a different fingerprint arrives; that different context
-/// may rebuild and restore a fresh live instance for all callers.
+/// error, and is retried by the next non-suspended validation call. A suspended
+/// input fails fast without inspecting or rebuilding the instance; other inputs
+/// continue to rebuild and use the shared instance normally.
 struct RebuildableInstance {
-    slot: Mutex<RebuildableSlot>,
+    state: Mutex<RebuildableState>,
     rebuild: RebuildContext,
+    fingerprint_key: [u8; 32],
 }
 
 impl RebuildableInstance {
     fn new(live: LiveInstance, rebuild: RebuildContext) -> Self {
         Self {
-            slot: Mutex::new(RebuildableSlot::Live(
-                Box::new(live),
-                RebuildProvenance::Fresh,
-            )),
+            state: Mutex::new(RebuildableState::new(live)),
             rebuild,
+            fingerprint_key: random_validation_fingerprint_key(),
         }
+    }
+
+    fn validate_config_context(
+        &self,
+        attributes: &[(String, wit_types::Value)],
+    ) -> ValidationContextFingerprint {
+        ValidationContextFingerprint::validate_config(&self.fingerprint_key, attributes)
+    }
+
+    fn validate_custom_type_context(
+        &self,
+        identity: &wit_types::TypeIdentity,
+        value: &str,
+    ) -> ValidationContextFingerprint {
+        ValidationContextFingerprint::validate_custom_type(&self.fingerprint_key, identity, value)
     }
 
     async fn acquire(
         &self,
         context: ValidationContextFingerprint,
     ) -> ProviderResult<RebuildableLiveInstanceGuard<'_>> {
-        let mut slot = self.slot.lock().await;
-        let rebuild = match &*slot {
-            RebuildableSlot::Live(_, _) => None,
-            RebuildableSlot::Poisoned { reason } => {
-                Some((reason.original().clone(), reason.rebuild_provenance()))
-            }
-            RebuildableSlot::Suspended {
-                reason,
-                context: suspended_context,
-            } if suspended_context == &context => {
-                return Err(suspended_validation_error(reason, suspended_context));
-            }
-            RebuildableSlot::Suspended {
-                reason,
-                context: suspended_context,
-            } => Some((
-                reason.clone(),
-                RebuildProvenance::RebuiltAfterWallClockTimeout {
-                    reason: reason.clone(),
-                    context: suspended_context.clone(),
-                },
-            )),
+        let mut state = self.state.lock().await;
+        if let Some(reason) = state.suspended_reason(&context) {
+            return Err(suspended_validation_error(reason, &context));
+        }
+        let rebuild = match &state.instance {
+            ValidationInstanceState::Live(_) => None,
+            ValidationInstanceState::Poisoned { reason } => Some(reason.clone()),
         };
-        if let Some((reason, provenance)) = rebuild {
+        if let Some(reason) = rebuild {
             let live = self
                 .rebuild
                 .create_instance()
@@ -3139,29 +3144,29 @@ impl RebuildableInstance {
                     )
                 })
                 .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
-            *slot = RebuildableSlot::Live(Box::new(live), provenance);
+            state.instance = ValidationInstanceState::Live(Box::new(live));
             log::warn!(
                 "rebuilt poisoned WASM provider validation instance; previous poison reason: \
                  {reason}"
             );
         }
-        RebuildableLiveInstanceGuard::from_slot(slot, context)
+        RebuildableLiveInstanceGuard::from_state(state, context)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     async fn live_world(&self) -> Option<InstantiationWorld> {
-        match &*self.slot.lock().await {
-            RebuildableSlot::Live(live, _) => Some(live.instantiation_world()),
-            RebuildableSlot::Poisoned { reason: _ } | RebuildableSlot::Suspended { .. } => None,
+        match &self.state.lock().await.instance {
+            ValidationInstanceState::Live(live) => Some(live.instantiation_world()),
+            ValidationInstanceState::Poisoned { reason: _ } => None,
         }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     fn set_budget(&mut self, budget: GuestCallBudget) {
         self.rebuild.budget = budget;
-        match self.slot.get_mut() {
-            RebuildableSlot::Live(live, _) => live.store.set_budget(budget),
-            RebuildableSlot::Poisoned { reason: _ } | RebuildableSlot::Suspended { .. } => {}
+        match &mut self.state.get_mut().instance {
+            ValidationInstanceState::Live(live) => live.store.set_budget(budget),
+            ValidationInstanceState::Poisoned { reason: _ } => {}
         }
     }
 }
@@ -3192,9 +3197,10 @@ pub struct WasmProviderFactory {
     cached_provider_config_types: HashMap<String, carina_core::schema::AttributeType>,
     enable_http: bool,
     /// Reusable, rebuildable WASM instance for editor-facing validation.
-    /// A poisoned slot is recreated from `engine` + `component`; an input that
-    /// repeats a wall-clock timeout immediately after that rebuild is suspended
-    /// until the validation context changes.
+    /// A poisoned instance is recreated from `engine` + `component`; each input
+    /// is suspended after its second wall-clock timeout. A successful retry
+    /// after one timeout clears that input's history; suspension lasts for this
+    /// factory, so loading a new provider version starts with a fresh map.
     init_instance: RebuildableInstance,
     /// Lazily created shared instances for provider + normalizer, keyed
     /// by binding name. `None` is the kind's default instance;
@@ -3833,7 +3839,7 @@ impl ProviderFactory for WasmProviderFactory {
     ) -> ProviderResult<()> {
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes.attributes())
             .map_err(|error| wasm_value_encode_provider_error("validate_config", error))?;
-        let context = ValidationContextFingerprint::validate_config(&wit_attrs);
+        let context = self.init_instance.validate_config_context(&wit_attrs);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -3855,8 +3861,9 @@ impl ProviderFactory for WasmProviderFactory {
         value: &CanonicalCustomTypeValue,
     ) -> ProviderResult<()> {
         let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
-        let context =
-            ValidationContextFingerprint::validate_custom_type(&wit_identity, value.as_str());
+        let context = self
+            .init_instance
+            .validate_custom_type_context(&wit_identity, value.as_str());
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let instance = &self.init_instance;
@@ -8892,51 +8899,65 @@ mod tests {
 
     #[test]
     fn validation_context_fingerprint_is_canonical_and_secret_safe() {
-        let first = ValidationContextFingerprint::validate_config(&[
+        let key = [7_u8; 32];
+        let other_key = [8_u8; 32];
+        let attributes = [
             (
                 "secret".to_string(),
                 wit_types::Value::SecretVal("do-not-retain-me".to_string()),
             ),
             ("count".to_string(), wit_types::Value::IntVal(3)),
-        ]);
-        let reordered = ValidationContextFingerprint::validate_config(&[
-            ("count".to_string(), wit_types::Value::IntVal(3)),
-            (
-                "secret".to_string(),
-                wit_types::Value::SecretVal("do-not-retain-me".to_string()),
-            ),
-        ]);
-        let changed = ValidationContextFingerprint::validate_config(&[
-            ("count".to_string(), wit_types::Value::IntVal(4)),
-            (
-                "secret".to_string(),
-                wit_types::Value::SecretVal("do-not-retain-me".to_string()),
-            ),
-        ]);
+        ];
+        let first = ValidationContextFingerprint::validate_config(&key, &attributes);
+        let reordered = ValidationContextFingerprint::validate_config(
+            &key,
+            &[
+                ("count".to_string(), wit_types::Value::IntVal(3)),
+                (
+                    "secret".to_string(),
+                    wit_types::Value::SecretVal("do-not-retain-me".to_string()),
+                ),
+            ],
+        );
+        let changed = ValidationContextFingerprint::validate_config(
+            &key,
+            &[
+                ("count".to_string(), wit_types::Value::IntVal(4)),
+                (
+                    "secret".to_string(),
+                    wit_types::Value::SecretVal("do-not-retain-me".to_string()),
+                ),
+            ],
+        );
+        let different_factory =
+            ValidationContextFingerprint::validate_config(&other_key, &attributes);
 
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
-        assert!(!format!("{first:?}").contains("do-not-retain-me"));
+        assert_ne!(first, different_factory);
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("do-not-retain-me"));
+        assert!(debug.contains("<redacted>"), "fingerprint debug: {debug}");
+        assert!(
+            !debug.contains("input_sha256"),
+            "the keyed digest must not be exposed through Debug: {debug}"
+        );
     }
 
     #[tokio::test]
-    async fn rebuildable_slot_suspends_only_second_consecutive_timeout_on_same_context() {
+    async fn rebuildable_state_retains_timeout_history_across_other_input_successes() {
         let Some(factory) = rebuildable_state_test_factory().await else {
             return;
         };
         let instance = &factory.init_instance;
-        let context_x = ValidationContextFingerprint::validate_config(&[(
-            "probe".to_string(),
-            wit_types::Value::IntVal(1),
-        )]);
-        let context_y = ValidationContextFingerprint::validate_config(&[(
-            "probe".to_string(),
-            wit_types::Value::IntVal(2),
-        )]);
+        let context_x =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(1))]);
+        let context_y =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(2))]);
 
         assert!(matches!(
-            &*instance.slot.lock().await,
-            RebuildableSlot::Live(_, RebuildProvenance::Fresh)
+            &instance.state.lock().await.instance,
+            ValidationInstanceState::Live(_)
         ));
 
         instance
@@ -8944,45 +8965,117 @@ mod tests {
             .await
             .expect("fresh validation instance should be live")
             .wall_clock_timeout();
-        assert!(matches!(
-            &*instance.slot.lock().await,
-            RebuildableSlot::Poisoned {
-                reason: RebuildablePoisonReason::WallClockTimeout {
-                    context,
-                    ..
-                }
-            } if context == &context_x
-        ));
-
-        let rebuilt = instance
-            .acquire(context_x.clone())
+        let rebuilt_for_y = instance
+            .acquire(context_y.clone())
             .await
-            .expect("the first timeout should permit one rebuild");
-        assert!(matches!(
-            rebuilt.slot.as_deref(),
-            Some(RebuildableSlot::Live(
-                _,
-                RebuildProvenance::RebuiltAfterWallClockTimeout { context, .. }
-            )) if context == &context_x
-        ));
-        rebuilt.wall_clock_timeout();
-        assert!(matches!(
-            &*instance.slot.lock().await,
-            RebuildableSlot::Suspended { context, .. } if context == &context_x
-        ));
-
-        let resumed = instance
-            .acquire(context_y)
-            .await
-            .expect("a different validation context should rebuild a suspended slot");
-        resumed
+            .expect("another input should rebuild the poisoned instance");
+        rebuilt_for_y
             .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
             .await
-            .expect("a successful different context should reset provenance");
-        assert!(matches!(
-            &*instance.slot.lock().await,
-            RebuildableSlot::Live(_, RebuildProvenance::Fresh)
-        ));
+            .expect("the other input should succeed");
+
+        instance
+            .acquire(context_x.clone())
+            .await
+            .expect("the second call for X should use the live instance")
+            .wall_clock_timeout();
+
+        let started = std::time::Instant::now();
+        let suspended = match instance.acquire(context_x.clone()).await {
+            Ok(_) => panic!("X must be suspended after its second timeout"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            suspended.detail().host_cause(),
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended)
+        );
+
+        instance
+            .acquire(context_y)
+            .await
+            .expect("Y should rebuild while X remains suspended")
+            .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
+            .await
+            .expect("Y should remain usable");
+        assert!(
+            instance.acquire(context_x).await.is_err(),
+            "Y's success must not clear X's suspension"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_input_clears_its_own_first_timeout() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let context =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(1))]);
+
+        instance
+            .acquire(context.clone())
+            .await
+            .unwrap()
+            .wall_clock_timeout();
+        instance
+            .acquire(context.clone())
+            .await
+            .expect("one timeout still permits a retry")
+            .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
+            .await
+            .expect("the retry should succeed");
+        assert!(
+            !instance
+                .state
+                .lock()
+                .await
+                .input_health
+                .contains_key(&context)
+        );
+
+        instance
+            .acquire(context.clone())
+            .await
+            .unwrap()
+            .wall_clock_timeout();
+        instance
+            .acquire(context)
+            .await
+            .expect("a timeout after success must be treated as the first timeout again");
+    }
+
+    #[tokio::test]
+    async fn validation_input_health_evicts_the_oldest_entry_at_the_bound() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let contexts = (0..=MAX_VALIDATION_INPUT_HEALTH_ENTRIES)
+            .map(|value| {
+                instance.validate_config_context(&[(
+                    "probe".to_string(),
+                    wit_types::Value::IntVal(i64::try_from(value).unwrap()),
+                )])
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = instance.state.lock().await;
+        for context in &contexts {
+            state.record_wall_clock_timeout(
+                context.clone(),
+                PoisonReason::WallClockTimeout {
+                    operation: "validate_config",
+                },
+            );
+        }
+
+        assert_eq!(
+            state.input_health.len(),
+            MAX_VALIDATION_INPUT_HEALTH_ENTRIES
+        );
+        assert!(!state.input_health.contains_key(&contexts[0]));
+        assert!(state.input_health.contains_key(contexts.last().unwrap()));
     }
 
     #[tokio::test]
@@ -8991,7 +9084,7 @@ mod tests {
             return;
         };
         let instance = &factory.init_instance;
-        let context = ValidationContextFingerprint::validate_config(&[]);
+        let context = instance.validate_config_context(&[]);
 
         instance
             .acquire(context.clone())
@@ -9010,9 +9103,9 @@ mod tests {
             .expect_err("the synthetic trap must fail");
         assert_eq!(error.variant_name(), "internal");
         assert!(matches!(
-            &*instance.slot.lock().await,
-            RebuildableSlot::Poisoned {
-                reason: RebuildablePoisonReason::Other(PoisonReason::Trap { .. })
+            &instance.state.lock().await.instance,
+            ValidationInstanceState::Poisoned {
+                reason: PoisonReason::Trap { .. }
             }
         ));
 
@@ -9021,8 +9114,11 @@ mod tests {
             .await
             .expect("traps should continue to rebuild on every call");
         assert!(matches!(
-            rebuilt_after_trap.slot.as_deref(),
-            Some(RebuildableSlot::Live(_, RebuildProvenance::Fresh))
+            rebuilt_after_trap
+                .state
+                .as_deref()
+                .map(|state| &state.instance),
+            Some(ValidationInstanceState::Live(_))
         ));
     }
 
@@ -9148,11 +9244,11 @@ mod tests {
                 budget: GuestCallBudget::PRODUCTION,
             },
         );
-        *instance.slot.lock().await = RebuildableSlot::Poisoned {
-            reason: RebuildablePoisonReason::Other(PoisonReason::Cancelled),
+        instance.state.lock().await.instance = ValidationInstanceState::Poisoned {
+            reason: PoisonReason::Cancelled,
         };
 
-        let context = ValidationContextFingerprint::validate_config(&[]);
+        let context = instance.validate_config_context(&[]);
         let locked = instance
             .acquire(context)
             .await
@@ -9176,15 +9272,16 @@ mod tests {
         let engine = Engine::new(&config).expect("test engine should be valid");
         let component =
             Component::new(&engine, "(component)").expect("empty test component should compile");
-        let context = ValidationContextFingerprint::validate_config(&[]);
+        let fingerprint_key = [9_u8; 32];
+        let context = ValidationContextFingerprint::validate_config(&fingerprint_key, &[]);
         let instance = RebuildableInstance {
-            slot: Mutex::new(RebuildableSlot::Poisoned {
-                reason: RebuildablePoisonReason::WallClockTimeout {
+            state: Mutex::new(RebuildableState {
+                instance: ValidationInstanceState::Poisoned {
                     reason: PoisonReason::WallClockTimeout {
                         operation: "validate_config",
                     },
-                    context: context.clone(),
                 },
+                input_health: IndexMap::new(),
             }),
             rebuild: RebuildContext {
                 engine,
@@ -9193,6 +9290,7 @@ mod tests {
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
             },
+            fingerprint_key,
         };
 
         for attempt in 1..=2 {
@@ -9247,13 +9345,10 @@ mod tests {
             );
             assert!(
                 matches!(
-                    &*instance.slot.lock().await,
-                    RebuildableSlot::Poisoned {
-                        reason: RebuildablePoisonReason::WallClockTimeout {
-                            reason: PoisonReason::WallClockTimeout {
-                                operation: "validate_config"
-                            },
-                            ..
+                    &instance.state.lock().await.instance,
+                    ValidationInstanceState::Poisoned {
+                        reason: PoisonReason::WallClockTimeout {
+                            operation: "validate_config"
                         }
                     }
                 ),

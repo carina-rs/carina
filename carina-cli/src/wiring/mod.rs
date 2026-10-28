@@ -1411,7 +1411,8 @@ fn type_error_attribute(error: &TypeError) -> Option<&str> {
         | TypeError::PatternMismatch { attribute, .. }
         | TypeError::LengthOutOfRange { attribute, .. }
         | TypeError::StringLiteralExpectedEnum { attribute, .. }
-        | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+        | TypeError::ResourceValidationFailed { attribute, .. }
+        | TypeError::ProviderValidationFailed { attribute, .. } => attribute.as_deref(),
         TypeError::BlockSyntaxNotAllowed { attribute } => Some(attribute),
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }

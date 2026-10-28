@@ -274,14 +274,21 @@ fn walk_custom_lookup_on_path<'a>(
             };
             let resolved = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
             if let Err(e) = lookup(identity, &resolved) {
-                let message = match e {
-                    TypeError::ValidationFailed { message } => message,
-                    other => other.to_string(),
-                };
-                errors.push(TypeError::ResourceValidationFailed {
-                    message,
-                    attribute: Some(attr_name.to_string()),
-                });
+                match e {
+                    error @ TypeError::ProviderValidationFailed { .. } => {
+                        errors.push(error.with_attribute(attr_name));
+                    }
+                    TypeError::ValidationFailed { message } => {
+                        errors.push(TypeError::ResourceValidationFailed {
+                            message,
+                            attribute: Some(attr_name.to_string()),
+                        });
+                    }
+                    other => errors.push(TypeError::ResourceValidationFailed {
+                        message: other.to_string(),
+                        attribute: Some(attr_name.to_string()),
+                    }),
+                }
             }
         }
         AttrTypeKind::List {
@@ -397,14 +404,21 @@ fn run_identified_lookup(
     if let Some(id) = identity
         && let Err(e) = lookup(id, value)
     {
-        let message = match e {
-            TypeError::ValidationFailed { message } => message,
-            other => other.to_string(),
-        };
-        errors.push(TypeError::ResourceValidationFailed {
-            message,
-            attribute: Some(attr_name.to_string()),
-        });
+        match e {
+            error @ TypeError::ProviderValidationFailed { .. } => {
+                errors.push(error.with_attribute(attr_name));
+            }
+            TypeError::ValidationFailed { message } => {
+                errors.push(TypeError::ResourceValidationFailed {
+                    message,
+                    attribute: Some(attr_name.to_string()),
+                });
+            }
+            other => errors.push(TypeError::ResourceValidationFailed {
+                message: other.to_string(),
+                attribute: Some(attr_name.to_string()),
+            }),
+        }
     }
 }
 
@@ -3844,7 +3858,8 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
 
 fn validation_error_message(err: TypeError) -> String {
     match err {
-        TypeError::ValidationFailed { message } => message,
+        TypeError::ValidationFailed { message }
+        | TypeError::ProviderValidationFailed { message, .. } => message,
         other => other.to_string(),
     }
 }
@@ -5761,6 +5776,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::LengthOutOfRange { .. }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
+        | TypeError::ProviderValidationFailed { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
         | TypeError::ReadOnlyAttribute { .. }
@@ -5861,6 +5877,16 @@ pub enum TypeError {
 
     #[error("Validation failed: {message}")]
     ValidationFailed { message: String },
+
+    /// Provider-backed validation failure with host policy metadata retained
+    /// for diagnostic decisions such as suspension deduplication.
+    #[error("Validation failed: {message}")]
+    ProviderValidationFailed {
+        message: String,
+        host_cause: Option<crate::provider::HostErrorCause>,
+        provider_name: Option<String>,
+        attribute: Option<String>,
+    },
 
     #[error("Resource validation failed: {message}")]
     ResourceValidationFailed {
@@ -6005,6 +6031,17 @@ impl TypeError {
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
                 message: MASKED_MESSAGE.to_string(),
             },
+            TypeError::ProviderValidationFailed {
+                host_cause,
+                provider_name,
+                attribute,
+                ..
+            } => TypeError::ProviderValidationFailed {
+                message: MASKED_MESSAGE.to_string(),
+                host_cause,
+                provider_name,
+                attribute,
+            },
             TypeError::ResourceValidationFailed { attribute, .. } => {
                 TypeError::ResourceValidationFailed {
                     message: MASKED_MESSAGE.to_string(),
@@ -6108,6 +6145,10 @@ impl TypeError {
                     | TypeError::StringLiteralExpectedEnum {
                         attribute: attr_slot,
                         ..
+                    }
+                    | TypeError::ProviderValidationFailed {
+                        attribute: attr_slot,
+                        ..
                     } => {
                         *attr_slot = Some(attribute.into());
                     }
@@ -6140,6 +6181,36 @@ impl TypeError {
                 extra_message: None,
             },
             other => other,
+        }
+    }
+
+    /// Host-side lifecycle marker retained from provider validation.
+    pub fn host_cause(&self) -> Option<crate::provider::HostErrorCause> {
+        match self {
+            TypeError::ProviderValidationFailed { host_cause, .. } => *host_cause,
+            TypeError::ListItemError { inner, .. }
+            | TypeError::MapKeyError { inner, .. }
+            | TypeError::MapValueError { inner, .. }
+            | TypeError::StructFieldError { inner, .. } => inner.host_cause(),
+            TypeError::UnionAlternativesMismatch { failures } => {
+                failures.iter().find_map(TypeError::host_cause)
+            }
+            _ => None,
+        }
+    }
+
+    /// Provider name retained from provider-backed validation.
+    pub fn provider_name(&self) -> Option<&str> {
+        match self {
+            TypeError::ProviderValidationFailed { provider_name, .. } => provider_name.as_deref(),
+            TypeError::ListItemError { inner, .. }
+            | TypeError::MapKeyError { inner, .. }
+            | TypeError::MapValueError { inner, .. }
+            | TypeError::StructFieldError { inner, .. } => inner.provider_name(),
+            TypeError::UnionAlternativesMismatch { failures } => {
+                failures.iter().find_map(TypeError::provider_name)
+            }
+            _ => None,
         }
     }
 }

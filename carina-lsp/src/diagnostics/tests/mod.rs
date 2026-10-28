@@ -126,9 +126,22 @@ impl ProviderFactory for SuspendedValidationFactory {
     fn validate_custom_type(
         &self,
         _identity: &carina_core::schema::TypeIdentity,
-        _value: &carina_core::provider::CanonicalCustomTypeValue,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
-        Err(carina_core::provider::ProviderError::timeout(Self::ERROR))
+        let message = match value.as_str() {
+            "ordinary-a" => "ordinary timeout for input a",
+            "ordinary-b" => "ordinary timeout for input b",
+            _ => Self::ERROR,
+        };
+        let error = carina_core::provider::ProviderError::timeout(message);
+        if matches!(
+            value.as_str(),
+            "ordinary-a" | "ordinary-b" | "unmarked-lookalike"
+        ) {
+            Err(error)
+        } else {
+            Err(error.with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended))
+        }
     }
 
     fn extract_region(
@@ -185,6 +198,118 @@ pub(super) fn test_engine_with_suspended_validation_provider() -> DiagnosticEngi
         vec!["mock".to_string()],
         Arc::new(factories),
     )
+}
+
+struct EnumDeclaredCustomTypeFactory {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ProviderFactory for EnumDeclaredCustomTypeFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_config_attribute_types(
+        &self,
+    ) -> std::collections::HashMap<String, carina_core::schema::AttributeType> {
+        std::collections::HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &carina_core::schema::TypeIdentity,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        self.seen.lock().unwrap().push(value.to_string());
+        if value.as_str() == "ENABLED" {
+            Ok(())
+        } else {
+            Err(carina_core::provider::ProviderError::invalid_input(
+                "expected canonical enum API spelling",
+            ))
+        }
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!(
+            "EnumDeclaredCustomTypeFactory::create_provider is not used in diagnostics tests"
+        )
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+        };
+
+        let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
+        let custom = AttributeType::refined_string_with_validator(
+            Some(identity),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        );
+        vec![ResourceSchema::new("test.consumer").attribute(AttributeSchema::new("mode", custom))]
+    }
+}
+
+pub(super) fn test_engine_with_enum_declared_custom_type()
+-> (DiagnosticEngine, Arc<std::sync::Mutex<Vec<String>>>) {
+    use carina_core::schema::{AttributeType, TypeIdentity};
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumDeclaredCustomTypeFactory {
+        seen: Arc::clone(&seen),
+    })];
+    let schemas = Arc::new(provider_mod::collect_schemas(&factories));
+    let mut engine = DiagnosticEngine::new(
+        Arc::clone(&schemas),
+        vec!["mock".to_string()],
+        Arc::new(factories),
+    );
+    let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
+    engine.provider_context.custom_type_attribute_types.insert(
+        identity.clone(),
+        AttributeType::enum_(
+            identity,
+            Some(vec!["ENABLED".to_string()]),
+            vec![("ENABLED".to_string(), "enabled".to_string())],
+            None,
+            None,
+        ),
+    );
+    (engine, seen)
 }
 
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {
