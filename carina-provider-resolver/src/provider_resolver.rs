@@ -17241,17 +17241,39 @@ transparency_log_present = true
     }
 
     fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
-        fn visit(root: &Path, current: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        snapshot_tree_with_exclusion(root, None)
+    }
+
+    fn snapshot_tree_excluding(
+        root: &Path,
+        excluded_subtree: &Path,
+    ) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        snapshot_tree_with_exclusion(root, Some(excluded_subtree))
+    }
+
+    fn snapshot_tree_with_exclusion(
+        root: &Path,
+        excluded_subtree: Option<&Path>,
+    ) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(
+            root: &Path,
+            current: &Path,
+            excluded_subtree: Option<&Path>,
+            snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>,
+        ) {
             let mut entries = fs::read_dir(current)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect::<Vec<_>>();
             entries.sort();
             for path in entries {
+                if excluded_subtree == Some(path.as_path()) {
+                    continue;
+                }
                 let relative = path.strip_prefix(root).unwrap().to_path_buf();
                 if path.is_dir() {
                     snapshot.push((relative, None));
-                    visit(root, &path, snapshot);
+                    visit(root, &path, excluded_subtree, snapshot);
                 } else {
                     snapshot.push((relative, Some(fs::read(&path).unwrap())));
                 }
@@ -17259,7 +17281,7 @@ transparency_log_present = true
         }
 
         let mut snapshot = Vec::new();
-        visit(root, root, &mut snapshot);
+        visit(root, root, excluded_subtree, &mut snapshot);
         snapshot
     }
 
@@ -18766,6 +18788,7 @@ transparency_log_present = true
         fs::create_dir_all(user_dirs.trust_record_dir().parent().unwrap()).unwrap();
         fs::write(user_dirs.trust_record_dir(), b"sentinel").unwrap();
         let trust_before = fs::read(user_dirs.trust_record_dir()).unwrap();
+        let home_before = snapshot_tree_excluding(user_home.path(), user_dirs.plugin_cache_dir());
         let source = "example/widget";
         let version = SIGNED_FIXTURE_VERSION;
         let versions_url = "https://registry.carina-rs.dev/v1/providers/example/widget/versions";
@@ -18819,6 +18842,10 @@ transparency_log_present = true
 
         assert_eq!(http.request_count(artifact_url), 1);
         assert_eq!(
+            snapshot_tree_excluding(user_home.path(), user_dirs.plugin_cache_dir()),
+            home_before
+        );
+        assert_eq!(
             fs::read(user_dirs.trust_record_dir()).unwrap(),
             trust_before
         );
@@ -18827,12 +18854,12 @@ transparency_log_present = true
 
     #[test]
     fn registry_source_prints_first_use_pin_notice_once() {
-        let user_dirs = carina_core::TestUserDirs::new();
         const CHILD_ENV: &str = "CARINA_TEST_FIRST_USE_PIN_NOTICE";
         const TEST_NAME: &str =
             "provider_resolver::tests::registry_source_prints_first_use_pin_notice_once";
 
         if std::env::var_os(CHILD_ENV).is_some() {
+            let user_dirs = carina_core::TestUserDirs::new();
             let dir = tempfile::tempdir().unwrap();
             let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
             let mut lock_file = LockFile::default();
@@ -22324,6 +22351,7 @@ future_protection_field = "retain-me"
         fs::create_dir_all(user_dirs.trust_record_dir().parent().unwrap()).unwrap();
         fs::write(user_dirs.trust_record_dir(), b"sentinel").unwrap();
         let trust_before = fs::read(user_dirs.trust_record_dir()).unwrap();
+        let home_before = snapshot_tree_excluding(user_home.path(), user_dirs.plugin_cache_dir());
         let source = "github.com/carina-test-only/provider";
         let version = "1.2.3";
         let origin_bytes = b"third-party provider";
@@ -22346,6 +22374,10 @@ future_protection_field = "retain-me"
         }
 
         assert_eq!(github_http.requests().len(), 1);
+        assert_eq!(
+            snapshot_tree_excluding(user_home.path(), user_dirs.plugin_cache_dir()),
+            home_before
+        );
         assert_eq!(
             fs::read(user_dirs.trust_record_dir()).unwrap(),
             trust_before

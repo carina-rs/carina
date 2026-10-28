@@ -1,3 +1,5 @@
+#![cfg(feature = "test-utils")]
+
 use std::path::Path;
 
 use carina_core::UserDirs;

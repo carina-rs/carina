@@ -24,7 +24,7 @@ impl UserDirs {
     ///
     /// This is the only Carina API that discovers a home directory. Binary
     /// entry points call it once and pass the resulting value through library
-    /// code. Tests should use [`Self::under`] instead.
+    /// code. Tests should enable `test-utils` and use [`Self::under`] instead.
     pub fn from_real_home() -> Result<Self, UserDirsError> {
         // Home discovery belongs only at this process boundary. All library
         // consumers receive the resulting typed paths from their caller.
@@ -40,7 +40,19 @@ impl UserDirs {
     }
 
     /// Build every user-owned path beneath `root`, treating it as a home directory.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn under(root: &Path) -> Self {
+        Self::under_root(root)
+    }
+
+    /// Replace the trust-record directory in an isolated test configuration.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_trust_record_dir(mut self, trust_record_dir: PathBuf) -> Self {
+        self.trust_record_dir = trust_record_dir;
+        self
+    }
+
+    fn under_root(root: &Path) -> Self {
         let carina = root.join(".carina");
         Self {
             trust_record_dir: carina.join("trust"),
@@ -90,7 +102,7 @@ impl UserDirs {
             None
         };
 
-        let mut dirs = Self::under(&home);
+        let mut dirs = Self::under_root(&home);
         if let Some(value) = trust_record_override {
             let path = PathBuf::from(value);
             if !path.is_absolute() {

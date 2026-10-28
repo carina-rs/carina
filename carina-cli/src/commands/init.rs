@@ -358,7 +358,6 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -469,7 +468,6 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -482,7 +480,13 @@ mod tests {
         let first_user_root = tempfile::tempdir().unwrap();
         let fresh_user_root = tempfile::tempdir().unwrap();
         let first_user_dirs = UserDirs::under(first_user_root.path());
-        let fresh_user_dirs = UserDirs::under(fresh_user_root.path());
+        let fresh_user_dirs = first_user_dirs
+            .clone()
+            .with_trust_record_dir(fresh_user_root.path().join(".carina").join("trust"));
+        assert_eq!(
+            first_user_dirs.plugin_cache_dir(),
+            fresh_user_dirs.plugin_cache_dir()
+        );
         fs::write(
             project.path().join("providers.crn"),
             "provider aws {\n  source = 'carina-rs/aws'\n}\n",
@@ -496,6 +500,25 @@ mod tests {
         let lock_before = fs::read(&lock_path).unwrap();
         let downloads_before = request_count(&http, SIGNED_ARTIFACT_URL);
         assert_eq!(downloads_before, 1);
+        let project_wasm = project
+            .path()
+            .join(".carina/providers/carina-rs/aws")
+            .join(SIGNED_VERSION)
+            .join("aws.wasm");
+        let global_wasm = first_user_dirs
+            .plugin_cache_dir()
+            .join("carina-rs/aws")
+            .join(SIGNED_VERSION)
+            .join("aws.wasm");
+        // Model a warm shared cache whose verified bytes are not yet trusted by
+        // the fresh user.
+        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
+        fs::copy(&project_wasm, &global_wasm).unwrap();
+        assert!(
+            global_wasm.is_file(),
+            "warm shared global cache must contain {}",
+            global_wasm.display()
+        );
         assert_installed_provider_loads_as_aws(&first_user_dirs, project.path()).await;
 
         assert!(!tree_contains_file(fresh_user_dirs.trust_record_dir()));
@@ -575,7 +598,6 @@ mod tests {
 
     #[test]
     fn init_real_verifier_is_safe_on_current_thread_runtime() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -585,7 +607,6 @@ mod tests {
 
     #[test]
     fn init_real_verifier_is_safe_on_multi_thread_runtime() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

@@ -31,14 +31,6 @@ use std::num::NonZeroUsize;
 pub const DEFAULT_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 #[cfg(test)]
-pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(test)]
 pub(crate) fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new())
