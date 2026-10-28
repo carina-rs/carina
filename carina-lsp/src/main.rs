@@ -160,7 +160,7 @@ async fn main() {
 
     // Provider loading needs user-owned storage, but the rest of the language
     // server remains useful when that storage cannot be resolved.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(clippy::disallowed_methods)]
     let user_dirs = carina_core::UserDirs::from_real_home().map_err(|error| {
         let message = error.to_string();
         log::error!("LSP provider loading disabled: {message}");

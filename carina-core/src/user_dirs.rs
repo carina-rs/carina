@@ -28,7 +28,7 @@ impl UserDirs {
     pub fn from_real_home() -> Result<Self, UserDirsError> {
         // Home discovery belongs only at this process boundary. All library
         // consumers receive the resulting typed paths from their caller.
-        #[allow(clippy::disallowed_methods)]
+        #[expect(clippy::disallowed_methods)]
         let home = dirs::home_dir().ok_or(UserDirsError::HomeDirectoryUnavailable)?;
         Self::from_home_and_environment(
             home,

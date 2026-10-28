@@ -1,3 +1,4 @@
+nextest-version = { required = "0.9.133" }
 experimental = ["setup-scripts"]
 
 [scripts.setup.carina-user-dirs]

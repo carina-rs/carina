@@ -373,7 +373,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
 fn resolve_user_dirs() -> Result<carina_core::UserDirs, error::AppError> {
     // Home discovery is intentionally confined to this binary boundary and
     // invoked only by command arms that use user-owned storage.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(clippy::disallowed_methods)]
     carina_core::UserDirs::from_real_home().map_err(Into::into)
 }
 
