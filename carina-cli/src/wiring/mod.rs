@@ -1577,6 +1577,7 @@ pub fn normalize_state_with_ctx(
     // before a later async factory call.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
+        .enable_all()
         .build()
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();

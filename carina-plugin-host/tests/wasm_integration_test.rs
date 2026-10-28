@@ -9,9 +9,10 @@ use carina_core::executor::complete_create_for_writeback;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateOutcome,
     CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Observation, Provider,
-    ProviderFactory, ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest,
-    ResumeFailure, ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent,
-    SentRecord, UpdateRequest, hydrate_provider_states, normalize_provider_states,
+    ProviderError, ProviderFactory, ProviderReadyConfig, RawSavedAttrs, ReadRequest,
+    ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind,
+    SavedAttrs, Sent, SentRecord, UpdateRequest, hydrate_provider_states,
+    normalize_provider_states,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
@@ -19,7 +20,7 @@ use carina_core::resource::{
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
-use carina_plugin_host::WasmProviderFactory;
+use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
@@ -224,6 +225,14 @@ fn resource_with_string_attribute(
         Value::Concrete(ConcreteValue::String(value.to_string().into())),
     );
     resource
+}
+
+fn create_failure_error(failure: CreateFailure) -> ProviderError {
+    match failure.into_kind() {
+        CreateFailureKind::Untracked(error) => error,
+        CreateFailureKind::InFlight { pending: _, error } => error,
+        CreateFailureKind::Created { created: _, error } => error,
+    }
 }
 
 fn persisted_create_for_resume(
@@ -1165,6 +1174,217 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_production_budget_allows_25s_host_wait() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-25s", None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        "host-wait-25s",
+        "call_delay_millis",
+        25_000,
+    );
+
+    provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect("a host wait below the compute budget should succeed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_production_budget_allows_35s_host_wait() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-35s", None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        "host-wait-35s",
+        "call_delay_millis",
+        35_000,
+    );
+
+    provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect("time parked in a host import must not consume guest compute budget");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_short_compute_budget_excludes_5s_host_wait() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-5s", None);
+    let resource =
+        resource_with_int_attribute("test.resource", "host-wait-5s", "call_delay_millis", 5_000);
+
+    provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect("host wait longer than the compute budget should succeed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(2),
+        Duration::from_secs(60),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "spin-forever", None);
+    let mut resource = resource_with_int_attribute("test.resource", "spin-forever", "value", 1);
+    resource.set_attr(
+        "call_spin_forever",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let started = Instant::now();
+
+    let error = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("busy guest computation should exhaust its compute budget");
+    let elapsed = started.elapsed();
+    let error = create_failure_error(error);
+    let rendered = error.to_string();
+
+    assert!(matches!(error, ProviderError::Timeout(_)), "{rendered}");
+    assert!(rendered.contains("guest compute budget"), "{rendered}");
+    assert!(
+        !rendered.to_lowercase().contains("credential"),
+        "{rendered}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "compute timeout should fire well before the wall budget; elapsed {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(2),
+        Duration::from_secs(60),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "spin-with-host-calls-forever",
+        None,
+    );
+    let mut resource =
+        resource_with_int_attribute("test.resource", "spin-with-host-calls-forever", "value", 1);
+    resource.set_attr(
+        "call_spin_with_host_calls_forever",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let started = Instant::now();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.create_for_test(&id, create_request_for_test(resource).await),
+    )
+    .await
+    .expect("compute timeout should fire within 10s even when the guest calls host imports")
+    .expect_err("guest computation should exhaust its compute budget across host calls");
+    let elapsed = started.elapsed();
+    let error = create_failure_error(error);
+    let rendered = error.to_string();
+
+    assert!(matches!(error, ProviderError::Timeout(_)), "{rendered}");
+    assert!(rendered.contains("guest compute budget"), "{rendered}");
+    assert!(
+        !rendered.to_lowercase().contains("credential"),
+        "{rendered}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "compute timeout should fire well before the wall budget; elapsed {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_short_wall_budget_times_out_host_wait() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "wall-timeout", None);
+    let resource =
+        resource_with_int_attribute("test.resource", "wall-timeout", "call_delay_millis", 10_000);
+    let started = Instant::now();
+
+    let error = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the whole guest call should be bounded by its wall budget");
+    let elapsed = started.elapsed();
+    let error = create_failure_error(error);
+    let rendered = error.to_string();
+
+    assert!(matches!(error, ProviderError::Timeout(_)), "{rendered}");
+    let cause = error
+        .detail()
+        .cause()
+        .expect("wall timeout must retain its typed cause");
+    assert!(
+        cause.source().is_some(),
+        "the operation-aware timeout cause must retain WallBudgetExceeded"
+    );
+    assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert_eq!(
+        rendered.matches("wall-clock budget").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("credential"),
+        "{rendered}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
+        "wall timeout should fire after about 2s; elapsed {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -1200,10 +1420,66 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "test-utils")]
+async fn test_wasm_short_wall_budget_times_out_validate_config() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    ));
+    let attributes = indexmap::IndexMap::from([(
+        "validate_delay_millis".to_string(),
+        Value::Concrete(ConcreteValue::Int(10_000)),
+    )]);
+    let config = resolved_provider_config(factory.name(), attributes);
+    let started = Instant::now();
+
+    let error = carina_core::executor::prepare_provider_ready_config(&factory, &config)
+        .expect_err("validate_config should be bounded by the guest wall budget");
+    let elapsed = started.elapsed();
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("validate_config"), "{rendered}");
+    assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert!(
+        !rendered.to_lowercase().contains("credential"),
+        "{rendered}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
+        "validate_config should time out after about 2s; elapsed {elapsed:?}"
+    );
+
+    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    let retry_started = Instant::now();
+    let retry_error = carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect_err("the timed-out init instance must remain poisoned");
+    let retry_elapsed = retry_started.elapsed();
+    let retry_rendered = retry_error.to_string();
+
+    assert!(
+        retry_rendered.contains("unusable after wall-clock timeout in validate_config"),
+        "{retry_rendered}"
+    );
+    assert!(
+        !retry_rendered.contains("cannot enter component instance"),
+        "the follow-up must report the original poison reason: {retry_rendered}"
+    );
+    assert!(
+        retry_elapsed < Duration::from_secs(1),
+        "a poisoned init instance must fail fast; elapsed {retry_elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
 async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let factory = factory.with_operation_hard_timeout(Duration::from_secs(1));
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    ));
     let provider = factory
         .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
