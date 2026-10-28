@@ -588,7 +588,16 @@ mod tests {
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
 
         let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = test_source();
+        let expected_sha256 = "0".repeat(64);
+        crate::verified_artifact::record_test_github_origin_download(
+            &source.source_key(),
+            &expected_sha256,
+            None,
+        )
+        .unwrap();
         let wasm_path = cache_path_revision(dir.path(), &source, TEST_SHA);
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::write(&wasm_path, b"tampered provider").unwrap();
@@ -600,7 +609,7 @@ mod tests {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
             },
-            sha256: "expected-sha256".into(),
+            sha256: expected_sha256,
             registry: None,
         });
 

@@ -7450,6 +7450,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use futures::executor::block_on;
     use indexmap::IndexMap;
     use std::io::Write;
 
@@ -14869,8 +14870,8 @@ transparency_log_present = true
         );
     }
 
-    #[tokio::test]
-    async fn registry_signed_origin_install_writes_user_trust() {
+    #[test]
+    fn registry_signed_origin_install_writes_user_trust() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -14893,12 +14894,12 @@ transparency_log_present = true
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let class = installed
-            .load_with(&no_local_grants(), |verified| async move {
+        let class = block_on(
+            installed.load_with(&no_local_grants(), |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            })
-            .await
-            .unwrap();
+            }),
+        )
+        .unwrap();
 
         assert_eq!(
             http.request_count("https://downloads.example.test/aws.wasm"),
@@ -17402,8 +17403,8 @@ transparency_log_present = false
         assert!(http.was_requested(&wasm_url));
     }
 
-    #[tokio::test]
-    async fn github_origin_install_writes_user_trust_and_loads_as_aws() {
+    #[test]
+    fn github_origin_install_writes_user_trust_and_loads_as_aws() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -17430,12 +17431,12 @@ transparency_log_present = false
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let class = installed
-            .load_with(&no_local_grants(), |verified| async move {
+        let class = block_on(
+            installed.load_with(&no_local_grants(), |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            })
-            .await
-            .unwrap();
+            }),
+        )
+        .unwrap();
 
         assert!(http.was_requested(&wasm_url));
         assert!(
@@ -18340,8 +18341,8 @@ transparency_log_present = false
         assert_eq!(error.identity_error().unwrap().configured_name(), "foo");
     }
 
-    #[tokio::test]
-    async fn trusted_remote_source_rejects_disagreeing_configured_name_before_loader() {
+    #[test]
+    fn trusted_remote_source_rejects_disagreeing_configured_name_before_loader() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -18379,13 +18380,14 @@ transparency_log_present = false
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
-        let error = installed
-            .load_with(&no_local_grants(), move |_verified| async move {
+        let error = block_on(installed.load_with(
+            &no_local_grants(),
+            move |_verified| async move {
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, std::convert::Infallible>(())
-            })
-            .await
-            .unwrap_err();
+            },
+        ))
+        .unwrap_err();
 
         assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
         let identity_error = error.identity_error().unwrap();
@@ -18393,8 +18395,8 @@ transparency_log_present = false
         assert_eq!(identity_error.expected(), "aws");
     }
 
-    #[tokio::test]
-    async fn remote_lock_and_project_artifact_without_user_trust_are_untrusted_and_hint_once() {
+    #[test]
+    fn remote_lock_and_project_artifact_without_user_trust_are_untrusted_and_hint_once() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18422,16 +18424,14 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
         let mut emitted = Vec::new();
 
-        let class = installed
-            .load_with_notice_sink(
-                &no_local_grants(),
-                |line| emitted.push(line.to_string()),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-                },
-            )
-            .await
-            .unwrap();
+        let class = block_on(installed.load_with_notice_sink(
+            &no_local_grants(),
+            |line| emitted.push(line.to_string()),
+            |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            },
+        ))
+        .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert_eq!(
@@ -18443,8 +18443,8 @@ transparency_log_present = false
         );
     }
 
-    #[tokio::test]
-    async fn broken_remote_user_trust_record_warns_and_is_untrusted() {
+    #[test]
+    fn broken_remote_user_trust_record_warns_and_is_untrusted() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18479,16 +18479,14 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
         let mut emitted = Vec::new();
 
-        let class = installed
-            .load_with_notice_sink(
-                &no_local_grants(),
-                |line| emitted.push(line.to_string()),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-                },
-            )
-            .await
-            .unwrap();
+        let class = block_on(installed.load_with_notice_sink(
+            &no_local_grants(),
+            |line| emitted.push(line.to_string()),
+            |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            },
+        ))
+        .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert!(
@@ -18499,8 +18497,8 @@ transparency_log_present = false
         );
     }
 
-    #[tokio::test]
-    async fn official_github_revision_without_user_trust_is_untrusted_and_hinted() {
+    #[test]
+    fn official_github_revision_without_user_trust_is_untrusted_and_hinted() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18533,16 +18531,14 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
         let mut emitted = Vec::new();
 
-        let class = installed
-            .load_with_notice_sink(
-                &no_local_grants(),
-                |line| emitted.push(line.to_string()),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-                },
-            )
-            .await
-            .unwrap();
+        let class = block_on(installed.load_with_notice_sink(
+            &no_local_grants(),
+            |line| emitted.push(line.to_string()),
+            |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            },
+        ))
+        .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert_eq!(emitted.len(), 1);
@@ -18555,8 +18551,8 @@ transparency_log_present = false
         );
     }
 
-    #[tokio::test]
-    async fn load_identity_uses_user_record_signer_instead_of_lock_signer() {
+    #[test]
+    fn load_identity_uses_user_record_signer_instead_of_lock_signer() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18588,16 +18584,14 @@ transparency_log_present = false
         let installed = find_installed_provider(project.path(), &config).unwrap();
         let mut emitted = Vec::new();
 
-        let class = installed
-            .load_with_notice_sink(
-                &no_local_grants(),
-                |line| emitted.push(line.to_string()),
-                |verified| async move {
-                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-                },
-            )
-            .await
-            .unwrap();
+        let class = block_on(installed.load_with_notice_sink(
+            &no_local_grants(),
+            |line| emitted.push(line.to_string()),
+            |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            },
+        ))
+        .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert!(
