@@ -1,5 +1,6 @@
 //! Provider resolution: download, cache, and verify provider WASM components.
 
+mod github;
 mod install_lock;
 pub mod provider_resolver;
 pub mod revision_resolver;
@@ -11,7 +12,8 @@ pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
 pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact};
 pub use version_resolver::{
-    ResolvedVersion, fetch_latest_tag, fetch_release_tags, resolve_from_tags,
+    GithubRelease, ReleaseAsset, ReleaseAssetSelectionError, ReleaseResolutionError, ReleaseTag,
+    resolve_from_releases, select_release_asset,
 };
 
 #[cfg(test)]

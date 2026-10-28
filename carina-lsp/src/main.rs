@@ -46,9 +46,12 @@ fn resolve_install(
         ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(config),
         ProviderSource::Remote(_) => {
             carina_provider_resolver::find_installed_provider(source_dir, config)
+                .map_err(|error| error.to_string())
         }
     }
-    .map_err(|message| InstallRejection::ResolutionFailed { message })?;
+    .map_err(|error| InstallRejection::ResolutionFailed {
+        message: error.to_string(),
+    })?;
     // Both resolver functions only construct `InstalledProvider` after their
     // selected path exists, so a second `.exists()` check here was unreachable.
     Ok(installed)
@@ -316,8 +319,10 @@ mod tests {
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
             source: source.into(),
-            kind: carina_provider_resolver::LockEntryKind::Version {
+            kind: carina_provider_resolver::LockEntryKind::GithubRelease {
                 version: version.into(),
+                tag: serde_json::from_str("\"v0.5.0\"").unwrap(),
+                asset_id: 42,
                 constraint: None,
             },
             sha256: "pinned-sha256".into(),

@@ -7444,8 +7444,10 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
         source: source.into(),
-        kind: carina_provider_resolver::LockEntryKind::Version {
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
             version: "1.0.0".into(),
+            tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
+            asset_id: 42,
             constraint: None,
         },
         sha256: "fixture".into(),
@@ -7581,8 +7583,10 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
         source: source.into(),
-        kind: carina_provider_resolver::LockEntryKind::Version {
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
             version: "1.0.0".into(),
+            tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
+            asset_id: 42,
             constraint: None,
         },
         sha256: "fixture".into(),

@@ -1,11 +1,12 @@
 //! Resolve provider binaries from GitHub Actions CI artifacts by git revision.
 
 use serde::Deserialize;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use carina_core::provider_source::GithubSource;
 
+use crate::github::{GithubApi, GithubHttp, UreqGithubHttp};
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
     global_cache_artifact_path, install_global_artifact_atomically,
@@ -79,30 +80,22 @@ pub fn resolve_ref_to_sha(
     revision: &str,
     token: &str,
 ) -> Result<String, String> {
+    let http = UreqGithubHttp;
+    let api = GithubApi::new(&http, Some(token));
+    resolve_ref_to_sha_with_api(source, revision, &api)
+}
+
+fn resolve_ref_to_sha_with_api<H: GithubHttp + ?Sized>(
+    source: &GithubSource,
+    revision: &str,
+    api: &GithubApi<'_, H>,
+) -> Result<String, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/{revision}");
-
-    let response = ureq::get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("User-Agent", "carina")
-        .call()
-        .map_err(|e| format!("Failed to resolve revision '{revision}' for {source}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "GitHub API returned status {} when resolving revision '{revision}' for {source}",
-            response.status()
-        ));
-    }
-
-    let body: String = response
-        .into_body()
-        .read_to_string()
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
-    let commit: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
+    let commit: serde_json::Value = api.get_json(&url).map_err(|error| {
+        format!("Failed to resolve revision '{revision}' for {source}: {error}")
+    })?;
 
     commit
         .get("sha")
@@ -118,10 +111,10 @@ pub fn resolve_ref_to_sha(
 /// both triggered on push to main). The caller is responsible for picking the
 /// run that actually contains the expected artifact — see
 /// [`select_artifact_from_runs`].
-fn find_workflow_run_ids(
+fn find_workflow_run_ids<H: GithubHttp + ?Sized>(
     source: &GithubSource,
     sha: &str,
-    token: &str,
+    api: &GithubApi<'_, H>,
 ) -> Result<Vec<u64>, String> {
     let owner = source.owner();
     let repo = source.repo();
@@ -129,61 +122,27 @@ fn find_workflow_run_ids(
         "https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={sha}&status=success&per_page=10"
     );
 
-    let response = ureq::get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("User-Agent", "carina")
-        .call()
-        .map_err(|e| format!("Failed to fetch workflow runs for {source}@{sha}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "GitHub API returned status {} when fetching workflow runs",
-            response.status()
-        ));
-    }
-
-    let body: String = response
-        .into_body()
-        .read_to_string()
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
-    let data: WorkflowRunsResponse =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
+    let data: WorkflowRunsResponse = api
+        .get_json(&url)
+        .map_err(|error| format!("Failed to fetch workflow runs for {source}@{sha}: {error}"))?;
 
     Ok(data.workflow_runs.into_iter().map(|r| r.id).collect())
 }
 
 /// Fetch the artifacts list for a single workflow run.
-fn fetch_run_artifacts(
+fn fetch_run_artifacts<H: GithubHttp + ?Sized>(
     source: &GithubSource,
     run_id: u64,
-    token: &str,
+    api: &GithubApi<'_, H>,
 ) -> Result<Vec<Artifact>, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url =
         format!("https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts");
 
-    let response = ureq::get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("User-Agent", "carina")
-        .call()
-        .map_err(|e| format!("Failed to fetch artifacts for run {run_id}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "GitHub API returned status {} when fetching artifacts",
-            response.status()
-        ));
-    }
-
-    let body: String = response
-        .into_body()
-        .read_to_string()
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
-    let data: ArtifactsResponse =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
+    let data: ArtifactsResponse = api
+        .get_json(&url)
+        .map_err(|error| format!("Failed to fetch artifacts for run {run_id}: {error}"))?;
     Ok(data.artifacts)
 }
 
@@ -269,38 +228,21 @@ where
 }
 
 /// Download a GitHub Actions artifact (ZIP) and extract the WASM file.
-fn download_artifact<'lock>(
+fn download_artifact<'lock, H: GithubHttp + ?Sized>(
     install_lock: &'lock ProviderInstallLock,
     source: &GithubSource,
     artifact_id: u64,
     destination: &WasmArtifactPath,
-    token: &str,
+    api: &GithubApi<'_, H>,
 ) -> Result<StagedArtifact<'lock>, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url =
         format!("https://api.github.com/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip");
 
-    let response = ureq::get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("User-Agent", "carina")
-        .call()
-        .map_err(|e| format!("Failed to download artifact {artifact_id}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "GitHub API returned status {} when downloading artifact",
-            response.status()
-        ));
-    }
-
-    let mut zip_data = Vec::new();
-    response
-        .into_body()
-        .into_reader()
-        .read_to_end(&mut zip_data)
-        .map_err(|e| format!("Failed to read artifact data: {e}"))?;
+    let zip_data = api
+        .get_bytes(&url, "application/vnd.github+json")
+        .map_err(|error| format!("Failed to download artifact {artifact_id}: {error}"))?;
 
     // Extract the .wasm file from the ZIP
     let cursor = io::Cursor::new(zip_data);
@@ -384,9 +326,22 @@ pub fn resolve_provider_by_revision(
     name: &str,
     upgrade: bool,
 ) -> Result<(WasmArtifactPath, String), String> {
+    let token = get_github_token()?;
+    let http = UreqGithubHttp;
+    let api = GithubApi::new(&http, Some(&token));
+    resolve_provider_by_revision_with_api(lock_file, source, revision, name, upgrade, &api)
+}
+
+pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
+    lock_file: &mut GuardedLockFile<'_>,
+    source: &GithubSource,
+    revision: &str,
+    name: &str,
+    upgrade: bool,
+    api: &GithubApi<'_, H>,
+) -> Result<(WasmArtifactPath, String), String> {
     let install_lock = lock_file.install_lock();
     let base_dir = install_lock.project_dir();
-    let token = get_github_token()?;
     let source_key = source.source_key();
 
     // 1. Resolve revision to SHA
@@ -405,7 +360,7 @@ pub fn resolve_provider_by_revision(
             "Resolving revision '{}' for provider '{}'...",
             revision, name
         );
-        resolve_ref_to_sha(source, revision, &token)?
+        resolve_ref_to_sha_with_api(source, revision, api)?
     };
 
     let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
@@ -466,13 +421,13 @@ pub fn resolve_provider_by_revision(
         &sha[..sha.len().min(12)]
     );
 
-    let run_ids = find_workflow_run_ids(source, &sha, &token)?;
+    let run_ids = find_workflow_run_ids(source, &sha, api)?;
     let expected_name = format!("{}.wasm", source.repo());
     let artifact_id =
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
-            fetch_run_artifacts(source, run_id, &token)
+            fetch_run_artifacts(source, run_id, api)
         })?;
-    let staged = download_artifact(install_lock, source, artifact_id, &wasm_path, &token)?;
+    let staged = download_artifact(install_lock, source, artifact_id, &wasm_path, api)?;
     let installed_path = match publish_download(staged, artifact_pin)? {
         DownloadedArtifact::Verified { artifact, pin } => {
             record_verified_revision_pin(lock_file, &artifact, pin, name);
