@@ -19,7 +19,7 @@ provider 'hello' was built against protocol version 10 but this host requires at
 provider 'hello' was built against protocol version 13 but this host supports up to version 12; upgrade carina to load this provider
 ```
 
-So far every release has set the minimum equal to its own version, so a provider has to be built for exactly the protocol version of the Carina that loads it:
+Since v0.5.0, the first release that checks the version, every release has set the minimum equal to its own version, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|

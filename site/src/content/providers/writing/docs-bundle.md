@@ -34,7 +34,7 @@ The registry checks every rule when a version is published and refuses a bundle 
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
 
-Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when one plus the largest number of `|` characters on any line, multiplied by its number of lines, exceeds 250,000. Each page's rendered HTML is capped at 2 MiB, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
+Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when one plus the largest number of `|` characters on any line, multiplied by its number of lines, exceeds 250,000. Each page's Markdown may render to at most 2 MiB of HTML, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
 
 Docs are accepted only for stable versions. A pre-release publish that carries a docs bundle is refused as a whole, so attach docs only to stable releases. A version's docs are fixed when it is first published: corrected docs ship with the next version.
 
@@ -51,7 +51,7 @@ The registry treats documentation as untrusted input. It renders GitHub Flavored
 
 Build the archive reproducibly: entries sorted by name, a fixed modification time, owner and group 0, and no timestamp in the gzip header. A publish that is retried compares the archive's digest, so a rebuild that produces different bytes from the same files is refused as a conflict.
 
-This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, skips hidden files such as `.DS_Store`, and stops on any other file, which the registry would refuse. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
+This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8 or the Markdown limits in the table above. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
 
 ```python
 #!/usr/bin/env python3
@@ -61,22 +61,29 @@ Usage: build-docs-bundle.py <docs-dir> <output.tar.gz>
 """
 import gzip
 import io
+import os
 import re
 import sys
 import tarfile
 from pathlib import Path
 
 src, out = Path(sys.argv[1]), Path(sys.argv[2])
-allowed = re.compile(r"index\.md|(resources|data-sources)/[a-z0-9][a-z0-9_]*\.md")
+allowed = re.compile(r"index\.md|(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md")
 
 files, unexpected = [], []
-for path in sorted(p for p in src.rglob("*") if p.is_file()):
-    name = path.relative_to(src).as_posix()
-    if any(part.startswith(".") for part in path.relative_to(src).parts):
-        continue  # editor and OS files such as .DS_Store
-    (files if allowed.fullmatch(name) else unexpected).append((name, path))
+for root, dirs, names in os.walk(src, followlinks=True):
+    dirs[:] = [d for d in dirs if not d.startswith(".")]
+    for file_name in names:
+        if file_name.startswith("."):
+            continue  # editor and OS files such as .DS_Store
+        path = Path(root, file_name)
+        name = path.relative_to(src).as_posix()
+        (files if allowed.fullmatch(name) else unexpected).append((name, path))
+files.sort()
 if unexpected:
-    sys.exit("not allowed in a docs bundle: " + ", ".join(n for n, _ in unexpected))
+    sys.exit("not allowed in a docs bundle: " + ", ".join(sorted(n for n, _ in unexpected)))
+if not any(name == "index.md" for name, _ in files):
+    sys.exit("index.md is missing")
 
 buf = io.BytesIO()
 with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
@@ -99,7 +106,7 @@ with open(out, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename
 python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 ```
 
-Attach the archive to the same GitHub release as the `.wasm`. The registry fetches it from that URL when the version is published. When the version is signed, the same release workflow run must also sign the archive's digest, in the same way as the `.wasm`; the registry refuses docs signed by another run, or not signed at all. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
+Attach the archive to the same GitHub release as the `.wasm`. The registry fetches it from that URL when the version is published. When the version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
 
 There is no standalone checker for these rules yet; the registry runs them at publish. Making the registry's own validator available to providers is tracked in [carina-rs/registry#139](https://github.com/carina-rs/registry/issues/139).
 
