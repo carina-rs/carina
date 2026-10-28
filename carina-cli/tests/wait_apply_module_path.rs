@@ -517,17 +517,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ]),
         &parsed.providers,
     );
-    let errs = validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        true,
-        &inference_errors,
-        &[],
-    );
-    assert!(errs.is_empty(), "expand stage must succeed: {errs:?}");
+    let wiring = providers
+        .validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors, &[])
+        .expect("expand stage must succeed");
 
-    let ctx = providers.context();
+    let ctx = wiring.context();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();

@@ -42,8 +42,8 @@ use crate::commands::shared::state_writeback::{
 use crate::commands::state::run_state_refresh_locked;
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    ProviderLoad, WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names,
-    resolve_attr_prefixes, resolve_names, validate_resources,
+    ProviderLoad, ValidatedWiring, WiringContext, compute_anonymous_identifiers,
+    reconcile_prefixed_names, resolve_attr_prefixes, resolve_names, validate_resources,
 };
 use carina_core::parser::BackendConfig;
 use carina_core::provider::{Provider, ProviderFactory};
@@ -118,8 +118,10 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
             }) as Box<dyn ProviderFactory>
         })
         .collect();
-    let ctx =
-        WiringContext::new_for_test(factories, contents.provider_configs.as_provider_configs());
+    let ctx = ValidatedWiring::from_factories_for_test(
+        factories,
+        contents.provider_configs.as_provider_configs(),
+    );
     contents
         .record(&ctx)
         .expect("test plan provider evidence must be valid")
@@ -2135,6 +2137,9 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
+    let wiring = providers
+        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .unwrap();
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
@@ -2142,7 +2147,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
-        providers.context(),
+        &wiring,
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -2181,6 +2186,9 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let mut parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
+    let wiring = providers
+        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .unwrap();
 
     let result = run_state_refresh_locked(
         &mut parsed,
@@ -2189,7 +2197,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
-        providers.context(),
+        &wiring,
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -2246,6 +2254,9 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let mut parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
+    let wiring = providers
+        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .unwrap();
 
     let result = run_state_refresh_locked(
         &mut parsed,
@@ -2254,7 +2265,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
-        providers.context(),
+        &wiring,
     )
     .await;
 
@@ -3699,8 +3710,8 @@ fn builtin_mock_provider_config() -> ProviderConfig {
     }
 }
 
-fn builtin_mock_recording_context() -> WiringContext {
-    WiringContext::new_for_test(Vec::new(), &[builtin_mock_provider_config()])
+fn builtin_mock_recording_context() -> ValidatedWiring {
+    ValidatedWiring::from_factories_for_test(Vec::new(), &[builtin_mock_provider_config()])
 }
 
 #[test]
@@ -3817,7 +3828,7 @@ fn zero_referenced_provider_plan_round_trips() {
     contents.current_states.clear();
 
     let recorded = contents
-        .record(&WiringContext::new_for_test(Vec::new(), &[]))
+        .record(&ValidatedWiring::from_factories_for_test(Vec::new(), &[]))
         .expect("providerless evidence must record the built-in mock");
     assert!(recorded.schema_fingerprints().providers.is_empty());
     assert_eq!(
@@ -3856,7 +3867,7 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
         )),
     )];
 
-    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
+    let ctx = ValidatedWiring::from_factories_for_test(Vec::new(), &[]);
     let recorded = contents
         .record(&ctx)
         .expect("a state-only type from an unloaded provider must record");
@@ -3907,7 +3918,7 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     contents.sorted_resources.clear();
     contents.current_states.clear();
 
-    let ctx = WiringContext::new_for_test(Vec::new(), &[configured]);
+    let ctx = ValidatedWiring::from_factories_for_test(Vec::new(), &[configured]);
     let error = contents
         .record(&ctx)
         .expect_err("a configured provider without a loaded artifact must be rejected");

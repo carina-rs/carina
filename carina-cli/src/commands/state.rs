@@ -49,7 +49,7 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, ProviderLoad, WiringContext, get_provider_with_ctx,
+    AddressedDataSourceReadInputs, ProviderLoad, ValidatedWiring, get_provider_with_ctx,
     prepare_default_provider_ready_config, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
 };
@@ -880,12 +880,14 @@ async fn run_state_bucket_delete(
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
+    )?;
+    let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
+    let mut parsed = loaded.parsed;
 
     let backend_config = parsed
         .backend
@@ -935,12 +937,16 @@ async fn run_state_bucket_delete(
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
     let providers = ProviderLoad::load(provider_inputs.configs().as_provider_configs(), base_dir)?;
-    let bucket_provider = create_state_bucket_delete_provider(
-        providers.context(),
-        provider_inputs.configs(),
-        provider_name,
-    )
-    .await?;
+    let wiring = providers.validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
+    let bucket_provider =
+        create_state_bucket_delete_provider(&wiring, provider_inputs.configs(), provider_name)
+            .await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -1000,10 +1006,11 @@ async fn load_state_bucket_delete_provider_inputs<E>(
 }
 
 async fn create_state_bucket_delete_provider(
-    ctx: &WiringContext,
+    wiring: &ValidatedWiring,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     provider_name: &str,
 ) -> Result<Box<dyn carina_core::provider::Provider>, AppError> {
+    let ctx = wiring.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
@@ -1031,10 +1038,9 @@ pub async fn run_state_refresh(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    crate::commands::validate_and_resolve_with_config(
+    let wiring = providers.validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
-        &providers,
         true,
         &inference_errors,
         &duplicate_declarations,
@@ -1075,7 +1081,7 @@ pub async fn run_state_refresh(
         base_dir,
         provider_context,
         cancel.clone(),
-        providers.context(),
+        &wiring,
     )
     .await;
 
@@ -1098,8 +1104,9 @@ pub(crate) async fn run_state_refresh_locked(
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
-    ctx: &WiringContext,
+    wiring: &ValidatedWiring,
 ) -> Result<(), AppError> {
+    let ctx = wiring.context();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -2395,7 +2402,7 @@ mod tests {
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2410,7 +2417,7 @@ mod tests {
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &ctx,
+            &wiring,
         )
         .await
         .expect("state refresh must construct the provider from resolved upstream attributes");
@@ -2440,7 +2447,7 @@ mod tests {
                 source: PathBuf::from("../unrelated"),
             });
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &parsed.providers,
         );
@@ -2452,7 +2459,7 @@ mod tests {
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &ctx,
+            &wiring,
         )
         .await
         .expect("state refresh must not load an upstream unused by provider configuration");
@@ -2470,7 +2477,7 @@ mod tests {
         )
         .unwrap();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &parsed.providers,
         );
@@ -2483,7 +2490,7 @@ mod tests {
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &ctx,
+            &wiring,
         )
         .await
         {
@@ -2522,6 +2529,9 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
+        let wiring = providers
+            .validate_and_resolve_with_config(&mut parsed, &downstream, true, &[], &[])
+            .unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2530,7 +2540,7 @@ mod tests {
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            providers.context(),
+            &wiring,
         )
         .await
         .expect("state refresh must return before resolving providers when no local state exists");
@@ -2541,6 +2551,9 @@ mod tests {
         let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
+        let wiring = providers
+            .validate_and_resolve_with_config(&mut parsed, &base_dir, true, &[], &[])
+            .unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2549,7 +2562,7 @@ mod tests {
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            providers.context(),
+            &wiring,
         )
         .await
         .expect("state refresh must defer provider default tags until resource normalization");
@@ -2560,6 +2573,9 @@ mod tests {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
+        let wiring = providers
+            .validate_and_resolve_with_config(&mut parsed, &base_dir, true, &[], &[])
+            .unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2568,7 +2584,7 @@ mod tests {
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            providers.context(),
+            &wiring,
         )
         .await
         .expect("state refresh must not load upstream state used only by default tags");
@@ -2585,7 +2601,7 @@ mod tests {
         .await
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let ctx = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2646,7 +2662,7 @@ mod tests {
         .await
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let ctx = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2690,7 +2706,7 @@ mod tests {
         .await
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let ctx = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -3000,7 +3016,7 @@ mod tests {
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
                 trigger,
@@ -3016,7 +3032,7 @@ mod tests {
             temp.path(),
             &ProviderContext::default(),
             cancel,
-            &ctx,
+            &wiring,
         )
         .await
         .expect_err("graceful cancellation must interrupt state refresh");
@@ -3089,7 +3105,7 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
             })],
@@ -3104,7 +3120,7 @@ mod tests {
             temp.path(),
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &ctx,
+            &wiring,
         )
         .await
         .expect("an unrelated module constraint must not block a data-source read");
@@ -3165,7 +3181,7 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &parsed.providers,
         );
@@ -3178,7 +3194,7 @@ mod tests {
             temp.path(),
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &ctx,
+            &wiring,
         )
         .await
         .expect("an unrelated module constraint cannot block an absent data-source phase");

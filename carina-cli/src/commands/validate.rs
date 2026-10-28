@@ -306,16 +306,15 @@ pub fn run_validate(
     let (providers, provider_load_error) =
         ProviderLoad::load_reporting(&parsed.providers, base_dir);
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
-    let validation_errors = super::validate_and_resolve_errors(
+    let validation_report = providers.validation_report(
         &mut parsed,
         base_dir,
-        &providers,
         false,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     parsed.print_warnings_from(printed_warning_count);
-    error_reports.extend(validation_errors.iter().map(ToString::to_string));
+    error_reports.extend(validation_report.errors().iter().map(ToString::to_string));
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
@@ -324,7 +323,7 @@ pub fn run_validate(
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
         &loaded.authored_bindings,
-        providers.context().schemas(),
+        validation_report.schemas(),
     );
 
     // Check for duplicate attribute keys

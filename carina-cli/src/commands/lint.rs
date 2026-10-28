@@ -70,7 +70,7 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     let (providers, provider_factory_error) =
         ProviderLoad::load_reporting(&parsed.providers, base_dir);
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
-    let schemas = providers.context().schemas();
+    let schemas = providers.schemas();
 
     // Report invalid root-owned module blocks through lint's collected,
     // path-prefixed output. The resolver enforces the same invariants as

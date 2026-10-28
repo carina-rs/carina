@@ -53,7 +53,7 @@ use crate::plan_image::{
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LoadedProviderArtifact, ProviderLoad, WiringContext,
+    LoadedProviderArtifact, ProviderLoad, ValidatedWiring, WiringContext,
     create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
@@ -946,7 +946,8 @@ impl Deref for PlanFile {
 impl PlanFileContents {
     /// Atomically bind these contents to the schemas and provider artifacts
     /// loaded in the planning context.
-    pub fn record(self, ctx: &WiringContext) -> Result<PlanFile, ProviderEvidenceError> {
+    pub fn record(self, wiring: &ValidatedWiring) -> Result<PlanFile, ProviderEvidenceError> {
+        let ctx = wiring.context();
         let references = self.referenced_schema_types();
         let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
         Ok(PlanFile {
@@ -2472,7 +2473,10 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record(&crate::wiring::WiringContext::new_for_test(Vec::new(), &[]))
+        .record(&crate::wiring::ValidatedWiring::from_factories_for_test(
+            Vec::new(),
+            &[],
+        ))
         .expect("test plan provider evidence must be valid")
     }
 
@@ -2637,7 +2641,10 @@ mod managed_current_serde_tests {
             to: ResolvedResourceId::new(destination.clone()),
         });
         let plan = contents
-            .record(&crate::wiring::WiringContext::new_for_test(Vec::new(), &[]))
+            .record(&crate::wiring::ValidatedWiring::from_factories_for_test(
+                Vec::new(),
+                &[],
+            ))
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
@@ -2710,7 +2717,7 @@ fn build_plan_file<E>(
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-    wiring: &WiringContext,
+    wiring: &ValidatedWiring,
 ) -> Result<PlanFile, PlanSaveError> {
     assert_eq!(
         ctx.data_sources.len(),
@@ -3184,11 +3191,10 @@ pub async fn run_plan(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let mut canonical_resources = crate::commands::validate_and_resolve_config_pair(
+    let (wiring, mut canonical_resources) = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
-        &providers,
         false,
         &inference_errors,
         &duplicate_declarations,
@@ -3335,10 +3341,10 @@ pub async fn run_plan(
         base_dir,
         provider_context,
         UpstreamMissingStatePolicy::Lenient,
-        providers.context(),
+        &wiring,
     )
     .await?;
-    let wiring = providers.context();
+    let ctx_wiring = wiring.context();
     if !refresh {
         eprintln!(
             "{}",
@@ -3351,7 +3357,7 @@ pub async fn run_plan(
     // prints post-expansion warnings and returns the still-unresolved
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        wiring,
+        &wiring,
         canonical_resources,
         provider_inputs.configs(),
         &state_file,
@@ -3438,7 +3444,7 @@ pub async fn run_plan(
         data_source_values: &ctx.data_source_values,
         state_file: state_file.as_ref(),
         plan: &ctx.plan,
-        schemas: wiring.schemas(),
+        schemas: ctx_wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context,
     })
@@ -3468,7 +3474,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            wiring,
+            &wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -3480,7 +3486,7 @@ pub async fn run_plan(
     } else if tui {
         carina_tui::run(
             &ctx.plan,
-            wiring.schemas(),
+            ctx_wiring.schemas(),
             &historical_display,
             Some(&ctx.prev_explicit),
         )
@@ -3494,7 +3500,7 @@ pub async fn run_plan(
             &summary,
             detail,
             &historical_display,
-            Some(wiring.schemas()),
+            Some(ctx_wiring.schemas()),
             &ctx.moved_origins,
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
@@ -3528,7 +3534,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            wiring,
+            &wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -3636,8 +3642,9 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     base_dir: &Path,
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
-    wiring: &WiringContext,
+    validated_wiring: &ValidatedWiring,
 ) -> Result<PreparedPlanIdentityData, AppError> {
+    let wiring = validated_wiring.context();
     reconcile_canonical_prefixed_names(canonical_resources, state_file);
     let parsed = canonical_resources.parsed();
     let state_blocks = crate::wiring::resolve_state_blocks(
@@ -5296,7 +5303,7 @@ mod run_plan_out_tests {
             None,
             &Some(state_file),
             &ctx,
-            &WiringContext::new_for_test(Vec::new(), &[]),
+            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
         let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
@@ -5661,7 +5668,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &WiringContext::new_for_test(Vec::new(), &[]),
+            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
 
@@ -5746,7 +5753,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &WiringContext::new_for_test(Vec::new(), &[]),
+            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize prepared compositions");
 
@@ -5802,7 +5809,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &WiringContext::new_for_test(Vec::new(), &[]),
+            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
         )
         .expect_err("a secret-bearing upstream snapshot must be rejected")
         .to_string();
@@ -5851,7 +5858,7 @@ mod run_plan_out_tests {
             residual_deferred_for: Vec::new(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
-        let wiring = WiringContext::new_for_test(Vec::new(), &[configured]);
+        let wiring = ValidatedWiring::from_factories_for_test(Vec::new(), &[configured]);
 
         let error = build_plan_file(
             &path,

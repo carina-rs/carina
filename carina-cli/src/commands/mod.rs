@@ -15,7 +15,7 @@ pub mod skills;
 pub mod state;
 pub mod validate;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -317,12 +317,12 @@ pub(crate) fn duplicate_declaration_errors(
     errors
 }
 
-/// Run the common validation and module-resolution pipeline.
+/// Test-support wrapper around the non-minting validation report.
 ///
-/// Callers loading a directory must pass both diagnostic channels from the
-/// same [`LoadedConfig`](carina_core::config_loader::LoadedConfig). Requiring
-/// `duplicate_declarations` here prevents production callers from silently
-/// bypassing directory-level uniqueness validation.
+/// Both diagnostic channels from the same
+/// [`LoadedConfig`](carina_core::config_loader::LoadedConfig) remain mandatory,
+/// so fixtures exercise directory-level uniqueness validation as well.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_config(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
@@ -331,14 +331,15 @@ pub fn validate_and_resolve_with_config(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<(), AppError> {
-    let errors = validate_and_resolve_errors(
-        parsed,
-        base_dir,
-        providers,
-        skip_resource_validation,
-        prior_inference_errors,
-        duplicate_declarations,
-    );
+    let errors = providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+        .into_errors();
     if errors.is_empty() {
         Ok(())
     } else {
@@ -366,11 +367,14 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     )
 }
 
-/// Vec-returning twin of [`validate_and_resolve_with_config`].
+/// Collecting, non-minting validation entry point.
 ///
-/// The `&ProviderLoad` supplies both the factory context and per-provider load
-/// diagnostics from the command's load; validation does not perform another
-/// load at this lower-level entry point.
+/// The `&ProviderLoad` privately owns both the factory context and
+/// per-provider diagnostics used to build the report. This helper neither
+/// performs another load nor exposes a context or mints
+/// [`ValidatedWiring`](crate::wiring::ValidatedWiring).
+/// Execution commands use the consuming validation methods on
+/// [`ProviderLoad`] instead.
 pub fn validate_and_resolve_errors(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
@@ -379,27 +383,23 @@ pub fn validate_and_resolve_errors(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
-    match validate_and_resolve_errors_inner(
-        parsed,
-        base_dir,
-        providers,
-        skip_resource_validation,
-        prior_inference_errors,
-        duplicate_declarations,
-        ConfigNameResolution::EvaluatedOnly,
-    ) {
-        Ok(ResolvedConfig::Evaluated(_)) => Vec::new(),
-        Ok(ResolvedConfig::Paired(_)) => unreachable!("evaluated-only validation returned pair"),
-        Err(errors) => errors,
-    }
+    providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+        .into_errors()
 }
 
-enum ConfigNameResolution {
+pub(crate) enum ConfigNameResolution {
     EvaluatedOnly,
     Paired(Box<UnresolvedConfigSnapshot>),
 }
 
-enum ResolvedConfig<'a> {
+pub(crate) enum ResolvedConfig<'a> {
     Evaluated(&'a mut carina_core::parser::InferredFile),
     Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
 }
@@ -436,45 +436,17 @@ impl ResolvedConfig<'_> {
     }
 }
 
-/// Validate and canonicalize the evaluated and authored resource snapshots at
-/// the same schema-aware name-resolution boundary.
-pub(crate) fn validate_and_resolve_config_pair(
-    mut parsed: carina_core::parser::InferredFile,
-    unresolved: UnresolvedConfigSnapshot,
-    base_dir: &Path,
-    providers: &ProviderLoad,
-    skip_resource_validation: bool,
-    prior_inference_errors: &[ExportInferenceError],
-    duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-    match validate_and_resolve_errors_inner(
-        &mut parsed,
-        base_dir,
-        providers,
-        skip_resource_validation,
-        prior_inference_errors,
-        duplicate_declarations,
-        ConfigNameResolution::Paired(Box::new(unresolved)),
-    )
-    .map_err(collapse_errors)?
-    {
-        ResolvedConfig::Paired(pair) => Ok(*pair),
-        ResolvedConfig::Evaluated(_) => unreachable!("paired validation returned evaluated-only"),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn validate_and_resolve_errors_inner<'a>(
+pub(crate) fn validate_and_resolve_errors_inner<'a>(
     parsed: &'a mut carina_core::parser::InferredFile,
     base_dir: &Path,
-    providers: &ProviderLoad,
+    ctx: &WiringContext,
+    load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> Result<ResolvedConfig<'a>, Vec<AppError>> {
-    let ctx = providers.context();
-    let load_errors = providers.load_errors();
     let module_walk = if skip_resource_validation {
         ModuleWalk::default()
     } else {

@@ -19,7 +19,7 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
-fn complete_provider_context_reports_every_load_error_in_provider_name_order() {
+fn execution_validation_reports_every_load_error_in_provider_name_order() {
     let providers = ProviderLoad::for_test_with_load_errors(
         Vec::new(),
         &[],
@@ -29,8 +29,15 @@ fn complete_provider_context_reports_every_load_error_in_provider_name_order() {
         ]),
     );
 
-    let error = match providers.into_complete_context() {
-        Ok(_) => panic!("incomplete provider loads must not yield a wiring context"),
+    let mut parsed = carina_core::parser::InferredFile::default();
+    let error = match providers.validate_and_resolve_with_config(
+        &mut parsed,
+        Path::new("."),
+        true,
+        &[],
+        &[],
+    ) {
+        Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
     };
 
@@ -852,7 +859,8 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
 ) -> Result<PlanContext, AppError> {
     let (factories, _) =
         build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
-    let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
+    let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
+    let ctx = wiring.context();
     let unresolved = carina_core::parser::ParsedFile {
         resources: unresolved_resources.to_vec(),
         ..Default::default()
@@ -864,7 +872,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     )
     .expect("test block-name resolution must succeed");
     create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
+        &wiring,
         canonical_resources,
         provider_configs,
         state_file,
@@ -1727,15 +1735,16 @@ fn assert_provider_config_constraint_error(error: &AppError) {
 async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
     let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
         provider_configs.as_provider_configs(),
     );
+    let ctx = wiring.context();
     let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
+        &wiring,
         canonical_resources,
         &provider_configs,
         &None,
@@ -2213,10 +2222,11 @@ let shared = read test.shared.Type {}
         .expect("test state row is unique");
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
-    let ctx = WiringContext::new_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ManagedAndDataSourceFactory)],
         provider_configs.as_provider_configs(),
     );
+    let ctx = wiring.context();
     let canonical_resources = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
@@ -2224,7 +2234,7 @@ let shared = read test.shared.Type {}
     );
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
+        &wiring,
         canonical_resources,
         &provider_configs,
         &state_file,
@@ -4592,11 +4602,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         }
     "#;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let ctx = wiring.context();
     let mut parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let mut unresolved_parsed = parsed.clone();
-    compute_initial_anonymous_ids(&ctx, &mut parsed);
-    compute_initial_anonymous_ids(&ctx, &mut unresolved_parsed);
+    compute_initial_anonymous_ids(ctx, &mut parsed);
+    compute_initial_anonymous_ids(ctx, &mut unresolved_parsed);
 
     let unresolved_subnet_key_before_plan = unresolved_parsed
         .resources
@@ -4605,7 +4616,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .expect("anonymous subnet should parse")
         .id
         .clone();
-    let state_subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
+    let state_subnet_identity = concrete_subnet_identity(ctx, &parsed.providers);
 
     let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
         .expect("fixture identifier is non-empty")
@@ -4640,7 +4651,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         ctx.schemas(),
     );
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
+        &wiring,
         canonical_resources,
         &provider_configs,
         &Some(state_file),
@@ -8677,7 +8688,9 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
@@ -8686,7 +8699,7 @@ mod resolved_value_constraint_gate {
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
-        PlanPreprocessor::new(normalizer, &ctx)
+        PlanPreprocessor::new(normalizer, ctx)
             .prepare(
                 &mut resources,
                 &origins,
@@ -8744,7 +8757,9 @@ mod resolved_value_constraint_gate {
         producer_values: Vec<(&str, Value)>,
         composition: &mut Composition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let mut producer =
             Resource::with_provider("test", "source", "producer", None).with_binding("producer");
         for (name, value) in producer_values {
@@ -8775,7 +8790,7 @@ mod resolved_value_constraint_gate {
         let module_gate =
             carina_core::executor::ModuleConstraintGate::new(std::slice::from_ref(composition));
 
-        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
+        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, ctx)
             .prepare(
                 &mut resources,
                 &origins,
@@ -9055,7 +9070,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("upstream state fixture must load");
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &remote_bindings,
@@ -9064,7 +9081,7 @@ exports { team_prefix: String = "x" }"#,
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &ctx,
+            &wiring,
             canonical_resources,
             &provider_configs,
             &None,
@@ -9124,12 +9141,13 @@ exports { team_prefix: String = "x" }"#,
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
         let reads = Arc::new(AtomicUsize::new(0));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(RecordingDataSourceFactory {
                 reads: reads.clone(),
             })],
             &[],
         );
+        let ctx = wiring.context();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -9138,7 +9156,7 @@ exports { team_prefix: String = "x" }"#,
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &ctx,
+            &wiring,
             canonical_resources,
             &provider_configs,
             &None,

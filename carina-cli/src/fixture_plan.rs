@@ -27,11 +27,10 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
-use crate::commands::validate_and_resolve_config_pair;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
-    ProviderLoad, add_deferred_create_effects,
+    ProviderLoad, ValidatedWiring, add_deferred_create_effects,
     compute_canonical_pair_anonymous_identifiers_with_ctx,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities,
@@ -270,16 +269,16 @@ where
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let mut canonical_resources = validate_and_resolve_config_pair(
-        parsed,
-        unresolved_parsed,
-        base_dir,
-        &validation_providers,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )
-    .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
+    let (_validation_wiring, mut canonical_resources) = validation_providers
+        .validate_config_pair(
+            parsed,
+            unresolved_parsed,
+            base_dir,
+            true,
+            &inference_errors,
+            &duplicate_declarations,
+        )
+        .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
     let parsed = canonical_resources.parsed();
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
@@ -293,12 +292,15 @@ where
         None
     };
 
-    let providers = ProviderLoad::for_fixture_with_additional_schemas(
+    // This fixture intentionally uses a second, fuller schema context for
+    // planning; the test-only constructor marks that separately assembled
+    // context as the fixture's validated execution wiring.
+    let wiring = ValidatedWiring::for_fixture_with_additional_schemas(
         load_factories(fixture_provider_factories(&fixture_pathbuf)),
         &parsed.providers,
         fixture_schemas(),
     );
-    let wiring = providers.context();
+    let wiring = wiring.context();
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")

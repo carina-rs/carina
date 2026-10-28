@@ -63,7 +63,7 @@ use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    ProviderLoad, WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
+    ProviderLoad, ValidatedWiring, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 
@@ -89,10 +89,9 @@ pub async fn run_destroy(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    crate::commands::validate_and_resolve_with_config(
+    let wiring = providers.validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
-        &providers,
         true,
         &inference_errors,
         &duplicate_declarations,
@@ -136,7 +135,7 @@ pub async fn run_destroy(
     };
 
     let outcome = run_destroy_locked_owned(
-        providers.context(),
+        &wiring,
         &mut parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -200,7 +199,7 @@ impl DestroyedInstances {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_owned(
-    ctx: &WiringContext,
+    wiring: &ValidatedWiring,
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -213,6 +212,7 @@ async fn run_destroy_locked_owned(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> LockCommandOutcome<Result<(), AppError>> {
+    let ctx = wiring.context();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -1299,8 +1299,23 @@ async fn run_destroy_locked(
             .await;
         }
     };
+    let wiring = match providers.validate_and_resolve_with_config(parsed, base_dir, true, &[], &[])
+    {
+        Ok(wiring) => wiring,
+        Err(error) => {
+            return finish_lock_command(
+                backend.as_ref(),
+                LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                },
+                &cancel,
+            )
+            .await;
+        }
+    };
     let outcome = run_destroy_locked_owned(
-        providers.context(),
+        &wiring,
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -1331,10 +1346,10 @@ async fn run_destroy_locked_with_ctx(
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-    ctx: &WiringContext,
+    wiring: &ValidatedWiring,
 ) -> Result<(), AppError> {
     let outcome = run_destroy_locked_owned(
-        ctx,
+        wiring,
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -2086,7 +2101,7 @@ mod tests {
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let ctx = ValidatedWiring::from_factories_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2433,15 +2448,15 @@ mod tests {
         let base_dir = get_base_dir(fixture.config_path());
         let providers =
             ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
-        crate::commands::validate_and_resolve_with_config(
-            &mut parsed,
-            base_dir,
-            &providers,
-            true,
-            &loaded.inference_errors,
-            &loaded.duplicate_declarations,
-        )
-        .expect("fixture must validate");
+        let wiring = providers
+            .validate_and_resolve_with_config(
+                &mut parsed,
+                base_dir,
+                true,
+                &loaded.inference_errors,
+                &loaded.duplicate_declarations,
+            )
+            .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
 
@@ -2457,7 +2472,7 @@ mod tests {
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),
-            providers.context(),
+            &wiring,
         )
         .await
         .expect_err("heartbeat lock loss must fail destroy");
