@@ -1161,6 +1161,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls 0.25.0",
+ "tracing",
  "uuid",
  "wasmprinter",
  "wasmtime",
