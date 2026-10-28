@@ -108,30 +108,33 @@ fn block_names_from_config<F>(
     directory: &Path,
     config: &FormattingDirectoryConfig,
     build_factories: &mut F,
-) -> DirectoryBlockNames
+) -> Result<DirectoryBlockNames, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
+    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingFactoryLoad, AppError>,
 {
     if config.providers.is_empty() {
-        return DirectoryBlockNames::default();
+        return Ok(DirectoryBlockNames::default());
     }
 
     // Coverage is split at this seam: unit tests prove builder output feeds
     // block-name collection, and wiring tests pin the production builder. Its
     // one-line application here is the remaining integration seam because the
     // workspace mock WASM exports no schemas for a real conversion end-to-end.
-    let (factories, load_errors) = build_factories(&config.providers, directory);
+    let (factories, load_errors) = build_factories(&config.providers, directory)?;
     let ctx = WiringContext::new(factories, &config.providers);
-    DirectoryBlockNames {
+    Ok(DirectoryBlockNames {
         block_names: collect_all_block_names(ctx.schemas()),
         provider_load_diagnostics: load_errors,
-    }
+    })
 }
 
 #[cfg(test)]
-fn block_names_for_dir<F>(directory: &Path, mut build_factories: F) -> DirectoryBlockNames
+fn block_names_for_dir<F>(
+    directory: &Path,
+    mut build_factories: F,
+) -> Result<DirectoryBlockNames, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
+    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingFactoryLoad, AppError>,
 {
     let config = load_formatting_directory_config(directory);
     block_names_from_config(directory, &config, &mut build_factories)
@@ -228,22 +231,26 @@ fn resolve_directory_block_names<F>(
     import_map: &HashMap<PathBuf, Vec<PathBuf>>,
     cache: &mut HashMap<PathBuf, Arc<DirectoryBlockNames>>,
     build_factories: &mut F,
-) -> Arc<DirectoryBlockNames>
+) -> Result<Arc<DirectoryBlockNames>, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
+    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingFactoryLoad, AppError>,
 {
     let directory = canonical_directory(directory);
     if let Some(block_names) = cache.get(&directory) {
-        return Arc::clone(block_names);
+        return Ok(Arc::clone(block_names));
     }
 
     if let Some(config) = directories
         .get(&directory)
         .filter(|config| !config.providers.is_empty())
     {
-        let block_names = Arc::new(block_names_from_config(&directory, config, build_factories));
+        let block_names = Arc::new(block_names_from_config(
+            &directory,
+            config,
+            build_factories,
+        )?);
         cache.insert(directory, Arc::clone(&block_names));
-        return block_names;
+        return Ok(block_names);
     }
 
     let caller_provider_directory = import_map.get(&directory).and_then(|callers| {
@@ -251,13 +258,14 @@ where
             .iter()
             .find_map(|caller| nearest_provider_directory(caller, directories))
     });
-    let block_names = caller_provider_directory
-        .map(|caller| {
-            resolve_directory_block_names(&caller, directories, import_map, cache, build_factories)
-        })
-        .unwrap_or_else(|| Arc::new(DirectoryBlockNames::default()));
+    let block_names = match caller_provider_directory {
+        Some(caller) => {
+            resolve_directory_block_names(&caller, directories, import_map, cache, build_factories)?
+        }
+        None => Arc::new(DirectoryBlockNames::default()),
+    };
     cache.insert(directory, Arc::clone(&block_names));
-    block_names
+    Ok(block_names)
 }
 
 /// Format `.crn` files without making provider availability a hard dependency.
@@ -289,7 +297,7 @@ fn run_fmt_with_factory_builder<F>(
     mut build_factories: F,
 ) -> Result<(), AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
+    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingFactoryLoad, AppError>,
 {
     if path.is_file() {
         return Err(AppError::Config(format!(
@@ -326,7 +334,7 @@ where
             &import_map,
             &mut block_names_by_dir,
             &mut build_factories,
-        );
+        )?;
         provider_load_diagnostics.extend(
             block_names
                 .provider_load_diagnostics
@@ -515,8 +523,9 @@ mod tests {
             let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(FactoryWithBlockSchema {
                 block_name: "entry_from_factory",
             })];
-            (factories, HashMap::new())
-        });
+            Ok((factories, HashMap::new()))
+        })
+        .unwrap();
 
         assert_eq!(loaded_provider_names, ["example"]);
         assert_eq!(
@@ -542,7 +551,7 @@ mod tests {
 
         let error = run_fmt_with_factory_builder(&file, FmtMode::Write, false, |_, _| {
             builder_calls += 1;
-            (Vec::new(), HashMap::new())
+            Ok((Vec::new(), HashMap::new()))
         })
         .expect_err("a file path must be rejected");
 
@@ -551,22 +560,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_factory_builder_error_fails_formatting_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
+
+        let error = run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, false, |_, _| {
+            Err(AppError::from(
+                carina_provider_resolver::GrantParseError::MissingSeparator {
+                    value: "not-a-grant".to_string(),
+                },
+            ))
+        })
+        .expect_err("invalid grant input must fail once provider loading begins");
+
+        assert!(matches!(error, AppError::TrustedLocalGrant(_)));
+    }
+
+    #[test]
     fn directory_unavailable_status_comes_from_load_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
         let skipped = block_names_for_dir(tmp.path(), |_, _| {
-            (Vec::<Box<dyn ProviderFactory>>::new(), HashMap::new())
-        });
+            Ok((Vec::<Box<dyn ProviderFactory>>::new(), HashMap::new()))
+        })
+        .unwrap();
         let failed = block_names_for_dir(tmp.path(), |_, _| {
-            (
+            Ok((
                 Vec::<Box<dyn ProviderFactory>>::new(),
                 HashMap::from([(
                     "example".to_string(),
                     ProviderFactoryDiagnostic::Message("load failed".into()),
                 )]),
-            )
-        });
+            ))
+        })
+        .unwrap();
 
         assert!(skipped.provider_load_diagnostics.is_empty());
         assert!(!failed.provider_load_diagnostics.is_empty());
@@ -628,7 +656,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            (factories, HashMap::new())
+            Ok((factories, HashMap::new()))
         })
         .unwrap();
 
@@ -648,7 +676,7 @@ let imported = use {{
 
         run_fmt_with_factory_builder(&module, FmtMode::Write, false, |_, _| {
             builder_calls += 1;
-            (Vec::new(), HashMap::new())
+            Ok((Vec::new(), HashMap::new()))
         })
         .unwrap();
 
@@ -693,7 +721,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            (factories, HashMap::new())
+            Ok((factories, HashMap::new()))
         })
         .unwrap();
 

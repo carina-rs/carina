@@ -68,7 +68,7 @@ impl VerifiedSignerIdentity {
         self.0.repository_digest.as_deref()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_test(
         certificate_san: &str,
         oidc_issuer: &str,
