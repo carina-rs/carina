@@ -132,13 +132,17 @@ async fn update_request_for_test(
     let mut schemas = carina_core::schema::SchemaRegistry::new();
     schemas.insert(
         resource.id.provider.clone(),
-        carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone()).attribute(
-            carina_core::schema::AttributeSchema::new(
-                "reassert_token",
-                carina_core::schema::AttributeType::string(),
+        carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone())
+            .attribute(
+                carina_core::schema::AttributeSchema::optional(
+                    "reassert_token",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .write_only()
+                .build(),
             )
-            .write_only(),
-        ),
+            .validate()
+            .expect("test schema must be valid"),
     );
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
@@ -329,8 +333,8 @@ async fn test_wasm_mock_provider_factory() {
     let schemas = factory.schemas();
     let short_budget = schemas
         .iter()
-        .find(|schema| schema.resource_type() == "test.short_budget")
-        .and_then(|schema| schema.operation_config())
+        .find(|schema| schema.parts().resource_type == "test.short_budget")
+        .and_then(|schema| schema.parts().operation_config)
         .expect("mock provider should expose the short-budget schema");
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));

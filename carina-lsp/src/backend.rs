@@ -905,8 +905,8 @@ mod tests {
             "Mock"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -928,15 +928,20 @@ mod tests {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let rules = AttributeType::list(AttributeType::struct_(
                 "Rule",
-                vec![StructField::new("action", AttributeType::string())],
+                vec![StructField::optional("action", AttributeType::string()).build()],
             ));
             vec![
-                ResourceSchema::new("test.resource").attribute(
-                    AttributeSchema::new("rules", rules).with_block_name(self.block_name),
-                ),
+                ResourceSchema::new("test.resource")
+                    .attribute(
+                        AttributeSchema::optional("rules", rules)
+                            .with_block_name(self.block_name)
+                            .build(),
+                    )
+                    .validate()
+                    .expect("formatting test schema must be valid"),
             ]
         }
     }

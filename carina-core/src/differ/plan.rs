@@ -53,6 +53,7 @@ fn find_changed_create_only(
     let Some(schema) = registry.get(provider, resource_type, SchemaKind::Resource) else {
         return Vec::new();
     };
+    let schema = schema.as_schema();
 
     let create_only_attrs = schema.create_only_attributes();
     changed_attributes
@@ -115,6 +116,7 @@ pub(super) fn filter_non_removable_removals(
         // No schema available — keep all changes (conservative)
         return changed_attributes;
     };
+    let schema = schema.as_schema();
 
     let removable_attrs = schema.removable_attributes();
 
@@ -407,11 +409,13 @@ fn create_plan_parts(
             .unwrap_or_else(|| PlanInputCurrent::absent(resource.id.clone()));
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
-        let schema = registry.get(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            SchemaKind::Resource,
-        );
+        let schema = registry
+            .get(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                SchemaKind::Resource,
+            )
+            .map(|schema| schema.as_schema());
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
             Current::CreateInFlight(pending) => {
@@ -663,8 +667,8 @@ fn create_plan_parts(
         if !gates_a_pending_change {
             continue;
         }
-        let schema_timeout = schema.and_then(|s| s.default_wait_timeout);
-        let schema_interval = schema.and_then(|s| s.default_wait_interval);
+        let schema_timeout = schema.and_then(|s| s.as_schema().default_wait_timeout);
+        let schema_interval = schema.and_then(|s| s.as_schema().default_wait_interval);
         let timeout = wb
             .timeout_secs
             .map(std::time::Duration::from_secs)
@@ -877,7 +881,7 @@ pub(super) fn temporary_name_for_cbd(
                 .clone()
                 .unwrap_or_else(|| resource.id.identity_display().to_string()),
         })?;
-    generate_temporary_name(resource, from, schema)
+    generate_temporary_name(resource, from, schema.as_schema())
 }
 
 fn apply_temporary_name(

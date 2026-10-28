@@ -6290,7 +6290,7 @@ mod enum_attr_tests {
 
     fn schema_with_status() -> ResourceSchema {
         ResourceSchema::new("aws.s3.BucketVersioning")
-            .attribute(AttributeSchema::new("status", status_enum_type()))
+            .attribute(AttributeSchema::optional("status", status_enum_type()).build())
     }
 
     fn options_struct_type(fields: Vec<StructField>) -> AttributeType {
@@ -6299,7 +6299,7 @@ mod enum_attr_tests {
 
     fn schema_with_options(fields: Vec<StructField>) -> ResourceSchema {
         ResourceSchema::new("aws.s3.BucketVersioning")
-            .attribute(AttributeSchema::new("options", options_struct_type(fields)))
+            .attribute(AttributeSchema::optional("options", options_struct_type(fields)).build())
     }
 
     fn schema_with_rule_statements(
@@ -6311,20 +6311,23 @@ mod enum_attr_tests {
                 "Rule",
                 AttributeType::struct_(
                     "Rule",
-                    vec![StructField::new("statements", statements_type)],
+                    vec![StructField::optional("statements", statements_type).build()],
                 ),
             )
             .with_def(
                 "Statement",
                 AttributeType::struct_(
                     "Statement",
-                    vec![StructField::new("protocol", protocol_type)],
+                    vec![StructField::optional("protocol", protocol_type).build()],
                 ),
             )
-            .attribute(AttributeSchema::new(
-                "rules",
-                AttributeType::list(AttributeType::ref_("Rule")),
-            ))
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::ref_("Rule")),
+                )
+                .build(),
+            )
     }
 
     fn schema_with_nested_rule_protocol(protocol_type: AttributeType) -> ResourceSchema {
@@ -6389,7 +6392,7 @@ mod enum_attr_tests {
     #[test]
     fn non_enum_attribute_is_an_error() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
-            .attribute(AttributeSchema::new("name", AttributeType::string()));
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
         let resource = resource_with_attr("name", ConcreteValue::String("x".into()));
 
         assert!(matches!(
@@ -6465,7 +6468,7 @@ mod enum_attr_tests {
     #[test]
     fn dsl_alias_is_not_accepted_as_a_string_api_value() {
         let schema = ResourceSchema::new("aws.ec2.SecurityGroupRule")
-            .attribute(AttributeSchema::new("protocol", ip_protocol_enum_type()));
+            .attribute(AttributeSchema::optional("protocol", ip_protocol_enum_type()).build());
         let alias = Value::Concrete(ConcreteValue::String("all".into()));
         let api_value = Value::Concrete(ConcreteValue::String("-1".into()));
 
@@ -6611,10 +6614,9 @@ mod enum_attr_tests {
                 "Recursive",
                 AttributeType::list(AttributeType::ref_("Recursive")),
             )
-            .attribute(AttributeSchema::new(
-                "rules",
-                AttributeType::ref_("Recursive"),
-            ));
+            .attribute(
+                AttributeSchema::optional("rules", AttributeType::ref_("Recursive")).build(),
+            );
 
         assert!(matches!(
             enum_attr_at_schema_path(&schema, "rules", &["protocol"], None),
@@ -6661,7 +6663,7 @@ mod enum_attr_tests {
     #[test]
     fn open_enum_string_is_returned_verbatim() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
-            .attribute(AttributeSchema::new("status", open_status_enum_type()));
+            .attribute(AttributeSchema::optional("status", open_status_enum_type()).build());
         let resource = resource_with_attr(
             "status",
             ConcreteValue::String("vendor_VALUE-with-MixedCase".into()),
@@ -6741,10 +6743,10 @@ mod enum_attr_tests {
     fn ref_typed_attribute_is_resolved_through_defs() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .with_def("VersioningStatus", status_enum_type())
-            .attribute(AttributeSchema::new(
-                "status",
-                AttributeType::ref_("VersioningStatus"),
-            ));
+            .attribute(
+                AttributeSchema::optional("status", AttributeType::ref_("VersioningStatus"))
+                    .build(),
+            );
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::String("Enabled".into()),
@@ -6765,7 +6767,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_attribute_absent_is_ok_none() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
@@ -6776,7 +6780,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_value_that_is_not_a_map_is_an_error() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_attr("options", ConcreteValue::String("Enabled".into()));
 
         assert!(matches!(
@@ -6788,8 +6794,9 @@ mod enum_attr_tests {
 
     #[test]
     fn missing_struct_schema_field_is_an_error() {
-        let schema =
-            schema_with_options(vec![StructField::new("dns_hostnames", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_hostnames", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
 
         assert!(matches!(
@@ -6802,7 +6809,7 @@ mod enum_attr_tests {
     #[test]
     fn non_struct_schema_attribute_is_an_error() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
-            .attribute(AttributeSchema::new("options", AttributeType::string()));
+            .attribute(AttributeSchema::optional("options", AttributeType::string()).build());
         let resource = resource_with_attr("options", ConcreteValue::String("Enabled".into()));
 
         assert!(matches!(
@@ -6813,14 +6820,15 @@ mod enum_attr_tests {
 
     #[test]
     fn list_struct_schema_is_not_a_struct_field_accessor_when_value_is_absent() {
-        let schema =
-            ResourceSchema::new("aws.s3.BucketVersioning").attribute(AttributeSchema::new(
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning").attribute(
+            AttributeSchema::optional(
                 "options",
-                AttributeType::list(options_struct_type(vec![StructField::new(
-                    "dns_support",
-                    status_enum_type(),
-                )])),
-            ));
+                AttributeType::list(options_struct_type(vec![
+                    StructField::optional("dns_support", status_enum_type()).build(),
+                ])),
+            )
+            .build(),
+        );
         let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
@@ -6831,14 +6839,15 @@ mod enum_attr_tests {
 
     #[test]
     fn list_struct_schema_is_not_a_struct_field_accessor_when_value_is_present() {
-        let schema =
-            ResourceSchema::new("aws.s3.BucketVersioning").attribute(AttributeSchema::new(
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning").attribute(
+            AttributeSchema::optional(
                 "options",
-                AttributeType::list(options_struct_type(vec![StructField::new(
-                    "dns_support",
-                    status_enum_type(),
-                )])),
-            ));
+                AttributeType::list(options_struct_type(vec![
+                    StructField::optional("dns_support", status_enum_type()).build(),
+                ])),
+            )
+            .build(),
+        );
         let resource = resource_with_attr("options", ConcreteValue::List(Vec::new()));
 
         assert!(matches!(
@@ -6849,10 +6858,9 @@ mod enum_attr_tests {
 
     #[test]
     fn non_enum_struct_field_is_an_error() {
-        let schema = schema_with_options(vec![StructField::new(
-            "dns_support",
-            AttributeType::string(),
-        )]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", AttributeType::string()).build(),
+        ]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::String("Enabled".into()),
@@ -6867,10 +6875,9 @@ mod enum_attr_tests {
 
     #[test]
     fn absent_struct_attribute_does_not_hide_non_enum_field() {
-        let schema = schema_with_options(vec![StructField::new(
-            "dns_support",
-            AttributeType::string(),
-        )]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", AttributeType::string()).build(),
+        ]);
         let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
@@ -6881,7 +6888,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_absent_from_map_is_ok_none() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![("dns_hostnames", canonical_status("Enabled"))]);
 
         assert!(matches!(
@@ -6892,7 +6901,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_accepts_matching_canonical_enum() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
 
         assert_struct_field_enabled(&resource, &schema);
@@ -6900,7 +6911,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_rejects_enum_identifier() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
@@ -6914,7 +6927,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_accepts_exact_closed_enum_string() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::String("Enabled".into()),
@@ -6925,7 +6940,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_rejects_folded_closed_enum_string() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::String("enabled".into()),
@@ -6939,7 +6956,9 @@ mod enum_attr_tests {
 
     #[test]
     fn struct_field_rejects_mismatched_canonical_enum_identity() {
-        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let schema = schema_with_options(vec![
+            StructField::optional("dns_support", status_enum_type()).build(),
+        ]);
         let resource = resource_with_options(vec![(
             "dns_support",
             ConcreteValue::CanonicalEnum(CanonicalEnumValue::new_for_test(
@@ -6960,12 +6979,13 @@ mod enum_attr_tests {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .with_def(
                 "Options",
-                options_struct_type(vec![StructField::new("dns_support", status_enum_type())]),
+                options_struct_type(vec![
+                    StructField::optional("dns_support", status_enum_type()).build(),
+                ]),
             )
-            .attribute(AttributeSchema::new(
-                "options",
-                AttributeType::ref_("Options"),
-            ));
+            .attribute(
+                AttributeSchema::optional("options", AttributeType::ref_("Options")).build(),
+            );
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::String("Enabled".into()),
@@ -6982,13 +7002,19 @@ mod enum_attr_tests {
     fn struct_field_resolves_ref_typed_field_through_defs() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .with_def("VersioningStatus", status_enum_type())
-            .attribute(AttributeSchema::new(
-                "options",
-                options_struct_type(vec![StructField::new(
-                    "dns_support",
-                    AttributeType::ref_("VersioningStatus"),
-                )]),
-            ));
+            .attribute(
+                AttributeSchema::optional(
+                    "options",
+                    options_struct_type(vec![
+                        StructField::optional(
+                            "dns_support",
+                            AttributeType::ref_("VersioningStatus"),
+                        )
+                        .build(),
+                    ]),
+                )
+                .build(),
+            );
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::String("Enabled".into()),
@@ -7398,7 +7424,7 @@ pub fn plan_input_current_map_from_refs<'a>(
             && let Some(state) = current.get_mut(&resource.id)
             && let Some(attributes) = state.attributes_mut()
         {
-            crate::utils::lift_state_enum_leaves(attributes, schema);
+            crate::utils::lift_state_enum_leaves(attributes, schema.as_schema());
         }
     }
     current

@@ -1184,7 +1184,7 @@ impl StateFile {
         else {
             return;
         };
-        for key in recorded_write_only_keys(Some(schema), attributes, &[]) {
+        for key in recorded_write_only_keys(Some(schema.as_schema()), attributes, &[]) {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 current.attributes.entry(key.clone())
                 && let Some(value) = attributes.get(&key)

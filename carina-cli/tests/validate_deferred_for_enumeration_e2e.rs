@@ -42,8 +42,8 @@ impl ProviderFactory for ForTestFactory {
     fn display_name(&self) -> &str {
         "AWS (for-loop test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -75,42 +75,51 @@ impl ProviderFactory for ForTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![cert_schema(), record_set_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![cert_schema(), record_set_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "validation_method",
-            AttributeType::string(),
-        ))
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("validation_method", AttributeType::string()).build())
         // Provider-read/computed collection that the `for` iterates.
         // Element type is immaterial here — the loop is deferred at
         // parse time because `cert.domain_validation_options` is an
         // unresolved provider-computed reference, not because of the
         // element schema.
-        .attribute(AttributeSchema::new(
-            "domain_validation_options",
-            AttributeType::list(AttributeType::string()),
-        ))
+        .attribute(
+            AttributeSchema::optional(
+                "domain_validation_options",
+                AttributeType::list(AttributeType::string()),
+            )
+            .build(),
+        )
 }
 
 fn record_set_schema() -> ResourceSchema {
     ResourceSchema::new("route53.RecordSet")
-        .attribute(AttributeSchema::new(
-            "hosted_zone_id",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("type", AttributeType::string()))
-        .attribute(AttributeSchema::new("ttl", AttributeType::int()))
-        .attribute(AttributeSchema::new(
-            "resource_records",
-            AttributeType::list(AttributeType::string()),
-        ))
+        .attribute(AttributeSchema::optional("hosted_zone_id", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("ttl", AttributeType::int()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "resource_records",
+                AttributeType::list(AttributeType::string()),
+            )
+            .build(),
+        )
 }
 
 struct NoopProvider;

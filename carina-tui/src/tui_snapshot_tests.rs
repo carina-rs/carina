@@ -448,22 +448,28 @@ fn snapshot_create_with_schema() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required())
+        .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::new("enable_dns_support", AttributeType::bool())
-                .with_default(Value::Concrete(ConcreteValue::Bool(true))),
+            AttributeSchema::optional("enable_dns_support", AttributeType::bool())
+                .with_default(Value::Concrete(ConcreteValue::Bool(true)))
+                .build(),
         )
         .attribute(
-            AttributeSchema::new("enable_dns_hostnames", AttributeType::bool())
-                .with_default(Value::Concrete(ConcreteValue::Bool(false))),
+            AttributeSchema::optional("enable_dns_hostnames", AttributeType::bool())
+                .with_default(Value::Concrete(ConcreteValue::Bool(false)))
+                .build(),
         )
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::new("default_security_group_id", AttributeType::string()).read_only(),
+            AttributeSchema::provider_populated(
+                "default_security_group_id",
+                AttributeType::string(),
+            )
+            .build(),
         );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("", schema);
+    schemas.insert("", schema.validate().expect("test schema must be valid"));
 
     let output = render_tui_with_schemas(&plan, &schemas, 120, 40, 0);
     insta::assert_snapshot!(output);

@@ -925,7 +925,9 @@ fn classify_replacement_outcome(
             ReplacementOutcome::CreateAppliedDeposeOld(planned_depose(
                 delete,
                 upsert.resource,
-                schemas.get_for(upsert.resource),
+                schemas
+                    .get_for(upsert.resource)
+                    .map(|schema| schema.as_schema()),
                 state_file,
                 managed_current,
                 moved_origins,
@@ -1175,7 +1177,10 @@ fn plan_displaced_identifier_deposes(
                 previous_attributes: None,
             },
             upsert.resource,
-            input.schemas.get_for(upsert.resource),
+            input
+                .schemas
+                .get_for(upsert.resource)
+                .map(|schema| schema.as_schema()),
             input.state_file,
             input.managed_current,
             moved_origins,
@@ -1385,7 +1390,7 @@ pub(crate) fn build_state_after_apply(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let schema = schemas.get_for(resource);
+        let schema = schemas.get_for(resource).map(|schema| schema.as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
                 ResourceState::from_provider_state_for_resource_and_schema(
@@ -2254,12 +2259,20 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            (ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
                 .attribute(
-                    AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+                    AttributeSchema::optional("replacement_key", AttributeType::string())
+                        .create_only()
+                        .build(),
                 )
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         schemas
     }
@@ -2376,12 +2389,14 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("ec2.InternetGateway")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "tags",
-                    AttributeType::map(AttributeType::string()),
-                )),
+            (ResourceSchema::new("ec2.InternetGateway")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let existing = state_after_accepted_create(
             &applied,
@@ -3018,11 +3033,14 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::new("password", AttributeType::string())
+            (ResourceSchema::new("test.resource").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
                     .write_only()
-                    .create_only(),
-            ),
+                    .create_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let saved = build_state_after_apply(
@@ -3141,14 +3159,19 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
-                .attribute(AttributeSchema::new("api_key", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "unsent_secret",
-                    AttributeType::string(),
-                )),
+            (ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("unsent_secret", AttributeType::string()).build(),
+                ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let state = write_observed_fixture(
             &resource,
@@ -3257,11 +3280,14 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::new("password", AttributeType::string())
+            (ResourceSchema::new("test.resource").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
                     .write_only()
-                    .create_only(),
-            ),
+                    .create_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let state = write_observed_fixture(
             &resource,
@@ -3461,8 +3487,10 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("name", AttributeType::string())),
+            (ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut initial = StateFile::new();
         initial
@@ -3544,10 +3572,16 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
-                .attribute(AttributeSchema::new("api_key", AttributeType::string())),
+            (ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let resolved_resource = resolved(resource.clone());
         let pending = fresh_in_flight(
@@ -5392,8 +5426,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("test.resource").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let saved = build_state_after_apply(
@@ -5449,8 +5488,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("db.Instance").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let saved = build_state_after_apply(
@@ -5565,9 +5609,15 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            ResourceSchema::new("route53.Record")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("route53.Record")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let state = build_state_after_apply(
@@ -5628,12 +5678,20 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("test.resource")
+            (ResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+                    AttributeSchema::optional("replacement_key", AttributeType::string())
+                        .create_only()
+                        .build(),
                 )
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
-                .with_coexisting_replacement(),
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .with_coexisting_replacement())
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let sorted_resources = vec![resolved(desired.clone())];
         let current_states = HashMap::from([(id.clone(), current_state.clone())]);
@@ -5890,8 +5948,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            ResourceSchema::new("route53.Record")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("route53.Record").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let state = build_state_after_apply(
@@ -6181,9 +6244,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            ResourceSchema::new("ec2.Vpc").attribute(
-                AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-            ),
+            (ResourceSchema::new("ec2.Vpc").attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let plan = create_plan(
             &sorted_resources,
@@ -6260,12 +6327,16 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("s3.Bucket")
+            (ResourceSchema::new("s3.Bucket")
                 .attribute(
-                    AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
+                    AttributeSchema::optional("bucket_name", AttributeType::string())
+                        .create_only()
+                        .build(),
                 )
-                .attribute(AttributeSchema::new("comment", AttributeType::string()))
-                .with_coexisting_replacement(),
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .with_coexisting_replacement())
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut plan = create_plan(
             &sorted_resources,

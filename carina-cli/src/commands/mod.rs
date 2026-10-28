@@ -1353,10 +1353,8 @@ exports {
             "AWSCC resource create-only enum test provider"
         }
 
-        fn provider_config_attribute_types(
-            &self,
-        ) -> HashMap<String, carina_core::schema::AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -1400,26 +1398,37 @@ exports {
             })
         }
 
-        fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
-            vec![
-                carina_core::schema::ResourceSchema::new("ec2.Subnet").attribute(
-                    carina_core::schema::AttributeSchema::new(
-                        "placement_region",
-                        carina_core::schema::AttributeType::enum_(
-                            carina_core::schema::TypeIdentity::new(
-                                Some(self.enum_provider),
-                                Vec::<String>::new(),
-                                "Region",
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                vec![
+                    carina_core::schema::ResourceSchema::new("ec2.Subnet").attribute(
+                        carina_core::schema::AttributeSchema::optional(
+                            "placement_region",
+                            carina_core::schema::AttributeType::enum_(
+                                carina_core::schema::TypeIdentity::new(
+                                    Some(self.enum_provider),
+                                    Vec::<String>::new(),
+                                    "Region",
+                                ),
+                                None,
+                                Vec::new(),
+                                None,
+                                Some(carina_core::schema::DslTransform::HyphenToUnderscore),
                             ),
-                            None,
-                            Vec::new(),
-                            None,
-                            Some(carina_core::schema::DslTransform::HyphenToUnderscore),
-                        ),
-                    )
-                    .create_only(),
-                ),
-            ]
+                        )
+                        .create_only()
+                        .build(),
+                    ),
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 

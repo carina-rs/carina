@@ -428,12 +428,12 @@ impl ProviderConfigPreparationError {
 fn canonicalize_provider_config_attributes(
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
-    attr_types: &HashMap<String, crate::schema::AttributeType>,
+    attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
         provider_name,
         attributes,
-        attr_types,
+        attr_types.parts(),
     )
     .map_err(|error| {
         let (provider, attribute, error) = error.into_parts();
@@ -460,10 +460,10 @@ pub fn validate_and_canonicalize_provider_config(
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let attr_types = factory.provider_config_attribute_types();
+    let config_schema = factory.provider_config_attribute_types();
     let canonical =
-        canonicalize_provider_config_attributes(provider_name, attributes, &attr_types)?;
-    validate_provider_config_attributes(provider_name, canonical.attributes(), &attr_types)?;
+        canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
+    validate_provider_config_attributes(provider_name, canonical.attributes(), &config_schema)?;
 
     let serializable = canonical
         .attributes
@@ -531,18 +531,17 @@ pub fn prepare_provider_ready_config(
 fn validate_provider_config_attributes(
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
-    attr_types: &HashMap<String, crate::schema::AttributeType>,
+    attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
-    let schema_view = crate::schema::Schema::with_defs(std::collections::BTreeMap::new());
     for (attribute, value) in attributes {
-        if let Some(attr_type) = attr_types.get(attribute) {
-            schema_view
-                .validate_attr(attr_type, value)
-                .map_err(|error| ProviderConfigPreparationError::InvalidAttribute {
+        if let Some(attr_type) = attr_types.effective_type(attribute) {
+            attr_type.validate(value).map_err(|error| {
+                ProviderConfigPreparationError::InvalidAttribute {
                     provider: provider_name.to_string(),
                     attribute: attribute.clone(),
                     error: Box::new(error),
-                })?;
+                }
+            })?;
         }
     }
     Ok(())
@@ -751,6 +750,7 @@ pub(super) fn managed_update_schema<'a>(
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)
+        .map(|schema| schema.as_schema())
         .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
             resource: resource.id.clone(),
         })
@@ -807,7 +807,7 @@ pub fn provider_custom_type_lookup(
 
 fn validate_known_provider_values(
     id: &ResourceId,
-    schema: &ResourceSchema,
+    schema: &crate::schema::ValidatedResourceSchema,
     attributes: &HashMap<String, Value>,
     quoted_string_attrs: &HashSet<String>,
     factories: &[Box<dyn ProviderFactory>],
@@ -824,7 +824,7 @@ fn validate_known_provider_values(
 
 fn validate_selected_provider_values(
     id: &ResourceId,
-    schema: &ResourceSchema,
+    schema: &crate::schema::ValidatedResourceSchema,
     attributes: &HashMap<String, Value>,
     selected: &HashSet<String>,
     quoted_string_attrs: &HashSet<String>,
@@ -924,8 +924,8 @@ mod provider_config_tests {
             "enum config test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::from([(
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
                 "region".to_string(),
                 AttributeType::enum_(
                     crate::schema::TypeIdentity::new(Some("test"), Vec::<String>::new(), "Region"),
@@ -934,7 +934,8 @@ mod provider_config_tests {
                     None,
                     None,
                 ),
-            )])
+            )]))
+            .expect("test provider config schema must be valid")
         }
 
         fn validate_config(
@@ -963,7 +964,7 @@ mod provider_config_tests {
             unreachable!("config preparation tests do not create providers")
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
             Vec::new()
         }
     }
@@ -998,11 +999,12 @@ mod provider_config_tests {
             "provider config preparation test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::from([(
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
                 "region".to_string(),
                 AttributeType::refined_string(None, Some(r"^good-[a-z]+$".to_string()), None, None),
-            )])
+            )]))
+            .expect("test provider config schema must be valid")
         }
 
         fn validate_config(
@@ -1028,7 +1030,7 @@ mod provider_config_tests {
             unreachable!("config preparation tests do not create providers")
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
             Vec::new()
         }
     }

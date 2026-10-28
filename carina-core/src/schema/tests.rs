@@ -1,5 +1,851 @@
 use super::*;
 
+fn admission_error(schema: ResourceSchema) -> String {
+    schema
+        .validate()
+        .expect_err("schema admission must reject the malformed draft")
+        .to_string()
+}
+
+#[test]
+fn attribute_builder_methods_preserve_each_mode() {
+    let optional = AttributeSchema::optional("optional", AttributeType::string())
+        .with_default(Value::Concrete(ConcreteValue::String("default".into())))
+        .write_only()
+        .create_only()
+        .identity()
+        .with_description("optional description")
+        .with_provider_name("Optional")
+        .with_block_name("optional_block")
+        .with_completions(vec![CompletionValue::new(
+            "candidate",
+            "candidate description",
+        )])
+        .removable()
+        .build();
+    let optional = optional.parts();
+    assert_eq!(optional.declared_input_mode, InputMode::Optional);
+    assert!(optional.default.is_some());
+    assert!(optional.write_only);
+    assert!(optional.create_only);
+    assert!(optional.identity);
+    assert_eq!(optional.description, Some("optional description"));
+    assert_eq!(optional.provider_name, Some("Optional"));
+    assert_eq!(optional.block_name, Some("optional_block"));
+    assert!(optional.completions.is_some());
+    assert_eq!(optional.removable, Some(true));
+
+    let required = AttributeSchema::required("required", AttributeType::string())
+        .write_only()
+        .create_only()
+        .identity()
+        .with_description("required description")
+        .with_provider_name("Required")
+        .with_block_name("required_block")
+        .with_completions(vec![])
+        .build();
+    let required = required.parts();
+    assert_eq!(required.declared_input_mode, InputMode::Required);
+    assert!(required.write_only);
+    assert!(required.create_only);
+    assert!(required.identity);
+    assert_eq!(required.description, Some("required description"));
+    assert_eq!(required.provider_name, Some("Required"));
+    assert_eq!(required.block_name, Some("required_block"));
+    assert!(required.completions.is_some());
+
+    let provider_populated = AttributeSchema::provider_populated("output", AttributeType::string())
+        .with_description("output description")
+        .with_provider_name("Output")
+        .deferred_populate()
+        .build();
+    let provider_populated = provider_populated.parts();
+    assert_eq!(
+        provider_populated.declared_input_mode,
+        InputMode::ProviderPopulated
+    );
+    assert_eq!(provider_populated.description, Some("output description"));
+    assert_eq!(provider_populated.provider_name, Some("Output"));
+    assert!(provider_populated.deferred_populate);
+}
+
+#[test]
+fn struct_field_builder_methods_preserve_each_mode() {
+    let optional = StructField::optional("optional", AttributeType::string())
+        .write_only()
+        .with_description("optional description")
+        .with_provider_name("Optional")
+        .with_block_name("optional_block")
+        .deferred_populate()
+        .build();
+    let optional = optional.parts();
+    assert_eq!(optional.declared_input_mode, InputMode::Optional);
+    assert!(optional.write_only);
+    assert_eq!(optional.description, Some("optional description"));
+    assert_eq!(optional.provider_name, Some("Optional"));
+    assert_eq!(optional.block_name, Some("optional_block"));
+    assert!(optional.deferred_populate);
+
+    let required = StructField::required("required", AttributeType::string())
+        .write_only()
+        .with_description("required description")
+        .with_provider_name("Required")
+        .with_block_name("required_block")
+        .deferred_populate()
+        .build();
+    let required = required.parts();
+    assert_eq!(required.declared_input_mode, InputMode::Required);
+    assert!(required.write_only);
+    assert_eq!(required.description, Some("required description"));
+    assert_eq!(required.provider_name, Some("Required"));
+    assert_eq!(required.block_name, Some("required_block"));
+    assert!(required.deferred_populate);
+
+    let provider_populated = StructField::provider_populated("output", AttributeType::string())
+        .with_description("output description")
+        .with_provider_name("Output")
+        .with_block_name("output_block")
+        .deferred_populate()
+        .build();
+    let provider_populated = provider_populated.parts();
+    assert_eq!(
+        provider_populated.declared_input_mode,
+        InputMode::ProviderPopulated
+    );
+    assert_eq!(provider_populated.description, Some("output description"));
+    assert_eq!(provider_populated.provider_name, Some("Output"));
+    assert_eq!(provider_populated.block_name, Some("output_block"));
+    assert!(provider_populated.deferred_populate);
+}
+
+#[test]
+fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
+    let registry = builtin_validator_registry();
+    assert_eq!(registry.len(), 12);
+
+    let positive_int = builtin_validator(&TypeIdentity::bare("PositiveInt"))
+        .expect("PositiveInt must be registered by its exact identity");
+    assert!(positive_int(&Value::Concrete(ConcreteValue::Int(1))).is_ok());
+    assert!(positive_int(&Value::Concrete(ConcreteValue::Int(0))).is_err());
+
+    let email = builtin_validator(&TypeIdentity::bare("Email"))
+        .expect("Email must be registered by its exact identity");
+    assert!(
+        email(&Value::Concrete(ConcreteValue::String(
+            "user@example.com".into()
+        )))
+        .is_ok()
+    );
+    assert!(
+        email(&Value::Concrete(ConcreteValue::String(
+            "not-an-email".into()
+        )))
+        .is_err()
+    );
+}
+
+#[test]
+fn schema_admission_rejects_a_dangling_attribute_ref() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Missing")).build()),
+    );
+
+    assert!(error.contains("test.Widget"), "{error}");
+    assert!(error.contains("config"), "{error}");
+    assert!(error.contains("Missing"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_a_dangling_ref_reached_from_defs() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .with_def("Root", AttributeType::ref_("Missing"))
+            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Root")).build()),
+    );
+
+    assert!(error.contains("defs.Root"), "{error}");
+    assert!(error.contains("Missing"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_duplicate_top_level_attributes() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build()),
+    );
+
+    assert!(error.contains("duplicate"), "{error}");
+    assert!(error.contains("name"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_duplicate_nested_struct_fields() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("mode", AttributeType::string()).build(),
+                        StructField::required("mode", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("duplicate"), "{error}");
+    assert!(error.contains("config.mode"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_duplicate_struct_fields_in_defs() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .with_def(
+                "Config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("mode", AttributeType::string()).build(),
+                        StructField::optional("mode", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Config")).build()),
+    );
+
+    assert!(error.contains("defs.Config.mode"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_unknown_exclusive_required_names() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("left", AttributeType::string()).build())
+            .exclusive_required(&["left", "missing"]),
+    );
+
+    assert!(error.contains("exclusive_required"), "{error}");
+    assert!(error.contains("missing"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_provider_populated_exclusive_required_names() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
+            .exclusive_required(&["arn"]),
+    );
+
+    assert!(error.contains("exclusive_required"), "{error}");
+    assert!(error.contains("arn"), "{error}");
+    assert!(error.contains("provider-populated"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_an_unknown_unique_name_attribute() {
+    let error =
+        admission_error(ResourceSchema::new("test.Widget").with_unique_name_attribute("missing"));
+
+    assert!(error.contains("unique name"), "{error}");
+    assert!(error.contains("missing"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let error = admission_error(
+            ResourceSchema::new("test.Widget").attribute(
+                AttributeSchema::optional("threshold", AttributeType::float())
+                    .with_default(Value::Concrete(ConcreteValue::Float(value)))
+                    .build(),
+            ),
+        );
+        assert!(error.contains("threshold"), "{error}");
+        assert!(error.contains("finite"), "{error}");
+    }
+
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("thresholds", AttributeType::list(AttributeType::float()))
+                .with_default(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Float(f64::NAN),
+                )])))
+                .build(),
+        ),
+    );
+    assert!(error.contains("thresholds[0]"), "{error}");
+    assert!(error.contains("finite"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_deferred_defaults_recursively() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .with_default(Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ForValue,
+                )))
+                .build(),
+        ),
+    );
+
+    assert!(error.contains("name"), "{error}");
+    assert!(error.contains("portable"), "{error}");
+}
+
+#[test]
+fn schema_admission_allows_declared_user_input_below_provider_populated_output() {
+    ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("value", AttributeType::string())
+                            .with_block_name("value_block")
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("declared user-input metadata is inert below provider output");
+}
+
+#[test]
+fn shared_def_keeps_declared_mode_and_is_assignable_on_its_writable_path() {
+    let schema = ResourceSchema::new("test.Widget")
+        .with_def(
+            "Tag",
+            AttributeType::struct_(
+                "Tag",
+                vec![
+                    StructField::required("key", AttributeType::string())
+                        .with_block_name("tag_key")
+                        .build(),
+                ],
+            ),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "effective_tags",
+                AttributeType::list(AttributeType::ref_("Tag")),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("one definition may be reached through writable and read-only paths");
+
+    let tag = schema
+        .parts()
+        .defs
+        .get("Tag")
+        .expect("shared definition must remain present");
+    let RawShape::Struct { fields, .. } = tag.raw_shape() else {
+        panic!("Tag must remain a struct");
+    };
+    assert_eq!(fields[0].parts().declared_input_mode, InputMode::Required);
+    assert_eq!(fields[0].parts().block_name, Some("tag_key"));
+
+    let attributes = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String("Name".into())),
+            )])),
+        )])),
+    )]);
+    schema
+        .validate(&attributes)
+        .expect("declared fields remain assignable through the writable path");
+}
+
+#[test]
+fn effective_field_mode_is_derived_from_each_reference_path() {
+    let schema = ResourceSchema::new("test.Widget")
+        .with_def(
+            "Tag",
+            AttributeType::struct_(
+                "Tag",
+                vec![StructField::required("key", AttributeType::string()).build()],
+            ),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "effective_tags",
+                AttributeType::list(AttributeType::ref_("Tag")),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("shared definition must be valid");
+
+    let writable = schema
+        .effective_node_at_path(&["tags".to_string(), "key".to_string()])
+        .expect("writable field path must resolve");
+    assert_eq!(writable.effective_input_mode(), InputMode::Required);
+    assert!(writable.is_required());
+    assert!(!writable.is_read_only());
+
+    let output = schema
+        .effective_node_at_path(&["effective_tags".to_string(), "key".to_string()])
+        .expect("provider-populated field path must resolve");
+    assert_eq!(output.effective_input_mode(), InputMode::ProviderPopulated);
+    assert!(!output.is_required());
+    assert!(output.is_read_only());
+}
+
+#[test]
+fn effective_attribute_separates_canonical_and_authored_names() {
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional("rules", AttributeType::string())
+                .with_block_name("rule")
+                .build(),
+        )
+        .validate()
+        .expect("schema fixture must be valid");
+
+    assert!(schema.effective_attribute("rule").is_none());
+    assert_eq!(
+        schema
+            .effective_attribute_by_authored_name("rule")
+            .expect("authored alias must resolve")
+            .name(),
+        "rules"
+    );
+    assert_eq!(
+        schema
+            .effective_node_at_authored_path(&["rule".to_string()])
+            .expect("authored path traversal must accept the block alias")
+            .name(),
+        "rules"
+    );
+}
+
+#[test]
+fn effective_node_lookup_gives_each_path_segment_a_fresh_shape_budget() {
+    let mut attr_type = AttributeType::string();
+    let mut nested_segments = Vec::new();
+    for index in (0..80).rev() {
+        let name = format!("field_{index}");
+        attr_type = AttributeType::struct_(
+            format!("Level{index}"),
+            vec![StructField::required(name.clone(), attr_type).build()],
+        );
+        nested_segments.push(name);
+    }
+    nested_segments.reverse();
+    let schema = ResourceSchema::new("test.Deep")
+        .attribute(AttributeSchema::provider_populated("output", attr_type).build())
+        .validate()
+        .expect("deep schema must be valid");
+    let mut path = vec!["output".to_string()];
+    path.extend(nested_segments);
+
+    let leaf = schema
+        .effective_node_at_path(&path)
+        .expect("earlier path segments must not exhaust a shared lookup budget");
+    assert!(leaf.is_read_only());
+}
+
+#[test]
+fn schema_admission_rechecks_recursive_defs_per_ancestry_path() {
+    ResourceSchema::new("test.Node")
+        .with_def(
+            "Node",
+            AttributeType::struct_(
+                "Node",
+                vec![
+                    StructField::optional("value", AttributeType::string()).build(),
+                    StructField::provider_populated("child", AttributeType::ref_("Node")).build(),
+                ],
+            ),
+        )
+        .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build())
+        .validate()
+        .expect("recursive refs must distinguish writable and provider-populated ancestry");
+}
+
+#[test]
+fn schema_admission_rejects_recursive_write_only_after_ancestry_changes() {
+    let error = admission_error(
+        ResourceSchema::new("test.Node")
+            .with_def(
+                "Node",
+                AttributeType::struct_(
+                    "Node",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                        StructField::provider_populated("child", AttributeType::ref_("Node"))
+                            .build(),
+                    ],
+                ),
+            )
+            .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build()),
+    );
+
+    assert!(error.contains("root.child.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn schema_admission_carries_provider_ancestry_through_union_members() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::union(vec![
+                    AttributeType::struct_(
+                        "Output",
+                        vec![
+                            StructField::optional("secret", AttributeType::string())
+                                .write_only()
+                                .build(),
+                        ],
+                    ),
+                    AttributeType::string(),
+                ]),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("output.<union:0>.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn schema_admission_carries_provider_ancestry_through_map_values() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::map(AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                    ],
+                )),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("output.<value>.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn provider_populated_read_model_does_not_require_declared_required_fields() {
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![StructField::required("eventual", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("schema fixture must be valid");
+    let output = schema
+        .effective_attribute("output")
+        .expect("output attribute must exist")
+        .value_type();
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+
+    assert!(
+        output.validate(&value).is_ok(),
+        "a provider read model may omit a nested field whose declared required mode is inert"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_write_only_below_provider_populated_output() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("output.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_write_only_in_shared_def_on_read_only_path() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .with_def(
+                "Shared",
+                AttributeType::struct_(
+                    "Shared",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("output", AttributeType::ref_("Shared"))
+                    .build(),
+            ),
+    );
+
+    assert!(error.contains("output.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_deferred_field_in_shared_def_on_writable_path() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget")
+            .with_def(
+                "Shared",
+                AttributeType::struct_(
+                    "Shared",
+                    vec![
+                        StructField::optional("value", AttributeType::string())
+                            .deferred_populate()
+                            .build(),
+                    ],
+                ),
+            )
+            .attribute(AttributeSchema::optional("input", AttributeType::ref_("Shared")).build())
+            .attribute(
+                AttributeSchema::provider_populated("output", AttributeType::ref_("Shared"))
+                    .build(),
+            ),
+    );
+
+    assert!(error.contains("input.value"), "{error}");
+    assert!(error.contains("deferred-populate"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_a_default_on_provider_populated_output() {
+    let mut attribute =
+        AttributeSchema::provider_populated("output", AttributeType::string()).build();
+    attribute.default = Some(Value::Concrete(ConcreteValue::String("invalid".into())));
+
+    let error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+
+    assert!(error.contains("output"), "{error}");
+    assert!(error.contains("default"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_top_level_and_nested_write_only_conflicts() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .write_only()
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("config"), "{error}");
+    assert!(error.contains("write-only-bearing"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_write_only_fields_inside_union_members() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::union(vec![AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                    ],
+                )]),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("config"), "{error}");
+    assert!(error.contains("union"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
+    let mut field = StructField::provider_populated("secret", AttributeType::string()).build();
+    field.write_only = true;
+    let error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+
+    assert!(error.contains("config.secret"), "{error}");
+    assert!(error.contains("write-only"), "{error}");
+}
+
+#[test]
+fn config_schema_admission_rejects_dangling_refs_and_duplicate_fields() {
+    let types = HashMap::from([
+        ("direct".to_string(), AttributeType::ref_("Missing")),
+        (
+            "nested".to_string(),
+            AttributeType::struct_(
+                "Nested",
+                vec![
+                    StructField::optional("value", AttributeType::string()).build(),
+                    StructField::optional("value", AttributeType::int()).build(),
+                ],
+            ),
+        ),
+    ]);
+
+    let errors = ValidatedConfigSchema::validate(types)
+        .expect_err("config schema admission must reject malformed types");
+    let message = errors.to_string();
+    assert!(message.contains("Missing"), "{message}");
+    assert!(message.contains("nested.value"), "{message}");
+}
+
+#[test]
+fn config_schema_admission_allows_declared_user_input_below_provider_output() {
+    let types = HashMap::from([(
+        "output".to_string(),
+        AttributeType::struct_(
+            "Output",
+            vec![
+                StructField::provider_populated(
+                    "nested",
+                    AttributeType::struct_(
+                        "Nested",
+                        vec![StructField::required("value", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            ],
+        ),
+    )]);
+
+    ValidatedConfigSchema::validate(types)
+        .expect("declared user input is inert below provider-populated config output");
+}
+
+#[test]
+fn config_schema_effective_field_lookup_carries_provider_populated_ancestry() {
+    let nested = || {
+        AttributeType::struct_(
+            "Nested",
+            vec![StructField::required("value", AttributeType::string()).build()],
+        )
+    };
+    let types = HashMap::from([
+        (
+            "writable".to_string(),
+            AttributeType::struct_(
+                "Writable",
+                vec![StructField::optional("nested", nested()).build()],
+            ),
+        ),
+        (
+            "output".to_string(),
+            AttributeType::struct_(
+                "Output",
+                vec![StructField::provider_populated("nested", nested()).build()],
+            ),
+        ),
+    ]);
+    let schema = ValidatedConfigSchema::validate(types).expect("config schema must be valid");
+
+    let writable = schema
+        .effective_field_at_path(&[
+            "writable".to_string(),
+            "nested".to_string(),
+            "value".to_string(),
+        ])
+        .expect("writable config path must resolve");
+    assert_eq!(writable.effective_input_mode(), InputMode::Required);
+
+    let output = schema
+        .effective_field_at_path(&[
+            "output".to_string(),
+            "nested".to_string(),
+            "value".to_string(),
+        ])
+        .expect("provider-populated config path must resolve");
+    assert_eq!(output.effective_input_mode(), InputMode::ProviderPopulated);
+}
+
+#[test]
+fn declared_tags_validator_executes_on_a_validated_schema() {
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+        .validate()
+        .unwrap();
+    let attributes = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "Key".to_string(),
+                Value::Concrete(ConcreteValue::String("Name".into())),
+            ),
+            (
+                "Value".to_string(),
+                Value::Concrete(ConcreteValue::String("widget".into())),
+            ),
+        ]))),
+    )]);
+
+    assert!(schema.validate(&attributes).is_err());
+}
+
 #[test]
 fn unavailable_type_name_matches_the_equivalent_function_call() {
     let args = vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
@@ -22,16 +868,19 @@ fn unavailable_type_name_matches_the_equivalent_function_call() {
 
 #[test]
 fn enum_custom_lookup_receives_resolved_api_spelling() {
-    let schema = ResourceSchema::new("widget").attribute(AttributeSchema::new(
-        "mode",
-        AttributeType::enum_(
-            enum_identity("Mode", Some("test.widget")),
-            Some(vec!["Allow".to_string(), "Deny".to_string()]),
-            vec![("Allow".to_string(), "allow".to_string())],
-            None,
-            None,
-        ),
-    ));
+    let schema = ResourceSchema::new("widget").attribute(
+        AttributeSchema::optional(
+            "mode",
+            AttributeType::enum_(
+                enum_identity("Mode", Some("test.widget")),
+                Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                vec![("Allow".to_string(), "allow".to_string())],
+                None,
+                None,
+            ),
+        )
+        .build(),
+    );
     let attributes = std::collections::HashMap::from([(
         "mode".to_string(),
         Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow")),
@@ -63,118 +912,27 @@ fn enum_custom_lookup_receives_resolved_api_spelling() {
 }
 
 #[test]
-#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
-fn struct_field_conflicting_input_mode_required_then_read_only_is_rejected() {
-    let _ = StructField::new("arn", AttributeType::string())
-        .required()
-        .read_only();
-}
-
-#[test]
-#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
-fn struct_field_conflicting_input_mode_read_only_then_required_is_rejected() {
-    let _ = StructField::new("arn", AttributeType::string())
-        .read_only()
-        .required();
-}
-
-#[test]
 fn struct_field_write_only_builder_allows_required_input() {
-    let field = StructField::new("client_secret", AttributeType::string())
-        .required()
-        .write_only();
+    let field = StructField::required("client_secret", AttributeType::string())
+        .write_only()
+        .build();
 
-    assert!(field.is_required());
+    assert_eq!(field.parts().declared_input_mode, InputMode::Required);
     assert!(field.write_only);
 }
 
 #[test]
-#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
-fn struct_field_conflicting_write_only_then_read_only_is_rejected() {
-    let _ = StructField::new("client_secret", AttributeType::string())
-        .write_only()
-        .read_only();
-}
-
-#[test]
-#[should_panic(expected = "struct field cannot be both write-only and provider-populated")]
-fn struct_field_conflicting_read_only_then_write_only_is_rejected() {
-    let _ = StructField::new("client_secret", AttributeType::string())
-        .read_only()
-        .write_only();
-}
-
-#[test]
-#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
-fn attribute_schema_conflicting_input_mode_required_then_read_only_is_rejected() {
-    let _ = AttributeSchema::new("arn", AttributeType::string())
-        .required()
-        .read_only();
-}
-
-#[test]
-#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
-fn attribute_schema_conflicting_input_mode_read_only_then_required_is_rejected() {
-    let _ = AttributeSchema::new("arn", AttributeType::string())
-        .read_only()
-        .required();
-}
-
-#[test]
-#[should_panic(expected = "attribute cannot be both write-only and provider-populated")]
-fn attribute_schema_conflicting_write_only_then_read_only_is_rejected() {
-    let _ = AttributeSchema::new("client_secret", AttributeType::string())
-        .write_only()
-        .read_only();
-}
-
-#[test]
-#[should_panic(expected = "attribute cannot be both write-only and provider-populated")]
-fn attribute_schema_conflicting_read_only_then_write_only_is_rejected() {
-    let _ = AttributeSchema::new("client_secret", AttributeType::string())
-        .read_only()
-        .write_only();
-}
-
-#[test]
 fn attribute_schema_write_only_default_false() {
-    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int());
+    let attr = AttributeSchema::optional("ipv4_netmask_length", AttributeType::int()).build();
     assert!(!attr.write_only);
 }
 
 #[test]
 fn attribute_schema_write_only_builder() {
-    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only();
+    let attr = AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+        .write_only()
+        .build();
     assert!(attr.write_only);
-}
-
-#[test]
-#[should_panic(expected = "top-level attribute cannot be both write-only and write-only-bearing")]
-fn top_level_write_only_attribute_cannot_also_bear_write_only_fields() {
-    let _ = ResourceSchema::new("listener").attribute(
-        AttributeSchema::new(
-            "default_actions",
-            AttributeType::struct_(
-                "Action",
-                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
-            ),
-        )
-        .write_only(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "top-level attribute cannot be both write-only and write-only-bearing")]
-fn adding_a_def_rechecks_top_level_write_only_bearing_conflicts() {
-    let _ = ResourceSchema::new("listener")
-        .attribute(AttributeSchema::new("config", AttributeType::ref_("Config")).write_only())
-        .with_def(
-            "Config",
-            AttributeType::struct_(
-                "Config",
-                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
-            ),
-        );
 }
 
 #[test]
@@ -185,16 +943,19 @@ fn first_write_only_conflict_reports_lexicographically_first_attribute() {
             let name = format!("conflict_{index:02}");
             attributes.insert(
                 name.clone(),
-                AttributeSchema::new(
+                AttributeSchema::optional(
                     name,
                     AttributeType::struct_(
                         "Action",
                         vec![
-                            StructField::new("client_secret", AttributeType::string()).write_only(),
+                            StructField::optional("client_secret", AttributeType::string())
+                                .write_only()
+                                .build(),
                         ],
                     ),
                 )
-                .write_only(),
+                .write_only()
+                .build(),
             );
         }
 
@@ -208,41 +969,6 @@ fn first_write_only_conflict_reports_lexicographically_first_attribute() {
 }
 
 #[test]
-#[should_panic(expected = "union members cannot be write-only-bearing")]
-fn union_member_cannot_bear_write_only_fields() {
-    let _ = ResourceSchema::new("listener").attribute(AttributeSchema::new(
-        "authentication",
-        AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::struct_(
-                "OidcConfig",
-                vec![StructField::new("client_secret", AttributeType::string()).write_only()],
-            ),
-        ]),
-    ));
-}
-
-#[test]
-#[should_panic(expected = "union members cannot be write-only-bearing")]
-fn adding_a_def_rechecks_union_write_only_bearing_conflicts() {
-    let _ = ResourceSchema::new("listener")
-        .attribute(AttributeSchema::new(
-            "authentication",
-            AttributeType::ref_("Authentication"),
-        ))
-        .with_def(
-            "Authentication",
-            AttributeType::union(vec![
-                AttributeType::string(),
-                AttributeType::struct_(
-                    "OidcConfig",
-                    vec![StructField::new("client_secret", AttributeType::string()).write_only()],
-                ),
-            ]),
-        );
-}
-
-#[test]
 fn write_only_bearing_and_projection_walk_ref_list_and_map() {
     let schema = ResourceSchema::new("listener")
         .with_def(
@@ -250,15 +976,20 @@ fn write_only_bearing_and_projection_walk_ref_list_and_map() {
             AttributeType::struct_(
                 "OidcConfig",
                 vec![
-                    StructField::new("issuer", AttributeType::string()),
-                    StructField::new("client_secret", AttributeType::string()).write_only(),
+                    StructField::optional("issuer", AttributeType::string()).build(),
+                    StructField::optional("client_secret", AttributeType::string())
+                        .write_only()
+                        .build(),
                 ],
             ),
         )
-        .attribute(AttributeSchema::new(
-            "configs",
-            AttributeType::map(AttributeType::list(AttributeType::ref_("OidcConfig"))),
-        ));
+        .attribute(
+            AttributeSchema::optional(
+                "configs",
+                AttributeType::map(AttributeType::list(AttributeType::ref_("OidcConfig"))),
+            )
+            .build(),
+        );
     let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "primary".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
@@ -312,16 +1043,21 @@ fn write_only_bearing_and_projection_walk_ref_list_and_map() {
 
 #[test]
 fn write_only_walkers_treat_dangling_refs_as_opaque() {
-    let schema = ResourceSchema::new("listener").attribute(AttributeSchema::new(
-        "config",
-        AttributeType::struct_(
-            "Config",
-            vec![
-                StructField::new("opaque", AttributeType::ref_("Missing")),
-                StructField::new("client_secret", AttributeType::string()).write_only(),
-            ],
-        ),
-    ));
+    let schema = ResourceSchema::new("listener").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("opaque", AttributeType::ref_("Missing")).build(),
+                    StructField::optional("client_secret", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     let read_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "opaque".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -882,19 +1618,22 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
     // End-to-end at the ResourceSchema boundary: the attribute loop in
     // `ResourceSchema::validate` must wrap type errors with the attribute
     // name so every downstream consumer (CLI, LSP) sees the plumbed form.
-    let schema = ResourceSchema::new("test.assignment").attribute(
-        AttributeSchema::new(
-            "target_type",
-            AttributeType::enum_(
-                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
-                Some(vec!["AWS_ACCOUNT".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
+    let schema = ResourceSchema::new("test.assignment")
+        .attribute(
+            AttributeSchema::required(
+                "target_type",
+                AttributeType::enum_(
+                    crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                    Some(vec!["AWS_ACCOUNT".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
         )
-        .required(),
-    );
+        .validate()
+        .expect("enum validation schema must be valid");
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
@@ -1013,19 +1752,22 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
     // `ConcreteValue::EnumIdentifier` = bare/namespaced identifier),
     // so the diagnostic shape follows from the value's variant
     // independently of the origin tag.
-    let schema = ResourceSchema::new("test.assignment").attribute(
-        AttributeSchema::new(
-            "target_type",
-            AttributeType::enum_(
-                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
-                Some(vec!["AWS_ACCOUNT".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
+    let schema = ResourceSchema::new("test.assignment")
+        .attribute(
+            AttributeSchema::required(
+                "target_type",
+                AttributeType::enum_(
+                    crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                    Some(vec!["AWS_ACCOUNT".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
         )
-        .required(),
-    );
+        .validate()
+        .expect("enum origin schema must be valid");
 
     // Quoted literal → reshaped diagnostic, regardless of origin tag.
     let mut attrs = HashMap::new();
@@ -1063,19 +1805,22 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     // A valid enum value (bare or namespaced) must still pass even
     // when the caller tags it as string-literal origin — the shape
     // check is only triggered on a failing match.
-    let schema = ResourceSchema::new("test.assignment").attribute(
-        AttributeSchema::new(
-            "target_type",
-            AttributeType::enum_(
-                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
-                Some(vec!["AWS_ACCOUNT".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
+    let schema = ResourceSchema::new("test.assignment")
+        .attribute(
+            AttributeSchema::required(
+                "target_type",
+                AttributeType::enum_(
+                    crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                    Some(vec!["AWS_ACCOUNT".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
         )
-        .required(),
-    );
+        .validate()
+        .expect("enum origin schema must be valid");
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
@@ -1105,20 +1850,23 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
             _ => Err("expected String".to_string()),
         }
     }
-    let schema = ResourceSchema::new("test.r.mode_holder").attribute(
-        AttributeSchema::new(
-            "mode",
-            AttributeType::enum_with_base(
-                crate::schema::enum_identity("Mode", Some("test.r")),
-                AttributeType::string(),
-                None,
-                vec![],
-                Some(legacy_validator(validate_mode)),
-                None,
-            ),
+    let schema = ResourceSchema::new("test.r.mode_holder")
+        .attribute(
+            AttributeSchema::required(
+                "mode",
+                AttributeType::enum_with_base(
+                    crate::schema::enum_identity("Mode", Some("test.r")),
+                    AttributeType::string(),
+                    None,
+                    vec![],
+                    Some(legacy_validator(validate_mode)),
+                    None,
+                ),
+            )
+            .build(),
         )
-        .required(),
-    );
+        .validate()
+        .expect("custom enum origin schema must be valid");
     let mut attrs = HashMap::new();
     // Two-part form like "test.r.Mode.aaa" would skip the Custom
     // branch by passing validation; use a bare-shape literal that
@@ -1311,9 +2059,11 @@ fn validate_positive_int() {
 #[test]
 fn validate_resource_schema() {
     let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("count", types::positive_int()))
-        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("count", types::positive_int()).build())
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
+        .validate()
+        .expect("resource validation schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -1332,7 +2082,9 @@ fn validate_resource_schema() {
 #[test]
 fn missing_required_attribute() {
     let schema = ResourceSchema::new("bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .validate()
+        .expect("bucket schema must be valid");
 
     let attrs = HashMap::new();
     let result = schema.validate(&attrs);
@@ -1403,9 +2155,9 @@ fn validate_struct_type() {
     let t = AttributeType::struct_(
         "Ingress".to_string(),
         vec![
-            StructField::new("ip_protocol", AttributeType::string()).required(),
-            StructField::new("from_port", AttributeType::int()),
-            StructField::new("to_port", AttributeType::int()),
+            StructField::required("ip_protocol", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
         ],
     );
 
@@ -1460,10 +2212,10 @@ fn struct_rejects_unknown_field() {
     let t = AttributeType::struct_(
         "Ingress".to_string(),
         vec![
-            StructField::new("ip_protocol", AttributeType::string()).required(),
-            StructField::new("from_port", AttributeType::int()),
-            StructField::new("to_port", AttributeType::int()),
-            StructField::new("cidr_ip", AttributeType::string()),
+            StructField::required("ip_protocol", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
+            StructField::optional("cidr_ip", AttributeType::string()).build(),
         ],
     );
 
@@ -1499,10 +2251,10 @@ fn struct_suggests_similar_field() {
     let t = AttributeType::struct_(
         "Ingress".to_string(),
         vec![
-            StructField::new("ip_protocol", AttributeType::string()),
-            StructField::new("from_port", AttributeType::int()),
-            StructField::new("to_port", AttributeType::int()),
-            StructField::new("cidr_ip", AttributeType::string()),
+            StructField::optional("ip_protocol", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
+            StructField::optional("cidr_ip", AttributeType::string()).build(),
         ],
     );
 
@@ -1557,8 +2309,8 @@ fn struct_error_message_format() {
     let t = AttributeType::struct_(
         "SecurityGroupIngress".to_string(),
         vec![
-            StructField::new("vpc_id", AttributeType::string()),
-            StructField::new("cidr_ip", AttributeType::string()),
+            StructField::optional("vpc_id", AttributeType::string()).build(),
+            StructField::optional("cidr_ip", AttributeType::string()).build(),
         ],
     );
 
@@ -1628,7 +2380,7 @@ fn test_suggest_similar_name() {
 fn validate_list_of_struct() {
     let struct_type = AttributeType::struct_(
         "Ingress".to_string(),
-        vec![StructField::new("ip_protocol", AttributeType::string()).required()],
+        vec![StructField::required("ip_protocol", AttributeType::string()).build()],
     );
     let list_type = AttributeType::list(struct_type);
 
@@ -1655,7 +2407,7 @@ fn struct_rejects_block_syntax_single_element() {
     // for bare Struct attributes
     let struct_type = AttributeType::struct_(
         "VersioningConfiguration".to_string(),
-        vec![StructField::new("status", AttributeType::string()).required()],
+        vec![StructField::required("status", AttributeType::string()).build()],
     );
 
     let mut map = IndexMap::new();
@@ -1686,7 +2438,7 @@ fn struct_rejects_block_syntax_multiple_elements() {
     // Multiple blocks for a bare Struct attribute should also be rejected
     let struct_type = AttributeType::struct_(
         "VersioningConfiguration".to_string(),
-        vec![StructField::new("status", AttributeType::string()).required()],
+        vec![StructField::required("status", AttributeType::string()).build()],
     );
 
     let mut map1 = IndexMap::new();
@@ -2032,52 +2784,51 @@ fn types_module_has_no_aws_specific_types() {
 }
 
 #[test]
-fn resource_validator_called() {
-    fn my_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        if attributes.contains_key("forbidden") {
-            Err(vec![TypeError::ValidationFailed {
-                message: "forbidden attribute not allowed".to_string(),
-            }])
-        } else {
-            Ok(())
-        }
-    }
-
+fn declared_resource_validator_called() {
     let schema = ResourceSchema::new("test")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("forbidden", AttributeType::string()))
-        .with_validator(my_validator);
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+        .validate()
+        .expect("declared-validator schema must be valid");
 
-    // Valid: no forbidden attribute
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".into())),
-    );
+    let attrs = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".into())),
+        )]))),
+    )]);
     assert!(schema.validate(&attrs).is_ok());
 
-    // Invalid: forbidden attribute present
-    let mut bad_attrs = HashMap::new();
-    bad_attrs.insert(
-        "forbidden".to_string(),
-        Value::Concrete(ConcreteValue::String("bad".into())),
-    );
+    let bad_attrs = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "Key".to_string(),
+                Value::Concrete(ConcreteValue::String("Name".into())),
+            ),
+            (
+                "Value".to_string(),
+                Value::Concrete(ConcreteValue::String("test".into())),
+            ),
+        ]))),
+    )]);
     let result = schema.validate(&bad_attrs);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().len(), 1);
 }
 
 #[test]
-fn with_validator_stores_in_process_validation() {
-    fn accept_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        Ok(())
-    }
-
-    let schema = ResourceSchema::new("test").with_validator(accept_all);
+fn with_declared_validators_stores_portable_validation() {
+    let schema = ResourceSchema::new("test")
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck]);
 
     assert!(matches!(
         schema.validation,
-        ResourceValidation::InProcess(_)
+        ResourceValidation::Declared(ref validators)
+            if validators == &[ValidatorType::TagsKeyValueCheck]
     ));
     assert!(schema.validator().is_some());
 }
@@ -2087,22 +2838,41 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     use crate::resource::UnknownReason;
 
     let schema = ResourceSchema::new("test.KnownValues")
-        .attribute(AttributeSchema::new(
-            "pattern",
-            AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
-        ))
-        .attribute(AttributeSchema::new(
-            "length",
-            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
-        ))
-        .attribute(AttributeSchema::new(
-            "range",
-            AttributeType::refined_int(None, Some((Some(1), Some(10)))),
-        ))
-        .attribute(AttributeSchema::new(
-            "custom",
-            AttributeType::refined_string(Some(TypeIdentity::bare("CheckedId")), None, None, None),
-        ));
+        .attribute(
+            AttributeSchema::optional(
+                "pattern",
+                AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "length",
+                AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "range",
+                AttributeType::refined_int(None, Some((Some(1), Some(10)))),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "custom",
+                AttributeType::refined_string(
+                    Some(TypeIdentity::bare("CheckedId")),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("secret enum schema must be valid");
     let unknown = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
     let mut attributes = HashMap::from([
         ("pattern".to_string(), unknown()),
@@ -2178,15 +2948,18 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
 fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
     use crate::resource::UnknownReason;
 
-    let schema = ResourceSchema::new("test.NestedKnownValues").attribute(AttributeSchema::new(
-        "names",
-        AttributeType::list(AttributeType::refined_string(
-            None,
-            Some("^[a-z]+$".to_string()),
-            None,
-            None,
-        )),
-    ));
+    let schema = ResourceSchema::new("test.NestedKnownValues").attribute(
+        AttributeSchema::optional(
+            "names",
+            AttributeType::list(AttributeType::refined_string(
+                None,
+                Some("^[a-z]+$".to_string()),
+                None,
+                None,
+            )),
+        )
+        .build(),
+    );
     let attributes = HashMap::from([(
         "names".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
@@ -2212,17 +2985,6 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
 fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     use indexmap::IndexMap;
 
-    fn reject_resource_secret(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        match attributes.get("resource_custom") {
-            Some(Value::Concrete(ConcreteValue::String(value))) => {
-                Err(vec![TypeError::ValidationFailed {
-                    message: format!("resource validator rejected {}", value.expose_plaintext()),
-                }])
-            }
-            _ => Ok(()),
-        }
-    }
-
     let constrained = || {
         AttributeType::refined_string(
             None,
@@ -2232,7 +2994,7 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         )
     };
     let custom = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("SecretCustom")),
+        TypeIdentity::bare("SecretCustom"),
         None,
         None,
         legacy_validator(|value| match value {
@@ -2245,39 +3007,40 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         None,
     );
     let schema = ResourceSchema::new("test.SecretValues")
-        .attribute(AttributeSchema::new("length", constrained()))
-        .attribute(AttributeSchema::new(
-            "enum_value",
-            AttributeType::enum_(
-                TypeIdentity::bare("Mode"),
-                Some(vec!["allowed".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
-        ))
-        .attribute(AttributeSchema::new("custom", custom.clone()))
-        .attribute(AttributeSchema::new("lookup", custom))
-        .attribute(AttributeSchema::new(
-            "list",
-            AttributeType::list(constrained()),
-        ))
-        .attribute(AttributeSchema::new(
-            "map",
-            AttributeType::map(constrained()),
-        ))
-        .attribute(AttributeSchema::new(
-            "struct",
-            AttributeType::struct_(
-                "SecretStruct".to_string(),
-                vec![StructField::new("field", constrained())],
-            ),
-        ))
-        .attribute(AttributeSchema::new(
-            "resource_custom",
-            AttributeType::string(),
-        ))
-        .with_validator(reject_resource_secret);
+        .attribute(AttributeSchema::optional("length", constrained()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "enum_value",
+                AttributeType::enum_(
+                    TypeIdentity::bare("Mode"),
+                    Some(vec!["allowed".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(AttributeSchema::optional("custom", custom.clone()).build())
+        .attribute(AttributeSchema::optional("lookup", custom).build())
+        .attribute(AttributeSchema::optional("list", AttributeType::list(constrained())).build())
+        .attribute(AttributeSchema::optional("map", AttributeType::map(constrained())).build())
+        .attribute(
+            AttributeSchema::optional(
+                "struct",
+                AttributeType::struct_(
+                    "SecretStruct".to_string(),
+                    vec![StructField::optional("field", constrained()).build()],
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+        .validate()
+        .expect("secret validation schema must be valid");
     let secret = |value: &str| {
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String(value.to_string().into()),
@@ -2287,6 +3050,10 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     map.insert("key".to_string(), secret("map-plaintext"));
     let mut structure = IndexMap::new();
     structure.insert("field".to_string(), secret("struct-plaintext"));
+    let tags = IndexMap::from([
+        ("Key".to_string(), secret("tag-key-plaintext")),
+        ("Value".to_string(), secret("tag-value-plaintext")),
+    ]);
     let attributes = HashMap::from([
         ("length".to_string(), secret("length-plaintext")),
         (
@@ -2307,8 +3074,8 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
             Value::Concrete(ConcreteValue::Map(structure)),
         ),
         (
-            "resource_custom".to_string(),
-            secret("resource-custom-plaintext"),
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(tags)),
         ),
     ]);
     let lookup = |_identity: &TypeIdentity, value: &Value| match value {
@@ -2336,7 +3103,8 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         "list-plaintext",
         "map-plaintext",
         "struct-plaintext",
-        "resource-custom-plaintext",
+        "tag-key-plaintext",
+        "tag-value-plaintext",
     ] {
         assert!(
             !rendered.contains(plaintext),
@@ -2368,32 +3136,40 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
     let enumerated_plaintext = "enumerated-secret-literal";
     let validator_plaintext = "validator-secret-literal";
     let schema = ResourceSchema::new("test.SecretEnums")
-        .attribute(AttributeSchema::new(
-            "enumerated",
-            AttributeType::enum_(
-                TypeIdentity::bare("Mode"),
-                Some(vec!["allowed".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
-        ))
-        .attribute(AttributeSchema::new(
-            "validated",
-            AttributeType::enum_with_base(
-                enum_identity("DynamicMode", Some("test.SecretEnums")),
-                AttributeType::string(),
-                None,
-                vec![],
-                Some(legacy_validator(|value| match value {
-                    Value::Concrete(ConcreteValue::String(value)) => {
-                        Err(format!("provider rejected {}", value.expose_plaintext()))
-                    }
-                    _ => Err("expected a string".to_string()),
-                })),
-                None,
-            ),
-        ));
+        .attribute(
+            AttributeSchema::optional(
+                "enumerated",
+                AttributeType::enum_(
+                    TypeIdentity::bare("Mode"),
+                    Some(vec!["allowed".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "validated",
+                AttributeType::enum_with_base(
+                    enum_identity("DynamicMode", Some("test.SecretEnums")),
+                    AttributeType::string(),
+                    None,
+                    vec![],
+                    Some(legacy_validator(|value| match value {
+                        Value::Concrete(ConcreteValue::String(value)) => {
+                            Err(format!("provider rejected {}", value.expose_plaintext()))
+                        }
+                        _ => Err("expected a string".to_string()),
+                    })),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("secret enum schema must be valid");
     let secret = |plaintext: &str| {
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String(plaintext.to_string().into()),
@@ -2493,7 +3269,7 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     let unknown_field = "unknown-struct-field-secret";
     let error = AttributeType::struct_(
         "SecretStruct",
-        vec![StructField::new("allowed", AttributeType::string())],
+        vec![StructField::optional("allowed", AttributeType::string()).build()],
     )
     .validate(&secret_map([(
         unknown_field.to_string(),
@@ -2510,11 +3286,11 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     let error = AttributeType::union(vec![
         AttributeType::struct_(
             "LeftAlternative",
-            vec![StructField::new("left", AttributeType::string())],
+            vec![StructField::optional("left", AttributeType::string()).build()],
         ),
         AttributeType::struct_(
             "RightAlternative",
-            vec![StructField::new("right", AttributeType::string())],
+            vec![StructField::optional("right", AttributeType::string()).build()],
         ),
     ])
     .validate(&secret_map([(
@@ -2557,7 +3333,7 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     let struct_field = "struct-field-secret";
     let error = AttributeType::struct_(
         "SecretValueStruct",
-        vec![StructField::new(struct_field, constrained())],
+        vec![StructField::optional(struct_field, constrained()).build()],
     )
     .validate(&secret_map([(
         struct_field.to_string(),
@@ -2618,7 +3394,7 @@ fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
 fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
     let plaintext = "hidden-mode";
     let attr = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Mode")),
+        TypeIdentity::bare("Mode"),
         None,
         None,
         validator(|value| match value {
@@ -2656,25 +3432,21 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
 }
 
 #[test]
-fn validate_known_values_runs_resource_validator_without_structural_errors() {
-    fn reject_forbidden(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        if attributes.contains_key("forbidden") {
-            Err(vec![TypeError::ValidationFailed {
-                message: "resource validator rejected value".to_string(),
-            }])
-        } else {
-            Ok(())
-        }
-    }
-
+fn validate_known_values_runs_declared_validator_without_structural_errors() {
     let schema = ResourceSchema::new("test.KnownValues")
-        .attribute(AttributeSchema::new("required", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("read_only", AttributeType::string()).read_only())
-        .attribute(AttributeSchema::new("choice_a", AttributeType::string()))
-        .attribute(AttributeSchema::new("choice_b", AttributeType::string()))
-        .attribute(AttributeSchema::new("forbidden", AttributeType::string()))
+        .attribute(AttributeSchema::required("required", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("read_only", AttributeType::string()).build(),
+        )
+        .attribute(AttributeSchema::optional("choice_a", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("choice_b", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
         .exclusive_required(&["choice_a", "choice_b"])
-        .with_validator(reject_forbidden);
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+        .validate()
+        .expect("known-values schema must be valid");
     let structurally_invalid = HashMap::from([
         (
             "unknown".to_string(),
@@ -2696,19 +3468,27 @@ fn validate_known_values_runs_resource_validator_without_structural_errors() {
         "missing, unknown, read-only, and exclusive-required checks belong to structural validation"
     );
 
-    let forbidden = HashMap::from([(
-        "forbidden".to_string(),
-        Value::Concrete(ConcreteValue::String("present".into())),
+    let malformed_tags = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "Key".to_string(),
+                Value::Concrete(ConcreteValue::String("Name".into())),
+            ),
+            (
+                "Value".to_string(),
+                Value::Concrete(ConcreteValue::String("test".into())),
+            ),
+        ]))),
     )]);
     let errors = schema
-        .validate_known_values_with_origins_and_lookup(&forbidden, &|_| false, no_lookup())
+        .validate_known_values_with_origins_and_lookup(&malformed_tags, &|_| false, no_lookup())
         .expect_err("resource validators must run at the known-value gate");
-    assert_eq!(
-        errors,
-        vec![TypeError::ValidationFailed {
-            message: "resource validator rejected value".to_string(),
-        }]
-    );
+    assert!(matches!(
+        errors.as_slice(),
+        [TypeError::ResourceValidationFailed { attribute: Some(attribute), .. }]
+            if attribute == "tags"
+    ));
 }
 
 #[test]
@@ -2765,82 +3545,15 @@ fn validate_exclusive_required_helper() {
 }
 
 #[test]
-fn exclusive_required_with_resource_schema() {
-    fn subnet_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        validators::validate_exclusive_required(attributes, &["cidr_block", "ipv4_ipam_pool_id"])
-    }
-
-    let schema = ResourceSchema::new("subnet")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "ipv4_ipam_pool_id",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).required())
-        .with_validator(subnet_validator);
-
-    // Valid: has cidr_block only
-    let mut attrs1 = HashMap::new();
-    attrs1.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-123".into())),
-    );
-    attrs1.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
-    );
-    assert!(schema.validate(&attrs1).is_ok());
-
-    // Valid: has ipv4_ipam_pool_id only
-    let mut attrs2 = HashMap::new();
-    attrs2.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-123".into())),
-    );
-    attrs2.insert(
-        "ipv4_ipam_pool_id".to_string(),
-        Value::Concrete(ConcreteValue::String("ipam-pool-123".into())),
-    );
-    assert!(schema.validate(&attrs2).is_ok());
-
-    // Invalid: has neither
-    let mut attrs3 = HashMap::new();
-    attrs3.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-123".into())),
-    );
-    let result = schema.validate(&attrs3);
-    assert!(result.is_err());
-
-    // Invalid: has both
-    let mut attrs4 = HashMap::new();
-    attrs4.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-123".into())),
-    );
-    attrs4.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
-    );
-    attrs4.insert(
-        "ipv4_ipam_pool_id".to_string(),
-        Value::Concrete(ConcreteValue::String("ipam-pool-123".into())),
-    );
-    let result = schema.validate(&attrs4);
-    assert!(result.is_err());
-}
-
-#[test]
 fn exclusive_required_declarative() {
     // Same semantics as the closure-based form above, but declared as data
     // so it can cross the WASM plugin boundary.
     let schema = ResourceSchema::new("vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "ipv4_ipam_pool_id",
-            AttributeType::string(),
-        ))
-        .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("ipv4_ipam_pool_id", AttributeType::string()).build())
+        .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"])
+        .validate()
+        .expect("exclusive-required schema must be valid");
 
     // Valid: exactly one present
     let mut one = HashMap::new();
@@ -2884,12 +3597,14 @@ fn exclusive_required_declarative() {
 #[test]
 fn exclusive_required_multiple_groups() {
     let schema = ResourceSchema::new("multi")
-        .attribute(AttributeSchema::new("a", AttributeType::string()))
-        .attribute(AttributeSchema::new("b", AttributeType::string()))
-        .attribute(AttributeSchema::new("x", AttributeType::string()))
-        .attribute(AttributeSchema::new("y", AttributeType::string()))
+        .attribute(AttributeSchema::optional("a", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("b", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("x", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("y", AttributeType::string()).build())
         .exclusive_required(&["a", "b"])
-        .exclusive_required(&["x", "y"]);
+        .exclusive_required(&["x", "y"])
+        .validate()
+        .expect("exclusive-required schema must be valid");
 
     // Neither group satisfied → two errors
     let err = schema.validate(&HashMap::new()).unwrap_err();
@@ -2919,7 +3634,7 @@ fn exclusive_required_multiple_groups() {
 fn validate_union_type() {
     // Create two Custom types that validate different prefixes
     let type_a = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeA")),
+        TypeIdentity::bare("TypeA"),
         None,
         None,
         legacy_validator(|value| {
@@ -2939,7 +3654,7 @@ fn validate_union_type() {
         None,
     );
     let type_b = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeB")),
+        TypeIdentity::bare("TypeB"),
         None,
         None,
         legacy_validator(|value| {
@@ -2997,8 +3712,8 @@ fn union_struct_unknown_field_shows_specific_error() {
         AttributeType::struct_(
             "Principal".to_string(),
             vec![
-                StructField::new("service", AttributeType::string()),
-                StructField::new("federated", AttributeType::string()),
+                StructField::optional("service", AttributeType::string()).build(),
+                StructField::optional("federated", AttributeType::string()).build(),
             ],
         ),
         AttributeType::string(),
@@ -3031,14 +3746,14 @@ fn union_struct_unknown_field_shows_specific_error() {
 #[test]
 fn union_type_name() {
     let type_a = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeA")),
+        TypeIdentity::bare("TypeA"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let type_b = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeB")),
+        TypeIdentity::bare("TypeB"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3059,14 +3774,15 @@ fn string_literal_set_type_name_uses_canonical_literals() {
 
 #[test]
 fn with_block_name_builder() {
-    let attr = AttributeSchema::new("operating_regions", AttributeType::string())
-        .with_block_name("operating_region");
+    let attr = AttributeSchema::optional("operating_regions", AttributeType::string())
+        .with_block_name("operating_region")
+        .build();
     assert_eq!(attr.block_name.as_deref(), Some("operating_region"));
 }
 
 #[test]
 fn block_name_default_is_none() {
-    let attr = AttributeSchema::new("name", AttributeType::string());
+    let attr = AttributeSchema::optional("name", AttributeType::string()).build();
     assert!(attr.block_name.is_none());
 }
 
@@ -3074,10 +3790,11 @@ fn block_name_default_is_none() {
 fn block_name_map_returns_mapping() {
     let schema = ResourceSchema::new("test.resource")
         .attribute(
-            AttributeSchema::new("operating_regions", AttributeType::string())
-                .with_block_name("operating_region"),
+            AttributeSchema::optional("operating_regions", AttributeType::string())
+                .with_block_name("operating_region")
+                .build(),
         )
-        .attribute(AttributeSchema::new("name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
 
     let map = schema.block_name_map();
     assert_eq!(map.len(), 1);
@@ -3087,7 +3804,7 @@ fn block_name_map_returns_mapping() {
 #[test]
 fn block_name_map_empty_when_no_block_names() {
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
 
     let map = schema.block_name_map();
     assert!(map.is_empty());
@@ -3117,10 +3834,13 @@ fn resolve_block_names_renames_key() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::new("operating_regions", AttributeType::string())
-                .with_block_name("operating_region"),
-        ),
+        (ResourceSchema::new("ec2.ipam").attribute(
+            AttributeSchema::optional("operating_regions", AttributeType::string())
+                .with_block_name("operating_region")
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3154,9 +3874,19 @@ fn resolve_block_names_preserves_authored_order_across_multiple_aliases() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.thing")
-            .attribute(AttributeSchema::new("firsts", block_type()).with_block_name("first"))
-            .attribute(AttributeSchema::new("seconds", block_type()).with_block_name("second")),
+        (ResourceSchema::new("test.thing")
+            .attribute(
+                AttributeSchema::optional("firsts", block_type())
+                    .with_block_name("first")
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("seconds", block_type())
+                    .with_block_name("second")
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3185,8 +3915,10 @@ fn resolve_block_names_noop_when_no_match() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.ipam")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("ec2.ipam")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3232,10 +3964,13 @@ fn resolve_block_names_errors_on_mixed_syntax() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::new("operating_regions", AttributeType::string())
-                .with_block_name("operating_region"),
-        ),
+        (ResourceSchema::new("ec2.ipam").attribute(
+            AttributeSchema::optional("operating_regions", AttributeType::string())
+                .with_block_name("operating_region")
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let result = resolve_block_names(&mut resources, &schemas);
@@ -3267,11 +4002,12 @@ fn resolve_block_names_skips_unknown_schema() {
 
 #[test]
 fn struct_field_with_block_name() {
-    let field = StructField::new(
+    let field = StructField::optional(
         "transitions",
         AttributeType::list(AttributeType::struct_("Transition".to_string(), vec![])),
     )
-    .with_block_name("transition");
+    .with_block_name("transition")
+    .build();
     assert_eq!(field.block_name.as_deref(), Some("transition"));
 }
 
@@ -3306,22 +4042,28 @@ fn resolve_block_names_nested_struct() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            AttributeType::struct_(
-                "LifecycleConfiguration".to_string(),
-                vec![
-                    StructField::new(
-                        "transitions",
-                        AttributeType::list(AttributeType::struct_(
-                            "Transition".to_string(),
-                            vec![],
-                        )),
-                    )
-                    .with_block_name("transition"),
-                ],
-            ),
-        )),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration".to_string(),
+                    vec![
+                        StructField::optional(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition".to_string(),
+                                vec![],
+                            )),
+                        )
+                        .with_block_name("transition")
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3374,26 +4116,33 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            AttributeType::struct_(
-                "LifecycleConfiguration".to_string(),
-                vec![
-                    StructField::new(
-                        "transition",
-                        AttributeType::struct_("Transition".to_string(), vec![]),
-                    ),
-                    StructField::new(
-                        "transitions",
-                        AttributeType::list(AttributeType::struct_(
-                            "Transition".to_string(),
-                            vec![],
-                        )),
-                    )
-                    .with_block_name("transition"),
-                ],
-            ),
-        )),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration".to_string(),
+                    vec![
+                        StructField::optional(
+                            "transition",
+                            AttributeType::struct_("Transition".to_string(), vec![]),
+                        )
+                        .build(),
+                        StructField::optional(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition".to_string(),
+                                vec![],
+                            )),
+                        )
+                        .with_block_name("transition")
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3416,17 +4165,21 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
 #[test]
 fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     let schema = ResourceSchema::new("thing").attribute(
-        AttributeSchema::new(
+        AttributeSchema::optional(
             "rules",
             AttributeType::list(AttributeType::struct_(
                 "Rule",
-                vec![StructField::new("action", AttributeType::string())],
+                vec![StructField::optional("action", AttributeType::string()).build()],
             )),
         )
-        .with_block_name("rule"),
+        .with_block_name("rule")
+        .build(),
     );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let evaluated_resource = Resource::with_provider("test", "thing", "consumer", None)
         .with_attribute(
@@ -3477,24 +4230,27 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     let lifecycle_type = AttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "transition",
                 AttributeType::struct_("Transition".to_string(), vec![]),
-            ),
-            StructField::new(
+            )
+            .build(),
+            StructField::optional(
                 "transitions",
                 AttributeType::list(AttributeType::struct_("Transition".to_string(), vec![])),
             )
-            .with_block_name("transition"),
+            .with_block_name("transition")
+            .build(),
         ],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing").attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            lifecycle_type,
-        )),
+        (ResourceSchema::new("thing").attribute(
+            AttributeSchema::optional("lifecycle_configuration", lifecycle_type).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     // Reference resolution may make the evaluated value a concrete list, but
@@ -3575,18 +4331,21 @@ fn resolve_file_block_names_canonicalizes_data_source_blocks() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing")
+        (ResourceSchema::new("thing")
             .attribute(
-                AttributeSchema::new(
+                AttributeSchema::optional(
                     "rules",
                     AttributeType::list(AttributeType::struct_(
                         "Rule",
-                        vec![StructField::new("action", AttributeType::string())],
+                        vec![StructField::optional("action", AttributeType::string()).build()],
                     )),
                 )
-                .with_block_name("rule"),
+                .with_block_name("rule")
+                .build(),
             )
-            .as_data_source(),
+            .as_data_source())
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_file_block_names_with_schemas(&mut parsed, &schemas)
@@ -3629,26 +4388,33 @@ fn resolve_block_names_block_syntax_wins_ambiguous_non_list_field() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            AttributeType::struct_(
-                "LifecycleConfiguration".to_string(),
-                vec![
-                    StructField::new(
-                        "transition",
-                        AttributeType::struct_("Transition".to_string(), vec![]),
-                    ),
-                    StructField::new(
-                        "transitions",
-                        AttributeType::list(AttributeType::struct_(
-                            "Transition".to_string(),
-                            vec![],
-                        )),
-                    )
-                    .with_block_name("transition"),
-                ],
-            ),
-        )),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration".to_string(),
+                    vec![
+                        StructField::optional(
+                            "transition",
+                            AttributeType::struct_("Transition".to_string(), vec![]),
+                        )
+                        .build(),
+                        StructField::optional(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition".to_string(),
+                                vec![],
+                            )),
+                        )
+                        .with_block_name("transition")
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3683,23 +4449,33 @@ fn resolve_block_names_real_list_field_wins_ambiguous_list_value() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            AttributeType::struct_(
-                "LifecycleConfiguration".to_string(),
-                vec![
-                    StructField::new("transition", AttributeType::list(AttributeType::string())),
-                    StructField::new(
-                        "transitions",
-                        AttributeType::list(AttributeType::struct_(
-                            "Transition".to_string(),
-                            vec![],
-                        )),
-                    )
-                    .with_block_name("transition"),
-                ],
-            ),
-        )),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional(
+                "lifecycle_configuration",
+                AttributeType::struct_(
+                    "LifecycleConfiguration".to_string(),
+                    vec![
+                        StructField::optional(
+                            "transition",
+                            AttributeType::list(AttributeType::string()),
+                        )
+                        .build(),
+                        StructField::optional(
+                            "transitions",
+                            AttributeType::list(AttributeType::struct_(
+                                "Transition".to_string(),
+                                vec![],
+                            )),
+                        )
+                        .with_block_name("transition")
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -3739,16 +4515,19 @@ fn resolve_block_names_same_block_and_canonical_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.SecurityGroup").attribute(
-            AttributeSchema::new(
+        (ResourceSchema::new("ec2.SecurityGroup").attribute(
+            AttributeSchema::optional(
                 "ingress",
                 AttributeType::list(AttributeType::struct_(
                     "Ingress".to_string(),
-                    vec![StructField::new("ip_protocol", AttributeType::string())],
+                    vec![StructField::optional("ip_protocol", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("ingress"),
-        ),
+            .with_block_name("ingress")
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     // Should succeed without errors (block_name == canonical name, no rename needed)
@@ -3798,16 +4577,19 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.SecurityGroup").attribute(
-            AttributeSchema::new(
+        (ResourceSchema::new("ec2.SecurityGroup").attribute(
+            AttributeSchema::optional(
                 "ingress",
                 AttributeType::list(AttributeType::struct_(
                     "Ingress".to_string(),
-                    vec![StructField::new("ip_protocol", AttributeType::string())],
+                    vec![StructField::optional("ip_protocol", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("ingress"),
-        ),
+            .with_block_name("ingress")
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     // Should succeed; block_name == canonical name means no conflict possible
@@ -3855,25 +4637,31 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
-            "config",
-            AttributeType::struct_(
-                "Config".to_string(),
-                vec![
-                    StructField::new(
-                        "tag",
-                        AttributeType::list(AttributeType::struct_(
-                            "Tag".to_string(),
-                            vec![
-                                StructField::new("key", AttributeType::string()),
-                                StructField::new("value", AttributeType::string()),
-                            ],
-                        )),
-                    )
-                    .with_block_name("tag"),
-                ],
-            ),
-        )),
+        (ResourceSchema::new("test.resource").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config".to_string(),
+                    vec![
+                        StructField::optional(
+                            "tag",
+                            AttributeType::list(AttributeType::struct_(
+                                "Tag".to_string(),
+                                vec![
+                                    StructField::optional("key", AttributeType::string()).build(),
+                                    StructField::optional("value", AttributeType::string()).build(),
+                                ],
+                            )),
+                        )
+                        .with_block_name("tag")
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     // Should succeed without errors
@@ -3943,26 +4731,32 @@ fn resolve_block_names_recurses_through_ref_attribute() {
     let lifecycle_def = AttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "rules",
                 AttributeType::list(AttributeType::struct_(
                     "Rule".to_string(),
-                    vec![StructField::new("id", AttributeType::string())],
+                    vec![StructField::optional("id", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("rule"),
+            .with_block_name("rule")
+            .build(),
         ],
     );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new(
-                "lifecycle_configuration",
-                AttributeType::ref_("LifecycleConfiguration".to_string()),
-            ))
-            .with_def("LifecycleConfiguration", lifecycle_def),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(
+                AttributeSchema::optional(
+                    "lifecycle_configuration",
+                    AttributeType::ref_("LifecycleConfiguration".to_string()),
+                )
+                .build(),
+            )
+            .with_def("LifecycleConfiguration", lifecycle_def))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -4019,31 +4813,37 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
     let lifecycle_def = AttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "rules",
                 AttributeType::list(AttributeType::struct_(
                     "Rule".to_string(),
-                    vec![StructField::new("id", AttributeType::string())],
+                    vec![StructField::optional("id", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("rule"),
+            .with_block_name("rule")
+            .build(),
         ],
     );
 
     let wrapper_type = AttributeType::struct_(
         "Wrapper".to_string(),
-        vec![StructField::new(
-            "lifecycle",
-            AttributeType::ref_("LifecycleConfiguration".to_string()),
-        )],
+        vec![
+            StructField::optional(
+                "lifecycle",
+                AttributeType::ref_("LifecycleConfiguration".to_string()),
+            )
+            .build(),
+        ],
     );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("wrapper", wrapper_type))
-            .with_def("LifecycleConfiguration", lifecycle_def),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("wrapper", wrapper_type).build())
+            .with_def("LifecycleConfiguration", lifecycle_def))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -4061,6 +4861,64 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
         "expected nested 'rule' block under Ref-typed field to be renamed to 'rules'"
     );
     assert!(!lifecycle.contains_key("rule"));
+}
+
+#[test]
+fn block_name_below_provider_output_is_not_resolved() {
+    let mut output = IndexMap::new();
+    output.insert(
+        "item".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::new()),
+        )])),
+    );
+    let mut resources = vec![{
+        let mut resource = Resource::new("test.Widget", "example");
+        resource.set_attr(
+            "output".to_string(),
+            Value::Concrete(ConcreteValue::Map(output)),
+        );
+        resource
+    }];
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "output",
+                    AttributeType::struct_(
+                        "Output",
+                        vec![
+                            StructField::optional(
+                                "items",
+                                AttributeType::list(AttributeType::struct_("Item", vec![])),
+                            )
+                            .with_block_name("item")
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+
+    resolve_block_names(&mut resources, &schemas).expect("inert aliases cannot conflict");
+
+    let Value::Concrete(ConcreteValue::Map(output)) = resources[0]
+        .get_attr("output")
+        .expect("output value must remain present")
+    else {
+        panic!("output must remain a map");
+    };
+    assert!(output.contains_key("item"));
+    assert!(!output.contains_key("items"));
+    assert!(
+        !collect_all_block_names(&schemas).contains_key("items"),
+        "an inert alias must not be offered to formatter consumers"
+    );
 }
 
 #[test]
@@ -4255,7 +5113,9 @@ fn test_resource_schema_without_operation_config() {
 #[test]
 fn validate_rejects_unknown_attribute() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+        .validate()
+        .expect("bucket schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4277,11 +5137,12 @@ fn validate_rejects_unknown_attribute() {
 #[test]
 fn validate_allows_known_attributes_only() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        ));
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .validate()
+        .expect("bucket schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4299,8 +5160,10 @@ fn validate_allows_known_attributes_only() {
 #[test]
 fn validate_rejects_read_only_attribute_assignment() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("region", AttributeType::string()).read_only());
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("region", AttributeType::string()).build())
+        .validate()
+        .expect("bucket schema must be valid");
 
     assert!(
         schema.validate(&HashMap::new()).is_ok(),
@@ -4343,16 +5206,19 @@ fn validate_rejects_read_only_attribute_assignment() {
 }
 
 #[test]
-fn validate_allows_required_attribute_to_be_omitted_when_it_has_a_default() {
-    let schema = ResourceSchema::new("test.Resource").attribute(
-        AttributeSchema::new("region", AttributeType::string())
-            .required()
-            .with_default(Value::Concrete(ConcreteValue::String("us-east-1".into()))),
-    );
+fn validate_allows_optional_attribute_to_be_omitted_when_it_has_a_default() {
+    let schema = ResourceSchema::new("test.Resource")
+        .attribute(
+            AttributeSchema::optional("region", AttributeType::string())
+                .with_default(Value::Concrete(ConcreteValue::String("us-east-1".into())))
+                .build(),
+        )
+        .validate()
+        .expect("optional default schema must be valid");
 
     assert!(
         schema.validate(&HashMap::new()).is_ok(),
-        "a default must satisfy a required top-level attribute"
+        "a default must satisfy an omitted optional top-level attribute"
     );
 }
 
@@ -4361,36 +5227,31 @@ fn attribute_schema_removability_preserves_input_mode_and_create_only_matrix() {
     let cases = [
         (
             "optional mutable",
-            AttributeSchema::new("value", AttributeType::string()),
+            AttributeSchema::optional("value", AttributeType::string()).build(),
             true,
         ),
         (
             "required mutable",
-            AttributeSchema::new("value", AttributeType::string()).required(),
+            AttributeSchema::required("value", AttributeType::string()).build(),
             false,
         ),
         (
             "provider-populated mutable",
-            AttributeSchema::new("value", AttributeType::string()).read_only(),
+            AttributeSchema::provider_populated("value", AttributeType::string()).build(),
             false,
         ),
         (
             "optional create-only",
-            AttributeSchema::new("value", AttributeType::string()).create_only(),
+            AttributeSchema::optional("value", AttributeType::string())
+                .create_only()
+                .build(),
             false,
         ),
         (
             "required create-only",
-            AttributeSchema::new("value", AttributeType::string())
-                .required()
-                .create_only(),
-            false,
-        ),
-        (
-            "provider-populated create-only",
-            AttributeSchema::new("value", AttributeType::string())
-                .read_only()
-                .create_only(),
+            AttributeSchema::required("value", AttributeType::string())
+                .create_only()
+                .build(),
             false,
         ),
     ];
@@ -4401,27 +5262,35 @@ fn attribute_schema_removability_preserves_input_mode_and_create_only_matrix() {
             expected_auto,
             "auto-detected removability changed for {name}"
         );
-        assert!(
-            schema.clone().removable().is_removable(),
-            "explicit removable override must win for {name}"
-        );
-        assert!(
-            !schema.non_removable().is_removable(),
-            "explicit non-removable override must win for {name}"
-        );
     }
+
+    assert!(
+        AttributeSchema::optional("value", AttributeType::string())
+            .removable()
+            .build()
+            .is_removable()
+    );
+    assert!(
+        !AttributeSchema::optional("value", AttributeType::string())
+            .non_removable()
+            .build()
+            .is_removable()
+    );
 }
 
 #[test]
-fn validate_read_only_block_name_error_uses_user_written_alias() {
-    let schema = ResourceSchema::new("test.Resource").attribute(
-        AttributeSchema::new(
-            "generated_rules",
-            AttributeType::list(AttributeType::string()),
+fn validate_user_input_block_name_alias_is_accepted() {
+    let schema = ResourceSchema::new("test.Resource")
+        .attribute(
+            AttributeSchema::optional(
+                "generated_rules",
+                AttributeType::list(AttributeType::string()),
+            )
+            .with_block_name("generated_rule")
+            .build(),
         )
-        .read_only()
-        .with_block_name("generated_rule"),
-    );
+        .validate()
+        .expect("user-input block-name schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4431,30 +5300,21 @@ fn validate_read_only_block_name_error_uses_user_written_alias() {
         )])),
     );
 
-    let errors = schema
-        .validate(&attrs)
-        .expect_err("assigning through a read-only block-name alias must fail validation");
-    assert_eq!(
-        errors.len(),
-        1,
-        "expected one writability error: {errors:?}"
-    );
-    assert!(
-        matches!(&errors[0], TypeError::ReadOnlyAttribute { name } if name == "generated_rule"),
-        "expected a structured read-only error naming the written alias: {errors:?}"
-    );
-    assert_eq!(
-        errors[0].to_string(),
-        "Attribute 'generated_rule' is populated by the provider and cannot be set"
-    );
+    assert!(schema.validate(&attrs).is_ok());
 }
 
 #[test]
 fn validate_read_only_is_keyed_per_resource_type_not_by_attribute_name() {
     let route_schema = ResourceSchema::new("ec2.Route")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).read_only());
+        .attribute(
+            AttributeSchema::provider_populated("cidr_block", AttributeType::string()).build(),
+        )
+        .validate()
+        .expect("route schema must be valid");
     let vpc_schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .validate()
+        .expect("VPC schema must be valid");
     let attrs = HashMap::from([(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -4478,16 +5338,22 @@ fn validate_read_only_scope_distinguishes_top_level_and_nested_struct_fields() {
     let origin = AttributeType::struct_(
         "Origin".to_string(),
         vec![
-            StructField::new("id", AttributeType::string()).required(),
-            StructField::new("domain_name", AttributeType::string()).read_only(),
+            StructField::required("id", AttributeType::string()).build(),
+            StructField::provider_populated("domain_name", AttributeType::string()).build(),
         ],
     );
     let schema = ResourceSchema::new("cloudfront.Distribution")
-        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only())
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::new("origins", AttributeType::list(origin)).with_block_name("origin"),
-        );
+            AttributeSchema::provider_populated("domain_name", AttributeType::string()).build(),
+        )
+        .attribute(
+            AttributeSchema::optional("origins", AttributeType::list(origin))
+                .with_block_name("origin")
+                .build(),
+        )
+        .validate()
+        .expect("distribution schema must be valid");
 
     let mut origin_value = IndexMap::new();
     origin_value.insert(
@@ -4564,7 +5430,9 @@ fn validate_read_only_scope_distinguishes_top_level_and_nested_struct_fields() {
 #[test]
 fn validate_unknown_attribute_with_suggestion() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+        .validate()
+        .expect("bucket schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4587,13 +5455,17 @@ fn validate_unknown_attribute_with_suggestion() {
 
 #[test]
 fn validate_accepts_block_name_alias() {
-    let schema = ResourceSchema::new("ec2.SecurityGroup").attribute(
-        AttributeSchema::new(
-            "ingress_rules",
-            AttributeType::unordered_list(AttributeType::string()),
+    let schema = ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(
+            AttributeSchema::optional(
+                "ingress_rules",
+                AttributeType::unordered_list(AttributeType::string()),
+            )
+            .with_block_name("ingress_rule")
+            .build(),
         )
-        .with_block_name("ingress_rule"),
-    );
+        .validate()
+        .expect("security-group schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4609,7 +5481,9 @@ fn validate_accepts_block_name_alias() {
 #[test]
 fn validate_does_not_exempt_underscore_prefixed_attributes() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+        .validate()
+        .expect("bucket schema must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -4632,14 +5506,14 @@ fn validate_does_not_exempt_underscore_prefixed_attributes() {
 fn make_custom(name: &str, base: AttributeType) -> AttributeType {
     match base.raw_shape() {
         RawShape::String { .. } => AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
         RawShape::Int { .. } => AttributeType::refined_int_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
         ),
@@ -4655,13 +5529,7 @@ fn make_custom_anon_pattern_and_len(
     pattern: Option<&str>,
     length: Option<(Option<u64>, Option<u64>)>,
 ) -> AttributeType {
-    AttributeType::refined_string_with_validator(
-        None,
-        pattern.map(str::to_string),
-        length,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    )
+    AttributeType::refined_string(None, pattern.map(str::to_string), length, None)
 }
 
 fn assignable_with_defs(
@@ -5158,18 +6026,18 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     match &attr.kind {
         AttrTypeKind::String {
-            identity: None,
+            binding: RefinementBinding::MetadataOnly(None),
             pattern: None,
             length: None,
             ..
         }
         | AttrTypeKind::Int {
-            identity: None,
+            binding: RefinementBinding::MetadataOnly(None),
             range: None,
             ..
         }
         | AttrTypeKind::Float {
-            identity: None,
+            binding: RefinementBinding::MetadataOnly(None),
             range: None,
             ..
         } => true,
@@ -5369,25 +6237,21 @@ fn assignable_source_mutual_ref_cycle_fails_conservatively() {
 #[test]
 fn assignable_identity_direction_survives_refs() {
     let generic = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
+        TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let role = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let certificate = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(
-            Some("aws"),
-            ["acm", "Certificate"],
-            "Arn",
-        )),
+        TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -5426,7 +6290,7 @@ fn assignable_list_ref_name_collision_uses_each_schema_defs() {
         "Tag".to_string(),
         AttributeType::struct_(
             "Tag".to_string(),
-            vec![StructField::new("key", AttributeType::string())],
+            vec![StructField::optional("key", AttributeType::string()).build()],
         ),
     )]);
     let sink = AttributeType::list(AttributeType::ref_("Tag".to_string()));
@@ -5467,18 +6331,10 @@ fn assignable_inline_lists_remain_assignable() {
 
 #[test]
 fn assignable_list_ignores_order_and_length_metadata() {
-    let source = AttributeType::refined_list(
-        AttributeType::string(),
-        false,
-        Some((Some(1), Some(2))),
-        crate::schema::legacy_validator(|_| Ok(())),
-    );
-    let sink = AttributeType::refined_list(
-        AttributeType::string(),
-        true,
-        Some((Some(10), Some(20))),
-        crate::schema::legacy_validator(|_| Ok(())),
-    );
+    let source =
+        AttributeType::refined_list(AttributeType::string(), false, Some((Some(1), Some(2))));
+    let sink =
+        AttributeType::refined_list(AttributeType::string(), true, Some((Some(10), Some(20))));
 
     assert!(assignable(&source, &sink));
 }
@@ -5524,7 +6380,7 @@ fn assignable_map_ref_name_collision_rejects_incompatible_value() {
         "Tag".to_string(),
         AttributeType::struct_(
             "Tag".to_string(),
-            vec![StructField::new("key", AttributeType::string())],
+            vec![StructField::optional("key", AttributeType::string()).build()],
         ),
     )]);
     let sink = AttributeType::map(AttributeType::ref_("Tag".to_string()));
@@ -5635,16 +6491,8 @@ fn assignable_list_identified_string_flows_to_anonymous_string() {
 
 #[test]
 fn assignable_list_int_range_rejects_wider_source() {
-    let source = AttributeType::list(AttributeType::refined_int_with_validator(
-        None,
-        Some((Some(0), Some(100))),
-        crate::schema::legacy_validator(|_| Ok(())),
-    ));
-    let sink = AttributeType::list(AttributeType::refined_int_with_validator(
-        None,
-        Some((Some(0), Some(10))),
-        crate::schema::legacy_validator(|_| Ok(())),
-    ));
+    let source = AttributeType::list(AttributeType::refined_int(None, Some((Some(0), Some(100)))));
+    let sink = AttributeType::list(AttributeType::refined_int(None, Some((Some(0), Some(10)))));
 
     // Structural List comparison intentionally closes the old name-only
     // false acceptance: the source element range is not contained by sink.
@@ -5654,10 +6502,9 @@ fn assignable_list_int_range_rejects_wider_source() {
 #[test]
 fn resource_schema_type_in_schema_uses_its_own_defs() {
     let schema = ResourceSchema::new("test.Item")
-        .attribute(AttributeSchema::new(
-            "value",
-            AttributeType::ref_("Value".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("value", AttributeType::ref_("Value".to_string())).build(),
+        )
         .with_def("Value", AttributeType::string());
     let attr = &schema.attributes["value"].attr_type;
 
@@ -5738,11 +6585,7 @@ fn assignable_allows_same_semantic_name() {
 fn assignable_rejects_same_kind_across_providers() {
     let provider_custom = |provider: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(
-                Some(provider),
-                Vec::<String>::new(),
-                "Region",
-            )),
+            TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5801,7 +6644,7 @@ fn assignable_accepts_same_enum_typeidentity_from_distinct_constructions() {
 fn assignable_specific_arn_flows_into_generic_arn() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
             pattern.map(str::to_string),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5840,7 +6683,7 @@ fn assignable_specific_arn_flows_into_generic_arn() {
 fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
             Some(pattern.to_string()),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5859,7 +6702,7 @@ fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
 fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
             pattern.map(str::to_string),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5877,7 +6720,7 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
 fn assignable_identified_custom_length_must_be_contained() {
     let mk = |length: Option<(Option<u64>, Option<u64>)>| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("SizedString")),
+            TypeIdentity::bare("SizedString"),
             None,
             length,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5906,7 +6749,7 @@ fn assignable_identified_custom_length_must_be_contained() {
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
     let mk = || {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), vec!["ec2", "Vpc"], "Id")),
+            TypeIdentity::new(Some("aws"), vec!["ec2", "Vpc"], "Id"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5926,11 +6769,7 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id() {
     let mk = || {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(
-                Some("aws"),
-                Vec::<String>::new(),
-                "AccountId",
-            )),
+            TypeIdentity::new(Some("aws"), Vec::<String>::new(), "AccountId"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5949,7 +6788,7 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id()
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn() {
     let mk = || {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), vec!["iam", "Role"], "Arn")),
+            TypeIdentity::new(Some("aws"), vec!["iam", "Role"], "Arn"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5972,11 +6811,7 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn
 fn assignable_rejects_account_id_across_genuinely_different_providers() {
     let mk = |provider: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(
-                Some(provider),
-                Vec::<String>::new(),
-                "AccountId",
-            )),
+            TypeIdentity::new(Some(provider), Vec::<String>::new(), "AccountId"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -5996,7 +6831,7 @@ fn assignable_rejects_account_id_across_genuinely_different_providers() {
 fn assignable_identity_axis_directionality() {
     let mk = |provider: Option<&str>, segments: &[&str]| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(provider, segments.to_vec(), "Arn")),
+            TypeIdentity::new(provider, segments.to_vec(), "Arn"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -6022,20 +6857,14 @@ fn assignable_identity_axis_directionality() {
 fn assignable_narrow_to_anonymous_unconstrained_sink() {
     // Semantic source with no pattern assigns to fully-anonymous unconstrained sink.
     let account = make_custom("AwsAccountId", AttributeType::string());
-    let anon = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let anon = AttributeType::refined_string(None, None, None, None);
     assert!(assignable(&account, &anon));
 }
 
 #[test]
 fn assignable_identified_source_without_length_rejected_by_identityless_length_sink() {
     let log_group_arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["logs", "LogGroup"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["logs", "LogGroup"], "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -6110,7 +6939,7 @@ fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
 #[test]
 fn assignable_plain_string_rejects_identified_sink() {
     let vpc_id = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "Id")),
+        TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "Id"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -6154,9 +6983,12 @@ fn assignable_plain_string_rejects_enum_sink_through_composite_types() {
     assert!(!assignable(
         &AttributeType::struct_(
             "Source",
-            vec![StructField::new("value", AttributeType::string())],
+            vec![StructField::optional("value", AttributeType::string()).build()],
         ),
-        &AttributeType::struct_("Sink", vec![StructField::new("value", status.clone())],),
+        &AttributeType::struct_(
+            "Sink",
+            vec![StructField::optional("value", status.clone()).build()],
+        ),
     ));
 
     let other_status = AttributeType::enum_(
@@ -6189,9 +7021,12 @@ fn assignable_identityless_sink_rule_recurses_through_composite_types() {
     assert!(assignable(
         &AttributeType::struct_(
             "Source",
-            vec![StructField::new("value", AttributeType::string())],
+            vec![StructField::optional("value", AttributeType::string()).build()],
         ),
-        &AttributeType::struct_("Sink", vec![StructField::new("value", constrained.clone())],),
+        &AttributeType::struct_(
+            "Sink",
+            vec![StructField::optional("value", constrained.clone()).build()],
+        ),
     ));
 
     let sink_union = AttributeType::union(vec![identified.clone(), constrained.clone()]);
@@ -6228,13 +7063,7 @@ fn assignable_union_sink_accepts_assignable_member() {
 fn assignable_union_source_requires_all_members_assignable() {
     // All members of source must be assignable to sink.
     let vpc = make_custom("VpcId", AttributeType::string());
-    let anon_any = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let anon_any = AttributeType::refined_string(None, None, None, None);
     let both_ok = AttributeType::union(vec![vpc.clone(), vpc.clone()]);
     assert!(assignable(&both_ok, &vpc));
 
@@ -6252,13 +7081,7 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
     // Replaces the old buggy `is_compatible_with_two_string_based_customs`
     // which asserted VpcId <-> SubnetId were symmetric-compatible.
     let vpc = make_custom("VpcId", AttributeType::string());
-    let anon = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let anon = AttributeType::refined_string(None, None, None, None);
     assert!(assignable(&vpc, &anon));
     // Reverse: anon has no proof it's a VpcId → NG.
     assert!(!assignable(&anon, &vpc));
@@ -6393,7 +7216,7 @@ fn assignable_anon_length_both_none_compatible() {
 #[test]
 fn custom_carries_semantic_name_pattern_length() {
     let t = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("VpcId")),
+        TypeIdentity::bare("VpcId"),
         Some("^vpc-[a-f0-9]+$".to_string()),
         Some((Some(8), Some(21))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -6401,12 +7224,12 @@ fn custom_carries_semantic_name_pattern_length() {
     );
     match t.kind() {
         AttrTypeKind::String {
-            identity,
+            binding,
             pattern,
             length,
             ..
         } => {
-            assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("VpcId"));
+            assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("VpcId"));
             assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
             assert_eq!(*length, Some((Some(8), Some(21))));
         }
@@ -6416,13 +7239,7 @@ fn custom_carries_semantic_name_pattern_length() {
 
 #[test]
 fn custom_pattern_rejects_and_accepts_string_values() {
-    let attr = AttributeType::refined_string_with_validator(
-        None,
-        Some("^[a-z]+$".to_string()),
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let attr = AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None);
 
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String("ABC".into())))
@@ -6445,7 +7262,7 @@ fn custom_pattern_rejects_and_accepts_string_values() {
 #[test]
 fn custom_pattern_and_length_passes_still_run_validator() {
     let attr = AttributeType::refined_string_with_validator(
-        None,
+        TypeIdentity::bare("TestValidator"),
         Some("^[a-z]+$".to_string()),
         Some((Some(1), Some(10))),
         validator(|_| {
@@ -6471,7 +7288,7 @@ fn custom_pattern_and_length_passes_still_run_validator() {
 fn custom_pattern_rejects_wafv2_description_parentheses() {
     let pattern = r"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$";
     let attr = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("EntityDescription")),
+        TypeIdentity::bare("EntityDescription"),
         Some(pattern.to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -6504,13 +7321,7 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
 
 #[test]
 fn custom_length_uses_character_count_not_bytes() {
-    let attr = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        Some((Some(1), Some(5))),
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let attr = AttributeType::refined_string(None, None, Some((Some(1), Some(5))), None);
 
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String("abcdef".into())))
@@ -6538,13 +7349,7 @@ fn custom_length_uses_character_count_not_bytes() {
 
 #[test]
 fn custom_length_enforces_minimum_bound() {
-    let attr = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        Some((Some(2), None)),
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let attr = AttributeType::refined_string(None, None, Some((Some(2), None)), None);
 
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String("a".into())))
@@ -6568,12 +7373,7 @@ fn custom_length_enforces_minimum_bound() {
 
 #[test]
 fn custom_int_base_maps_length_to_range() {
-    let attr = AttributeType::refined_int_with_validator(
-        None,
-        Some((Some(100), Some(200)))
-            .map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
-        crate::schema::legacy_validator(|_| Ok(())),
-    );
+    let attr = AttributeType::refined_int(None, Some((Some(100_i64), Some(200_i64))));
 
     assert!(
         attr.validate(&Value::Concrete(ConcreteValue::Int(150)))
@@ -6592,13 +7392,7 @@ fn custom_uncompilable_pattern_is_non_fatal() {
         regex::Regex::new(pattern).is_err(),
         "test must use a pattern unsupported by the regex crate"
     );
-    let attr = AttributeType::refined_string_with_validator(
-        None,
-        Some(pattern.to_string()),
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let attr = AttributeType::refined_string(None, Some(pattern.to_string()), None, None);
 
     assert!(
         attr.validate(&Value::Concrete(ConcreteValue::String("anything".into())))
@@ -6609,7 +7403,7 @@ fn custom_uncompilable_pattern_is_non_fatal() {
 #[test]
 fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
     let attr = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Slug")),
+        TypeIdentity::bare("Slug"),
         Some("^[a-z]+$".to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -6633,35 +7427,22 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
 
 #[test]
 fn custom_type_name_anonymous_pattern_only() {
-    let t = AttributeType::refined_string_with_validator(
-        None,
-        Some("^foo$".to_string()),
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let t = AttributeType::refined_string(None, Some("^foo$".to_string()), None, None);
     assert_eq!(t.type_name(), "String(pattern)");
 }
 
 #[test]
 fn custom_type_name_anonymous_length_only() {
-    let t = AttributeType::refined_string_with_validator(
-        None,
-        None,
-        Some((Some(1), Some(64))),
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
+    let t = AttributeType::refined_string(None, None, Some((Some(1), Some(64))), None);
     assert_eq!(t.type_name(), "String(len: 1..=64)");
 }
 
 #[test]
 fn custom_type_name_anonymous_pattern_and_length() {
-    let t = AttributeType::refined_string_with_validator(
+    let t = AttributeType::refined_string(
         None,
         Some("^.*$".to_string()),
         Some((Some(1), Some(64))),
-        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
@@ -6701,8 +7482,8 @@ fn validate_email_type() {
 
     // Type identity: refined String with kind "Email"
     match t.kind() {
-        AttrTypeKind::String { identity, .. } => {
-            assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("Email"));
+        AttrTypeKind::String { binding, .. } => {
+            assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("Email"));
         }
         other => panic!("Expected refined String, got: {:?}", other),
     }
@@ -6903,9 +7684,9 @@ fn validate_http_response_status_code_type() {
 
     // Type identity: refined String with kind "HttpResponseStatusCode"
     match t.kind() {
-        AttrTypeKind::String { identity, .. } => {
+        AttrTypeKind::String { binding, .. } => {
             assert_eq!(
-                identity.as_ref().map(|id| id.kind.as_str()),
+                binding.identity().map(|id| id.kind.as_str()),
                 Some("HttpResponseStatusCode")
             );
         }
@@ -6965,11 +7746,11 @@ mod schema_validate_attr_struct_tests {
     fn validate_attr_rejects_unknown_nested_struct_field_with_suggestion() {
         let retention = struct_type(
             "Retention",
-            vec![StructField::new("days", AttributeType::int())],
+            vec![StructField::optional("days", AttributeType::int()).build()],
         );
         let policy = struct_type(
             "Policy",
-            vec![StructField::new("retention", retention).required()],
+            vec![StructField::required("retention", retention).build()],
         );
         let value = map_value(vec![(
             "retention",
@@ -7001,11 +7782,11 @@ mod schema_validate_attr_struct_tests {
         let retention = AttributeType::union(vec![
             struct_type(
                 "RetentionDays",
-                vec![StructField::new("days", AttributeType::int()).required()],
+                vec![StructField::required("days", AttributeType::int()).build()],
             ),
             struct_type(
                 "RetentionYears",
-                vec![StructField::new("years", AttributeType::int()).required()],
+                vec![StructField::required("years", AttributeType::int()).build()],
             ),
         ]);
         let schema = Schema::flat(retention);
@@ -7051,7 +7832,9 @@ mod schema_validate_attr_struct_tests {
         let lifecycle = struct_type(
             "Lifecycle",
             vec![
-                StructField::new("transitions", AttributeType::int()).with_block_name("transition"),
+                StructField::optional("transitions", AttributeType::int())
+                    .with_block_name("transition")
+                    .build(),
             ],
         );
         let schema = Schema::flat(AttributeType::string());
@@ -7081,9 +7864,9 @@ mod schema_validate_attr_struct_tests {
         let lifecycle = struct_type(
             "Lifecycle",
             vec![
-                StructField::new("transitions", AttributeType::int())
+                StructField::required("transitions", AttributeType::int())
                     .with_block_name("transition")
-                    .required(),
+                    .build(),
             ],
         );
         let value = map_value(vec![(
@@ -7101,9 +7884,12 @@ mod schema_validate_attr_struct_tests {
     fn validate_attr_preserves_required_and_nested_type_errors() {
         let inner = struct_type(
             "Inner",
-            vec![StructField::new("count", AttributeType::int()).required()],
+            vec![StructField::required("count", AttributeType::int()).build()],
         );
-        let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
+        let outer = struct_type(
+            "Outer",
+            vec![StructField::required("nested", inner).build()],
+        );
         let schema = Schema::flat(AttributeType::string());
 
         let missing = schema
@@ -7143,7 +7929,7 @@ mod schema_validate_attr_struct_tests {
     fn validate_rejects_read_only_nested_field_before_type_checking() {
         let config = struct_type(
             "Config",
-            vec![StructField::new("provider_id", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("provider_id", AttributeType::string()).build()],
         );
         let value = map_value(vec![(
             "provider_id",
@@ -7169,11 +7955,11 @@ mod schema_validate_attr_struct_tests {
     fn validate_rejects_read_only_field_two_struct_levels_deep() {
         let destination = struct_type(
             "Destination",
-            vec![StructField::new("table_arn", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("table_arn", AttributeType::string()).build()],
         );
         let metadata = struct_type(
             "Metadata",
-            vec![StructField::new("destination", destination)],
+            vec![StructField::optional("destination", destination).build()],
         );
         let value = map_value(vec![(
             "destination",
@@ -7208,7 +7994,9 @@ mod schema_validate_attr_struct_tests {
     fn validate_rejects_read_only_field_inside_list_of_struct() {
         let item = struct_type(
             "Item",
-            vec![StructField::new("table_namespace", AttributeType::string()).read_only()],
+            vec![
+                StructField::provider_populated("table_namespace", AttributeType::string()).build(),
+            ],
         );
         let value = Value::Concrete(ConcreteValue::List(vec![map_value(vec![(
             "table_namespace",
@@ -7258,8 +8046,8 @@ mod validate_collect_tests {
         let ty = struct_type(
             "Versioning",
             vec![
-                StructField::new("status", AttributeType::string()).required(),
-                StructField::new("mfa_delete", AttributeType::bool()),
+                StructField::required("status", AttributeType::string()).build(),
+                StructField::optional("mfa_delete", AttributeType::bool()).build(),
             ],
         );
         let v = map_value(vec![
@@ -7283,7 +8071,7 @@ mod validate_collect_tests {
         // first.
         let ty = struct_type(
             "Versioning",
-            vec![StructField::new("status", AttributeType::string())],
+            vec![StructField::optional("status", AttributeType::string()).build()],
         );
         let v = map_value(vec![
             (
@@ -7311,9 +8099,12 @@ mod validate_collect_tests {
         // walk back to the source position.
         let inner = struct_type(
             "Inner",
-            vec![StructField::new("count", AttributeType::int()).required()],
+            vec![StructField::required("count", AttributeType::int()).build()],
         );
-        let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
+        let outer = struct_type(
+            "Outer",
+            vec![StructField::required("nested", inner).build()],
+        );
         let v = map_value(vec![(
             "nested",
             map_value(vec![(
@@ -7334,7 +8125,7 @@ mod validate_collect_tests {
         // so the LSP can locate the offending block.
         let inner = struct_type(
             "Item",
-            vec![StructField::new("name", AttributeType::string()).required()],
+            vec![StructField::required("name", AttributeType::string()).build()],
         );
         let outer_attr = AttributeType::list(inner);
 
@@ -7357,7 +8148,7 @@ mod validate_collect_tests {
     fn collect_reports_read_only_struct_field_at_written_path() {
         let ty = struct_type(
             "Config",
-            vec![StructField::new("provider_id", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("provider_id", AttributeType::string()).build()],
         );
         let value = map_value(vec![(
             "provider_id",
@@ -7382,11 +8173,11 @@ mod validate_collect_tests {
     fn collect_reports_deep_read_only_field_with_full_path() {
         let destination = struct_type(
             "Destination",
-            vec![StructField::new("table_arn", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("table_arn", AttributeType::string()).build()],
         );
         let metadata = struct_type(
             "Metadata",
-            vec![StructField::new("destination", destination)],
+            vec![StructField::optional("destination", destination).build()],
         );
         let value = map_value(vec![(
             "destination",
@@ -7414,7 +8205,9 @@ mod validate_collect_tests {
     fn collect_reports_read_only_field_inside_list_element() {
         let item = struct_type(
             "Item",
-            vec![StructField::new("table_namespace", AttributeType::string()).read_only()],
+            vec![
+                StructField::provider_populated("table_namespace", AttributeType::string()).build(),
+            ],
         );
         let value = Value::Concrete(ConcreteValue::List(vec![map_value(vec![(
             "table_namespace",
@@ -7439,11 +8232,11 @@ mod validate_collect_tests {
     fn read_only_field_inside_map_struct_is_rejected_at_the_map_field_path() {
         let entry = struct_type(
             "Entry",
-            vec![StructField::new("arn", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("arn", AttributeType::string()).build()],
         );
         let root = struct_type(
             "Config",
-            vec![StructField::new("entries", AttributeType::map(entry))],
+            vec![StructField::optional("entries", AttributeType::map(entry)).build()],
         );
         let value = map_value(vec![(
             "entries",
@@ -7508,14 +8301,11 @@ mod validate_collect_tests {
     fn read_only_field_behind_ref_typed_struct_field_is_rejected() {
         let root = struct_type(
             "Config",
-            vec![StructField::new(
-                "destination",
-                AttributeType::ref_("Destination"),
-            )],
+            vec![StructField::optional("destination", AttributeType::ref_("Destination")).build()],
         );
         let destination = struct_type(
             "Destination",
-            vec![StructField::new("arn", AttributeType::string()).read_only()],
+            vec![StructField::provider_populated("arn", AttributeType::string()).build()],
         );
         let schema = Schema {
             root,
@@ -7554,41 +8344,6 @@ mod validate_collect_tests {
     }
 
     #[test]
-    fn read_only_nested_block_name_reports_the_alias_the_user_wrote() {
-        let root = struct_type(
-            "Config",
-            vec![
-                StructField::new("generated_rules", AttributeType::string())
-                    .with_block_name("generated_rule")
-                    .read_only(),
-            ],
-        );
-        let value = map_value(vec![(
-            "generated_rule",
-            Value::Concrete(ConcreteValue::String("provider-owned".into())),
-        )]);
-        let schema = Schema::flat(root);
-
-        assert!(matches!(
-            schema.validate(&value),
-            Err(TypeError::StructFieldError { field, inner })
-                if field == "generated_rule"
-                    && matches!(
-                        inner.as_ref(),
-                        TypeError::ReadOnlyAttribute { name } if name == "generated_rule"
-                    )
-        ));
-
-        let errors = schema.validate_collect(&value);
-        assert_eq!(errors.len(), 1, "expected one aliased writability error");
-        assert_eq!(errors[0].0.to_string(), "generated_rule");
-        assert!(matches!(
-            &errors[0].1,
-            TypeError::ReadOnlyAttribute { name } if name == "generated_rule"
-        ));
-    }
-
-    #[test]
     fn collect_resolves_block_name_alias() {
         // `block_name` is an alias users can type instead of `name` in
         // the DSL (e.g. `transition` for the canonical `transitions`).
@@ -7599,8 +8354,9 @@ mod validate_collect_tests {
         let ty = struct_type(
             "Lifecycle",
             vec![
-                StructField::new("transitions", AttributeType::string())
-                    .with_block_name("transition"),
+                StructField::optional("transitions", AttributeType::string())
+                    .with_block_name("transition")
+                    .build(),
             ],
         );
         let v = map_value(vec![(
@@ -7621,7 +8377,7 @@ mod validate_collect_tests {
         // fields whose value is `vpc.id` etc.
         let ty = struct_type(
             "Subnet",
-            vec![StructField::new("vpc_id", AttributeType::int())],
+            vec![StructField::optional("vpc_id", AttributeType::int()).build()],
         );
         let v = map_value(vec![(
             "vpc_id",
@@ -7643,7 +8399,7 @@ mod validate_collect_tests {
         // suggestion, which #2214 fixes.
         let ty = struct_type(
             "Versioning",
-            vec![StructField::new("status", AttributeType::string())],
+            vec![StructField::optional("status", AttributeType::string()).build()],
         );
         let v = map_value(vec![(
             "statuus",
@@ -7767,20 +8523,23 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
             _ => Err("expected String".to_string()),
         }
     }
-    let schema = ResourceSchema::new("test.r.mode_holder").attribute(
-        AttributeSchema::new(
-            "mode",
-            AttributeType::enum_with_base(
-                crate::schema::enum_identity("Mode", Some("test.r")),
-                AttributeType::string(),
-                None,
-                vec![],
-                Some(legacy_validator(validate_mode)),
-                None,
-            ),
+    let schema = ResourceSchema::new("test.r.mode_holder")
+        .attribute(
+            AttributeSchema::required(
+                "mode",
+                AttributeType::enum_with_base(
+                    crate::schema::enum_identity("Mode", Some("test.r")),
+                    AttributeType::string(),
+                    None,
+                    vec![],
+                    Some(legacy_validator(validate_mode)),
+                    None,
+                ),
+            )
+            .build(),
         )
-        .required(),
-    );
+        .validate()
+        .expect("custom enum schema must be valid");
     let mut attrs = HashMap::new();
     attrs.insert(
         "mode".to_string(),
@@ -7869,11 +8628,11 @@ fn retention_union() -> AttributeType {
     AttributeType::union(vec![
         AttributeType::struct_(
             "RetentionDays".to_string(),
-            vec![StructField::new("days", AttributeType::int()).required()],
+            vec![StructField::required("days", AttributeType::int()).build()],
         ),
         AttributeType::struct_(
             "RetentionYears".to_string(),
-            vec![StructField::new("years", AttributeType::int()).required()],
+            vec![StructField::required("years", AttributeType::int()).build()],
         ),
     ])
 }
@@ -7902,7 +8661,7 @@ fn required_int_struct(name: &str, fields: &[&str]) -> AttributeType {
         name.to_string(),
         fields
             .iter()
-            .map(|field| StructField::new(*field, AttributeType::int()).required())
+            .map(|field| StructField::required(*field, AttributeType::int()).build())
             .collect(),
     )
 }
@@ -8043,8 +8802,8 @@ fn union_struct_diagnostic_uses_recognized_field_sets_not_cardinality() {
         AttributeType::struct_(
             "Days".to_string(),
             vec![
-                StructField::new("days", AttributeType::int()).required(),
-                StructField::new("unit", AttributeType::string()),
+                StructField::required("days", AttributeType::int()).build(),
+                StructField::optional("unit", AttributeType::string()).build(),
             ],
         ),
         required_int_struct("Years", &["years"]),
@@ -8167,15 +8926,15 @@ fn union_struct_three_alternatives_render_as_one_readable_list() {
     let union = AttributeType::union(vec![
         AttributeType::struct_(
             "RetentionDays".to_string(),
-            vec![StructField::new("days", AttributeType::int()).required()],
+            vec![StructField::required("days", AttributeType::int()).build()],
         ),
         AttributeType::struct_(
             "RetentionWeeks".to_string(),
-            vec![StructField::new("weeks", AttributeType::int()).required()],
+            vec![StructField::required("weeks", AttributeType::int()).build()],
         ),
         AttributeType::struct_(
             "RetentionYears".to_string(),
-            vec![StructField::new("years", AttributeType::int()).required()],
+            vec![StructField::required("years", AttributeType::int()).build()],
         ),
     ]);
     let value = union_map(vec![]);
@@ -8195,15 +8954,15 @@ fn union_struct_multi_field_alternatives_render_each_field_set_once() {
         AttributeType::struct_(
             "DateRange".to_string(),
             vec![
-                StructField::new("start", AttributeType::string()).required(),
-                StructField::new("end", AttributeType::string()).required(),
+                StructField::required("start", AttributeType::string()).build(),
+                StructField::required("end", AttributeType::string()).build(),
             ],
         ),
         AttributeType::struct_(
             "DayMode".to_string(),
             vec![
-                StructField::new("days", AttributeType::int()).required(),
-                StructField::new("mode", AttributeType::string()).required(),
+                StructField::required("days", AttributeType::int()).build(),
+                StructField::required("mode", AttributeType::string()).build(),
             ],
         ),
     ]);
@@ -8286,15 +9045,15 @@ fn union_struct_overlapping_optional_arms_do_not_demand_optional_fields() {
         AttributeType::struct_(
             "DaysWithExtra".to_string(),
             vec![
-                StructField::new("days", AttributeType::int()).required(),
-                StructField::new("extra", AttributeType::int()),
+                StructField::required("days", AttributeType::int()).build(),
+                StructField::optional("extra", AttributeType::int()).build(),
             ],
         ),
         AttributeType::struct_(
             "DaysWithOther".to_string(),
             vec![
-                StructField::new("days", AttributeType::int()).required(),
-                StructField::new("other", AttributeType::int()),
+                StructField::required("days", AttributeType::int()).build(),
+                StructField::optional("other", AttributeType::int()).build(),
             ],
         ),
     ]);
@@ -8475,11 +9234,11 @@ fn union_struct_ambiguous_field_sets_quote_type_names() {
     let union = AttributeType::union(vec![
         AttributeType::struct_(
             "IntVariant".to_string(),
-            vec![StructField::new("value", AttributeType::int()).required()],
+            vec![StructField::required("value", AttributeType::int()).build()],
         ),
         AttributeType::struct_(
             "StringVariant".to_string(),
-            vec![StructField::new("value", AttributeType::string()).required()],
+            vec![StructField::required("value", AttributeType::string()).build()],
         ),
     ]);
     let value = union_map(vec![("value", Value::Concrete(ConcreteValue::Bool(true)))]);
@@ -8499,15 +9258,15 @@ fn union_struct_tie_with_only_shared_fields_reports_no_satisfied_alternative() {
         AttributeType::struct_(
             "RetentionDays".to_string(),
             vec![
-                StructField::new("label", AttributeType::string()).required(),
-                StructField::new("days", AttributeType::int()).required(),
+                StructField::required("label", AttributeType::string()).build(),
+                StructField::required("days", AttributeType::int()).build(),
             ],
         ),
         AttributeType::struct_(
             "RetentionYears".to_string(),
             vec![
-                StructField::new("label", AttributeType::string()).required(),
-                StructField::new("years", AttributeType::int()).required(),
+                StructField::required("label", AttributeType::string()).build(),
+                StructField::required("years", AttributeType::int()).build(),
             ],
         ),
     ]);
@@ -8764,7 +9523,7 @@ fn schema_validation_ref_cycle_guard_resets_for_struct_field_values() {
             "Node".to_string(),
             AttributeType::struct_(
                 "Node",
-                vec![StructField::new("child", AttributeType::ref_("Node"))],
+                vec![StructField::optional("child", AttributeType::ref_("Node")).build()],
             ),
         )]),
     };
@@ -8850,14 +9609,14 @@ fn tied_scalar_union_reports_every_distinct_failure_in_declaration_order() {
     }
     let union = AttributeType::union(vec![
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("FirstScalar")),
+            TypeIdentity::bare("FirstScalar"),
             None,
             None,
             legacy_validator(reject_first),
             None,
         ),
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("SecondScalar")),
+            TypeIdentity::bare("SecondScalar"),
             None,
             None,
             legacy_validator(reject_second),
@@ -9086,14 +9845,16 @@ fn quoted_non_enum_validator_error_is_not_reshaped_as_an_enum_attribute() {
         )],
     };
     let attr_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("StringWithValidator")),
+        TypeIdentity::bare("StringWithValidator"),
         None,
         None,
         validator(move |_| Err(enum_error.clone())),
         None,
     );
-    let schema =
-        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("value", attr_type));
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::optional("value", attr_type).build())
+        .validate()
+        .expect("validated-string schema must be valid");
     let attributes = std::collections::HashMap::from([(
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("q".into())),
@@ -9127,15 +9888,17 @@ fn quoted_union_string_validator_error_is_not_reshaped_as_an_enum_arm() {
     };
     let expected = validator_error.clone().with_attribute("value");
     let validated_string = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("StringWithValidator")),
+        TypeIdentity::bare("StringWithValidator"),
         None,
         None,
         validator(move |_| Err(validator_error.clone())),
         None,
     );
     let attr_type = AttributeType::union(vec![AttributeType::int(), validated_string]);
-    let schema =
-        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("value", attr_type));
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::optional("value", attr_type).build())
+        .validate()
+        .expect("union validator schema must be valid");
     let attributes = std::collections::HashMap::from([(
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("q".into())),
@@ -9344,13 +10107,13 @@ fn canonicalize_union_selects_the_struct_that_accepts_all_fields() {
     let union = AttributeType::union(vec![
         AttributeType::struct_(
             "Narrow".to_string(),
-            vec![StructField::new("a", string_or_list).required()],
+            vec![StructField::required("a", string_or_list).build()],
         ),
         AttributeType::struct_(
             "Wide".to_string(),
             vec![
-                StructField::new("a", AttributeType::string()).required(),
-                StructField::new("b", AttributeType::int()).required(),
+                StructField::required("a", AttributeType::string()).build(),
+                StructField::required("b", AttributeType::int()).build(),
             ],
         ),
     ]);
@@ -9386,7 +10149,7 @@ fn canonicalize_union_ref_selects_the_struct_that_accepts_all_fields() {
                 "Narrow".to_string(),
                 AttributeType::struct_(
                     "Narrow".to_string(),
-                    vec![StructField::new("a", string_or_list).required()],
+                    vec![StructField::required("a", string_or_list).build()],
                 ),
             ),
             (
@@ -9394,8 +10157,8 @@ fn canonicalize_union_ref_selects_the_struct_that_accepts_all_fields() {
                 AttributeType::struct_(
                     "Wide".to_string(),
                     vec![
-                        StructField::new("a", AttributeType::string()).required(),
-                        StructField::new("b", AttributeType::int()).required(),
+                        StructField::required("a", AttributeType::string()).build(),
+                        StructField::required("b", AttributeType::int()).build(),
                     ],
                 ),
             ),
@@ -9446,7 +10209,7 @@ fn union_enum_typo_reports_variants_and_suggestion_when_no_member_accepts() {
         ),
         AttributeType::struct_(
             "Condition",
-            vec![StructField::new("key", AttributeType::string())],
+            vec![StructField::optional("key", AttributeType::string()).build()],
         ),
     ]);
     let value = Value::Concrete(ConcreteValue::enum_identifier("alow"));
@@ -9476,7 +10239,7 @@ fn union_quoted_non_member_reports_string_literal_expected_enum() {
         ),
         AttributeType::struct_(
             "Condition",
-            vec![StructField::new("key", AttributeType::string())],
+            vec![StructField::optional("key", AttributeType::string()).build()],
         ),
     ]);
     let value = Value::Concrete(ConcreteValue::String("not-a-member".into()));
@@ -9499,7 +10262,7 @@ fn union_list_vs_list_struct_picks_inner_struct_error() {
         AttributeType::list(AttributeType::string()),
         AttributeType::list(AttributeType::struct_(
             "Item".to_string(),
-            vec![StructField::new("name", AttributeType::string())],
+            vec![StructField::optional("name", AttributeType::string()).build()],
         )),
     ]);
     let mut bad = IndexMap::new();
@@ -9540,7 +10303,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     let union_type = AttributeType::union(vec![
         AttributeType::int(),
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Arn")),
+            TypeIdentity::bare("Arn"),
             None,
             None,
             legacy_validator(must_be_arn),
@@ -9604,7 +10367,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // is the `Custom` one.
     let union_type = AttributeType::union(vec![
         AttributeType::refined_int_with_validator(
-            Some(TypeIdentity::bare("PositiveInt")),
+            TypeIdentity::bare("PositiveInt"),
             None,
             legacy_validator(must_be_positive),
         ),
@@ -9636,7 +10399,7 @@ fn union_struct_member_still_wins_for_map_input_regression() {
     let union_type = AttributeType::union(vec![
         AttributeType::struct_(
             "Principal".to_string(),
-            vec![StructField::new("service", AttributeType::string())],
+            vec![StructField::optional("service", AttributeType::string()).build()],
         ),
         AttributeType::string(),
     ]);
@@ -9667,7 +10430,7 @@ fn custom_validator_can_capture_external_state() {
     // #2217 (closure-capable Custom validator).
     let allowed_region = "ap-northeast-1".to_string();
     let attr = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Region")),
+        TypeIdentity::bare("Region"),
         None,
         None,
         validator(move |v| match v {
@@ -9710,7 +10473,7 @@ fn custom_validator_returns_structured_type_error_directly() {
     // This is what unlocks LSP code-action quick-fixes for Custom-typed
     // attributes (see #2220 / #2309 for the structured-error path).
     let attr = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Mode")),
+        TypeIdentity::bare("Mode"),
         None,
         None,
         validator(|v| match v {
@@ -9770,8 +10533,16 @@ fn schema_registry_inserts_managed_and_data_source_for_same_type() {
     let managed = ResourceSchema::new("s3.Bucket");
     let data_source = ResourceSchema::new("s3.Bucket").as_data_source();
 
-    registry.insert("aws", managed);
-    registry.insert("aws", data_source);
+    registry.insert(
+        "aws",
+        managed.validate().expect("schema fixture must be valid"),
+    );
+    registry.insert(
+        "aws",
+        data_source
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     assert_eq!(registry.len(), 2);
     assert!(registry.has_managed("aws", "s3.Bucket"));
@@ -9786,8 +10557,18 @@ fn schema_registry_routes_lookup_by_typestate() {
     use crate::resource::{DataSource, Resource};
 
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", ResourceSchema::new("s3.Bucket"));
-    registry.insert("aws", ResourceSchema::new("s3.Bucket").as_data_source());
+    registry.insert(
+        "aws",
+        (ResourceSchema::new("s3.Bucket"))
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    registry.insert(
+        "aws",
+        (ResourceSchema::new("s3.Bucket").as_data_source())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let managed_res = Resource::with_provider("aws", "s3.Bucket", "new", None);
     let data_res = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
@@ -9795,12 +10576,12 @@ fn schema_registry_routes_lookup_by_typestate() {
     let m = registry
         .get_for(&managed_res)
         .expect("managed schema present");
-    assert_eq!(m.kind, SchemaKind::Resource);
+    assert_eq!(m.as_schema().kind, SchemaKind::Resource);
 
     let d = registry
         .get_for_data_source(&data_res)
         .expect("data source schema present");
-    assert_eq!(d.kind, SchemaKind::DataSource);
+    assert_eq!(d.as_schema().kind, SchemaKind::DataSource);
 }
 
 #[test]
@@ -9818,7 +10599,12 @@ fn schema_registry_missing_returns_none() {
 #[test]
 fn schema_registry_has_managed_only_does_not_imply_data_source() {
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", ResourceSchema::new("s3.Bucket"));
+    registry.insert(
+        "aws",
+        (ResourceSchema::new("s3.Bucket"))
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     assert!(registry.has_managed("aws", "s3.Bucket"));
     assert!(!registry.has_data_source("aws", "s3.Bucket"));
@@ -9859,7 +10645,7 @@ fn walk_custom_lookup_skips_value_unknown() {
         })
     });
     let custom_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("vpc_id")),
+        TypeIdentity::bare("vpc_id"),
         None,
         None,
         always_fail,
@@ -9887,7 +10673,7 @@ fn walk_custom_lookup_skips_value_unknown() {
 
 fn resource_schema_with_self_cyclic_string_union() -> ResourceSchema {
     ResourceSchema::new("test.SelfCyclicUnion")
-        .attribute(AttributeSchema::new("value", AttributeType::ref_("A")))
+        .attribute(AttributeSchema::optional("value", AttributeType::ref_("A")).build())
         .with_def(
             "A",
             AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
@@ -9896,7 +10682,9 @@ fn resource_schema_with_self_cyclic_string_union() -> ResourceSchema {
 
 #[test]
 fn resource_schema_validate_self_cyclic_union_with_valid_value_terminates() {
-    let schema = resource_schema_with_self_cyclic_string_union();
+    let schema = resource_schema_with_self_cyclic_string_union()
+        .validate()
+        .expect("self-cyclic union schema must be valid");
     let attributes = HashMap::from([(
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("x".into())),
@@ -9907,7 +10695,9 @@ fn resource_schema_validate_self_cyclic_union_with_valid_value_terminates() {
 
 #[test]
 fn resource_schema_validate_self_cyclic_union_with_invalid_value_terminates() {
-    let schema = resource_schema_with_self_cyclic_string_union();
+    let schema = resource_schema_with_self_cyclic_string_union()
+        .validate()
+        .expect("self-cyclic union schema must be valid");
     let attributes = HashMap::from([("value".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
 
     let errors = schema
@@ -9926,14 +10716,14 @@ fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let custom_string = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("cyclic_leaf")),
+        TypeIdentity::bare("cyclic_leaf"),
         None,
         None,
         validator(|_| Ok(())),
         None,
     );
     let schema = ResourceSchema::new("test.CyclicCustomLookup")
-        .attribute(AttributeSchema::new("value", AttributeType::ref_("A")))
+        .attribute(AttributeSchema::optional("value", AttributeType::ref_("A")).build())
         .with_def(
             "A",
             AttributeType::union(vec![
@@ -9941,7 +10731,9 @@ fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
                 custom_string,
                 AttributeType::list(AttributeType::ref_("A")),
             ]),
-        );
+        )
+        .validate()
+        .expect("cyclic custom-lookup schema must be valid");
     let attributes = HashMap::from([(
         "value".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -9992,7 +10784,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     // discarded.
     let custom = |name: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             None,
             validator(|_v: &Value| Ok(())),
@@ -10034,7 +10826,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     // count must be 1, not 2.
     let custom = |name: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             None,
             validator(|_v: &Value| Ok(())),
@@ -10627,7 +11419,9 @@ fn validate_map_with_ref_enum_key_uses_supplied_defs() {
     let value = map_value_with_one_key("RSA_2048");
 
     assert!(
-        map_type.validate_with_defs(&value, &defs).is_ok(),
+        RootlessType::with_defs(map_type.clone(), defs.clone())
+            .validate(&value)
+            .is_ok(),
         "validation must resolve the map key Ref through the supplied defs"
     );
 
@@ -10680,17 +11474,22 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     );
     let statement_struct = AttributeType::struct_(
         "Statement".to_string(),
-        vec![StructField::new("effect", effect_enum)],
+        vec![StructField::optional("effect", effect_enum).build()],
     );
     let policy_struct = AttributeType::struct_(
         "PolicyDocument".to_string(),
         vec![
-            StructField::new("version", version_enum),
-            StructField::new("statement", AttributeType::unordered_list(statement_struct)),
+            StructField::optional("version", version_enum).build(),
+            StructField::optional("statement", AttributeType::unordered_list(statement_struct))
+                .build(),
         ],
     );
     let schema = ResourceSchema::new("aws.iam.role_policy")
-        .attribute(AttributeSchema::new("policy", policy_struct));
+        .attribute(AttributeSchema::optional("policy", policy_struct).build());
+    let validated = schema
+        .clone()
+        .validate()
+        .expect("IAM policy schema must be valid");
 
     // Attributes exactly as loaded from persisted state JSON: enum
     // positions hold `ConcreteValue::String`, not `EnumIdentifier`.
@@ -10717,7 +11516,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     );
 
     // BEFORE the lift: strict validator rejects the loaded String.
-    let before = schema.validate(&attrs);
+    let before = validated.validate(&attrs);
     let errs = before.expect_err("loaded state String must fail strict Enum validation");
     fn has_string_literal_expected_enum(errs: &[TypeError]) -> bool {
         errs.iter().any(|e| match e {
@@ -10739,7 +11538,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     lift_state_enum_leaves(&mut attrs, &schema);
 
     // AFTER the lift: validation passes.
-    schema
+    validated
         .validate(&attrs)
         .expect("lifted state must pass strict Enum validation");
 
@@ -10781,10 +11580,14 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     );
     let policy_struct = AttributeType::struct_(
         "PolicyDocument".to_string(),
-        vec![StructField::new("version", version_enum)],
+        vec![StructField::optional("version", version_enum).build()],
     );
     let schema = ResourceSchema::new("aws.iam.role_policy")
-        .attribute(AttributeSchema::new("policy", policy_struct));
+        .attribute(AttributeSchema::optional("policy", policy_struct).build());
+    let validated = schema
+        .clone()
+        .validate()
+        .expect("IAM policy schema must be valid");
 
     // Case 1: already an EnumIdentifier (post-fix re-plan) is canonicalized.
     let mut already = IndexMap::new();
@@ -10834,7 +11637,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
         "unrecognized member must stay String (validator still rejects it)"
     );
     assert!(
-        schema.validate(&attrs2).is_err(),
+        validated.validate(&attrs2).is_err(),
         "invalid persisted state must still fail validation, not be masked"
     );
 }
@@ -10852,7 +11655,7 @@ fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
             Some(crate::schema::DslTransform::HyphenToUnderscore),
         );
         ResourceSchema::new("aws.ec2.subnet")
-            .attribute(AttributeSchema::new("availability_zone", zone_name))
+            .attribute(AttributeSchema::optional("availability_zone", zone_name).build())
     }
 
     fn lifted_value(raw: &str) -> Value {
@@ -10925,13 +11728,16 @@ fn principal_union_schema() -> AttributeType {
     AttributeType::union(vec![
         AttributeType::struct_(
             "PrincipalStruct".to_string(),
-            vec![StructField::new(
-                "service",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
-            )],
+            vec![
+                StructField::optional(
+                    "service",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            ],
         ),
         AttributeType::string(),
     ])
@@ -11011,7 +11817,7 @@ fn select_union_member_map_never_picks_string_member() {
         AttributeType::string(),
         AttributeType::struct_(
             "PrincipalStruct".to_string(),
-            vec![StructField::new("service", AttributeType::string())],
+            vec![StructField::optional("service", AttributeType::string()).build()],
         ),
     ]);
     assert!(
@@ -11081,20 +11887,26 @@ fn cyclic_statement_schema() -> Schema {
         "Statement".to_string(),
         AttributeType::struct_(
             "Statement".to_string(),
-            vec![StructField::new(
-                "and_statement",
-                AttributeType::ref_("AndStatement".to_string()),
-            )],
+            vec![
+                StructField::optional(
+                    "and_statement",
+                    AttributeType::ref_("AndStatement".to_string()),
+                )
+                .build(),
+            ],
         ),
     );
     defs.insert(
         "AndStatement".to_string(),
         AttributeType::struct_(
             "AndStatement".to_string(),
-            vec![StructField::new(
-                "statements",
-                AttributeType::list(AttributeType::ref_("Statement".to_string())),
-            )],
+            vec![
+                StructField::optional(
+                    "statements",
+                    AttributeType::list(AttributeType::ref_("Statement".to_string())),
+                )
+                .build(),
+            ],
         ),
     );
     Schema {
@@ -11254,11 +12066,6 @@ enum FingerprintChange {
     WaitInterval,
     Definition,
     DeclarativeValidator,
-    ResourceValidator,
-}
-
-fn fingerprint_reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-    Err(Vec::new())
 }
 
 fn schema_fingerprint_fixture(reverse_attributes: bool) -> ResourceSchema {
@@ -11283,14 +12090,13 @@ fn schema_fingerprint_fixture_with(
     } else {
         Value::Concrete(ConcreteValue::Map(default_map))
     };
-    let mut first = AttributeSchema::new(
+    let mut first = AttributeSchema::optional(
         "first",
         AttributeType::list(AttributeType::struct_(
             "Nested",
-            vec![StructField::new("value", AttributeType::string()).required()],
+            vec![StructField::required("value", AttributeType::string()).build()],
         )),
     )
-    .required()
     .with_default(default)
     .with_provider_name(if change == Some(FingerprintChange::ProviderName) {
         "Other"
@@ -11311,25 +12117,30 @@ fn schema_fingerprint_fixture_with(
     if change != Some(FingerprintChange::Identity) {
         first = first.identity();
     }
-    if change != Some(FingerprintChange::DeferredPopulate) {
-        first = first.deferred_populate();
-    }
+    let first = first.build();
 
-    let mut second = AttributeSchema::new(
-        "second",
-        if change == Some(FingerprintChange::AttributeType) {
-            AttributeType::bool()
-        } else {
-            AttributeType::int()
-        },
-    );
-    if change == Some(FingerprintChange::InputMode) {
-        second = second.required();
-    }
-    second = if change == Some(FingerprintChange::Removable) {
-        second.removable()
+    let second_type = if change == Some(FingerprintChange::AttributeType) {
+        AttributeType::bool()
     } else {
-        second.non_removable()
+        AttributeType::int()
+    };
+    let second = if change == Some(FingerprintChange::InputMode) {
+        AttributeSchema::required("second", second_type).build()
+    } else if change == Some(FingerprintChange::Removable) {
+        AttributeSchema::optional("second", second_type)
+            .removable()
+            .build()
+    } else {
+        AttributeSchema::optional("second", second_type)
+            .non_removable()
+            .build()
+    };
+    let generated = if change == Some(FingerprintChange::DeferredPopulate) {
+        AttributeSchema::provider_populated("generated", AttributeType::string()).build()
+    } else {
+        AttributeSchema::provider_populated("generated", AttributeType::string())
+            .deferred_populate()
+            .build()
     };
 
     let operation_config = OperationConfig {
@@ -11387,7 +12198,6 @@ fn schema_fingerprint_fixture_with(
         Some(FingerprintChange::DeclarativeValidator) => {
             schema.with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
         }
-        Some(FingerprintChange::ResourceValidator) => schema.with_validator(fingerprint_reject_all),
         Some(
             FingerprintChange::ResourceType
             | FingerprintChange::AttributeType
@@ -11411,9 +12221,15 @@ fn schema_fingerprint_fixture_with(
         | None => schema,
     };
     if reverse_attributes {
-        schema.attribute(second).attribute(first)
+        schema
+            .attribute(generated)
+            .attribute(second)
+            .attribute(first)
     } else {
-        schema.attribute(first).attribute(second)
+        schema
+            .attribute(generated)
+            .attribute(first)
+            .attribute(second)
     }
 }
 
@@ -11431,20 +12247,30 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
 
 #[test]
 fn resource_schema_semantic_fingerprint_covers_nested_write_only() {
-    let observable = ResourceSchema::new("test.Widget").attribute(AttributeSchema::new(
-        "config",
-        AttributeType::struct_(
-            "Config",
-            vec![StructField::new("client_secret", AttributeType::string())],
-        ),
-    ));
-    let write_only = ResourceSchema::new("test.Widget").attribute(AttributeSchema::new(
-        "config",
-        AttributeType::struct_(
-            "Config",
-            vec![StructField::new("client_secret", AttributeType::string()).write_only()],
-        ),
-    ));
+    let observable = ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![StructField::optional("client_secret", AttributeType::string()).build()],
+            ),
+        )
+        .build(),
+    );
+    let write_only = ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("client_secret", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
 
     assert_ne!(
         observable.semantic_fingerprint(),
@@ -11463,26 +12289,6 @@ fn schema_kind_serde_uses_the_snake_case_core_shape() {
         serde_json::from_value::<SchemaKind>(serde_json::json!("data_source"))
             .expect("deserialize data-source kind"),
         SchemaKind::DataSource
-    );
-}
-
-#[test]
-fn in_process_validator_fingerprint_uses_a_fixed_marker() {
-    fn accept_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        Ok(())
-    }
-
-    fn reject_all(_attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        Err(Vec::new())
-    }
-
-    let accepting = schema_fingerprint_fixture(false).with_validator(accept_all);
-    let rejecting = schema_fingerprint_fixture(false).with_validator(reject_all);
-
-    assert_eq!(
-        accepting.semantic_fingerprint(),
-        rejecting.semantic_fingerprint(),
-        "in-process callback identity must not affect a portable fingerprint",
     );
 }
 
@@ -11512,7 +12318,6 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
             "declarative validator",
             FingerprintChange::DeclarativeValidator,
         ),
-        ("resource validator", FingerprintChange::ResourceValidator),
     ];
 
     for (field, change) in changes {

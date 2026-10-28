@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,7 +5,7 @@ use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::{InferredFile, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::{Resource, Value};
-use carina_core::schema::{AttributeType, ResourceSchema, SchemaRegistry};
+use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
 use indexmap::IndexMap;
 
@@ -23,8 +22,8 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         "provider upstream state capture"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -49,8 +48,16 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        Vec::new()
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 

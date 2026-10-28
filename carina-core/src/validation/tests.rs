@@ -116,8 +116,10 @@ fn function_ref_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -977,7 +979,7 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
     attrs.into_iter().fold(
         ResourceSchema::new(resource_type),
         |schema, (name, attr_type)| {
-            schema.attribute(crate::schema::AttributeSchema::new(name, attr_type))
+            schema.attribute(crate::schema::AttributeSchema::optional(name, attr_type).build())
         },
     )
 }
@@ -1037,10 +1039,12 @@ fn resource_ref_validation_checks_composition_attribute_membership_only() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "test.Consumer",
             vec![("target_group_arn", AttributeType::bool())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let valid = Resource::with_provider("awscc", "test.Consumer", "valid", None).with_attribute(
@@ -1084,7 +1088,9 @@ fn unknown_binding_reference_reports_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
+        (make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     // Subnet references "vpc" binding which doesn't exist
@@ -1107,11 +1113,15 @@ fn unknown_attribute_reference_reports_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
+        (make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
+        (make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     // VPC resource with binding
@@ -1147,19 +1157,27 @@ fn postfix_access_validation_fixture(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Queue")
-            .attribute(AttributeSchema::new("identifier", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "rules",
-                AttributeType::list(AttributeType::struct_(
-                    "Rule".to_string(),
-                    vec![StructField::new("name", AttributeType::string())],
-                )),
-            )),
+        (ResourceSchema::new("test.Queue")
+            .attribute(AttributeSchema::optional("identifier", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule".to_string(),
+                        vec![StructField::optional("name", AttributeType::string()).build()],
+                    )),
+                )
+                .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Consumer").attribute(AttributeSchema::new("value", sink)),
+        (ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::optional("value", sink).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let queue = Resource::with_provider("mock", "test.Queue", "queue", None)
@@ -1244,15 +1262,19 @@ fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Thing")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string())),
+        (ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("identifier", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Consumer")
-            .attribute(AttributeSchema::new("direct", AttributeType::string()))
-            .attribute(AttributeSchema::new("grouped", AttributeType::string())),
+        (ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::optional("direct", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("grouped", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
@@ -1405,20 +1427,24 @@ fn unknown_attribute_reference_suggests_similar_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "ec2.internet_gateway",
             vec![("internet_gateway_id", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "ec2.route",
             vec![
                 ("route_table_id", AttributeType::string()),
                 ("gateway_id", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let igw =
@@ -1451,20 +1477,24 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![
                 ("certificate_arn", AttributeType::string()),
                 ("status", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elasticloadbalancingv2.Listener",
             vec![("certificate_arn", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
@@ -1520,20 +1550,24 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![
                 ("certificate_arn", AttributeType::string()),
                 ("status", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elasticloadbalancingv2.Listener",
             vec![("certificate_arn", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
@@ -1588,8 +1622,18 @@ fn resource_ref_string_is_assignable_to_ref_membered_sink_union() {
     .with_def("S", AttributeType::string())
     .with_def("L", AttributeType::list(AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     // Directory-shaped input: two resources and a let-binding reference,
     // matching the validation walk used for merged sibling files.
@@ -1625,8 +1669,18 @@ fn resource_ref_mismatch_displays_resolved_ref_type_names() {
     )
     .with_def("Target", AttributeType::bool());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let parsed = crate::parser::parse(
         r#"
 let source = test.r.source {}
@@ -1667,8 +1721,18 @@ fn resource_ref_mismatch_displays_resolved_union_member_names() {
     .with_def("S", AttributeType::string())
     .with_def("L", AttributeType::list(AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let parsed = crate::parser::parse(
         r#"
 let source = test.r.source {}
@@ -1700,26 +1764,30 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![
                 ("certificate_arn", AttributeType::string()),
                 ("status", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elasticloadbalancingv2.Listener",
             vec![(
                 "certificates",
                 AttributeType::list(AttributeType::struct_(
                     "Certificate".to_string(),
-                    vec![StructField::new("certificate_arn", AttributeType::string())],
+                    vec![StructField::optional("certificate_arn", AttributeType::string()).build()],
                 )),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
@@ -1772,26 +1840,30 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![
                 ("certificate_arn", AttributeType::string()),
                 ("status", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elasticloadbalancingv2.Listener",
             vec![(
                 "certificates",
                 AttributeType::list(AttributeType::struct_(
                     "Certificate".to_string(),
-                    vec![StructField::new("certificate_arn", AttributeType::string())],
+                    vec![StructField::optional("certificate_arn", AttributeType::string()).build()],
                 )),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
@@ -1830,10 +1902,12 @@ fn unknown_outer_attr_does_not_mask_nested_unknown_binding_ref() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elasticloadbalancingv2.Listener",
             vec![("certificates", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut nested = IndexMap::new();
@@ -1863,11 +1937,15 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
+        (make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
+        (make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
@@ -1917,12 +1995,16 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
     // test.r.vpc exposes `vpc_id: Int`
     schemas.insert(
         "test",
-        make_schema("r.vpc", vec![("vpc_id", AttributeType::int())]),
+        (make_schema("r.vpc", vec![("vpc_id", AttributeType::int())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
     // test.r.pool_user requires `pool_id: Bool` — incompatible with Int.
     schemas.insert(
         "test",
-        make_schema("r.pool_user", vec![("pool_id", AttributeType::bool())]),
+        (make_schema("r.pool_user", vec![("pool_id", AttributeType::bool())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
@@ -2930,8 +3012,8 @@ fn lifted_struct_rejects_missing_schema_field_when_source_has_extra() {
     let schema = AttributeType::struct_(
         "Row".to_string(),
         vec![
-            StructField::new("a", AttributeType::int()),
-            StructField::new("b", AttributeType::string()),
+            StructField::optional("a", AttributeType::int()).build(),
+            StructField::optional("b", AttributeType::string()).build(),
         ],
     );
     assert!(!lifted_source_is_assignable_to_schema(
@@ -2953,8 +3035,8 @@ fn lifted_struct_matches_same_shape_schema() {
     let schema = AttributeType::struct_(
         "Row".to_string(),
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new("value", AttributeType::int()),
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional("value", AttributeType::int()).build(),
         ],
     );
     assert!(lifted_source_is_assignable_to_schema(
@@ -3029,7 +3111,7 @@ fn non_liftable_unknown_is_unchecked_for_custom_sink() {
         Ok(())
     }
     let custom = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("VpcId")),
+        TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop),
@@ -3049,7 +3131,7 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
         Ok(())
     }
     let schema = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("VpcId")),
+        TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop),
@@ -3070,17 +3152,7 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
 // the pattern when known (carina#3805).
 #[test]
 fn directional_relation_accepts_plain_string_for_identityless_pattern_sink() {
-    use crate::schema::legacy_validator;
-    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
-        Ok(())
-    }
-    let schema = AttributeType::refined_string_with_validator(
-        None,
-        Some("^.+$".to_string()),
-        None,
-        legacy_validator(noop),
-        None,
-    );
+    let schema = AttributeType::refined_string(None, Some("^.+$".to_string()), None, None);
     assert!(
         lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
@@ -3103,7 +3175,7 @@ fn directional_relation_accepts_string_through_plain_union_member() {
     let schema = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("VpcId")),
+            TypeIdentity::bare("VpcId"),
             None,
             None,
             legacy_validator(noop),
@@ -3131,7 +3203,7 @@ fn directional_relation_rejects_string_for_union_of_only_identified_sinks() {
     }
     let mk = |name: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             None,
             legacy_validator(noop),
@@ -3184,7 +3256,7 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
         Ok(())
     }
     let schema = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("VpcId")),
+        TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop),
@@ -3484,20 +3556,29 @@ fn attribute_param_ref_type_mismatch_detected() {
         );
 
     let mut role_schema = ResourceSchema::new("iam.role");
-    role_schema = role_schema.attribute(AttributeSchema::new("role_name", AttributeType::string()));
-    role_schema = role_schema.attribute(AttributeSchema::new(
-        "arn",
-        AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("IamRoleArn")),
-            None,
-            None,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
-        ),
-    ));
+    role_schema = role_schema
+        .attribute(AttributeSchema::optional("role_name", AttributeType::string()).build());
+    role_schema = role_schema.attribute(
+        AttributeSchema::optional(
+            "arn",
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("IamRoleArn"),
+                None,
+                None,
+                crate::schema::legacy_validator(|_| Ok(())),
+                None,
+            ),
+        )
+        .build(),
+    );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", role_schema);
+    schemas.insert(
+        "awscc",
+        role_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let mut parsed = empty_parsed();
     parsed.resources.push(role); // allow: direct — fixture test inspection
@@ -3553,13 +3634,15 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
             Value::Concrete(ConcreteValue::String("text".into())),
         );
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new(
-            "value",
-            AttributeType::ref_("X".to_string()),
-        ))
+        .attribute(AttributeSchema::optional("value", AttributeType::ref_("X".to_string())).build())
         .with_def("X", AttributeType::string());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
@@ -3930,12 +4013,17 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("ec2.Subnet").attribute(AttributeSchema::new("subnet_id", subnet_id)),
+        (ResourceSchema::new("ec2.Subnet")
+            .attribute(AttributeSchema::optional("subnet_id", subnet_id).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "aws",
-        ResourceSchema::new("ec2.SecurityGroup")
-            .attribute(AttributeSchema::new("group_id", security_group_id)),
+        (ResourceSchema::new("ec2.SecurityGroup")
+            .attribute(AttributeSchema::optional("group_id", security_group_id).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut parsed = empty_parsed();
@@ -4007,8 +4095,10 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("counter")
-            .attribute(AttributeSchema::new("count", AttributeType::int())),
+        (ResourceSchema::new("counter")
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let mut parsed = empty_parsed();
     parsed
@@ -4064,10 +4154,14 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
         );
 
     let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
-    vpc_schema = vpc_schema.attribute(AttributeSchema::new("vpc_id", AttributeType::string()));
+    vpc_schema =
+        vpc_schema.attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", vpc_schema);
+    schemas.insert(
+        "awscc",
+        vpc_schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut nested = IndexMap::new();
     nested.insert(
@@ -4103,14 +4197,18 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         );
 
     let mut cert_schema = ResourceSchema::new("acm.Certificate");
-    cert_schema = cert_schema.attribute(AttributeSchema::new(
-        "certificate_arn",
-        AttributeType::string(),
-    ));
-    cert_schema = cert_schema.attribute(AttributeSchema::new("status", AttributeType::string()));
+    cert_schema = cert_schema
+        .attribute(AttributeSchema::optional("certificate_arn", AttributeType::string()).build());
+    cert_schema =
+        cert_schema.attribute(AttributeSchema::optional("status", AttributeType::string()).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", cert_schema);
+    schemas.insert(
+        "aws",
+        cert_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let params = vec![AttributeParameter::dummy(
         "certificate_arn".to_string(),
@@ -4159,10 +4257,14 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
         );
 
     let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
-    vpc_schema = vpc_schema.attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+    vpc_schema = vpc_schema
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", vpc_schema);
+    schemas.insert(
+        "awscc",
+        vpc_schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut nested = IndexMap::new();
     nested.insert(
@@ -4194,13 +4296,15 @@ fn validate_attribute_params_against_target_group(
         .with_binding("target_group")
         .with_attribute("name", Value::Concrete(ConcreteValue::String("app".into())));
     let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "target_group_arn",
-            AttributeType::string(),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target_group_arn", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", target_group_schema);
+    schemas.insert(
+        "awscc",
+        target_group_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let mut parsed = empty_parsed();
     parsed.resources.push(target_group); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
@@ -4223,7 +4327,7 @@ fn validate_attribute_params_against_target_group_tags(
             AttributeType::struct_(
                 "TargetGroupTags",
                 vec![
-                    StructField::new(
+                    StructField::optional(
                         "environment",
                         AttributeType::refined_string(
                             Some(TypeIdentity::bare("EnvironmentName")),
@@ -4231,14 +4335,20 @@ fn validate_attribute_params_against_target_group_tags(
                             None,
                             None,
                         ),
-                    ),
-                    StructField::new("bad_fields", AttributeType::string()),
+                    )
+                    .build(),
+                    StructField::optional("bad_fields", AttributeType::string()).build(),
                 ],
             ),
         )],
     );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", target_group_schema);
+    schemas.insert(
+        "awscc",
+        target_group_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let mut parsed = empty_parsed();
     parsed.resources.push(target_group); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
@@ -4675,7 +4785,7 @@ fn type_relation_provider_scoped_subtype_flows_into_bare_annotation() {
     // #1874: a declared `Arn` sink accepts a provider-scoped KMS key ARN
     // source (narrower segments, same kind).
     let kms_key_arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["kms", "Key"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["kms", "Key"], "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4692,7 +4802,7 @@ fn type_relation_provider_scoped_subtype_flows_into_bare_annotation() {
 fn type_relation_sibling_rejected_by_declared_sink() {
     // A declared `KmsKeyArn` sink rejects an IAM role ARN source.
     let iam_role_arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4710,7 +4820,7 @@ fn type_relation_resource_id_subtype_flows_into_bare_annotation() {
     // A declared `ResourceId` sink accepts VPC resource IDs (narrower
     // segments, same kind).
     let vpc_id = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "ResourceId")),
+        TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "ResourceId"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4727,7 +4837,7 @@ fn type_relation_resource_id_subtype_flows_into_bare_annotation() {
 fn type_relation_resource_id_siblings_rejected() {
     // A declared `VpcId` sink rejects a SubnetId source.
     let subnet_id = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("SubnetId")),
+        TypeIdentity::bare("SubnetId"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4743,7 +4853,7 @@ fn type_relation_resource_id_siblings_rejected() {
 #[test]
 fn type_relation_exact_identity_match() {
     let arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Arn")),
+        TypeIdentity::bare("Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4834,7 +4944,7 @@ fn lifted_simple_flows_into_union_struct_or_string() {
     let principal_union = AttributeType::union(vec![
         AttributeType::struct_(
             "IamPolicyPrincipal".to_string(),
-            vec![StructField::new("federated", AttributeType::string())],
+            vec![StructField::optional("federated", AttributeType::string()).build()],
         ),
         AttributeType::string(),
     ]);
@@ -4868,7 +4978,7 @@ fn directional_relation_accepts_refined_string_when_union_has_other_scalar() {
     let mixed = AttributeType::union(vec![
         AttributeType::struct_(
             "Principal".to_string(),
-            vec![StructField::new("federated", AttributeType::string())],
+            vec![StructField::optional("federated", AttributeType::string()).build()],
         ),
         AttributeType::string(),
         AttributeType::int(),
@@ -4888,7 +4998,7 @@ fn lifted_simple_rejected_when_union_has_no_compatible_member() {
     let no_string = AttributeType::union(vec![
         AttributeType::struct_(
             "Principal".to_string(),
-            vec![StructField::new("federated", AttributeType::string())],
+            vec![StructField::optional("federated", AttributeType::string()).build()],
         ),
         AttributeType::list(AttributeType::string()),
     ]);
@@ -4904,7 +5014,7 @@ fn lifted_simple_rejected_when_union_has_no_compatible_member() {
 #[test]
 fn directional_relation_accepts_refined_string_with_string_shaped_union_peers() {
     let arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Arn")),
+        TypeIdentity::bare("Arn"),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4940,10 +5050,12 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "organizations.account",
             vec![("account_id", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod", None)
@@ -4989,10 +5101,12 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "organizations.account",
             vec![("account_id", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod", None)
@@ -5041,13 +5155,21 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new(
-            "values",
-            AttributeType::list(AttributeType::ref_("S".to_string())),
-        ))
+        .attribute(
+            AttributeSchema::optional(
+                "values",
+                AttributeType::list(AttributeType::ref_("S".to_string())),
+            )
+            .build(),
+        )
         .with_def("S", AttributeType::string());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let source = Resource::with_provider("test", "source.Item", "source", None)
         .with_binding("source")
         .with_attribute("values", Value::Concrete(ConcreteValue::List(Vec::new())));
@@ -5083,7 +5205,9 @@ fn export_param_ref_types_flags_unknown_attribute() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]),
+        (make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
@@ -5168,10 +5292,12 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "elbv2.TargetGroup",
             vec![("target_group_arn", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let exports = vec![
         InferredExportParam {
@@ -5237,13 +5363,15 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![
                 ("certificate_arn", AttributeType::string()),
                 ("status", AttributeType::string()),
             ],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
@@ -5297,16 +5425,18 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "ec2.Vpc",
             vec![(
                 "config",
                 AttributeType::struct_(
                     "VpcConfig".to_string(),
-                    vec![StructField::new("sub_attr", AttributeType::string())],
+                    vec![StructField::optional("sub_attr", AttributeType::string()).build()],
                 ),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
@@ -5348,7 +5478,9 @@ fn validate_export_param_ref_types_skips_reported_unknown_index() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]),
+        (make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
     let exports = vec![InferredExportParam {
         name: "zone_id".to_string(),
@@ -5389,10 +5521,12 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema(
+        (make_schema(
             "organizations.account",
             vec![("account_id", AttributeType::string())],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let exports = vec![InferredExportParam {
@@ -5429,13 +5563,15 @@ fn validate_resources_accepts_resource_ref_in_list_position() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "route53.RecordSet",
             vec![(
                 "resource_records",
                 AttributeType::list(AttributeType::string()),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let record_set = Resource::with_provider("aws", "route53.RecordSet", "ns", None)
@@ -5475,16 +5611,18 @@ fn validate_resources_accepts_resource_ref_in_struct_field_position() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "test.StructHolder",
             vec![(
                 "config",
                 AttributeType::struct_(
                     "Config".to_string(),
-                    vec![StructField::new("name", AttributeType::string())],
+                    vec![StructField::optional("name", AttributeType::string()).build()],
                 ),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut config = IndexMap::new();
@@ -5516,13 +5654,15 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "test.MapHolder",
             vec![(
                 "tags",
                 AttributeType::map_with_key(AttributeType::string(), AttributeType::string()),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let holder = Resource::with_provider("aws", "test.MapHolder", "h", None).with_attribute(
@@ -5555,7 +5695,10 @@ fn validate_resources_checks_secret_literals_without_revealing_them() {
         )],
     );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let parsed = crate::parser::parse_and_resolve(&format!(
         "let holder = test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}"
     ))
@@ -5587,7 +5730,10 @@ fn validate_resources_rejects_missing_exclusive_required() {
     .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None);
 
@@ -5625,7 +5771,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        make_schema(
+        (make_schema(
             "r.mode_holder",
             vec![(
                 "mode",
@@ -5637,7 +5783,9 @@ fn enum_membership_violation_in_for_body_is_flagged() {
                     None,
                 ),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut known = HashSet::new();
@@ -5661,7 +5809,7 @@ fn mode_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        make_schema(
+        (make_schema(
             "r.mode_holder",
             vec![(
                 "mode",
@@ -5673,7 +5821,9 @@ fn mode_schema() -> SchemaRegistry {
                     None,
                 ),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -5806,7 +5956,9 @@ fn read_against_managed_only_type_is_rejected() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
+        (make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let parsed = crate::parser::parse(
@@ -5878,24 +6030,30 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
     // List<Struct{resource_record_name: String, ...}>`.
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
                 AttributeType::list(AttributeType::struct_(
                     "DomainValidationOption".to_string(),
                     vec![
-                        StructField::new("resource_record_name", AttributeType::string()),
-                        StructField::new("resource_record_value", AttributeType::string()),
+                        StructField::optional("resource_record_name", AttributeType::string())
+                            .build(),
+                        StructField::optional("resource_record_value", AttributeType::string())
+                            .build(),
                     ],
                 )),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     // `aws.route53.RecordSet.name` is a plain String.
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
+        (make_schema("route53.RecordSet", vec![("name", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
@@ -5941,21 +6099,25 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
                 AttributeType::list(AttributeType::struct_(
                     "DomainValidationOption".to_string(),
-                    vec![StructField::new("rotation_count", AttributeType::int())],
+                    vec![StructField::optional("rotation_count", AttributeType::int()).build()],
                 )),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     // Receiver `name` is String — the chained access yields Int.
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
+        (make_schema("route53.RecordSet", vec![("name", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
@@ -6011,32 +6173,37 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     // migration.
     schemas.insert(
         "aws",
-        make_schema(
+        (make_schema(
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
                 AttributeType::list(AttributeType::struct_(
                     "DomainValidation".to_string(),
                     vec![
-                        StructField::new("domain_name", AttributeType::string()),
-                        StructField::new(
+                        StructField::optional("domain_name", AttributeType::string()).build(),
+                        StructField::optional(
                             "resource_record",
                             AttributeType::struct_(
                                 "ResourceRecord".to_string(),
                                 vec![
-                                    StructField::new("name", AttributeType::string()),
-                                    StructField::new("value", AttributeType::string()),
+                                    StructField::optional("name", AttributeType::string()).build(),
+                                    StructField::optional("value", AttributeType::string()).build(),
                                 ],
                             ),
-                        ),
+                        )
+                        .build(),
                     ],
                 )),
             )],
-        ),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
+        (make_schema("route53.RecordSet", vec![("name", AttributeType::string())]))
+            .validate()
+            .expect("schema fixture must be valid"),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
@@ -6128,8 +6295,8 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         &self.name
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -6158,7 +6325,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         unimplemented!("RecordingFactory::create_provider is not used in these tests")
     }
 
-    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+    fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
         Vec::new()
     }
 }
@@ -6245,8 +6412,8 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             "awscc"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::from([(
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
                 "region".to_string(),
                 AttributeType::enum_(
                     crate::schema::enum_identity("Region", Some("aws")),
@@ -6255,7 +6422,8 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
                     None,
                     None,
                 ),
-            )])
+            )]))
+            .expect("test provider config schema must be valid")
         }
 
         fn validate_config(
@@ -6284,7 +6452,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             unimplemented!("EnumRecordingFactory::create_provider is not used in this test")
         }
 
-        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
             Vec::new()
         }
     }

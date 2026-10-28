@@ -1,4 +1,3 @@
-pub(crate) mod attribute_path;
 pub mod backend;
 pub mod code_action;
 pub mod completion;

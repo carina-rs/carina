@@ -844,6 +844,7 @@ fn lookup_schema<'a>(
     schemas
         .get(provider, resource_type, SchemaKind::Resource)
         .or_else(|| schemas.get(provider, resource_type, SchemaKind::DataSource))
+        .map(|schema| schema.as_schema())
 }
 
 fn descend_struct_field<'a>(
@@ -886,23 +887,33 @@ fn descend_struct_field<'a>(
 ///   identity old CustomEnum-origin schemas carried before enum
 ///   unification.
 pub(super) fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
-    match attr_type.kind() {
-        AttrTypeKind::String {
-            identity: Some(id), ..
-        }
-        | AttrTypeKind::Int {
-            identity: Some(id), ..
-        }
-        | AttrTypeKind::Float {
-            identity: Some(id), ..
-        } => match &id.provider {
+    let scalar_identity = match attr_type.kind() {
+        AttrTypeKind::String { binding, .. }
+        | AttrTypeKind::Int { binding, .. }
+        | AttrTypeKind::Float { binding, .. } => binding.identity(),
+        AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. }
+        | AttrTypeKind::List { .. }
+        | AttrTypeKind::Map { .. }
+        | AttrTypeKind::Struct { .. }
+        | AttrTypeKind::Union(_)
+        | AttrTypeKind::Ref(_) => None,
+    };
+    if let Some(id) = scalar_identity {
+        return match &id.provider {
             Some(provider) => TypeExpr::SchemaType {
                 provider: provider.clone(),
                 path: id.segments.join("."),
                 type_name: id.kind.clone(),
             },
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
-        },
+        };
+    }
+
+    match attr_type.kind() {
         AttrTypeKind::String { .. } => TypeExpr::String,
         AttrTypeKind::ResourceHandle {
             provider,
@@ -1192,7 +1203,7 @@ mod tests {
 
     fn vpc_id_custom() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("VpcId")),
+            TypeIdentity::bare("VpcId"),
             None,
             None,
             legacy_validator(noop),
@@ -1202,13 +1213,18 @@ mod tests {
 
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-            .attribute(AttributeSchema::new("vpc_id", vpc_id_custom()))
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom()).build())
     }
 
     fn schemas_with_vpc() -> SchemaRegistry {
         let mut s = SchemaRegistry::new();
-        s.insert("awscc", vpc_schema());
+        s.insert(
+            "awscc",
+            vpc_schema()
+                .validate()
+                .expect("VPC inference schema must be valid"),
+        );
         s
     }
 
@@ -1356,12 +1372,15 @@ mod tests {
         use crate::schema::StructField;
         let tags_struct = AttributeType::struct_(
             "Tags",
-            vec![StructField::new("environment", AttributeType::string())],
+            vec![StructField::optional("environment", AttributeType::string()).build()],
         );
-        let schema =
-            ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new("tags", tags_struct));
+        let schema = ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("tags", tags_struct).build());
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("awscc", schema);
+        schemas.insert(
+            "awscc",
+            schema.validate().expect("schema fixture must be valid"),
+        );
 
         let path = AccessPath::with_fields("vpc", "tags", vec!["environment".to_string()]);
         let r = infer_type_from_value(
@@ -1666,10 +1685,13 @@ mod tests {
         // would type the value as the collection itself and a
         // downstream `: String` receiver would spuriously reject.
         let list_str = AttributeType::list(AttributeType::string());
-        let schema =
-            ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new("subnets", list_str));
+        let schema = ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("subnets", list_str).build());
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("awscc", schema);
+        schemas.insert(
+            "awscc",
+            schema.validate().expect("schema fixture must be valid"),
+        );
 
         let path = AccessPath::with_fields_and_subscripts(
             "vpc",
@@ -1756,9 +1778,12 @@ mod tests {
         // it doesn't. Demand annotation instead.
         let union_attr = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
         let schema = ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("polymorphic", union_attr));
+            .attribute(AttributeSchema::optional("polymorphic", union_attr).build());
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("awscc", schema);
+        schemas.insert(
+            "awscc",
+            schema.validate().expect("schema fixture must be valid"),
+        );
 
         let path = AccessPath::new("vpc", "polymorphic");
         let r = infer_type_from_value(
@@ -1815,22 +1840,25 @@ mod tests {
         use crate::schema::StructField;
         let inner_struct = AttributeType::struct_(
             "Statement",
-            vec![StructField::new(
-                "principal",
-                AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
-            )],
+            vec![
+                StructField::optional(
+                    "principal",
+                    AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
+                )
+                .build(),
+            ],
         );
         let outer_struct = AttributeType::struct_(
             "PolicyDocument",
-            vec![StructField::new(
-                "statement",
-                AttributeType::list(inner_struct),
-            )],
+            vec![StructField::optional("statement", AttributeType::list(inner_struct)).build()],
         );
         let schema = ResourceSchema::new("iam.Policy")
-            .attribute(AttributeSchema::new("policy_document", outer_struct));
+            .attribute(AttributeSchema::optional("policy_document", outer_struct).build());
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("awscc", schema);
+        schemas.insert(
+            "awscc",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "policy".to_string(),

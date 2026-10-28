@@ -30,28 +30,51 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
-            .with_unique_name_attribute("name"),
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
-    let mut vpc_id = AttributeSchema::new("vpc_id", AttributeType::string()).required();
-    if subnet_vpc_id_create_only {
-        vpc_id = vpc_id.create_only();
-    }
+    let vpc_id = if subnet_vpc_id_create_only {
+        AttributeSchema::required("vpc_id", AttributeType::string())
+            .create_only()
+            .build()
+    } else {
+        AttributeSchema::required("vpc_id", AttributeType::string()).build()
+    };
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Subnet")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(vpc_id)
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required())
-            .attribute(AttributeSchema::new("tags", AttributeType::string()))
+        (ResourceSchema::new("ec2.Subnet")
             .attribute(
-                AttributeSchema::new("availability_zone", AttributeType::string()).create_only(),
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .with_unique_name_attribute("name"),
+            .attribute(vpc_id)
+            .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("tags", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("availability_zone", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -432,9 +455,19 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     let mut schemas = base_schemas(false);
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let (managed_vpc, unresolved_vpc) = vpc_resources(false);
     let (managed_subnet, unresolved_subnet) = subnet_resources(false, false);
@@ -467,26 +500,54 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Producer")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("shape", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("producer_id", AttributeType::string()).read_only())
-            .with_unique_name_attribute("name"),
+        (ResourceSchema::new("test.Producer")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("shape", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("producer_id", AttributeType::string()).build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "",
-        ResourceSchema::new("test.Middle")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("a_id", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("b_id", AttributeType::string()).read_only())
-            .with_unique_name_attribute("name"),
+        (ResourceSchema::new("test.Middle")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("a_id", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::provider_populated("b_id", AttributeType::string()).build())
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "",
-        ResourceSchema::new("test.Consumer")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("b_id", AttributeType::string()))
-            .with_unique_name_attribute("name"),
+        (ResourceSchema::new("test.Consumer")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("b_id", AttributeType::string()).build())
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut producer = Resource::new("test.Producer", "producer")

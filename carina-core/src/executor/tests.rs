@@ -902,7 +902,12 @@ use std::sync::LazyLock;
 /// canonicalize stage. `'static` so it can back `&` in `ExecutionInput`.
 static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut registry = SchemaRegistry::new();
-    registry.insert("", crate::schema::ResourceSchema::new("test"));
+    registry.insert(
+        "",
+        (crate::schema::ResourceSchema::new("test"))
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     registry
 });
 
@@ -912,10 +917,11 @@ static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "test",
-        ResourceSchema::new("test").attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        )),
+        (ResourceSchema::new("test").attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     registry
 });
@@ -928,14 +934,20 @@ static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
     let mut reg = SchemaRegistry::new();
-    let schema = ResourceSchema::new("sg").attribute(AttributeSchema::new(
-        "subject",
-        AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::list(AttributeType::string()),
-        ]),
-    ));
-    reg.insert("test", schema);
+    let schema = ResourceSchema::new("sg").attribute(
+        AttributeSchema::optional(
+            "subject",
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::list(AttributeType::string()),
+            ]),
+        )
+        .build(),
+    );
+    reg.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     reg
 });
 
@@ -946,42 +958,59 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 
     let mut reg = SchemaRegistry::new();
     let schema = ResourceSchema::new("a")
-        .attribute(AttributeSchema::new("description", AttributeType::string()))
-        .attribute(AttributeSchema::new("size", AttributeType::float()))
-        .attribute(AttributeSchema::new(
-            "options",
-            AttributeType::struct_(
-                "Options",
-                vec![
-                    StructField::new("enabled", AttributeType::bool()),
-                    StructField::new("label", AttributeType::string()),
-                ],
-            ),
-        ))
-        .attribute(AttributeSchema::new(
-            "mode",
-            AttributeType::enum_(
-                enum_identity("Mode", Some("test")),
-                Some(vec!["AES256".to_string(), "aws:kms".to_string()]),
-                Vec::new(),
-                None,
-                None,
-            ),
-        ))
-        .attribute(AttributeSchema::new("write_only_token", AttributeType::string()).write_only())
+        .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("size", AttributeType::float()).build())
         .attribute(
-            AttributeSchema::new("create_only_write_only_token", AttributeType::string())
-                .write_only()
-                .create_only(),
+            AttributeSchema::optional(
+                "options",
+                AttributeType::struct_(
+                    "Options",
+                    vec![
+                        StructField::optional("enabled", AttributeType::bool()).build(),
+                        StructField::optional("label", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
         )
-        .attribute(AttributeSchema::new(
-            "master_password",
-            AttributeType::union(vec![
-                AttributeType::string(),
-                AttributeType::list(AttributeType::string()),
-            ]),
-        ));
-    reg.insert("test", schema);
+        .attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::enum_(
+                    enum_identity("Mode", Some("test")),
+                    Some(vec!["AES256".to_string(), "aws:kms".to_string()]),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("write_only_token", AttributeType::string())
+                .write_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("create_only_write_only_token", AttributeType::string())
+                .write_only()
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "master_password",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            )
+            .build(),
+        );
+    reg.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     reg
 });
 
@@ -992,21 +1021,29 @@ struct AliasFactory;
 fn alias_resource_schema() -> crate::schema::ResourceSchema {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
 
-    ResourceSchema::new("sg").attribute(AttributeSchema::new(
-        "ip_protocol",
-        AttributeType::enum_(
-            enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
-            Some(vec!["all".to_string(), "tcp".to_string()]),
-            Vec::new(),
-            None,
-            None,
-        ),
-    ))
+    ResourceSchema::new("sg").attribute(
+        AttributeSchema::optional(
+            "ip_protocol",
+            AttributeType::enum_(
+                enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
+                Some(vec!["all".to_string(), "tcp".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )
+        .build(),
+    )
 }
 
 static ALIAS_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut registry = SchemaRegistry::new();
-    registry.insert("test", alias_resource_schema());
+    registry.insert(
+        "test",
+        (alias_resource_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     registry
 });
 
@@ -1017,8 +1054,8 @@ impl ProviderFactory for AliasFactory {
     fn display_name(&self) -> &str {
         "Test"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -1036,8 +1073,12 @@ impl ProviderFactory for AliasFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
         unreachable!("test factory does not create providers")
     }
-    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        vec![alias_resource_schema()]
+    fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+        vec![
+            alias_resource_schema()
+                .validate()
+                .expect("alias schema must be valid"),
+        ]
     }
 }
 
@@ -2319,22 +2360,36 @@ fn provider_boundary_constraint_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test")
-            .attribute(AttributeSchema::new(
-                "target",
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+        (ResourceSchema::new("test")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("token", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![
+                            StructField::optional("issuer", AttributeType::string()).build(),
+                            StructField::optional("client_secret", AttributeType::string())
+                                .write_only()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
             ))
-            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only())
-            .attribute(AttributeSchema::new(
-                "config",
-                AttributeType::struct_(
-                    "Config",
-                    vec![
-                        StructField::new("issuer", AttributeType::string()),
-                        StructField::new("client_secret", AttributeType::string()).write_only(),
-                    ],
-                ),
-            )),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -2345,10 +2400,15 @@ fn deferred_child_constraint_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test").attribute(AttributeSchema::new(
-            "value",
-            AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
-        )),
+        (ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "value",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -2359,12 +2419,15 @@ fn deferred_data_source_constraint_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("Lookup")
-            .as_data_source()
-            .attribute(AttributeSchema::new(
+        (ResourceSchema::new("Lookup").as_data_source().attribute(
+            AttributeSchema::optional(
                 "filter",
                 AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
-            )),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -2848,18 +2911,30 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test")
-            .attribute(AttributeSchema::new(
-                "target",
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+        (ResourceSchema::new("test")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "creds",
+                    AttributeType::struct_(
+                        "Credentials",
+                        vec![
+                            StructField::optional("password", AttributeType::string())
+                                .write_only()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
             ))
-            .attribute(AttributeSchema::new(
-                "creds",
-                AttributeType::struct_(
-                    "Credentials",
-                    vec![StructField::new("password", AttributeType::string()).write_only()],
-                ),
-            )),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let input = ExecutionInput {
         plan: &plan,
@@ -4993,12 +5068,17 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test")
-            .attribute(AttributeSchema::new(
-                "marker",
-                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
-            ))
-            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+        (ResourceSchema::new("test")
+            .attribute(
+                AttributeSchema::optional(
+                    "marker",
+                    AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("runtime", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let mut bindings = ResolvedBindings::default();
     bindings.set(
@@ -5074,10 +5154,15 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test").attribute(AttributeSchema::new(
-            "marker",
-            AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
-        )),
+        (ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "marker",
+                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let resource_origins = HashMap::new();
     let input = ExecutionInput {
@@ -5181,13 +5266,18 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("Lookup")
+        (ResourceSchema::new("Lookup")
             .as_data_source()
-            .attribute(AttributeSchema::new(
-                "marker",
-                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
-            ))
-            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+            .attribute(
+                AttributeSchema::optional(
+                    "marker",
+                    AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("runtime", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let input = ExecutionInput {
         plan: &plan,
@@ -7791,21 +7881,43 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
-            .with_coexisting_replacement(),
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build(),
+            )
+            .with_coexisting_replacement())
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Subnet")
-            .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+        (ResourceSchema::new("ec2.Subnet")
             .attribute(
-                AttributeSchema::new("availability_zone", AttributeType::string()).create_only(),
+                AttributeSchema::optional("vpc_id", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
-            .with_coexisting_replacement(),
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("availability_zone", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("subnet_id", AttributeType::string()).build(),
+            )
+            .with_coexisting_replacement())
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut managed_vpc = Resource::new("ec2.Vpc", "vpc")

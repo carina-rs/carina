@@ -229,7 +229,9 @@ async fn create_checked_bootstrap_resource(
                 &resolved,
                 &state,
                 None,
-                schemas.get_for(resolved.as_resource()),
+                schemas
+                    .get_for(resolved.as_resource())
+                    .map(|schema| schema.as_schema()),
                 RowBasis::Applied(&accepted_request),
                 None,
             )
@@ -266,7 +268,9 @@ async fn create_checked_bootstrap_resource(
                     &resolved,
                     created,
                     None,
-                    schemas.get_for(resolved.as_resource()),
+                    schemas
+                        .get_for(resolved.as_resource())
+                        .map(|schema| schema.as_schema()),
                     None,
                 )
                 .map(Some)
@@ -278,7 +282,9 @@ async fn create_checked_bootstrap_resource(
                     &resolved,
                     pending,
                     None,
-                    schemas.get_for(resolved.as_resource()),
+                    schemas
+                        .get_for(resolved.as_resource())
+                        .map(|schema| schema.as_schema()),
                     None,
                 )
                 .map(Some)

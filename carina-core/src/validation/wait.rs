@@ -167,9 +167,11 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::new("state", AttributeType::string()))
-                .attribute(AttributeSchema::new("status", status)),
+            (ResourceSchema::new("acm.Certificate")
+                .attribute(AttributeSchema::optional("state", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("status", status).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         schemas
     }
@@ -229,13 +231,15 @@ let status_ready = wait cert {
         );
         let renewal_summary = AttributeType::struct_(
             "RenewalSummary",
-            vec![StructField::new("renewal_status", renewal_status)],
+            vec![StructField::optional("renewal_status", renewal_status).build()],
         );
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+            (ResourceSchema::new("acm.Certificate")
+                .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let parsed = parse(
             r#"
@@ -256,10 +260,12 @@ let renewed = wait cert {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
-                "labels",
-                AttributeType::map(AttributeType::string()),
-            )),
+            (ResourceSchema::new("job.Job").attribute(
+                AttributeSchema::optional("labels", AttributeType::map(AttributeType::string()))
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let parsed = parse(
             r#"
@@ -287,8 +293,11 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("job.Job")
-                .attribute(AttributeSchema::new("statuses", AttributeType::map(status))),
+            (ResourceSchema::new("job.Job").attribute(
+                AttributeSchema::optional("statuses", AttributeType::map(status)).build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let parsed = parse(
             r#"
@@ -309,10 +318,12 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
-                "states",
-                AttributeType::list(AttributeType::string()),
-            )),
+            (ResourceSchema::new("job.Job").attribute(
+                AttributeSchema::optional("states", AttributeType::list(AttributeType::string()))
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let parsed = parse(
             r#"
@@ -345,8 +356,10 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("lookup.Job")
-                .attribute(AttributeSchema::new("status", managed_status)),
+            (ResourceSchema::new("lookup.Job")
+                .attribute(AttributeSchema::optional("status", managed_status).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let parsed = parse(
             r#"

@@ -1622,11 +1622,10 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
     let mut existing = ResourceState::new("test.Resource", "main", "mock");
     existing.explicit = ExplicitFields::Unrecorded;
     let schema = ResourceSchema::new("test.Resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        );
 
     let row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
@@ -2308,17 +2307,21 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
         .cloned()
         .map(with_provider_status)
         .collect();
-    let schema = ResourceSchema::new("listener.Listener").attribute(AttributeSchema::new(
-        "rules",
-        AttributeType::list(AttributeType::struct_(
-            "Rule",
-            vec![
-                StructField::new("port", AttributeType::int()),
-                StructField::new("description", AttributeType::string()),
-                StructField::new("provider_status", AttributeType::string()).read_only(),
-            ],
-        )),
-    ));
+    let schema = ResourceSchema::new("listener.Listener").attribute(
+        AttributeSchema::optional(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![
+                    StructField::optional("port", AttributeType::int()).build(),
+                    StructField::optional("description", AttributeType::string()).build(),
+                    StructField::provider_populated("provider_status", AttributeType::string())
+                        .build(),
+                ],
+            )),
+        )
+        .build(),
+    );
     let applied = Resource::with_provider("mock", "listener.Listener", "listener", None)
         .with_attribute(
             "rules",
@@ -2452,19 +2455,22 @@ fn carried_legacy_list_mixed_refresh_rebuilds_alignment_and_plans_clean() {
         .cloned()
         .map(with_provider_status)
         .collect();
-    let schema = ResourceSchema::new("listener.Listener").attribute(AttributeSchema::new(
-        "rules",
-        AttributeType::list(AttributeType::struct_(
-            "Rule",
-            vec![
-                StructField::new("port", AttributeType::int()),
-                StructField::new("description", AttributeType::string()),
-                // Deliberately not read-only: WholeValue would expose this
-                // provider-populated field as a phantom removal.
-                StructField::new("provider_status", AttributeType::string()),
-            ],
-        )),
-    ));
+    let schema = ResourceSchema::new("listener.Listener").attribute(
+        AttributeSchema::optional(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![
+                    StructField::optional("port", AttributeType::int()).build(),
+                    StructField::optional("description", AttributeType::string()).build(),
+                    // Deliberately not read-only: WholeValue would expose this
+                    // provider-populated field as a phantom removal.
+                    StructField::optional("provider_status", AttributeType::string()).build(),
+                ],
+            )),
+        )
+        .build(),
+    );
     let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
         .with_attribute(
             "rules",
@@ -2627,10 +2633,9 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
             },
         )]),
     };
-    let schema = ResourceSchema::new("ec2.InternetGateway").attribute(AttributeSchema::new(
-        "tags",
-        AttributeType::map(AttributeType::string()),
-    ));
+    let schema = ResourceSchema::new("ec2.InternetGateway").attribute(
+        AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+    );
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
@@ -5576,8 +5581,12 @@ fn accepted_create_records_write_only_attributes() {
     };
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .build(),
+        );
     let request = AcceptedRequest::create_for_test();
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
@@ -5687,7 +5696,9 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("settings", desired);
     let schema = ResourceSchema::new("test.Resource").attribute(
-        AttributeSchema::new("settings", AttributeType::map(AttributeType::string())).write_only(),
+        AttributeSchema::optional("settings", AttributeType::map(AttributeType::string()))
+            .write_only()
+            .build(),
     );
     let error = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
@@ -5734,8 +5745,11 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         partial_read: None,
     };
 
-    let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+    let schema = ResourceSchema::new("ec2.Vpc").attribute(
+        AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+            .write_only()
+            .build(),
+    );
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
@@ -5785,8 +5799,11 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         partial_read: None,
     };
 
-    let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("some_attr", AttributeType::string()).write_only());
+    let schema = ResourceSchema::new("ec2.Vpc").attribute(
+        AttributeSchema::optional("some_attr", AttributeType::string())
+            .write_only()
+            .build(),
+    );
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
@@ -6051,8 +6068,11 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
         "password",
         Value::Concrete(ConcreteValue::String(marker.clone().into())),
     );
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("password", AttributeType::string())
+            .write_only()
+            .build(),
+    );
     let row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &State::existing(resource.id.clone(), HashMap::new()).with_identifier("plain-id"),
@@ -6092,16 +6112,21 @@ fn nested_write_only_state_fixture(
     ])));
     let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
         .with_attribute("config", config);
-    let schema = ResourceSchema::new("test.Resource").attribute(AttributeSchema::new(
-        "config",
-        AttributeType::struct_(
-            "Config",
-            vec![
-                StructField::new("issuer", AttributeType::string()),
-                StructField::new("client_secret", AttributeType::string()).write_only(),
-            ],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("issuer", AttributeType::string()).build(),
+                    StructField::optional("client_secret", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     (resource, schema)
 }
 
@@ -6222,16 +6247,21 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
     ))));
     let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
         .with_attribute("config", config);
-    let schema = ResourceSchema::new("test.Resource").attribute(AttributeSchema::new(
-        "config",
-        AttributeType::struct_(
-            "Config",
-            vec![
-                StructField::new("issuer", AttributeType::string()),
-                StructField::new("client_secret", AttributeType::string()).write_only(),
-            ],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("issuer", AttributeType::string()).build(),
+                    StructField::optional("client_secret", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     let provider_state = State::existing(
         resource.id.clone(),
         HashMap::from([(
@@ -6391,24 +6421,30 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             Resource::with_provider("mock", "elasticloadbalancingv2.Listener", identity, None)
                 .with_attribute("default_actions", desired_actions);
         let schema = ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(
-            AttributeSchema::new(
+            AttributeSchema::optional(
                 "default_actions",
                 AttributeType::list(AttributeType::struct_(
                     "Action",
-                    vec![StructField::new(
-                        "authenticate_oidc_config",
-                        AttributeType::struct_(
-                            "AuthenticateOidcConfig",
-                            vec![
-                                StructField::new("issuer", AttributeType::string()),
-                                StructField::new("client_secret", AttributeType::string())
-                                    .write_only(),
-                            ],
-                        ),
-                    )],
+                    vec![
+                        StructField::optional(
+                            "authenticate_oidc_config",
+                            AttributeType::struct_(
+                                "AuthenticateOidcConfig",
+                                vec![
+                                    StructField::optional("issuer", AttributeType::string())
+                                        .build(),
+                                    StructField::optional("client_secret", AttributeType::string())
+                                        .write_only()
+                                        .build(),
+                                ],
+                            ),
+                        )
+                        .build(),
+                    ],
                 )),
             )
-            .create_only(),
+            .create_only()
+            .build(),
         );
         let identifier = AppliedIdentifier::new(format!("{identity}-id")).unwrap();
         let observed_actions = action(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -6503,7 +6539,13 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             .upsert_resource(row.clone())
             .expect("observed row has a unique address");
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("mock", schema.clone());
+        schemas.insert(
+            "mock",
+            schema
+                .clone()
+                .validate()
+                .expect("test schema must be valid"),
+        );
         let saved = state_file.build_saved_attrs().lift(&schemas);
 
         assert!(
@@ -6623,8 +6665,11 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         partial_read: None,
     };
 
-    let schema = ResourceSchema::new("db.Instance")
-        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let schema = ResourceSchema::new("db.Instance").attribute(
+        AttributeSchema::optional("password", AttributeType::string())
+            .write_only()
+            .build(),
+    );
     let request = AcceptedRequest::update_for_test(&["password"], &[]);
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
@@ -6660,8 +6705,11 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
         .expect("fixture identifier is non-empty")
         .with_attribute("password", serde_json::json!("old"));
     existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
-    let schema = ResourceSchema::new("test.Resource")
-        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::optional("password", AttributeType::string())
+            .write_only()
+            .build(),
+    );
     let request = AcceptedRequest::update_for_test(&["apply_time_normalized_key"], &[]);
 
     let row = ResourceState::from_provider_state_for_resource_and_schema(
@@ -6722,8 +6770,11 @@ fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() 
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
     let existing = ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-id")
         .expect("fixture identifier is non-empty");
-    let schema = ResourceSchema::new("test.Resource")
-        .attribute(AttributeSchema::new("password", AttributeType::string()).write_only());
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::optional("password", AttributeType::string())
+            .write_only()
+            .build(),
+    );
     let fresh = ProviderState::existing(
         id,
         HashMap::from([(
@@ -6769,7 +6820,13 @@ fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
     schemas.insert(
         "mock",
         ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .validate()
+            .expect("test schema must be valid"),
     );
 
     let mut omitted = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");

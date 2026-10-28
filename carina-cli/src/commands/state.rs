@@ -1963,7 +1963,9 @@ where
                 return Err(AppError::Interrupted);
             }
         }
-        let schema = schemas.get_for(&masking_resource);
+        let schema = schemas
+            .get_for(&masking_resource)
+            .map(|schema| schema.as_schema());
         let attributes = target
             .generation
             .refreshed_attributes_for_resource_and_schema(
@@ -2070,7 +2072,7 @@ where
         *fresh_state = normalized;
     }
     if let Some(schema) = schemas.get_for(resource.as_resource()) {
-        carina_core::utils::lift_state_enum_leaves(&mut fresh_state.attributes, schema);
+        carina_core::utils::lift_state_enum_leaves(&mut fresh_state.attributes, schema.as_schema());
     }
     Ok(())
 }
@@ -2149,6 +2151,7 @@ fn diff_display_update_resource(
             carina_core::schema::SchemaKind::Resource,
         ),
     };
+    let resource_schema = schema.map(carina_core::schema::ValidatedResourceSchema::as_schema);
 
     let refreshed_resource_state = if exists {
         match resource {
@@ -2157,7 +2160,7 @@ fn diff_display_update_resource(
                     resource,
                     fresh_state,
                     Some(existing_rs),
-                    schema,
+                    resource_schema,
                     RowBasis::Carried,
                     None,
                 )
@@ -2174,7 +2177,7 @@ fn diff_display_update_resource(
                 })?;
                 Some(
                     refreshable
-                        .refreshed_from_provider_state(fresh_state, schema)
+                        .refreshed_from_provider_state(fresh_state, resource_schema)
                         .map_err(|source| {
                             AppError::from_resource_state_encoding(id.as_inner().clone(), source)
                         })?,
@@ -2747,8 +2750,8 @@ mod tests {
             "state refresh module constraint provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -2773,8 +2776,17 @@ mod tests {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            vec![ResourceSchema::new("lookup").as_data_source()]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+                vec![ResourceSchema::new("lookup").as_data_source()];
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -2862,8 +2874,8 @@ mod tests {
             "cancelling state refresh provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -2892,8 +2904,17 @@ mod tests {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            vec![ResourceSchema::new("lookup").as_data_source()]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+                vec![ResourceSchema::new("lookup").as_data_source()];
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -3567,16 +3588,21 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new(
-                "status",
-                AttributeType::enum_(
-                    carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
-                    Some(vec!["Enabled".to_string()]),
-                    vec![("Enabled".to_string(), "enabled".to_string())],
-                    None,
-                    None,
-                ),
-            )),
+            (ResourceSchema::new("service.Widget").attribute(
+                AttributeSchema::optional(
+                    "status",
+                    AttributeType::enum_(
+                        carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
+                        Some(vec!["Enabled".to_string()]),
+                        vec![("Enabled".to_string(), "enabled".to_string())],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let desired_ids = sorted_resources
@@ -4333,9 +4359,15 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
-                .attribute(AttributeSchema::new("endpoint", AttributeType::string())),
+            (ResourceSchema::new("db.Instance")
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(AttributeSchema::optional("endpoint", AttributeType::string()).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -4395,8 +4427,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("db.Instance").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -4505,9 +4542,15 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
-                .attribute(AttributeSchema::new("endpoint", AttributeType::string())),
+            (ResourceSchema::new("db.Instance")
+                .attribute(
+                    AttributeSchema::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(AttributeSchema::optional("endpoint", AttributeType::string()).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -4738,8 +4781,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("ec2.Subnet")
-                .attribute(AttributeSchema::new("token", AttributeType::string()).write_only()),
+            (ResourceSchema::new("ec2.Subnet").attribute(
+                AttributeSchema::optional("token", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         diff_display_update_resource(
@@ -4849,8 +4897,10 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("example.Lists")
-                .attribute(AttributeSchema::new("items", list_type)),
+            (ResourceSchema::new("example.Lists")
+                .attribute(AttributeSchema::optional("items", list_type).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut counts = StateRefreshCounts::default();
 
@@ -4899,10 +4949,12 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("ec2.InternetGateway").attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            )),
+            (ResourceSchema::new("ec2.InternetGateway").attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut counts = StateRefreshCounts::default();
 
@@ -4934,7 +4986,7 @@ mod tests {
                 &fresh,
                 &saved,
                 Some(&row.explicit),
-                schemas.get_for(&desired),
+                schemas.get_for(&desired).map(|schema| schema.as_schema()),
             ),
             Diff::NoChange(_)
         ));
@@ -4991,12 +5043,14 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            ResourceSchema::new("ec2.InternetGateway")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "tags",
-                    AttributeType::map(AttributeType::string()),
-                )),
+            (ResourceSchema::new("ec2.InternetGateway")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut counts = StateRefreshCounts::default();
 
@@ -5026,7 +5080,7 @@ mod tests {
             &fresh,
             &saved,
             Some(&row.explicit),
-            schemas.get_for(&desired),
+            schemas.get_for(&desired).map(|schema| schema.as_schema()),
         )
         else {
             panic!("refresh must preserve the pending tags removal");
@@ -5394,8 +5448,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("db.Instance").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let mut counts = StateRefreshCounts::default();
 
@@ -5442,8 +5501,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("db.Instance").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         diff_display_update_resource(
@@ -5489,8 +5553,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("db.Instance")
-                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+            (ResourceSchema::new("db.Instance").attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         diff_display_update_resource(
@@ -5584,16 +5653,21 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new(
-                "status",
-                AttributeType::enum_(
-                    carina_core::schema::enum_identity("Status", Some("awscc.service.Widget")),
-                    Some(vec!["Enabled".to_string()]),
-                    vec![("Enabled".to_string(), "enabled".to_string())],
-                    None,
-                    None,
-                ),
-            )),
+            (ResourceSchema::new("service.Widget").attribute(
+                AttributeSchema::optional(
+                    "status",
+                    AttributeType::enum_(
+                        carina_core::schema::enum_identity("Status", Some("awscc.service.Widget")),
+                        Some(vec!["Enabled".to_string()]),
+                        vec![("Enabled".to_string(), "enabled".to_string())],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let mut state = StateFile::new();

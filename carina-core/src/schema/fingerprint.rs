@@ -15,7 +15,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v3";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v4";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -110,6 +110,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         default_wait_timeout,
         default_wait_interval,
         defs,
+        duplicate_attributes: _duplicate_attributes,
     } = schema;
 
     encoder.string(resource_type);
@@ -175,8 +176,6 @@ fn encode_resource_validation(encoder: &mut CanonicalEncoder, validation: &Resou
                 encoder.bytes(&validator);
             }
         }
-        // A callback has no portable identity; WASM-hosted schemas use Declared.
-        ResourceValidation::InProcess(_) => encoder.tag(2),
     }
 }
 
@@ -220,62 +219,49 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
     let AttributeType { kind } = attribute_type;
     match kind {
         AttrTypeKind::String {
-            identity,
+            binding,
             pattern,
             length,
-            validate: _validate,
             to_dsl,
         } => {
             encoder.tag(0);
-            encoder.option(identity.as_ref(), encode_type_identity);
+            encoder.option(binding.identity(), encode_type_identity);
             encoder.option(pattern.as_deref(), CanonicalEncoder::string);
             encode_optional_u64_range(encoder, *length);
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, binding.callback().is_some());
             encoder.option(to_dsl.as_ref(), encode_dsl_transform);
         }
         AttrTypeKind::ResourceHandle {
             provider,
             resource_type,
-            validate: _validate,
         } => {
             encoder.tag(1);
             encoder.string(provider);
             encoder.string(resource_type);
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::StringLiteralSet {
-            values,
-            validate: _validate,
-        } => {
+        AttrTypeKind::StringLiteralSet { values } => {
             encoder.tag(2);
             let mut values = values.clone();
             values.sort();
             values.dedup();
             encoder.strings(&values);
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::Int {
-            identity,
-            range,
-            validate: _validate,
-        } => {
+        AttrTypeKind::Int { binding, range } => {
             encoder.tag(3);
-            encoder.option(identity.as_ref(), encode_type_identity);
+            encoder.option(binding.identity(), encode_type_identity);
             encode_optional_i64_range(encoder, *range);
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, binding.callback().is_some());
         }
-        AttrTypeKind::Float {
-            identity,
-            range,
-            validate: _validate,
-        } => {
+        AttrTypeKind::Float { binding, range } => {
             encoder.tag(4);
-            encoder.option(identity.as_ref(), encode_type_identity);
+            encoder.option(binding.identity(), encode_type_identity);
             encoder.option(*range, |encoder, (min, max)| {
                 encoder.option(min, |encoder, value| encoder.u64(value.to_bits()));
                 encoder.option(max, |encoder, value| encoder.u64(value.to_bits()));
             });
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, binding.callback().is_some());
         }
         AttrTypeKind::Bool => encoder.tag(5),
         AttrTypeKind::Duration => encoder.tag(6),
@@ -310,13 +296,12 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             element_type,
             ordered,
             length,
-            validate: _validate,
         } => {
             encoder.tag(8);
             encode_attribute_type(encoder, element_type);
             encoder.bool(*ordered);
             encode_optional_u64_range(encoder, *length);
-            encode_callback_presence(encoder, true);
+            encode_callback_presence(encoder, false);
         }
         AttrTypeKind::Map { key, value } => {
             encoder.tag(9);
@@ -358,7 +343,7 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
     let StructField {
         name,
         field_type,
-        input_mode,
+        declared_input_mode,
         description: _description,
         provider_name,
         block_name,
@@ -367,7 +352,7 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
     } = field;
     encoder.string(name);
     encode_attribute_type(encoder, field_type);
-    encode_input_mode(encoder, *input_mode);
+    encode_input_mode(encoder, *declared_input_mode);
     encoder.option(provider_name.as_deref(), CanonicalEncoder::string);
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*deferred_populate);
@@ -539,36 +524,36 @@ mod tests {
     }
 
     #[test]
-    fn every_attribute_callback_field_has_a_presence_marker() {
+    fn callback_presence_markers_reflect_the_new_binding_model() {
         assert_eq!(
             attribute_type_encoding(AttributeType::string()),
-            vec![0, 0, 0, 0, 1, 0],
+            vec![0, 0, 0, 0, 0, 0],
             "String encodes validate before to_dsl"
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::resource_handle("", "")),
-            [vec![1], vec![0; 16], vec![1]].concat(),
-            "ResourceHandle encodes validate"
+            [vec![1], vec![0; 16], vec![0]].concat(),
+            "ResourceHandle has no callback"
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::string_literal_set(Vec::new())),
-            [vec![2], vec![0; 8], vec![1]].concat(),
-            "StringLiteralSet encodes validate"
+            [vec![2], vec![0; 8], vec![0]].concat(),
+            "StringLiteralSet has no callback"
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::int()),
-            vec![3, 0, 0, 1],
+            vec![3, 0, 0, 0],
             "Int encodes validate"
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::float()),
-            vec![4, 0, 0, 1],
+            vec![4, 0, 0, 0],
             "Float encodes validate"
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::list(AttributeType::bool())),
-            vec![8, 5, 1, 0, 1],
-            "List encodes validate"
+            vec![8, 5, 1, 0, 0],
+            "List has no callback"
         );
     }
 

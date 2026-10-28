@@ -38,7 +38,7 @@ use crate::parser::File;
 use crate::resource::{
     AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
 };
-use crate::schema::{AttrTypeKind, AttributeSchema, AttributeType, SchemaKind, SchemaRegistry};
+use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 
 /// One diagnostic for a deferred-populate-bound chained reference
 /// that lacks a synchronizing `wait` block.
@@ -283,11 +283,11 @@ fn check_ref(
     let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
         return;
     };
-    let Some(attr_schema) = schema.attributes.get(path.attribute()) else {
+    let Some(attr_schema) = schema.effective_attribute_by_authored_name(path.attribute()) else {
         return;
     };
 
-    if path_traverses_deferred(attr_schema, path.segments(), &schema.defs) {
+    if path_traverses_deferred(attr_schema, path.segments()) {
         out.push(DeferredPopulateDiagnostic {
             message: format!(
                 "attribute `{attribute_key}` references `{}`, which is populated asynchronously by the provider after Create. \
@@ -308,15 +308,11 @@ fn check_ref(
 /// `AttributeSchema.deferred_populate=true` value is deferred-bound
 /// for *every* downstream chained access on it, even with no
 /// segments).
-fn path_traverses_deferred(
-    top_attr: &AttributeSchema,
-    segments: &[PathSegment],
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> bool {
-    if top_attr.deferred_populate {
+fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSegment]) -> bool {
+    if top_attr.is_deferred_populate() {
         return true;
     }
-    let mut current_type = &top_attr.attr_type;
+    let mut current_type = top_attr.value_type();
     for segment in segments {
         // Peel List wrappers introduced by `[idx]` segments. A
         // `Subscript::Int` traverses `List<T>` to `T`; a
@@ -324,39 +320,44 @@ fn path_traverses_deferred(
         // the resulting `current_type` is the element type — no
         // deferred flag lives on List/Map themselves (they have no
         // such field on their builders).
-        // Resolve `Ref` chains so the cyclic-CFN case
-        // (`Statement -> AndStatement -> List<Statement>`) does not
-        // bail out at the first cycle hop (carina#3340).
-        let resolved = current_type.resolve_refs_with_defs(defs).as_attr();
-        match (resolved.kind(), segment) {
-            (
-                AttrTypeKind::List {
-                    element_type: inner,
-                    ..
-                },
-                PathSegment::Subscript { .. },
-            ) => {
-                current_type = inner;
-            }
-            (AttrTypeKind::Map { value, .. }, PathSegment::Subscript { .. }) => {
-                current_type = value;
-            }
-            (AttrTypeKind::Struct { fields, .. }, PathSegment::Field { name }) => {
-                let Some(field) = fields.iter().find(|f| &f.name == name) else {
+        match segment {
+            PathSegment::Subscript { .. } => {
+                let next = current_type
+                    .list_element()
+                    .or_else(|| current_type.map_value());
+                let Some(next) = next else {
                     return false;
                 };
-                if field.deferred_populate {
+                current_type = next;
+            }
+            PathSegment::Field { name } => {
+                match current_type.shape() {
+                    Shape::Struct { .. } | Shape::Union => {}
+                    Shape::String { .. }
+                    | Shape::Int { .. }
+                    | Shape::Float { .. }
+                    | Shape::Bool
+                    | Shape::Duration
+                    | Shape::Enum { .. }
+                    | Shape::List { .. }
+                    | Shape::Map { .. } => return false,
+                }
+                // Each path hop receives a fresh bounded transparent-shape
+                // search through `field_candidates`; earlier segments cannot
+                // exhaust the budget and turn a later deferred field into a
+                // silent `None`.
+                let Some(field) = current_type
+                    .field_candidates()
+                    .into_iter()
+                    .find(|field| field.name() == name || field.block_name() == Some(name))
+                else {
+                    return false;
+                };
+                if field.is_deferred_populate() {
                     return true;
                 }
-                current_type = &field.field_type;
+                current_type = field.value_type();
             }
-            // `[idx]` against a Struct, `.field` against a List/Map,
-            // etc. — the type-narrowing pass (carina#3028) catches
-            // these as separate diagnostics. Bailing here matches the
-            // resolver's bail-on-mismatch behaviour and avoids
-            // surfacing a confusing double-diagnostic for the same
-            // typo.
-            _ => return false,
         }
         // After traversing a List<Struct> via [idx], the next field
         // hop looks up against the inner Struct directly because
@@ -378,26 +379,69 @@ mod tests {
     };
 
     fn cert_schema_with_dvo_inner_field_deferred() -> ResourceSchema {
-        ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
-            "domain_validation_options",
-            AttributeType::list(AttributeType::struct_(
-                "DomainValidationOption".to_string(),
-                vec![
-                    StructField::new("domain_name", AttributeType::string()),
-                    StructField::new("resource_record_value", AttributeType::string())
-                        .deferred_populate(),
-                ],
-            )),
-        ))
+        ResourceSchema::new("acm.Certificate").attribute(
+            AttributeSchema::provider_populated(
+                "domain_validation_options",
+                AttributeType::list(AttributeType::struct_(
+                    "DomainValidationOption".to_string(),
+                    vec![
+                        StructField::provider_populated("domain_name", AttributeType::string())
+                            .build(),
+                        StructField::provider_populated(
+                            "resource_record_value",
+                            AttributeType::string(),
+                        )
+                        .deferred_populate()
+                        .build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+    }
+
+    #[test]
+    fn deep_deferred_path_does_not_exhaust_a_shared_shape_budget() {
+        let mut attr_type = AttributeType::struct_(
+            "Leaf",
+            vec![
+                StructField::optional("deferred", AttributeType::string())
+                    .deferred_populate()
+                    .build(),
+            ],
+        );
+        let mut segments = vec![PathSegment::Field {
+            name: "deferred".to_string(),
+        }];
+        for index in (0..80).rev() {
+            let name = format!("field_{index}");
+            attr_type = AttributeType::struct_(
+                format!("Level{index}"),
+                vec![StructField::required(name.clone(), attr_type).build()],
+            );
+            segments.insert(0, PathSegment::Field { name });
+        }
+        let schema = ResourceSchema::new("test.Deep")
+            .attribute(AttributeSchema::provider_populated("output", attr_type).build())
+            .validate()
+            .expect("deep schema must be valid");
+        let output = schema
+            .effective_attribute("output")
+            .expect("output attribute must exist");
+
+        assert!(path_traverses_deferred(output, &segments));
     }
 
     fn rrset_schema() -> ResourceSchema {
         ResourceSchema::new("route53.RecordSet")
-            .attribute(AttributeSchema::new(
-                "resource_records",
-                AttributeType::list(AttributeType::string()),
-            ))
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(
+                AttributeSchema::optional(
+                    "resource_records",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
     }
 
     fn dvo_chained_ref(field: &str) -> Value {
@@ -443,8 +487,18 @@ mod tests {
 
     fn registry_for_acm() -> SchemaRegistry {
         let mut r = SchemaRegistry::new();
-        r.insert("aws", cert_schema_with_dvo_inner_field_deferred());
-        r.insert("aws", rrset_schema());
+        r.insert(
+            "aws",
+            (cert_schema_with_dvo_inner_field_deferred())
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
+        r.insert(
+            "aws",
+            (rrset_schema())
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
         r
     }
 
@@ -547,20 +601,29 @@ mod tests {
         // Mirror RDS DBInstance.endpoint shape: the whole attribute
         // is undefined immediately post-Create.
         let schema = ResourceSchema::new("rds.DBInstance").attribute(
-            AttributeSchema::new(
+            AttributeSchema::provider_populated(
                 "endpoint",
                 AttributeType::struct_(
                     "Endpoint".to_string(),
-                    vec![StructField::new("address", AttributeType::string())],
+                    vec![
+                        StructField::provider_populated("address", AttributeType::string()).build(),
+                    ],
                 ),
             )
-            .deferred_populate(),
+            .deferred_populate()
+            .build(),
         );
         let consumer = ResourceSchema::new("ec2.Instance")
-            .attribute(AttributeSchema::new("user_data", AttributeType::string()));
+            .attribute(AttributeSchema::optional("user_data", AttributeType::string()).build());
         let mut r = SchemaRegistry::new();
-        r.insert("aws", schema);
-        r.insert("aws", consumer);
+        r.insert(
+            "aws",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        r.insert(
+            "aws",
+            consumer.validate().expect("schema fixture must be valid"),
+        );
 
         let mut db = Resource::new("rds.DBInstance", "db");
         db.id = ResourceId::with_identity("rds.DBInstance", "db");

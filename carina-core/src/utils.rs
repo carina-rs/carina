@@ -604,7 +604,7 @@ pub(crate) fn lift_saved_state_enum_leaves(
             &id.resource_type,
             crate::schema::SchemaKind::Resource,
         ) {
-            lift_state_enum_leaves(attrs, schema);
+            lift_state_enum_leaves(attrs, schema.as_schema());
             crate::value::canonicalize_state_attribute_map_with_schema(attrs, schema);
         }
     }
@@ -642,7 +642,7 @@ pub fn lift_current_state_enum_leaves(
             && let Some(state) = current_states.get_mut(&resource.id)
             && let Some(attributes) = state.attributes_mut()
         {
-            lift_state_enum_leaves(attributes, schema);
+            lift_state_enum_leaves(attributes, schema.as_schema());
         }
     }
 }
@@ -663,7 +663,7 @@ pub fn lift_current_state_enum_leaves_for_data_sources(
         if let Some(schema) = registry.get_for_data_source(data_source)
             && let Some(state) = current_states.get_mut(&data_source.id)
         {
-            lift_state_enum_leaves(&mut state.attributes, schema);
+            lift_state_enum_leaves(&mut state.attributes, schema.as_schema());
         }
     }
 }
@@ -1806,13 +1806,15 @@ mod tests {
         );
         let policy_struct = AttributeType::struct_(
             "PolicyDocument".to_string(),
-            vec![StructField::new("version", version_enum)],
+            vec![StructField::optional("version", version_enum).build()],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            ResourceSchema::new("iam.RolePolicy")
-                .attribute(AttributeSchema::new("policy_document", policy_struct)),
+            (ResourceSchema::new("iam.RolePolicy")
+                .attribute(AttributeSchema::optional("policy_document", policy_struct).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
@@ -1881,15 +1883,16 @@ mod tests {
         );
         let policy_struct = AttributeType::struct_(
             "PolicyDocument".to_string(),
-            vec![StructField::new("version", version_enum)],
+            vec![StructField::optional("version", version_enum).build()],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            ResourceSchema::new("iam.Role").attribute(AttributeSchema::new(
-                "assume_role_policy_document",
-                policy_struct,
-            )),
+            (ResourceSchema::new("iam.Role").attribute(
+                AttributeSchema::optional("assume_role_policy_document", policy_struct).build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let role = Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);

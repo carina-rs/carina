@@ -22,7 +22,7 @@ use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
-    TypeIdentity,
+    TypeIdentity, ValidatedResourceSchema,
 };
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
@@ -45,12 +45,15 @@ const FIXTURE_SUBPATH: &str = "tests/fixtures/plan_display";
 /// identity plus the schema-sensitive fields used by fixture diffing. Richer
 /// provider-specific formatting/validation fixtures add local schemas below,
 /// which take precedence over matching entries in this catalog.
-fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
-    let create_only_string =
-        |name| AttributeSchema::new(name, AttributeType::string()).create_only();
+fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
+    let create_only_string = |name| {
+        AttributeSchema::optional(name, AttributeType::string())
+            .create_only()
+            .build()
+    };
     let aws = |schema| ("aws".to_string(), schema);
     let awscc = |schema| ("awscc".to_string(), schema);
-    vec![
+    let schemas = vec![
         aws(ResourceSchema::new("acm.Certificate").attribute(create_only_string("domain_name"))),
         aws(ResourceSchema::new("acm.CertificateValidation")
             .attribute(create_only_string("certificate_arn"))
@@ -76,55 +79,73 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
         awscc(
             ResourceSchema::new("ec2.Vpc")
                 .attribute(create_only_string("cidr_block"))
-                .attribute(AttributeSchema::new(
-                    "instance_tenancy",
-                    fixture_instance_tenancy_type(),
-                ))
-                .attribute(AttributeSchema::new(
-                    "enable_dns_support",
-                    AttributeType::bool(),
-                ))
-                .attribute(AttributeSchema::new(
-                    "tags",
-                    AttributeType::map(AttributeType::string()),
-                )),
+                .attribute(
+                    AttributeSchema::optional("instance_tenancy", fixture_instance_tenancy_type())
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                ),
         ),
         awscc(
             ResourceSchema::new("elasticloadbalancingv2.Listener")
-                .attribute(AttributeSchema::new(
-                    "default_actions",
-                    AttributeType::list(AttributeType::struct_(
-                        "Action",
-                        vec![StructField::new(
-                            "authenticate_oidc_config",
-                            AttributeType::struct_(
-                                "AuthenticateOidcConfig",
-                                vec![
-                                    StructField::new("issuer", AttributeType::string()),
-                                    StructField::new("client_secret", AttributeType::string())
-                                        .write_only(),
-                                ],
-                            ),
-                        )],
-                    )),
-                ))
-                .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()))
-                .attribute(AttributeSchema::new("port", AttributeType::int()).create_only()),
+                .attribute(
+                    AttributeSchema::optional(
+                        "default_actions",
+                        AttributeType::list(AttributeType::struct_(
+                            "Action",
+                            vec![
+                                StructField::optional(
+                                    "authenticate_oidc_config",
+                                    AttributeType::struct_(
+                                        "AuthenticateOidcConfig",
+                                        vec![
+                                            StructField::optional(
+                                                "issuer",
+                                                AttributeType::string(),
+                                            )
+                                            .build(),
+                                            StructField::optional(
+                                                "client_secret",
+                                                AttributeType::string(),
+                                            )
+                                            .write_only()
+                                            .build(),
+                                        ],
+                                    ),
+                                )
+                                .build(),
+                            ],
+                        )),
+                    )
+                    .build(),
+                )
+                .attribute(AttributeSchema::optional("ssl_policy", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("port", AttributeType::int())
+                        .create_only()
+                        .build(),
+                ),
         ),
         awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
         awscc(
             ResourceSchema::new("issue3885.Role")
                 .attribute(create_only_string("role_name"))
-                .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+                .attribute(
+                    AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
+                ),
         ),
         awscc(
             ResourceSchema::new("iam.RolePolicy")
                 .attribute(create_only_string("policy_name"))
                 .attribute(create_only_string("role_name"))
-                .attribute(AttributeSchema::new(
-                    "policy_document",
-                    AttributeType::string(),
-                )),
+                .attribute(
+                    AttributeSchema::optional("policy_document", AttributeType::string()).build(),
+                ),
         ),
         awscc(ResourceSchema::new("logs.LogGroup").attribute(create_only_string("log_group_name"))),
         awscc(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
@@ -138,7 +159,16 @@ fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
                 .attribute(create_only_string("target_type")),
         ),
         awscc(ResourceSchema::new("test.Widget").attribute(create_only_string("external_name"))),
-    ]
+    ];
+    schemas
+        .into_iter()
+        .map(|(provider, schema)| {
+            (
+                provider,
+                schema.validate().expect("fixture schema must be valid"),
+            )
+        })
+        .collect()
 }
 
 /// Complete output of fixture-based plan construction.
@@ -790,33 +820,44 @@ fn fixture_provider_config_factories() -> Vec<Box<dyn ProviderFactory>> {
     ]
 }
 
-fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, ResourceSchema)> {
-    match fixture_path.file_name().and_then(|name| name.to_str()) {
+fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, ValidatedResourceSchema)> {
+    let schemas = match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![(
             "fixture".to_string(),
             ResourceSchema::new("network.Subnet").attribute(
-                AttributeSchema::new("availability_zone", fixture_zone_name_type()).required(),
+                AttributeSchema::required("availability_zone", fixture_zone_name_type()).build(),
             ),
         )],
         Some("enum_display" | "no_changes_enum") => vec![(
             "awscc".to_string(),
             ResourceSchema::new("ec2.Vpc")
                 .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string())
-                        .required()
-                        .create_only(),
+                    AttributeSchema::required("cidr_block", AttributeType::string())
+                        .create_only()
+                        .build(),
                 )
                 .attribute(
-                    AttributeSchema::new("instance_tenancy", fixture_instance_tenancy_type())
-                        .required(),
+                    AttributeSchema::required("instance_tenancy", fixture_instance_tenancy_type())
+                        .build(),
                 ),
         )],
         _ => Vec::new(),
-    }
+    };
+    schemas
+        .into_iter()
+        .map(|(provider, schema)| {
+            (
+                provider,
+                schema
+                    .validate()
+                    .expect("fixture validation schema must be valid"),
+            )
+        })
+        .collect()
 }
 
-fn fixture_region_attribute_types(provider: &str) -> HashMap<String, AttributeType> {
-    HashMap::from([(
+fn fixture_region_attribute_types(provider: &str) -> carina_core::schema::ValidatedConfigSchema {
+    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
         "region".to_string(),
         AttributeType::enum_(
             TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
@@ -825,7 +866,8 @@ fn fixture_region_attribute_types(provider: &str) -> HashMap<String, AttributeTy
             None,
             Some(DslTransform::HyphenToUnderscore),
         ),
-    )])
+    )]))
+    .expect("fixture provider config schema must be valid")
 }
 
 fn fixture_instance_tenancy_type() -> AttributeType {
@@ -869,7 +911,7 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         "Fixture provider config schema"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
         fixture_region_attribute_types(self.provider)
     }
 
@@ -892,8 +934,16 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        Vec::new()
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -908,8 +958,8 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         "Resolved value constraint fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -931,15 +981,25 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        let constrained =
-            AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
-        vec![
-            ResourceSchema::new("test.Source")
-                .attribute(AttributeSchema::new("value", AttributeType::string()).required()),
-            ResourceSchema::new("test.Consumer")
-                .attribute(AttributeSchema::new("target", constrained).required()),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            let constrained =
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+            vec![
+                ResourceSchema::new("test.Source")
+                    .attribute(AttributeSchema::required("value", AttributeType::string()).build()),
+                ResourceSchema::new("test.Consumer")
+                    .attribute(AttributeSchema::required("target", constrained).build()),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -954,7 +1014,7 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
         fixture_region_attribute_types(self.name())
     }
 
@@ -977,30 +1037,42 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        let statement = AttributeType::list(AttributeType::struct_(
-            "Statement",
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            let statement = AttributeType::list(AttributeType::struct_(
+                "Statement",
+                vec![
+                    StructField::optional("sid", AttributeType::string()).build(),
+                    StructField::optional("effect", AttributeType::string()).build(),
+                    StructField::optional("action", AttributeType::list(AttributeType::string()))
+                        .build(),
+                    StructField::optional("resource", AttributeType::list(AttributeType::string()))
+                        .build(),
+                ],
+            ));
             vec![
-                StructField::new("sid", AttributeType::string()),
-                StructField::new("effect", AttributeType::string()),
-                StructField::new("action", AttributeType::list(AttributeType::string())),
-                StructField::new("resource", AttributeType::list(AttributeType::string())),
-            ],
-        ));
-        vec![
-            ResourceSchema::new("iam.RolePolicy")
-                .attribute(
-                    AttributeSchema::new("policy_name", AttributeType::string())
-                        .required()
-                        .create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("role_name", AttributeType::string())
-                        .required()
-                        .create_only(),
-                )
-                .attribute(AttributeSchema::new("statement", statement).required()),
-        ]
+                ResourceSchema::new("iam.RolePolicy")
+                    .attribute(
+                        AttributeSchema::required("policy_name", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::required("role_name", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(AttributeSchema::required("statement", statement).build()),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1015,8 +1087,8 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         "Test fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1038,22 +1110,36 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![replace_create_only_widget_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![replace_create_only_widget_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn replace_create_only_widget_schema() -> ResourceSchema {
     ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::new("external_name", AttributeType::string()).create_only())
         .attribute(
-            AttributeSchema::new("legacy_token", AttributeType::string())
+            AttributeSchema::optional("external_name", AttributeType::string())
                 .create_only()
-                .removable(),
+                .build(),
         )
-        .attribute(AttributeSchema::new("description", AttributeType::string()))
-        .attribute(AttributeSchema::new("metric_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("scope", AttributeType::string()))
+        .attribute(
+            AttributeSchema::optional("legacy_token", AttributeType::string())
+                .create_only()
+                .removable()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("metric_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("scope", AttributeType::string()).build())
 }
 
 struct PlanImageFixtureFactory;
@@ -1067,8 +1153,8 @@ impl ProviderFactory for PlanImageFixtureFactory {
         "Plan image fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1090,12 +1176,25 @@ impl ProviderFactory for PlanImageFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            replace_create_only_widget_schema()
-                .attribute(AttributeSchema::new("output_id", AttributeType::string()).read_only())
-                .with_unique_name_attribute("external_name"),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                replace_create_only_widget_schema()
+                    .attribute(
+                        AttributeSchema::provider_populated("output_id", AttributeType::string())
+                            .build(),
+                    )
+                    .with_unique_name_attribute("external_name"),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1110,7 +1209,7 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
         fixture_region_attribute_types(self.name())
     }
 
@@ -1133,10 +1232,24 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::new("external_name", AttributeType::string()).create_only(),
-        )]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("test.Widget").attribute(
+                    AttributeSchema::optional("external_name", AttributeType::string())
+                        .create_only()
+                        .build(),
+                ),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1151,7 +1264,7 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
         fixture_region_attribute_types(self.name())
     }
 
@@ -1174,19 +1287,32 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("ec2.Vpc")
-                .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string())
-                        .required()
-                        .create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("instance_tenancy", fixture_instance_tenancy_type())
-                        .required(),
-                ),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("ec2.Vpc")
+                    .attribute(
+                        AttributeSchema::required("cidr_block", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::required(
+                            "instance_tenancy",
+                            fixture_instance_tenancy_type(),
+                        )
+                        .build(),
+                    ),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1201,8 +1327,8 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         "Fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1224,10 +1350,20 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![ResourceSchema::new("network.Subnet").attribute(
-            AttributeSchema::new("availability_zone", fixture_zone_name_type()).required(),
-        )]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![ResourceSchema::new("network.Subnet").attribute(
+                AttributeSchema::required("availability_zone", fixture_zone_name_type()).build(),
+            )]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1242,8 +1378,8 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         "Fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1265,21 +1401,31 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        let zone_name = AttributeType::refined_string(
-            Some(TypeIdentity::new(
-                Some("fixture"),
-                vec!["route53".to_string(), "HostedZone".to_string()],
-                "Name",
-            )),
-            None,
-            Some((None, Some(1024))),
-            Some(DslTransform::StripSuffix(".".to_string())),
-        );
-        vec![
-            ResourceSchema::new("route53.HostedZone")
-                .attribute(AttributeSchema::new("name", zone_name).required()),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            let zone_name = AttributeType::refined_string(
+                Some(TypeIdentity::new(
+                    Some("fixture"),
+                    vec!["route53".to_string(), "HostedZone".to_string()],
+                    "Name",
+                )),
+                None,
+                Some((None, Some(1024))),
+                Some(DslTransform::StripSuffix(".".to_string())),
+            );
+            vec![
+                ResourceSchema::new("route53.HostedZone")
+                    .attribute(AttributeSchema::required("name", zone_name).build()),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
