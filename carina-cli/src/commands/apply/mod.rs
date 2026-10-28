@@ -47,9 +47,9 @@ use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
     CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityData, ProviderUpstreamScope,
-    ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
-    collect_historical_display_attributes, load_and_resolve_provider_configs,
-    prepare_plan_identity_and_provider_inputs_with_wiring,
+    ReloadedCompositionRehydrationError, ReloadedPlanFile, ResolvedProviderInputs,
+    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs_with_wiring,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -2926,26 +2926,11 @@ fn rehydrate_desired_plan_file(
             drop(canonicalize_error);
             carina_core::config_loader::get_base_dir(apply_target.source_dir()).to_path_buf()
         });
-    for composition in plan_file.compositions_mut() {
-        let has_placeholder = composition
-            .signature
-            .arguments
-            .values()
-            .any(|argument| carina_core::value::contains_redacted_secret(argument.value()))
-            || composition.signature.attributes.values().any(|attribute| {
-                carina_core::value::contains_redacted_secret(&attribute.to_value())
-            });
-        let candidate = parsed
-            .compositions
-            .iter()
-            .find(|candidate| {
-                candidate
-                    .call_path()
-                    .saved_origin_id(&canonical_source_root)
-                    == composition.origin_id
-            })
-            .ok_or_else(|| {
-                let call = composition.origin_id.immediate();
+    plan_file
+        .rehydrate_composition_secrets(&parsed.compositions, &canonical_source_root)
+        .map_err(|error| match error {
+            ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
+                let call = origin_id.immediate();
                 saved_plan_secret_shape_error(
                     format!(
                         "composition call id {}:{}:{} disagreed with the saved plan",
@@ -2955,14 +2940,11 @@ fn rehydrate_desired_plan_file(
                     ),
                     apply_target,
                 )
-            })?;
-        if !has_placeholder {
-            continue;
-        }
-        *composition =
-            carina_core::value::rehydrate_saved_composition_secrets(composition, candidate)
-                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    }
+            }
+            ReloadedCompositionRehydrationError::Secret(error) => {
+                saved_plan_secret_rehydration_error(error, apply_target)
+            }
+        })?;
 
     rehydrate_saved_resource_like(
         plan_file.data_sources_mut(),
@@ -2979,11 +2961,9 @@ fn rehydrate_desired_plan_file(
 
     let fresh_provider_configs =
         carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-    let provider_configs = plan_file
-        .provider_configs()
-        .rehydrate_secrets(&fresh_provider_configs)
+    plan_file
+        .rehydrate_provider_config_secrets(&fresh_provider_configs)
         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    *plan_file.provider_configs_mut() = provider_configs;
     for (binding, attributes) in plan_file.upstream_snapshot_mut() {
         if let Some((key, _)) = attributes
             .iter()
@@ -3071,11 +3051,11 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. The current
-    // format requires normalized composition call origins. Plan-file version
-    // 26 persists the exact provider artifacts used to compute the plan. Plan-file version 25
-    // persists every data-source outcome so apply never re-derives it from a
-    // partial graph.
+    // Validate version compatibility before decoding the payload. Format 27
+    // requires normalized composition call origins. Plan-file version 26
+    // persists the exact provider artifacts used to compute the plan. Plan-file
+    // version 25 persists every data-source outcome so apply never re-derives
+    // it from a partial graph.
     // Plan-file version 24 removes the
     // redundant wait target schema kind now that waits are managed-only.
     // Version 23 persists the provider-schema fingerprints checked before
