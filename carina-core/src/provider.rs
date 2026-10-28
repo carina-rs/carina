@@ -112,7 +112,29 @@ pub struct ErrorDetail {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HostErrorCause {
     /// Repeated wall-clock timeouts suspended validation for one input.
-    ValidationSuspended,
+    ValidationSuspended(SuspendedValidationId),
+}
+
+/// Opaque identity of a validation input suspended by host timeout policy.
+///
+/// The identity is built only from a keyed, one-way fingerprint. Its bytes are
+/// intentionally private, have no accessor or serialization path, and are
+/// redacted from `Debug`; callers can only compare or hash it for deduplication.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SuspendedValidationId([u8; 32]);
+
+impl SuspendedValidationId {
+    /// Wrap a keyed validation-input fingerprint without exposing it again.
+    #[must_use]
+    pub const fn from_keyed_fingerprint(keyed_fingerprint: [u8; 32]) -> Self {
+        Self(keyed_fingerprint)
+    }
+}
+
+impl std::fmt::Debug for SuspendedValidationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SuspendedValidationId(<redacted>)")
+    }
 }
 
 /// Stable classification of a [`ProviderError`] for callers that need policy
@@ -6322,11 +6344,12 @@ mod tests {
 
     #[test]
     fn host_error_cause_is_not_transported_over_the_provider_protocol() {
+        let suspended_input = SuspendedValidationId::from_keyed_fingerprint([7_u8; 32]);
         let error = ProviderError::timeout("suspended")
-            .with_host_cause(HostErrorCause::ValidationSuspended);
+            .with_host_cause(HostErrorCause::ValidationSuspended(suspended_input));
         assert_eq!(
             error.detail().host_cause(),
-            Some(HostErrorCause::ValidationSuspended)
+            Some(HostErrorCause::ValidationSuspended(suspended_input))
         );
 
         let decoded = ProviderError::from_wire(error.to_wire());
@@ -6334,6 +6357,21 @@ mod tests {
         assert_eq!(decoded.kind(), ProviderErrorKind::Timeout);
         assert_eq!(decoded.to_string(), "suspended");
         assert_eq!(decoded.detail().host_cause(), None);
+    }
+
+    #[test]
+    fn suspended_validation_id_is_comparable_hashable_and_debug_redacted() {
+        let first = SuspendedValidationId::from_keyed_fingerprint([1_u8; 32]);
+        let same = SuspendedValidationId::from_keyed_fingerprint([1_u8; 32]);
+        let second = SuspendedValidationId::from_keyed_fingerprint([2_u8; 32]);
+
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        let ids = std::collections::HashSet::from([first, same, second]);
+        assert_eq!(ids.len(), 2);
+
+        let debug = format!("{first:?}");
+        assert_eq!(debug, "SuspendedValidationId(<redacted>)");
     }
 
     #[test]

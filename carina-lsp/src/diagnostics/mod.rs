@@ -15,32 +15,40 @@ use crate::position;
 use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
 };
-use carina_core::provider::{HostErrorCause, ProviderError, ProviderFactory};
+use carina_core::provider::{
+    HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
+};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
 
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
-    suspended_providers: Mutex<HashSet<String>>,
+    suspended_inputs: Mutex<HashSet<(String, SuspendedValidationId)>>,
 }
 
 impl ProviderValidationDeduplicator {
     fn should_emit(&self, provider: &str, error: &ProviderError) -> bool {
-        error.detail().host_cause() != Some(HostErrorCause::ValidationSuspended)
-            || self
-                .suspended_providers
-                .lock()
-                .expect("provider validation diagnostic lock must not be poisoned")
-                .insert(provider.to_string())
+        let Some(HostErrorCause::ValidationSuspended(input_id)) = error.detail().host_cause()
+        else {
+            return true;
+        };
+        self.suspended_inputs
+            .lock()
+            .expect("provider validation diagnostic lock must not be poisoned")
+            .insert((provider.to_string(), input_id))
     }
 
     fn should_emit_type_error(&self, error: &TypeError) -> bool {
-        error.host_cause() != Some(HostErrorCause::ValidationSuspended)
-            || self
-                .suspended_providers
-                .lock()
-                .expect("provider validation diagnostic lock must not be poisoned")
-                .insert(error.provider_name().unwrap_or("<unknown>").to_string())
+        let Some(HostErrorCause::ValidationSuspended(input_id)) = error.host_cause() else {
+            return true;
+        };
+        self.suspended_inputs
+            .lock()
+            .expect("provider validation diagnostic lock must not be poisoned")
+            .insert((
+                error.provider_name().unwrap_or("<unknown>").to_string(),
+                input_id,
+            ))
     }
 }
 
@@ -840,6 +848,7 @@ impl DiagnosticEngine {
                 if let Some(schema) = schema {
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut provider_errors_reported_at_attribute_level = HashSet::new();
 
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_attr_value) {
@@ -1139,9 +1148,23 @@ impl DiagnosticEngine {
                                             .err()
                                             .or_else(|| lookup(identity, value).err())
                                             .and_then(|inner_err| {
-                                                provider_validation_deduplicator
+                                                if !provider_validation_deduplicator
                                                     .should_emit_type_error(&inner_err)
-                                                    .then(|| inner_err.to_string())
+                                                {
+                                                    return None;
+                                                }
+                                                let message = inner_err.to_string();
+                                                if matches!(
+                                                    inner_err,
+                                                    TypeError::ProviderValidationFailed { .. }
+                                                ) {
+                                                    provider_errors_reported_at_attribute_level
+                                                        .insert((
+                                                            canonical_name.to_string(),
+                                                            message.clone(),
+                                                        ));
+                                                }
+                                                Some(message)
                                             })
                                     }
                                 }
@@ -1292,16 +1315,45 @@ impl DiagnosticEngine {
                             if !provider_validation_deduplicator.should_emit_type_error(&error) {
                                 continue;
                             }
-                            if let carina_core::schema::TypeError::ResourceValidationFailed {
+                            if let TypeError::ProviderValidationFailed {
                                 attribute: Some(attribute),
                                 ..
                             } = &error
-                                && matches!(
+                                && provider_errors_reported_at_attribute_level
+                                    .contains(&(attribute.clone(), error.to_string()))
+                            {
+                                continue;
+                            }
+                            let deferred_attribute = match &error {
+                                TypeError::ProviderValidationFailed { attribute, .. }
+                                | TypeError::ResourceValidationFailed { attribute, .. } => {
+                                    attribute.as_deref()
+                                }
+                                TypeError::TypeMismatch { .. }
+                                | TypeError::InvalidEnumVariant { .. }
+                                | TypeError::PatternMismatch { .. }
+                                | TypeError::LengthOutOfRange { .. }
+                                | TypeError::StringLiteralExpectedEnum { .. }
+                                | TypeError::ValidationFailed { .. }
+                                | TypeError::MissingRequired { .. }
+                                | TypeError::ReadOnlyAttribute { .. }
+                                | TypeError::UnknownAttribute { .. }
+                                | TypeError::UnknownStructField { .. }
+                                | TypeError::UnionStructMismatch { .. }
+                                | TypeError::UnionAlternativesMismatch { .. }
+                                | TypeError::ListItemError { .. }
+                                | TypeError::MapKeyError { .. }
+                                | TypeError::MapValueError { .. }
+                                | TypeError::StructFieldError { .. }
+                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
+                            };
+                            if deferred_attribute.is_some_and(|attribute| {
+                                matches!(
                                     resource_attributes.get(attribute),
                                     Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
                                         | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
                                 )
-                            {
+                            }) {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
@@ -1329,14 +1381,31 @@ impl DiagnosticEngine {
                             }
                             // Try attribute-level position first, fall back to resource position
                             let position = match &error {
-                                carina_core::schema::TypeError::ResourceValidationFailed {
-                                    attribute: Some(attr),
-                                    ..
+                                TypeError::ProviderValidationFailed { attribute, .. }
+                                | TypeError::ResourceValidationFailed { attribute, .. } => {
+                                    attribute.as_deref().and_then(|attr| {
+                                        self.find_attribute_position(doc, attr, scope)
+                                    })
                                 }
-                                | carina_core::schema::TypeError::ReadOnlyAttribute {
-                                    name: attr,
-                                } => self.find_attribute_position(doc, attr, scope),
-                                _ => None,
+                                TypeError::ReadOnlyAttribute { name } => {
+                                    self.find_attribute_position(doc, name, scope)
+                                }
+                                TypeError::TypeMismatch { .. }
+                                | TypeError::InvalidEnumVariant { .. }
+                                | TypeError::PatternMismatch { .. }
+                                | TypeError::LengthOutOfRange { .. }
+                                | TypeError::StringLiteralExpectedEnum { .. }
+                                | TypeError::ValidationFailed { .. }
+                                | TypeError::MissingRequired { .. }
+                                | TypeError::UnknownAttribute { .. }
+                                | TypeError::UnknownStructField { .. }
+                                | TypeError::UnionStructMismatch { .. }
+                                | TypeError::UnionAlternativesMismatch { .. }
+                                | TypeError::ListItemError { .. }
+                                | TypeError::MapKeyError { .. }
+                                | TypeError::MapValueError { .. }
+                                | TypeError::StructFieldError { .. }
+                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
                             };
                             let position = position.or_else(|| {
                                 self.find_resource_type_position(

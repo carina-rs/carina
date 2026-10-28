@@ -1310,6 +1310,62 @@ security_group_ingress {
 }
 
 #[test]
+fn provider_custom_type_failures_emit_once_at_the_attribute() {
+    let engine = test_engine_with_suspended_validation_provider();
+
+    for (value, expected_message) in [
+        ("invalid-input", "rejected custom-type value"),
+        ("first-time-timeout", "first custom-type timeout"),
+    ] {
+        let doc = create_document(&format!(
+            r#"mock.test.resource {{
+  probe = "{value}"
+}}
+"#,
+        ));
+
+        let diagnostics = engine.analyze(&doc, None);
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+        let diagnostic = &diagnostics[0];
+        assert!(
+            diagnostic.message.contains(expected_message),
+            "diagnostic: {diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.range.start.line, 1,
+            "diagnostic: {:#?}",
+            diagnostic
+        );
+        assert_eq!(
+            diagnostic.range.start.character, 2,
+            "diagnostic: {:#?}",
+            diagnostic
+        );
+    }
+}
+
+#[test]
+fn provider_custom_type_failure_from_static_secret_points_to_the_attribute() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let doc = create_document(
+        r#"mock.test.resource {
+  probe = secret("invalid-input")
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let masked = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("(secret) failed validation"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(masked.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(masked[0].range.start.line, 1);
+    assert_eq!(masked[0].range.start.character, 2);
+}
+
+#[test]
 fn suspended_provider_validation_is_reported_once_per_provider_per_pass() {
     let engine = test_engine_with_suspended_validation_provider();
     let doc = create_document(
@@ -1340,6 +1396,66 @@ let third = mock.test.resource {
         suspended[0].message.contains("validate_custom_type"),
         "diagnostic must retain the original validation operation: {:#?}",
         suspended[0]
+    );
+}
+
+#[test]
+fn distinct_suspended_inputs_are_each_reported_once_per_pass() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let doc = create_document(
+        r#"let first = mock.test.resource {
+  probe = "suspended-a"
+}
+let second = mock.test.resource {
+  probe = "suspended-b"
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let suspended = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(
+                "provider validation is suspended after repeated wall-clock timeouts for this input",
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(suspended.len(), 2, "diagnostics: {diagnostics:#?}");
+}
+
+#[test]
+fn suspended_provider_config_and_custom_type_inputs_are_both_reported() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let doc = create_document(
+        r#"provider mock {
+  region = "suspended-config"
+}
+let example = mock.test.resource {
+  probe = "suspended-custom-type"
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let suspended = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(
+                "provider validation is suspended after repeated wall-clock timeouts for this input",
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(suspended.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        suspended[0].range.start.line, 1,
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert_eq!(
+        suspended[1].range.start.line, 4,
+        "diagnostics: {diagnostics:#?}"
     );
 }
 
@@ -1405,14 +1521,17 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
 
     let first = lookup(&identity, &value).expect_err("validation must remain an error");
     let second = lookup(&identity, &value).expect_err("validation must remain an error");
-    assert_eq!(
-        first.host_cause(),
-        Some(carina_core::provider::HostErrorCause::ValidationSuspended)
-    );
-    assert_eq!(
-        second.host_cause(),
-        Some(carina_core::provider::HostErrorCause::ValidationSuspended)
-    );
+    let Some(carina_core::provider::HostErrorCause::ValidationSuspended(first_id)) =
+        first.host_cause()
+    else {
+        panic!("first error must retain its suspended-input id: {first:?}");
+    };
+    let Some(carina_core::provider::HostErrorCause::ValidationSuspended(second_id)) =
+        second.host_cause()
+    else {
+        panic!("second error must retain its suspended-input id: {second:?}");
+    };
+    assert_eq!(first_id, second_id);
 
     let deduplicator = ProviderValidationDeduplicator::default();
     assert!(deduplicator.should_emit_type_error(&first));

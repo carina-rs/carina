@@ -487,6 +487,13 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
+    fn validate_custom_type(&self, _identity: &TypeIdentity, value: &str) -> Result<(), String> {
+        if value == "__mock_validate_custom_type_hang__" {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        Ok(())
+    }
+
     fn initialize(&mut self, attrs: &HashMap<String, Value>) -> Result<(), String> {
         if attrs.contains_key("__mock_initialize_error__") {
             return Err("intentional mock initialization failure".to_string());

@@ -1058,7 +1058,9 @@ mod provider_config_tests {
             match self.plugin_error {
                 Some(ConfigFailure::Invalid(message)) => Err(ProviderError::invalid_input(message)),
                 Some(ConfigFailure::Timeout(message)) => Err(ProviderError::timeout(message)
-                    .with_host_cause(crate::provider::HostErrorCause::ValidationSuspended)),
+                    .with_host_cause(crate::provider::HostErrorCause::ValidationSuspended(
+                        crate::provider::SuspendedValidationId::from_keyed_fingerprint([0_u8; 32]),
+                    ))),
                 None => Ok(()),
             }
         }
@@ -1208,10 +1210,10 @@ mod provider_config_tests {
             provider_error.kind(),
             crate::provider::ProviderErrorKind::Timeout
         );
-        assert_eq!(
+        assert!(matches!(
             provider_error.detail().host_cause(),
-            Some(crate::provider::HostErrorCause::ValidationSuspended)
-        );
+            Some(crate::provider::HostErrorCause::ValidationSuspended(_))
+        ));
         assert!(!error.to_string().contains(plaintext));
     }
 

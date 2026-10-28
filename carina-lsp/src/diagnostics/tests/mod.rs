@@ -97,8 +97,23 @@ struct SuspendedValidationFactory;
 
 impl SuspendedValidationFactory {
     const ERROR: &'static str = "provider validation is suspended after repeated wall-clock \
-        timeouts for this input in validate_custom_type; editing the configuration (or using a \
-        new provider version) resumes validation";
+        timeouts for this input in validate_custom_type; changing this value (or restarting with \
+        a new provider version) resumes validation";
+
+    fn suspended_input_id(discriminator: u8) -> carina_core::provider::SuspendedValidationId {
+        carina_core::provider::SuspendedValidationId::from_keyed_fingerprint([discriminator; 32])
+    }
+
+    fn custom_type_suspended_input_id(value: &str) -> carina_core::provider::SuspendedValidationId {
+        let discriminator = match value {
+            "same" | "suspended" => 2,
+            "suspended-a" => 3,
+            "suspended-b" => 4,
+            "suspended-custom-type" => 5,
+            _ => 6,
+        };
+        Self::suspended_input_id(discriminator)
+    }
 }
 
 impl ProviderFactory for SuspendedValidationFactory {
@@ -113,14 +128,27 @@ impl ProviderFactory for SuspendedValidationFactory {
     fn provider_config_attribute_types(
         &self,
     ) -> std::collections::HashMap<String, carina_core::schema::AttributeType> {
-        std::collections::HashMap::new()
+        std::collections::HashMap::from([(
+            "region".to_string(),
+            carina_core::schema::AttributeType::string(),
+        )])
     }
 
     fn validate_config(
         &self,
-        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
-        Ok(())
+        if attributes.contains_key("region") {
+            Err(
+                carina_core::provider::ProviderError::timeout(Self::ERROR).with_host_cause(
+                    carina_core::provider::HostErrorCause::ValidationSuspended(
+                        Self::suspended_input_id(1),
+                    ),
+                ),
+            )
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_custom_type(
@@ -128,6 +156,16 @@ impl ProviderFactory for SuspendedValidationFactory {
         _identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
+        if value.as_str() == "invalid-input" {
+            return Err(carina_core::provider::ProviderError::invalid_input(
+                "rejected custom-type value",
+            ));
+        }
+        if value.as_str() == "first-time-timeout" {
+            return Err(carina_core::provider::ProviderError::timeout(
+                "first custom-type timeout",
+            ));
+        }
         let message = match value.as_str() {
             "ordinary-a" => "ordinary timeout for input a",
             "ordinary-b" => "ordinary timeout for input b",
@@ -140,7 +178,11 @@ impl ProviderFactory for SuspendedValidationFactory {
         ) {
             Err(error)
         } else {
-            Err(error.with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended))
+            Err(
+                error.with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended(
+                    Self::custom_type_suspended_input_id(value.as_str()),
+                )),
+            )
         }
     }
 

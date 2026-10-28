@@ -1636,7 +1636,9 @@ async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() 
     );
     assert!(rendered.contains("validate_config"), "{rendered}");
     assert!(
-        rendered.contains("editing the configuration") && rendered.contains("new provider version"),
+        rendered.contains(
+            "changing this value (or restarting with a new provider version) resumes validation"
+        ),
         "{rendered}"
     );
     assert!(
@@ -1743,6 +1745,65 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
         &Value::Concrete(ConcreteValue::String("clean".into())),
     )
     .expect("validate_custom_type should rebuild the timed-out init instance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_value() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    ));
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
+    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
+    let identity = TypeIdentity::new(Some("mock"), Vec::<String>::new(), "TimingProbe");
+    let hanging = Value::Concrete(ConcreteValue::String(
+        "__mock_validate_custom_type_hang__".into(),
+    ));
+
+    for attempt in 1..=2 {
+        let started = Instant::now();
+        let error = validate(&identity, &hanging)
+            .expect_err("the mock custom-type hook must exceed the wall-clock budget");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            error.kind(),
+            ProviderErrorKind::Timeout,
+            "attempt {attempt}: {error}"
+        );
+        assert!(
+            error.to_string().contains("validate_custom_type"),
+            "attempt {attempt}: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
+            "attempt {attempt} should consume about the 2s wall budget; elapsed {elapsed:?}"
+        );
+    }
+
+    let suspended_started = Instant::now();
+    let suspended = validate(&identity, &hanging)
+        .expect_err("the repeatedly timed-out custom-type value must be suspended");
+    let suspended_elapsed = suspended_started.elapsed();
+    assert!(matches!(
+        suspended.detail().host_cause(),
+        Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+            _
+        ))
+    ));
+    assert!(
+        suspended_elapsed < Duration::from_secs(1),
+        "the suspended value must fail fast; elapsed {suspended_elapsed:?}"
+    );
+
+    validate(
+        &identity,
+        &Value::Concrete(ConcreteValue::String("healthy-value".into())),
+    )
+    .expect("a different custom-type value must still validate");
 }
 
 #[tokio::test(flavor = "multi_thread")]

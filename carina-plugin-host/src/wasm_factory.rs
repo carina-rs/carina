@@ -2514,7 +2514,8 @@ impl fmt::Debug for ValidationContextFingerprint {
 
 impl ValidationContextFingerprint {
     fn validate_config(key: &[u8; 32], attributes: &[(String, wit_types::Value)]) -> Self {
-        let mut hasher = validation_fingerprint_hasher(key);
+        let operation = ValidationOperation::ValidateConfig;
+        let mut hasher = validation_fingerprint_hasher(key, operation);
         let mut attributes = attributes.iter().collect::<Vec<_>>();
         attributes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         for (name, value) in attributes {
@@ -2522,7 +2523,7 @@ impl ValidationContextFingerprint {
             hash_wit_validation_value(&mut hasher, value);
         }
         Self {
-            operation: ValidationOperation::ValidateConfig,
+            operation,
             keyed_input_sha256: hasher.finalize().into_bytes().into(),
         }
     }
@@ -2532,7 +2533,8 @@ impl ValidationContextFingerprint {
         identity: &wit_types::TypeIdentity,
         value: &str,
     ) -> Self {
-        let mut hasher = validation_fingerprint_hasher(key);
+        let operation = ValidationOperation::ValidateCustomType;
+        let mut hasher = validation_fingerprint_hasher(key, operation);
         hash_validation_bytes(&mut hasher, identity.provider.as_bytes());
         let segment_count = u64::try_from(identity.segments.len())
             .expect("validation type segment count must fit in u64");
@@ -2543,7 +2545,7 @@ impl ValidationContextFingerprint {
         hash_validation_bytes(&mut hasher, identity.kind.as_bytes());
         hash_validation_bytes(&mut hasher, value.as_bytes());
         Self {
-            operation: ValidationOperation::ValidateCustomType,
+            operation,
             keyed_input_sha256: hasher.finalize().into_bytes().into(),
         }
     }
@@ -2551,13 +2553,24 @@ impl ValidationContextFingerprint {
     const fn operation(&self) -> &'static str {
         self.operation.as_str()
     }
+
+    const fn suspended_validation_id(&self) -> carina_core::provider::SuspendedValidationId {
+        carina_core::provider::SuspendedValidationId::from_keyed_fingerprint(
+            self.keyed_input_sha256,
+        )
+    }
 }
 
 type ValidationFingerprintHasher = Hmac<Sha256>;
 
-fn validation_fingerprint_hasher(key: &[u8; 32]) -> ValidationFingerprintHasher {
-    ValidationFingerprintHasher::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts every 32-byte validation fingerprint key")
+fn validation_fingerprint_hasher(
+    key: &[u8; 32],
+    operation: ValidationOperation,
+) -> ValidationFingerprintHasher {
+    let mut hasher = ValidationFingerprintHasher::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts every 32-byte validation fingerprint key");
+    hash_validation_bytes(&mut hasher, operation.as_str().as_bytes());
+    hasher
 }
 
 fn random_validation_fingerprint_key() -> [u8; 32] {
@@ -2901,10 +2914,12 @@ fn suspended_validation_error(
     };
     ProviderError::timeout(format!(
         "provider validation is suspended after repeated wall-clock timeouts for this input in \
-         {original_operation}; editing the configuration (or using a new provider version) \
+         {original_operation}; changing this value (or restarting with a new provider version) \
          resumes validation"
     ))
-    .with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended)
+    .with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended(
+        context.suspended_validation_id(),
+    ))
 }
 
 /// Exclusive, one-call access to a rebuildable validation instance.
@@ -8935,6 +8950,18 @@ mod tests {
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
         assert_ne!(first, different_factory);
+        assert_eq!(
+            first.suspended_validation_id(),
+            reordered.suspended_validation_id()
+        );
+        assert_ne!(
+            first.suspended_validation_id(),
+            changed.suspended_validation_id()
+        );
+        assert_ne!(
+            first.suspended_validation_id(),
+            different_factory.suspended_validation_id()
+        );
         let debug = format!("{first:?}");
         assert!(!debug.contains("do-not-retain-me"));
         assert!(debug.contains("<redacted>"), "fingerprint debug: {debug}");
@@ -8988,7 +9015,9 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(
             suspended.detail().host_cause(),
-            Some(carina_core::provider::HostErrorCause::ValidationSuspended)
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+                context_x.suspended_validation_id()
+            ))
         );
 
         instance
