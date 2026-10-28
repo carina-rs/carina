@@ -22,6 +22,7 @@ use crate::provider_trust::{ProviderLoadIdentity, ProviderTrust};
 use crate::revision_resolver::cache_path_revision;
 use crate::signing::VerifiedSignerIdentity;
 use crate::user_trust::{UserTrustRecord, user_trust_record_exists};
+use crate::version_resolver::VerifiedReleaseAsset;
 
 /// Provider artifact bytes captured by the resolver.
 ///
@@ -149,7 +150,16 @@ pub(crate) struct GithubReleaseDownloadLocation {
 }
 
 impl GithubReleaseDownloadLocation {
-    pub(crate) fn new(repo: RepoSlug, tag: ReleaseTag, asset_id: AssetId) -> Self {
+    pub(crate) fn from_verified_asset(asset: &VerifiedReleaseAsset) -> Self {
+        Self {
+            repo: asset.repo().clone(),
+            tag: asset.tag().clone(),
+            asset_id: asset.asset_id(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(repo: RepoSlug, tag: ReleaseTag, asset_id: AssetId) -> Self {
         Self {
             repo,
             tag,
@@ -634,7 +644,7 @@ pub(crate) fn record_test_github_origin_download(
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let repo = github_repo_from_key(source)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    let location = GithubReleaseDownloadLocation::new(
+    let location = GithubReleaseDownloadLocation::for_test(
         repo,
         ReleaseTag::from_lock("test".into()),
         AssetId::from_lock(1),
@@ -1384,7 +1394,7 @@ mod tests {
         };
         let source = github.source_key();
         let repo = RepoSlug::try_from(&github).unwrap();
-        let location = GithubReleaseDownloadLocation::new(
+        let location = GithubReleaseDownloadLocation::for_test(
             repo.clone(),
             ReleaseTag::from_lock("v1.2.3".into()),
             AssetId::from_lock(42),
@@ -1420,7 +1430,7 @@ mod tests {
             ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
             source => panic!("expected GitHub source: {source}"),
         };
-        let wrong_repo = GithubReleaseDownloadLocation::new(
+        let wrong_repo = GithubReleaseDownloadLocation::for_test(
             RepoSlug::try_from(&other).unwrap(),
             ReleaseTag::from_lock("v1.2.3".into()),
             AssetId::from_lock(42),
@@ -1474,7 +1484,7 @@ mod tests {
             registry: None,
         });
         let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
-        let location = FetchedLocation::for_test(GithubReleaseDownloadLocation::new(
+        let location = FetchedLocation::for_test(GithubReleaseDownloadLocation::for_test(
             github_repo_from_key(&source).unwrap(),
             tag,
             asset_id,

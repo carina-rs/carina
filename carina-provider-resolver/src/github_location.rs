@@ -98,6 +98,13 @@ impl RepoSlug {
         self.url_with_segments(&["releases", "latest"])
     }
 
+    pub(crate) fn release_by_tag_url(
+        &self,
+        tag: &ReleaseTag,
+    ) -> Result<url::Url, GithubLocationError> {
+        self.url_with_segments(&["releases", "tags", tag.as_str()])
+    }
+
     pub(crate) fn release_asset_url(
         &self,
         asset_id: AssetId,
@@ -425,6 +432,27 @@ mod tests {
             );
         }
         assert!(ReleaseTag::new("v1.2.3+build_1".into()).is_ok());
+    }
+
+    #[test]
+    fn release_by_tag_url_keeps_the_tag_in_one_path_segment() {
+        let repo = RepoSlug::new("acme".into(), "widget".into()).unwrap();
+        let tag = ReleaseTag::new("v1.2.3+build_1".into()).unwrap();
+
+        let url = repo.release_by_tag_url(&tag).unwrap();
+
+        assert_eq!(
+            url.path_segments().unwrap().collect::<Vec<_>>(),
+            [
+                "repos",
+                "acme",
+                "widget",
+                "releases",
+                "tags",
+                "v1.2.3+build_1"
+            ]
+        );
+        assert_eq!(url.host_str(), Some("api.github.com"));
     }
 
     #[test]

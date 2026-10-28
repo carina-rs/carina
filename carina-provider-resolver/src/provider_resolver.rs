@@ -46,9 +46,9 @@ use crate::verified_artifact::{
     lookup_github_release_artifact_pin, publish_download, record_verified_registry_origin_download,
 };
 use crate::version_resolver::{
-    GithubRelease, ReleaseAssetSelectionError, fetch_latest_release_with_api,
-    fetch_releases_with_api, resolve_from_releases, resolve_release_at_version,
-    select_release_asset,
+    GithubRelease, ReleaseAssetVerificationError, VerifiedReleaseAsset,
+    fetch_latest_release_with_api, fetch_releases_with_api, resolve_from_releases,
+    resolve_release_at_version, verify_fresh_release_asset,
 };
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -4582,7 +4582,7 @@ impl InstalledProvider {
         error: ProviderLoadIdentityError,
     ) -> ProviderArtifactLoadError<E> {
         ProviderArtifactLoadError {
-            error: ProviderArtifactLoadFailure::Identity(error),
+            error: ProviderArtifactLoadFailure::Identity(Box::new(error)),
             provider_name: self.provider_name.clone(),
             artifact_path: self.path().as_path().to_path_buf(),
             provenance: Box::new(self.provenance()),
@@ -4787,14 +4787,14 @@ pub struct ProviderArtifactLoadError<E> {
 
 #[derive(Debug)]
 enum ProviderArtifactLoadFailure<E> {
-    Identity(ProviderLoadIdentityError),
+    Identity(Box<ProviderLoadIdentityError>),
     Loader(E),
 }
 
 impl<E> ProviderArtifactLoadError<E> {
     pub fn identity_error(&self) -> Option<&ProviderLoadIdentityError> {
         match &self.error {
-            ProviderArtifactLoadFailure::Identity(error) => Some(error),
+            ProviderArtifactLoadFailure::Identity(error) => Some(error.as_ref()),
             ProviderArtifactLoadFailure::Loader(_) => None,
         }
     }
@@ -4814,7 +4814,7 @@ impl<E> ProviderArtifactLoadError<E> {
             provenance,
         } = self;
         match error {
-            ProviderArtifactLoadFailure::Identity(error) => Ok(error),
+            ProviderArtifactLoadFailure::Identity(error) => Ok(*error),
             ProviderArtifactLoadFailure::Loader(error) => Err(Self {
                 error: ProviderArtifactLoadFailure::Loader(error),
                 provider_name,
@@ -4828,7 +4828,7 @@ impl<E> ProviderArtifactLoadError<E> {
 impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let error: &dyn fmt::Display = match &self.error {
-            ProviderArtifactLoadFailure::Identity(error) => error,
+            ProviderArtifactLoadFailure::Identity(error) => error.as_ref(),
             ProviderArtifactLoadFailure::Loader(error) => error,
         };
         write!(
@@ -6482,9 +6482,9 @@ fn record_verified_github_release_pin(
         name: name.to_string(),
         source: artifact.source().to_string(),
         kind: LockEntryKind::GithubRelease {
-            version: resolved.version.clone(),
-            tag: resolved.tag.clone(),
-            asset_id: resolved.asset_id,
+            version: resolved.version().clone(),
+            tag: resolved.tag().clone(),
+            asset_id: resolved.asset_id(),
             constraint: pin.constraint,
         },
         sha256: artifact.sha256().to_string(),
@@ -6999,30 +6999,85 @@ fn annotate_github_release_lock_entry(
     }
 }
 
-/// A GitHub release whose single WASM asset has been selected, or whose
-/// selected asset ID was restored from a typed lock entry.
+/// A GitHub release selected from fresh API metadata, or release coordinates
+/// restored from a typed lock entry that still require origin verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedGithubRelease {
-    version: Version,
-    tag: ReleaseTag,
-    asset_id: AssetId,
+enum ResolvedGithubRelease {
+    Verified(VerifiedReleaseAsset),
+    Locked {
+        version: Version,
+        tag: ReleaseTag,
+        asset_id: AssetId,
+    },
 }
 
 impl ResolvedGithubRelease {
-    fn from_selected_release(release: GithubRelease) -> Result<Self, ReleaseAssetSelectionError> {
-        let asset = select_release_asset(&release)?;
-        Ok(Self {
-            version: release.version().clone(),
-            tag: release.tag().clone(),
-            asset_id: asset.id(),
-        })
+    fn from_selected_release(
+        repo: RepoSlug,
+        release: GithubRelease,
+    ) -> Result<Self, ReleaseAssetVerificationError> {
+        verify_fresh_release_asset(repo, release).map(Self::Verified)
     }
 
     fn from_lock_entry(version: Version, tag: ReleaseTag, asset_id: AssetId) -> Self {
-        Self {
+        Self::Locked {
             version,
             tag,
             asset_id,
+        }
+    }
+
+    fn version(&self) -> &Version {
+        match self {
+            Self::Verified(asset) => asset.version(),
+            Self::Locked {
+                version,
+                tag: _,
+                asset_id: _,
+            } => version,
+        }
+    }
+
+    fn tag(&self) -> &ReleaseTag {
+        match self {
+            Self::Verified(asset) => asset.tag(),
+            Self::Locked {
+                version: _,
+                tag,
+                asset_id: _,
+            } => tag,
+        }
+    }
+
+    fn asset_id(&self) -> AssetId {
+        match self {
+            Self::Verified(asset) => asset.asset_id(),
+            Self::Locked {
+                version: _,
+                tag: _,
+                asset_id,
+            } => *asset_id,
+        }
+    }
+
+    fn verified_asset_for_download<G: GithubHttp + ?Sized>(
+        &self,
+        repo: &RepoSlug,
+        github: &GithubApi<'_, G>,
+    ) -> Result<VerifiedReleaseAsset, String> {
+        match self {
+            Self::Verified(asset) => Ok(asset.clone()),
+            Self::Locked {
+                version,
+                tag,
+                asset_id,
+            } => github
+                .verify_locked_release_asset(repo, version, tag, *asset_id)
+                .map_err(|error| {
+                    format!(
+                        "Failed to verify GitHub release asset id {asset_id} for tag '{tag}': {error}"
+                    )
+                }),
         }
     }
 }
@@ -7038,14 +7093,13 @@ fn resolve_github_provider_with_clients<G>(
 where
     G: GithubHttp + ?Sized,
 {
-    let asset_id = resolved.asset_id;
+    let asset_id = resolved.asset_id();
     let repo = RepoSlug::try_from(source).map_err(|error| error.to_string())?;
     let install_lock = lock_file.install_lock();
     let project_dir = install_lock.project_dir();
     let source_key = source.source_key();
-    let version = &resolved.version;
-    let artifact_pin =
-        lookup_github_release_artifact_pin(lock_file, &source_key, &resolved.version, name);
+    let version = resolved.version();
+    let artifact_pin = lookup_github_release_artifact_pin(lock_file, &source_key, version, name);
 
     // Machine-local caches are accelerators, not trust anchors. Without both a
     // matching lock pin and a user-owned trust record, project and global cache
@@ -7099,6 +7153,7 @@ where
         return Ok(verified.path().clone());
     }
 
+    let verified_asset = resolved.verified_asset_for_download(&repo, github)?;
     let mut staged = StagedArtifact::for_project(install_lock, &wasm_path).map_err(|error| {
         format!(
             "Failed to stage provider artifact {}: {error}",
@@ -7110,15 +7165,15 @@ where
         name,
         repo.owner(),
         repo.repo(),
-        resolved.tag,
+        resolved.tag(),
         asset_id
     );
     let (bytes, download_location) = github
-        .download_release_asset(&repo, &resolved.tag, asset_id)
+        .download_release_asset(verified_asset)
         .map_err(|error| {
             format!(
                 "Failed to download GitHub release asset id {asset_id} for tag '{}': {error}",
-                resolved.tag
+                resolved.tag()
             )
         })?
         .into_parts();
@@ -7137,7 +7192,7 @@ where
                 source: source_key.to_string(),
                 kind: LockEntryKind::GithubRelease {
                     version: version.clone(),
-                    tag: resolved.tag.clone(),
+                    tag: resolved.tag().clone(),
                     asset_id,
                     constraint: constraint.map(|constraint| constraint.raw.clone()),
                 },
@@ -7768,6 +7823,7 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
     github: &GithubApi<'_, G>,
 ) -> Result<ResolvedGithubRelease, String> {
     let source_key = source.source_key();
+    let repo = RepoSlug::try_from(source).map_err(|error| error.to_string())?;
     if mode != LockMode::Upgrade
         && let Some(release) = try_reuse_locked_github_release(&source_key, constraint, lock_file)?
     {
@@ -7809,15 +7865,15 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
                     provider_name, legacy_version, available
                 )
             })?;
-        let resolved = ResolvedGithubRelease::from_selected_release(release)
+        let resolved = ResolvedGithubRelease::from_selected_release(repo.clone(), release)
             .map_err(|error| error.to_string())?;
         lock_file.upsert(LockEntry {
             name: provider_name.to_string(),
             source: source_key.to_string(),
             kind: LockEntryKind::GithubRelease {
-                version: resolved.version.clone(),
-                tag: resolved.tag.clone(),
-                asset_id: resolved.asset_id,
+                version: resolved.version().clone(),
+                tag: resolved.tag().clone(),
+                asset_id: resolved.asset_id(),
                 constraint: constraint.map(|constraint| constraint.raw.clone()),
             },
             sha256: legacy_sha256,
@@ -7842,11 +7898,13 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
                         provider_name, constraint.raw, available
                     )
                 })?;
-            ResolvedGithubRelease::from_selected_release(release).map_err(|error| error.to_string())
+            ResolvedGithubRelease::from_selected_release(repo, release)
+                .map_err(|error| error.to_string())
         }
-        None => ResolvedGithubRelease::from_selected_release(fetch_latest_release_with_api(
-            source, github,
-        )?)
+        None => ResolvedGithubRelease::from_selected_release(
+            repo,
+            fetch_latest_release_with_api(source, github)?,
+        )
         .map_err(|error| error.to_string()),
     }
 }
@@ -8828,12 +8886,19 @@ sha256 = "def"
         }
     }
 
-    fn resolved_github_release(version: &str) -> ResolvedGithubRelease {
-        ResolvedGithubRelease::from_lock_entry(
-            Version::parse(version).unwrap(),
-            ReleaseTag::from_lock(format!("v{version}")),
-            release_asset_id(42),
-        )
+    fn resolved_github_release(source: &GithubSource, version: &str) -> ResolvedGithubRelease {
+        let release = GithubRelease::from_api(crate::github::GithubReleaseResponse {
+            tag_name: format!("v{version}"),
+            draft: false,
+            prerelease: !Version::parse(version).unwrap().pre.is_empty(),
+            assets: vec![crate::github::GithubAssetResponse {
+                id: 42,
+                name: "provider.wasm".into(),
+            }],
+        })
+        .unwrap();
+        ResolvedGithubRelease::from_selected_release(RepoSlug::try_from(source).unwrap(), release)
+            .unwrap()
     }
 
     fn release_asset_id(id: u64) -> AssetId {
@@ -8849,6 +8914,79 @@ sha256 = "def"
             .to_string()
     }
 
+    fn github_release_by_tag_url(source: &str, tag: &str) -> String {
+        let repo = RepoSlug::try_from(&github_source(source)).unwrap();
+        repo.release_by_tag_url(&ReleaseTag::from_lock(tag.into()))
+            .unwrap()
+            .to_string()
+    }
+
+    fn assert_locked_github_release_rejected_without_writes(
+        release: serde_json::Value,
+        expected_error: &str,
+    ) {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let tag = "v0.1.0";
+        let locked_bytes = b"locked provider bytes";
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: Version::parse(version).unwrap(),
+                tag: ReleaseTag::from_lock(tag.into()),
+                asset_id: release_asset_id(42),
+                constraint: Some("^0.1".into()),
+            },
+            sha256: sha256_bytes(locked_bytes),
+            registry: None,
+        });
+        let lock_path = provider_lock_path(project.path());
+        lock.save(&lock_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+        let global_before = snapshot_tree(global.path());
+        let trust_before = snapshot_tree(trust.path());
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
+        let release_url = github_release_by_tag_url(source, tag);
+        let asset_url = github_asset_url(source, 42);
+        let github_http = FixtureGithubHttp::default()
+            .json(&release_url, serde_json::to_vec(&release).unwrap())
+            .bytes(&asset_url, locked_bytes);
+        let github = GithubApi::new(&github_http, None);
+
+        let error = resolve_all_with_github(
+            project.path(),
+            &[versioned_config(source, "^0.1")],
+            LockMode::Normal,
+            &FixtureRegistryHttp::default(),
+            &github,
+        )
+        .expect_err("an unverified locked release asset must be rejected");
+
+        assert!(error.contains(expected_error), "{error}");
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        assert!(!project_wasm.exists(), "project cache must stay untouched");
+        assert!(
+            !project_wasm.parent().unwrap().exists(),
+            "project cache directory must not be created"
+        );
+        assert!(
+            !global_wasm.as_path().exists(),
+            "global cache must stay untouched"
+        );
+        assert_eq!(snapshot_tree(global.path()), global_before);
+        assert_eq!(snapshot_tree(trust.path()), trust_before);
+        assert_eq!(github_http.requested_urls(), [release_url]);
+    }
+
     fn resolve_github_provider_with_client<G: GithubHttp + ?Sized>(
         base_dir: &Path,
         source: &str,
@@ -8859,9 +8997,10 @@ sha256 = "def"
     ) -> Result<WasmArtifactPath, String> {
         let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
+            let source = github_source(source);
             super::resolve_github_provider_with_clients(
-                &github_source(source),
-                &resolved_github_release(version),
+                &source,
+                &resolved_github_release(&source, version),
                 None,
                 name,
                 lock_file,
@@ -8911,7 +9050,7 @@ sha256 = "def"
                 let github = GithubApi::new(&github_http, None);
                 super::resolve_github_provider_with_clients(
                     source,
-                    &resolved_github_release(version),
+                    &resolved_github_release(source, version),
                     None,
                     name,
                     lock_file,
@@ -18865,8 +19004,14 @@ transparency_log_present = false
             registry: None,
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
+        let release_url = github_release_by_tag_url(source, "0.1.0");
         let asset_url = github_asset_url(source, 42);
-        let github_http = FixtureGithubHttp::default().bytes(&asset_url, bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"0.1.0","assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(&asset_url, bytes);
         let github = GithubApi::new(&github_http, None);
 
         let resolved = resolve_all_with_github(
@@ -18885,13 +19030,124 @@ transparency_log_present = false
                 .iter()
                 .map(|request| request.url())
                 .collect::<Vec<_>>(),
-            [asset_url]
+            [release_url, asset_url]
         );
         assert_eq!(
-            github_http.requests()[0].accept(),
+            github_http.requests()[1].accept(),
             "application/octet-stream"
         );
-        assert_eq!(github_http.requests()[0].authorization(), None);
+        assert_eq!(github_http.requests()[1].authorization(), None);
+    }
+
+    #[test]
+    fn github_release_lock_rejects_asset_from_another_release_without_writes() {
+        assert_locked_github_release_rejected_without_writes(
+            serde_json::json!({
+                "tag_name": "v0.1.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{"name": "provider.wasm", "id": 7}],
+            }),
+            "does not contain locked asset id 42",
+        );
+    }
+
+    #[test]
+    fn github_release_lock_rejects_prerelease_for_stable_version_without_writes() {
+        assert_locked_github_release_rejected_without_writes(
+            serde_json::json!({
+                "tag_name": "v0.1.0",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{"name": "provider.wasm", "id": 42}],
+            }),
+            "is marked as a prerelease but locked version 0.1.0 is not a prerelease",
+        );
+    }
+
+    #[test]
+    fn github_release_lock_rejects_non_wasm_asset_without_writes() {
+        assert_locked_github_release_rejected_without_writes(
+            serde_json::json!({
+                "tag_name": "v0.1.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"name": "provider.wasm", "id": 7},
+                    {"name": "checksums.txt", "id": 42}
+                ],
+            }),
+            "locked asset id 42 is not the release's selected .wasm asset id 7",
+        );
+    }
+
+    #[test]
+    fn github_release_lock_rejects_draft_release_without_writes() {
+        assert_locked_github_release_rejected_without_writes(
+            serde_json::json!({
+                "tag_name": "v0.1.0",
+                "draft": true,
+                "prerelease": false,
+                "assets": [{"name": "provider.wasm", "id": 42}],
+            }),
+            "GitHub release 'v0.1.0' is a draft",
+        );
+    }
+
+    #[test]
+    fn github_release_lock_accepts_verified_asset_and_writes_trust_record() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let tag = "v0.1.0";
+        let bytes = b"verified locked provider";
+        let sha256 = sha256_bytes(bytes);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: Version::parse(version).unwrap(),
+                tag: ReleaseTag::from_lock(tag.into()),
+                asset_id: release_asset_id(42),
+                constraint: Some("^0.1".into()),
+            },
+            sha256: sha256.clone(),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let release_url = github_release_by_tag_url(source, tag);
+        let asset_url = github_asset_url(source, 42);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"v0.1.0","draft":false,"prerelease":false,"assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(&asset_url, bytes);
+        let github = GithubApi::new(&github_http, None);
+
+        let resolved = resolve_all_with_github(
+            project.path(),
+            &[versioned_config(source, "^0.1")],
+            LockMode::Normal,
+            &FixtureRegistryHttp::default(),
+            &github,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(resolved["awscc"].as_path()).unwrap(), bytes);
+        assert!(
+            load_user_verified_identity(&sha256, &source_key(source))
+                .unwrap()
+                .is_some(),
+            "the verified origin download must write a user trust record"
+        );
+        assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
     }
 
     #[test]
@@ -18943,8 +19199,14 @@ transparency_log_present = false
             registry: None,
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
+        let release_url = github_release_by_tag_url(source, "v0.1.0");
         let asset_url = "https://api.github.com/repos/acme/widget/releases/assets/42";
-        let github_http = FixtureGithubHttp::default().bytes(asset_url, bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"v0.1.0","assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(asset_url, bytes);
         let tokens = CountingGithubTokenProvider {
             calls: AtomicUsize::new(0),
         };
@@ -18965,10 +19227,14 @@ transparency_log_present = false
                 .iter()
                 .map(|request| request.url())
                 .collect::<Vec<_>>(),
-            [asset_url]
+            [release_url, asset_url.to_string()]
         );
         assert_eq!(
             github_http.requests()[0].authorization(),
+            Some("Bearer lazy-production-token")
+        );
+        assert_eq!(
+            github_http.requests()[1].authorization(),
             Some("Bearer lazy-production-token")
         );
         assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);
@@ -19573,8 +19839,14 @@ future_protection_field = "retain-me"
         );
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
 
+        let release_url = github_release_by_tag_url(source, "v0.1.0");
         let asset_url = github_asset_url(source, 42);
-        let github_http = FixtureGithubHttp::default().bytes(&asset_url, expected_bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"v0.1.0","assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(&asset_url, expected_bytes);
         let github = GithubApi::new(&github_http, None);
         let rerun = resolve_all_with_github(
             project.path(),
@@ -19589,7 +19861,7 @@ future_protection_field = "retain-me"
         assert_eq!(fs::read(&project_wasm).unwrap(), expected_bytes);
         assert_eq!(fs::read(global_wasm.as_path()).unwrap(), expected_bytes);
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
-        assert_eq!(github_http.requests()[0].url(), asset_url);
+        assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
     }
 
     #[test]
@@ -19791,8 +20063,14 @@ future_protection_field = "retain-me"
         let project_before = fs::read(&project_wasm).unwrap();
         let global_before = fs::read(global_wasm.as_path()).unwrap();
         let trust_before = snapshot_tree(trust.path());
+        let release_url = github_release_by_tag_url(source, "v0.1.0");
         let asset_url = github_asset_url(source, 42);
-        let github_http = FixtureGithubHttp::default().bytes(&asset_url, origin_bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"v0.1.0","assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(&asset_url, origin_bytes);
         let github = GithubApi::new(&github_http, None);
         let mut config = provider_config(source, None);
         config.name = "aws".into();
@@ -19813,6 +20091,7 @@ future_protection_field = "retain-me"
         assert_eq!(fs::read(&project_wasm).unwrap(), project_before);
         assert_eq!(fs::read(global_wasm.as_path()).unwrap(), global_before);
         assert_eq!(snapshot_tree(trust.path()), trust_before);
+        assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
     }
 
     #[test]
@@ -19929,8 +20208,14 @@ future_protection_field = "retain-me"
         let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        let release_url = github_release_by_tag_url(source, "v0.1.0");
         let asset_url = github_asset_url(source, 42);
-        let github_http = FixtureGithubHttp::default().bytes(&asset_url, cached_bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                r#"{"tag_name":"v0.1.0","assets":[{"name":"provider.wasm","id":42}]}"#,
+            )
+            .bytes(&asset_url, cached_bytes);
         let github = GithubApi::new(&github_http, None);
 
         let resolved = resolve_all_with_github(
@@ -19945,7 +20230,7 @@ future_protection_field = "retain-me"
 
         assert_eq!(resolved.get("awscc").unwrap().as_path(), project_wasm);
         assert_eq!(fs::read(&project_wasm).unwrap(), cached_bytes);
-        assert_eq!(github_http.requests().len(), 1);
+        assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
         assert!(
             snapshot_tree(trust.path())
                 .iter()

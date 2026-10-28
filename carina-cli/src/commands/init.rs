@@ -389,13 +389,25 @@ mod tests {
         let lock_path = project.path().join("carina-providers.lock");
         lock.save(&lock_path).unwrap();
         let lock_before = fs::read(&lock_path).unwrap();
+        let release_url = format!(
+            "https://api.github.com/repos/{}/{}/releases/tags/v{version}",
+            github_source.owner(),
+            github_source.repo()
+        );
         let origin_url = format!(
             "https://api.github.com/repos/{}/{}/releases/assets/42",
             github_source.owner(),
             github_source.repo()
         );
         let registry_http = FixtureRegistryHttp::default();
-        let github_http = FixtureGithubHttp::default().bytes(&origin_url, bytes);
+        let github_http = FixtureGithubHttp::default()
+            .json(
+                &release_url,
+                format!(
+                    r#"{{"tag_name":"v{version}","assets":[{{"name":"provider.wasm","id":42}}]}}"#
+                ),
+            )
+            .bytes(&origin_url, bytes);
 
         run_init_with_fixtures(project.path(), &registry_http, &github_http).await;
 
@@ -404,6 +416,14 @@ mod tests {
                 .requested_urls()
                 .iter()
                 .filter(|requested| requested.as_str() == origin_url)
+                .count(),
+            1
+        );
+        assert_eq!(
+            github_http
+                .requested_urls()
+                .iter()
+                .filter(|requested| requested.as_str() == release_url)
                 .count(),
             1
         );
@@ -418,6 +438,14 @@ mod tests {
                 .requested_urls()
                 .iter()
                 .filter(|requested| requested.as_str() == origin_url)
+                .count(),
+            1
+        );
+        assert_eq!(
+            github_http
+                .requested_urls()
+                .iter()
+                .filter(|requested| requested.as_str() == release_url)
                 .count(),
             1
         );

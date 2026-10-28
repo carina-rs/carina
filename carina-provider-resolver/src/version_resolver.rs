@@ -20,6 +20,7 @@ impl ReleaseAsset {
         &self.name
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> AssetId {
         self.id
     }
@@ -36,6 +37,8 @@ struct ListedReleaseAsset {
 pub(crate) struct GithubRelease {
     version: Version,
     tag: ReleaseTag,
+    draft: bool,
+    prerelease: bool,
     assets: Vec<ListedReleaseAsset>,
 }
 
@@ -47,9 +50,6 @@ impl GithubRelease {
             prerelease,
             assets,
         } = response;
-        if draft {
-            return Err(format!("GitHub release '{tag_name}' is a draft"));
-        }
         let tag = ReleaseTag::new(tag_name).map_err(|error| error.to_string())?;
         let version = parse_tag(tag.as_str()).ok_or_else(|| {
             format!(
@@ -57,12 +57,11 @@ impl GithubRelease {
                 tag.as_str()
             )
         })?;
-        // The parsed semver, not GitHub's advisory flag, controls prerelease
-        // matching through `VersionReq`.
-        let _ = prerelease;
         Ok(Self {
             version,
             tag,
+            draft,
+            prerelease,
             assets: assets
                 .into_iter()
                 .map(|GithubAssetResponse { id, name }| ListedReleaseAsset { name, id })
@@ -76,6 +75,35 @@ impl GithubRelease {
 
     pub(crate) fn tag(&self) -> &ReleaseTag {
         &self.tag
+    }
+}
+
+/// Proof that one release asset belongs to a published release and is the
+/// release's single WASM asset. Its fields are private so only the validation
+/// functions in this module can mint a value accepted by the downloader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedReleaseAsset {
+    repo: RepoSlug,
+    version: Version,
+    tag: ReleaseTag,
+    asset_id: AssetId,
+}
+
+impl VerifiedReleaseAsset {
+    pub(crate) fn repo(&self) -> &RepoSlug {
+        &self.repo
+    }
+
+    pub(crate) fn version(&self) -> &Version {
+        &self.version
+    }
+
+    pub(crate) fn tag(&self) -> &ReleaseTag {
+        &self.tag
+    }
+
+    pub(crate) fn asset_id(&self) -> AssetId {
+        self.asset_id
     }
 }
 
@@ -109,6 +137,190 @@ impl fmt::Display for ReleaseAssetSelectionError {
 }
 
 impl std::error::Error for ReleaseAssetSelectionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseAssetVerificationError {
+    InvalidReleaseMetadata {
+        tag: String,
+        detail: String,
+    },
+    UnexpectedTag {
+        expected: ReleaseTag,
+        actual: ReleaseTag,
+    },
+    UnexpectedVersion {
+        tag: ReleaseTag,
+        expected: Version,
+        actual: Version,
+    },
+    Draft {
+        tag: ReleaseTag,
+    },
+    PrereleaseForStableVersion {
+        tag: ReleaseTag,
+        version: Version,
+    },
+    LockedAssetNotInRelease {
+        tag: ReleaseTag,
+        asset_id: AssetId,
+    },
+    LockedAssetNotSelected {
+        tag: ReleaseTag,
+        locked_asset_id: AssetId,
+        selected_asset_id: AssetId,
+    },
+    AssetSelection(ReleaseAssetSelectionError),
+}
+
+impl fmt::Display for ReleaseAssetVerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidReleaseMetadata { tag, detail } => {
+                write!(
+                    formatter,
+                    "GitHub release '{tag}' has invalid metadata: {detail}"
+                )
+            }
+            Self::UnexpectedTag { expected, actual } => write!(
+                formatter,
+                "GitHub release lookup for tag '{expected}' returned tag '{actual}'"
+            ),
+            Self::UnexpectedVersion {
+                tag,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GitHub release '{tag}' resolves to version {actual}, not locked version {expected}"
+            ),
+            Self::Draft { tag } => write!(formatter, "GitHub release '{tag}' is a draft"),
+            Self::PrereleaseForStableVersion { tag, version } => write!(
+                formatter,
+                "GitHub release '{tag}' is marked as a prerelease but locked version {version} is not a prerelease"
+            ),
+            Self::LockedAssetNotInRelease { tag, asset_id } => write!(
+                formatter,
+                "GitHub release '{tag}' does not contain locked asset id {asset_id}"
+            ),
+            Self::LockedAssetNotSelected {
+                tag,
+                locked_asset_id,
+                selected_asset_id,
+            } => write!(
+                formatter,
+                "GitHub release '{tag}' locked asset id {locked_asset_id} is not the release's selected .wasm asset id {selected_asset_id}"
+            ),
+            Self::AssetSelection(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseAssetVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AssetSelection(error) => Some(error),
+            Self::InvalidReleaseMetadata { .. }
+            | Self::UnexpectedTag { .. }
+            | Self::UnexpectedVersion { .. }
+            | Self::Draft { .. }
+            | Self::PrereleaseForStableVersion { .. }
+            | Self::LockedAssetNotInRelease { .. }
+            | Self::LockedAssetNotSelected { .. } => None,
+        }
+    }
+}
+
+impl From<ReleaseAssetSelectionError> for ReleaseAssetVerificationError {
+    fn from(error: ReleaseAssetSelectionError) -> Self {
+        Self::AssetSelection(error)
+    }
+}
+
+pub(crate) fn verify_fresh_release_asset(
+    repo: RepoSlug,
+    release: GithubRelease,
+) -> Result<VerifiedReleaseAsset, ReleaseAssetVerificationError> {
+    verify_release_asset(repo, release, None)
+}
+
+pub(crate) fn verify_locked_release_asset(
+    repo: RepoSlug,
+    expected_version: &Version,
+    expected_tag: &ReleaseTag,
+    expected_asset_id: AssetId,
+    response: GithubReleaseResponse,
+) -> Result<VerifiedReleaseAsset, ReleaseAssetVerificationError> {
+    let response_tag = response.tag_name.clone();
+    let release = GithubRelease::from_api(response).map_err(|detail| {
+        ReleaseAssetVerificationError::InvalidReleaseMetadata {
+            tag: response_tag,
+            detail,
+        }
+    })?;
+    verify_release_asset(
+        repo,
+        release,
+        Some((expected_version, expected_tag, expected_asset_id)),
+    )
+}
+
+fn verify_release_asset(
+    repo: RepoSlug,
+    release: GithubRelease,
+    expected: Option<(&Version, &ReleaseTag, AssetId)>,
+) -> Result<VerifiedReleaseAsset, ReleaseAssetVerificationError> {
+    if let Some((expected_version, expected_tag, _)) = expected {
+        if release.tag != *expected_tag {
+            return Err(ReleaseAssetVerificationError::UnexpectedTag {
+                expected: expected_tag.clone(),
+                actual: release.tag,
+            });
+        }
+        if release.version != *expected_version {
+            return Err(ReleaseAssetVerificationError::UnexpectedVersion {
+                tag: release.tag,
+                expected: expected_version.clone(),
+                actual: release.version,
+            });
+        }
+    }
+    if release.draft {
+        return Err(ReleaseAssetVerificationError::Draft { tag: release.tag });
+    }
+    if release.prerelease && release.version.pre.is_empty() {
+        return Err(ReleaseAssetVerificationError::PrereleaseForStableVersion {
+            tag: release.tag,
+            version: release.version,
+        });
+    }
+    if let Some((_, _, expected_asset_id)) = expected
+        && !release
+            .assets
+            .iter()
+            .any(|asset| AssetId::from_api(asset.id) == expected_asset_id)
+    {
+        return Err(ReleaseAssetVerificationError::LockedAssetNotInRelease {
+            tag: release.tag,
+            asset_id: expected_asset_id,
+        });
+    }
+    let selected = select_release_asset(&release)?;
+    if let Some((_, _, expected_asset_id)) = expected
+        && selected.id != expected_asset_id
+    {
+        return Err(ReleaseAssetVerificationError::LockedAssetNotSelected {
+            tag: release.tag,
+            locked_asset_id: expected_asset_id,
+            selected_asset_id: selected.id,
+        });
+    }
+    Ok(VerifiedReleaseAsset {
+        repo,
+        version: release.version,
+        tag: release.tag,
+        asset_id: selected.id,
+    })
+}
 
 /// Select the release's only `.wasm` asset.
 pub(crate) fn select_release_asset(
@@ -399,6 +611,95 @@ mod tests {
         let resolved = resolve_from_releases(&releases, &req).unwrap().unwrap();
 
         assert_eq!(resolved.tag().as_str(), "v1.0.0-beta.1");
+    }
+
+    #[test]
+    fn fresh_release_verification_rejects_stable_version_marked_prerelease() {
+        let release = GithubRelease::from_api(GithubReleaseResponse {
+            tag_name: "v1.0.0".into(),
+            draft: false,
+            prerelease: true,
+            assets: vec![GithubAssetResponse {
+                id: 42,
+                name: "provider.wasm".into(),
+            }],
+        })
+        .unwrap();
+
+        let error =
+            verify_fresh_release_asset(RepoSlug::try_from(&github_source()).unwrap(), release)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReleaseAssetVerificationError::PrereleaseForStableVersion { tag, version }
+                if tag.as_str() == "v1.0.0" && version == Version::new(1, 0, 0)
+        ));
+    }
+
+    #[test]
+    fn locked_non_wasm_asset_is_a_typed_verification_error() {
+        let expected_tag = ReleaseTag::from_lock("v1.0.0".into());
+        let error = verify_locked_release_asset(
+            RepoSlug::try_from(&github_source()).unwrap(),
+            &Version::new(1, 0, 0),
+            &expected_tag,
+            AssetId::from_lock(42),
+            GithubReleaseResponse {
+                tag_name: "v1.0.0".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![
+                    GithubAssetResponse {
+                        id: 7,
+                        name: "provider.wasm".into(),
+                    },
+                    GithubAssetResponse {
+                        id: 42,
+                        name: "checksums.txt".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReleaseAssetVerificationError::LockedAssetNotSelected {
+                tag,
+                locked_asset_id,
+                selected_asset_id,
+            } if tag.as_str() == "v1.0.0"
+                && locked_asset_id.get() == 42
+                && selected_asset_id.get() == 7
+        ));
+    }
+
+    #[test]
+    fn locked_prerelease_is_allowed_for_prerelease_semver() {
+        let version = Version::parse("1.0.0-beta.1").unwrap();
+        let tag = ReleaseTag::from_lock("v1.0.0-beta.1".into());
+
+        let verified = verify_locked_release_asset(
+            RepoSlug::try_from(&github_source()).unwrap(),
+            &version,
+            &tag,
+            AssetId::from_lock(42),
+            GithubReleaseResponse {
+                tag_name: tag.as_str().into(),
+                draft: false,
+                prerelease: true,
+                assets: vec![GithubAssetResponse {
+                    id: 42,
+                    name: "provider.wasm".into(),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(verified.version(), &version);
+        assert_eq!(verified.tag(), &tag);
+        assert_eq!(verified.asset_id().get(), 42);
     }
 
     #[test]
