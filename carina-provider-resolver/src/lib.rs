@@ -1,6 +1,7 @@
 //! Provider resolution: download, cache, and verify provider WASM components.
 
 mod github;
+mod github_location;
 mod install_lock;
 pub mod provider_resolver;
 pub mod revision_resolver;
@@ -8,10 +9,10 @@ mod signing;
 mod verified_artifact;
 mod version_resolver;
 
+pub use github_location::{ArtifactId, AssetId, CommitSha, ReleaseTag};
 pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
 pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact};
-pub use version_resolver::{ReleaseAssetId, ReleaseTag};
 
 #[cfg(test)]
 pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {

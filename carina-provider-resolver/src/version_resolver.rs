@@ -2,89 +2,16 @@
 
 use std::fmt;
 
-use semver::{Version, VersionReq};
-use serde::{Deserialize, Serialize};
-
 use carina_core::provider_source::GithubSource;
+use semver::{Version, VersionReq};
 
 use crate::github::{GithubApi, GithubAssetResponse, GithubHttp, GithubReleaseResponse};
-
-/// The exact tag string returned by GitHub or persisted in a release lock.
-///
-/// The inner string is private so a raw semver string cannot accidentally be
-/// substituted at a release-download boundary.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct ReleaseTag(String);
-
-impl ReleaseTag {
-    fn from_api(tag: String) -> Result<Self, String> {
-        if tag.is_empty() {
-            return Err("GitHub release tag_name must not be empty".to_string());
-        }
-        Ok(Self(tag))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_lock(tag: String) -> Self {
-        Self(tag)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn semver(&self) -> Option<Version> {
-        parse_tag(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ReleaseTag {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let tag = String::deserialize(deserializer)?;
-        Self::from_api(tag).map_err(serde::de::Error::custom)
-    }
-}
-
-impl fmt::Display for ReleaseTag {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// A GitHub release asset ID obtained from release selection or a lock file.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct ReleaseAssetId(u64);
-
-impl ReleaseAssetId {
-    fn from_api(id: u64) -> Self {
-        Self(id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_lock(id: u64) -> Self {
-        Self(id)
-    }
-
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for ReleaseAssetId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+use crate::github_location::{AssetId, ReleaseTag, RepoSlug};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseAsset {
     name: String,
-    id: ReleaseAssetId,
+    id: AssetId,
 }
 
 impl ReleaseAsset {
@@ -93,7 +20,7 @@ impl ReleaseAsset {
         &self.name
     }
 
-    pub(crate) fn id(&self) -> ReleaseAssetId {
+    pub(crate) fn id(&self) -> AssetId {
         self.id
     }
 }
@@ -123,7 +50,7 @@ impl GithubRelease {
         if draft {
             return Err(format!("GitHub release '{tag_name}' is a draft"));
         }
-        let tag = ReleaseTag::from_api(tag_name)?;
+        let tag = ReleaseTag::new(tag_name).map_err(|error| error.to_string())?;
         let version = parse_tag(tag.as_str()).ok_or_else(|| {
             format!(
                 "GitHub release tag '{}' is not a semantic version",
@@ -200,7 +127,7 @@ pub(crate) fn select_release_asset(
     match wasm_assets.as_slice() {
         [asset] => Ok(ReleaseAsset {
             name: asset.name.clone(),
-            id: ReleaseAssetId::from_api(asset.id),
+            id: AssetId::from_api(asset.id),
         }),
         [] => Err(ReleaseAssetSelectionError::NoWasmAsset {
             tag: release.tag.clone(),
@@ -295,8 +222,10 @@ pub(crate) fn fetch_releases_with_api<H: GithubHttp + ?Sized>(
     source: &GithubSource,
     api: &GithubApi<'_, H>,
 ) -> Result<Vec<GithubRelease>, String> {
+    let repo = RepoSlug::try_from(source).map_err(|error| error.to_string())?;
     Ok(api
-        .list_releases(source)?
+        .list_releases(&repo)
+        .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|response| !response.draft)
         .filter_map(|response| GithubRelease::from_api(response).ok())
@@ -307,7 +236,11 @@ pub(crate) fn fetch_latest_release_with_api<H: GithubHttp + ?Sized>(
     source: &GithubSource,
     api: &GithubApi<'_, H>,
 ) -> Result<GithubRelease, String> {
-    GithubRelease::from_api(api.latest_release(source)?)
+    let repo = RepoSlug::try_from(source).map_err(|error| error.to_string())?;
+    GithubRelease::from_api(
+        api.latest_release(&repo)
+            .map_err(|error| error.to_string())?,
+    )
 }
 
 #[cfg(test)]

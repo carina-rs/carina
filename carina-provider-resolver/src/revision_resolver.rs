@@ -1,12 +1,12 @@
 //! Resolve provider binaries from GitHub Actions CI artifacts by git revision.
 
-use serde::Deserialize;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use carina_core::provider_source::GithubSource;
 
-use crate::github::{GithubApi, GithubHttp, UreqGithubHttp};
+use crate::github::{GithubApi, GithubArtifactResponse, GithubHttp, UreqGithubHttp};
+use crate::github_location::{ArtifactId, CommitSha, GitRef, RepoSlug};
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
     global_cache_artifact_path, install_global_artifact_atomically,
@@ -19,29 +19,10 @@ use crate::verified_artifact::{
 };
 
 /// GitHub Actions artifact metadata (subset used by the resolver).
-#[derive(Deserialize)]
 struct Artifact {
-    id: u64,
+    id: ArtifactId,
     name: String,
-    #[serde(default)]
     expired: bool,
-}
-
-#[derive(Deserialize)]
-struct ArtifactsResponse {
-    #[serde(default)]
-    artifacts: Vec<Artifact>,
-}
-
-#[derive(Deserialize)]
-struct WorkflowRun {
-    id: u64,
-}
-
-#[derive(Deserialize)]
-struct WorkflowRunsResponse {
-    #[serde(default)]
-    workflow_runs: Vec<WorkflowRun>,
 }
 
 /// Obtain a GitHub token for API authentication.
@@ -92,18 +73,30 @@ fn resolve_ref_to_sha_with_api<H: GithubHttp + ?Sized>(
     revision: &str,
     api: &GithubApi<'_, H>,
 ) -> Result<String, String> {
-    let owner = source.owner();
-    let repo = source.repo();
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/{revision}");
-    let commit: serde_json::Value = api.get_json(&url).map_err(|error| {
+    let (repo, git_ref) = validate_revision_location(source, revision)?;
+    resolve_typed_ref_to_sha(source, revision, &repo, &git_ref, api)
+}
+
+fn validate_revision_location(
+    source: &GithubSource,
+    revision: &str,
+) -> Result<(RepoSlug, GitRef), String> {
+    let repo = RepoSlug::try_from(source).map_err(|error| error.to_string())?;
+    let git_ref = GitRef::new(revision.to_string()).map_err(|error| error.to_string())?;
+    Ok((repo, git_ref))
+}
+
+fn resolve_typed_ref_to_sha<H: GithubHttp + ?Sized>(
+    source: &GithubSource,
+    revision: &str,
+    repo: &RepoSlug,
+    git_ref: &GitRef,
+    api: &GithubApi<'_, H>,
+) -> Result<String, String> {
+    let commit = api.commit(repo, git_ref).map_err(|error| {
         format!("Failed to resolve revision '{revision}' for {source}: {error}")
     })?;
-
-    commit
-        .get("sha")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("No SHA found for revision '{revision}' in {source}"))
+    Ok(commit.to_string())
 }
 
 /// Find all successful workflow runs for a given commit SHA.
@@ -115,44 +108,36 @@ fn resolve_ref_to_sha_with_api<H: GithubHttp + ?Sized>(
 /// [`select_artifact_from_runs`].
 fn find_workflow_run_ids<H: GithubHttp + ?Sized>(
     source: &GithubSource,
+    repo: &RepoSlug,
     sha: &str,
     api: &GithubApi<'_, H>,
 ) -> Result<Vec<u64>, String> {
-    let owner = source.owner();
-    let repo = source.repo();
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={sha}&status=success&per_page=10"
-    );
-
-    let data: WorkflowRunsResponse = api
-        .get_json(&url)
-        .map_err(|error| format!("Failed to fetch workflow runs for {source}@{sha}: {error}"))?;
-
-    Ok(data.workflow_runs.into_iter().map(|r| r.id).collect())
+    let sha = CommitSha::new(sha.to_string()).map_err(|error| error.to_string())?;
+    api.workflow_runs(repo, &sha)
+        .map_err(|error| format!("Failed to fetch workflow runs for {source}@{sha}: {error}"))
 }
 
 /// Fetch the artifacts list for a single workflow run.
 fn fetch_run_artifacts<H: GithubHttp + ?Sized>(
-    source: &GithubSource,
+    repo: &RepoSlug,
     run_id: u64,
     api: &GithubApi<'_, H>,
 ) -> Result<Vec<Artifact>, String> {
-    let owner = source.owner();
-    let repo = source.repo();
-    let url =
-        format!("https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts");
-
-    let data: ArtifactsResponse = api
-        .get_json(&url)
-        .map_err(|error| format!("Failed to fetch artifacts for run {run_id}: {error}"))?;
-    Ok(data.artifacts)
+    api.run_artifacts(repo, run_id)
+        .map(|artifacts| {
+            artifacts
+                .into_iter()
+                .map(|GithubArtifactResponse { id, name, expired }| Artifact { id, name, expired })
+                .collect()
+        })
+        .map_err(|error| format!("Failed to fetch artifacts for run {run_id}: {error}"))
 }
 
 /// Result of looking for a specific artifact inside a single run's artifact list.
 #[derive(Debug, PartialEq, Eq)]
 enum ArtifactMatch {
     /// A non-expired artifact with the expected name was found.
-    Found(u64),
+    Found(ArtifactId),
     /// The expected artifact exists in this run but has expired.
     Expired,
     /// No artifact with the expected name is in this run.
@@ -195,7 +180,7 @@ fn select_artifact_from_runs<F>(
     source: &GithubSource,
     sha: &str,
     mut fetch: F,
-) -> Result<u64, String>
+) -> Result<ArtifactId, String>
 where
     F: FnMut(u64) -> Result<Vec<Artifact>, String>,
 {
@@ -233,17 +218,13 @@ where
 fn download_artifact<'lock, H: GithubHttp + ?Sized>(
     install_lock: &'lock ProviderInstallLock,
     source: &GithubSource,
-    artifact_id: u64,
+    repo: &RepoSlug,
+    artifact_id: ArtifactId,
     destination: &WasmArtifactPath,
     api: &GithubApi<'_, H>,
 ) -> Result<StagedArtifact<'lock>, String> {
-    let owner = source.owner();
-    let repo = source.repo();
-    let url =
-        format!("https://api.github.com/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip");
-
     let zip_data = api
-        .get_bytes(&url, "application/vnd.github+json")
+        .download_artifact_zip(repo, artifact_id)
         .map_err(|error| format!("Failed to download artifact {artifact_id}: {error}"))?;
 
     // Extract the .wasm file from the ZIP
@@ -342,6 +323,7 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
     upgrade: bool,
     api: &GithubApi<'_, H>,
 ) -> Result<(WasmArtifactPath, String), String> {
+    let (repo, git_ref) = validate_revision_location(source, revision)?;
     let install_lock = lock_file.install_lock();
     let base_dir = install_lock.project_dir();
     let source_key = source.source_key();
@@ -362,7 +344,7 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
             "Resolving revision '{}' for provider '{}'...",
             revision, name
         );
-        resolve_ref_to_sha_with_api(source, revision, api)?
+        resolve_typed_ref_to_sha(source, revision, &repo, &git_ref, api)?
     };
 
     let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
@@ -423,13 +405,13 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
         &sha[..sha.len().min(12)]
     );
 
-    let run_ids = find_workflow_run_ids(source, &sha, api)?;
+    let run_ids = find_workflow_run_ids(source, &repo, &sha, api)?;
     let expected_name = format!("{}.wasm", source.repo());
     let artifact_id =
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
-            fetch_run_artifacts(source, run_id, api)
+            fetch_run_artifacts(&repo, run_id, api)
         })?;
-    let staged = download_artifact(install_lock, source, artifact_id, &wasm_path, api)?;
+    let staged = download_artifact(install_lock, source, &repo, artifact_id, &wasm_path, api)?;
     let installed_path = match publish_download(staged, artifact_pin)? {
         DownloadedArtifact::Verified { artifact, pin } => {
             record_verified_revision_pin(lock_file, &artifact, pin, name);
@@ -467,6 +449,7 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::FixtureGithubHttp;
     use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
     use carina_core::provider_source::{ProviderSource, RemoteSource};
     use std::io::Write as _;
@@ -479,6 +462,22 @@ mod tests {
             ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
             source => panic!("expected GitHub source: {source}"),
         }
+    }
+
+    #[test]
+    fn invalid_config_revision_is_rejected_before_any_github_request() {
+        let source = github_source("carina-rs", "provider");
+        let http = FixtureGithubHttp::default();
+        let api = GithubApi::new(&http, Some("token"));
+
+        for revision in ["%2e%2e", "..", "/", "?", "#", "%2F", " ", ""] {
+            let error = resolve_ref_to_sha_with_api(&source, revision, &api).unwrap_err();
+            assert!(
+                error.contains("invalid GitHub git ref"),
+                "{revision}: {error}"
+            );
+        }
+        assert!(http.requests().is_empty());
     }
 
     #[test]
@@ -740,7 +739,7 @@ mod tests {
 
     fn artifact(name: &str, id: u64, expired: bool) -> Artifact {
         Artifact {
-            id,
+            id: ArtifactId::from_lock(id),
             name: name.to_string(),
             expired,
         }
@@ -754,7 +753,7 @@ mod tests {
         ];
         assert_eq!(
             pick_artifact_id(&artifacts, "carina-provider-aws.wasm"),
-            ArtifactMatch::Found(42)
+            ArtifactMatch::Found(ArtifactId::from_lock(42))
         );
     }
 
@@ -782,7 +781,7 @@ mod tests {
         let artifacts = vec![artifact("my.wasm", 1, true), artifact("my.wasm", 2, false)];
         assert_eq!(
             pick_artifact_id(&artifacts, "my.wasm"),
-            ArtifactMatch::Found(2)
+            ArtifactMatch::Found(ArtifactId::from_lock(2))
         );
     }
 
@@ -808,7 +807,7 @@ mod tests {
             TEST_SHA,
             fetch,
         );
-        assert_eq!(result.unwrap(), 999);
+        assert_eq!(result.unwrap(), ArtifactId::from_lock(999));
     }
 
     #[test]
@@ -818,7 +817,7 @@ mod tests {
         assert_eq!(
             select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
                 .unwrap(),
-            7
+            ArtifactId::from_lock(7)
         );
     }
 
@@ -837,7 +836,7 @@ mod tests {
         assert_eq!(
             select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
                 .unwrap(),
-            2
+            ArtifactId::from_lock(2)
         );
     }
 
@@ -907,10 +906,15 @@ mod tests {
                  "node_id": "ignored", "size_in_bytes": 1024}
             ]
         }"#;
-        let parsed: ArtifactsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.artifacts.len(), 1);
-        assert_eq!(parsed.artifacts[0].id, 12345);
-        assert_eq!(parsed.artifacts[0].name, "carina-provider-aws.wasm");
-        assert!(!parsed.artifacts[0].expired);
+        let url =
+            "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/runs/7/artifacts";
+        let http = FixtureGithubHttp::default().json(url, json);
+        let api = GithubApi::new(&http, Some("token"));
+        let repo = RepoSlug::try_from(&test_source()).unwrap();
+        let parsed = api.run_artifacts(&repo, 7).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id.get(), 12345);
+        assert_eq!(parsed[0].name, "carina-provider-aws.wasm");
+        assert!(!parsed[0].expired);
     }
 }

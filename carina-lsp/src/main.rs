@@ -323,7 +323,7 @@ mod tests {
             name: "aws".into(),
             source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::GithubRelease {
-                version: version.into(),
+                version: version.parse().unwrap(),
                 tag: serde_json::from_str("\"v0.5.0\"").unwrap(),
                 asset_id: serde_json::from_str("42").unwrap(),
                 constraint: None,

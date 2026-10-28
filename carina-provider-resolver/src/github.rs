@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::OnceLock;
 
-use carina_core::provider_source::GithubSource;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::version_resolver::ReleaseAssetId;
+use crate::github_location::{
+    ArtifactId, AssetId, CommitSha, GitRef, GithubLocationError, RepoSlug,
+};
 
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
 const OCTET_STREAM_ACCEPT: &str = "application/octet-stream";
@@ -140,6 +141,111 @@ pub(crate) struct GithubReleaseResponse {
     pub(crate) assets: Vec<GithubAssetResponse>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GithubArtifactResponse {
+    pub(crate) id: ArtifactId,
+    pub(crate) name: String,
+    pub(crate) expired: bool,
+}
+
+#[derive(Deserialize)]
+struct GithubArtifactWireResponse {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    expired: bool,
+}
+
+#[derive(Deserialize)]
+struct GithubCommitResponse {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GithubWorkflowRunResponse {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct GithubWorkflowRunsResponse {
+    #[serde(default)]
+    workflow_runs: Vec<GithubWorkflowRunResponse>,
+}
+
+#[derive(Deserialize)]
+struct GithubArtifactsResponse {
+    #[serde(default)]
+    artifacts: Vec<GithubArtifactWireResponse>,
+}
+
+#[derive(Debug)]
+pub(crate) enum GithubApiError {
+    Location(GithubLocationError),
+    Http(String),
+    Authentication(String),
+    Status {
+        status: u16,
+        endpoint: String,
+        message: Option<String>,
+        anonymous: bool,
+    },
+    Decode {
+        endpoint: String,
+        source: serde_json::Error,
+    },
+    PaginationCycle {
+        endpoint: String,
+    },
+}
+
+impl std::fmt::Display for GithubApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Location(error) => error.fmt(formatter),
+            Self::Http(error) | Self::Authentication(error) => formatter.write_str(error),
+            Self::Status {
+                status,
+                endpoint,
+                message,
+                anonymous,
+            } => {
+                write!(
+                    formatter,
+                    "GitHub API returned status {status} for {endpoint}"
+                )?;
+                if let Some(message) = message {
+                    write!(formatter, ": {message}")?;
+                }
+                if *anonymous && matches!(status, 401 | 403 | 404) {
+                    formatter
+                        .write_str(". Set GITHUB_TOKEN or run `gh auth login` to authenticate")?;
+                }
+                Ok(())
+            }
+            Self::Decode { endpoint, source } => {
+                write!(
+                    formatter,
+                    "Failed to parse GitHub response from {endpoint}: {source}"
+                )
+            }
+            Self::PaginationCycle { endpoint } => {
+                write!(
+                    formatter,
+                    "GitHub release pagination cycle revisited {endpoint}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GithubApiError {}
+
+impl From<GithubLocationError> for GithubApiError {
+    fn from(error: GithubLocationError) -> Self {
+        Self::Location(error)
+    }
+}
+
 enum GithubTokenSource<'token> {
     Fixed(&'token str),
     Anonymous,
@@ -183,16 +289,16 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
 
     pub(crate) fn list_releases(
         &self,
-        source: &GithubSource,
-    ) -> Result<Vec<GithubReleaseResponse>, String> {
-        let mut url = github_repo_url(source, &["releases"])?;
-        url.query_pairs_mut().append_pair("per_page", "100");
-        let mut next = Some(url.to_string());
+        repo: &RepoSlug,
+    ) -> Result<Vec<GithubReleaseResponse>, GithubApiError> {
+        let mut next = Some(repo.releases_url()?);
         let mut releases = Vec::new();
         let mut visited = BTreeSet::new();
         while let Some(url) = next {
-            if !visited.insert(url.clone()) {
-                return Err(format!("GitHub release pagination cycle revisited {url}"));
+            if !visited.insert(url.as_str().to_string()) {
+                return Err(GithubApiError::PaginationCycle {
+                    endpoint: endpoint_label(&url),
+                });
             }
             let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Optional)?;
             let page: Vec<GithubReleaseResponse> = parse_json(&response.body, &url)?;
@@ -200,76 +306,111 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
             next = response
                 .header("link")
                 .and_then(next_link)
-                .map(str::to_string);
-            if let Some(next_url) = &next {
-                validate_github_api_url(next_url)?;
-            }
+                .map(|next_url| repo.validate_url(next_url))
+                .transpose()?;
         }
         Ok(releases)
     }
 
     pub(crate) fn latest_release(
         &self,
-        source: &GithubSource,
-    ) -> Result<GithubReleaseResponse, String> {
-        let url = github_repo_url(source, &["releases", "latest"])?;
-        let response = self.get(
-            url.as_str(),
-            GITHUB_JSON_ACCEPT,
-            GithubAuthentication::Optional,
-        )?;
-        parse_json(&response.body, url.as_str())
+        repo: &RepoSlug,
+    ) -> Result<GithubReleaseResponse, GithubApiError> {
+        let url = repo.latest_release_url()?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Optional)?;
+        parse_json(&response.body, &url)
     }
 
     pub(crate) fn download_release_asset(
         &self,
-        source: &GithubSource,
-        asset_id: ReleaseAssetId,
-    ) -> Result<Vec<u8>, String> {
-        let id = asset_id.to_string();
-        let url = github_repo_url(source, &["releases", "assets", &id])?;
-        self.get(
-            url.as_str(),
-            OCTET_STREAM_ACCEPT,
-            GithubAuthentication::Optional,
-        )
-        .map(|response| response.body)
+        repo: &RepoSlug,
+        asset_id: AssetId,
+    ) -> Result<Vec<u8>, GithubApiError> {
+        let url = repo.release_asset_url(asset_id)?;
+        self.get(&url, OCTET_STREAM_ACCEPT, GithubAuthentication::Optional)
+            .map(|response| response.body)
     }
 
-    pub(crate) fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
-        let response = self.get(url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
-        parse_json(&response.body, url)
+    pub(crate) fn commit(
+        &self,
+        repo: &RepoSlug,
+        git_ref: &GitRef,
+    ) -> Result<CommitSha, GithubApiError> {
+        let url = repo.commit_url(git_ref)?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
+        let commit: GithubCommitResponse = parse_json(&response.body, &url)?;
+        CommitSha::new(commit.sha).map_err(Into::into)
     }
 
-    pub(crate) fn get_bytes(&self, url: &str, accept: &'static str) -> Result<Vec<u8>, String> {
-        self.get(url, accept, GithubAuthentication::Required)
+    pub(crate) fn workflow_runs(
+        &self,
+        repo: &RepoSlug,
+        commit_sha: &CommitSha,
+    ) -> Result<Vec<u64>, GithubApiError> {
+        let url = repo.workflow_runs_url(commit_sha)?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
+        let runs: GithubWorkflowRunsResponse = parse_json(&response.body, &url)?;
+        Ok(runs.workflow_runs.into_iter().map(|run| run.id).collect())
+    }
+
+    pub(crate) fn run_artifacts(
+        &self,
+        repo: &RepoSlug,
+        run_id: u64,
+    ) -> Result<Vec<GithubArtifactResponse>, GithubApiError> {
+        let url = repo.run_artifacts_url(run_id)?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
+        let artifacts: GithubArtifactsResponse = parse_json(&response.body, &url)?;
+        Ok(artifacts
+            .artifacts
+            .into_iter()
+            .map(|artifact| GithubArtifactResponse {
+                id: ArtifactId::from_api(artifact.id),
+                name: artifact.name,
+                expired: artifact.expired,
+            })
+            .collect())
+    }
+
+    pub(crate) fn download_artifact_zip(
+        &self,
+        repo: &RepoSlug,
+        artifact_id: ArtifactId,
+    ) -> Result<Vec<u8>, GithubApiError> {
+        let url = repo.artifact_zip_url(artifact_id)?;
+        self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)
             .map(|response| response.body)
     }
 
     fn get(
         &self,
-        url: &str,
+        url: &url::Url,
         accept: &'static str,
         authentication: GithubAuthentication,
-    ) -> Result<GithubResponse, String> {
-        validate_github_api_url(url)?;
+    ) -> Result<GithubResponse, GithubApiError> {
         let authorization = self.authorization(authentication)?;
         let authenticated = authorization.is_some();
-        let mut response = self.http.get(GithubRequest {
-            url: url.to_string(),
-            accept,
-            authorization,
-        })?;
+        let mut response = self
+            .http
+            .get(GithubRequest {
+                url: url.to_string(),
+                accept,
+                authorization,
+            })
+            .map_err(GithubApiError::Http)?;
         let mut anonymous = !authenticated;
         if authenticated
             && response.status == 401
             && matches!(authentication, GithubAuthentication::Optional)
         {
-            response = self.http.get(GithubRequest {
-                url: url.to_string(),
-                accept,
-                authorization: None,
-            })?;
+            response = self
+                .http
+                .get(GithubRequest {
+                    url: url.to_string(),
+                    accept,
+                    authorization: None,
+                })
+                .map_err(GithubApiError::Http)?;
             anonymous = true;
         }
         if !(200..300).contains(&response.status) {
@@ -281,7 +422,7 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
     fn authorization(
         &self,
         authentication: GithubAuthentication,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, GithubApiError> {
         match (&self.token_source, authentication) {
             (GithubTokenSource::Fixed(token), GithubAuthentication::Optional)
             | (GithubTokenSource::Fixed(token), GithubAuthentication::Required) => {
@@ -289,7 +430,7 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
             }
             (GithubTokenSource::Anonymous, GithubAuthentication::Optional) => Ok(None),
             (GithubTokenSource::Anonymous, GithubAuthentication::Required) => {
-                Err(github_authentication_error())
+                Err(GithubApiError::Authentication(github_authentication_error()))
             }
             (GithubTokenSource::Lazy(provider), GithubAuthentication::Optional) => Ok(self
                 .resolved_token
@@ -302,7 +443,7 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
                 .get_or_init(|| provider.get_github_token())
                 .as_ref()
                 .map(|token| Some(format!("Bearer {token}")))
-                .map_err(Clone::clone),
+                .map_err(|error| GithubApiError::Authentication(error.clone())),
         }
     }
 }
@@ -317,72 +458,31 @@ struct GithubErrorResponse {
     message: String,
 }
 
-fn github_status_error(response: &GithubResponse, url: &str, anonymous: bool) -> String {
-    let detail = serde_json::from_slice::<GithubErrorResponse>(&response.body)
+fn github_status_error(
+    response: &GithubResponse,
+    url: &url::Url,
+    anonymous: bool,
+) -> GithubApiError {
+    let message = serde_json::from_slice::<GithubErrorResponse>(&response.body)
         .ok()
         .map(|error| error.message);
-    let mut message = format!("GitHub API returned status {} for {url}", response.status);
-    if let Some(detail) = detail {
-        message.push_str(": ");
-        message.push_str(&detail);
+    GithubApiError::Status {
+        status: response.status,
+        endpoint: endpoint_label(url),
+        message,
+        anonymous,
     }
-    if anonymous && matches!(response.status, 401 | 403 | 404) {
-        message.push_str(". Set GITHUB_TOKEN or run `gh auth login` to authenticate");
-    }
-    message
 }
 
-fn github_repo_url(source: &GithubSource, suffix: &[&str]) -> Result<url::Url, String> {
-    let mut url = url::Url::parse("https://api.github.com/")
-        .map_err(|error| format!("Failed to construct GitHub API URL: {error}"))?;
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|()| "GitHub API base URL cannot contain path segments".to_string())?;
-        segments.push("repos");
-        segments.push(source.owner());
-        segments.push(source.repo());
-        for segment in suffix {
-            segments.push(segment);
-        }
-    }
-    Ok(url)
+fn parse_json<T: DeserializeOwned>(body: &[u8], url: &url::Url) -> Result<T, GithubApiError> {
+    serde_json::from_slice(body).map_err(|source| GithubApiError::Decode {
+        endpoint: endpoint_label(url),
+        source,
+    })
 }
 
-fn validate_github_api_url(raw: &str) -> Result<(), String> {
-    let url =
-        url::Url::parse(raw).map_err(|error| format!("Invalid GitHub API URL '{raw}': {error}"))?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("api.github.com")
-        || url.port().is_some()
-        || has_explicit_port(raw)
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(format!(
-            "Refusing to send GitHub API credentials to non-GitHub URL: {raw}"
-        ));
-    }
-    Ok(())
-}
-
-fn has_explicit_port(raw: &str) -> bool {
-    let Some(rest) = raw.strip_prefix("https://") else {
-        return false;
-    };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-    authority.rsplit_once(':').is_some()
-}
-
-fn parse_json<T: DeserializeOwned>(body: &[u8], url: &str) -> Result<T, String> {
-    serde_json::from_slice(body)
-        .map_err(|error| format!("Failed to parse GitHub response from {url}: {error}"))
+fn endpoint_label(url: &url::Url) -> String {
+    url.path().to_string()
 }
 
 fn next_link(header: &str) -> Option<&str> {
@@ -510,13 +610,17 @@ mod tests {
         }
     }
 
+    fn repo_slug() -> RepoSlug {
+        RepoSlug::try_from(&github_source()).unwrap()
+    }
+
     #[test]
     fn release_listing_sends_bearer_when_token_is_present() {
         let url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
         let http = FixtureGithubHttp::default().json(url, r#"[]"#);
         let api = GithubApi::new(&http, Some("test-token"));
 
-        api.list_releases(&github_source()).unwrap();
+        api.list_releases(&repo_slug()).unwrap();
 
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
@@ -530,7 +634,7 @@ mod tests {
         let http = FixtureGithubHttp::default().json(url, r#"[]"#);
         let api = GithubApi::new(&http, None);
 
-        api.list_releases(&github_source()).unwrap();
+        api.list_releases(&repo_slug()).unwrap();
 
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
@@ -540,7 +644,7 @@ mod tests {
     #[test]
     fn release_listing_follows_next_link_until_exhausted() {
         let first = "https://api.github.com/repos/acme/widget/releases?per_page=100";
-        let second = "https://api.github.com/repositories/123/releases?per_page=100&page=2";
+        let second = "https://api.github.com/repos/acme/widget/releases?per_page=100&page=2";
         let http = FixtureGithubHttp::default()
             .json_with_headers(
                 first,
@@ -550,7 +654,7 @@ mod tests {
             .json(second, r#"[{"tag_name":"1.0.0","assets":[]}]"#);
         let api = GithubApi::new(&http, None);
 
-        let releases = api.list_releases(&github_source()).unwrap();
+        let releases = api.list_releases(&repo_slug()).unwrap();
 
         assert_eq!(
             releases
@@ -575,7 +679,7 @@ mod tests {
         let api = GithubApi::new(&http, Some("test-token"));
 
         let bytes = api
-            .download_release_asset(&github_source(), ReleaseAssetId::from_lock(42))
+            .download_release_asset(&repo_slug(), AssetId::from_lock(42))
             .unwrap();
 
         assert_eq!(bytes, b"wasm");
@@ -597,7 +701,7 @@ mod tests {
         );
         let api = GithubApi::new(&http, None);
 
-        let error = api.list_releases(&github_source()).unwrap_err();
+        let error = api.list_releases(&repo_slug()).unwrap_err().to_string();
 
         assert!(error.contains("Repository access denied"), "{error}");
         assert!(error.contains("GITHUB_TOKEN"), "{error}");
@@ -616,8 +720,8 @@ mod tests {
         };
         let api = GithubApi::with_token_provider(&http, &tokens);
 
-        api.list_releases(&github_source()).unwrap();
-        api.download_release_asset(&github_source(), ReleaseAssetId::from_lock(42))
+        api.list_releases(&repo_slug()).unwrap();
+        api.download_release_asset(&repo_slug(), AssetId::from_lock(42))
             .unwrap();
 
         assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);
@@ -636,7 +740,7 @@ mod tests {
             .response(url, 200, r#"[]"#, &[]);
         let api = GithubApi::new(&http, Some("expired-token"));
 
-        assert!(api.list_releases(&github_source()).is_ok());
+        assert!(api.list_releases(&repo_slug()).is_ok());
 
         let requests = http.requests();
         assert_eq!(requests.len(), 2);
@@ -646,18 +750,49 @@ mod tests {
 
     #[test]
     fn required_authentication_does_not_retry_unauthorized_request_anonymously() {
-        let url = "https://api.github.com/repos/acme/widget/git/ref/heads/main";
+        let url = "https://api.github.com/repos/acme/widget/commits/heads%2Fmain";
         let http = FixtureGithubHttp::default()
             .response(url, 401, r#"{"message":"Bad credentials"}"#, &[])
             .response(url, 200, r#"{}"#, &[]);
         let api = GithubApi::new(&http, Some("expired-token"));
 
-        let error = api.get_json::<serde_json::Value>(url).unwrap_err();
+        let error = api
+            .commit(&repo_slug(), &GitRef::new("heads/main".into()).unwrap())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("Bad credentials"), "{error}");
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].authorization(), Some("Bearer expired-token"));
+    }
+
+    #[test]
+    fn commit_response_rejects_non_canonical_sha() {
+        let url = "https://api.github.com/repos/acme/widget/commits/main";
+        let http = FixtureGithubHttp::default()
+            .json(url, r#"{"sha":"ABCDEF0123456789abcdef0123456789abcdef01"}"#);
+        let api = GithubApi::new(&http, Some("token"));
+
+        let error = api
+            .commit(&repo_slug(), &GitRef::new("main".into()).unwrap())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GithubApiError::Location(GithubLocationError::InvalidCommitSha { .. })
+        ));
+    }
+
+    #[test]
+    fn workflow_runs_builds_query_from_typed_commit_sha() {
+        let sha = CommitSha::new("abcdef0123456789abcdef0123456789abcdef01".into()).unwrap();
+        let url = "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abcdef0123456789abcdef0123456789abcdef01&status=success&per_page=10";
+        let http = FixtureGithubHttp::default().json(url, r#"{"workflow_runs":[{"id":7}]}"#);
+        let api = GithubApi::new(&http, Some("token"));
+
+        assert_eq!(api.workflow_runs(&repo_slug(), &sha).unwrap(), [7]);
+        assert_eq!(http.requests()[0].url(), url);
     }
 
     #[test]
@@ -667,7 +802,7 @@ mod tests {
         let http = FixtureGithubHttp::default().response(url, 500, secret_body, &[]);
         let api = GithubApi::new(&http, None);
 
-        let error = api.list_releases(&github_source()).unwrap_err();
+        let error = api.list_releases(&repo_slug()).unwrap_err().to_string();
 
         assert!(error.contains("status 500"), "{error}");
         assert!(!error.contains(secret_body), "{error}");
@@ -676,10 +811,11 @@ mod tests {
 
     #[test]
     fn github_api_url_rejects_explicit_port() {
-        let error = validate_github_api_url("https://api.github.com:8443/repos/acme/widget")
+        let error = repo_slug()
+            .validate_url("https://api.github.com:8443/repos/acme/widget/releases")
             .expect_err("an explicit port must not be accepted for GitHub API requests");
 
-        assert!(error.contains("non-GitHub URL"), "{error}");
+        assert!(error.to_string().contains("non-GitHub URL"), "{error}");
     }
 
     struct CycleGithubHttp {
@@ -711,7 +847,7 @@ mod tests {
         };
         let api = GithubApi::new(&http, None);
 
-        let error = api.list_releases(&github_source()).unwrap_err();
+        let error = api.list_releases(&repo_slug()).unwrap_err().to_string();
 
         assert!(error.contains("pagination cycle"), "{error}");
         assert_eq!(http.requests.lock().unwrap().len(), 1);
@@ -728,9 +864,37 @@ mod tests {
         );
         let api = GithubApi::new(&http, None);
 
-        let error = api.list_releases(&github_source()).unwrap_err();
+        let error = api.list_releases(&repo_slug()).unwrap_err().to_string();
 
         assert!(error.contains("non-GitHub URL"), "{error}");
+        assert_eq!(http.requests().len(), 1);
+        assert_eq!(http.requests()[0].url(), first);
+    }
+
+    #[test]
+    fn release_pagination_rejects_next_link_outside_typed_repo_before_requesting_it() {
+        let first = "https://api.github.com/repos/acme/widget/releases?per_page=100";
+        let other_repo = "https://api.github.com/repos/attacker/other/releases?page=2";
+        let http = FixtureGithubHttp::default().json_with_headers(
+            first,
+            r#"[]"#,
+            &[("Link", format!("<{other_repo}>; rel=\"next\""))],
+        );
+        let api = GithubApi::new(&http, None);
+
+        let error = api.list_releases(&repo_slug()).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GithubApiError::Location(GithubLocationError::UnexpectedRepositoryPath {
+                    expected_prefix,
+                    actual_path,
+                }) if expected_prefix == "/repos/acme/widget/"
+                    && actual_path == "/repos/attacker/other/releases"
+            ),
+            "{error}"
+        );
         assert_eq!(http.requests().len(), 1);
         assert_eq!(http.requests()[0].url(), first);
     }

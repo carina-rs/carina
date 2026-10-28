@@ -7445,7 +7445,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         name: "awscc".into(),
         source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
-            version: "1.0.0".into(),
+            version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
@@ -7584,7 +7584,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         name: "awscc".into(),
         source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
-            version: "1.0.0".into(),
+            version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
