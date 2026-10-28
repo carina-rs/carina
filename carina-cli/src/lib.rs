@@ -39,6 +39,37 @@ pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_composition_call_path() -> carina_core::resource::CompositionCallPath {
+    test_composition_call_path_in(std::path::Path::new(
+        "/carina-tests/composition-fixture.crn",
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn test_composition_call_path_in(
+    source_file: &std::path::Path,
+) -> carina_core::resource::CompositionCallPath {
+    let parsed = carina_core::parser::parse_file(
+        "let fixture_module = use { source = './fixture_module' }\nfixture_module {}\n",
+        source_file,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse composition test call");
+    let call = parsed
+        .module_calls
+        .first()
+        .expect("composition test call must exist");
+    carina_core::resource::CompositionCallPath::direct(carina_core::resource::CompositionCall {
+        id: call.id().clone(),
+        module_name: call.module_name.clone(),
+        binding: call.binding_name.clone(),
+        instance: "fixture_module".to_string(),
+        module_source: Some("./fixture_module".to_string()),
+        module_directory: None,
+    })
+}
+
+#[cfg(test)]
 pub(crate) struct ScopedTestEnvVar {
     name: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -377,7 +408,7 @@ fn dispatch_fixture_create(
         }
     }
     let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
@@ -438,7 +469,7 @@ pub(crate) fn fixture_repend_in_flight_create(
 ) -> carina_core::provider::InFlightCreate {
     let id = pending.id().clone();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,

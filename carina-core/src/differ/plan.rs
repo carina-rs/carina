@@ -220,7 +220,7 @@ pub fn generate_temporary_name(
 /// # Typestate invariants
 ///
 /// compositions are intentionally not an input. The compile-fail doctest
-/// below pins that — passing a [`Composition`](crate::resource::Composition)
+/// below pins that — passing a [`LiveComposition`](crate::resource::LiveComposition)
 /// slice must fail to type-check, so the post-apply-only composition class
 /// (carina#3169) cannot accidentally reach pre-apply differ logic.
 ///
@@ -228,9 +228,9 @@ pub fn generate_temporary_name(
 /// use std::collections::HashMap;
 /// use carina_core::differ::{Orphans, PlanPriorStates, create_plan};
 /// use carina_core::provider::RawSavedAttrs;
-/// use carina_core::resource::{Composition, Current, ResourceId, into_plan_input_current_map};
+/// use carina_core::resource::{LiveComposition, Current, ResourceId, into_plan_input_current_map};
 /// use carina_core::schema::SchemaRegistry;
-/// let compositions: Vec<Composition> = vec![];
+/// let compositions: Vec<LiveComposition> = vec![];
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
 /// let states = HashMap::<ResourceId, Current>::new();

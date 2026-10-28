@@ -77,7 +77,7 @@ pub(super) fn failure_binding_name(effect: &Effect) -> Option<String> {
 pub(super) fn build_scheduler_deps(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     finish_scheduler_deps(
@@ -92,10 +92,28 @@ pub(super) fn build_scheduler_deps(
     )
 }
 
+pub(super) fn build_saved_scheduler_deps(
+    effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    compositions: &[crate::resource::SavedComposition],
+    deferred_replace_delete_deps: &[(usize, usize)],
+) -> SchedulerDeps {
+    finish_scheduler_deps(
+        effects,
+        crate::effect::deps::build_saved_effect_dependency_analysis(
+            effects,
+            unresolved_resources,
+            compositions,
+            ScheduleInputs::Apply,
+        ),
+        deferred_replace_delete_deps,
+    )
+}
+
 pub(super) fn build_scheduler_deps_from_resources(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     let effect_refs: Vec<_> = effects.iter().collect();

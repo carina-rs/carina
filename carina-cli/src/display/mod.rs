@@ -1164,7 +1164,7 @@ fn format_plan_tree<'a>(
     // followed by the leaf rows. Roots with no lineage entry render
     // at the top level as before. (carina#3307 introduced the
     // grouping; carina#3322 renamed the user-facing label from
-    // `Composition "<binding>"` to the DSL-visible
+    // `LiveComposition "<binding>"` to the DSL-visible
     // `module "<binding>" (<source_path>)` shape.)
     let composition_groups = group_roots_by_outermost_composition(plan, &roots, expansion_trace);
 
@@ -1229,7 +1229,7 @@ fn format_plan_tree<'a>(
 /// `module` matches the DSL `module_call` construct the operator
 /// wrote (`let r = infra { ... }`), so it is something they can
 /// trace back to their own `.crn` — unlike the previous internal
-/// `Composition` label (carina#3322).
+/// `LiveComposition` label (carina#3322).
 fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
     let sigil = Sigil::module_header();
     let prefix = top_level_sigil_prefix(&sigil);

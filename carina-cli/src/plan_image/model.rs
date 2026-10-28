@@ -8,7 +8,7 @@ use carina_core::identifier::anonymous_identity_discriminator;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::plan_tree::build_dependency_graph_from_effects;
 use carina_core::resource::{
-    Composition, EphemeralId, ExpansionTrace, ModuleSource, PersistentId, ResolvedResource,
+    EphemeralId, ExpansionTrace, LiveComposition, ModuleSource, PersistentId, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
 };
 
@@ -27,7 +27,7 @@ pub struct PlanImageInput<'a> {
     /// Identity-resolved snapshots from before value/reference resolution.
     /// The executor scheduler uses these to reconstruct apply-order edges.
     pub unresolved_resources: &'a [UnresolvedResource],
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub expansion_trace: Option<&'a ExpansionTrace>,
     pub state: Option<StateMetadata<'a>>,
     pub summary: &'a PlanChangeSummary,
@@ -798,7 +798,7 @@ fn deferred_label(binding: &str, id: &ResolvedResourceId) -> String {
 }
 
 fn build_module_catalog(
-    compositions: &[Composition],
+    compositions: &[LiveComposition],
     trace: Option<&ExpansionTrace>,
 ) -> HashMap<EphemeralId, ModuleInfo> {
     let mut catalog = HashMap::new();
@@ -818,7 +818,8 @@ fn build_module_catalog(
         }
     }
     for composition in compositions {
-        let info = if let Some(call) = composition.diagnostic_root_call() {
+        let info = {
+            let call = composition.call_path().root();
             let Ok(identity) = ResourceIdentity::try_from(call.instance.clone()) else {
                 continue;
             };
@@ -826,15 +827,6 @@ fn build_module_catalog(
                 id: EphemeralId::new(ResolvedResourceId::with_identity("_virtual", identity)),
                 label: call.display_label(),
                 source_path: call.module_source.clone(),
-            }
-        } else {
-            ModuleInfo {
-                id: composition.ephemeral_id(),
-                label: composition
-                    .binding
-                    .clone()
-                    .unwrap_or_else(|| format!("{} (anonymous call)", composition.module_name)),
-                source_path: None,
             }
         };
         catalog.entry(info.id.clone()).or_insert(info);

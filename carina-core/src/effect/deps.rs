@@ -336,25 +336,24 @@ impl IdentityTargets {
     }
 }
 
-struct DependencyAnalyzer {
+struct DependencyAnalyzer<'a> {
     instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
     delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
-    compositions_by_binding: HashMap<String, crate::resource::Composition>,
+    compositions_by_binding: HashMap<String, crate::resource::CompositionRuntimeRef<'a>>,
 }
 
-impl DependencyAnalyzer {
+impl<'a> DependencyAnalyzer<'a> {
     fn new(
         instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
         delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
-        compositions: &[crate::resource::Composition],
+        compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
     ) -> Self {
         let compositions_by_binding = compositions
-            .iter()
+            .into_iter()
             .filter_map(|composition| {
                 composition
-                    .binding
-                    .clone()
-                    .map(|binding| (binding, composition.clone()))
+                    .binding()
+                    .map(|binding| (binding.to_string(), composition))
             })
             .collect();
         Self {
@@ -507,7 +506,7 @@ impl DependencyAnalyzer {
         let Some(composition) = self.compositions_by_binding.get(binding) else {
             return;
         };
-        for inner in crate::deps::get_composition_dependencies(composition) {
+        for inner in crate::deps::get_composition_runtime_dependencies(*composition) {
             if self.compositions_by_binding.contains_key(inner.as_str())
                 || self.lookup_by_string_ref(inner.as_str()).is_some()
             {
@@ -534,14 +533,41 @@ impl DependencyAnalyzer {
 pub fn build_effect_dependency_analysis(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
-        unresolved_resources
-            .get(id)
-            .map(UnresolvedResource::as_resource)
-    })
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Live),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(UnresolvedResource::as_resource)
+        },
+    )
+}
+
+pub fn build_saved_effect_dependency_analysis(
+    effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    compositions: &[crate::resource::SavedComposition],
+    inputs: ScheduleInputs<'_>,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Saved),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(UnresolvedResource::as_resource)
+        },
+    )
 }
 
 /// Borrowed-resource form of [`build_effect_dependency_analysis`].
@@ -551,19 +577,26 @@ pub fn build_effect_dependency_analysis(
 pub(crate) fn build_effect_dependency_analysis_from_resources(
     effects: &[&Effect],
     unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
-        unresolved_resources
-            .get(id)
-            .map(|resource| resource.as_resource())
-    })
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Live),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(|resource| resource.as_resource())
+        },
+    )
 }
 
-fn build_effect_dependency_analysis_with_lookup<'a, E, F>(
+fn build_effect_dependency_analysis_with_lookup<'a, 'composition, E, F>(
     effects: &[E],
-    compositions: &[crate::resource::Composition],
+    compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'composition>>,
     inputs: ScheduleInputs<'_>,
     unresolved_resource: F,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
@@ -783,7 +816,7 @@ mod tests {
 
     fn analyzer_from_instance_to_idx(
         instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
-    ) -> DependencyAnalyzer {
+    ) -> DependencyAnalyzer<'static> {
         let mut delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>> = HashMap::new();
         for (key, targets) in &instance_to_idx {
             let blockers = targets.lookup_delete_blockers();
@@ -798,7 +831,11 @@ mod tests {
             blockers.sort_unstable();
             blockers.dedup();
         }
-        DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_identity, &[])
+        DependencyAnalyzer::new(
+            instance_to_idx,
+            delete_blockers_by_identity,
+            std::iter::empty(),
+        )
     }
 
     fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {

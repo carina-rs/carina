@@ -6296,7 +6296,7 @@ mod tests {
         let mut resource = Resource::from_id(id.clone());
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
@@ -6379,7 +6379,7 @@ mod tests {
         let mut resource = Resource::from_id(pending.id().clone());
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let provider_configs = [];
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];

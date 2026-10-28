@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
-    ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome, ProviderCheckInputs,
-    UnresolvedResource, execute_plan,
+    ExecutionEvent, ExecutionObserver, ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
+    UnresolvedResource, execute_live_plan,
 };
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
@@ -311,7 +311,7 @@ fn canonical_pair<E: Clone>(
 fn build_override_aware_pair_for_test<S>(
     unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
     state_file: Option<&S>,
-    inputs: PreApplyInputs<'_>,
+    inputs: LivePreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
 where
     S: carina_core::override_aware::NameOverrideSource + ?Sized,
@@ -944,7 +944,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
-        carina_core::binding_index::PreApplyInputs {
+        carina_core::binding_index::LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -954,7 +954,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
         },
     )
     .unwrap();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let mut current_states = HashMap::new();
     let mut data_source_values = DataSourceValues::empty();
     let mut orphans = Orphans::new();
@@ -1063,7 +1063,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(vec![desired], &SchemaRegistry::new()),
         None::<&StateFile>,
-        PreApplyInputs {
+        LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -1135,7 +1135,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         .prepare(
             &mut resources,
             &resource_origins,
-            &carina_core::executor::ModuleConstraintGate::new(&[]),
+            &carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]),
             &mut current_states,
             &mut data_source_values,
             &mut orphans,
@@ -4674,7 +4674,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         ctx.schemas(),
         &sorted_resources,
     );
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &sorted_resources,
         compositions: &[],
         managed_current: &plan_input_states,
@@ -4689,7 +4689,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .into_executable()
         .expect("fixture plan must not contain blocked data sources");
     let provider = CascadeCreateProvider::default();
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan: &plan_ctx.plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -4707,7 +4707,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         precompleted_success_count: 0,
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
-    let outcome = execute_plan(
+    let outcome = execute_live_plan(
         &provider,
         input,
         &NoopExecutionObserver,
@@ -5349,7 +5349,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
 
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
     let bindings = ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     for resolution in resolved {
         match resolution {
             DataSourceRefreshResolution::Resolved(resource) => {
@@ -5401,7 +5401,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
         .expect("schema fixture must be valid"),
     );
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
 
     let error = read_data_source_with_retry(
         &provider,
@@ -5780,7 +5780,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             ctx.schemas(),
         ),
         None::<&StateFile>,
-        PreApplyInputs {
+        LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -8317,7 +8317,7 @@ mod resolved_value_constraint_gate {
     use super::{build_override_aware_pair_for_test, canonical_pair, canonical_unresolved};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use carina_core::binding_index::PreApplyInputs;
+    use carina_core::binding_index::LivePreApplyInputs;
     use carina_core::effect::PlanOp;
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
@@ -8327,8 +8327,8 @@ mod resolved_value_constraint_gate {
         ready_noop,
     };
     use carina_core::resource::{
-        AccessPath, Composition, DataSource, InterpolationPart, ModuleConstraintId,
-        PendingModuleConstraint, Signature, UnknownReason,
+        AccessPath, DataSource, InterpolationPart, LiveComposition, LiveCompositionSignature,
+        ModuleConstraintId, PendingModuleConstraint, UnknownReason,
     };
     use carina_core::schema::{TypeIdentity, ValidatorType};
 
@@ -8632,14 +8632,14 @@ mod resolved_value_constraint_gate {
             .with_binding("consumer")
             .with_attribute(resolved_attribute, ref_value());
         let source = vec![producer, consumer];
-        let compositions = Vec::<Composition>::new();
+        let compositions = Vec::<LiveComposition>::new();
         let current_states = HashMap::new();
         let remote_bindings = HashMap::new();
         let wait_aliases = Vec::new();
         let (resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(source, &SchemaRegistry::new()),
             None::<&carina_state::StateFile>,
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions: &compositions,
                 managed_current: &current_states,
@@ -8661,7 +8661,8 @@ mod resolved_value_constraint_gate {
         let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
+        let module_gate =
+            carina_core::executor::ModuleConstraintGate::from_live_compositions(&compositions);
         let mut current_states = HashMap::new();
         let mut data_source_values = DataSourceValues::empty();
         let mut orphans = Orphans::new();
@@ -8686,18 +8687,22 @@ mod resolved_value_constraint_gate {
     fn pending_composition(
         arguments: Vec<(&str, Value)>,
         constraint: PendingModuleConstraint,
-    ) -> Composition {
-        Composition {
+    ) -> LiveComposition {
+        LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: arguments
                     .into_iter()
                     .map(|(name, value)| {
                         (
                             name.to_string(),
-                            serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap(),
+                            carina_core::resource::LiveCompositionArgument::from_value(
+                                value,
+                                carina_core::parser::TypeExpr::String,
+                                carina_core::parser::ArgumentOrigin::Defaulted,
+                            ),
                         )
                     })
                     .collect(),
@@ -8708,7 +8713,7 @@ mod resolved_value_constraint_gate {
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -8723,7 +8728,7 @@ mod resolved_value_constraint_gate {
 
     async fn prepare_composition(
         producer_values: Vec<(&str, Value)>,
-        composition: &mut Composition,
+        composition: &mut LiveComposition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
         let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let mut producer =
@@ -8738,7 +8743,7 @@ mod resolved_value_constraint_gate {
         let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(vec![producer], ctx.schemas()),
             None::<&carina_state::StateFile>,
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions,
                 managed_current: &current_states,
@@ -8753,8 +8758,9 @@ mod resolved_value_constraint_gate {
         let mut data_source_values = DataSourceValues::empty();
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
-        let module_gate =
-            carina_core::executor::ModuleConstraintGate::new(std::slice::from_ref(composition));
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
+            std::slice::from_ref(composition),
+        );
 
         PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
             .prepare(
@@ -8883,7 +8889,7 @@ mod resolved_value_constraint_gate {
         let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(Vec::new(), ctx.schemas()),
             None::<&carina_state::StateFile>,
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions: &[],
                 managed_current: &HashMap::new(),
@@ -8901,7 +8907,7 @@ mod resolved_value_constraint_gate {
             DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
                 .with_attribute("target", ref_value()),
         ];
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let mut states = HashMap::new();
         let mut data_source_values = super::test_data_source_values(&data_sources, &HashMap::new());
         let mut orphans = Orphans::new();

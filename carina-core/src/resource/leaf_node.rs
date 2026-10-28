@@ -3,22 +3,22 @@
 //! `LeafNode` is the [`GraphNode`](super::GraphNode) **subset** that
 //! contains only the variants which survive composition expansion:
 //! resources (CRUD) and data sources (read). A
-//! [`Composition`](super::Composition) is, by definition, the
+//! [`LiveComposition`](super::LiveComposition) is, by definition, the
 //! intermediate-only node that expands away into leaves; it is
 //! therefore deliberately not representable by `LeafNode`.
 //!
 //! ## Why a separate enum
 //!
 //! The `#3287` design splits the IR pipeline so that
-//! `Composition` is a parse-time construct, while the differ /
+//! `LiveComposition` is a parse-time construct, while the differ /
 //! executor / state layers only ever see leaves. Encoding the
-//! "no `Composition` past this point" invariant in the type system —
+//! "no `LiveComposition` past this point" invariant in the type system —
 //! rather than in a hand-maintained doctest or a runtime guard —
 //! means a stale or misguided caller cannot pass a composition into
 //! the post-expansion path: the code does not type-check.
 //!
 //! Today the practical guarantee is structural: `LeafNode` has two
-//! variants and no `Composition` arm. As callers migrate from
+//! variants and no `LiveComposition` arm. As callers migrate from
 //! threading `&[Resource], &[DataSource]` pairs to receiving
 //! `&[LeafNode]` (or iterating `into_leaf_nodes()`), the type guard
 //! propagates outward; future PRs in the series tighten the
@@ -29,20 +29,20 @@
 //!
 //! - `GraphNode::Resource(r)` / `GraphNode::DataSource(d)` → matching
 //!   `LeafNode` variant.
-//! - `GraphNode::Composition(_)` → `None`. Use [`expand_to_leaves`] to
+//! - `GraphNode::LiveComposition(_)` → `None`. Use [`expand_to_leaves`] to
 //!   collect the leaf nodes from a `Vec<GraphNode>` while dropping
 //!   compositions, or [`TryFrom<GraphNode>`](LeafNode#impl-TryFrom<GraphNode>-for-LeafNode)
 //!   for single-node conversion that surfaces the failure.
 
 use serde::{Deserialize, Serialize};
 
-use super::{Composition, DataSource, GraphNode, Resource, ResourceId};
+use super::{DataSource, GraphNode, LiveComposition, Resource, ResourceId};
 
 /// An owned post-expansion IR node — either a resource (CRUD) or a
 /// data source (read-only).
 ///
 /// `LeafNode` is the type-level guarantee that
-/// [`Composition`](super::Composition) cannot enter post-expansion
+/// [`LiveComposition`](super::LiveComposition) cannot enter post-expansion
 /// paths. Convert from [`GraphNode`](super::GraphNode) via
 /// [`TryFrom<GraphNode>`](#impl-TryFrom<GraphNode>-for-LeafNode) (for
 /// a single node where the caller wants to handle the composition
@@ -120,11 +120,11 @@ impl From<LeafNode> for GraphNode {
     }
 }
 
-/// A `GraphNode` was a `Composition`, so it cannot become a `LeafNode`.
+/// A `GraphNode` was a `LiveComposition`, so it cannot become a `LeafNode`.
 ///
 /// Returned by [`TryFrom<GraphNode> for LeafNode`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompositionNotALeaf(pub Composition);
+pub struct CompositionNotALeaf(pub LiveComposition);
 
 impl TryFrom<GraphNode> for LeafNode {
     type Error = CompositionNotALeaf;
@@ -133,7 +133,7 @@ impl TryFrom<GraphNode> for LeafNode {
         match node {
             GraphNode::Resource(r) => Ok(LeafNode::Resource(r)),
             GraphNode::DataSource(d) => Ok(LeafNode::DataSource(d)),
-            GraphNode::Composition(c) => Err(CompositionNotALeaf(c)),
+            GraphNode::LiveComposition(c) => Err(CompositionNotALeaf(c)),
         }
     }
 }
@@ -141,7 +141,7 @@ impl TryFrom<GraphNode> for LeafNode {
 /// Expand a `Vec<GraphNode>` into leaves, discarding compositions.
 ///
 /// This is the simple form of the expansion boundary: every
-/// `Composition` is dropped from the output. A later PR in the series
+/// `LiveComposition` is dropped from the output. A later PR in the series
 /// will return an `ExpansionTrace` alongside the leaves so the display
 /// layer can fold leaf rows under their originating composition; for
 /// now the trace would be a placeholder unit and is therefore omitted
@@ -170,12 +170,12 @@ mod tests {
         DataSource::new("aws.ec2.Ami", "ami")
     }
 
-    fn sample_composition() -> Composition {
+    fn sample_composition() -> LiveComposition {
         use indexmap::IndexMap;
         use std::collections::{BTreeSet, HashSet};
-        Composition {
+        LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
-            signature: super::super::Signature {
+            signature: super::super::LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -184,7 +184,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn try_from_graph_node_composition_err() {
         let c = sample_composition();
-        let node = GraphNode::Composition(c.clone());
+        let node = GraphNode::LiveComposition(c.clone());
         let err = LeafNode::try_from(node).expect_err("composition is not a leaf");
         assert_eq!(err.0.id, c.id);
     }
@@ -231,7 +231,7 @@ mod tests {
     fn expand_to_leaves_drops_compositions() {
         let nodes = vec![
             GraphNode::Resource(sample_resource()),
-            GraphNode::Composition(sample_composition()),
+            GraphNode::LiveComposition(sample_composition()),
             GraphNode::DataSource(sample_data_source()),
         ];
         let leaves = expand_to_leaves(nodes);
@@ -248,17 +248,17 @@ mod tests {
         assert_eq!(leaf, back);
     }
 
-    /// Composition cannot be constructed as a `LeafNode`. Pinning this
-    /// at the type level (no `LeafNode::Composition` variant exists)
+    /// LiveComposition cannot be constructed as a `LeafNode`. Pinning this
+    /// at the type level (no `LeafNode::LiveComposition` variant exists)
     /// is the core guarantee of this enum.
     ///
     /// ```compile_fail
-    /// use carina_core::resource::{LeafNode, Composition, ResourceId, Signature};
+    /// use carina_core::resource::{LeafNode, LiveComposition, ResourceId, LiveCompositionSignature};
     /// use indexmap::IndexMap;
     /// use std::collections::{BTreeSet, HashSet};
-    /// let c = Composition {
+    /// let c = LiveComposition {
     ///     id: ResourceId::with_identity("_virtual", "m"),
-    ///     signature: Signature {
+    ///     signature: LiveCompositionSignature {
     ///         arguments: IndexMap::new(),
     ///         attributes: IndexMap::new(),
     ///     },
@@ -266,10 +266,10 @@ mod tests {
     ///     dependency_bindings: BTreeSet::new(),
     ///     module_name: "m".to_string(),
     ///     instance: "i".to_string(),
-    ///     provenance: Default::default(),
+    ///     call_path: Default::default(),
     ///     quoted_string_attrs: HashSet::new(),
     /// };
-    /// // No `From<Composition> for LeafNode` impl exists. This must
+    /// // No `From<LiveComposition> for LeafNode` impl exists. This must
     /// // fail to type-check.
     /// let _leaf: LeafNode = c.into();
     /// ```

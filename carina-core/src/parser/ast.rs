@@ -11,8 +11,8 @@ use crate::binding_index::IterableBindings;
 use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode,
-    LeafNode, PathSegment, Resource, ResourceId, ResourceIdentity, StructuralOperand,
+    ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode, LeafNode,
+    LiveComposition, PathSegment, Resource, ResourceId, ResourceIdentity, StructuralOperand,
     StructuralOperandRef, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
@@ -176,7 +176,7 @@ pub enum ResourceRef<'a> {
     /// A top-level resource.
     Resource(&'a Resource),
     /// A top-level composition (module-expansion synthetic node).
-    Composition(&'a Composition),
+    LiveComposition(&'a LiveComposition),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource),
     /// The template body of a deferred `for` expression — always a
@@ -192,7 +192,7 @@ impl<'a> ResourceRef<'a> {
     pub fn id(&self) -> &'a ResourceId {
         match self {
             ResourceRef::Resource(r) => &r.id,
-            ResourceRef::Composition(v) => &v.id,
+            ResourceRef::LiveComposition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
             ResourceRef::Deferred { resource, .. } => &resource.id,
         }
@@ -201,8 +201,8 @@ impl<'a> ResourceRef<'a> {
     /// Source-order preserving attribute map as `Value`s.
     ///
     /// Returned as a [`Cow`](std::borrow::Cow) because
-    /// [`Composition`] stores its attributes typed as
-    /// [`CompositionAttribute`](crate::resource::CompositionAttribute)
+    /// [`LiveComposition`] stores its attributes typed as
+    /// [`LiveCompositionAttribute`](crate::resource::LiveCompositionAttribute)
     /// since #3294, and must materialize a `Value`-typed view on
     /// demand. The other three variants ([`Resource`],
     /// [`DataSource`], [`Deferred`](Self::Deferred)) return a borrowed
@@ -211,7 +211,7 @@ impl<'a> ResourceRef<'a> {
     pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value>> {
         match self {
             ResourceRef::Resource(r) => std::borrow::Cow::Borrowed(&r.attributes),
-            ResourceRef::Composition(v) => std::borrow::Cow::Owned(
+            ResourceRef::LiveComposition(v) => std::borrow::Cow::Owned(
                 v.signature
                     .attributes
                     .iter()
@@ -229,7 +229,7 @@ impl<'a> ResourceRef<'a> {
     pub fn binding(&self) -> Option<&'a str> {
         match self {
             ResourceRef::Resource(r) => r.binding.as_deref(),
-            ResourceRef::Composition(v) => v.binding.as_deref(),
+            ResourceRef::LiveComposition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
             ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
         }
@@ -244,19 +244,19 @@ impl<'a> ResourceRef<'a> {
     pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
         match self {
             ResourceRef::Resource(r) => &r.dependency_bindings,
-            ResourceRef::Composition(v) => &v.dependency_bindings,
+            ResourceRef::LiveComposition(v) => &v.dependency_bindings,
             ResourceRef::DataSource(d) => &d.dependency_bindings,
             ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
         }
     }
 
-    /// `directives` meta-argument block. [`Composition`] drops the
+    /// `directives` meta-argument block. [`LiveComposition`] drops the
     /// field (no `prevent_destroy` on a synthetic node) — returns `None`
     /// for the `Virtual` arm.
     pub fn directives(&self) -> Option<&'a Directives> {
         match self {
             ResourceRef::Resource(r) => Some(&r.directives),
-            ResourceRef::Composition(_) => None,
+            ResourceRef::LiveComposition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
             ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
         }
@@ -266,7 +266,7 @@ impl<'a> ResourceRef<'a> {
     pub fn quoted_string_attrs(&self) -> &'a HashSet<String> {
         match self {
             ResourceRef::Resource(r) => &r.quoted_string_attrs,
-            ResourceRef::Composition(v) => &v.quoted_string_attrs,
+            ResourceRef::LiveComposition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
             ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
         }
@@ -1165,6 +1165,85 @@ impl From<Value> for ModuleArgument {
     }
 }
 
+/// Parser-owned identity of a source file containing a module call.
+///
+/// The inner path is intentionally opaque: callers may inspect it for
+/// diagnostics and saved-plan normalization, but only the parser can mint an
+/// identity-bearing module call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceFileId(PathBuf);
+
+impl SourceFileId {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Parser-owned discriminator for one concrete `for` expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExpansionKey(String);
+
+impl ExpansionKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether a module call is direct or one concrete expansion of a `for` body.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallExpansion {
+    Direct,
+    Expanded(ExpansionKey),
+}
+
+/// Deterministic parser-minted identity of one concrete module call.
+///
+/// User-authored names and argument values deliberately do not participate in
+/// equality. The source file and authored span identify the call site, while
+/// [`CallExpansion`] distinguishes concrete iterations sharing that span.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallId {
+    source_file: SourceFileId,
+    call_span: SourceSpan,
+    expansion: CallExpansion,
+}
+
+impl ModuleCallId {
+    fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
+        Self {
+            source_file: SourceFileId(source_file),
+            call_span,
+            expansion: CallExpansion::Direct,
+        }
+    }
+
+    fn expand(&mut self, expansion_key: String) {
+        self.expansion = CallExpansion::Expanded(ExpansionKey(expansion_key));
+    }
+
+    pub fn source_file(&self) -> &Path {
+        self.source_file.path()
+    }
+
+    pub fn call_span(&self) -> SourceSpan {
+        self.call_span
+    }
+
+    pub fn expansion(&self) -> &CallExpansion {
+        &self.expansion
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_dummy() -> Self {
+        Self::direct(PathBuf::from("test.crn"), SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
+        Self::direct(source_file.into(), SourceSpan::dummy())
+    }
+}
+
 /// Module call (instantiation)
 #[derive(Debug, Clone)]
 pub struct ModuleCall {
@@ -1175,7 +1254,7 @@ pub struct ModuleCall {
 }
 
 impl ModuleCall {
-    pub(crate) fn from_authored_arguments_in_source(
+    pub(super) fn from_authored_arguments_in_source(
         module_name: impl Into<String>,
         binding_name: Option<String>,
         call_span: SourceSpan,
@@ -1187,9 +1266,7 @@ impl ModuleCall {
             binding_name,
             arguments,
             source: Box::new(ModuleCallSite {
-                file: source_file,
-                call_span,
-                expansion_key: None,
+                id: ModuleCallId::direct(source_file, call_span),
             }),
         }
     }
@@ -1213,23 +1290,22 @@ impl ModuleCall {
         )
     }
 
-    pub(crate) fn set_expansion_key(&mut self, expansion_key: String) {
-        self.source.expansion_key = Some(expansion_key);
+    pub(super) fn set_expansion_key(&mut self, expansion_key: String) {
+        self.source.id.expand(expansion_key);
+    }
+
+    pub fn id(&self) -> &ModuleCallId {
+        &self.source.id
     }
 
     /// Source file assigned before this call was parsed.
     pub fn source_file(&self) -> &std::path::Path {
-        &self.source.file
-    }
-
-    /// Concrete expansion identity for calls expanded from an authored site.
-    pub fn expansion_key(&self) -> Option<&str> {
-        self.source.expansion_key.as_deref()
+        self.source.id.source_file()
     }
 
     /// Return this call's parser span; every call carries one by construction.
     pub fn source_span(&self) -> SourceSpan {
-        self.source.call_span
+        self.source.id.call_span()
     }
 
     /// Iterate authored arguments, each of which carries parser spans by construction.
@@ -1281,9 +1357,7 @@ impl ModuleCall {
     /// Source identity retained by a directory-loaded module call.
     pub fn diagnostic_source(&self) -> ModuleCallDiagnosticSource {
         ModuleCallDiagnosticSource {
-            file: self.source.file.clone(),
-            call_span: self.source.call_span,
-            expansion_key: self.source.expansion_key.clone(),
+            id: self.source.id.clone(),
         }
     }
 }
@@ -1338,9 +1412,7 @@ impl AuthoredModuleArgument {
 
 #[derive(Debug, Clone)]
 struct ModuleCallSite {
-    file: PathBuf,
-    call_span: SourceSpan,
-    expansion_key: Option<String>,
+    id: ModuleCallId,
 }
 
 #[derive(Debug, Clone)]
@@ -1360,7 +1432,8 @@ impl DeclarationSource {
 /// Module calls, their arguments, and declaration parameters share this
 /// representation. Lines and columns are one-indexed, matching pest positions.
 /// Calls expanded from one `for` body intentionally share the authored span
-/// and are distinguished by [`ModuleCall::expansion_key`].
+/// and are distinguished by the [`CallExpansion`] carried by
+/// [`ModuleCall::id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceSpan {
     start_byte: usize,
@@ -1488,11 +1561,17 @@ impl SourceSpan {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleCallDiagnosticSource {
-    pub file: std::path::PathBuf,
-    pub call_span: SourceSpan,
-    /// Distinguishes concrete calls expanded from the same authored `for`
-    /// body. Direct calls have no expansion key.
-    pub expansion_key: Option<String>,
+    pub id: ModuleCallId,
+}
+
+impl ModuleCallDiagnosticSource {
+    pub fn file(&self) -> &Path {
+        self.id.source_file()
+    }
+
+    pub fn call_span(&self) -> SourceSpan {
+        self.id.call_span()
+    }
 }
 
 /// Parser-only binding metadata that must survive directory fixed-point passes.
@@ -1880,7 +1959,7 @@ pub struct File<E> {
     /// Read-only data-source resources (`read`-keyword resources).
     pub data_sources: Vec<DataSource>,
     /// Virtual resources synthesized by module-call expansion.
-    pub compositions: Vec<Composition>,
+    pub compositions: Vec<LiveComposition>,
     pub variables: IndexMap<String, Value>,
     /// Module `use` statements
     pub uses: Vec<UseStatement>,
@@ -2048,7 +2127,7 @@ impl<E> File<E> {
         self.resources
             .iter()
             .map(ResourceRef::Resource)
-            .chain(self.compositions.iter().map(ResourceRef::Composition))
+            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
             .chain(
                 self.deferred_for_expressions
@@ -2072,7 +2151,7 @@ impl<E> File<E> {
         self.resources
             .iter()
             .map(ResourceRef::Resource)
-            .chain(self.compositions.iter().map(ResourceRef::Composition))
+            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
     }
 
@@ -2139,7 +2218,7 @@ impl<E> File<E> {
     /// [`LeafNode`]s — i.e. resources and data sources only.
     ///
     /// `LeafNode` is the subset of [`GraphNode`] that has no
-    /// `Composition` variant by construction, so a downstream caller
+    /// `LiveComposition` variant by construction, so a downstream caller
     /// that takes `Vec<LeafNode>` (the post-expansion view) cannot
     /// be handed a composition through the type system. This is the
     /// type-level counterpart to
@@ -2148,7 +2227,7 @@ impl<E> File<E> {
     /// composition expansion.
     ///
     /// Compositions are dropped from the output; the originating
-    /// `Composition` → leaf lineage will be carried separately by the
+    /// `LiveComposition` → leaf lineage will be carried separately by the
     /// `ExpansionTrace` once #3295 introduces it.
     pub fn into_leaf_nodes(self) -> impl Iterator<Item = LeafNode> {
         self.resources
@@ -2741,8 +2820,8 @@ fn substitute_placeholder_lazily(
 mod substitute_placeholder_tests {
     use super::*;
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, ResourceId, Signature,
-        UnknownReason, Value,
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, LiveCompositionSignature,
+        ResourceId, UnknownReason, Value,
     };
     use std::collections::BTreeSet;
 
@@ -2783,12 +2862,12 @@ mod substitute_placeholder_tests {
         data_source.binding = Some("data_source_name".to_string());
         parsed.data_sources.push(data_source);
 
-        parsed.compositions.push(Composition {
+        parsed.compositions.push(LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual",
                 "composition_node",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -2797,7 +2876,7 @@ mod substitute_placeholder_tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "module_name".to_string(),
             instance: "composition_name".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
         });
 

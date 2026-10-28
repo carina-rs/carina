@@ -2407,7 +2407,7 @@ fn snapshot_server_default_struct_leaf() {
 /// `module "<binding>" (<source_path>)` header. The third leaf,
 /// declared at the DSL root with no trace entry, stays at the top
 /// level. The header label was rebadged from the internal
-/// `Composition "<binding>"` term in carina#3322.
+/// `LiveComposition "<binding>"` term in carina#3322.
 #[test]
 fn snapshot_composition_folding() {
     use carina_core::effect::Effect;
@@ -2468,8 +2468,8 @@ fn snapshot_composition_folding() {
         output
     );
     assert!(
-        !output.contains("Composition"),
-        "must not leak internal `Composition` term in:\n{}",
+        !output.contains("LiveComposition"),
+        "must not leak internal `LiveComposition` term in:\n{}",
         output
     );
     assert!(
@@ -2612,8 +2612,8 @@ fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
         output,
     );
     assert!(
-        !output.contains("Composition"),
-        "internal `Composition` term must not surface to operators in:\n{}",
+        !output.contains("LiveComposition"),
+        "internal `LiveComposition` term must not surface to operators in:\n{}",
         output,
     );
 }

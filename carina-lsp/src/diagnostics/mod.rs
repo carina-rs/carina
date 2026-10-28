@@ -13,7 +13,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
+    ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call, parse_file,
 };
 use carina_core::provider::{
     HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
@@ -257,13 +257,23 @@ impl DiagnosticEngine {
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
-        let current_parsed = doc.parsed().or_else(|| {
+        let explicit_current_parse = current_file_path
+            .filter(|path| *path != doc.source_file())
+            .and_then(|path| parse_file(&text, path, doc.provider_context()).ok());
+        let merged_current_file = || {
             current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
                     .and_then(|result| result.directory.semantic_file(path))
             })
-        });
+        };
+        let current_parsed = if current_file_path.is_some_and(|path| path != doc.source_file()) {
+            explicit_current_parse
+                .as_ref()
+                .or_else(&merged_current_file)
+        } else {
+            doc.parsed().or_else(merged_current_file)
+        };
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -717,7 +727,7 @@ impl DiagnosticEngine {
                     carina_core::parser::ResourceRef::DataSource(d) => {
                         self.schemas.get_for_data_source(d)
                     }
-                    carina_core::parser::ResourceRef::Composition(_) => None,
+                    carina_core::parser::ResourceRef::LiveComposition(_) => None,
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);

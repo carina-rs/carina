@@ -1445,7 +1445,7 @@ mod tests {
         resource: Resource,
     ) -> Result<CreateOutcome, CreateFailure> {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
@@ -1624,7 +1624,8 @@ mod tests {
             let mode_guard = EnvGuard::set("CARINA_MOCK_RESUME_MODE", mode);
             let request = runtime.block_on(async {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
-                let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+                let module_gate =
+                    carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
                 let schemas = carina_core::schema::SchemaRegistry::new();
                 let preparation = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
@@ -2167,7 +2168,8 @@ mod tests {
             from_attrs.insert("comment".to_string(), string_value("v1"));
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
-            let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+            let module_gate =
+                carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
             let mut schemas = carina_core::schema::SchemaRegistry::new();
             schemas.insert(
                 "mock",

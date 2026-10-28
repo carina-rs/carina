@@ -4742,7 +4742,7 @@ mod tests {
             ]),
         );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",

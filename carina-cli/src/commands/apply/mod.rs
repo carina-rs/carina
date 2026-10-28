@@ -11,7 +11,9 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{PreDataSourceReadInputs, ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{
+    LivePreDataSourceReadInputs, ResolvedBindings, SavedPreApplyInputs, WaitAliasSpec,
+};
 #[cfg(test)]
 use carina_core::config_loader::UnresolvedConfigSnapshot;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -21,8 +23,8 @@ use carina_core::differ::{
     into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::{
-    ExecutionCheckpointSink, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource,
+    ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::override_aware::{
     CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
@@ -208,7 +210,8 @@ async fn create_checked_bootstrap_resource(
     } = context;
     let id = resource.id.clone();
     let bindings = bootstrap_resolved_bindings(parsed);
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&parsed.compositions);
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
@@ -338,7 +341,7 @@ fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> Re
         .iter()
         .map(WaitAliasSpec::from)
         .collect();
-    ResolvedBindings::pre_data_source_read(PreDataSourceReadInputs {
+    ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
@@ -368,10 +371,19 @@ fn start_apply_state_saver(
 }
 
 fn finalize_module_constraints(
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     bindings: &ResolvedBindings,
 ) -> Result<(), AppError> {
-    carina_core::executor::ModuleConstraintGate::new(compositions)
+    carina_core::executor::ModuleConstraintGate::from_live_compositions(compositions)
+        .finish(bindings, true)
+        .map_err(AppError::from)
+}
+
+fn finalize_saved_module_constraints(
+    compositions: &[carina_core::resource::SavedComposition],
+    bindings: &ResolvedBindings,
+) -> Result<(), AppError> {
+    carina_core::executor::ModuleConstraintGate::from_saved_compositions(compositions)
         .finish(bindings, true)
         .map_err(AppError::from)
 }
@@ -566,14 +578,14 @@ async fn execute_effects_with_observer(
     data_source_values: ExecutableDataSourceValues,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     precompleted_success_count: usize,
     checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
 ) -> ExecutionOutcome {
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: unresolved_resources,
@@ -592,7 +604,8 @@ async fn execute_effects_with_observer(
         checkpoint_sink,
     };
 
-    let outcome = carina_core::executor::execute_plan(provider, input, &*observer, cancel).await;
+    let outcome =
+        carina_core::executor::execute_live_plan(provider, input, &*observer, cancel).await;
 
     // Write back the updated current views so callers see refreshes.
     let result = match &outcome {
@@ -620,33 +633,39 @@ async fn execute_rehydrated_saved_plan(
     data_source_values: ExecutableDataSourceValues,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::SavedComposition],
     precompleted_success_count: usize,
     checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
 ) -> ExecutionOutcome {
-    execute_effects_with_observer(
-        plan_file.plan(),
-        provider,
+    let input = SavedExecutionInput {
+        plan: plan_file.plan(),
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: unresolved_resources,
+            data_source_origins,
+        },
+        compositions,
+        bindings: bindings.clone(),
+        managed_current: std::mem::take(managed_current),
+        data_source_values,
         normalizer,
         provider_configs,
         factories,
         schemas,
-        bindings,
-        managed_current,
-        data_source_values,
-        unresolved_resources,
-        data_source_origins,
-        compositions,
+        parallelism,
         precompleted_success_count,
         checkpoint_sink,
-        cancel,
-        parallelism,
-        observer,
-    )
-    .await
+    };
+    let outcome =
+        carina_core::executor::execute_saved_plan(provider, input, &*observer, cancel).await;
+    let result = match &outcome {
+        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
+    };
+    *managed_current = result.managed_current.clone();
+    *bindings = result.bindings.clone();
+    outcome
 }
 
 /// Re-load each upstream declared in the saved plan and verify its
@@ -1069,7 +1088,7 @@ pub(crate) async fn persist_exports_only(
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     data_source_values: &DataSourceValues,
-    pre_resolve_compositions: &[carina_core::resource::Composition],
+    pre_resolve_compositions: &[carina_core::resource::LiveComposition],
     export_params: &carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::InferredExportParam,
     >,
@@ -1671,7 +1690,7 @@ enum SourceApplyAfterHeartbeat {
 struct SourceApplyPersistExports {
     state_file: Option<StateFile>,
     resources: Vec<Resource>,
-    compositions: Vec<carina_core::resource::Composition>,
+    compositions: Vec<carina_core::resource::LiveComposition>,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
     managed_current: HashMap<ResourceId, Current>,
@@ -1688,7 +1707,7 @@ struct SourceApplyExecuted {
     data_source_values: DataSourceValues,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
-    pre_resolve_compositions: Vec<carina_core::resource::Composition>,
+    pre_resolve_compositions: Vec<carina_core::resource::LiveComposition>,
     cancel: ShutdownToken,
 }
 
@@ -2059,7 +2078,7 @@ async fn run_apply_locked_owned(
             // after any Replace on a referenced managed resource.
             // carina#3181: composition resources live in `parsed.compositions`
             // as their own typed slice.
-            let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+            let pre_resolve_compositions: Vec<carina_core::resource::LiveComposition> =
                 parsed.compositions.clone();
 
             let pre_apply_current = carina_core::resource::into_plan_input_current_map(
@@ -2082,7 +2101,7 @@ async fn run_apply_locked_owned(
                 OverrideAwareResources::build_pair_with_stability(
                     expanded_canonical_resources.as_pair(),
                     state_file.as_ref(),
-                    carina_core::binding_index::PreApplyInputs {
+                    carina_core::binding_index::LivePreApplyInputs {
                         managed: &[],
                         compositions: &pre_resolve_compositions,
                         managed_current: &pre_apply_current,
@@ -2112,8 +2131,9 @@ async fn run_apply_locked_owned(
             // Run the normalization pipeline (same as plan path in wiring.rs).
             // `create_plan` resolves typed wait RHS values against target schemas.
             let wait_bindings = parsed.wait_bindings.clone();
-            let module_gate =
-                carina_core::executor::ModuleConstraintGate::new(&pre_resolve_compositions);
+            let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
+                &pre_resolve_compositions,
+            );
             let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
             let preparation = if let Some(errors) = refresh_module_constraint_errors {
                 Err(crate::wiring::PlanPreparationError::Plan(errors))
@@ -2343,7 +2363,7 @@ async fn run_apply_locked_owned(
                 // `parsed.compositions` and still carry the authored
                 // `ResourceRef` snapshots — the shape post-apply export resolution expects
                 // from the post-apply path.
-                let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
+                let pre_resolve_compositions_noop: Vec<carina_core::resource::LiveComposition> =
                     parsed.compositions.clone();
                 return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
                     SourceApplyPersistExports {
@@ -2899,6 +2919,13 @@ fn rehydrate_desired_plan_file(
         carina_core::value::rehydrate_resource_secrets,
     )?;
 
+    let canonical_source_root = carina_core::config_loader::get_base_dir(apply_target.source_dir())
+        .canonicalize()
+        .unwrap_or_else(|error| {
+            let canonicalize_error = error;
+            drop(canonicalize_error);
+            carina_core::config_loader::get_base_dir(apply_target.source_dir()).to_path_buf()
+        });
     for composition in plan_file.compositions_mut() {
         let has_placeholder = composition
             .signature
@@ -2908,25 +2935,33 @@ fn rehydrate_desired_plan_file(
             || composition.signature.attributes.values().any(|attribute| {
                 carina_core::value::contains_redacted_secret(&attribute.to_value())
             });
-        if !has_placeholder {
-            continue;
-        }
         let candidate = parsed
             .compositions
             .iter()
-            .find(|candidate| candidate.id == composition.id)
-            .or_else(|| {
-                let binding = composition.binding.as_deref()?;
-                parsed
-                    .compositions
-                    .iter()
-                    .find(|candidate| candidate.binding.as_deref() == Some(binding))
+            .find(|candidate| {
+                candidate
+                    .call_path()
+                    .saved_origin_id(&canonical_source_root)
+                    == composition.origin_id
             })
             .ok_or_else(|| {
-                saved_plan_secret_shape_error(composition.id.to_string(), apply_target)
+                let call = composition.origin_id.immediate();
+                saved_plan_secret_shape_error(
+                    format!(
+                        "composition call id {}:{}:{} disagreed with the saved plan",
+                        call.source_file().display(),
+                        call.start_line(),
+                        call.start_column(),
+                    ),
+                    apply_target,
+                )
             })?;
-        *composition = carina_core::value::rehydrate_composition_secrets(composition, candidate)
-            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+        if !has_placeholder {
+            continue;
+        }
+        *composition =
+            carina_core::value::rehydrate_saved_composition_secrets(composition, candidate)
+                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
     }
 
     rehydrate_saved_resource_like(
@@ -3036,8 +3071,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 26 persists the exact
-    // provider artifacts used to compute the plan. Plan-file version 25
+    // Validate version compatibility before decoding the payload. The current
+    // format requires normalized composition call origins. Plan-file version
+    // 26 persists the exact provider artifacts used to compute the plan. Plan-file version 25
     // persists every data-source outcome so apply never re-derives it from a
     // partial graph.
     // Plan-file version 24 removes the
@@ -3525,16 +3561,15 @@ async fn run_apply_from_plan_locked_owned(
                     wiring.schemas(),
                     sorted_resources,
                 );
-                let terminal_bindings =
-                    ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-                        managed: sorted_resources,
-                        compositions: plan_compositions,
-                        managed_current: &terminal_input_current,
-                        data_source_values: &data_source_values,
-                        remote_bindings: rehydrated_plan_file.upstream_snapshot(),
-                        wait_aliases: &terminal_wait_aliases,
-                    });
-                finalize_module_constraints(plan_compositions, &terminal_bindings)?;
+                let terminal_bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
+                    managed: sorted_resources,
+                    compositions: plan_compositions,
+                    managed_current: &terminal_input_current,
+                    data_source_values: &data_source_values,
+                    remote_bindings: rehydrated_plan_file.upstream_snapshot(),
+                    wait_aliases: &terminal_wait_aliases,
+                });
+                finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
                 println!("{}", "No changes needed.".green());
                 return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
             }
@@ -3603,15 +3638,14 @@ async fn run_apply_from_plan_locked_owned(
                 wiring.schemas(),
                 sorted_resources,
             );
-            let mut bindings =
-                ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-                    managed: sorted_resources,
-                    compositions: plan_compositions,
-                    managed_current: &pre_apply_input_current,
-                    data_source_values: &data_source_values,
-                    remote_bindings: &upstream_snapshot,
-                    wait_aliases: &wait_aliases,
-                });
+            let mut bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
+                managed: sorted_resources,
+                compositions: plan_compositions,
+                managed_current: &pre_apply_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &upstream_snapshot,
+                wait_aliases: &wait_aliases,
+            });
             bindings.apply_plan_stability(
                 sorted_resources,
                 &pre_apply_input_current,

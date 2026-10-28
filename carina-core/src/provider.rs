@@ -5840,7 +5840,7 @@ mod tests {
 
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
         let bindings = crate::binding_index::ResolvedBindings::default();
-        let gate = crate::executor::ModuleConstraintGate::new(&[]);
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
         let context = crate::executor::ProviderPreparationContext::new(
             &bindings,
@@ -5858,7 +5858,7 @@ mod tests {
 
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
-        let gate = crate::executor::ModuleConstraintGate::new(&[]);
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
         let context = crate::executor::ProviderPreparationContext::new(
             &bindings,

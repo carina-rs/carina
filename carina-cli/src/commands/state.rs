@@ -2295,8 +2295,8 @@ mod tests {
         UpdateRequest,
     };
     use carina_core::resource::{
-        Composition, CompositionArgument, ConcreteValue, DeferredValue, ModuleConstraintId,
-        PendingModuleConstraint, Resource, Signature,
+        ConcreteValue, DeferredValue, LiveComposition, LiveCompositionArgument,
+        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, Resource,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
     use carina_state::{DeposedInstance, DeposedKey};
@@ -2311,8 +2311,12 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
-    fn saved_composition_argument(value: Value) -> CompositionArgument {
-        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+    fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
+        LiveCompositionArgument::from_value(
+            value,
+            carina_core::parser::TypeExpr::String,
+            carina_core::parser::ArgumentOrigin::Defaulted,
+        )
     }
 
     fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
@@ -3046,11 +3050,11 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_module_constraint_unrelated_to_data_source() {
-        let composition = Composition {
+        let composition = LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::from([(
                     "value".to_string(),
                     saved_composition_argument(Value::Concrete(ConcreteValue::String(
@@ -3072,7 +3076,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
         let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
@@ -3129,11 +3133,11 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_module_constraint_when_there_are_no_data_sources() {
-        let composition = Composition {
+        let composition = LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::from([(
                     "value".to_string(),
                     saved_composition_argument(Value::Concrete(ConcreteValue::String(
@@ -3155,7 +3159,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
         let mut parsed = carina_core::parser::InferredFile::default();

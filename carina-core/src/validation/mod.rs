@@ -17,7 +17,8 @@ use crate::parser::{
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
-    CompositionCall, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Resource, Value,
+    CompositionCallPath, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Resource,
+    Value,
 };
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
@@ -612,7 +613,7 @@ pub fn suppress_coalesce_existence_error(
         && matches!(
             error,
             RefTypeError::UnknownAttribute {
-                target: crate::binding_index::RefTargetKind::Composition,
+                target: crate::binding_index::RefTargetKind::LiveComposition,
                 ..
             } | RefTypeError::UnknownUpstreamExport { .. }
         )
@@ -794,8 +795,7 @@ pub struct CompositionModuleCallRefError {
     pub origin: Box<crate::parser::ArgumentOrigin>,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
-    pub call: CompositionCall,
-    pub root_call: CompositionCall,
+    pub call_path: CompositionCallPath,
     reference_position: usize,
 }
 
@@ -803,7 +803,7 @@ impl std::fmt::Display for CompositionModuleCallRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         format_module_call_ref_error(
             f,
-            &self.call.display_label(),
+            &self.call_path.immediate().display_label(),
             &self.argument,
             &self.path,
             &self.kind,
@@ -939,7 +939,7 @@ impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CompositionModuleCallErrorKey {
-    call_instance: String,
+    call_path: CompositionCallPath,
     argument: String,
     reference_position: usize,
     kind: CompositionRefErrorKindKey,
@@ -1391,34 +1391,33 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
 
 /// Validate every fully expanded module-call boundary exactly once.
 ///
-/// Both halves of the boundary live on [`crate::resource::Composition`]:
+/// Both halves of the boundary live on [`crate::resource::LiveComposition`]:
 /// typed call arguments and typed output attributes. The shared
 /// [`BindingIndex`] is built only after all nested compositions have been
 /// prefixed into the root parse, so unannotated forwarded outputs can inherit
 /// their resource-schema type through arbitrarily deep composition chains.
+///
+/// Saved compositions cannot enter this live validation seam:
+///
+/// ```compile_fail
+/// use carina_core::binding_index::BindingIndex;
+/// use carina_core::resource::SavedComposition;
+/// use carina_core::validation::validate_composition_ref_types_with_bindings;
+/// fn validate(saved: &[SavedComposition], bindings: &BindingIndex<'_>) {
+///     let _ = validate_composition_ref_types_with_bindings(saved, bindings);
+/// }
+/// ```
 pub fn validate_composition_ref_types_with_bindings(
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     bindings: &BindingIndex<'_>,
 ) -> Vec<CompositionRefError> {
     let mut errors = Vec::new();
 
     for composition in compositions {
-        let (Some(call), Some(root_call)) = (
-            composition.diagnostic_call(),
-            composition.diagnostic_root_call(),
-        ) else {
-            // Saved plans have already passed source validation and omit
-            // diagnostic provenance by design.
-            continue;
-        };
+        let call_path = composition.call_path();
+        let call = call_path.immediate();
         for (argument_name, argument) in &composition.signature.arguments {
-            let Some((declared_type, origin)) = argument.validation_metadata() else {
-                // Value-only saved-plan arguments cannot occur on the normal
-                // live expansion path. If a caller manually combines one
-                // with live provenance, it still cannot provide a source
-                // origin for a diagnostic.
-                continue;
-            };
+            let (declared_type, origin) = argument.validation_metadata();
             let mut reference_position = 0;
             visit_refs_with_sink(
                 argument.value(),
@@ -1441,8 +1440,7 @@ pub fn validate_composition_ref_types_with_bindings(
                             origin: Box::new(origin),
                             path: path.to_owned(),
                             kind,
-                            call: call.clone(),
-                            root_call: root_call.clone(),
+                            call_path: call_path.clone(),
                             reference_position: current_position,
                         },
                     ));
@@ -1498,7 +1496,7 @@ pub fn validate_composition_ref_types_with_bindings(
     errors.retain(|error| match error {
         CompositionRefError::ModuleCall(error) => {
             seen_calls.insert(CompositionModuleCallErrorKey {
-                call_instance: error.call.instance.clone(),
+                call_path: error.call_path.clone(),
                 argument: error.argument.clone(),
                 reference_position: error.reference_position,
                 kind: (&error.kind).into(),
@@ -1628,7 +1626,7 @@ pub fn validate_resources<E>(
                     .filter_map(|resource| match resource {
                         ResourceRef::Resource(resource)
                         | ResourceRef::Deferred { resource, .. } => Some(resource),
-                        ResourceRef::Composition(_) | ResourceRef::DataSource(_) => None,
+                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                     }),
                 registry,
                 known_providers,
@@ -1653,7 +1651,7 @@ pub fn validate_resources<E>(
         // A deferred for-expression template body is always managed —
         // `for` bodies never carry `read` / composition.
         let (kind, schema) = match rref {
-            ResourceRef::Composition(_) => continue,
+            ResourceRef::LiveComposition(_) => continue,
             ResourceRef::DataSource(d) => {
                 (ValidatableKind::DataSource, registry.get_for_data_source(d))
             }
@@ -1748,7 +1746,7 @@ fn validate_resource_ref_types_inner<E>(
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
         let schema = match rref {
-            ResourceRef::Composition(_) => continue,
+            ResourceRef::LiveComposition(_) => continue,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
             ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
                 registry.get_for(m)
@@ -3236,7 +3234,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
-        // `Composition` has no directives — `directives()` is `None`
+        // `LiveComposition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
         for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
             referenced.insert(dep.clone());

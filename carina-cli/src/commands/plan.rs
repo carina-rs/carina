@@ -20,7 +20,7 @@ use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
-    Composition, ConcreteValue, Current, DataSource, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, DataSource, Resource, ResourceId, SavedComposition, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -260,8 +260,9 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 26 adds mandatory identities for every loaded provider
-    /// artifact. Plan format 25 adds the mandatory typed `data_source_values`
+    /// The current format adds a mandatory normalized module-call origin path
+    /// to every saved composition. Plan format 26 adds mandatory identities
+    /// for every loaded provider artifact. Plan format 25 adds the mandatory typed `data_source_values`
     /// outcomes and removes duplicate data-source rows from `current_states`.
     /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
     /// format 21 explicitly tags managed and data-source current-state entries,
@@ -317,8 +318,9 @@ pub struct PlanFile {
     ///
     /// Empty when the configuration declares no module calls /
     /// `attributes { ... }` blocks.
-    #[serde(default)]
-    pub compositions: Vec<carina_core::resource::Composition>,
+    /// Every entry carries a required normalized call-ID path; the field is
+    /// mandatory so apply never falls back to resource or binding names.
+    pub compositions: Vec<carina_core::resource::SavedComposition>,
     /// Data sources (`let x = read aws.iam.user { ... }`) emitted by
     /// module expansion at plan time (carina#3248). Persisted so the
     /// saved-plan apply path can re-create the same unified
@@ -389,7 +391,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 26;
+    pub const CURRENT_VERSION: u32 = 27;
 
     /// Capture provider artifacts and the exact schema inventory together.
     pub fn record_loaded_providers(&mut self, ctx: &WiringContext) {
@@ -633,7 +635,7 @@ impl PlanFile {
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
-        use carina_core::resource::{Composition, DataSource, Signature};
+        use carina_core::resource::{DataSource, SavedComposition, SavedCompositionSignature};
 
         fn resource_contains(resource: &Resource) -> bool {
             let Resource {
@@ -667,18 +669,17 @@ impl PlanFile {
                 .any(carina_core::value::contains_redacted_secret)
         }
 
-        fn composition_contains(composition: &Composition) -> bool {
-            let Composition {
+        fn composition_contains(composition: &SavedComposition) -> bool {
+            let SavedComposition {
                 id: _id,
                 signature,
                 binding: _binding,
                 dependency_bindings: _dependency_bindings,
                 module_name: _module_name,
                 instance: _instance,
-                provenance: _provenance,
-                quoted_string_attrs: _quoted_string_attrs,
+                origin_id: _origin_id,
             } = composition;
-            let Signature {
+            let SavedCompositionSignature {
                 arguments,
                 attributes,
                 pending_constraints: _pending_constraints,
@@ -1582,11 +1583,11 @@ impl ReloadedPlanFile {
         &mut self.plan_file.unresolved_resources
     }
 
-    pub(crate) fn compositions(&self) -> &[Composition] {
+    pub(crate) fn compositions(&self) -> &[SavedComposition] {
         &self.plan_file.compositions
     }
 
-    pub(crate) fn compositions_mut(&mut self) -> &mut Vec<Composition> {
+    pub(crate) fn compositions_mut(&mut self) -> &mut Vec<SavedComposition> {
         &mut self.plan_file.compositions
     }
 
@@ -2055,6 +2056,11 @@ fn build_plan_file<E>(
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string();
+    let canonical_source_root = get_base_dir(path).canonicalize().unwrap_or_else(|error| {
+        let canonicalize_error = error;
+        drop(canonicalize_error);
+        get_base_dir(path).to_path_buf()
+    });
 
     let desired_resources: HashMap<ResourceId, Resource> = ctx
         .sorted_resources
@@ -2268,7 +2274,10 @@ fn build_plan_file<E>(
         compositions: ctx
             .compositions
             .iter()
-            .map(carina_core::value::redact_secrets_in_virtual)
+            .map(|composition| {
+                let saved = composition.clone().into_saved(&canonical_source_root);
+                carina_core::value::redact_secrets_in_saved_composition(&saved)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         data_sources: ctx
             .data_sources
@@ -3048,7 +3057,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
 pub(crate) struct CheckExportsPreApplyInput<'a> {
     pub export_params: &'a [carina_core::parser::InferredExportParam],
     pub resources: &'a [Resource],
-    pub compositions: &'a [carina_core::resource::Composition],
+    pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub data_source_values: &'a carina_core::data_source_value::DataSourceValues,
     /// Persisted secret shapes that classify provider-returned plaintext before
@@ -3099,8 +3108,8 @@ pub(crate) fn check_exports_pre_apply(
         input.schemas,
         input.resources,
     );
-    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
+    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
             managed: input.resources,
             compositions: input.compositions,
             managed_current: &plan_input_current,
@@ -4380,8 +4389,8 @@ exports { region: String = "ap-northeast-1" }"#,
                 &parsed.data_sources,
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
-        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &parsed.resources,
                 compositions: &parsed.compositions,
                 managed_current: &managed_current,
@@ -4448,9 +4457,9 @@ mod run_plan_out_tests {
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
-        AccessPath, Composition, CompositionArgument, DataSource, DeferredValue,
-        ModuleConstraintId, PendingModuleConstraint, ResolvedResource, ResourceId, Signature,
-        Value,
+        AccessPath, DataSource, DeferredValue, LiveComposition, LiveCompositionArgument,
+        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, ResolvedResource,
+        ResourceId, Value,
     };
     use std::fs;
 
@@ -4463,8 +4472,12 @@ mod run_plan_out_tests {
             .clone()
     }
 
-    fn saved_composition_argument(value: Value) -> CompositionArgument {
-        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+    fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
+        LiveCompositionArgument::from_value(
+            value,
+            carina_core::parser::TypeExpr::String,
+            carina_core::parser::ArgumentOrigin::Defaulted,
+        )
     }
 
     fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
@@ -4969,11 +4982,11 @@ mod run_plan_out_tests {
             "name".to_string(),
             saved_composition_argument(Value::resource_ref("producer", "name", vec![])),
         );
-        let prepared = Composition {
+        let prepared = LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments,
                 attributes: indexmap::IndexMap::new(),
                 pending_constraints: vec![PendingModuleConstraint {
@@ -4990,7 +5003,7 @@ mod run_plan_out_tests {
             dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
         };
         let parsed = carina_core::parser::ParsedFile::default();
@@ -5190,8 +5203,8 @@ mod export_diff_tests {
                 "vpc_id",
                 Value::Concrete(ConcreteValue::String("vpc-123".into())),
             );
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
                 managed_current: &HashMap::new(),
@@ -5222,8 +5235,8 @@ mod export_diff_tests {
                     ConcreteValue::String("topsecretXYZ".into()),
                 )))),
             );
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
                 managed_current: &HashMap::new(),

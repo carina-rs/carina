@@ -13,17 +13,16 @@ use crate::parser::{
     ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    AccessMissPolicy, Composition, CompositionCall, CompositionProvenance, ConcreteValue,
-    DataSource, DeferredValue, ModuleInstanceScope, ModuleSource, PathSegment, Resource,
+    AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
+    DeferredValue, LiveComposition, ModuleInstanceScope, ModuleSource, PathSegment, Resource,
     ResourceId, ResourceIdentity, ResourceIdentityState, StructuralOperandRef, Value,
     ValuePathSegmentResult, apply_value_path_segment,
 };
 
 use super::error::ModuleError;
 use super::resolver::{
-    ModuleCallConstraintReport, ModuleCallSystemIdentity, ModuleResolver,
-    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, TypeResolutionPolicy,
+    ModuleCallConstraintReport, ModuleResolver, ResolvedModuleConstraintOrigin,
+    ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus, TypeResolutionPolicy,
 };
 use super::validation::{
     ConstraintEvaluation, ModuleConstraintKind, ModuleConstraints, evaluate_module_constraints,
@@ -32,7 +31,7 @@ use super::validation::{
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// Expand a module call into resources.
     ///
-    /// Every module call creates a [`Composition`]. Bound calls expose module
+    /// Every module call creates a [`LiveComposition`]. Bound calls expose module
     /// outputs through it; all calls retain their typed argument boundary for
     /// one post-expansion validation pass. Virtual resources are skipped by
     /// the differ.
@@ -68,7 +67,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     ) -> Result<ParsedFile, ModuleError> {
-        let source_file = call.source_file();
         self.expand_module_call_inner(
             call,
             instance_prefix,
@@ -76,12 +74,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             binding_index,
             resolved_bindings,
         )
-        .map_err(|error| {
-            error.with_failing_call(ModuleCallSystemIdentity::for_authored_call(
-                source_file.to_path_buf(),
-                call,
-            ))
-        })
+        .map_err(|error| error.with_failing_call(call.id().clone()))
     }
 
     fn expand_module_call_inner(
@@ -507,6 +500,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             path.canonicalize().unwrap_or(path)
         });
         let expanded_call = CompositionCall {
+            id: call.id().clone(),
             module_name: call.module_name.clone(),
             binding: call.binding_name.clone(),
             instance: instance_prefix.to_string(),
@@ -516,7 +510,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
         // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
-        let mut compositions: Vec<Composition> = Vec::new();
+        let mut compositions: Vec<LiveComposition> = Vec::new();
         for composition in &module.compositions {
             let mut expanded = prefix_module_composition(
                 composition,
@@ -536,13 +530,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // and anonymous calls. Besides exposing outputs for bound calls, the
         // node is the post-expansion record of the call boundary itself.
         {
-            let mut composition_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
+            let mut composition_attrs: IndexMap<String, crate::resource::LiveCompositionAttribute> =
                 IndexMap::new();
 
             // Copy attribute values from the module definition.
             // Each value is classified into `Forwarded` (single-hop
             // alias) vs `Derived` (multi-source expression) via
-            // `CompositionAttribute::from_value` (#3294).
+            // `LiveCompositionAttribute::from_value` (#3294).
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
                     let source_argument = source_argument_name(value, &argument_values);
@@ -571,7 +565,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::CompositionAttribute::from_value(
+                        crate::resource::LiveCompositionAttribute::from_value(
                             substituted,
                             declared_type,
                         )
@@ -585,13 +579,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // composition in `module.arguments` declaration order so
             // the trace is stable across runs, preserving whether each
             // call-site argument was a value or a structural handle.
-            let mut signature_arguments: IndexMap<String, crate::resource::CompositionArgument> =
-                IndexMap::new();
+            let mut signature_arguments: IndexMap<
+                String,
+                crate::resource::LiveCompositionArgument,
+            > = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
                     let recorded = match argument.value_ref() {
                         StructuralOperandRef::Value(value) => {
-                            crate::resource::CompositionArgument::from_value(
+                            crate::resource::LiveCompositionArgument::from_value(
                                 value.clone(),
                                 arg.type_expr.clone(),
                                 argument.origin,
@@ -600,14 +596,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         StructuralOperandRef::Handle {
                             handle,
                             access_base,
-                        } => crate::resource::CompositionArgument::from_handle(
+                        } => crate::resource::LiveCompositionArgument::from_handle(
                             access_base.clone(),
                             arg.type_expr.clone(),
                             handle.clone(),
                             argument.origin,
                         ),
                         StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::CompositionArgument::from_value(
+                            crate::resource::LiveCompositionArgument::from_value(
                                 access_base.clone(),
                                 arg.type_expr.clone(),
                                 argument.origin,
@@ -618,12 +614,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 }
             }
 
-            let composition = Composition {
+            let composition = LiveComposition {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "_virtual",
                     crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
                 )),
-                signature: crate::resource::Signature {
+                signature: crate::resource::LiveCompositionSignature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
                     pending_constraints,
@@ -632,10 +628,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
-                provenance: Box::new(CompositionProvenance::expanded(
-                    expanded_call.clone(),
-                    expanded_call.clone(),
-                )),
+                call_path: CompositionCallPath::direct(expanded_call.clone()),
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -1538,29 +1531,27 @@ fn prefix_module_data_source(
 }
 
 /// Instance-prefix one composition resource crossing a module boundary — the
-/// [`Composition`] analogue of [`prefix_module_resource`]. The flattened
+/// [`LiveComposition`] analogue of [`prefix_module_resource`]. The flattened
 /// identity/binding, diagnostic call provenance, arguments, and attributes all
 /// take the prefix treatment; compositions have no `prefixes` or `directives`.
 fn prefix_module_composition(
-    composition: &Composition,
+    composition: &LiveComposition,
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
     root_call: &CompositionCall,
     config: &crate::parser::ProviderContext,
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-) -> Result<Composition, ArgumentSubstitutionError> {
+) -> Result<LiveComposition, ArgumentSubstitutionError> {
     let mut new_virtual = composition.clone();
 
-    let mut call = composition
-        .diagnostic_call()
-        .expect("nested compositions are produced by live expansion")
-        .clone();
-    call.instance = apply_instance_prefix(instance_prefix, &call.instance);
-    if let Some(binding) = &call.binding {
-        call.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    for call in new_virtual.call_path.calls_mut() {
+        call.instance = apply_instance_prefix(instance_prefix, &call.instance);
+        if let Some(binding) = &call.binding {
+            call.binding = Some(apply_instance_prefix(instance_prefix, binding));
+        }
     }
-    *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
+    new_virtual.call_path = new_virtual.call_path.clone().prepend(root_call.clone());
 
     let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
     new_virtual.id = composition
@@ -1572,7 +1563,7 @@ fn prefix_module_composition(
     }
     new_virtual.instance = apply_instance_prefix(instance_prefix, &new_virtual.instance);
 
-    let mut substituted_arguments: IndexMap<String, crate::resource::CompositionArgument> =
+    let mut substituted_arguments: IndexMap<String, crate::resource::LiveCompositionArgument> =
         IndexMap::new();
     for (key, argument) in &new_virtual.signature.arguments {
         if let Some(parameter) = argument.forwarded_parameter()
@@ -1616,7 +1607,7 @@ fn prefix_module_composition(
     }
     new_virtual.signature.arguments = substituted_arguments;
 
-    let mut substituted_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
+    let mut substituted_attrs: IndexMap<String, crate::resource::LiveCompositionAttribute> =
         IndexMap::new();
     for (key, attr) in &new_virtual.signature.attributes {
         // Round-trip through `Value` so the existing `prefix_attr_value`
@@ -1659,7 +1650,7 @@ fn prefix_module_composition(
 /// for plan/apply gates, and concrete failures use the same typed diagnostic
 /// path as direct module calls.
 fn settle_prefixed_composition_constraints(
-    composition: &mut Composition,
+    composition: &mut LiveComposition,
 ) -> Result<(), ModuleError> {
     if composition.signature.pending_constraints.is_empty() {
         return Ok(());
@@ -1696,13 +1687,11 @@ fn settle_prefixed_composition_constraints(
 
 fn check_composition_argument_type(
     parameter: &str,
-    argument: &crate::resource::CompositionArgument,
+    argument: &crate::resource::LiveCompositionArgument,
     config: &crate::parser::ProviderContext,
     line: usize,
 ) -> Result<(), ArgumentSubstitutionError> {
-    let Some(declared_type) = argument.declared_type() else {
-        return Ok(());
-    };
+    let declared_type = argument.declared_type();
     let Some(resolved_parameter) =
         crate::validation::resolve_parameter_type_for_check(declared_type, config).map_err(
             |message| ArgumentSubstitutionError {
@@ -2414,7 +2403,7 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
-    compositions: &mut [Composition],
+    compositions: &mut [LiveComposition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
 ) {
@@ -2624,16 +2613,14 @@ pub fn reconcile_anonymous_module_instances(
         if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
             composition.instance = rewritten;
         }
-        if let Some((call, root_call)) = composition.provenance.calls_mut() {
-            for call in [call, root_call] {
-                if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
-                    call.instance = rewritten;
-                }
-                if let Some(binding) = call.binding.as_deref()
-                    && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
-                {
-                    call.binding = Some(rewritten);
-                }
+        for call in composition.call_path.calls_mut() {
+            if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                call.instance = rewritten;
+            }
+            if let Some(binding) = call.binding.as_deref()
+                && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+            {
+                call.binding = Some(rewritten);
             }
         }
 

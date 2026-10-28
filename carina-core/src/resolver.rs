@@ -11,7 +11,7 @@ use crate::binding_index::{BindingValueSource, ResolvedBindings};
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
-    AccessMissPolicy, Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
+    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, InterpolationPart, LiveComposition,
     PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
     apply_value_path_segment,
 };
@@ -33,15 +33,16 @@ pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     managed_current: &HashMap<ResourceId, PlanInputCurrent>,
 ) -> Result<(), String> {
-    let bindings =
-        crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+        crate::binding_index::LivePreApplyInputs {
             managed: resources,
             compositions: &[],
             managed_current,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
-        });
+        },
+    );
     resolve_refs_with_state_and_remote(resources, &bindings)
 }
 
@@ -200,7 +201,7 @@ fn resolve_data_source_refs_inner(
 }
 
 /// Post-apply path: resolve `ResourceRef` values across a slice of
-/// `Composition`s using a `ResolvedBindings` view that the caller
+/// `LiveComposition`s using a `ResolvedBindings` view that the caller
 /// has already built against the post-apply state.
 ///
 /// Calling this against pre-apply state would re-introduce the
@@ -213,25 +214,67 @@ fn resolve_data_source_refs_inner(
 /// `dependency_bindings` is left untouched: composition→resource edges are
 /// already recorded during the pre-apply pass, and the post-apply
 /// resolution only needs to materialise the attribute values.
-pub fn resolve_virtual_refs_post_apply(
-    compositions: &mut [Composition],
+pub fn resolve_live_composition_refs_post_apply(
+    compositions: &mut [LiveComposition],
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
     for v in compositions.iter_mut() {
-        let mut resolved_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
-            IndexMap::new();
-        for (key, attr) in &v.signature.attributes {
-            // Reify the typed attribute back into a `Value`, resolve
-            // it the same way as before, then re-classify the
-            // resolved result. A `Forwarded` that resolves to a
-            // literal becomes a `Derived(Concrete(...))`; a one that
-            // resolves into another `ResourceRef` stays `Forwarded`.
-            let resolved = resolve_ref_value(&attr.to_value(), bindings)?;
-            resolved_attrs.insert(key.clone(), attr.with_value(resolved));
-        }
-        v.signature.attributes = resolved_attrs;
+        v.signature.attributes = resolve_composition_attributes(&v.signature.attributes, bindings)?;
     }
     Ok(())
+}
+
+pub fn resolve_saved_composition_refs_post_apply(
+    compositions: &mut [crate::resource::SavedComposition],
+    bindings: &ResolvedBindings,
+) -> Result<(), String> {
+    for composition in compositions {
+        composition.signature.attributes =
+            resolve_composition_attributes(&composition.signature.attributes, bindings)?;
+    }
+    Ok(())
+}
+
+trait RuntimeCompositionAttribute: Sized {
+    fn runtime_value(&self) -> Value;
+    fn with_runtime_value(&self, value: Value) -> Self;
+}
+
+impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
+    fn runtime_value(&self) -> Value {
+        self.to_value()
+    }
+
+    fn with_runtime_value(&self, value: Value) -> Self {
+        self.with_value(value)
+    }
+}
+
+impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
+    fn runtime_value(&self) -> Value {
+        self.to_value()
+    }
+
+    fn with_runtime_value(&self, value: Value) -> Self {
+        self.with_value(value)
+    }
+}
+
+fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
+    attributes: &IndexMap<String, A>,
+    bindings: &ResolvedBindings,
+) -> Result<IndexMap<String, A>, String> {
+    attributes
+        .iter()
+        .map(|(key, attribute)| {
+            // Reify the typed attribute into a value, resolve it, then
+            // reclassify it in the same lifecycle. A forwarded reference that
+            // resolves to a literal becomes derived; one that remains a
+            // reference stays forwarded.
+            let resolved = resolve_ref_value(&attribute.runtime_value(), bindings)?;
+            Ok((key.clone(), attribute.with_runtime_value(resolved)))
+        })
+        .collect()
 }
 
 /// Replace any `Value::ResourceRef` whose root binding is in
@@ -852,7 +895,7 @@ mod tests {
                 make_resource(&format!("{}-resource", binding), Some(binding), attrs)
             })
             .collect();
-        ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -1102,8 +1145,8 @@ mod tests {
                 ]),
             },
         )]);
-        let bindings = ResolvedBindings::pre_apply_with_stability(
-            crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live_with_stability(
+            crate::binding_index::LivePreApplyInputs {
                 managed: std::slice::from_ref(&resource),
                 compositions: &[],
                 managed_current: &current,
@@ -1230,7 +1273,7 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &resources,
         );
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &current,
@@ -1380,7 +1423,7 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &[],
         );
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: resources,
             compositions: &[],
             managed_current: &plan_input_states,
@@ -1404,7 +1447,7 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &[],
         );
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: resources,
             compositions: &[],
             managed_current: &plan_input_states,
@@ -3367,7 +3410,7 @@ mod tests {
                 )),
             )],
         );
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &[cert],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3396,7 +3439,7 @@ mod tests {
     /// PlanError path — not a panic — surfaces it.
     #[test]
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),

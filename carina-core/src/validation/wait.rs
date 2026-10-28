@@ -29,7 +29,7 @@ enum WaitTarget {
         resource_type: String,
     },
     DataSource,
-    Composition,
+    LiveComposition,
 }
 
 /// A wait-construct diagnostic.
@@ -71,7 +71,7 @@ pub fn validate_wait_bindings<E>(
                     resource_type: id.resource_type.clone(),
                 },
                 ResourceRef::DataSource(_) => WaitTarget::DataSource,
-                ResourceRef::Composition(_) => WaitTarget::Composition,
+                ResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
             };
             by_binding.insert(b.to_string(), target);
         }
@@ -101,7 +101,7 @@ pub fn validate_wait_bindings<E>(
                 target: wb.target.to_string(),
             }
             .to_string()),
-            WaitTarget::Composition => Err(format!(
+            WaitTarget::LiveComposition => Err(format!(
                 "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
                 wb.binding, wb.target
             )),

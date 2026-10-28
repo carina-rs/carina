@@ -7531,9 +7531,12 @@ pub mod graph_node;
 pub mod leaf_node;
 pub mod persistent_id;
 
+pub(crate) use composition::CompositionRuntimeRef;
 pub use composition::{
-    Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    ModuleConstraintId, PendingModuleConstraint, Signature,
+    CompositionCall, CompositionCallPath, LiveComposition, LiveCompositionArgument,
+    LiveCompositionAttribute, LiveCompositionSignature, ModuleConstraintId,
+    PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
+    SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
 };
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};

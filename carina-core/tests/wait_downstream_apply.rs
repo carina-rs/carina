@@ -33,8 +33,8 @@ use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
-    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, ProviderCheckInputs,
-    UnresolvedResource, execute_plan,
+    ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
+    UnresolvedResource, execute_live_plan,
 };
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
@@ -293,8 +293,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
     {
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 managed_current: &plan_input_current(
@@ -357,7 +357,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         failures: Mutex::new(Vec::new()),
     };
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -377,7 +377,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     };
 
     let result = completed_result(
-        execute_plan(
+        execute_live_plan(
             &provider,
             input,
             &observer,
@@ -469,8 +469,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
     {
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 managed_current: &plan_input_current(
@@ -532,7 +532,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         failures: Mutex::new(Vec::new()),
     };
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -552,7 +552,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     };
 
     let result = completed_result(
-        execute_plan(
+        execute_live_plan(
             &provider,
             input,
             &observer,
@@ -623,8 +623,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     let mut resources_for_plan = sorted_resources.clone();
     {
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &resources_for_plan.clone(),
                 compositions: &[],
                 managed_current: &plan_input_current(

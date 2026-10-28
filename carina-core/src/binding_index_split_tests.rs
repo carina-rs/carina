@@ -1,8 +1,8 @@
 //! Tests for #3176: typed `ResolvedBindings` constructors.
 //!
-//! - `ResolvedBindings::pre_apply(PreApplyInputs)` is the unified pre-apply constructor;
+//! - `ResolvedBindings::pre_apply_live(LivePreApplyInputs)` is the unified pre-apply constructor;
 //!   pre-apply bindings from a managed slice plus current state.
-//! - `ResolvedBindings::layer_compositions_post_apply(&mut self, &[Composition])` —
+//! - `ResolvedBindings::layer_live_compositions_post_apply(&mut self, &[LiveComposition])` —
 //!   layer composition bindings on top, called only after managed bindings exist.
 //!
 //! the legacy `from_*_with_state` entries have been removed (carina#3248).
@@ -15,7 +15,8 @@ use indexmap::IndexMap;
 use crate::binding_index::ResolvedBindings;
 use crate::resolver::{ValueResolution, resolve_ref_value_status};
 use crate::resource::{
-    Composition, ConcreteValue, DeferredValue, Resource, ResourceId, Signature, State, Value,
+    ConcreteValue, DeferredValue, LiveComposition, LiveCompositionSignature, Resource, ResourceId,
+    State, Value,
 };
 
 fn s(s: &str) -> Value {
@@ -40,20 +41,21 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
     }
 }
 
-fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
-    let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
+fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveComposition {
+    let mut attributes: IndexMap<String, crate::resource::LiveCompositionAttribute> =
+        IndexMap::new();
     for (k, v) in attrs {
         attributes.insert(
             (*k).into(),
-            crate::resource::CompositionAttribute::from_value(v.clone(), None),
+            crate::resource::LiveCompositionAttribute::from_value(v.clone(), None),
         );
     }
-    Composition {
+    LiveComposition {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual.module",
             binding,
         )),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: IndexMap::new(),
             attributes,
             pending_constraints: Vec::new(),
@@ -62,7 +64,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
         instance: binding.into(),
-        provenance: Default::default(),
+        call_path: Default::default(),
         quoted_string_attrs: Default::default(),
     }
 }
@@ -70,7 +72,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
 #[test]
 fn pre_apply_records_dsl_attributes() {
     let m = make_managed("a", &[("value", s("hello"))]);
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[m],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -94,7 +96,7 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
     let mut current_states = HashMap::new();
     current_states.insert(m.id.clone(), State::existing(m.id.clone(), state_attrs));
 
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[m],
         compositions: &[],
         managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -115,7 +117,7 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
 fn pre_apply_skips_resources_without_binding() {
     let mut m = make_managed("a", &[("k", s("v"))]);
     m.binding = None;
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[m],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -129,7 +131,7 @@ fn pre_apply_skips_resources_without_binding() {
 #[test]
 fn pre_apply_composition_is_complete_for_coalesce_absence() {
     let composition = make_virtual("module", &[("present", s("value"))]);
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[],
         compositions: &[composition],
         managed_current: &HashMap::new(),
@@ -153,7 +155,7 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
 #[test]
 fn add_compositions_layers_on_top_of_resources() {
     let managed = make_managed("a", &[("value", s("from_managed"))]);
-    let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let mut bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[managed],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -165,8 +167,8 @@ fn add_compositions_layers_on_top_of_resources() {
 
     let virt = make_virtual("v", &[("role_arn", s("post_apply_arn"))]);
     bindings
-        .layer_compositions_post_apply(&[virt])
-        .expect("layer_compositions_post_apply");
+        .layer_live_compositions_post_apply(&[virt])
+        .expect("layer_live_compositions_post_apply");
 
     // Both bindings present after layering.
     assert!(bindings.get("a").is_some());
@@ -177,10 +179,10 @@ fn add_compositions_layers_on_top_of_resources() {
 #[test]
 fn add_compositions_overwrites_same_name_resource_binding() {
     // If a composition happens to share a binding name with a managed one,
-    // layer_compositions_post_apply lands later → the composition wins. This is the
+    // layer_live_compositions_post_apply lands later → the composition wins. This is the
     // "post-apply view layers on the pre-apply view" semantic.
     let managed = make_managed("rd", &[("v", s("pre_apply"))]);
-    let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let mut bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[managed],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -190,8 +192,8 @@ fn add_compositions_overwrites_same_name_resource_binding() {
     });
     let virt = make_virtual("rd", &[("v", s("post_apply"))]);
     bindings
-        .layer_compositions_post_apply(&[virt])
-        .expect("layer_compositions_post_apply");
+        .layer_live_compositions_post_apply(&[virt])
+        .expect("layer_live_compositions_post_apply");
 
     let view = bindings.get("rd").expect("rd binding present");
     assert_eq!(view.get("v"), Some(&s("post_apply")));
@@ -201,7 +203,7 @@ fn add_compositions_overwrites_same_name_resource_binding() {
 fn add_compositions_skips_unbound() {
     let mut virt = make_virtual("v", &[("k", s("x"))]);
     virt.binding = None;
-    let mut bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let mut bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -210,8 +212,8 @@ fn add_compositions_skips_unbound() {
         wait_aliases: &[],
     });
     bindings
-        .layer_compositions_post_apply(&[virt])
-        .expect("layer_compositions_post_apply");
+        .layer_live_compositions_post_apply(&[virt])
+        .expect("layer_live_compositions_post_apply");
     assert!(bindings.get("v").is_none());
 }
 
@@ -222,11 +224,11 @@ fn managed_plus_virtual_layering() {
     // from all kinds (managed + composition + data_sources). This test
     // exercises the *increment* path used by `state_writeback`:
     // build via `pre_apply` with `compositions: &[]`, then layer them
-    // on top via `layer_compositions_post_apply` after re-resolution.
+    // on top via `layer_live_compositions_post_apply` after re-resolution.
     let managed = make_managed("a", &[("value", s("hello"))]);
     let virt = make_virtual("v", &[("forwarded", s("via_virtual"))]);
 
-    let mut typed = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let mut typed = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: std::slice::from_ref(&managed),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -235,8 +237,8 @@ fn managed_plus_virtual_layering() {
         wait_aliases: &[],
     });
     typed
-        .layer_compositions_post_apply(std::slice::from_ref(&virt))
-        .expect("layer_compositions_post_apply");
+        .layer_live_compositions_post_apply(std::slice::from_ref(&virt))
+        .expect("layer_live_compositions_post_apply");
 
     assert_eq!(
         typed.get("a").and_then(|m| m.get("value")),

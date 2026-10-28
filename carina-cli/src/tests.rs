@@ -508,7 +508,10 @@ fn plan_file_serde_round_trip() {
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(26));
+    assert_eq!(
+        wire["version"],
+        serde_json::json!(PlanFile::CURRENT_VERSION)
+    );
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");

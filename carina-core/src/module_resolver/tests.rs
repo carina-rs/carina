@@ -38,7 +38,7 @@ fn resolve_modules_with_config(
 
 fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
-    compositions: &mut [crate::resource::Composition],
+    compositions: &mut [crate::resource::LiveComposition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
     crate::module_resolver::reconcile_anonymous_module_instances(
@@ -821,6 +821,9 @@ fn test_expand_module_call_creates_composition() {
     // Module info lives in the flattened module_name / instance fields.
     assert_eq!(composition_res.module_name, "web_tier");
     assert_eq!(composition_res.instance, "web");
+    assert_eq!(composition_res.call_path().calls().count(), 1);
+    assert_eq!(&composition_res.call_path().root().id, call.id());
+    assert_eq!(&composition_res.call_path().immediate().id, call.id());
     assert!(!composition_res.signature.attributes.contains_key("_module"));
     assert!(
         !composition_res
@@ -1050,8 +1053,8 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
 
 /// PR E (#3292) acceptance: a composition's `signature.arguments`
 /// preserves the resolved call-site arguments. The pre-#3292 expander
-/// dropped this information with the `ModuleCall`; with `Signature`
-/// on `Composition`, the call boundary is now inspectable on the
+/// dropped this information with the `ModuleCall`; with `LiveCompositionSignature`
+/// on `LiveComposition`, the call boundary is now inspectable on the
 /// expanded node itself.
 #[test]
 fn test_expand_module_call_preserves_arguments_on_composition_signature() {
@@ -1157,7 +1160,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .signature
             .arguments
             .get("region")
-            .and_then(|argument| argument.declared_type()),
+            .map(|argument| argument.declared_type()),
         Some(&TypeExpr::String),
         "the declared sink type must travel with the argument value",
     );
@@ -1554,7 +1557,7 @@ thing { name = 'after-edit' }
     nested.binding = Some(format!("{new_prefix}.nested"));
     nested.signature.arguments.insert(
         "role_name".to_string(),
-        crate::resource::CompositionArgument::from_value(
+        crate::resource::LiveCompositionArgument::from_value(
             Value::resource_ref(
                 format!("{new_prefix}.role"),
                 "role_name".to_string(),
@@ -2605,12 +2608,8 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
         .iter()
         .find(|composition| composition.module_name == "inner")
         .expect("inner module composition must be retained");
-    let immediate_call = nested
-        .diagnostic_call()
-        .expect("nested expansion records its immediate call");
-    let root_call = nested
-        .diagnostic_root_call()
-        .expect("nested expansion records its root call");
+    let immediate_call = nested.call_path().immediate();
+    let root_call = nested.call_path().root();
     assert_eq!(immediate_call.binding.as_deref(), Some("web.net"));
     assert_eq!(immediate_call.instance, "web.net");
     assert_eq!(immediate_call.module_name, "inner");
@@ -3092,9 +3091,23 @@ fn test_argument_validation_with_resource_reference_is_pending() {
 fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
     use crate::parser::{CompareOp, ValidateExpr};
     use crate::resource::{
-        Composition, CompositionArgument, CompositionCall, CompositionProvenance,
-        ModuleConstraintId, PendingModuleConstraint, Signature,
+        CompositionCall, CompositionCallPath, LiveComposition, LiveCompositionArgument,
+        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint,
     };
+
+    let parsed_calls = crate::parser::parse_file(
+        r#"let inner = use { source = './inner' }
+let outer = use { source = './outer' }
+inner {}
+let root = outer { outer_port = producer.port }
+"#,
+        std::path::Path::new("/tmp/root.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("parse distinct inner and outer call identities")
+    .module_calls;
+    let inner_id = parsed_calls[0].id().clone();
+    let call = parsed_calls[1].clone();
 
     let inner_call = CompositionCall {
         module_name: "inner".to_string(),
@@ -3102,15 +3115,16 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         instance: "inner".to_string(),
         module_source: None,
         module_directory: None,
+        id: inner_id.clone(),
     };
-    let inner = Composition {
+    let inner = LiveComposition {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual", "inner",
         )),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: IndexMap::from([(
                 "port".to_string(),
-                CompositionArgument::from_value(
+                LiveCompositionArgument::from_value(
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "outer_port".to_string(),
                     }),
@@ -3136,10 +3150,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         dependency_bindings: BTreeSet::new(),
         module_name: "inner".to_string(),
         instance: "inner".to_string(),
-        provenance: Box::new(CompositionProvenance::expanded(
-            inner_call.clone(),
-            inner_call,
-        )),
+        call_path: CompositionCallPath::direct(inner_call),
         quoted_string_attrs: HashSet::new(),
     };
     let outer = ParsedFile {
@@ -3176,15 +3187,6 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         resolver.imported_modules.insert("outer".to_string(), outer);
         resolver
     };
-    let call = ModuleCall::test(
-        "outer".to_string(),
-        Some("root".to_string()),
-        module_arguments([(
-            "outer_port".to_string(),
-            Value::resource_ref("producer", "port", Vec::new()),
-        )]),
-    );
-
     let expanded = resolver.expand_module_call(&call, "root").unwrap();
     let nested = expanded
         .compositions
@@ -3192,12 +3194,22 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         .find(|composition| composition.module_name == "inner")
         .expect("nested composition");
     assert_eq!(nested.instance, "root.inner");
+    assert_eq!(nested.call_path().calls().count(), 2);
+    assert_eq!(nested.call_path().root().module_name, "outer");
+    assert_eq!(nested.call_path().immediate().module_name, "inner");
+    assert_eq!(nested.call_path().immediate().instance, "root.inner");
+    assert_eq!(&nested.call_path().root().id, call.id());
+    assert_eq!(&nested.call_path().immediate().id, &inner_id);
+    assert_ne!(
+        nested.call_path().root().id,
+        nested.call_path().immediate().id,
+    );
     assert_eq!(
         nested
             .signature
             .arguments
             .get("port")
-            .map(CompositionArgument::value),
+            .map(LiveCompositionArgument::value),
         Some(&Value::resource_ref("producer", "port", Vec::new()))
     );
     let constraint = &nested.signature.pending_constraints[0];

@@ -59,7 +59,7 @@ pub struct PlanSchedulerEndpoint {
 pub fn build_plan_scheduler_dependency_edges(
     plan_effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let parallel::ExpandedEffects {
         effects,
@@ -393,7 +393,7 @@ pub enum Applied {
 }
 
 /// Input data required to execute a plan.
-pub struct ExecutionInput<'a> {
+pub struct LiveExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
@@ -405,7 +405,7 @@ pub struct ExecutionInput<'a> {
     /// managed resource that depends on `<module-instance>.<attr>` —
     /// where the module-instance binding is a composition — has that edge
     /// followed through the composition's own attribute refs (#2543).
-    pub compositions: &'a [crate::resource::Composition],
+    pub compositions: &'a [crate::resource::LiveComposition],
     pub bindings: ResolvedBindings,
     pub managed_current: HashMap<ResourceId, Current>,
     /// One executor-safe outcome for every configured data source. This type
@@ -437,6 +437,151 @@ pub struct ExecutionInput<'a> {
     /// callers must choose and construct the handoff explicitly; tests that do
     /// not persist effect results may use the test-only no-op constructor.
     pub checkpoint_sink: ExecutionCheckpointSink,
+}
+
+/// Saved-plan counterpart of [`LiveExecutionInput`].
+///
+/// Keeping the composition slice in a distinct input type prevents a
+/// deserialized plan from entering the live validation/expansion lifecycle.
+pub struct SavedExecutionInput<'a> {
+    pub plan: &'a crate::plan::Plan,
+    pub provider_check_inputs: ProviderCheckInputs<'a>,
+    pub compositions: &'a [crate::resource::SavedComposition],
+    pub bindings: ResolvedBindings,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues,
+    pub normalizer: &'a dyn ProviderNormalizer,
+    pub provider_configs: &'a [ProviderConfig],
+    pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
+    pub schemas: &'a crate::schema::SchemaRegistry,
+    pub parallelism: NonZeroUsize,
+    pub precompleted_success_count: usize,
+    pub checkpoint_sink: ExecutionCheckpointSink,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RuntimeCompositions<'a> {
+    Live(&'a [crate::resource::LiveComposition]),
+    Saved(&'a [crate::resource::SavedComposition]),
+}
+
+impl RuntimeCompositions<'_> {
+    fn module_constraint_gate(self) -> ModuleConstraintGate {
+        match self {
+            Self::Live(compositions) => ModuleConstraintGate::from_live_compositions(compositions),
+            Self::Saved(compositions) => {
+                ModuleConstraintGate::from_saved_compositions(compositions)
+            }
+        }
+    }
+
+    fn scheduler_dependencies(
+        self,
+        effects: &[Effect],
+        unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+        deferred_replace_delete_deps: &[(usize, usize)],
+    ) -> scheduler::SchedulerDeps {
+        match self {
+            Self::Live(compositions) => scheduler::build_scheduler_deps(
+                effects,
+                unresolved_resources,
+                compositions,
+                deferred_replace_delete_deps,
+            ),
+            Self::Saved(compositions) => scheduler::build_saved_scheduler_deps(
+                effects,
+                unresolved_resources,
+                compositions,
+                deferred_replace_delete_deps,
+            ),
+        }
+    }
+}
+
+pub(super) struct RuntimeExecutionInput<'a> {
+    pub(super) plan: &'a crate::plan::Plan,
+    pub(super) provider_check_inputs: ProviderCheckInputs<'a>,
+    pub(super) compositions: RuntimeCompositions<'a>,
+    pub(super) bindings: ResolvedBindings,
+    pub(super) managed_current: HashMap<ResourceId, Current>,
+    pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues,
+    pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) provider_configs: &'a [ProviderConfig],
+    pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
+    pub(super) schemas: &'a crate::schema::SchemaRegistry,
+    pub(super) parallelism: NonZeroUsize,
+    pub(super) precompleted_success_count: usize,
+    pub(super) checkpoint_sink: ExecutionCheckpointSink,
+}
+
+impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a> {
+    fn from(input: LiveExecutionInput<'a>) -> Self {
+        let LiveExecutionInput {
+            plan,
+            provider_check_inputs,
+            compositions,
+            bindings,
+            managed_current,
+            data_source_values,
+            normalizer,
+            provider_configs,
+            factories,
+            schemas,
+            parallelism,
+            precompleted_success_count,
+            checkpoint_sink,
+        } = input;
+        Self {
+            plan,
+            provider_check_inputs,
+            compositions: RuntimeCompositions::Live(compositions),
+            bindings,
+            managed_current,
+            data_source_values,
+            normalizer,
+            provider_configs,
+            factories,
+            schemas,
+            parallelism,
+            precompleted_success_count,
+            checkpoint_sink,
+        }
+    }
+}
+
+impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a> {
+    fn from(input: SavedExecutionInput<'a>) -> Self {
+        let SavedExecutionInput {
+            plan,
+            provider_check_inputs,
+            compositions,
+            bindings,
+            managed_current,
+            data_source_values,
+            normalizer,
+            provider_configs,
+            factories,
+            schemas,
+            parallelism,
+            precompleted_success_count,
+            checkpoint_sink,
+        } = input;
+        Self {
+            plan,
+            provider_check_inputs,
+            compositions: RuntimeCompositions::Saved(compositions),
+            bindings,
+            managed_current,
+            data_source_values,
+            normalizer,
+            provider_configs,
+            factories,
+            schemas,
+            parallelism,
+            precompleted_success_count,
+            checkpoint_sink,
+        }
+    }
 }
 
 /// Value provenance for provider-bound effects in one execution.
@@ -991,9 +1136,40 @@ pub trait ExecutionObserver: Send + Sync {
 /// - Failure propagation (failed_bindings)
 /// - Dependency skip
 /// - Pending state refreshes
-pub async fn execute_plan(
+pub async fn execute_live_plan(
     provider: &dyn Provider,
-    mut input: ExecutionInput<'_>,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+}
+
+#[cfg(test)]
+pub(crate) type ExecutionInput<'a> = LiveExecutionInput<'a>;
+
+#[cfg(test)]
+async fn execute_plan(
+    provider: &dyn Provider,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    execute_live_plan(provider, input, observer, shutdown).await
+}
+
+pub async fn execute_saved_plan(
+    provider: &dyn Provider,
+    input: SavedExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+}
+
+async fn execute_runtime_plan(
+    provider: &dyn Provider,
+    mut input: RuntimeExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {

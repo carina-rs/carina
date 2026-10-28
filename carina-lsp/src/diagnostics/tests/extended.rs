@@ -5234,8 +5234,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use carina_core::binding_index::BindingIndex;
     use carina_core::parser::{ArgumentOrigin, TypeExpr};
     use carina_core::resource::{
-        Composition, CompositionArgument, CompositionAttribute, CompositionCall,
-        CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
+        CompositionCall, CompositionCallPath, ConcreteValue, LiveComposition,
+        LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature, ResourceId,
+        Value,
     };
     use indexmap::IndexMap;
 
@@ -5247,19 +5248,27 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
-    fn composition(binding: &'static str, call_binding: &str) -> Composition {
+    fn composition(binding: &'static str, call_binding: &str) -> LiveComposition {
+        let source_file = std::path::PathBuf::from(format!("/{call_binding}.crn"));
+        let parsed = carina_core::parser::parse_file(
+            "let missing = use { source = '../missing' }\nmissing {}\n",
+            &source_file,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("parse synthetic composition call");
         let call = CompositionCall {
+            id: parsed.module_calls[0].id().clone(),
             module_name: "missing".to_string(),
             binding: Some(call_binding.to_string()),
             instance: call_binding.to_string(),
             module_source: Some("../missing".to_string()),
             module_directory: None,
         };
-        Composition {
+        LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -5268,7 +5277,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             dependency_bindings: Default::default(),
             module_name: "missing".to_string(),
             instance: call_binding.to_string(),
-            provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+            call_path: CompositionCallPath::direct(call),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -5285,7 +5294,7 @@ let first = unrelated { }
     let mut source = composition("source", "missing-source-call");
     source.signature.attributes.insert(
         "sg".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
@@ -5293,7 +5302,7 @@ let first = unrelated { }
     let mut consumer = composition("consumer", "missing-consumer-call");
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
-        CompositionArgument::from_value(
+        LiveCompositionArgument::from_value(
             Value::resource_ref("source", "missing", vec![]),
             schema_type("ec2.Vpc"),
             ArgumentOrigin::Defaulted,
@@ -6508,6 +6517,56 @@ let web2 = issue {
 }
 
 #[test]
+fn identical_anonymous_module_calls_anchor_mismatches_at_their_own_spans() {
+    let engine = module_boundary_identity_engine();
+    let main = r#"let checked = use { source = './module' }
+
+let sg = aws.ec2.SecurityGroup {
+  name = "root"
+}
+
+checked {
+  vpc_id = sg.group_id
+}
+
+checked {
+  vpc_id = sg.group_id
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "module/main.crn",
+            "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", main);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'checked': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatches
+            .iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>(),
+        vec![
+            Range::new(Position::new(7, 2), Position::new(7, 8)),
+            Range::new(Position::new(11, 2), Position::new(11, 8)),
+        ],
+    );
+}
+
+#[test]
 fn defaulted_composition_argument_mismatch_anchors_the_authored_call() {
     let engine = module_boundary_identity_engine();
     let main = r#"let checked = use { source = './module' }
@@ -7054,8 +7113,13 @@ fn analyze_with_buffer(
     filename: &str,
     buffer: &str,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-    let doc = create_document(buffer);
-    engine.analyze(&doc, Some(&(base).join(filename)))
+    let path = base.join(filename);
+    let doc = crate::document::Document::new_with_path(
+        buffer.to_string(),
+        path.clone(),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    engine.analyze(&doc, Some(&path))
 }
 
 #[test]

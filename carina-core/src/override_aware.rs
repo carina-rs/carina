@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use crate::binding_index::{LivePreApplyInputs, ManagedBindingStability, ResolvedBindings};
 use crate::data_source_value::DataSourceValues;
 use crate::deps::sort_resources_by_dependencies;
 use crate::effect::deps::UnresolvedResource;
@@ -251,11 +251,11 @@ pub enum OverrideAwareBuildMode<'a> {
 ///
 /// ```compile_fail
 /// # use std::collections::HashMap;
-/// # use carina_core::binding_index::PreApplyInputs;
+/// # use carina_core::binding_index::LivePreApplyInputs;
 /// # use carina_core::name_override::NameOverride;
 /// # use carina_core::override_aware::{OverrideAwareBuildMode, OverrideAwareResources};
 /// # use carina_core::resource::{Resource, ResourceId};
-/// # fn bypass(raw: Vec<Resource>, inputs: PreApplyInputs<'_>) {
+/// # fn bypass(raw: Vec<Resource>, inputs: LivePreApplyInputs<'_>) {
 /// let _ = OverrideAwareResources::build_pair_with_stability::<
 ///     (),
 ///     HashMap<ResourceId, HashMap<String, NameOverride>>,
@@ -284,7 +284,7 @@ pub struct OverrideAwareResources {
 /// late identity reconciliation. The managed set is deliberately absent: the
 /// rebuilt view always uses the resource set owned by the receiver.
 pub struct RebuildBindingsInputs<'a> {
-    pub compositions: &'a [crate::resource::Composition],
+    pub compositions: &'a [crate::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, crate::resource::PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -297,7 +297,7 @@ impl OverrideAwareResources {
     pub fn build_pair_with_stability<E, S>(
         resources: &CanonicalResourcePair<E>,
         state_file: Option<&S>,
-        inputs: PreApplyInputs<'_>,
+        inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
     ) -> Result<(Self, Self), String>
@@ -314,7 +314,7 @@ impl OverrideAwareResources {
     fn build_inner<S>(
         unresolved: Vec<Resource>,
         state_file: Option<&S>,
-        inputs: &PreApplyInputs<'_>,
+        inputs: &LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
     ) -> Result<Self, String>
@@ -322,8 +322,8 @@ impl OverrideAwareResources {
         S: NameOverrideSource + ?Sized,
     {
         let mut resources = unresolved.clone();
-        let mut bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
                 managed_current: inputs.managed_current,
@@ -370,8 +370,8 @@ impl OverrideAwareResources {
             }
         }
 
-        bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
                 managed_current: inputs.managed_current,
@@ -522,8 +522,8 @@ impl OverrideAwareResources {
             remote_bindings,
             wait_aliases,
         } = inputs;
-        self.bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        self.bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &self.resources,
                 compositions,
                 managed_current,
@@ -553,7 +553,7 @@ impl OverrideAwareResources {
         let data_source_values = DataSourceValues::empty();
         let remote_bindings = HashMap::new();
         let wait_aliases = [];
-        let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &compositions,
             managed_current: &managed_current,
@@ -720,7 +720,7 @@ mod tests {
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
             Some(overrides),
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions: &compositions,
                 managed_current: &managed_current,

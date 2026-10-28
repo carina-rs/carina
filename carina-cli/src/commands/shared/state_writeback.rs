@@ -240,7 +240,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// (paired with `export_params: None`, so no export resolution
     /// runs there anyway).
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    /// Pre-resolve snapshot of every `Composition` in the
+    /// Pre-resolve snapshot of every `LiveComposition` in the
     /// configuration: each one carries its **authored**
     /// `ResourceRef` attribute values (e.g. `role_arn = role.arn`),
     /// not the pre-apply-resolved concrete values.
@@ -259,7 +259,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// post-apply state. Empty for the `apply --plan` path, where
     /// `export_params` is also `None` and no export resolution
     /// runs.
-    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
+    pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
 }
 
 /// Export writeback result split by per-export outcome.
@@ -430,14 +430,14 @@ pub(crate) struct SkippedExport {
 ///    attributes win over any pre-apply managed snapshot (carina#3266).
 /// 2. Split `sorted_resources` into a managed view (Managed +
 ///    DataSource collapsed onto `Resource` by field projection)
-///    and a composition view ([`Composition::try_from`]).
+///    and a composition view ([`LiveComposition::try_from`]).
 /// 3. Build the bindings view from the managed slice via
 ///    [`ResolvedBindings::from_managed_with_state`] (#3176).
 /// 4. Re-resolve each composition's `ResourceRef`s against that view via
-///    [`resolve_virtual_refs_post_apply`] (#3175), so a composition that
+///    [`resolve_live_composition_refs_post_apply`] (#3175), so a composition that
 ///    references a Replaced managed gets the *post*-replace value.
 /// 5. Layer the re-resolved compositions onto the bindings view via
-///    `layer_compositions_post_apply` (#3176).
+///    `layer_live_compositions_post_apply` (#3176).
 /// 6. Resolve export expressions against the combined view.
 ///
 /// # Partial-apply tolerance (carina#3551 / carina#3498)
@@ -454,7 +454,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
         carina_core::parser::InferredExportParam,
     >,
     pub sorted_resources: &'a [Resource],
-    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
+    pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
@@ -468,7 +468,7 @@ pub(crate) fn resolve_export_values_post_apply(
     AppError,
 > {
     use carina_core::binding_index::ResolvedBindings;
-    use carina_core::resolver::resolve_virtual_refs_post_apply;
+    use carina_core::resolver::resolve_live_composition_refs_post_apply;
 
     // Step 1: the post-apply state view was assembled by
     // [`PostApplyStates::from_current_and_state`] before this call.
@@ -481,7 +481,7 @@ pub(crate) fn resolve_export_values_post_apply(
     // resolver below can pick up the post-apply state values for
     // any managed sibling that was Replaced during apply
     // (#3169 / #3177).
-    let mut compositions: Vec<carina_core::resource::Composition> =
+    let mut compositions: Vec<carina_core::resource::LiveComposition> =
         input.pre_resolve_compositions.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
@@ -491,32 +491,33 @@ pub(crate) fn resolve_export_values_post_apply(
     // post-apply state in Step 4; only after that re-resolution can
     // they be layered into the bindings view. We use `pre_apply`
     // with `compositions: &[]` here, then call
-    // `layer_compositions_post_apply` once the re-resolution is done.
+    // `layer_live_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         input.post_apply_states.managed_current().clone(),
         input.schemas,
         input.sorted_resources,
     );
-    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: input.sorted_resources,
-        compositions: &[],
-        managed_current: &plan_input_current,
-        data_source_values: input.post_apply_states.data_source_values(),
-        remote_bindings: &HashMap::new(),
-        wait_aliases: input.wait_aliases,
-    });
+    let mut bindings =
+        ResolvedBindings::pre_apply_live(carina_core::binding_index::LivePreApplyInputs {
+            managed: input.sorted_resources,
+            compositions: &[],
+            managed_current: &plan_input_current,
+            data_source_values: input.post_apply_states.data_source_values(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: input.wait_aliases,
+        });
 
     // Step 4: re-resolve each composition's attributes against the
     // post-apply bindings view. After this, a composition's
     // `role_arn = role.arn` no longer holds the pre-apply
     // `ResourceRef`; it holds the post-apply concrete value.
-    resolve_virtual_refs_post_apply(&mut compositions, &bindings)?;
+    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)?;
 
     // Step 5: layer the re-resolved compositions onto the bindings view.
     // Now `exports { foo = some_module.role_arn }` resolves against
     // a binding whose `role_arn` is the post-apply value.
-    bindings.layer_compositions_post_apply(&compositions)?;
+    bindings.layer_live_compositions_post_apply(&compositions)?;
 
     // Step 6: resolve the export expressions against the combined
     // view. The input is already checked at the pre-apply boundary, but a

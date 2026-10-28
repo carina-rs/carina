@@ -4,7 +4,9 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
-use carina_core::resource::{Composition, Current, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    Current, DataSource, Resource, ResourceId, SavedComposition, State, Value,
+};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -650,7 +652,7 @@ impl RehydratedPlanFile {
         self.plan_file.unresolved_resources()
     }
 
-    fn compositions(&self) -> &[Composition] {
+    fn compositions(&self) -> &[SavedComposition] {
         self.plan_file.compositions()
     }
 
@@ -707,7 +709,7 @@ impl ExecutablePlanFile {
         self.plan.unresolved_resources()
     }
 
-    pub(super) fn compositions(&self) -> &[Composition] {
+    pub(super) fn compositions(&self) -> &[SavedComposition] {
         self.plan.compositions()
     }
 

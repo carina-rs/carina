@@ -193,6 +193,20 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
         BTreeSet::from(["published", "silent", "wrapper", "wrapper.nested"]),
         "saved compositions must retain all authored and nested bindings",
     );
+    let nested_wire = saved_json["compositions"]
+        .as_array()
+        .expect("serialized compositions")
+        .iter()
+        .find(|composition| composition["binding"] == "wrapper.nested")
+        .expect("nested composition wire entry");
+    assert_eq!(
+        nested_wire["origin_id"]["descendants"]
+            .as_array()
+            .expect("saved origin descendants")
+            .len(),
+        1,
+        "saved origin identity must retain the complete root-to-inner call path",
+    );
     assert_eq!(
         saved_plan
             .compositions
@@ -231,24 +245,29 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
         "the output-less bound call must still serialize as a composition",
     );
 
-    for composition in &saved_plan.compositions {
+    for composition in saved_json["compositions"]
+        .as_array()
+        .expect("serialized compositions")
+    {
         assert!(
-            composition.diagnostic_call().is_none() && composition.diagnostic_root_call().is_none(),
-            "saved composition {} must deserialize with Deserialized provenance",
-            composition.instance,
+            composition.get("origin_id").is_some(),
+            "every saved composition must carry its required origin path: {composition}"
         );
-        for (name, argument) in &composition.signature.arguments {
+        assert_eq!(
+            composition["origin_id"]["root"]["source_file"]["location"], "source_root_relative",
+            "project-local call identities must be normalized to the canonical plan root",
+        );
+        let serialized = composition.to_string();
+        for forbidden in [
+            "declared_type",
+            "source_argument",
+            "call_path",
+            "quoted_string_attrs",
+            "structural_operand",
+        ] {
             assert!(
-                argument.declared_type().is_none(),
-                "saved composition {} argument {name} must omit its declared type",
-                composition.instance,
-            );
-        }
-        for (name, attribute) in &composition.signature.attributes {
-            assert!(
-                attribute.declared_type().is_none(),
-                "saved composition {} attribute {name} must omit its declared type",
-                composition.instance,
+                !serialized.contains(forbidden),
+                "saved composition must omit live-only field {forbidden:?}: {serialized}",
             );
         }
     }
@@ -266,7 +285,7 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     for diagnostic_marker in ["module call '", "type mismatch", "cannot assign"] {
         assert!(
             !apply_text.contains(diagnostic_marker),
-            "saved-plan apply must not re-check a Deserialized composition without its serde-skipped declared types; found {diagnostic_marker:?} in:\n{apply_text}",
+            "saved-plan apply must not enter live composition validation; found {diagnostic_marker:?} in:\n{apply_text}",
         );
     }
 

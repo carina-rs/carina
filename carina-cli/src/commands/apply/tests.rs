@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::binding_index::PreApplyInputs;
+use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
@@ -8,9 +8,9 @@ use carina_core::provider::{
     ReadOutcome, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{
-    Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
-    PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
-    ResourceIdentity, Signature,
+    DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
+    ModuleConstraintId, ModuleSource, PendingModuleConstraint, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -613,20 +613,22 @@ fn deserialize_saved_provider_configs(
     serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
 }
 
-fn saved_composition_argument(value: Value) -> CompositionArgument {
-    let saved_shape: CompositionArgument =
-        serde_json::from_value(serde_json::to_value(string_value("")).unwrap()).unwrap();
-    saved_shape.with_value(value)
+fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
+    LiveCompositionArgument::from_value(
+        value,
+        carina_core::parser::TypeExpr::String,
+        carina_core::parser::ArgumentOrigin::Defaulted,
+    )
 }
 
-fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
+fn saved_module_composition(argument: Value, rejected: &str) -> LiveComposition {
     let argument_name = "value";
-    Composition {
+    LiveComposition {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual",
             "root.checked",
         )),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: indexmap::IndexMap::from([(
                 argument_name.to_string(),
                 saved_composition_argument(argument),
@@ -650,7 +652,7 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
         dependency_bindings: BTreeSet::new(),
         module_name: "checked_module".to_string(),
         instance: "root.checked".to_string(),
-        provenance: Default::default(),
+        call_path: crate::test_composition_call_path(),
         quoted_string_attrs: HashSet::new(),
     }
 }
@@ -693,31 +695,30 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
 
 #[tokio::test]
 async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
-    let secret = || {
-        Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-            "composition-secret",
-        ))))
-    };
-    let mut saved = saved_module_composition(secret(), "rejected");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut saved = saved_module_composition(string_value("public"), "rejected");
     saved.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
         "_virtual",
         "saved.anonymous",
     ));
     saved.binding = None;
-    let saved =
-        carina_core::value::redact_secrets_in_virtual(&saved).expect("redact saved composition");
+    let saved = saved.into_saved(tmp.path());
+    let saved = carina_core::value::redact_secrets_in_saved_composition(&saved)
+        .expect("redact saved composition");
 
-    let mut current = saved_module_composition(secret(), "rejected");
+    let mut current = saved_module_composition(string_value("public"), "rejected");
     current.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
         "_virtual",
         "current.anonymous",
     ));
     current.binding = None;
+    current.call_path = crate::test_composition_call_path_in(Path::new(
+        "/carina-tests/other-composition-fixture.crn",
+    ));
     let parsed = carina_core::parser::InferredFile {
         compositions: vec![current],
         ..Default::default()
     };
-    let tmp = tempfile::tempdir().expect("tempdir");
     let provider_inputs = load_and_resolve_provider_configs(
         &parsed,
         tmp.path(),
@@ -2446,7 +2447,10 @@ let lookup = read mock.iam.Roles {{
     let mut composition = saved_module_composition(string_value("bad"), "bad");
     composition.signature.attributes.insert(
         "value".to_string(),
-        carina_core::resource::CompositionAttribute::from_value(string_value("^existing$"), None),
+        carina_core::resource::LiveCompositionAttribute::from_value(
+            string_value("^existing$"),
+            None,
+        ),
     );
     parsed.compositions.push(composition);
     parsed.data_sources[0].set_attr(
@@ -2879,7 +2883,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         plan,
         sorted_resources: vec![producer.clone(), consumer.clone()],
         unresolved_resources: vec![producer, consumer],
-        compositions: vec![composition],
+        compositions: vec![composition.into_saved(tmp.path())],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
@@ -2959,7 +2963,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         plan: Plan::new(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
-        compositions: vec![saved_module_composition(string_value("bad"), "bad")],
+        compositions: vec![
+            saved_module_composition(string_value("bad"), "bad").into_saved(tmp.path()),
+        ],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
@@ -3329,7 +3335,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
         &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
         Some(&state),
-        PreApplyInputs {
+        LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &current_states,
@@ -7150,7 +7156,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
         let json = serde_json::json!({
@@ -7181,22 +7187,24 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // Virtual resource as `expand_module_call` produces it: binding is
     // the module-call alias, and each attribute is a ResourceRef into
     // an expanded sub-resource. carina#3181: compositions are their own type.
-    let mut virt_attrs: indexmap::IndexMap<String, carina_core::resource::CompositionAttribute> =
-        indexmap::IndexMap::new();
+    let mut virt_attrs: indexmap::IndexMap<
+        String,
+        carina_core::resource::LiveCompositionAttribute,
+    > = indexmap::IndexMap::new();
     virt_attrs.insert(
         "role_arn".to_string(),
-        carina_core::resource::CompositionAttribute::from_value(
+        carina_core::resource::LiveCompositionAttribute::from_value(
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("github_actions_carina.role", "arn"),
             }),
             None,
         ),
     );
-    let composition = Composition {
+    let composition = LiveComposition {
         id: carina_core::resource::ResolvedResourceId::new(
             carina_core::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
         ),
-        signature: carina_core::resource::Signature {
+        signature: carina_core::resource::LiveCompositionSignature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
             pending_constraints: Vec::new(),
@@ -7205,7 +7213,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "github_module".to_string(),
         instance: "github_actions_carina".to_string(),
-        provenance: Default::default(),
+        call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
     };
     let sorted_resources = vec![role_resource];
@@ -7261,7 +7269,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
         let json = serde_json::json!({
@@ -7293,22 +7301,22 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         |id_name: &'static str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
             let mut attributes: indexmap::IndexMap<
                 String,
-                carina_core::resource::CompositionAttribute,
+                carina_core::resource::LiveCompositionAttribute,
             > = indexmap::IndexMap::new();
             attributes.insert(
                 attr.to_string(),
-                carina_core::resource::CompositionAttribute::from_value(
+                carina_core::resource::LiveCompositionAttribute::from_value(
                     Value::Deferred(DeferredValue::ResourceRef {
                         path: AccessPath::new(ref_b, ref_a),
                     }),
                     None,
                 ),
             );
-            Composition {
+            LiveComposition {
                 id: carina_core::resource::ResolvedResourceId::new(
                     carina_core::resource::ResourceId::with_identity("_virtual", id_name),
                 ),
-                signature: carina_core::resource::Signature {
+                signature: carina_core::resource::LiveCompositionSignature {
                     arguments: indexmap::IndexMap::new(),
                     attributes,
                     pending_constraints: Vec::new(),
@@ -7317,7 +7325,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                 dependency_bindings: std::collections::BTreeSet::new(),
                 module_name: "mod".to_string(),
                 instance: binding.to_string(),
-                provenance: Default::default(),
+                call_path: crate::test_composition_call_path(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             }
         };
@@ -7386,7 +7394,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // call to `resolve_refs_with_state_and_remote(&mut
     // resources_for_plan, &pre_apply_managed_states, …)` collapses
     // every `ResourceRef` — including the ones inside a
-    // `Composition`'s `attributes` — into the pre-apply
+    // `LiveComposition`'s `attributes` — into the pre-apply
     // concrete value (here: OLD_ARN). The composition's `role_arn`
     // attribute thus becomes a frozen string snapshot of the
     // pre-apply state. Later in `finalize_apply`, the resource
@@ -7404,8 +7412,8 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // `resolve_export_values_post_apply`, which uses it (instead of the mutated
     // `sorted_resources`) to build a fresh post-apply
     // `ResolvedBindings` view via the typestate-split API
-    // (`from_managed_with_state` + `resolve_virtual_refs_post_apply`
-    // + `layer_compositions_post_apply`). Exports then resolve against the
+    // (`from_managed_with_state` + `resolve_live_composition_refs_post_apply`
+    // + `layer_live_compositions_post_apply`). Exports then resolve against the
     // post-apply view.
     //
     // **The test** mirrors that production pipeline: it (1)
@@ -7424,8 +7432,8 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
-        AccessPath, Composition, ConcreteValue, DeferredValue, ResourceId, State as ResourceState,
-        Value,
+        AccessPath, ConcreteValue, DeferredValue, LiveComposition, ResourceId,
+        State as ResourceState, Value,
     };
     use std::collections::HashMap;
 
@@ -7480,23 +7488,25 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
     role_managed.binding = Some("role".to_string());
 
-    let mut virt_attrs: indexmap::IndexMap<String, carina_core::resource::CompositionAttribute> =
-        indexmap::IndexMap::new();
+    let mut virt_attrs: indexmap::IndexMap<
+        String,
+        carina_core::resource::LiveCompositionAttribute,
+    > = indexmap::IndexMap::new();
     virt_attrs.insert(
         "role_arn".to_string(),
-        carina_core::resource::CompositionAttribute::from_value(
+        carina_core::resource::LiveCompositionAttribute::from_value(
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("role", "arn"),
             }),
             None,
         ),
     );
-    let composition = Composition {
+    let composition = LiveComposition {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual",
             "carina_module",
         )),
-        signature: carina_core::resource::Signature {
+        signature: carina_core::resource::LiveCompositionSignature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
             pending_constraints: Vec::new(),
@@ -7505,7 +7515,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "carina_module".to_string(),
         instance: "carina_module".to_string(),
-        provenance: Default::default(),
+        call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
     };
 
@@ -7513,13 +7523,13 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     // Step (c): pre-resolve snapshot of the composition — carries the
     // authored `ref role.arn`.
-    let pre_resolve_compositions: Vec<Composition> = vec![composition];
+    let pre_resolve_compositions: Vec<LiveComposition> = vec![composition];
 
     // Step (d): head-of-pipeline resolver — runs over the managed
     // slice only. compositions are not part of it, so the pre-resolve
     // snapshot above is preserved verbatim.
-    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
             managed: &sorted_resources.clone(),
             compositions: &[],
             managed_current: &crate::plan_input_current_from_states(
@@ -8098,16 +8108,50 @@ mod saved_plan_version_tests {
         else {
             panic!("expected typed unsupported plan version error")
         };
-        assert_eq!((found, expected), (25, 26));
+        assert_eq!(
+            (found, expected),
+            (25, crate::commands::plan::PlanFile::CURRENT_VERSION),
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_plan_version_is_rejected_before_payload_decoding() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("previous-plan.json");
+        let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
+        let old_plan = serde_json::json!({
+            "version": previous,
+            "timestamp": "2026-10-29T00:00:00Z",
+            "source_path": "infra",
+            "compositions": "intentionally invalid payload",
+        });
+        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
+            .expect("write previous plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("the previous format must be rejected before decoding its payload");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found, expected, ..
+        } = error
+        else {
+            panic!("expected typed unsupported plan version error")
+        };
+        assert_eq!(found, previous);
+        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
     }
 
     #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
-        assert_eq!(
-            crate::commands::plan::PlanFile::CURRENT_VERSION,
-            26,
-            "persisting loaded provider artifacts must bump the saved-plan format",
-        );
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -8153,7 +8197,10 @@ mod saved_plan_version_tests {
         else {
             panic!("expected typed version error, got {error:?}");
         };
-        assert_eq!((*found, *expected), (22, 26));
+        assert_eq!(
+            (*found, *expected),
+            (22, crate::commands::plan::PlanFile::CURRENT_VERSION),
+        );
         let expected_replan = format!("carina plan --out {} infra", plan_path.display());
         assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
         assert!(

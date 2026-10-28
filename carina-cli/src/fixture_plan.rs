@@ -181,7 +181,7 @@ pub struct FixturePlan {
     pub desired_resources: Vec<ResolvedResource>,
     /// Pre-resolution resource snapshots paired to `desired_resources`.
     pub unresolved_resources: Vec<UnresolvedResource>,
-    pub compositions: Vec<carina_core::resource::Composition>,
+    pub compositions: Vec<carina_core::resource::LiveComposition>,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_states: HashMap<ResourceId, State>,
     pub state_file: Option<StateFile>,
@@ -465,7 +465,7 @@ where
         OverrideAwareResources::build_pair_with_stability(
             &canonical_resources,
             state_file.as_ref(),
-            carina_core::binding_index::PreApplyInputs {
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
                 managed_current: &pre_apply_input_current,
@@ -501,7 +501,8 @@ where
     let constraint_origin_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let prepared_compositions = parsed.compositions.clone();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&prepared_compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&prepared_compositions);
     let wait_bindings = parsed.wait_bindings.clone();
     let mut provider_router = ProviderRouter::new();
     let preparation = {

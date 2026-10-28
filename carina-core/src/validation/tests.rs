@@ -4,8 +4,8 @@ use crate::parser::{
     WaitBinding,
 };
 use crate::resource::{
-    Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    DataSource, Resource, Signature,
+    CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
+    LiveCompositionAttribute, LiveCompositionSignature, Resource,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
@@ -984,27 +984,28 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
     )
 }
 
-fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
+fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
     let call = CompositionCall {
+        id: crate::parser::ModuleCallId::test_dummy_in(format!("{binding}.crn")),
         module_name: "test_module".to_string(),
         binding: Some(binding.to_string()),
         instance: binding.to_string(),
         module_source: None,
         module_directory: None,
     };
-    Composition {
+    LiveComposition {
         id: crate::resource::ResolvedResourceId::with_identity(
             "_virtual",
             crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
         ),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: IndexMap::new(),
             attributes: attributes
                 .iter()
                 .map(|name| {
                     (
                         (*name).to_string(),
-                        CompositionAttribute::from_value(
+                        LiveCompositionAttribute::from_value(
                             Value::Concrete(ConcreteValue::String(format!("{name}-value").into())),
                             None,
                         ),
@@ -1017,21 +1018,22 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
-        provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+        call_path: CompositionCallPath::direct(call),
         quoted_string_attrs: Default::default(),
     }
 }
 
-fn set_composition_module(composition: &mut Composition, module_name: &str) {
+fn set_composition_module(composition: &mut LiveComposition, module_name: &str) {
     composition.module_name = module_name.to_string();
     let call = CompositionCall {
+        id: composition.call_path.immediate().id.clone(),
         module_name: module_name.to_string(),
         binding: composition.binding.clone(),
         instance: composition.instance.clone(),
         module_source: None,
         module_directory: None,
     };
-    *composition.provenance = CompositionProvenance::expanded(call.clone(), call);
+    composition.call_path = CompositionCallPath::direct(call);
 }
 
 #[test]
@@ -3761,7 +3763,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let mut source = make_composition("inner", &[]);
     source.signature.attributes.insert(
         "security_group_id".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
@@ -3769,7 +3771,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let mut consumer = make_composition("consumer", &[]);
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
-        CompositionArgument::from_value(
+        LiveCompositionArgument::from_value(
             Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
             ArgumentOrigin::Defaulted,
@@ -3801,7 +3803,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     let mut consumer = make_composition("consumer", &[]);
     consumer.signature.attributes.insert(
         "x".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::resource_ref("inner".to_string(), "typo".to_string(), vec![]),
             Some(TypeExpr::String),
         ),
@@ -3841,7 +3843,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         let mut source = make_composition(&source_binding, &[]);
         source.signature.attributes.insert(
             "group_id".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::String("sg-123".into())),
                 Some(schema_type("ec2.SecurityGroup")),
             ),
@@ -3851,7 +3853,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         set_composition_module(&mut consumer, "bad_module");
         consumer.signature.attributes.insert(
             "bad".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::resource_ref(source_binding, "group_id".to_string(), vec![]),
                 Some(schema_type("ec2.Vpc")),
             ),
@@ -3889,7 +3891,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         let mut source = make_composition(&source_binding, &[]);
         source.signature.attributes.insert(
             "group_id".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::String("sg-123".into())),
                 Some(security_group_id.clone()),
             ),
@@ -3900,7 +3902,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         set_composition_module(&mut consumer, "bad_module");
         consumer.signature.attributes.insert(
             "both".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::resource_ref(source_binding.clone(), "group_id".to_string(), vec![]),
                     Value::resource_ref(source_binding, "nonexistent_attr".to_string(), vec![]),
@@ -3953,7 +3955,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     let mut source = make_composition("source", &[]);
     source.signature.attributes.insert(
         "group_id".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
@@ -3964,7 +3966,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     set_composition_module(&mut consumer, "needs");
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
-        CompositionArgument::from_value(
+        LiveCompositionArgument::from_value(
             Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
             ArgumentOrigin::Defaulted,
@@ -4735,7 +4737,7 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
 
 #[test]
 fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::parser::InferredExportParam;
 
     fn bindings(identifier: &str) -> ResolvedBindings {
@@ -4745,7 +4747,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
                 "identifier",
                 Value::Concrete(ConcreteValue::String(identifier.into())),
             );
-        ResolvedBindings::pre_apply(PreApplyInputs {
+        ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -5332,7 +5334,7 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
     assert_eq!(
         all_errors.lines().count(),
         2,
-        "an unreported Unknown export must check Schema and Composition targets: {all_errors}",
+        "an unreported Unknown export must check Schema and LiveComposition targets: {all_errors}",
     );
     assert!(all_errors.contains("export 'composition_bad': unknown attribute"));
     assert!(all_errors.contains("export 'schema_bad': unknown attribute"));

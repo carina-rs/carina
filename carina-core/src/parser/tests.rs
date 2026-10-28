@@ -1,5 +1,5 @@
 use super::*;
-use crate::binding_index::{IterableBindings, PreDataSourceReadInputs, ResolvedBindings};
+use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
@@ -3495,6 +3495,43 @@ fn parse_let_binding_module_call() {
 }
 
 #[test]
+fn module_call_ids_are_equal_across_independent_reparses() {
+    let input = "let module = use { source = './module' }\nlet call = module {}\n";
+    let path = std::path::Path::new("/tmp/project/main.crn");
+
+    let first = parse_file(input, path, &ProviderContext::default()).expect("first parse");
+    let second = parse_file(input, path, &ProviderContext::default()).expect("second parse");
+
+    assert_eq!(first.module_calls[0].id(), second.module_calls[0].id());
+}
+
+#[test]
+fn module_call_ids_distinguish_files_and_authored_spans() {
+    let input = "let module = use { source = './module' }\nmodule {}\nmodule {}\n";
+    let first_file = parse_file(
+        input,
+        std::path::Path::new("/tmp/project/first.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("first file");
+    let second_file = parse_file(
+        input,
+        std::path::Path::new("/tmp/project/second.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("second file");
+
+    assert_ne!(
+        first_file.module_calls[0].id(),
+        first_file.module_calls[1].id()
+    );
+    assert_ne!(
+        first_file.module_calls[0].id(),
+        second_file.module_calls[0].id()
+    );
+}
+
+#[test]
 fn parse_module_call_binding_enables_resource_ref() {
     // After `let web = web_tier { ... }`, `web.security_group` should
     // resolve as ResourceRef.
@@ -4445,6 +4482,17 @@ fn parse_for_expression_with_module_call_over_list() {
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
         )))
+    );
+
+    assert_eq!(
+        result.module_calls[0].source_span(),
+        result.module_calls[1].source_span(),
+        "for iterations retain the authored body span",
+    );
+    assert_ne!(
+        result.module_calls[0].id(),
+        result.module_calls[1].id(),
+        "the parser expansion discriminator must distinguish iterations",
     );
 }
 
@@ -9770,7 +9818,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
-    let bindings = ResolvedBindings::pre_data_source_read(PreDataSourceReadInputs {
+    let bindings = ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,

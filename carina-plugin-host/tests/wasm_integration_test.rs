@@ -95,7 +95,7 @@ fn redacted_secret_and_legacy_marker(plaintext: &str) -> (Value, String) {
 
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
@@ -137,7 +137,7 @@ async fn update_request_for_test(
     changed_attributes: &[String],
 ) -> UpdateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let mut schemas = carina_core::schema::SchemaRegistry::new();
     schemas.insert(
         resource.id.provider.clone(),
@@ -3541,7 +3541,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
         ),
     ]);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,

@@ -1876,7 +1876,7 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
 
 /// carina#3322: the composition group header reads
 /// `▾ module "<binding>" (<source_path>)`. The keyword is `module`,
-/// not the internal `Composition`; the binding name is the user's
+/// not the internal `LiveComposition`; the binding name is the user's
 /// `let` LHS, and the parenthesized suffix surfaces the DSL `use`
 /// path so the operator can trace the group back to a real `.crn`
 /// file.

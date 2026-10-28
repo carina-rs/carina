@@ -238,7 +238,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
         .filter(|rref| {
             !matches!(
                 rref,
-                ResourceRef::Composition(composition) if composition.binding.is_none()
+                ResourceRef::LiveComposition(composition) if composition.binding.is_none()
             )
         })
         .map(|rref| match rref {
@@ -572,13 +572,13 @@ mod tests {
     #[test]
     fn validation_listing_excludes_unbound_compositions() {
         use carina_core::parser::ParsedFile;
-        use carina_core::resource::{Composition, ResourceId, Signature};
+        use carina_core::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
 
-        let composition = |instance: &'static str, binding: Option<&str>| Composition {
+        let composition = |instance: &'static str, binding: Option<&str>| LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", instance,
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -587,7 +587,7 @@ mod tests {
             dependency_bindings: Default::default(),
             module_name: "example".to_string(),
             instance: instance.to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
         };
         let mut parsed = ParsedFile::default();

@@ -34,8 +34,8 @@ use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{Orphans, create_plan};
 use carina_core::executor::{
-    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, ProviderCheckInputs,
-    UnresolvedResource, execute_plan,
+    ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
+    UnresolvedResource, execute_live_plan,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -420,7 +420,7 @@ fn apply_path_propagates_module_wait_binding() {
         refs.iter().any(|p| p.binding() == "r.cert_issued"),
         "Distribution's distribution_config ref must bind to the wait \
          binding `r.cert_issued`, NOT the composition module proxy `r`. \
-         Found refs: {paths:?}. Composition `r` present: {composition_r}"
+         Found refs: {paths:?}. LiveComposition `r` present: {composition_r}"
     );
 }
 
@@ -533,8 +533,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
             managed: &resources_for_plan,
             compositions: &parsed.compositions,
             managed_current: &carina_core::resource::into_plan_input_current_map(
@@ -566,7 +566,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         carina_core::override_aware::OverrideAwareResources::build_pair_with_stability(
             &canonical_unresolved,
             None::<&carina_state::StateFile>,
-            carina_core::binding_index::PreApplyInputs {
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
                 managed_current: &carina_core::resource::into_plan_input_current_map(
@@ -586,7 +586,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let provider = NoopProvider { cert_publishes_arn };
     let wait_bindings = parsed.wait_bindings.clone();
     let compositions = parsed.compositions.clone();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&compositions);
     let mut data_sources = parsed.data_sources.clone();
     let mut data_source_values = carina_core::data_source_value::DataSourceValues::empty();
     let mut orphans = Orphans::new();
@@ -651,7 +652,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -674,7 +675,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let result = completed_result(
-        execute_plan(
+        execute_live_plan(
             &provider,
             input,
             &observer,

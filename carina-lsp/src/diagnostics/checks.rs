@@ -309,12 +309,15 @@ impl SemanticLookup for ModuleCall {
         merged: &'a ParsedFile,
         current_file: &std::path::Path,
     ) -> Option<&'a Self> {
-        let authored_span = self.source_span();
-        merged.module_calls.iter().find(|candidate| {
-            candidate.source_file() == current_file
-                && candidate.source_span() == authored_span
-                && candidate.expansion_key().is_none()
-        })
+        debug_assert_eq!(
+            self.source_file(),
+            current_file,
+            "authored module call must belong to the analyzed document"
+        );
+        merged
+            .module_calls
+            .iter()
+            .find(|candidate| candidate.id() == self.id())
     }
 
     fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value> {
@@ -361,27 +364,6 @@ impl SemanticLookup for ParsedExportParam {
         matches!(slot, TypecheckValueSlot::Parameter)
             .then_some(self.value.as_ref())
             .flatten()
-    }
-}
-
-/// Match an expanded call site back to an authored call without interpreting
-/// its dot-separated instance path. Named calls match their structural
-/// binding; anonymous calls match the deterministic instance identity that
-/// was recorded during expansion.
-fn composition_call_matches(
-    expanded: &carina_core::resource::CompositionCall,
-    authored: &ModuleCall,
-) -> bool {
-    if expanded.module_name != authored.module_name {
-        return false;
-    }
-
-    match (&expanded.binding, &authored.binding_name) {
-        (Some(expanded), Some(authored)) => expanded == authored,
-        (None, None) => {
-            expanded.instance == carina_core::module_resolver::instance_prefix_for_call(authored)
-        }
-        _ => false,
     }
 }
 
@@ -1355,13 +1337,7 @@ impl DiagnosticEngine {
 
         let call = parsed.module_calls.iter().find(|call| {
             let matches_identity =
-                |identity: &carina_core::module_resolver::ModuleCallSystemIdentity| {
-                    identity
-                        == &carina_core::module_resolver::ModuleCallSystemIdentity::for_authored_call(
-                            current_source.to_path_buf(),
-                            call,
-                        )
-                };
+                |identity: &carina_core::parser::ModuleCallId| identity == call.id();
             match call_source {
                 carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
                     matches_identity(failing)
@@ -2076,7 +2052,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         for report in reports.values() {
-            if report.source.file != current_file {
+            if report.source.file() != current_file {
                 continue;
             }
             for outcome in &report.outcomes {
@@ -2095,7 +2071,7 @@ impl DiagnosticEngine {
                         carina_core::parser::ArgumentOrigin::Defaulted,
                     )
                     | carina_core::module_resolver::ResolvedModuleConstraintOrigin::Call => {
-                        report.source.call_span
+                        report.source.call_span()
                     }
                 };
                 let (line, col) = source_span_position(span);
@@ -2215,7 +2191,7 @@ impl DiagnosticEngine {
         &self,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
-        compositions: &[carina_core::resource::Composition],
+        compositions: &[carina_core::resource::LiveComposition],
         binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
         carina_core::validation::validate_composition_ref_types_with_bindings(
@@ -2233,18 +2209,20 @@ impl DiagnosticEngine {
                 return None;
             };
 
+            let immediate_id = &expanded_error.call_path.immediate().id;
             let immediate_call = parsed.module_calls.iter().find(|call| {
-                semantic_view.lookup(*call).is_some_and(|semantic| {
-                    composition_call_matches(&expanded_error.call, semantic)
-                })
+                semantic_view
+                    .lookup(*call)
+                    .is_some_and(|semantic| semantic.id() == immediate_id)
             });
             let (authored_call, anchor_argument) = match immediate_call {
                 Some(call) => (call, true),
                 None => {
+                    let root_id = &expanded_error.call_path.root().id;
                     let call = parsed.module_calls.iter().find(|call| {
-                        semantic_view.lookup(*call).is_some_and(|semantic| {
-                            composition_call_matches(&expanded_error.root_call, semantic)
-                        })
+                        semantic_view
+                            .lookup(*call)
+                            .is_some_and(|semantic| semantic.id() == root_id)
                     })?;
                     (call, false)
                 }
@@ -2933,7 +2911,7 @@ impl DiagnosticEngine {
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
                     known_attributes,
-                    target: RefTargetKind::Composition,
+                    target: RefTargetKind::LiveComposition,
                     ..
                 }) => {
                     let known_attrs: Vec<&str> =

@@ -16,15 +16,17 @@ use thiserror::Error;
 use crate::binding_index::ResolvedBindings;
 use crate::executor::normalized::apply_desired_normalization;
 pub use crate::module_resolver::ModuleConstraintFailure;
-use crate::module_resolver::evaluate_pending_constraints;
+use crate::module_resolver::{
+    evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
+};
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
     CanonicalCustomTypeValue, CreateRequest, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderResult, UpdateRequest,
 };
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
-    Resource, ResourceId, Value,
+    ConcreteValue, DataSource, DeferredValue, LiveComposition, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeError, TypeIdentity};
 use crate::value::SerializationError;
@@ -253,15 +255,42 @@ impl std::error::Error for ModuleConstraintGateError {}
 /// from emitting the exact same already-reported violation a second time; it
 /// is never consulted to skip evaluation.
 pub struct ModuleConstraintGate {
-    compositions: Vec<Composition>,
+    compositions: ModuleConstraintCompositions,
     reported_failures: Mutex<HashSet<ModuleConstraintFailure>>,
 }
 
+enum ModuleConstraintCompositions {
+    Live(Vec<LiveComposition>),
+    Saved(Vec<SavedComposition>),
+}
+
 impl ModuleConstraintGate {
-    pub fn new(compositions: &[Composition]) -> Self {
+    pub fn from_live_compositions(compositions: &[LiveComposition]) -> Self {
         Self {
-            compositions: compositions.to_vec(),
+            compositions: ModuleConstraintCompositions::Live(compositions.to_vec()),
             reported_failures: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn from_saved_compositions(compositions: &[SavedComposition]) -> Self {
+        Self {
+            compositions: ModuleConstraintCompositions::Saved(compositions.to_vec()),
+            reported_failures: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn evaluate(
+        &self,
+        bindings: &ResolvedBindings,
+        terminal: bool,
+    ) -> Vec<ModuleConstraintFailure> {
+        match &self.compositions {
+            ModuleConstraintCompositions::Live(compositions) => {
+                evaluate_live_pending_constraints(compositions, bindings, terminal)
+            }
+            ModuleConstraintCompositions::Saved(compositions) => {
+                evaluate_saved_pending_constraints(compositions, bindings, terminal)
+            }
         }
     }
 
@@ -277,7 +306,7 @@ impl ModuleConstraintGate {
     /// be pending when a consumer of X runs if Y is unknown. It is evaluated
     /// when Y becomes known at a later gate, or rejected by the terminal sweep.
     pub fn check(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
-        let failures = evaluate_pending_constraints(&self.compositions, bindings, false);
+        let failures = self.evaluate(bindings, false);
         if failures.is_empty() {
             return Ok(());
         }
@@ -314,8 +343,7 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         report_unresolved: bool,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures =
-            evaluate_pending_constraints(&self.compositions, bindings, report_unresolved);
+        let failures = self.evaluate(bindings, report_unresolved);
         self.report_new(failures)
     }
 
@@ -916,7 +944,7 @@ mod provider_config_tests {
         let id = resource.id.clone();
         let from = crate::resource::State::existing(id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
-        let module_gate = ModuleConstraintGate::new(&[]);
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = SchemaRegistry::new();
         let context = ProviderPreparationContext::new(
             &bindings,
