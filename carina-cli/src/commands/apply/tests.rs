@@ -27,6 +27,7 @@ mod cancellation_fixture;
 
 use cancellation_fixture::ApplyCancellationFixture;
 
+use crate::commands::plan::PlanFileContents;
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
@@ -286,17 +287,34 @@ where
     registry
 }
 
-fn record_test_provider_artifacts(plan_file: &mut PlanFile) {
+fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
     let ctx =
-        WiringContext::new_for_test(Vec::new(), plan_file.provider_configs.as_provider_configs());
-    plan_file.record_loaded_providers(&ctx);
+        WiringContext::new_for_test(Vec::new(), contents.provider_configs.as_provider_configs());
+    contents
+        .record(&ctx)
+        .expect("test plan provider evidence must be valid")
 }
 
-fn record_builtin_mock_schema_fingerprints(plan_file: &mut PlanFile) {
-    record_test_provider_artifacts(plan_file);
-    plan_file.record_schema_fingerprints_for_test(&mock_schema_registry(
-        carina_provider_mock::builtin_schemas(),
-    ));
+fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry) -> PlanFile {
+    let additional_schemas = schemas
+        .iter()
+        .map(|(provider, _resource_type, _kind, schema)| (provider.to_string(), schema.clone()))
+        .collect::<Vec<_>>();
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        contents.provider_configs.as_provider_configs(),
+        additional_schemas,
+    );
+    contents
+        .record(&ctx)
+        .expect("test plan provider evidence must be valid")
+}
+
+fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
+    record_with_test_schemas(
+        contents,
+        &mock_schema_registry(carina_provider_mock::builtin_schemas()),
+    )
 }
 
 async fn run_saved_plan_schema_fingerprint_case(
@@ -340,7 +358,7 @@ async fn run_saved_plan_schema_fingerprint_case(
     plan.add(carina_core::effect::Effect::Create(resolved(
         resource.clone(),
     )));
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-27T00:00:00Z".to_string(),
@@ -372,11 +390,8 @@ async fn run_saved_plan_schema_fingerprint_case(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    plan_file.record_loaded_providers(&WiringContext::new_for_test(Vec::new(), &[]));
-    plan_file.record_schema_fingerprints_for_test(planning_schemas);
+    let plan_file = record_with_test_schemas(contents, planning_schemas);
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
@@ -523,7 +538,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     let fixture = ApplyCancellationFixture::new();
     let schemas = mock_schema_registry(carina_provider_mock::builtin_schemas());
     let id = ResourceId::with_provider_identity("mock", "example.thing", "gone", None);
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-28T00:00:00Z".to_string(),
@@ -555,12 +570,9 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
     let ctx = WiringContext::new_for_test(Vec::new(), &[]);
-    plan_file.record_loaded_providers(&ctx);
-    plan_file.record_schema_fingerprints_for_test(&schemas);
+    let plan_file = record_with_test_schemas(contents, &schemas);
 
     let reloaded = inspected_saved_plan(plan_file)
         .reload_in_flight_from_locked_state(None)
@@ -728,7 +740,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     .await
     .expect("resolve empty provider config");
     let candidates = SavedPlanSecretCandidates::from_test_parts(parsed, provider_inputs);
-    let plan_file = PlanFile {
+    let plan_file = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -748,9 +760,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    }
+    .record(&WiringContext::new_for_test(Vec::new(), &[]))
+    .expect("test plan provider evidence must be valid");
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
@@ -807,7 +819,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
     .with_identifier("mock-id");
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -839,10 +851,8 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_builtin_mock_schema_fingerprints(&mut plan_file);
+    let plan_file = record_with_builtin_mock_schemas(contents);
     let backend =
         Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
     unsafe {
@@ -2723,7 +2733,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }]);
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-07-02T00:00:00Z".to_string(),
@@ -2765,11 +2775,9 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_builtin_mock_schema_fingerprints(&mut plan_file);
-    let recorded = &plan_file.schema_fingerprints.providers["mock"].schemas;
+    let plan_file = record_with_builtin_mock_schemas(contents);
+    let recorded = &plan_file.schema_fingerprints().providers["mock"].schemas;
     assert!(recorded.iter().any(|schema| {
         schema.kind == carina_core::schema::SchemaKind::Resource
             && schema.resource_type == "test.resource"
@@ -2858,7 +2866,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     plan.add(carina_core::effect::Effect::Create(resolved(
         consumer.clone(),
     )));
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -2896,10 +2904,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_builtin_mock_schema_fingerprints(&mut plan_file);
+    let plan_file = record_with_builtin_mock_schemas(contents);
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
@@ -2947,7 +2953,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -2967,10 +2973,8 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_test_provider_artifacts(&mut plan_file);
+    let plan_file = record_with_test_context(contents);
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
@@ -3010,7 +3014,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
@@ -3042,10 +3046,8 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_test_provider_artifacts(&mut plan_file);
+    let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
     std::fs::write(
         &plan_path,
@@ -3125,7 +3127,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
             .get("Owner"),
         Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
     ));
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
@@ -3145,10 +3147,8 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_test_provider_artifacts(&mut plan_file);
+    let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("deferred-default-tags.plan.json");
     std::fs::write(
         &plan_path,
@@ -3530,7 +3530,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     plan.add(carina_core::effect::Effect::Create(resolved(
         resource.clone(),
     )));
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-21T00:00:00Z".to_string(),
@@ -3562,10 +3562,8 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
     };
-    record_builtin_mock_schema_fingerprints(&mut plan_file);
+    let plan_file = record_with_builtin_mock_schemas(contents);
     let observer_factory = fixture.observer_factory();
     let backend = fixture.lock_loss_backend_handle();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
@@ -8833,7 +8831,7 @@ mod saved_plan_version_tests {
         )
         .expect("test provider hints should succeed");
         assert_eq!(plan.replace_display_info().count(), 1);
-        let plan_file = crate::commands::plan::PlanFile {
+        let plan_file = crate::commands::plan::PlanFileContents {
             version: crate::commands::plan::PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-07-02T00:00:00Z".to_string(),
@@ -8856,9 +8854,19 @@ mod saved_plan_version_tests {
             upstream_snapshot: std::collections::HashMap::new(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
-            schema_fingerprints: Default::default(),
-            provider_artifacts: Default::default(),
-        };
+        }
+        .record(
+            &crate::wiring::WiringContext::new_for_test_with_additional_schemas(
+                Vec::new(),
+                &[],
+                schemas
+                    .iter()
+                    .map(|(provider, _resource_type, _kind, schema)| {
+                        (provider.to_string(), schema.clone())
+                    }),
+            ),
+        )
+        .expect("replacement plan provider evidence must be valid");
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
         (dir, plan_path, json)
     }

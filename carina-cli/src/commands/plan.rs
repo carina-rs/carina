@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
@@ -52,7 +53,7 @@ use crate::plan_image::{
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LoadedProviderArtifact, WiringContext, build_factories_from_providers,
-    create_plan_from_parsed_with_upstream_with_ctx,
+    create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
 use carina_core::hint::ProjectCommand;
@@ -88,7 +89,7 @@ pub struct ProviderSchemaFingerprint {
 }
 
 /// Provider schema snapshot persisted in a saved plan.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSchemaFingerprints {
     pub providers: BTreeMap<String, ProviderSchemaFingerprint>,
 }
@@ -103,7 +104,7 @@ struct PlanSchemaReference {
 /// Immutable inventory of schema types referenced by a decoded saved plan.
 ///
 /// Saved-plan apply captures this before the locked-state reload consumes
-/// `PlanFile::current_states`, then carries it to schema verification.
+/// [`PlanFileContents::current_states`], then carries it to schema verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanSchemaReferences(BTreeSet<PlanSchemaReference>);
 
@@ -135,6 +136,22 @@ pub enum RecordedProviderArtifact {
         sha256: String,
         origin: RecordedArtifactOrigin,
     },
+}
+
+/// Provider artifact implementation selected by a saved provider configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderArtifactKind {
+    BuiltIn,
+    Wasm,
+}
+
+impl std::fmt::Display for ProviderArtifactKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BuiltIn => "built-in",
+            Self::Wasm => "wasm",
+        })
+    }
 }
 
 /// Resolver origin persisted for one WASM provider artifact.
@@ -202,6 +219,13 @@ impl From<&LoadedProviderArtifact> for RecordedProviderArtifact {
 }
 
 impl RecordedProviderArtifact {
+    fn kind(&self) -> ProviderArtifactKind {
+        match self {
+            Self::BuiltIn => ProviderArtifactKind::BuiltIn,
+            Self::Wasm { .. } => ProviderArtifactKind::Wasm,
+        }
+    }
+
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::BuiltIn => "built-in".to_string(),
@@ -251,9 +275,30 @@ mod recorded_provider_artifact_tests {
     }
 }
 
-/// Saved plan file for `plan --out` / `apply <plan-file>`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanFile {
+/// Contents of a saved plan before provider evidence has been recorded.
+///
+/// This type is intentionally not a saved-plan wire type. Constructing these
+/// public fields does not produce a writable [`PlanFile`]; callers must consume
+/// the contents through [`PlanFileContents::record`] so the referenced schemas
+/// and loaded provider artifacts are captured together.
+///
+/// ```compile_fail,E0451
+/// use carina_cli::commands::plan::PlanFile;
+///
+/// fn rebuild(plan: PlanFile) -> PlanFile {
+///     PlanFile { ..plan }
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use carina_cli::commands::plan::PlanFileContents;
+///
+/// fn serialize_unrecorded(contents: &PlanFileContents) {
+///     let _ = serde_json::to_string(contents);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PlanFileContents {
     /// Plan file format version.
     ///
     /// `PlanFileHeader` in `commands/apply/mod.rs` relies on this field and
@@ -263,11 +308,13 @@ pub struct PlanFile {
     /// Plan format 26 adds mandatory identities for every loaded provider
     /// artifact. Plan format 25 adds the mandatory typed `data_source_values`
     /// outcomes and removes duplicate data-source rows from `current_states`.
-    /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
-    /// format 21 explicitly tags managed and data-source current-state entries,
-    /// and explicitly tags each managed [`Current`] variant. A serialized
-    /// `Present` row is classified again through [`Current::from_state`] when
-    /// decoded, so the tag cannot mint an invalid provider identifier.
+    /// Plan format 24 removes the redundant wait target schema kind now that
+    /// waits are managed-only. Plan format 23 adds the mandatory
+    /// `schema_fingerprints` snapshot. Plan format 21 explicitly tags managed
+    /// and data-source current-state entries, and explicitly tags each managed
+    /// [`Current`] variant. A serialized `Present` row is classified again
+    /// through [`Current::from_state`] when decoded, so the tag cannot mint an
+    /// invalid provider identifier.
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
@@ -317,7 +364,6 @@ pub struct PlanFile {
     ///
     /// Empty when the configuration declares no module calls /
     /// `attributes { ... }` blocks.
-    #[serde(default)]
     pub compositions: Vec<carina_core::resource::Composition>,
     /// Data sources (`let x = read aws.iam.user { ... }`) emitted by
     /// module expansion at plan time (carina#3248). Persisted so the
@@ -336,13 +382,11 @@ pub struct PlanFile {
     ///
     /// Empty when the configuration declares no `read`-bound
     /// bindings.
-    #[serde(default)]
     pub data_sources: Vec<carina_core::resource::DataSource>,
     /// Authored, pre-normalization counterparts of `data_sources`, paired by
     /// index and rewritten to the resolved IDs above. Apply uses these to
     /// derive which input attributes became known at runtime without
     /// rechecking canonicalized literals as authored values.
-    #[serde(default)]
     pub data_source_origins: Vec<carina_core::resource::DataSource>,
     /// One plan-time phase-2 outcome for every entry in `data_sources`.
     ///
@@ -378,33 +422,426 @@ pub struct PlanFile {
     /// effect-layer concerns already encoded in the serialized `plan`'s
     /// `Effect::Wait`, not needed to rebuild the value-layer alias.
     /// Empty when the configuration declares no `wait` bindings.
-    #[serde(default)]
     pub wait_bindings: Vec<PlanWaitBinding>,
-    /// Canonical fingerprints of exactly the managed and data-source schemas
-    /// this plan used. This field is mandatory since plan format 23.
-    pub schema_fingerprints: PlanSchemaFingerprints,
-    /// Exact provider-kind artifacts loaded while this plan was computed.
-    /// This field is mandatory since plan format 26.
-    pub provider_artifacts: PlanProviderArtifacts,
 }
 
-impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 26;
+/// Provider evidence captured atomically from the wiring context used to plan.
+///
+/// The fields are private so production code cannot assemble stale, partial,
+/// or empty sentinel evidence independently from the plan contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderEvidence {
+    /// Canonical fingerprints of exactly the managed and data-source schemas
+    /// this plan used. This field is mandatory since plan format 23.
+    schema_fingerprints: PlanSchemaFingerprints,
+    /// Exact provider-kind artifacts loaded while this plan was computed.
+    /// This field is mandatory since plan format 26.
+    provider_artifacts: PlanProviderArtifacts,
+}
 
-    /// Capture provider artifacts and the exact schema inventory together.
-    pub fn record_loaded_providers(&mut self, ctx: &WiringContext) {
-        let references = self.referenced_schema_types();
-        self.schema_fingerprints = PlanSchemaFingerprints::capture(&references, ctx.schemas());
-        self.provider_artifacts = recorded_provider_artifacts(ctx);
+/// Saved plan file for `plan --out` / `apply <plan-file>`.
+///
+/// This is a typestate boundary: an in-memory `PlanFile` always contains
+/// provider evidence recorded from the planning [`WiringContext`], or evidence
+/// that passed the same validation while decoding. Decode requires the schema
+/// inventory to match every referenced type exactly and the provider-artifact
+/// keys to match the providers implied by the saved provider configurations.
+///
+/// The format remains 26 because this change does not alter its on-disk shape;
+/// it only tightens validation. Plans written by the unreleased #4059 build
+/// that violate these rules are rejected as corrupt. No release has shipped
+/// since format 26 was introduced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
+pub struct PlanFile {
+    contents: PlanFileContents,
+    evidence: ProviderEvidence,
+}
+
+/// Private format-26 wire representation.
+///
+/// Field order is intentionally identical to the historical `PlanFile`
+/// serialization order. Evidence is mandatory and is never defaulted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanFileWire {
+    version: u32,
+    carina_version: String,
+    timestamp: String,
+    source_path: String,
+    state_lineage: Option<String>,
+    state_serial: Option<u64>,
+    provider_configs: SavedProviderConfigs,
+    backend_config: Option<BackendConfig>,
+    plan: Plan,
+    sorted_resources: Vec<Resource>,
+    unresolved_resources: Vec<Resource>,
+    #[serde(default)]
+    compositions: Vec<Composition>,
+    #[serde(default)]
+    data_sources: Vec<DataSource>,
+    #[serde(default)]
+    data_source_origins: Vec<DataSource>,
+    data_source_values: Vec<SavedDataSourceValue>,
+    current_states: Vec<CurrentStateEntry>,
+    upstream_snapshot: HashMap<String, HashMap<String, Value>>,
+    upstream_sources: Vec<UpstreamSource>,
+    #[serde(default)]
+    wait_bindings: Vec<PlanWaitBinding>,
+    schema_fingerprints: PlanSchemaFingerprints,
+    provider_artifacts: PlanProviderArtifacts,
+}
+
+/// A saved plan's provider evidence is incomplete or inconsistent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderEvidenceError {
+    EmptySchemaInventory {
+        provider: String,
+    },
+    DuplicateSchemaFingerprint {
+        provider: String,
+        kind: SchemaKind,
+        resource_type: String,
+    },
+    MissingSchemaFingerprint {
+        provider: String,
+        kind: SchemaKind,
+        resource_type: String,
+    },
+    UnexpectedSchemaFingerprint {
+        provider: String,
+        kind: SchemaKind,
+        resource_type: String,
+    },
+    MissingProviderArtifact {
+        provider: String,
+    },
+    UnexpectedProviderArtifact {
+        provider: String,
+    },
+    UnexpectedProviderArtifactKind {
+        provider: String,
+        expected: ProviderArtifactKind,
+        recorded: ProviderArtifactKind,
+    },
+}
+
+impl std::fmt::Display for ProviderEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid saved-plan provider evidence: ")?;
+        match self {
+            Self::EmptySchemaInventory { provider } => write!(
+                formatter,
+                "schema_fingerprints provider `{provider}` has an empty schemas list"
+            ),
+            Self::DuplicateSchemaFingerprint {
+                provider,
+                kind,
+                resource_type,
+            } => write!(
+                formatter,
+                "duplicate schema fingerprint for provider `{provider}`, {} type `{resource_type}`",
+                schema_kind_label(*kind)
+            ),
+            Self::MissingSchemaFingerprint {
+                provider,
+                kind,
+                resource_type,
+            } => write!(
+                formatter,
+                "schema_fingerprints is missing provider `{provider}`, {} type `{resource_type}`",
+                schema_kind_label(*kind)
+            ),
+            Self::UnexpectedSchemaFingerprint {
+                provider,
+                kind,
+                resource_type,
+            } => write!(
+                formatter,
+                "schema_fingerprints contains unreferenced provider `{provider}`, {} type `{resource_type}`",
+                schema_kind_label(*kind)
+            ),
+            Self::MissingProviderArtifact { provider } => write!(
+                formatter,
+                "provider_artifacts is missing expected provider `{provider}`"
+            ),
+            Self::UnexpectedProviderArtifact { provider } => write!(
+                formatter,
+                "provider_artifacts contains unexpected provider `{provider}`"
+            ),
+            Self::UnexpectedProviderArtifactKind {
+                provider,
+                expected,
+                recorded,
+            } => write!(
+                formatter,
+                "provider_artifacts records provider `{provider}` as {recorded}, expected {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderEvidenceError {}
+
+/// Provider artifact kinds determined by the saved provider configuration.
+///
+/// Factory-backed providers use the same source-presence rule as
+/// [`build_factories_from_providers`]. Source-less named instances therefore do
+/// not add an artifact. The built-in mock occupies the same `mock` key as a
+/// plugin factory and is also selected for the providerless fallback.
+fn expected_provider_artifacts(
+    provider_configs: &SavedProviderConfigs,
+) -> BTreeMap<String, ProviderArtifactKind> {
+    let configs = provider_configs.as_provider_configs();
+    let mut expected = configs
+        .iter()
+        .filter(|config| provider_factory_source(config).is_some())
+        .map(|config| (config.name.clone(), ProviderArtifactKind::Wasm))
+        .collect::<BTreeMap<_, _>>();
+    let uses_builtin_mock = carina_provider_mock::uses_builtin_provider(configs, |provider_name| {
+        expected.get(provider_name) == Some(&ProviderArtifactKind::Wasm)
+    });
+    if uses_builtin_mock {
+        expected.insert(
+            carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
+            ProviderArtifactKind::BuiltIn,
+        );
+    }
+    expected
+}
+
+impl ProviderEvidence {
+    fn capture(
+        references: &PlanSchemaReferences,
+        provider_configs: &SavedProviderConfigs,
+        ctx: &WiringContext,
+    ) -> Result<Self, ProviderEvidenceError> {
+        Self::new(
+            PlanSchemaFingerprints::capture(references, ctx.schemas()),
+            recorded_provider_artifacts(ctx),
+            references,
+            provider_configs,
+        )
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_schema_fingerprints_for_test(
-        &mut self,
-        schemas: &carina_core::schema::SchemaRegistry,
-    ) {
+    fn new(
+        schema_fingerprints: PlanSchemaFingerprints,
+        provider_artifacts: PlanProviderArtifacts,
+        references: &PlanSchemaReferences,
+        provider_configs: &SavedProviderConfigs,
+    ) -> Result<Self, ProviderEvidenceError> {
+        let evidence = Self {
+            schema_fingerprints,
+            provider_artifacts,
+        };
+        evidence.validate(references, provider_configs)?;
+        Ok(evidence)
+    }
+
+    fn validate(
+        &self,
+        references: &PlanSchemaReferences,
+        provider_configs: &SavedProviderConfigs,
+    ) -> Result<(), ProviderEvidenceError> {
+        let mut recorded = BTreeSet::new();
+        for (provider, fingerprint) in &self.schema_fingerprints.providers {
+            if fingerprint.schemas.is_empty() {
+                return Err(ProviderEvidenceError::EmptySchemaInventory {
+                    provider: provider.clone(),
+                });
+            }
+            for schema in &fingerprint.schemas {
+                let reference = PlanSchemaReference {
+                    provider: provider.clone(),
+                    kind: schema.kind,
+                    resource_type: schema.resource_type.clone(),
+                };
+                if !recorded.insert(reference) {
+                    return Err(ProviderEvidenceError::DuplicateSchemaFingerprint {
+                        provider: provider.clone(),
+                        kind: schema.kind,
+                        resource_type: schema.resource_type.clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(missing) = references.0.difference(&recorded).next() {
+            return Err(ProviderEvidenceError::MissingSchemaFingerprint {
+                provider: missing.provider.clone(),
+                kind: missing.kind,
+                resource_type: missing.resource_type.clone(),
+            });
+        }
+        if let Some(extra) = recorded.difference(&references.0).next() {
+            return Err(ProviderEvidenceError::UnexpectedSchemaFingerprint {
+                provider: extra.provider.clone(),
+                kind: extra.kind,
+                resource_type: extra.resource_type.clone(),
+            });
+        }
+
+        let expected_artifacts = expected_provider_artifacts(provider_configs);
+        let recorded_artifacts = self
+            .provider_artifacts
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_names = expected_artifacts.keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(provider) = expected_names.difference(&recorded_artifacts).next() {
+            return Err(ProviderEvidenceError::MissingProviderArtifact {
+                provider: provider.clone(),
+            });
+        }
+        if let Some(provider) = recorded_artifacts.difference(&expected_names).next() {
+            return Err(ProviderEvidenceError::UnexpectedProviderArtifact {
+                provider: provider.clone(),
+            });
+        }
+        for (provider, expected) in expected_artifacts {
+            let recorded = self.provider_artifacts[&provider].kind();
+            if recorded != expected {
+                return Err(ProviderEvidenceError::UnexpectedProviderArtifactKind {
+                    provider,
+                    expected,
+                    recorded,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<PlanFile> for PlanFileWire {
+    fn from(plan_file: PlanFile) -> Self {
+        let PlanFile { contents, evidence } = plan_file;
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        let ProviderEvidence {
+            schema_fingerprints,
+            provider_artifacts,
+        } = evidence;
+        Self {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+            schema_fingerprints,
+            provider_artifacts,
+        }
+    }
+}
+
+impl TryFrom<PlanFileWire> for PlanFile {
+    type Error = ProviderEvidenceError;
+
+    fn try_from(wire: PlanFileWire) -> Result<Self, Self::Error> {
+        let PlanFileWire {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+            schema_fingerprints,
+            provider_artifacts,
+        } = wire;
+        let contents = PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        };
+        let references = contents.referenced_schema_types();
+        let evidence = ProviderEvidence::new(
+            schema_fingerprints,
+            provider_artifacts,
+            &references,
+            &contents.provider_configs,
+        )?;
+        Ok(Self { contents, evidence })
+    }
+}
+
+impl Deref for PlanFile {
+    type Target = PlanFileContents;
+
+    fn deref(&self) -> &Self::Target {
+        &self.contents
+    }
+}
+
+impl PlanFileContents {
+    /// Atomically bind these contents to the schemas and provider artifacts
+    /// loaded in the planning context.
+    pub fn record(self, ctx: &WiringContext) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        self.schema_fingerprints = PlanSchemaFingerprints::capture(&references, schemas);
+        let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
+        Ok(PlanFile {
+            contents: self,
+            evidence,
+        })
     }
 
     pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
@@ -525,16 +962,37 @@ impl PlanFile {
         }
         PlanSchemaReferences(references)
     }
+}
+
+impl PlanFile {
+    pub const CURRENT_VERSION: u32 = 26;
+
+    #[cfg(test)]
+    pub(crate) fn into_contents(self) -> PlanFileContents {
+        self.contents
+    }
+
+    pub fn schema_fingerprints(&self) -> &PlanSchemaFingerprints {
+        &self.evidence.schema_fingerprints
+    }
+
+    pub fn provider_artifacts(&self) -> &PlanProviderArtifacts {
+        &self.evidence.provider_artifacts
+    }
 
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
     /// any status change in either direction invalidates it.
     pub(crate) fn reload_in_flight_from_locked_state(
-        mut self,
+        self,
         state_file: Option<&StateFile>,
     ) -> Result<ReloadedPlanFile, String> {
-        let moved_origins = MovedOrigins::from_plan(&self.plan);
-        let planned_in_flight_origins: HashSet<_> = self
+        let PlanFile {
+            mut contents,
+            evidence,
+        } = self;
+        let moved_origins = MovedOrigins::from_plan(&contents.plan);
+        let planned_in_flight_origins: HashSet<_> = contents
             .current_states
             .iter()
             .filter_map(|entry| match entry {
@@ -584,8 +1042,8 @@ impl PlanFile {
             }
         }
 
-        let mut current_states = Vec::with_capacity(self.current_states.len());
-        for entry in std::mem::take(&mut self.current_states) {
+        let mut current_states = Vec::with_capacity(contents.current_states.len());
+        for entry in std::mem::take(&mut contents.current_states) {
             match entry {
                 CurrentStateEntry::Managed { id, current } => {
                     let persisted_id = moved_origins.origin_for(&id);
@@ -593,8 +1051,10 @@ impl PlanFile {
                         .map(|state| state.build_state_for_resource(persisted_id))
                         .unwrap_or_else(|| Current::absent(id.clone()));
                     if persisted_id != &id {
-                        let authority =
-                            self.plan.move_authority(persisted_id, &id).ok_or_else(|| {
+                        let authority = contents
+                            .plan
+                            .move_authority(persisted_id, &id)
+                            .ok_or_else(|| {
                                 format!("saved plan has no move edge from {persisted_id} to {id}")
                             })?;
                         locked_current = rebind_current_for_move(locked_current, &authority)
@@ -625,7 +1085,8 @@ impl PlanFile {
             }
         }
         Ok(ReloadedPlanFile {
-            plan_file: self,
+            contents,
+            evidence,
             current_states,
         })
     }
@@ -717,7 +1178,7 @@ impl PlanFile {
             }
         }
 
-        let PlanFile {
+        let PlanFileContents {
             version: _version,
             carina_version: _carina_version,
             timestamp: _timestamp,
@@ -737,9 +1198,7 @@ impl PlanFile {
             upstream_snapshot,
             upstream_sources: _upstream_sources,
             wait_bindings: _wait_bindings,
-            schema_fingerprints: _schema_fingerprints,
-            provider_artifacts: _provider_artifacts,
-        } = self;
+        } = &self.contents;
 
         provider_configs.contains_redacted_secret()
             || backend_config.as_ref().is_some_and(|backend| {
@@ -1153,6 +1612,7 @@ impl PlanSchemaFingerprints {
 mod schema_fingerprint_tests {
     use super::*;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use indexmap::IndexMap;
 
     fn reference(provider: &str, resource_type: &str) -> PlanSchemaReference {
         PlanSchemaReference {
@@ -1165,6 +1625,59 @@ mod schema_fingerprint_tests {
     fn schema(resource_type: &str, attribute: &str) -> ResourceSchema {
         ResourceSchema::new(resource_type)
             .attribute(AttributeSchema::optional(attribute, AttributeType::string()).build())
+    }
+
+    fn saved_provider_configs(configs: Vec<ProviderConfig>) -> SavedProviderConfigs {
+        let parsed = carina_core::parser::InferredFile {
+            providers: configs,
+            ..Default::default()
+        };
+        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .expect("test provider configs must resolve");
+        SavedProviderConfigs::from(&resolved)
+    }
+
+    fn provider_config(name: &str, binding: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: binding.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn providerless_artifact_inventory_is_the_builtin_mock() {
+        assert_eq!(
+            expected_provider_artifacts(&saved_provider_configs(Vec::new())),
+            BTreeMap::from([("mock".to_string(), ProviderArtifactKind::BuiltIn)])
+        );
+    }
+
+    #[test]
+    fn configured_provider_aliases_share_one_artifact_key() {
+        let mut default = provider_config("aws", None);
+        default.source = Some("file:///aws.wasm".parse().unwrap());
+        let configs = saved_provider_configs(vec![default, provider_config("aws", Some("us"))]);
+        assert_eq!(
+            expected_provider_artifacts(&configs),
+            BTreeMap::from([("aws".to_string(), ProviderArtifactKind::Wasm)])
+        );
+    }
+
+    #[test]
+    fn named_instance_without_a_default_does_not_expect_an_artifact() {
+        let configs = saved_provider_configs(vec![provider_config("aws", Some("secondary"))]);
+
+        assert!(expected_provider_artifacts(&configs).is_empty());
     }
 
     #[test]
@@ -1526,12 +2039,15 @@ impl ReloadedCurrentStateEntry {
 
 /// A decoded saved plan that has crossed the locked-state reload boundary.
 ///
-/// The embedded `PlanFile::current_states` has been consumed and is never
+/// The embedded [`PlanFileContents::current_states`] has been consumed and is never
 /// exposed through this type. Runtime current states live only in the sibling
-/// `current_states` field below.
+/// `current_states` field below. Contents and provider evidence are stored as
+/// siblings so apply-time mutation cannot make an in-memory [`PlanFile`]
+/// inconsistent with its evidence.
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
-    plan_file: PlanFile,
+    contents: PlanFileContents,
+    evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
 }
 
@@ -1541,93 +2057,100 @@ impl ReloadedPlanFile {
         references: &PlanSchemaReferences,
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> Result<(), PlanSchemaFingerprintMismatch> {
-        self.plan_file
+        self.evidence
             .schema_fingerprints
             .verify(references, schemas)
     }
 
     pub(crate) fn provider_artifacts(&self) -> &PlanProviderArtifacts {
-        &self.plan_file.provider_artifacts
+        &self.evidence.provider_artifacts
     }
 
     pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.provider_configs
+        &self.contents.provider_configs
     }
 
-    pub(crate) fn provider_configs_mut(&mut self) -> &mut SavedProviderConfigs {
-        &mut self.plan_file.provider_configs
+    pub(crate) fn rehydrate_provider_config_secrets(
+        &mut self,
+        evaluated: &SavedProviderConfigs,
+    ) -> Result<(), carina_core::value::SecretRehydrationSiteError> {
+        self.contents.provider_configs = self
+            .contents
+            .provider_configs
+            .rehydrate_secrets(evaluated)?;
+        Ok(())
     }
 
     pub(crate) fn plan(&self) -> &Plan {
-        &self.plan_file.plan
+        &self.contents.plan
     }
 
     pub(crate) fn plan_mut(&mut self) -> &mut Plan {
-        &mut self.plan_file.plan
+        &mut self.contents.plan
     }
 
     pub(crate) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.sorted_resources
+        &self.contents.sorted_resources
     }
 
     pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource> {
-        &mut self.plan_file.sorted_resources
+        &mut self.contents.sorted_resources
     }
 
     pub(crate) fn unresolved_resources(&self) -> &[Resource] {
-        &self.plan_file.unresolved_resources
+        &self.contents.unresolved_resources
     }
 
     pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<Resource> {
-        &mut self.plan_file.unresolved_resources
+        &mut self.contents.unresolved_resources
     }
 
     pub(crate) fn compositions(&self) -> &[Composition] {
-        &self.plan_file.compositions
+        &self.contents.compositions
     }
 
     pub(crate) fn compositions_mut(&mut self) -> &mut Vec<Composition> {
-        &mut self.plan_file.compositions
+        &mut self.contents.compositions
     }
 
     pub(crate) fn data_sources(&self) -> &[DataSource] {
-        &self.plan_file.data_sources
+        &self.contents.data_sources
     }
 
     pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<DataSource> {
-        &mut self.plan_file.data_sources
+        &mut self.contents.data_sources
     }
 
     pub(crate) fn data_source_origins(&self) -> &[DataSource] {
-        &self.plan_file.data_source_origins
+        &self.contents.data_source_origins
     }
 
     pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
-        &mut self.plan_file.data_source_origins
+        &mut self.contents.data_source_origins
     }
 
     pub(crate) fn data_source_values(&self) -> &[SavedDataSourceValue] {
-        &self.plan_file.data_source_values
+        &self.contents.data_source_values
     }
 
     pub(crate) fn data_source_values_mut(&mut self) -> &mut [SavedDataSourceValue] {
-        &mut self.plan_file.data_source_values
+        &mut self.contents.data_source_values
     }
 
     pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
-        &self.plan_file.upstream_snapshot
+        &self.contents.upstream_snapshot
     }
 
     pub(crate) fn upstream_snapshot_mut(&mut self) -> &mut HashMap<String, HashMap<String, Value>> {
-        &mut self.plan_file.upstream_snapshot
+        &mut self.contents.upstream_snapshot
     }
 
     pub(crate) fn upstream_sources(&self) -> &[UpstreamSource] {
-        &self.plan_file.upstream_sources
+        &self.contents.upstream_sources
     }
 
     pub(crate) fn wait_bindings(&self) -> &[PlanWaitBinding] {
-        &self.plan_file.wait_bindings
+        &self.contents.wait_bindings
     }
 
     pub(crate) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
@@ -1801,8 +2324,8 @@ mod managed_current_serde {
 #[cfg(test)]
 mod managed_current_serde_tests {
     use super::{
-        CurrentStateEntry, PlanFile, ReloadSavedManagedCurrent, ReloadedCurrentStateEntry,
-        SavedManagedCurrent,
+        CurrentStateEntry, PlanFile, PlanFileContents, ReloadSavedManagedCurrent,
+        ReloadedCurrentStateEntry, SavedManagedCurrent,
     };
     use carina_core::provider::{AppliedIdentifier, Sent};
     use carina_core::resource::{
@@ -1811,7 +2334,7 @@ mod managed_current_serde_tests {
     use carina_state::{ResourceState, StateFile};
 
     fn plan_file_with_current(id: ResourceId, current: SavedManagedCurrent) -> PlanFile {
-        PlanFile {
+        PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-23T08:00:00Z".to_string(),
@@ -1832,9 +2355,9 @@ mod managed_current_serde_tests {
             upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
-            schema_fingerprints: Default::default(),
-            provider_artifacts: Default::default(),
         }
+        .record(&crate::wiring::WiringContext::new_for_test(Vec::new(), &[]))
+        .expect("test plan provider evidence must be valid")
     }
 
     #[test]
@@ -1988,14 +2511,18 @@ mod managed_current_serde_tests {
         locked
             .upsert_resource(row)
             .expect("state fixture must be valid");
-        let mut plan = plan_file_with_current(
+        let mut contents = plan_file_with_current(
             destination.clone(),
             SavedManagedCurrent::create_in_flight_marker(),
-        );
-        plan.plan.add(Effect::Move {
+        )
+        .into_contents();
+        contents.plan.add(Effect::Move {
             from: ResolvedResourceId::new(source),
             to: ResolvedResourceId::new(destination.clone()),
         });
+        let plan = contents
+            .record(&crate::wiring::WiringContext::new_for_test(Vec::new(), &[]))
+            .expect("test plan provider evidence must be valid");
 
         let plan = plan
             .reload_in_flight_from_locked_state(Some(&locked))
@@ -2031,6 +2558,35 @@ impl CurrentStateEntry {
     }
 }
 
+#[derive(Debug)]
+enum PlanSaveError {
+    Serialization(carina_core::value::SerializationError),
+    ProviderEvidence(ProviderEvidenceError),
+}
+
+impl From<carina_core::value::SerializationError> for PlanSaveError {
+    fn from(error: carina_core::value::SerializationError) -> Self {
+        Self::Serialization(error)
+    }
+}
+
+impl From<ProviderEvidenceError> for PlanSaveError {
+    fn from(error: ProviderEvidenceError) -> Self {
+        Self::ProviderEvidence(error)
+    }
+}
+
+impl std::fmt::Display for PlanSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialization(error) => error.fmt(formatter),
+            Self::ProviderEvidence(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PlanSaveError {}
+
 fn build_plan_file<E>(
     path: &Path,
     parsed: &carina_core::parser::File<E>,
@@ -2039,7 +2595,7 @@ fn build_plan_file<E>(
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     wiring: &WiringContext,
-) -> Result<PlanFile, carina_core::value::SerializationError> {
+) -> Result<PlanFile, PlanSaveError> {
     assert_eq!(
         ctx.data_sources.len(),
         parsed.data_sources.len(),
@@ -2166,7 +2722,14 @@ fn build_plan_file<E>(
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
 
-    let mut plan_file = PlanFile {
+    let contents = PlanFileContents {
+        // carina#4045: bumped 25→26 — saved plans persist the exact loaded
+        // provider artifacts used to compute the plan. carina#4060 keeps the
+        // format at 26 because it only tightens validation.
+        // carina#3993: bumped 24→25 — saved plans persist every data-source
+        // outcome so apply never re-derives it from a partial graph.
+        // carina#3916: bumped 23→24 — saved plans remove the redundant wait
+        // target schema kind now that waits are managed-only.
         // carina#3983: bumped 22→23 — saved plans bind every referenced
         // managed/data-source type to the canonical provider schema used by
         // planning. Apply must verify this snapshot before provider I/O.
@@ -2328,24 +2891,24 @@ fn build_plan_file<E>(
                 target: wb.target.as_str().to_string(),
             })
             .collect(),
-        schema_fingerprints: PlanSchemaFingerprints::default(),
-        provider_artifacts: PlanProviderArtifacts::default(),
     };
-    plan_file.record_loaded_providers(wiring);
-    Ok(plan_file)
+    contents.record(wiring).map_err(PlanSaveError::from)
 }
 
-/// Format a `SerializationError` from `build_plan_file` into the CLI's
+/// Format a failure from `build_plan_file` into the CLI's
 /// "cannot save plan" diagnostic, suggesting the caller drop `flag` (for
 /// example `--json` or `--out`) to fall back to display-only output.
-fn format_plan_save_error(e: &carina_core::value::SerializationError, flag: &str) -> String {
+fn format_plan_save_error(e: &PlanSaveError, flag: &str) -> String {
     match e {
-        carina_core::value::SerializationError::UnknownNotAllowed { reason, .. } => format!(
+        PlanSaveError::Serialization(
+            carina_core::value::SerializationError::UnknownNotAllowed { reason, .. },
+        ) => format!(
             "Cannot save plan: it depends on values that are not yet \
              applied ({reason}). Apply the upstream module(s) first, \
              or rerun without {flag}."
         ),
-        _ => e.to_string(),
+        PlanSaveError::Serialization(error) => error.to_string(),
+        PlanSaveError::ProviderEvidence(error) => format!("Cannot save plan: {error}"),
     }
 }
 
@@ -2776,9 +3339,9 @@ pub async fn run_plan(
         if let Some(note) = drift_note.as_ref() {
             eprintln!("{}", note.yellow());
         }
-        // `build_plan_file` propagates `SerializationError` so the user
-        // sees an actionable diagnostic (which upstream / for-binding
-        // is unresolved) instead of a panic backtrace.
+        // `build_plan_file` propagates serialization and provider-evidence
+        // failures so the user sees an actionable plan-save diagnostic
+        // instead of a panic backtrace.
         let plan_file = build_plan_file(
             path,
             parsed,
@@ -5088,6 +5651,69 @@ mod run_plan_out_tests {
             "saved-plan error lost the upstream field location: {error}",
         );
     }
+
+    #[test]
+    fn build_plan_file_reports_provider_evidence_failure_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        let configured = ProviderConfig {
+            name: "aws".to_string(),
+            attributes: indexmap::IndexMap::new(),
+            default_tags: indexmap::IndexMap::new(),
+            source: Some("file:///missing/aws.wasm".parse().unwrap()),
+            version: None,
+            revision: None,
+            unresolved_attributes: indexmap::IndexMap::new(),
+            binding: None,
+        };
+        let parsed = carina_core::parser::InferredFile {
+            providers: vec![configured.clone()],
+            ..Default::default()
+        };
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .unwrap();
+        let ctx = crate::wiring::PlanContext {
+            plan: Plan::new(),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            managed_current: HashMap::new(),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let wiring = WiringContext::new_for_test(Vec::new(), &[configured]);
+
+        let error = build_plan_file(
+            &path,
+            &parsed,
+            &provider_configs,
+            None,
+            &None,
+            &ctx,
+            &wiring,
+        )
+        .expect_err("a configured provider without an artifact must fail plan saving");
+        assert!(matches!(
+            &error,
+            PlanSaveError::ProviderEvidence(
+                ProviderEvidenceError::MissingProviderArtifact { provider }
+            ) if provider == "aws"
+        ));
+        assert_eq!(
+            format_plan_save_error(&error, "--out"),
+            "Cannot save plan: invalid saved-plan provider evidence: provider_artifacts is missing expected provider `aws`"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5251,8 +5877,8 @@ mod export_diff_tests {
 mod plan_serialization_error_tests {
     //! RFC #2371 stage 4: serialization-boundary errors are now produced
     //! by `PersistedValue::encode_provider_value` / `redact_secrets_in_*`
-    //! directly, surfaced through `build_plan_file`'s `SerializationError`
-    //! return. Verify the actionable wording and that every effect shape
+    //! directly, surfaced through `build_plan_file`'s typed plan-save error.
+    //! Verify the actionable wording and that every effect shape
     //! (top-level attributes, nested List/Map, Replace cascade) propagates
     //! the error.
     use carina_core::resource::{

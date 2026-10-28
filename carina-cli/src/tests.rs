@@ -30,7 +30,8 @@ use crate::commands::apply::{
     save_state_locked,
 };
 use crate::commands::plan::{
-    CurrentStateEntry, MovedOrigins, PlanFile, ReloadedCurrentStateEntry, SavedDataSourceValue,
+    CurrentStateEntry, MovedOrigins, PlanFile, PlanFileContents, RecordedProviderArtifact,
+    ReloadedCurrentStateEntry, SavedDataSourceValue,
 };
 use crate::commands::shared::finalize::StatePersistence;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
@@ -45,11 +46,83 @@ use crate::wiring::{
     resolve_names, validate_resources,
 };
 use carina_core::parser::BackendConfig;
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ProviderFactory};
 use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+struct EvidenceTestFactory {
+    name: String,
+}
+
+impl ProviderFactory for EvidenceTestFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        "saved-plan evidence test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async {
+            Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+        })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        Vec::new()
+    }
+}
+
+fn provider_config_for_evidence_test(name: &str) -> ProviderConfig {
+    ProviderConfig {
+        name: name.to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some(format!("file:///{name}.wasm").parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }
+}
+
+fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile {
+    let factories = providers
+        .iter()
+        .map(|provider| {
+            Box::new(EvidenceTestFactory {
+                name: (*provider).to_string(),
+            }) as Box<dyn ProviderFactory>
+        })
+        .collect();
+    let ctx =
+        WiringContext::new_for_test(factories, contents.provider_configs.as_provider_configs());
+    contents
+        .record(&ctx)
+        .expect("test plan provider evidence must be valid")
 }
 
 fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplyStateSaveInputs> {
@@ -454,57 +527,61 @@ fn plan_file_serde_round_trip() {
     ];
     let data_source = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
 
-    let plan_file = PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "0.1.0".to_string(),
-        timestamp: "2025-01-01T00:00:00Z".to_string(),
-        source_path: "example.crn".to_string(),
-        state_lineage: Some("test-lineage".to_string()),
-        state_serial: Some(1),
-        provider_configs: saved_provider_configs(vec![ProviderConfig {
-            name: "aws".to_string(),
-            attributes: IndexMap::from([(
-                "region".to_string(),
-                Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into())),
-            )]),
-            default_tags: IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        }]),
-        backend_config: Some(BackendConfig {
-            backend_type: "s3".to_string(),
-            attributes: HashMap::from([
-                (
-                    "bucket".to_string(),
-                    Value::Concrete(ConcreteValue::String("my-state".into())),
-                ),
-                (
-                    "key".to_string(),
-                    Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
-                ),
-            ]),
-            attribute_spans: HashMap::new(),
-        }),
-        plan,
-        sorted_resources: sorted_resources.clone(),
-        unresolved_resources: sorted_resources,
-        current_states,
-        compositions: vec![],
-        data_sources: vec![data_source],
-        data_source_origins: vec![],
-        data_source_values: vec![SavedDataSourceValue {
-            id: data_source_id.clone(),
-            value: DataSourceValue::read(State::existing(data_source_id.clone(), HashMap::new())),
-        }],
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: vec![],
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "0.1.0".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_path: "example.crn".to_string(),
+            state_lineage: Some("test-lineage".to_string()),
+            state_serial: Some(1),
+            provider_configs: saved_provider_configs(vec![ProviderConfig {
+                name: "aws".to_string(),
+                attributes: IndexMap::from([(
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into())),
+                )]),
+                default_tags: IndexMap::new(),
+                source: Some("file:///aws.wasm".parse().unwrap()),
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+            }]),
+            backend_config: Some(BackendConfig {
+                backend_type: "s3".to_string(),
+                attributes: HashMap::from([
+                    (
+                        "bucket".to_string(),
+                        Value::Concrete(ConcreteValue::String("my-state".into())),
+                    ),
+                    (
+                        "key".to_string(),
+                        Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
+                    ),
+                ]),
+                attribute_spans: HashMap::new(),
+            }),
+            plan,
+            sorted_resources: sorted_resources.clone(),
+            unresolved_resources: sorted_resources,
+            current_states,
+            compositions: vec![],
+            data_sources: vec![data_source],
+            data_source_origins: vec![],
+            data_source_values: vec![SavedDataSourceValue {
+                id: data_source_id.clone(),
+                value: DataSourceValue::read(State::existing(
+                    data_source_id.clone(),
+                    HashMap::new(),
+                )),
+            }],
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: vec![],
+        },
+        &["aws"],
+    );
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3111,32 +3188,35 @@ fn plan_file_serialization_redacts_secrets() {
     );
 
     // Redact before building PlanFile (same as production code does)
-    let plan_file = PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "0.1.0".to_string(),
-        timestamp: "2025-01-01T00:00:00Z".to_string(),
-        source_path: "example.crn".to_string(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
-        plan: redact_secrets_in_plan(&plan).unwrap(),
-        sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
-        unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
-        compositions: vec![],
-        data_sources: vec![],
-        data_source_origins: vec![],
-        data_source_values: vec![],
-        current_states: vec![CurrentStateEntry::managed(
-            ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
-            redact_secrets_in_state(&state_with_secret).unwrap(),
-        )],
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: vec![],
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "0.1.0".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_path: "example.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "awscc",
+            )]),
+            backend_config: None,
+            plan: redact_secrets_in_plan(&plan).unwrap(),
+            sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
+            unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
+            compositions: vec![],
+            data_sources: vec![],
+            data_source_origins: vec![],
+            data_source_values: vec![],
+            current_states: vec![CurrentStateEntry::managed(
+                ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
+                redact_secrets_in_state(&state_with_secret).unwrap(),
+            )],
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: vec![],
+        },
+        &["awscc"],
+    );
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
 
@@ -3161,33 +3241,36 @@ fn plan_file_serialization_redacts_secrets() {
 
 #[test]
 fn plan_file_serialization_rejects_pending_resource_identity() {
-    let plan_file = PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-01-01T00:00:00Z".to_string(),
-        source_path: "main.crn".to_string(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
-        plan: Plan::new(),
-        sorted_resources: vec![Resource::pending_with_provider(
-            "mock",
-            "test.resource",
-            None,
-        )],
-        unresolved_resources: Vec::new(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan: Plan::new(),
+            sorted_resources: vec![Resource::pending_with_provider(
+                "mock",
+                "test.resource",
+                None,
+            )],
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
 
     let error = serde_json::to_string(&plan_file)
         .expect_err("a saved plan must never persist a pending resource identity");
@@ -3200,34 +3283,37 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
 
 #[test]
 fn plan_file_validation_rejects_missing_resource_identity() {
-    let plan_file = PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-01-01T00:00:00Z".to_string(),
-        source_path: "main.crn".to_string(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
-        plan: Plan::new(),
-        sorted_resources: vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "alpha",
-            None,
-        )],
-        unresolved_resources: Vec::new(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan: Plan::new(),
+            sorted_resources: vec![Resource::with_provider(
+                "mock",
+                "test.resource",
+                "alpha",
+                None,
+            )],
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
     let mut json = serde_json::to_value(plan_file).unwrap();
     json["sorted_resources"][0]["id"]
         .as_object_mut()
@@ -3268,37 +3354,58 @@ fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
         interval: Duration::from_secs(5),
         explicit_dependencies: HashSet::new(),
     });
-    PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-01-01T00:00:00Z".to_string(),
-        source_path: "main.crn".to_string(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
-        plan,
-        sorted_resources: vec![managed_target.into_inner()],
-        unresolved_resources: Vec::new(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: vec![CurrentStateEntry::managed(
-            target_id.clone(),
-            State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
-        )],
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    }
+    record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: vec![managed_target.into_inner()],
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: vec![CurrentStateEntry::managed(
+                target_id.clone(),
+                State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
+            )],
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    )
 }
 
 fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFile {
     let mut json = serde_json::to_value(plan_file).unwrap();
     json["plan"]["effects"][0]["Wait"]["target_id"] = serde_json::to_value(target).unwrap();
+    let schemas = json["schema_fingerprints"]["providers"]
+        .as_object_mut()
+        .expect("provider fingerprint inventory")
+        .get_mut(&target.provider)
+        .expect("target provider fingerprint")
+        .get_mut("schemas")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("target provider schemas");
+    let already_recorded = schemas.iter().any(|schema| {
+        schema["kind"] == "resource" && schema["resource_type"] == target.resource_type.as_str()
+    });
+    if !already_recorded {
+        schemas.push(serde_json::json!({
+            "kind": "resource",
+            "resource_type": target.resource_type.as_str(),
+            "fingerprint": "absent"
+        }));
+    }
     serde_json::from_value(json)
         .expect("the transparent wait target should deserialize before load validation")
 }
@@ -3307,14 +3414,15 @@ fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFi
 fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
     let data_source =
         DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
-    let mut plan_file = plan_file_with_unchanged_managed_wait_target();
-    plan_file.data_sources.push(data_source.clone());
-    plan_file.data_source_values.push(SavedDataSourceValue {
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.data_sources.push(data_source.clone());
+    contents.data_source_values.push(SavedDataSourceValue {
         id: data_source.id.clone(),
         value: DataSourceValue::deferred_to_apply(Vec::new()),
     });
-    assert!(plan_file.data_source_origins.is_empty());
+    assert!(contents.data_source_origins.is_empty());
 
+    let plan_file = record_test_plan(contents, &["mock"]);
     let decoded = replace_saved_wait_target(plan_file, &data_source.id);
     let error = decoded
         .validate_resource_identities()
@@ -3363,32 +3471,35 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
     plan.add(Effect::Read {
         resource: resolved_data_source(data_source.clone()),
     });
-    let plan_file = PlanFile {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-10-28T00:00:00Z".to_string(),
-        source_path: "main.crn".to_string(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
-        plan,
-        sorted_resources: Vec::new(),
-        unresolved_resources: Vec::new(),
-        compositions: Vec::new(),
-        data_sources: vec![data_source.clone()],
-        data_source_origins: Vec::new(),
-        data_source_values: vec![SavedDataSourceValue {
-            id: data_source.id,
-            value: DataSourceValue::blocked_by_plan_error(),
-        }],
-        current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-        schema_fingerprints: Default::default(),
-        provider_artifacts: Default::default(),
-    };
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-28T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: vec![data_source.clone()],
+            data_source_origins: Vec::new(),
+            data_source_values: vec![SavedDataSourceValue {
+                id: data_source.id,
+                value: DataSourceValue::blocked_by_plan_error(),
+            }],
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
 
     let error = plan_file
         .validate_resource_identities()
@@ -3423,6 +3534,383 @@ fn plan_file_decode_requires_provider_artifacts_field() {
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("format 26 must require provider artifact identities");
     assert!(error.to_string().contains("provider_artifacts"), "{error}");
+}
+
+#[test]
+fn plan_file_decode_requires_schema_fingerprints_field() {
+    let mut encoded = serde_json::to_value(plan_file_with_unchanged_managed_wait_target()).unwrap();
+    encoded
+        .as_object_mut()
+        .expect("saved plan object")
+        .remove("schema_fingerprints");
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("format 23 and later must require schema fingerprints");
+    assert!(error.to_string().contains("schema_fingerprints"), "{error}");
+}
+
+fn encoded_plan_with_mock_provider_evidence() -> serde_json::Value {
+    let mut encoded = serde_json::to_value(plan_file_with_unchanged_managed_wait_target()).unwrap();
+    encoded["schema_fingerprints"] = serde_json::json!({
+        "providers": {
+            "mock": {
+                "schemas": [{
+                    "kind": "resource",
+                    "resource_type": "test.resource",
+                    "fingerprint": "absent"
+                }]
+            }
+        }
+    });
+    encoded["provider_artifacts"] = serde_json::json!({
+        "mock": {
+            "kind": "wasm",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "origin": { "kind": "file" }
+        }
+    });
+    encoded
+}
+
+#[test]
+fn plan_file_decode_accepts_base_mock_provider_evidence() {
+    serde_json::from_value::<PlanFile>(encoded_plan_with_mock_provider_evidence())
+        .expect("base provider evidence fixture must decode");
+}
+
+#[test]
+fn plan_file_decode_rejects_empty_schema_fingerprints_for_referenced_provider() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"] = serde_json::json!({});
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("referenced provider schemas must be recorded");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints is missing provider `mock`, managed type `test.resource`"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_provider_with_empty_schema_inventory() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"] = serde_json::json!([]);
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("a provider fingerprint entry must contain schemas");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints provider `mock` has an empty schemas list"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_missing_artifact_for_configured_provider() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["provider_artifacts"] = serde_json::json!({});
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("referenced providers must have artifact evidence");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts is missing expected provider `mock`"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_artifact_for_unconfigured_provider() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["provider_artifacts"]["retired"] = serde_json::json!({ "kind": "built_in" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("artifact keys must exactly match configured provider kinds");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts contains unexpected provider `retired`"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_wrong_artifact_kind_for_configured_provider() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["provider_artifacts"]["mock"] = serde_json::json!({ "kind": "built_in" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("artifact kind must match the configured provider implementation");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts records provider `mock` as built-in, expected wasm"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_extra_schema_fingerprint() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"]
+        .as_array_mut()
+        .expect("mock schema inventory")
+        .push(serde_json::json!({
+            "kind": "resource",
+            "resource_type": "test.extra",
+            "fingerprint": "absent"
+        }));
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("unreferenced schema evidence must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints contains unreferenced provider `mock`, managed type `test.extra`"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_duplicate_schema_fingerprint() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    let duplicate = encoded["schema_fingerprints"]["providers"]["mock"]["schemas"][0].clone();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"]
+        .as_array_mut()
+        .expect("mock schema inventory")
+        .push(duplicate);
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("duplicate schema evidence must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: duplicate schema fingerprint for provider `mock`, managed type `test.resource`"
+    );
+}
+
+fn builtin_mock_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }
+}
+
+fn builtin_mock_recording_context() -> WiringContext {
+    WiringContext::new_for_test(Vec::new(), &[builtin_mock_provider_config()])
+}
+
+#[test]
+fn recorded_builtin_only_plan_round_trips_with_format_26_top_level_keys() {
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
+    let recorded = contents
+        .record(&builtin_mock_recording_context())
+        .expect("built-in provider evidence must record");
+    assert_eq!(
+        recorded.provider_artifacts().get("mock"),
+        Some(&RecordedProviderArtifact::BuiltIn)
+    );
+
+    let encoded = serde_json::to_value(&recorded).expect("recorded plan serializes");
+    let actual_keys = encoded
+        .as_object()
+        .expect("saved plan is a top-level object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_keys = BTreeSet::from([
+        "backend_config",
+        "carina_version",
+        "compositions",
+        "current_states",
+        "data_source_origins",
+        "data_source_values",
+        "data_sources",
+        "plan",
+        "provider_artifacts",
+        "provider_configs",
+        "schema_fingerprints",
+        "sorted_resources",
+        "source_path",
+        "state_lineage",
+        "state_serial",
+        "timestamp",
+        "unresolved_resources",
+        "upstream_snapshot",
+        "upstream_sources",
+        "version",
+        "wait_bindings",
+    ]);
+    assert_eq!(actual_keys, expected_keys);
+
+    struct TopLevelKeys;
+
+    impl<'de> serde::de::Visitor<'de> for TopLevelKeys {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a saved-plan object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut keys = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                keys.push(key);
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(keys)
+        }
+    }
+
+    let serialized = serde_json::to_vec(&recorded).expect("recorded plan serializes in order");
+    let mut deserializer = serde_json::Deserializer::from_slice(&serialized);
+    let actual_order =
+        serde::de::Deserializer::deserialize_map(&mut deserializer, TopLevelKeys).unwrap();
+    assert_eq!(
+        actual_order,
+        [
+            "version",
+            "carina_version",
+            "timestamp",
+            "source_path",
+            "state_lineage",
+            "state_serial",
+            "provider_configs",
+            "backend_config",
+            "plan",
+            "sorted_resources",
+            "unresolved_resources",
+            "compositions",
+            "data_sources",
+            "data_source_origins",
+            "data_source_values",
+            "current_states",
+            "upstream_snapshot",
+            "upstream_sources",
+            "wait_bindings",
+            "schema_fingerprints",
+            "provider_artifacts",
+        ]
+    );
+
+    let decoded: PlanFile = serde_json::from_value(encoded).expect("recorded plan round-trips");
+    assert_eq!(
+        decoded.schema_fingerprints(),
+        recorded.schema_fingerprints()
+    );
+    assert_eq!(decoded.provider_artifacts(), recorded.provider_artifacts());
+}
+
+#[test]
+fn zero_referenced_provider_plan_round_trips() {
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(Vec::new());
+    contents.plan = Plan::new();
+    contents.sorted_resources.clear();
+    contents.current_states.clear();
+
+    let recorded = contents
+        .record(&WiringContext::new_for_test(Vec::new(), &[]))
+        .expect("providerless evidence must record the built-in mock");
+    assert!(recorded.schema_fingerprints().providers.is_empty());
+    assert_eq!(
+        recorded.provider_artifacts().get("mock"),
+        Some(&RecordedProviderArtifact::BuiltIn),
+        "the implicit built-in provider remains explicit artifact evidence"
+    );
+
+    let encoded = serde_json::to_value(&recorded).expect("zero-provider plan serializes");
+    let decoded: PlanFile =
+        serde_json::from_value(encoded).expect("zero-provider plan round-trips");
+    assert_eq!(
+        decoded.schema_fingerprints(),
+        recorded.schema_fingerprints()
+    );
+    assert_eq!(decoded.provider_artifacts(), recorded.provider_artifacts());
+}
+
+#[test]
+fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
+    let retired = ResourceId::with_provider_identity("retired", "legacy.Widget", "gone", None);
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(Vec::new());
+    contents.plan = Plan::new();
+    contents.plan.add(Effect::Remove {
+        id: carina_core::resource::ResolvedResourceId::new(retired.clone()),
+    });
+    contents.sorted_resources.clear();
+    contents.current_states = vec![CurrentStateEntry::managed(
+        retired,
+        State::not_found(ResourceId::with_provider_identity(
+            "retired",
+            "legacy.Widget",
+            "gone",
+            None,
+        )),
+    )];
+
+    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
+    let recorded = contents
+        .record(&ctx)
+        .expect("a state-only type from an unloaded provider must record");
+
+    assert_eq!(
+        recorded.schema_fingerprints().providers["retired"].schemas[0].fingerprint,
+        crate::commands::plan::TypeSchemaFingerprint::Absent
+    );
+    assert!(!recorded.provider_artifacts().contains_key("retired"));
+    assert_eq!(
+        recorded.provider_artifacts().get("mock"),
+        Some(&RecordedProviderArtifact::BuiltIn)
+    );
+
+    let encoded = serde_json::to_vec(&recorded).expect("state-only plan serializes");
+    let decoded: PlanFile =
+        serde_json::from_slice(&encoded).expect("state-only plan evidence round-trips");
+    assert_eq!(
+        decoded.schema_fingerprints(),
+        recorded.schema_fingerprints()
+    );
+    assert_eq!(decoded.provider_artifacts(), recorded.provider_artifacts());
+}
+
+#[test]
+fn recording_invalid_provider_artifact_inventory_does_not_panic() {
+    let configured = ProviderConfig {
+        name: "aws".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some("file:///missing/aws.wasm".parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(vec![configured.clone()]);
+    contents.plan = Plan::new();
+    contents.plan.add(Effect::Remove {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "aws",
+            "legacy.Widget",
+            "gone",
+            None,
+        )),
+    });
+    contents.sorted_resources.clear();
+    contents.current_states.clear();
+
+    let ctx = WiringContext::new_for_test(Vec::new(), &[configured]);
+    let error = contents
+        .record(&ctx)
+        .expect_err("a configured provider without a loaded artifact must be rejected");
+    assert_eq!(
+        error,
+        crate::commands::plan::ProviderEvidenceError::MissingProviderArtifact {
+            provider: "aws".to_string()
+        }
+    );
 }
 
 /// Backend that captures the state written to it.

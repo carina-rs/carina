@@ -319,6 +319,14 @@ pub(crate) type FormattingFactoryLoad = (
     HashMap<String, ProviderFactoryDiagnostic>,
 );
 
+/// Return the source for provider configurations that participate in factory loading.
+///
+/// A source-less named instance reuses its kind's default factory later during
+/// provider routing; it does not cause a factory to be loaded on its own.
+pub(crate) fn provider_factory_source(config: &ProviderConfig) -> Option<&ProviderSource> {
+    config.source.as_ref()
+}
+
 impl WiringContext {
     pub fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
         Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
@@ -523,7 +531,7 @@ where
     let mut attempted_default_sources = HashSet::new();
 
     for config in providers {
-        let Some(source) = &config.source else {
+        let Some(source) = provider_factory_source(config) else {
             continue;
         };
         if config.is_default() && !attempted_default_sources.insert(config.name.clone()) {
