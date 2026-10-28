@@ -49,7 +49,7 @@ impl GithubResponse {
 }
 
 pub(crate) trait GithubHttp {
-    fn get(&self, request: GithubRequest) -> Result<GithubResponse, String>;
+    fn get(&self, request: GithubRequest) -> Result<GithubResponse, GithubApiError>;
 }
 
 pub(crate) trait GithubTokenProvider {
@@ -83,7 +83,7 @@ impl UreqGithubHttp {
 }
 
 impl GithubHttp for UreqGithubHttp {
-    fn get(&self, request: GithubRequest) -> Result<GithubResponse, String> {
+    fn get(&self, request: GithubRequest) -> Result<GithubResponse, GithubApiError> {
         let mut call = self
             .agent()
             .get(request.url())
@@ -92,9 +92,12 @@ impl GithubHttp for UreqGithubHttp {
         if let Some(authorization) = request.authorization() {
             call = call.header("Authorization", authorization);
         }
-        let response = call
-            .call()
-            .map_err(|error| format!("Failed to fetch {} from GitHub: {error}", request.url()))?;
+        let response = call.call().map_err(|error| {
+            GithubApiError::Http(format!(
+                "Failed to fetch {} from GitHub: {error}",
+                request.url()
+            ))
+        })?;
         let status = response.status().into();
         let headers = response
             .headers()
@@ -123,29 +126,40 @@ fn read_response_body(
     mut reader: impl Read,
     url: &str,
     response_body_limit: Option<u64>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, GithubApiError> {
     let mut body = Vec::new();
     match response_body_limit {
         Some(limit) => reader.take(limit.saturating_add(1)).read_to_end(&mut body),
         None => reader.read_to_end(&mut body),
     }
-    .map_err(|error| format!("Failed to read GitHub response body from {url}: {error}"))?;
+    .map_err(|error| {
+        GithubApiError::Http(format!(
+            "Failed to read GitHub response body from {url}: {error}"
+        ))
+    })?;
     if let Some(limit) = response_body_limit
         && body.len() as u64 > limit
     {
-        return Err(response_body_limit_error(url, limit));
+        return Err(GithubApiError::ResponseBodyTooLarge {
+            url: url.to_string(),
+            limit,
+        });
     }
     Ok(body)
 }
 
 fn response_body_limit_error(url: &str, limit: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
-    let limit = if limit >= MIB && limit.is_multiple_of(MIB) {
-        format!("{} MiB", limit / MIB)
-    } else {
-        format!("{limit} byte{}", if limit == 1 { "" } else { "s" })
-    };
+    let limit = byte_size_label(limit);
     format!("GitHub response body from {url} exceeds the {limit} limit")
+}
+
+pub(crate) fn byte_size_label(size: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if size >= MIB && size.is_multiple_of(MIB) {
+        format!("{} MiB", size / MIB)
+    } else {
+        format!("{size} byte{}", if size == 1 { "" } else { "s" })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -222,6 +236,10 @@ pub(crate) enum GithubApiError {
     Location(GithubLocationError),
     Http(String),
     Authentication(String),
+    ResponseBodyTooLarge {
+        url: String,
+        limit: u64,
+    },
     Status {
         status: u16,
         endpoint: String,
@@ -242,6 +260,9 @@ impl std::fmt::Display for GithubApiError {
         match self {
             Self::Location(error) => error.fmt(formatter),
             Self::Http(error) | Self::Authentication(error) => formatter.write_str(error),
+            Self::ResponseBodyTooLarge { url, limit } => {
+                formatter.write_str(&response_body_limit_error(url, *limit))
+            }
             Self::Status {
                 status,
                 endpoint,
@@ -467,38 +488,24 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
     ) -> Result<GithubResponse, GithubApiError> {
         let authorization = self.authorization(authentication)?;
         let authenticated = authorization.is_some();
-        let mut response = self
-            .http
-            .get(GithubRequest {
-                url: url.to_string(),
-                accept,
-                authorization,
-                response_body_limit,
-            })
-            .map_err(GithubApiError::Http)?;
+        let mut response = self.http.get(GithubRequest {
+            url: url.to_string(),
+            accept,
+            authorization,
+            response_body_limit,
+        })?;
         let mut anonymous = !authenticated;
         if authenticated
             && response.status == 401
             && matches!(authentication, GithubAuthentication::Optional)
         {
-            response = self
-                .http
-                .get(GithubRequest {
-                    url: url.to_string(),
-                    accept,
-                    authorization: None,
-                    response_body_limit,
-                })
-                .map_err(GithubApiError::Http)?;
+            response = self.http.get(GithubRequest {
+                url: url.to_string(),
+                accept,
+                authorization: None,
+                response_body_limit,
+            })?;
             anonymous = true;
-        }
-        if let Some(limit) = response_body_limit
-            && response.body.len() as u64 > limit
-        {
-            return Err(GithubApiError::Http(response_body_limit_error(
-                url.as_str(),
-                limit,
-            )));
         }
         if !(200..300).contains(&response.status) {
             return Err(github_status_error(&response, url, anonymous));
@@ -619,7 +626,7 @@ impl FixtureGithubHttp {
         self.response(url, 200, body, &[])
     }
 
-    fn response(
+    pub(crate) fn response(
         self,
         url: &str,
         status: u16,
@@ -649,20 +656,30 @@ impl FixtureGithubHttp {
 
 #[cfg(test)]
 impl GithubHttp for FixtureGithubHttp {
-    fn get(&self, request: GithubRequest) -> Result<GithubResponse, String> {
+    fn get(&self, request: GithubRequest) -> Result<GithubResponse, GithubApiError> {
         self.requests.lock().unwrap().push(request.clone());
         let response = {
             let mut responses = self.responses.lock().unwrap();
-            let responses = responses
-                .get_mut(request.url())
-                .ok_or_else(|| format!("unexpected fixture GitHub URL: {}", request.url()))?;
+            let responses = responses.get_mut(request.url()).ok_or_else(|| {
+                GithubApiError::Http(format!("unexpected fixture GitHub URL: {}", request.url()))
+            })?;
             if responses.len() > 1 {
                 responses.pop_front()
             } else {
                 responses.front().cloned()
             }
-            .ok_or_else(|| format!("exhausted fixture GitHub URL: {}", request.url()))?
+            .ok_or_else(|| {
+                GithubApiError::Http(format!("exhausted fixture GitHub URL: {}", request.url()))
+            })?
         };
+        if let Some(limit) = request.response_body_limit
+            && response.body.len() as u64 > limit
+        {
+            return Err(GithubApiError::ResponseBodyTooLarge {
+                url: request.url().to_string(),
+                limit,
+            });
+        }
         Ok(GithubResponse {
             status: response.status,
             headers: response.headers,
@@ -983,7 +1000,8 @@ mod tests {
         };
 
         let error = read_response_body(reader, "https://api.github.com/artifact", Some(4))
-            .expect_err("the fifth byte must prove the body exceeds the limit");
+            .expect_err("the fifth byte must prove the body exceeds the limit")
+            .to_string();
 
         assert!(error.contains("exceeds"), "{error}");
         assert_eq!(bytes_read.get(), 5);
@@ -1018,13 +1036,11 @@ mod tests {
     }
 
     impl GithubHttp for CycleGithubHttp {
-        fn get(&self, request: GithubRequest) -> Result<GithubResponse, String> {
+        fn get(&self, request: GithubRequest) -> Result<GithubResponse, GithubApiError> {
             self.requests.lock().unwrap().push(request);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| "pagination made an unexpected repeated request".to_string())
+            self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                GithubApiError::Http("pagination made an unexpected repeated request".to_string())
+            })
         }
     }
 

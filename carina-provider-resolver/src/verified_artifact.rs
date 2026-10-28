@@ -208,8 +208,9 @@ impl ChecksumMismatch {
     }
 
     fn unchanged_revision_download_message(self) -> String {
+        let remedy = revision_artifact_replacement_remedy(&self.project_dir);
         format!(
-            "Downloaded provider '{}' ({}@{}) does not match the sha256 pinned in carina-providers.lock. Expected: {}, got: {}. The artifact for an unchanged commit changed after it was pinned; refusing to replace the lock entry.",
+            "Downloaded provider '{}' ({}@{}) does not match the sha256 pinned in carina-providers.lock. Expected: {}, got: {}. The artifact for an unchanged commit changed after it was pinned. {remedy}",
             self.provider_name,
             self.locked_source,
             self.locked_identity,
@@ -217,6 +218,13 @@ impl ChecksumMismatch {
             self.actual_sha256,
         )
     }
+}
+
+pub(crate) fn revision_artifact_replacement_remedy(project_dir: &Path) -> String {
+    format!(
+        "Push a new commit (or point `revision` at one), or remove this provider's entry from carina-providers.lock and run `{}` to accept the current build.",
+        ProjectCommand::new("init", project_dir)
+    )
 }
 
 pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
@@ -630,6 +638,23 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_revision_download_error_has_actionable_remedy() {
+        let mismatch = ChecksumMismatch {
+            provider_name: "aws".into(),
+            locked_source: "github.com/carina-rs/carina-provider-aws".into(),
+            locked_identity: "abcdef012345".into(),
+            expected_sha256: "expected".into(),
+            actual_sha256: "actual".into(),
+            project_dir: PathBuf::from("infra/foo"),
+        };
+
+        assert_eq!(
+            mismatch.unchanged_revision_download_message(),
+            "Downloaded provider 'aws' (github.com/carina-rs/carina-provider-aws@abcdef012345) does not match the sha256 pinned in carina-providers.lock. Expected: expected, got: actual. The artifact for an unchanged commit changed after it was pinned. Push a new commit (or point `revision` at one), or remove this provider's entry from carina-providers.lock and run `carina init infra/foo` to accept the current build."
+        );
+    }
 
     #[test]
     fn cache_removal_failure_is_included_in_checksum_error() {
