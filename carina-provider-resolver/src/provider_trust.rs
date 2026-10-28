@@ -3,6 +3,7 @@ use std::fmt;
 use carina_core::provider_source::RemoteSourceKey;
 
 use crate::provider_resolver::RegistrySignatureProtection;
+use crate::user_trust::UserVerifiedIdentity;
 
 const CARINA_RS_GITHUB_ORG_ID: &str = "260157389";
 const CARINA_RS_GITHUB_SAN_PREFIX: &str = "https://github.com/carina-rs/";
@@ -32,29 +33,12 @@ impl ProviderTrust {
         self.class
     }
 
-    pub(crate) fn from_verified_remote(
-        source: &RemoteSourceKey,
-        signature: Option<&RegistrySignatureProtection>,
-    ) -> Self {
-        if !signer_is_carina_rs(signature) {
-            return Self::untrusted();
-        }
+    pub(crate) fn from_verified_remote(identity: &UserVerifiedIdentity) -> Self {
+        classify_verified_remote(identity.source(), identity.signer())
+    }
 
-        match source.as_str() {
-            "github.com/carina-rs/carina-provider-aws" | "carina-rs/aws" => Self {
-                class: ProviderTrustClass::Aws,
-                name_requirement: ProviderNameRequirement::Exact("aws"),
-            },
-            "github.com/carina-rs/carina-provider-awscc" | "carina-rs/awscc" => Self {
-                class: ProviderTrustClass::Aws,
-                name_requirement: ProviderNameRequirement::Exact("awscc"),
-            },
-            "github.com/carina-rs/carina-provider-github" | "carina-rs/github" => Self {
-                class: ProviderTrustClass::GitHub,
-                name_requirement: ProviderNameRequirement::Exact("github"),
-            },
-            _ => Self::untrusted(),
-        }
+    pub(crate) fn remote_source_is_allowlisted(source: &RemoteSourceKey) -> bool {
+        remote_trust_shape(source).is_some()
     }
 
     pub(crate) fn trusted_local(class: ProviderTrustClass) -> Self {
@@ -73,6 +57,42 @@ impl ProviderTrust {
             class: ProviderTrustClass::Untrusted,
             name_requirement: ProviderNameRequirement::Any,
         }
+    }
+}
+
+fn classify_verified_remote(
+    source: &RemoteSourceKey,
+    signature: Option<&RegistrySignatureProtection>,
+) -> ProviderTrust {
+    if !signer_is_carina_rs(signature) {
+        return ProviderTrust::untrusted();
+    }
+    match remote_trust_shape(source) {
+        Some((class, name_requirement)) => ProviderTrust {
+            class,
+            name_requirement,
+        },
+        None => ProviderTrust::untrusted(),
+    }
+}
+
+fn remote_trust_shape(
+    source: &RemoteSourceKey,
+) -> Option<(ProviderTrustClass, ProviderNameRequirement)> {
+    match source.as_str() {
+        "github.com/carina-rs/carina-provider-aws" | "carina-rs/aws" => Some((
+            ProviderTrustClass::Aws,
+            ProviderNameRequirement::Exact("aws"),
+        )),
+        "github.com/carina-rs/carina-provider-awscc" | "carina-rs/awscc" => Some((
+            ProviderTrustClass::Aws,
+            ProviderNameRequirement::Exact("awscc"),
+        )),
+        "github.com/carina-rs/carina-provider-github" | "carina-rs/github" => Some((
+            ProviderTrustClass::GitHub,
+            ProviderNameRequirement::Exact("github"),
+        )),
+        _ => None,
     }
 }
 
@@ -206,7 +226,7 @@ mod tests {
 
     #[test]
     fn evil_github_aws_source_is_untrusted() {
-        let trust = ProviderTrust::from_verified_remote(&source_key("github.com/evil/aws"), None);
+        let trust = classify_verified_remote(&source_key("github.com/evil/aws"), None);
 
         assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
     }
@@ -220,7 +240,7 @@ mod tests {
             "github.com/Carina-rs/carina-provider-aws",
             "github.com/carina-rs/Carina-provider-aws",
         ] {
-            let trust = ProviderTrust::from_verified_remote(&source_key(source), None);
+            let trust = classify_verified_remote(&source_key(source), None);
             assert_eq!(
                 trust.class(),
                 ProviderTrustClass::Untrusted,
@@ -237,7 +257,7 @@ mod tests {
             "carina-rs/aws",
             "registry.carina-rs.dev/carina-rs/awscc",
         ] {
-            let trust = ProviderTrust::from_verified_remote(&source_key(source), None);
+            let trust = classify_verified_remote(&source_key(source), None);
             assert_eq!(
                 trust.class(),
                 ProviderTrustClass::Aws,
@@ -252,7 +272,7 @@ mod tests {
             "github.com/carina-rs/carina-provider-github",
             "carina-rs/github",
         ] {
-            let trust = ProviderTrust::from_verified_remote(&source_key(source), None);
+            let trust = classify_verified_remote(&source_key(source), None);
             assert_eq!(trust.class(), ProviderTrustClass::GitHub);
         }
     }
@@ -271,7 +291,7 @@ mod tests {
         ];
 
         for signature in &signatures {
-            let trust = ProviderTrust::from_verified_remote(&source, Some(signature));
+            let trust = classify_verified_remote(&source, Some(signature));
             assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
         }
     }
@@ -290,14 +310,14 @@ mod tests {
         ];
 
         for signature in &signatures {
-            let trust = ProviderTrust::from_verified_remote(&source, Some(signature));
+            let trust = classify_verified_remote(&source, Some(signature));
             assert_eq!(trust.class(), ProviderTrustClass::Aws);
         }
     }
 
     #[test]
     fn trusted_remote_identity_rejects_disagreeing_configured_name() {
-        let trust = ProviderTrust::from_verified_remote(
+        let trust = classify_verified_remote(
             &source_key("github.com/carina-rs/carina-provider-aws"),
             None,
         );
@@ -312,7 +332,7 @@ mod tests {
     fn untrusted_identity_accepts_any_configured_name_without_gaining_privilege() {
         let identity = ProviderLoadIdentity::new(
             "aws".into(),
-            ProviderTrust::from_verified_remote(&source_key("github.com/evil/aws"), None),
+            classify_verified_remote(&source_key("github.com/evil/aws"), None),
         )
         .unwrap();
 

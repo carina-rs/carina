@@ -9,11 +9,12 @@ use sha2::{Digest, Sha256};
 
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
-    LockEntry, LockEntryKind, LockFile, LockedProviderPin, NoRegistryLock, RegistryLock,
+    LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
     RegistrySignatureProtection, WasmArtifactPath, cache_path_wasm, sha256_file,
 };
 use crate::provider_trust::ProviderLoadIdentity;
 use crate::revision_resolver::cache_path_revision;
+use crate::user_trust::{UserTrustRecord, user_trust_record_exists};
 
 /// Provider artifact bytes captured by the resolver.
 ///
@@ -103,29 +104,20 @@ pub struct VerifiedArtifact {
     bytes: ProviderArtifactBytes,
     sha256: String,
     source: RemoteSourceKey,
-    signature: Option<RegistrySignatureProtection>,
     project_dir: PathBuf,
     pin: LockedProviderPin,
 }
 
-pub(crate) trait VerifiedArtifactRegistryLock {
-    fn signature(&self) -> RegistrySignatureProtection;
-}
-
-impl VerifiedArtifactRegistryLock for RegistryLock {
-    fn signature(&self) -> RegistrySignatureProtection {
-        self.signature_protection().clone()
-    }
-}
-
-impl VerifiedArtifactRegistryLock for NoRegistryLock {
-    fn signature(&self) -> RegistrySignatureProtection {
-        match *self {}
-    }
+pub(crate) struct OriginDownloadProof {
+    source: RemoteSourceKey,
+    sha256: String,
+    signer: Option<RegistrySignatureProtection>,
 }
 
 #[derive(Debug)]
-pub(crate) struct FirstUse(());
+pub(crate) struct FirstUse {
+    source: RemoteSourceKey,
+}
 
 #[derive(Debug)]
 pub(crate) enum ArtifactPin<'a, P, R = RegistryLock> {
@@ -133,21 +125,60 @@ pub(crate) enum ArtifactPin<'a, P, R = RegistryLock> {
         lock_entry: &'a LockEntry<R>,
         provider_name: &'a str,
         pin: P,
+        source: RemoteSourceKey,
     },
     Unpinned(FirstUse),
 }
 
 impl<P, R> ArtifactPin<'_, P, R> {
+    /// Return the lock pin only when the same content/source pair also has a
+    /// valid user-owned trust record, making a machine-local cache eligible.
     pub(crate) fn pinned(&self) -> Option<(&LockEntry<R>, &P)> {
         match self {
             Self::Pinned {
                 lock_entry,
                 provider_name: _,
                 pin,
-            } => Some((lock_entry, pin)),
+                source,
+            } if user_trust_record_exists(&lock_entry.sha256, source) => Some((lock_entry, pin)),
+            Self::Pinned { .. } => None,
             Self::Unpinned(_) => None,
         }
     }
+}
+
+impl OriginDownloadProof {
+    fn new(
+        source: RemoteSourceKey,
+        sha256: String,
+        signer: Option<RegistrySignatureProtection>,
+    ) -> Self {
+        Self {
+            source,
+            sha256,
+            signer,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (RemoteSourceKey, String, Option<RegistrySignatureProtection>) {
+        (self.source, self.sha256, self.signer)
+    }
+}
+
+pub(crate) fn record_verified_origin_download(
+    source: &RemoteSourceKey,
+    sha256: &str,
+    signer: Option<&RegistrySignatureProtection>,
+) -> Result<(), String> {
+    UserTrustRecord::from_origin_download(OriginDownloadProof::new(
+        source.clone(),
+        sha256.to_string(),
+        signer.cloned(),
+    ))
+    .and_then(|record| record.write())
+    .map_err(|error| format!("Failed to record user trust for {source}@{sha256}: {error}"))
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +227,12 @@ impl VerifiedArtifactError {
             Self::ChecksumMismatch(mismatch) => mismatch.download_message(),
             Self::Other(message) => message,
         }
+    }
+}
+
+impl From<VerifiedArtifactError> for String {
+    fn from(error: VerifiedArtifactError) -> Self {
+        error.into_download_message()
     }
 }
 
@@ -291,10 +328,6 @@ impl VerifiedArtifact {
         &self.source
     }
 
-    pub(crate) fn signature(&self) -> Option<&RegistrySignatureProtection> {
-        self.signature.as_ref()
-    }
-
     pub(crate) fn project_dir(&self) -> &Path {
         &self.project_dir
     }
@@ -303,7 +336,7 @@ impl VerifiedArtifact {
         &self.pin
     }
 
-    pub(crate) fn from_existing<R: VerifiedArtifactRegistryLock>(
+    pub(crate) fn from_existing<R>(
         lock_entry: &LockEntry<R>,
         provider_name: &str,
         project_dir: &Path,
@@ -313,7 +346,7 @@ impl VerifiedArtifact {
         Self::from_selection(selection, provider_name, project_dir)
     }
 
-    pub(crate) fn from_selection<R: VerifiedArtifactRegistryLock>(
+    pub(crate) fn from_selection<R>(
         selection: LockArtifactSelection<'_, R>,
         provider_name: &str,
         project_dir: &Path,
@@ -339,7 +372,7 @@ impl VerifiedArtifact {
         )
     }
 
-    fn verify_bytes_at<R: VerifiedArtifactRegistryLock>(
+    fn verify_bytes_at<R>(
         bytes_path: &Path,
         published_path: WasmArtifactPath,
         identity: LockArtifactIdentity<'_, R>,
@@ -375,10 +408,6 @@ impl VerifiedArtifact {
             bytes,
             sha256: actual_sha256,
             source,
-            signature: lock_entry
-                .registry
-                .as_ref()
-                .map(VerifiedArtifactRegistryLock::signature),
             project_dir: project_dir.to_path_buf(),
             pin,
         })
@@ -419,8 +448,11 @@ pub(crate) fn lookup_version_artifact_pin<'a>(
             lock_entry,
             provider_name,
             pin,
+            source: source.clone(),
         },
-        None => ArtifactPin::Unpinned(FirstUse(())),
+        None => ArtifactPin::Unpinned(FirstUse {
+            source: source.clone(),
+        }),
     }
 }
 
@@ -463,12 +495,15 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
             lock_entry,
             provider_name,
             pin,
+            source: source.clone(),
         },
-        None => ArtifactPin::Unpinned(FirstUse(())),
+        None => ArtifactPin::Unpinned(FirstUse {
+            source: source.clone(),
+        }),
     }
 }
 
-pub(crate) fn publish_cached<R: VerifiedArtifactRegistryLock>(
+pub(crate) fn publish_cached<R>(
     staged: StagedArtifact<'_>,
     lock_entry: &LockEntry<R>,
     provider_name: &str,
@@ -511,32 +546,46 @@ pub(crate) fn publish_cached<R: VerifiedArtifactRegistryLock>(
     Ok(verified)
 }
 
-pub(crate) fn publish_download<R: VerifiedArtifactRegistryLock, P>(
+pub(crate) fn publish_download<R, P>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
 ) -> Result<DownloadedArtifact<P>, String> {
+    publish_download_verified(staged, pin).map_err(String::from)
+}
+
+fn publish_download_verified<R, P>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
     match pin {
         ArtifactPin::Pinned {
             lock_entry,
             provider_name,
             pin,
-        } => publish_cached(staged, lock_entry, provider_name)
-            .map(|artifact| DownloadedArtifact::Verified {
+            source,
+        } => {
+            let artifact = publish_cached(staged, lock_entry, provider_name)?;
+            record_verified_origin_download(&source, artifact.sha256(), None)
+                .map_err(VerifiedArtifactError::Other)?;
+            Ok(DownloadedArtifact::Verified {
                 artifact: Box::new(artifact),
                 pin,
             })
-            .map_err(VerifiedArtifactError::into_download_message),
-        ArtifactPin::Unpinned(FirstUse(())) => {
-            let sha256 = sha256_file(staged.path())
-                .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
+        }
+        ArtifactPin::Unpinned(FirstUse { source }) => {
+            let sha256 = sha256_file(staged.path()).map_err(|error| {
+                VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
+            })?;
             let path = staged.destination().clone();
             let published_path = path.as_path().to_path_buf();
             staged.publish().map_err(|error| {
-                format!(
+                VerifiedArtifactError::Other(format!(
                     "Failed to publish provider artifact {}: {error}",
                     published_path.display()
-                )
+                ))
             })?;
+            record_verified_origin_download(&source, &sha256, None)
+                .map_err(VerifiedArtifactError::Other)?;
             Ok(DownloadedArtifact::FirstUse { path, sha256 })
         }
     }
@@ -632,7 +681,110 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    fn trust_record_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[test]
+    fn user_trust_record_write_is_concurrent_and_idempotent() {
+        let _env_guard = crate::test_env_guard();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = match "github.com/carina-rs/carina-provider-aws"
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::Remote(source) => source.source_key(),
+            ProviderSource::File(_) => unreachable!(),
+        };
+        let sha256 = "01".repeat(32);
+
+        record_verified_origin_download(&source, &sha256, None).unwrap();
+        let first = trust_record_files(trust.path());
+        record_verified_origin_download(&source, &sha256, None).unwrap();
+        assert_eq!(trust_record_files(trust.path()), first);
+
+        let threads = (0..8)
+            .map(|_| {
+                let source = source.clone();
+                let sha256 = sha256.clone();
+                std::thread::spawn(move || record_verified_origin_download(&source, &sha256, None))
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        assert_eq!(trust_record_files(trust.path()), first);
+        assert_eq!(first.len(), 1);
+    }
+
+    #[test]
+    fn origin_download_checksum_mismatch_is_typed_and_preserves_destination() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = match "github.com/carina-rs/carina-provider-aws"
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::Remote(source) => source.source_key(),
+            ProviderSource::File(_) => unreachable!(),
+        };
+        let version = "1.0.0";
+        let locked_bytes = b"repository-installed bytes";
+        let downloaded_bytes = b"changed origin bytes";
+        let expected_sha256 = format!("{:x}", Sha256::digest(locked_bytes));
+        let destination =
+            WasmArtifactPath::new(cache_path_wasm(project.path(), &source, version), "aws")
+                .unwrap();
+        std::fs::create_dir_all(destination.as_path().parent().unwrap()).unwrap();
+        std::fs::write(destination.as_path(), locked_bytes).unwrap();
+        let install_lock = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut staged = StagedArtifact::for_project(&install_lock, &destination).unwrap();
+        staged.write_all(downloaded_bytes).unwrap();
+        let mut lock_file = LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.to_string(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: expected_sha256,
+            registry: None,
+        });
+        let pin = lookup_version_artifact_pin(&lock_file, &source, version, "aws");
+
+        let error = publish_download_verified(staged, pin)
+            .expect_err("origin bytes must match the existing lock pin");
+
+        assert!(matches!(error, VerifiedArtifactError::ChecksumMismatch(_)));
+        assert_eq!(std::fs::read(destination.as_path()).unwrap(), locked_bytes);
+        assert!(trust_record_files(trust.path()).is_empty());
+    }
 
     #[test]
     fn cache_removal_failure_is_included_in_checksum_error() {

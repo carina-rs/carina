@@ -32,10 +32,11 @@ use crate::provider_trust::ProviderTrustClass;
 use crate::provider_trust::{ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust};
 use crate::signing;
 use crate::trusted_local::TrustedLocalGrants;
+use crate::user_trust::{load_user_verified_identity, user_trust_record_exists};
 use crate::verified_artifact::{
     DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
     VerifiedArtifactError, VerifiedLoad, VersionArtifactPin, lock_artifact_selection,
-    lookup_version_artifact_pin, publish_download,
+    lookup_version_artifact_pin, publish_download, record_verified_origin_download,
 };
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -1651,6 +1652,26 @@ impl From<RegistrySignatureProtection> for RegistrySignatureProtectionSerde {
     }
 }
 
+impl Serialize for RegistrySignatureProtection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        RegistrySignatureProtectionSerde::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RegistrySignatureProtection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RegistrySignatureProtectionSerde::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 fn sequence_from_wire(
     present: bool,
     sequence: Option<u64>,
@@ -2046,10 +2067,6 @@ impl RegistryLock {
 
     pub fn yanked_versions(&self) -> &YankedRegistryVersions {
         &self.yanked_versions
-    }
-
-    pub(crate) fn signature_protection(&self) -> &RegistrySignatureProtection {
-        &self.signature
     }
 }
 
@@ -4137,10 +4154,7 @@ impl InstalledProvider {
         notice_sink: &mut impl FnMut(&str),
     ) -> Result<ProviderLoadIdentity, ProviderLoadIdentityError> {
         let (trust, notice) = match &self.artifact {
-            InstalledArtifact::LockFile(artifact) => (
-                ProviderTrust::from_verified_remote(artifact.source(), artifact.signature()),
-                None,
-            ),
+            InstalledArtifact::LockFile(artifact) => remote_provider_trust(artifact),
             InstalledArtifact::File {
                 path: _,
                 bytes,
@@ -4211,6 +4225,23 @@ impl InstalledProvider {
         loader(VerifiedLoad::new(self.artifact_bytes(), identity))
             .await
             .map_err(|error| self.with_load_error(error))
+    }
+}
+
+fn remote_provider_trust(artifact: &VerifiedArtifact) -> (ProviderTrust, Option<String>) {
+    match load_user_verified_identity(artifact.sha256(), artifact.source()) {
+        Ok(Some(identity)) => (ProviderTrust::from_verified_remote(&identity), None),
+        Ok(None) | Err(_) => {
+            let notice =
+                ProviderTrust::remote_source_is_allowlisted(artifact.source()).then(|| {
+                    format!(
+                        "carina: run `{}` to verify {} before it receives credentials",
+                        ProjectCommand::new("init", artifact.project_dir()),
+                        artifact.source(),
+                    )
+                });
+            (ProviderTrust::untrusted(), notice)
+        }
     }
 }
 
@@ -5803,6 +5834,10 @@ impl VerifiedRegistryArtifact<'_> {
         }
     }
 
+    fn is_origin_download(&self) -> bool {
+        matches!(&self.state, RegistryArtifactState::Staged { .. })
+    }
+
     fn remove_if_cached(self) {
         if let RegistryArtifactState::Cached { install_lock, path } = self.state {
             let _ = install_lock.remove_project_artifact(&path);
@@ -5859,44 +5894,45 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
     let project_dir = install_lock.project_dir();
     let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
         .map_err(RegistryArtifactError::Invalid)?;
-    let (state, digest) = if path.as_path().exists() {
-        match hash_and_check(
-            path.as_path(),
-            expected_shasum,
-            &format!("cached {context}"),
-            project_dir,
-        ) {
-            Ok(digest) => (RegistryArtifactState::Cached { install_lock, path }, digest),
-            Err(error) => {
-                let _ = install_lock.remove_project_artifact(&path);
-                return Err(RegistryArtifactError::Invalid(error));
+    let (state, digest) =
+        if path.as_path().exists() && user_trust_record_exists(expected_shasum, source) {
+            match hash_and_check(
+                path.as_path(),
+                expected_shasum,
+                &format!("cached {context}"),
+                project_dir,
+            ) {
+                Ok(digest) => (RegistryArtifactState::Cached { install_lock, path }, digest),
+                Err(error) => {
+                    let _ = install_lock.remove_project_artifact(&path);
+                    return Err(RegistryArtifactError::Invalid(error));
+                }
             }
-        }
-    } else {
-        let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
-            RegistryArtifactError::Invalid(format!(
-                "Failed to stage provider artifact {}: {error}",
-                path.as_path().display()
-            ))
-        })?;
-        if let Err(error) = http.download_into(download_url, &mut staged) {
-            let message = error.to_string();
-            return Err(if error.is_unavailable() {
-                RegistryArtifactError::Unavailable(message)
-            } else {
-                RegistryArtifactError::Invalid(message)
-            });
-        }
-        let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
-            .map_err(RegistryArtifactError::Invalid)?;
-        (
-            RegistryArtifactState::Staged {
-                artifact: staged,
-                path,
-            },
-            digest,
-        )
-    };
+        } else {
+            let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
+                RegistryArtifactError::Invalid(format!(
+                    "Failed to stage provider artifact {}: {error}",
+                    path.as_path().display()
+                ))
+            })?;
+            if let Err(error) = http.download_into(download_url, &mut staged) {
+                let message = error.to_string();
+                return Err(if error.is_unavailable() {
+                    RegistryArtifactError::Unavailable(message)
+                } else {
+                    RegistryArtifactError::Invalid(message)
+                });
+            }
+            let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
+                .map_err(RegistryArtifactError::Invalid)?;
+            (
+                RegistryArtifactState::Staged {
+                    artifact: staged,
+                    path,
+                },
+                digest,
+            )
+        };
     Ok(VerifiedRegistryArtifact { state, digest })
 }
 
@@ -6300,6 +6336,11 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         }
         None => None,
     };
+    let origin_downloaded = artifact.is_origin_download();
+    let origin_signer = origin_downloaded.then(|| match &verified_signature {
+        Some((_, acceptance)) => RegistrySignatureProtection::Required(acceptance.next.clone()),
+        None => RegistrySignatureProtection::NotRequired,
+    });
 
     let kind = match intent {
         RegistryDownloadIntent::Version => LockEntryKind::Version {
@@ -6344,6 +6385,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         }
     }
 
+    let artifact_sha256 = download.shasum.clone();
     persistent_lock.upsert_registry_provider(RegistryProviderLockEntry {
         name: name.to_string(),
         source: source_key.clone(),
@@ -6352,6 +6394,9 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         registry,
         validated_sequence,
     })?;
+    if origin_downloaded {
+        record_verified_origin_download(source_key, &artifact_sha256, origin_signer.as_ref())?;
+    }
     Ok(artifact)
 }
 
@@ -6414,10 +6459,10 @@ fn resolve_provider_with_http<H: RegistryHttp>(
 
     let artifact_pin = lookup_version_artifact_pin(lock_file, &source_key, version, name);
 
-    // Machine-local caches are accelerators, not trust anchors. Without a
-    // matching lock pin, both project and global cache entries are skipped and
-    // the artifact is downloaded from its origin before first-use pinning.
-    // This deliberately preserves issue #2032 only for lock-backed cache hits.
+    // Machine-local caches are accelerators, not trust anchors. Without both a
+    // matching lock pin and a user-owned trust record, project and global cache
+    // entries are skipped and the artifact is downloaded from its origin.
+    // This deliberately preserves issue #2032 only for user-verified cache hits.
     let wasm_path =
         WasmArtifactPath::new(cache_path_wasm(project_dir, &source_key, version), name)?;
     if wasm_path.as_path().exists()
@@ -9215,7 +9260,10 @@ transparency_log_present = false
     /// the in-memory lock so a subsequent save cannot silently wipe the pin.
     #[test]
     fn resolve_upserts_lock_entry_when_wasm_cache_is_hit() {
+        let _env_guard = crate::test_env_guard();
         let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let base = dir.path();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
@@ -9239,6 +9287,7 @@ transparency_log_present = false
             sha256: cached_sha256.clone(),
             registry: None,
         });
+        record_verified_origin_download(&source_key(source), &cached_sha256, None).unwrap();
         resolve_provider(
             base,
             &provider_source(source),
@@ -13495,6 +13544,29 @@ transparency_log_present = true
         format!("{:x}", hasher.finalize())
     }
 
+    fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, current: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut entries = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    snapshot.push((relative, None));
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.push((relative, Some(fs::read(&path).unwrap())));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
     fn registry_http(download_body: &[u8], shasum: &str) -> FakeRegistryHttp {
         FakeRegistryHttp::default()
             .json(
@@ -14773,6 +14845,99 @@ transparency_log_present = true
         assert!(
             lock_contents.contains(&format!("source_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}")),
             "{lock_contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_origin_install_writes_user_trust_and_loads_as_aws() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "carina-rs/aws";
+        let version = "0.5.0";
+        let origin_bytes = b"registry origin provider";
+        let shasum = sha256_bytes(origin_bytes);
+        let http = registry_http(origin_bytes, &shasum);
+        let mut lock = LockFile::default();
+
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let class = installed
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            http.request_count("https://downloads.example.test/aws.wasm"),
+            1
+        );
+        assert!(
+            snapshot_tree(trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some())
+        );
+        assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[test]
+    fn registry_installed_artifact_without_user_trust_is_redownloaded() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let first_trust = tempfile::tempdir().unwrap();
+        let second_trust = tempfile::tempdir().unwrap();
+        let _first_trust_env =
+            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", first_trust.path());
+        let source = "carina-rs/aws";
+        let version = "0.5.0";
+        let origin_bytes = b"registry installed provider";
+        let shasum = sha256_bytes(origin_bytes);
+        let http = registry_http(origin_bytes, &shasum);
+        let mut lock = LockFile::default();
+
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+        let _second_trust_env =
+            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", second_trust.path());
+
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(
+            http.request_count("https://downloads.example.test/aws.wasm"),
+            2
+        );
+        assert!(
+            snapshot_tree(second_trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some())
         );
     }
 
@@ -16236,11 +16401,17 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_removes_cached_wasm_when_registry_shasum_mismatches() {
+        let _env_guard = crate::test_env_guard();
         let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let body = b"expected wasm bytes";
         let shasum = sha256_bytes(body);
         let http = registry_http(body, &shasum);
         let mut lock_file = LockFile::default();
+        let signature = RegistrySignatureProtection::NotRequired;
+        record_verified_origin_download(&source_key("carina-rs/aws"), &shasum, Some(&signature))
+            .unwrap();
         let cached_path = cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0");
         fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
         fs::write(&cached_path, b"stale cached wasm bytes").unwrap();
@@ -17081,7 +17252,9 @@ transparency_log_present = false
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
         let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let expected_bytes = b"locked provider bytes";
@@ -17105,6 +17278,7 @@ transparency_log_present = false
         let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
+        record_verified_origin_download(&source_key(source), &expected_sha256, None).unwrap();
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
 
         let error = resolve_all_with_http(
@@ -17148,12 +17322,159 @@ transparency_log_present = false
         assert!(http.was_requested(&wasm_url));
     }
 
+    #[tokio::test]
+    async fn github_origin_install_writes_user_trust_and_loads_as_aws() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let origin_bytes = b"origin-verified provider";
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut lock = LockFile::default();
+
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let class = installed
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert!(http.was_requested(&wasm_url));
+        assert!(
+            snapshot_tree(trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some()),
+            "origin verification must persist a user-owned trust record"
+        );
+        assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[test]
+    fn lock_matching_project_artifact_without_user_trust_is_redownloaded() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let origin_bytes = b"lock-matching origin provider";
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
+        fs::write(&project_wasm, origin_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(origin_bytes),
+            registry: None,
+        });
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(http.request_count(&wasm_url), 1);
+        assert!(
+            snapshot_tree(trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some())
+        );
+        assert_eq!(fs::read(project_wasm).unwrap(), origin_bytes);
+    }
+
+    #[test]
+    fn origin_mismatch_without_user_trust_preserves_lock_artifacts_caches_and_records() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let locked_bytes = b"repository-installed locked provider";
+        let origin_bytes = b"changed origin provider";
+        let locked_sha256 = sha256_bytes(locked_bytes);
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
+        fs::write(&project_wasm, locked_bytes).unwrap();
+        let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::write(global_wasm.as_path(), locked_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: locked_sha256.clone(),
+            registry: None,
+        });
+        let lock_path = provider_lock_path(project.path());
+        lock.save(&lock_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+        let project_before = fs::read(&project_wasm).unwrap();
+        let global_before = fs::read(global_wasm.as_path()).unwrap();
+        let trust_before = snapshot_tree(trust.path());
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+
+        let error = resolve_all_with_http(project.path(), &[config], LockMode::Normal, &http)
+            .expect_err("an origin download that disagrees with the lock must fail");
+
+        assert!(error.contains("Downloaded provider 'aws'"), "{error}");
+        assert!(error.contains(&locked_sha256), "{error}");
+        assert!(error.contains(&sha256_bytes(origin_bytes)), "{error}");
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        assert_eq!(fs::read(&project_wasm).unwrap(), project_before);
+        assert_eq!(fs::read(global_wasm.as_path()).unwrap(), global_before);
+        assert_eq!(snapshot_tree(trust.path()), trust_before);
+    }
+
     #[test]
     fn github_version_project_cache_mismatch_is_removed_and_reruns_from_origin() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
         let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let locked_bytes = b"locked provider bytes";
@@ -17173,6 +17494,7 @@ transparency_log_present = false
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, tampered_bytes).unwrap();
+        record_verified_origin_download(&source_key(source), &expected_sha256, None).unwrap();
         let wasm_url = download_url_wasm(&github_source(source), version);
         let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, locked_bytes);
 
@@ -17224,11 +17546,13 @@ transparency_log_present = false
     }
 
     #[test]
-    fn github_version_global_cache_match_installs_without_repinning() {
+    fn github_version_global_cache_match_without_user_trust_is_redownloaded() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
         let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let cached_bytes = b"lock-matching global provider bytes";
@@ -17250,32 +17574,26 @@ transparency_log_present = false
         let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
-        #[cfg(unix)]
-        let global_inode = {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(global_wasm.as_path()).unwrap().ino()
-        };
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, cached_bytes);
 
         let resolved = resolve_all_with_http(
             project.path(),
             &[provider_config(source, None)],
             LockMode::Normal,
-            &FakeRegistryHttp::default(),
+            &http,
         )
         .unwrap();
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
 
         assert_eq!(resolved.get("awscc").unwrap().as_path(), project_wasm);
         assert_eq!(fs::read(&project_wasm).unwrap(), cached_bytes);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(
-                fs::metadata(&project_wasm).unwrap().ino(),
-                global_inode,
-                "a same-filesystem global cache hit should be installed by hard link"
-            );
-        }
+        assert_eq!(http.request_count(&wasm_url), 1);
+        assert!(
+            snapshot_tree(trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some())
+        );
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         let saved = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(saved.find_by_source(source).unwrap().sha256, sha256);
@@ -17915,13 +18233,15 @@ transparency_log_present = false
 
     #[tokio::test]
     async fn trusted_remote_source_rejects_disagreeing_configured_name_before_loader() {
+        let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"verified provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
-        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
-        fs::write(&wasm_path, bytes).unwrap();
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
@@ -17933,6 +18253,17 @@ transparency_log_present = false
             sha256: sha256_bytes(bytes),
             registry: None,
         });
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, bytes);
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "awscc",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
         lock.save(&provider_lock_path(project.path())).unwrap();
         let installed =
             find_installed_provider(project.path(), &provider_config(source, None)).unwrap();
@@ -17954,8 +18285,61 @@ transparency_log_present = false
     }
 
     #[tokio::test]
-    async fn official_github_revision_load_identity_is_trusted_as_aws() {
+    async fn remote_lock_and_project_artifact_without_user_trust_are_untrusted_and_hint_once() {
+        let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let bytes = b"repository-controlled provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &no_local_grants(),
+                |line| emitted.push(line.to_string()),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert_eq!(
+            emitted,
+            vec![format!(
+                "carina: run `{}` to verify {source} before it receives credentials",
+                ProjectCommand::new("init", project.path()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn official_github_revision_without_user_trust_is_untrusted_and_hinted() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-aws";
         let revision = "main";
         let resolved_sha = "deadbeefcafe1234567890";
@@ -17982,50 +18366,79 @@ transparency_log_present = false
         let mut config = provider_config(source, Some(revision));
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
+        let mut emitted = Vec::new();
 
         let class = installed
-            .load_with(&no_local_grants(), |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(class, ProviderTrustClass::Aws);
-    }
-
-    #[tokio::test]
-    async fn verified_artifact_carries_non_carina_signer_pin_into_load_identity() {
-        let project = tempfile::tempdir().unwrap();
-        let source = "carina-rs/aws";
-        let version = "0.5.0";
-        let bytes = b"registry provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
-        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
-        fs::write(&wasm_path, bytes).unwrap();
-        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::Required(
-            SignerPinState::Current(CurrentSignerPins {
-                source: SourcePin {
-                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
-                    repository_owner_id: "999".into(),
-                    repository_id: "123".into(),
+            .load_with_notice_sink(
+                &no_local_grants(),
+                |line| emitted.push(line.to_string()),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
                 },
-                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            }),
-        ));
-        lock.provider[0].sha256 = sha256_bytes(bytes);
-        lock.save(&provider_lock_path(project.path())).unwrap();
-        let mut config = provider_config(source, None);
-        config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
-
-        let class = installed
-            .load_with(&no_local_grants(), |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            })
+            )
             .await
             .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0],
+            format!(
+                "carina: run `{}` to verify {source} before it receives credentials",
+                ProjectCommand::new("init", project.path()),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn load_identity_uses_user_record_signer_instead_of_lock_signer() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "carina-rs/aws";
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock = LockFile::default();
+        resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            SIGNED_FIXTURE_VERSION,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .unwrap();
+        lock.provider[0].registry.as_mut().unwrap().signature =
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+                    repository_owner_id: "260157389".into(),
+                    repository_id: "123".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
+            }));
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &no_local_grants(),
+                |line| emitted.push(line.to_string()),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(
+            emitted.is_empty(),
+            "an existing record must not emit the init hint"
+        );
     }
 
     #[test]
