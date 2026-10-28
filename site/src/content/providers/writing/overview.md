@@ -14,11 +14,13 @@ A provider is a [WebAssembly component](https://component-model.bytecodealliance
 | World | Use it when |
 |-------|-------------|
 | `carina-provider` | The provider needs no network access. |
-| `carina-provider-with-http` | The provider calls an HTTP API. The host grants outgoing requests through `wasi:http`. |
+| `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http`. Only AWS hosts are reachable today; see below. |
 
 You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
 `export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, write `export_provider!(MyProvider, http)` and add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+
+The host checks every outgoing request against a fixed allow-list: hosts ending in `.amazonaws.com` or `.amazonaws.com.cn`, and the EC2 and ECS metadata addresses. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
 
 ## How the host calls a provider
 
@@ -57,21 +59,28 @@ A write-only attribute (one the API accepts but never returns, such as a passwor
 
 ## Short calls; the host waits
 
-Every call must return quickly. A provider never sleeps or polls inside a call. When an operation has not finished, the provider returns a pending result that carries a token it defines and a hint for when to ask again. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
+Every call must return quickly: the host stops a call that runs for more than 30 seconds, and caps each HTTP request at the same 30 seconds. A provider never sleeps or polls inside a call. When an operation has not finished, the provider returns a pending result that carries a token it defines and a hint for when to ask again. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
 
 A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets.
 
-Create results go through a typestate in the SDK, so a provider must say what it knows. Before it has a cloud identifier, a failure is `untracked` (nothing exists). After it calls `issued` with an identifier, the attempt can only finish as succeeded, partially succeeded, failed after creation, discarded, or still pending. There is no conversion from a plain error into a create result, so a provider cannot report "nothing was created" after it has created something.
+Create results go through a typestate in the SDK, so a provider must say what it knows. There is no conversion from a plain error into a create result; every failure has to be classified:
+
+- `untracked` means nothing was created. Use it only when you know the API never accepted the request, for example when local validation failed or the API rejected it outright. Carina keeps no record of the resource.
+- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `pending` without an identifier and settle it in `poll_create`, where an outcome you cannot determine is `undetermined`. Carina then keeps the attempt instead of forgetting a resource that may exist.
+- Call `issued` as soon as you see the resource's identifier. From then on the attempt can only finish as succeeded, partially succeeded, failed after creation, discarded, or still pending, so the SDK will not let you report that nothing was created.
+- `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it as failed after creation instead.
 
 ## The sandbox
 
 A provider runs with no filesystem access. It sees only these environment variables:
 
-- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider.
+- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
 - AWS credential and region variables, only for providers named `aws` or `awscc`.
 - `GITHUB_TOKEN`, only for a provider named `github`.
 
-The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead.
+The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` masks it in plans and state.
+
+Environment variables are not the only route to credentials. On EC2, the metadata address is open to every provider that uses the HTTP world, whatever its name, so such a provider can read the instance role's credentials. Install providers you trust only, especially on EC2. Restricting this is tracked in [carina#4022](https://github.com/carina-rs/carina/issues/4022).
 
 ## Protocol version
 
