@@ -2,7 +2,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use carina_provider_resolver::{
-    DiscardedSignerPins, LockFile, LockFileMigration, WorkflowPins, provider_lock_path,
+    DiscardedSignerPins, GuardedLockFile, LockFileMigration, ProviderInstallLock, WorkflowPins,
+    provider_lock_path,
 };
 
 use crate::error::AppError;
@@ -70,19 +71,35 @@ pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError>
     }
 }
 
-fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile, Option<LockFileMigration>), AppError> {
-    let lock_path = provider_lock_path(base_dir);
-    let loaded = LockFile::load(base_dir)
+fn acquire_install_lock(base_dir: &Path) -> Result<ProviderInstallLock, AppError> {
+    if !provider_lock_path(base_dir).exists() {
+        return Err(missing_lock_error(base_dir));
+    }
+
+    ProviderInstallLock::acquire(base_dir).map_err(|error| {
+        AppError::Config(format!(
+            "Failed to acquire provider install lock for {}: {error}",
+            base_dir.display()
+        ))
+    })
+}
+
+fn missing_lock_error(base_dir: &Path) -> AppError {
+    AppError::Config(format!(
+        "Provider lock file {} does not exist; run `{}` first",
+        provider_lock_path(base_dir).display(),
+        ProjectCommand::new("init", base_dir)
+    ))
+}
+
+fn load_lock<'lock>(
+    install_lock: &'lock ProviderInstallLock,
+) -> Result<GuardedLockFile<'lock>, AppError> {
+    let loaded = install_lock
+        .load_lock_file()
         .map_err(|error| AppError::Config(error.to_string()))?
-        .ok_or_else(|| {
-            AppError::Config(format!(
-                "Provider lock file {} does not exist; run `{}` first",
-                lock_path.display(),
-                ProjectCommand::new("init", base_dir)
-            ))
-        })?;
-    let (lock, migration) = loaded.into_parts();
-    Ok((lock_path, lock, migration))
+        .ok_or_else(|| missing_lock_error(install_lock.project_dir()))?;
+    Ok(loaded)
 }
 
 fn report_lock_migration(migration: Option<&LockFileMigration>) {
@@ -97,8 +114,9 @@ fn flush_preview() -> Result<(), AppError> {
         .map_err(|error| AppError::Config(format!("Failed to print recovery preview: {error}")))
 }
 
-fn save_lock(lock: &LockFile, lock_path: &Path) -> Result<(), AppError> {
-    lock.save(lock_path).map_err(|error| {
+fn save_lock(lock: &GuardedLockFile<'_>) -> Result<(), AppError> {
+    let lock_path = provider_lock_path(lock.project_dir());
+    lock.save().map_err(|error| {
         AppError::Config(format!(
             "Failed to save provider lock {}: {error}",
             lock_path.display()
@@ -134,9 +152,11 @@ fn confirm_recovery(target: &str, target_label: &str, force: bool) -> Result<boo
 }
 
 fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
+    let install_lock = acquire_install_lock(base_dir)?;
     // The recovery preview folds this explicit load event into its discard
     // report, so printing the event separately would duplicate its header.
-    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
+    let mut lock = load_lock(&install_lock)?;
+    let migration = lock.take_migration();
     let recovery = lock
         .prepare_registry_discovery_repin(host)
         .map_err(|error| AppError::Config(error.to_string()))?;
@@ -147,7 +167,7 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
         return Ok(());
     }
     recovery.commit();
-    save_lock(&lock, &lock_path)?;
+    save_lock(&lock)?;
     println!(
         "Registry discovery pin cleared. Run `{}` to verify discovery and acquire the new host pin.",
         ProjectCommand::new("init", base_dir)
@@ -156,7 +176,9 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
 }
 
 fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
+    let install_lock = acquire_install_lock(base_dir)?;
+    let mut lock = load_lock(&install_lock)?;
+    let migration = lock.take_migration();
     report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_identity_repin(provider)
@@ -205,7 +227,7 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
     recovery
         .commit()
         .map_err(|error| AppError::Config(error.to_string()))?;
-    save_lock(&lock, &lock_path)?;
+    save_lock(&lock)?;
     println!(
         "Signer pins cleared. Run `{}` to verify a signed artifact and acquire new pins.",
         ProjectCommand::new("init", base_dir)
@@ -220,7 +242,9 @@ fn display_sequence(value: Option<u64>) -> String {
 }
 
 fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
+    let install_lock = acquire_install_lock(base_dir)?;
+    let mut lock = load_lock(&install_lock)?;
+    let migration = lock.take_migration();
     report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_rebootstrap(provider)
@@ -245,7 +269,7 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
     recovery
         .commit()
         .map_err(|error| AppError::Config(error.to_string()))?;
-    save_lock(&lock, &lock_path)?;
+    save_lock(&lock)?;
     println!(
         "Registry freshness reset. Run `{}` to establish a new first-contact anchor.",
         ProjectCommand::new("init", base_dir)
