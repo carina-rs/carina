@@ -152,8 +152,10 @@ impl WasiHttpView for HostState {
 ///
 /// A wall timeout leaves the store mid-call: neither the call hook's
 /// `host_depth` nor the component instance state is unwound. The store must
-/// not be reused afterward. Current owners enforce that by either poisoning
-/// the shared store (`LockedStore`) or discarding an unshared store.
+/// not be reused afterward. Shared owners enforce that by replacing the
+/// complete live-instance slot (store plus bindings) with a typed poisoned
+/// state while its mutex is held; unshared initialization paths discard the
+/// store directly.
 pub(super) struct GuestStore {
     store: Store<HostState>,
 }

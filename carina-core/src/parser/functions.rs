@@ -427,8 +427,18 @@ pub fn provider_context_lookup(
     ctx: &ProviderContext,
 ) -> impl Fn(&TypeIdentity, &Value) -> Result<(), crate::schema::TypeError> + use<'_> {
     move |identity, value| {
-        validate_custom_type(identity, value, ctx)
-            .map_err(|message| crate::schema::TypeError::ValidationFailed { message })
+        validate_custom_type(identity, value, ctx).map_err(|error| {
+            crate::schema::TypeError::ProviderValidationFailed {
+                message: error.to_string(),
+                host_cause: error.detail().host_cause(),
+                provider_name: error
+                    .detail()
+                    .provider_name
+                    .clone()
+                    .or_else(|| identity.provider.clone()),
+                attribute: None,
+            }
+        })
     }
 }
 
@@ -444,7 +454,7 @@ pub fn validate_custom_type(
     identity: &TypeIdentity,
     value: &Value,
     config: &ProviderContext,
-) -> Result<(), String> {
+) -> crate::provider::ProviderResult<()> {
     // Built-in DSL custom types carry no provider axis — match on `kind`.
     let builtin = identity.provider.is_none() && identity.segments.is_empty();
     fn text(value: &Value) -> Option<&str> {
@@ -456,33 +466,43 @@ pub fn validate_custom_type(
     match (builtin.then_some(identity.kind.as_str()), value) {
         (Some("Ipv4Cidr"), value) if text(value).is_some() => {
             validate_ipv4_cidr(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("Ipv4Address"), value) if text(value).is_some() => {
             validate_ipv4_address(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("Ipv6Cidr"), value) if text(value).is_some() => {
             validate_ipv6_cidr(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("Ipv6Address"), value) if text(value).is_some() => {
             validate_ipv6_address(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("HttpResponseStatusCode"), value) if text(value).is_some() => {
             validate_http_response_status_code(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("RedirectHost"), value) if text(value).is_some() => {
             validate_redirect_host(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("RedirectPath"), value) if text(value).is_some() => {
             validate_redirect_path(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("RedirectPort"), value) if text(value).is_some() => {
             validate_redirect_port(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("RedirectProtocol"), value) if text(value).is_some() => {
             validate_redirect_protocol(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (Some("RedirectQuery"), value) if text(value).is_some() => {
             validate_redirect_query(text(value).unwrap())
+                .map_err(crate::provider::ProviderError::invalid_input)
         }
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (
@@ -507,30 +527,32 @@ pub fn validate_custom_type(
             // keyed by the full structured identity so two providers'
             // same-named types do not collide.
             let authored_text = text(value).unwrap();
-            let canonical = canonical_custom_type_value(identity, value, config)?;
+            let canonical = canonical_custom_type_value(identity, value, config)
+                .map_err(crate::provider::ProviderError::invalid_input)?;
             let validation_text = canonical
                 .as_ref()
                 .map_or(authored_text, CanonicalCustomTypeValue::as_str);
             if let Some(validator) = config.validators.get(identity) {
-                validator(validation_text)?;
+                validator(validation_text)
+                    .map_err(crate::provider::ProviderError::invalid_input)?;
             }
             // Fall back to factory-based validator (e.g., WASM providers)
             if let Some(ref factory_validator) = config.custom_type_validator {
                 let canonical = canonical.ok_or_else(|| {
-                    format!(
+                    crate::provider::ProviderError::invalid_input(format!(
                         "cannot resolve enum identifier `{authored_text}` through declared type {identity}"
-                    )
+                    ))
                 })?;
                 factory_validator(identity, &canonical)
             } else {
                 Ok(())
             }
         }
-        (_, value) => Err(format!(
+        (_, value) => Err(crate::provider::ProviderError::invalid_input(format!(
             "expected {}, got {}",
             identity,
             value_type_name(value)
-        )),
+        ))),
     }
 }
 

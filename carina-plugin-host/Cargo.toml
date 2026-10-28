@@ -32,6 +32,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = "0.22"
 tokio-rustls = "0.25"
 webpki-roots = "0.26"
+getrandom = "0.3"
+hmac = "0.12"
 sha2 = "0.10"
 indexmap = "2"
 uuid = { version = "1", features = ["v4"] }

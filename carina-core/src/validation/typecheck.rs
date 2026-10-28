@@ -211,7 +211,7 @@ pub fn check_type_expr_value(
                 let identity =
                     crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
                 validate_custom_type(&identity, value, config)
-                    .map_err(|message| validation_mismatch(expected, value, message))
+                    .map_err(|error| validation_mismatch(expected, value, error.to_string()))
             }
             _ => Err(mismatch(expected, value)),
         },
@@ -274,7 +274,7 @@ pub fn check_type_expr_value(
                 let identity =
                     crate::schema::TypeIdentity::from_schema_type(provider, path, type_name);
                 validate_custom_type(&identity, value, config)
-                    .map_err(|message| validation_mismatch(expected, value, message))
+                    .map_err(|error| validation_mismatch(expected, value, error.to_string()))
             }
             _ => Err(mismatch(expected, value)),
         },

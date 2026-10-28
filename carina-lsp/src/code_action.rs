@@ -136,6 +136,7 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
         | TypeError::ValidationFailed { .. }
+        | TypeError::ProviderValidationFailed { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
         | TypeError::ReadOnlyAttribute { .. }

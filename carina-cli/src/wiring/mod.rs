@@ -319,6 +319,14 @@ pub(crate) type FormattingFactoryLoad = (
     HashMap<String, ProviderFactoryDiagnostic>,
 );
 
+/// Return the source for provider configurations that participate in factory loading.
+///
+/// A source-less named instance reuses its kind's default factory later during
+/// provider routing; it does not cause a factory to be loaded on its own.
+pub(crate) fn provider_factory_source(config: &ProviderConfig) -> Option<&ProviderSource> {
+    config.source.as_ref()
+}
+
 impl WiringContext {
     pub fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
         Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
@@ -535,7 +543,7 @@ where
     let mut attempted_default_sources = HashSet::new();
 
     for config in providers {
-        let Some(source) = &config.source else {
+        let Some(source) = provider_factory_source(config) else {
             continue;
         };
         if config.is_default() && !attempted_default_sources.insert(config.name.clone()) {
@@ -1496,7 +1504,8 @@ fn type_error_attribute(error: &TypeError) -> Option<&str> {
         | TypeError::PatternMismatch { attribute, .. }
         | TypeError::LengthOutOfRange { attribute, .. }
         | TypeError::StringLiteralExpectedEnum { attribute, .. }
-        | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+        | TypeError::ResourceValidationFailed { attribute, .. }
+        | TypeError::ProviderValidationFailed { attribute, .. } => attribute.as_deref(),
         TypeError::BlockSyntaxNotAllowed { attribute } => Some(attribute),
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
@@ -1583,7 +1592,12 @@ fn validate_resolved_value_constraints(
         "plan value checking requires paired data sources"
     );
 
-    let lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
+    let provider_lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
+    let lookup = |identity: &carina_core::schema::TypeIdentity, value: &Value| {
+        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
+            message: error.to_string(),
+        })
+    };
     let mut plan_errors = Vec::new();
     for (resource, origin) in resources.iter().zip(resource_origins) {
         let Some(schema) = ctx.schemas().get_for(resource) else {

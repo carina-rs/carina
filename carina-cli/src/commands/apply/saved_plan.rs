@@ -757,7 +757,9 @@ mod tests {
         SchemaCheckedPlanFile,
     };
     use crate::commands::apply::ApplyTarget;
-    use crate::commands::plan::{PlanFile, RecordedProviderArtifact, SavedDataSourceValue};
+    use crate::commands::plan::{
+        PlanFile, PlanFileContents, RecordedProviderArtifact, SavedDataSourceValue,
+    };
     use crate::error::AppError;
     use crate::wiring::{LoadedProviderFactory, WiringContext};
 
@@ -781,7 +783,7 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> ProviderResult<()> {
             Ok(())
         }
 
@@ -831,16 +833,31 @@ mod tests {
         WiringContext::new_for_test(Vec::new(), &[])
     }
 
-    fn empty_plan_file() -> PlanFile {
-        PlanFile {
+    fn saved_provider_configs(
+        configs: Vec<ProviderConfig>,
+    ) -> carina_core::parser::SavedProviderConfigs {
+        let parsed = carina_core::parser::InferredFile {
+            providers: configs,
+            ..Default::default()
+        };
+        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("test provider configs must resolve");
+        carina_core::parser::SavedProviderConfigs::from(&resolved)
+    }
+
+    fn empty_plan_contents(provider_configs: Vec<ProviderConfig>) -> PlanFileContents {
+        PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
             source_path: "main.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: serde_json::from_value(serde_json::json!([]))
-                .expect("empty saved provider configs"),
+            provider_configs: saved_provider_configs(provider_configs),
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: Vec::new(),
@@ -853,15 +870,13 @@ mod tests {
             upstream_snapshot: HashMap::new(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
-            schema_fingerprints: Default::default(),
-            provider_artifacts: Default::default(),
         }
     }
 
-    fn plan_recorded_with(ctx: &WiringContext) -> PlanFile {
-        let mut plan = empty_plan_file();
-        plan.record_loaded_providers(ctx);
-        plan
+    fn plan_recorded_with(ctx: &WiringContext, provider_configs: Vec<ProviderConfig>) -> PlanFile {
+        empty_plan_contents(provider_configs)
+            .record(ctx)
+            .expect("test plan provider evidence must be valid")
     }
 
     fn apply_target() -> ApplyTarget<'static> {
@@ -882,8 +897,8 @@ mod tests {
         let planned = wasm_context("mock", b"artifact A");
         let loaded = wasm_context("mock", b"artifact B");
 
-        let result =
-            reloaded(plan_recorded_with(&planned)).verify_loaded_providers(loaded, apply_target());
+        let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
+            .verify_loaded_providers(loaded, apply_target());
 
         let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = result else {
             panic!("changed provider bytes must not produce SchemaCheckedPlanFile")
@@ -896,8 +911,8 @@ mod tests {
         let planned = wasm_context("mock", b"artifact A");
         let loaded = wasm_context("mock", b"artifact A");
 
-        let result =
-            reloaded(plan_recorded_with(&planned)).verify_loaded_providers(loaded, apply_target());
+        let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
+            .verify_loaded_providers(loaded, apply_target());
 
         assert!(matches!(
             result,
@@ -908,9 +923,9 @@ mod tests {
     #[test]
     fn builtin_artifact_records_and_verifies_as_builtin() {
         let planned = builtin_context();
-        let plan = plan_recorded_with(&planned);
+        let plan = plan_recorded_with(&planned, Vec::new());
         assert_eq!(
-            plan.provider_artifacts.get("mock"),
+            plan.provider_artifacts().get("mock"),
             Some(&RecordedProviderArtifact::BuiltIn)
         );
 
@@ -924,7 +939,7 @@ mod tests {
 
     #[test]
     fn builtin_vs_wasm_and_missing_or_extra_provider_keys_are_mismatches() {
-        let builtin_plan = plan_recorded_with(&builtin_context());
+        let builtin_plan = plan_recorded_with(&builtin_context(), Vec::new());
 
         let same_name = reloaded(builtin_plan.clone())
             .verify_loaded_providers(wasm_context("mock", b"artifact"), apply_target());
@@ -964,7 +979,7 @@ mod tests {
             HashMap::from([("token".to_string(), plaintext.clone())]),
         );
         let plan = Plan::new();
-        let plan_file = PlanFile {
+        let plan_file = PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
@@ -988,9 +1003,9 @@ mod tests {
             upstream_snapshot: HashMap::new(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
-            schema_fingerprints: Default::default(),
-            provider_artifacts: Default::default(),
         }
+        .record(&builtin_context())
+        .expect("test plan provider evidence must be valid")
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan");
         let pending = DesiredVerifiedPlanFile {

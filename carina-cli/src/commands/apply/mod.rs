@@ -2952,11 +2952,9 @@ fn rehydrate_desired_plan_file(
 
     let fresh_provider_configs =
         carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-    let provider_configs = plan_file
-        .provider_configs()
-        .rehydrate_secrets(&fresh_provider_configs)
+    plan_file
+        .rehydrate_provider_config_secrets(&fresh_provider_configs)
         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    *plan_file.provider_configs_mut() = provider_configs;
     for (binding, attributes) in plan_file.upstream_snapshot_mut() {
         if let Some((key, _)) = attributes
             .iter()

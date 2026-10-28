@@ -8176,7 +8176,8 @@ fn parse_custom_validator_rejects_invalid() {
     assert!(invalid_result.is_err());
     let msg = invalid_result.unwrap_err();
     assert!(
-        msg.contains("custom_type must start with 'valid-'"),
+        msg.to_string()
+            .contains("custom_type must start with 'valid-'"),
         "Expected validation error, got: {msg}"
     );
 }

@@ -2767,7 +2767,7 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -2891,7 +2891,7 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
