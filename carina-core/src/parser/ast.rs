@@ -734,8 +734,8 @@ pub type ExportParameter = ParsedExportParam;
 
 /// Phase-agnostic accessor over an export parameter. Implemented by both
 /// [`ParsedExportParam`] (parser phase) and [`InferredExportParam`]
-/// (post-loader phase) so helpers like `check_unused_bindings` work
-/// uniformly across both shapes.
+/// (post-loader phase) so reference resolution, type validation, module
+/// resolution, and upstream-state checks work uniformly across both shapes.
 pub trait ExportParamLike {
     fn name(&self) -> &str;
     fn value(&self) -> Option<&Value>;

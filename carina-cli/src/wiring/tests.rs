@@ -111,6 +111,83 @@ fn resolved_provider_configs<E>(
     resolved_provider_configs_with_remote(parsed, &HashMap::new())
 }
 
+fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -> TypeError {
+    let rejecting_member = |attribute: &'static str, pattern: &'static str| {
+        AttributeType::refined_string_with_validator(
+            None,
+            None,
+            None,
+            carina_core::schema::validator(move |_| {
+                Err(TypeError::PatternMismatch {
+                    value: "invalid".into(),
+                    pattern: pattern.to_string(),
+                    attribute: Some(attribute.to_string()),
+                    type_name: None,
+                })
+            }),
+            None,
+        )
+    };
+    let union = AttributeType::union(vec![
+        rejecting_member(first, "^first$"),
+        rejecting_member(second, "^second$"),
+    ]);
+
+    carina_core::schema::Schema::flat(union)
+        .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
+        .expect_err("both union members must reject the value")
+}
+
+fn tied_union_error_with_one_unattributed_failure() -> TypeError {
+    let attributed = AttributeType::refined_string_with_validator(
+        None,
+        None,
+        None,
+        carina_core::schema::validator(|_| {
+            Err(TypeError::PatternMismatch {
+                value: "invalid".into(),
+                pattern: "^first$".to_string(),
+                attribute: Some("target".to_string()),
+                type_name: None,
+            })
+        }),
+        None,
+    );
+    let unattributed = AttributeType::refined_string_with_validator(
+        None,
+        None,
+        None,
+        carina_core::schema::validator(|_| {
+            Err(TypeError::ValidationFailed {
+                message: "second failure".to_string(),
+            })
+        }),
+        None,
+    );
+
+    carina_core::schema::Schema::flat(AttributeType::union(vec![attributed, unattributed]))
+        .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
+        .expect_err("both union members must reject the value")
+}
+
+#[test]
+fn tied_union_error_reports_shared_attribute() {
+    let error = tied_union_error_with_attributes("target", "target");
+    assert_eq!(type_error_attribute(&error), Some("target"));
+}
+
+#[test]
+fn tied_union_error_with_different_attributes_has_no_single_attribute() {
+    let error = tied_union_error_with_attributes("first", "second");
+    assert_eq!(type_error_attribute(&error), None);
+}
+
+#[test]
+fn tied_union_error_ignores_failures_without_an_attribute() {
+    let error = tied_union_error_with_one_unattributed_failure();
+    assert_eq!(type_error_attribute(&error), Some("target"));
+}
+
 #[tokio::test]
 async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

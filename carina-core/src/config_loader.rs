@@ -203,11 +203,64 @@ impl fmt::Display for DuplicateDeclaration {
     }
 }
 
-/// The authored, pre-reference-resolution configuration snapshot.
+/// A merged view built from the directory parser's per-file output, after its
+/// static evaluation. That evaluation folds only fully static expressions and
+/// never folds a reference to a resource binding. This view is captured before
+/// reference resolution and the snapshot's function-call folding.
+///
+/// Only the configuration loader can build a directory view because its
+/// constructor requires [`DirectoryResolvedFile`] values produced by the
+/// directory parser. A standalone source buffer can use [`Self::parse_source`].
+/// There is intentionally no constructor from an arbitrary [`ParsedFile`].
+///
+/// ```compile_fail
+/// # fn bypass(parsed: carina_core::parser::ParsedFile) {
+/// let _ = carina_core::config_loader::AuthoredBindingView { parsed };
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AuthoredBindingView {
+    parsed: ParsedFile,
+}
+
+impl AuthoredBindingView {
+    pub(crate) fn from_directory_files(files: &[(PathBuf, DirectoryResolvedFile)]) -> Self {
+        let mut parsed = ParsedFile::default();
+        for (_, file) in files {
+            merge_parsed_file(&mut parsed, file.parsed.clone());
+        }
+        Self { parsed }
+    }
+
+    /// Parse one in-memory source as an authored binding view.
+    ///
+    /// This is the single-source counterpart to the directory loader, used by
+    /// editor buffers that have no base directory. It deliberately runs the
+    /// same directory parser as the multi-file loading paths.
+    pub fn parse_source(
+        source: &str,
+        config: &ProviderContext,
+    ) -> Result<Self, parser::ParseError> {
+        let files = vec![(PathBuf::from("buffer.crn"), source.to_string())];
+        let parsed_files =
+            parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
+        Ok(Self::from_directory_files(&parsed_files))
+    }
+
+    pub(crate) fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+}
+
+/// The pre-resource-resolution configuration snapshot used for schema-aware
+/// alias resolution. Its schema-resolved output also becomes the plan's
+/// unresolved, authored-form resources used for let-binding pairing.
 ///
 /// Its parsed representation is crate-private so downstream callers cannot
-/// extract a raw resource vector. Schema block-name resolution consumes this
-/// value and returns the typestate required by override-aware planning.
+/// extract a raw resource vector. Function calls may already be folded in this
+/// snapshot; it does not represent the exact authored reference graph. Schema
+/// block-name resolution consumes this value and returns the typestate required
+/// by override-aware planning.
 #[derive(Debug, Clone)]
 pub struct UnresolvedConfigSnapshot {
     parsed: ParsedFile,
@@ -221,10 +274,6 @@ impl UnresolvedConfigSnapshot {
         Self { parsed }
     }
 
-    pub(crate) fn parsed(&self) -> &ParsedFile {
-        &self.parsed
-    }
-
     pub(crate) fn into_inner(self) -> ParsedFile {
         self.parsed
     }
@@ -232,8 +281,9 @@ impl UnresolvedConfigSnapshot {
 
 /// Result of loading configuration, includes the file path containing backend block.
 ///
-/// The authored snapshot is opaque: callers must pass it through schema-aware
-/// block-name resolution instead of extracting raw resources.
+/// The unresolved alias-resolution snapshot is opaque: callers must pass it
+/// through schema-aware block-name resolution instead of extracting raw
+/// resources.
 ///
 /// ```compile_fail
 /// # fn bypass(loaded: carina_core::config_loader::LoadedConfig) {
@@ -252,11 +302,17 @@ pub struct LoadedConfig {
     /// with a matching indexed entry in `inference_errors` when inference
     /// produced a reportable failure).
     pub parsed: InferredFile,
-    /// Resources before reference resolution, for unused binding detection.
-    /// After `resolve_resource_refs`, intermediate `ResourceRef` values are resolved away,
-    /// so this preserves the original references for accurate unused binding analysis.
-    /// Internally retains the `ParsedFile` export shape because this snapshot
-    /// predates inference; callers receive only the opaque wrapper.
+    /// Values built from the directory parser's per-file output, after its
+    /// static evaluation. That evaluation folds only fully static expressions
+    /// and never folds a reference to a resource binding. This view is captured
+    /// before reference resolution and the snapshot's function-call folding.
+    /// Unused-binding validation consumes only this typed view.
+    pub authored_bindings: AuthoredBindingView,
+    /// Pre-resource-resolution input retained for schema-aware alias
+    /// resolution. Its schema-resolved output also becomes the plan's
+    /// unresolved, authored-form resources used for let-binding pairing. This
+    /// snapshot may contain folded function calls and must not be used as the
+    /// authored reference graph.
     pub unresolved_parsed: UnresolvedConfigSnapshot,
     pub backend_file: Option<PathBuf>,
     /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
@@ -467,6 +523,7 @@ pub fn load_configuration_with_config(
                 return Err(located.render(path));
             }
         };
+        let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
         let empty_parsed = ParsedFile::default;
@@ -548,6 +605,7 @@ pub fn load_configuration_with_config(
 
         Ok(LoadedConfig {
             parsed: inferred,
+            authored_bindings,
             unresolved_parsed: UnresolvedConfigSnapshot::from_parsed(unresolved_merged),
             backend_file,
             identifier_scope_errors,
@@ -589,6 +647,9 @@ pub fn parse_directory_with_overrides(
 /// need the merged AST together with load-seam diagnostics.
 pub struct DirectoryParseResult {
     pub parsed: ParsedFile,
+    /// A merged view of the directory parser's per-file output, after its
+    /// static evaluation and before reference resolution.
+    pub authored_bindings: AuthoredBindingView,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
     pub source_files: Vec<(PathBuf, String)>,
@@ -722,6 +783,7 @@ fn parse_directory_with_overrides_impl(
             });
         }
     };
+    let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if preserve_failed_user_calls {
         parsed_files
@@ -771,6 +833,7 @@ fn parse_directory_with_overrides_impl(
     // `load_configuration_with_config`).
     Ok(DirectoryParseResult {
         parsed: merged,
+        authored_bindings,
         duplicate_declarations,
         source_files: file_inputs,
         sole_backend_file,

@@ -3153,13 +3153,11 @@ pub fn validate_attribute_params(
 /// resource matched by an `import.to` or `moved.to` address.
 /// `moved.from` and `removed.from` identify state rows absent from the desired
 /// configuration and therefore do not count as references.
-///
-/// Generic over the export-parameter shape so both `ParsedFile` (parser
-/// phase) and `InferredFile` (post-loader phase) can drive it without
-/// duplicating the binding walk.
-pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
-) -> Vec<String> {
+pub fn check_unused_bindings(view: &crate::config_loader::AuthoredBindingView) -> Vec<String> {
+    check_unused_bindings_in_file(view.parsed())
+}
+
+fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<String> {
     let mut referenced: HashSet<String> = HashSet::new();
     let mut state_block_targets = Vec::new();
     for state_block in &parsed.state_blocks {
@@ -3212,11 +3210,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
-        // Post-resolution files replace ResourceRef values with their resolved
-        // values. The resolver snapshots those authored references here, so
-        // the generic File<E> walk remains accurate for both parser-phase and
-        // inferred-phase inputs.
-        referenced.extend(rref.dependency_bindings().iter().cloned());
         // `Composition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
         for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
@@ -3237,7 +3230,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         }
     }
     for export_param in &parsed.export_params {
-        if let Some(value) = export_param.value() {
+        if let Some(value) = &export_param.value {
             collect_dependencies(value, &mut referenced);
         }
     }
@@ -3266,25 +3259,16 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
 
 /// Check for unused bindings while retaining bindings that provide stable
 /// identities for otherwise-conflicting attribute-derived resources.
-pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_unused_bindings_with_identity_requirements(
+    view: &crate::config_loader::AuthoredBindingView,
     registry: &crate::schema::SchemaRegistry,
 ) -> Vec<String> {
     let identity_required =
-        crate::identifier::identity_required_bindings(&parsed.resources, registry);
-    check_unused_bindings(parsed)
+        crate::identifier::identity_required_bindings(&view.parsed().resources, registry);
+    check_unused_bindings(view)
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))
         .collect()
-}
-
-/// Identity-aware unused-binding check for the config loader's opaque
-/// pre-resolution snapshot.
-pub fn check_unused_bindings_with_identity_requirements_in_snapshot(
-    snapshot: &crate::config_loader::UnresolvedConfigSnapshot,
-    registry: &crate::schema::SchemaRegistry,
-) -> Vec<String> {
-    check_unused_bindings_with_identity_requirements(snapshot.parsed(), registry)
 }
 
 /// Walk `field_path` against `start`. Return `Ok(tail_type)` on a

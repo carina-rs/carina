@@ -1321,6 +1321,13 @@ fn type_error_attribute(error: &TypeError) -> Option<&str> {
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }
         | TypeError::StructFieldError { inner, .. } => type_error_attribute(inner),
+        TypeError::UnionAlternativesMismatch { failures } => {
+            let mut attributes = failures.iter().filter_map(type_error_attribute);
+            let first = attributes.next()?;
+            attributes
+                .all(|attribute| attribute == first)
+                .then_some(first)
+        }
         TypeError::TypeMismatch { .. }
         | TypeError::ValidationFailed { .. }
         | TypeError::MissingRequired { .. }
