@@ -175,12 +175,15 @@ Adopt with conditions, as an **addition** to named instances, not a replacement.
   Recommendation: (a) if "same settings" can be defined as a typed comparison of
   the resolved instance configuration; otherwise (c). Either way the plan must
   never silently delete+create.
+  **Decision: deferred to the implementation.** The feature is additive, so
+  existing configs keep working unchanged; the migration path is chosen when
+  the implementation starts, with these options as the starting point.
 - **Global-service rejection** (P7). Recommended, via a schema `regional` flag;
   it spans codegen and protocol and may be split into its own issue.
 
 ## Next steps
 
 1. Pin P1 and P2 with failing tests.
-2. Decide the migration option.
+2. Decide the migration option (deferred to this point).
 3. Implementation PR for core (routing key, derived instances, identity, formats,
    LSP), then the schema flag if P7 is taken in.
