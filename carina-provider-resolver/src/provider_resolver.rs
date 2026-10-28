@@ -4822,9 +4822,29 @@ enum ProviderLockState {
     StableSourceRefRule,
 }
 
+#[cfg(test)]
+#[repr(usize)]
+enum ProviderLockStateIndex {
+    SequenceObservation,
+    SequenceReferencePoint,
+    SequencePresence,
+    SignerPins,
+    SignaturePresence,
+    ValidUntilPresence,
+    TransparencyLogPresence,
+    YankedFlag,
+    ShasumPin,
+    HostnamePin,
+    StableSourceRefRule,
+    Count,
+}
+
+#[cfg(test)]
+const PROVIDER_LOCK_STATE_COUNT: usize = ProviderLockStateIndex::Count as usize;
+
 impl ProviderLockState {
     #[cfg(test)]
-    const ALL: [Self; 11] = [
+    const ALL: [Self; PROVIDER_LOCK_STATE_COUNT] = [
         Self::SequenceObservation,
         Self::SequenceReferencePoint,
         Self::SequencePresence,
@@ -4837,6 +4857,25 @@ impl ProviderLockState {
         Self::HostnamePin,
         Self::StableSourceRefRule,
     ];
+
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::SequenceObservation => ProviderLockStateIndex::SequenceObservation as usize,
+            Self::SequenceReferencePoint => ProviderLockStateIndex::SequenceReferencePoint as usize,
+            Self::SequencePresence => ProviderLockStateIndex::SequencePresence as usize,
+            Self::SignerPins => ProviderLockStateIndex::SignerPins as usize,
+            Self::SignaturePresence => ProviderLockStateIndex::SignaturePresence as usize,
+            Self::ValidUntilPresence => ProviderLockStateIndex::ValidUntilPresence as usize,
+            Self::TransparencyLogPresence => {
+                ProviderLockStateIndex::TransparencyLogPresence as usize
+            }
+            Self::YankedFlag => ProviderLockStateIndex::YankedFlag as usize,
+            Self::ShasumPin => ProviderLockStateIndex::ShasumPin as usize,
+            Self::HostnamePin => ProviderLockStateIndex::HostnamePin as usize,
+            Self::StableSourceRefRule => ProviderLockStateIndex::StableSourceRefRule as usize,
+        }
+    }
 }
 
 /// Per-host security state that can cause registry discovery to be refused.
@@ -4846,9 +4885,28 @@ enum HostLockState {
     LegacyDiscoveryValues,
 }
 
+#[cfg(test)]
+#[repr(usize)]
+enum HostLockStateIndex {
+    DiscoveryPin,
+    LegacyDiscoveryValues,
+    Count,
+}
+
+#[cfg(test)]
+const HOST_LOCK_STATE_COUNT: usize = HostLockStateIndex::Count as usize;
+
 impl HostLockState {
     #[cfg(test)]
-    const ALL: [Self; 2] = [Self::DiscoveryPin, Self::LegacyDiscoveryValues];
+    const ALL: [Self; HOST_LOCK_STATE_COUNT] = [Self::DiscoveryPin, Self::LegacyDiscoveryValues];
+
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::DiscoveryPin => HostLockStateIndex::DiscoveryPin as usize,
+            Self::LegacyDiscoveryValues => HostLockStateIndex::LegacyDiscoveryValues as usize,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4919,6 +4977,14 @@ mod recovery {
                 Self::DiscoveryRepin => "providers repin-discovery",
             }
         }
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RecoveryKind {
+        Rebootstrap,
+        IdentityRepin,
+        DiscoveryRepin,
     }
 
     impl ProviderLockState {
@@ -4999,6 +5065,21 @@ mod recovery {
             }
         }
 
+        pub(super) fn same_operation_and_target(self, other: Self) -> bool {
+            match (self.0, other.0) {
+                (
+                    RemediationKind::Provider(operation, _, target),
+                    RemediationKind::Provider(other_operation, _, other_target),
+                ) => operation == other_operation && target == other_target,
+                (
+                    RemediationKind::Host(operation, _, target),
+                    RemediationKind::Host(other_operation, _, other_target),
+                ) => operation == other_operation && target == other_target,
+                (RemediationKind::Provider(_, _, _), RemediationKind::Host(_, _, _))
+                | (RemediationKind::Host(_, _, _), RemediationKind::Provider(_, _, _)) => false,
+            }
+        }
+
         fn project_dir(self) -> &'a Path {
             match self.0 {
                 RemediationKind::Provider(_, _, target) => &target.project_dir,
@@ -5011,6 +5092,21 @@ mod recovery {
             match self.0 {
                 RemediationKind::Provider(operation, _, _) => operation.subcommand(),
                 RemediationKind::Host(operation, _, _) => operation.subcommand(),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) const fn kind(self) -> RecoveryKind {
+            match self.0 {
+                RemediationKind::Provider(ProviderRecovery::Rebootstrap, _, _) => {
+                    RecoveryKind::Rebootstrap
+                }
+                RemediationKind::Provider(ProviderRecovery::IdentityRepin, _, _) => {
+                    RecoveryKind::IdentityRepin
+                }
+                RemediationKind::Host(HostRecovery::DiscoveryRepin, _, _) => {
+                    RecoveryKind::DiscoveryRepin
+                }
             }
         }
 
@@ -5050,7 +5146,7 @@ mod recovery {
 use recovery::Remediation;
 
 #[cfg(test)]
-use recovery::{HostRecovery, ProviderRecovery};
+use recovery::{HostRecovery, ProviderRecovery, RecoveryKind};
 
 #[derive(Debug, Clone, Copy)]
 enum ScopedRegistryRefusal<'a> {
@@ -5336,6 +5432,72 @@ impl fmt::Display for RegistryRefusal {
 }
 
 impl std::error::Error for RegistryRefusal {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryRefusals {
+    first: RegistryRefusal,
+    rest: Vec<RegistryRefusal>,
+}
+
+impl RegistryRefusals {
+    fn new(first: RegistryRefusal) -> Self {
+        Self {
+            first,
+            rest: Vec::new(),
+        }
+    }
+
+    fn insert(refusals: &mut Option<Self>, refusal: RegistryRefusal) {
+        match refusals {
+            Some(refusals) => refusals.rest.push(refusal),
+            None => *refusals = Some(Self::new(refusal)),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RegistryRefusal> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+impl fmt::Display for RegistryRefusals {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.rest.is_empty() {
+            return self.first.fmt(formatter);
+        }
+
+        formatter.write_str("Registry response was refused for multiple reasons: ")?;
+        for (index, refusal) in self.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            refusal.fmt_reason(formatter)?;
+        }
+        formatter.write_str(". ")?;
+
+        let mut remediations = Vec::new();
+        for refusal in self.iter() {
+            let Some(remediation) = refusal.recovery() else {
+                return formatter
+                    .write_str("No sanctioned recovery operation clears all of these refusals.");
+            };
+            if !remediations
+                .iter()
+                .any(|existing| remediation.same_operation_and_target(*existing))
+            {
+                remediations.push(remediation);
+            }
+        }
+        for (index, remediation) in remediations.into_iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(" ")?;
+            }
+            remediation.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RegistryRefusals {}
 
 /// A registry whose hostname and API base were resolved through §1 discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5741,6 +5903,63 @@ mod registry_listing_validation {
             project_dir: &Path,
         ) -> Result<Self, String> {
             let source_key = source.source_key();
+            let target = ProviderRefusalTarget::new(source_key.as_str(), project_dir);
+            let valid_until_present = versions.valid_until.is_some();
+            let mut refusals = None;
+
+            match sequence_anchor {
+                RegistrySequenceAnchor::Unestablished => {}
+                RegistrySequenceAnchor::Established(previous) => match versions.sequence {
+                    None => RegistryRefusals::insert(
+                        &mut refusals,
+                        RegistryRefusal::SequenceFieldDisappeared {
+                            target: target.clone(),
+                        },
+                    ),
+                    Some(sequence) if sequence < previous => RegistryRefusals::insert(
+                        &mut refusals,
+                        RegistryRefusal::SequenceRollback {
+                            previous,
+                            current: sequence,
+                            target: target.clone(),
+                        },
+                    ),
+                    Some(sequence)
+                        if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD =>
+                    {
+                        RegistryRefusals::insert(
+                            &mut refusals,
+                            RegistryRefusal::SequenceFastForward {
+                                anchor: previous,
+                                current: sequence,
+                                target: target.clone(),
+                            },
+                        );
+                    }
+                    Some(_) => {}
+                },
+            }
+
+            let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
+            if !stripped_versions.is_empty() {
+                RegistryRefusals::insert(
+                    &mut refusals,
+                    RegistryRefusal::YankedFlagDisappeared {
+                        versions: stripped_versions,
+                        target: target.clone(),
+                    },
+                );
+            }
+            if locked.valid_until_present && !valid_until_present {
+                RegistryRefusals::insert(
+                    &mut refusals,
+                    RegistryRefusal::ValidUntilFieldDisappeared { target },
+                );
+            }
+            if let Some(refusals) = refusals {
+                return Err(refusals.to_string());
+            }
+
             let valid_until = versions
                 .valid_until
                 .as_deref()
@@ -5749,50 +5968,6 @@ mod registry_listing_validation {
                         .map_err(|error| format!("Invalid registry valid_until timestamp: {error}"))
                 })
                 .transpose()?;
-            let valid_until_present = valid_until.is_some();
-
-            match sequence_anchor {
-                RegistrySequenceAnchor::Unestablished => {}
-                RegistrySequenceAnchor::Established(previous) => {
-                    let Some(sequence) = versions.sequence else {
-                        return Err(RegistryRefusal::SequenceFieldDisappeared {
-                            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
-                        }
-                        .to_string());
-                    };
-                    if sequence < previous {
-                        return Err(RegistryRefusal::SequenceRollback {
-                            previous,
-                            current: sequence,
-                            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
-                        }
-                        .to_string());
-                    }
-                    if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
-                        return Err(RegistryRefusal::SequenceFastForward {
-                            anchor: previous,
-                            current: sequence,
-                            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
-                        }
-                        .to_string());
-                    }
-                }
-            }
-
-            let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
-            if !stripped_versions.is_empty() {
-                return Err(RegistryRefusal::YankedFlagDisappeared {
-                    versions: stripped_versions,
-                    target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
-                }
-                .to_string());
-            }
-            if locked.valid_until_present && !valid_until_present {
-                return Err(RegistryRefusal::ValidUntilFieldDisappeared {
-                    target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
-                }
-                .to_string());
-            }
             if valid_until.is_some_and(|valid_until| valid_until < OffsetDateTime::now_utc()) {
                 return Err(format!(
                     "registry versions listing valid_until is expired for {}/{}",
@@ -14711,6 +14886,69 @@ transparency_log_present = false
     }
 
     #[test]
+    fn rollback_with_dropped_yank_suppresses_incomplete_rebootstrap_advice() {
+        let source = registry_source("carina-rs/aws");
+        let lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let locked = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        let sequence_anchor = lock.registry_sequence_anchor("carina-rs/aws");
+        let listing = |yanked| RegistryVersions {
+            sequence: Some(4),
+            valid_until: Some("2999-01-01T00:00:00Z".into()),
+            versions: vec![RegistryVersion {
+                version: "0.4.0".into(),
+                yanked,
+            }],
+        };
+
+        let rollback = match ValidatedRegistryListing::validate(
+            &source,
+            &listing(true),
+            &locked,
+            sequence_anchor,
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("a sequence rollback must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            rollback.contains("registry sequence rollback"),
+            "{rollback}"
+        );
+        assert!(
+            rollback.contains("`carina providers re-bootstrap carina-rs/aws`"),
+            "{rollback}"
+        );
+
+        let rollback_and_yank = match ValidatedRegistryListing::validate(
+            &source,
+            &listing(false),
+            &locked,
+            sequence_anchor,
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("a rollback that also drops a yank must report both refusals"),
+            Err(error) => error,
+        };
+        assert!(
+            rollback_and_yank.contains("registry sequence rollback"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            rollback_and_yank.contains("registry yanked flag disappeared"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            !rollback_and_yank.contains("carina providers re-bootstrap"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            rollback_and_yank
+                .contains("No sanctioned recovery operation clears all of these refusals."),
+            "{rollback_and_yank}"
+        );
+    }
+
+    #[test]
     fn registry_recoveries_are_independent_and_order_independent() {
         let original = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
         let original_registry = original.provider[0].registry.as_ref().unwrap().clone();
@@ -15139,6 +15377,24 @@ transparency_log_present = false
     }
 
     #[test]
+    fn lock_state_all_inventories_are_complete_and_ordered() {
+        assert_eq!(
+            ProviderLockState::ALL
+                .into_iter()
+                .map(ProviderLockState::index)
+                .collect::<Vec<_>>(),
+            (0..PROVIDER_LOCK_STATE_COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            HostLockState::ALL
+                .into_iter()
+                .map(HostLockState::index)
+                .collect::<Vec<_>>(),
+            (0..HOST_LOCK_STATE_COUNT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn recovery_operations_clear_exactly_the_protocol_states() {
         let states_cleared_by = |operation| {
             ProviderLockState::ALL
@@ -15251,6 +15507,30 @@ transparency_log_present = false
         }
     }
 
+    fn expected_recovery_kind(refusal: &RegistryRefusal) -> Option<RecoveryKind> {
+        match refusal {
+            RegistryRefusal::SequenceFieldDisappeared { .. }
+            | RegistryRefusal::SequenceRollback { .. }
+            | RegistryRefusal::SequenceFastForward { .. } => Some(RecoveryKind::Rebootstrap),
+            RegistryRefusal::YankedFlagDisappeared { .. }
+            | RegistryRefusal::ValidUntilFieldDisappeared { .. }
+            | RegistryRefusal::LegacyShasumPinMismatch { .. }
+            | RegistryRefusal::LegacySignatureMissing { .. }
+            | RegistryRefusal::ShasumPinMismatch { .. }
+            | RegistryRefusal::HostnamePinMismatch { .. }
+            | RegistryRefusal::SignatureFieldDisappeared { .. }
+            | RegistryRefusal::TransparencyLogFieldDisappeared { .. } => None,
+            RegistryRefusal::DiscoveryMigrationAuthorizationRequired { .. }
+            | RegistryRefusal::DiscoveryPinMismatch { .. } => Some(RecoveryKind::DiscoveryRepin),
+            RegistryRefusal::Signer { rejection, .. } => match rejection {
+                SignerRejection::StableSourceRef { .. } => None,
+                SignerRejection::LegacyIdentity
+                | SignerRejection::SourceMismatch { .. }
+                | SignerRejection::Workflow { .. } => Some(RecoveryKind::IdentityRepin),
+            },
+        }
+    }
+
     fn registry_refusal_samples() -> Vec<RegistryRefusal> {
         let provider_target = ProviderRefusalTarget::new("carina-rs/aws", "infra/foo");
         let host_target = HostRefusalTarget::new("registry.carina-rs.dev", "infra/foo");
@@ -15264,7 +15544,7 @@ transparency_log_present = false
             repository_owner_id: "owner-b".into(),
             repository_id: "repo-b".into(),
         };
-        let samples = vec![
+        let inventory_samples = vec![
             RegistryRefusal::SequenceFieldDisappeared {
                 target: provider_target.clone(),
             },
@@ -15325,14 +15605,14 @@ transparency_log_present = false
                     expected: Box::new(source_pin),
                     actual: Box::new(other_source_pin),
                 },
-                target: provider_target,
+                target: provider_target.clone(),
             },
         ];
 
         // A new refusal fails to compile until it has an index arm. Giving that
         // arm a new index increases the count, so omitting its sample makes this
         // contiguous inventory assertion fail.
-        let sample_indices = samples
+        let sample_indices = inventory_samples
             .iter()
             .map(registry_refusal_variant_index)
             .collect::<Vec<_>>();
@@ -15340,6 +15620,28 @@ transparency_log_present = false
             sample_indices,
             (0..REFUSAL_VARIANT_COUNT).collect::<Vec<_>>()
         );
+        let mut samples = inventory_samples;
+        samples.extend([
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::LegacyIdentity,
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::Workflow {
+                    channel: ReleaseChannel::Stable,
+                    expected: WorkflowPin("expected.yml".into()),
+                    actual: WorkflowPin("actual.yml".into()),
+                },
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::StableSourceRef {
+                    expected: "refs/tags/v0.5.0".into(),
+                    actual: "refs/tags/v0.5.1".into(),
+                },
+                target: provider_target,
+            },
+        ]);
         samples
     }
 
@@ -15348,6 +15650,11 @@ transparency_log_present = false
         for refusal in registry_refusal_samples() {
             let recovery = refusal.recovery();
             let rendered = refusal.to_string();
+            assert_eq!(
+                recovery.map(|remediation| remediation.kind()),
+                expected_recovery_kind(&refusal),
+                "fixed protocol recovery mapping for {refusal:?}"
+            );
 
             match recovery {
                 Some(remediation) => {
@@ -15385,6 +15692,52 @@ transparency_log_present = false
                 );
             }
         }
+    }
+
+    #[test]
+    fn registry_refusal_collection_preserves_single_output_and_deduplicates_recovery() {
+        let target = ProviderRefusalTarget::new("carina-rs/aws", "infra/foo");
+        let rollback = RegistryRefusal::SequenceRollback {
+            previous: 7,
+            current: 6,
+            target: target.clone(),
+        };
+        assert_eq!(
+            RegistryRefusals::new(rollback.clone()).to_string(),
+            rollback.to_string()
+        );
+
+        let mut refusals = Some(RegistryRefusals::new(rollback));
+        RegistryRefusals::insert(
+            &mut refusals,
+            RegistryRefusal::SequenceFieldDisappeared {
+                target: target.clone(),
+            },
+        );
+        RegistryRefusals::insert(
+            &mut refusals,
+            RegistryRefusal::SequenceFastForward {
+                anchor: 7,
+                current: 1_000_008,
+                target,
+            },
+        );
+        let rendered = refusals.unwrap().to_string();
+        assert!(rendered.contains("sequence rollback"), "{rendered}");
+        assert!(
+            rendered.contains("sequence field disappeared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("sequence fast-forward"), "{rendered}");
+        assert_eq!(
+            rendered.matches("carina providers re-bootstrap").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("No sanctioned recovery operation"),
+            "{rendered}"
+        );
     }
 
     #[test]
