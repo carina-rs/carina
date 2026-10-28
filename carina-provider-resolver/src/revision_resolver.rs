@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::GithubSource;
 use sha2::{Digest, Sha256};
 
@@ -445,6 +446,7 @@ mod revision_artifact_selection {
         run_ids: &[WorkflowRunId],
         source: &GithubSource,
         sha: &CommitSha,
+        project_dir: &Path,
         mut fetch: F,
         mut download: D,
     ) -> Result<SelectedRevisionArtifact, String>
@@ -509,8 +511,9 @@ mod revision_artifact_selection {
             }
             0 if candidate_names.is_empty() && !expired_names.is_empty() => Err(format!(
                 "All artifacts in successful workflow runs for {source}@{sha} have expired: {}. \
-                 Re-run CI for this revision or run `carina init --upgrade`.",
-                expired_names.join(", ")
+                 Re-run CI for this revision or run `{}`.",
+                expired_names.join(", "),
+                ProjectCommand::new("init", project_dir).with_argument("--upgrade")
             )),
             0 => {
                 let candidates = if candidate_names.is_empty() {
@@ -597,10 +600,21 @@ fn locked_artifact_download_error(
     )
 }
 
+struct RevisionArtifactLocation<'a> {
+    source: &'a GithubSource,
+    sha: &'a CommitSha,
+}
+
+impl<'a> RevisionArtifactLocation<'a> {
+    fn new(source: &'a GithubSource, sha: &'a CommitSha) -> Self {
+        Self { source, sha }
+    }
+}
+
 fn resolve_revision_artifact<F, A, D>(
     artifact_pin: &ArtifactPin<'_, RevisionArtifactPin>,
-    source: &GithubSource,
-    sha: &CommitSha,
+    location: RevisionArtifactLocation<'_>,
+    project_dir: &Path,
     mode: LockMode,
     mut find_runs: F,
     mut fetch: A,
@@ -611,6 +625,7 @@ where
     A: FnMut(WorkflowRunId) -> Result<Vec<Artifact>, String>,
     D: FnMut(ArtifactId) -> Result<Vec<u8>, ArtifactDownloadError>,
 {
+    let RevisionArtifactLocation { source, sha } = location;
     let mut prefetched_artifacts = HashMap::new();
     let mut fallback_run_ids = None;
     let mut unavailable_artifact_id = None;
@@ -666,6 +681,7 @@ where
         &run_ids,
         source,
         sha,
+        project_dir,
         |run_id| match prefetched_artifacts.remove(&run_id) {
             Some(artifacts) => Ok(artifacts),
             None => fetch(run_id),
@@ -777,10 +793,14 @@ fn revision_artifact_recovery_notice(
     unavailable_artifact_id: ArtifactId,
     replacement_artifact_id: ArtifactId,
     mode: LockMode,
+    project_dir: &Path,
 ) -> String {
     let lock_status = match mode {
-        LockMode::Locked => "Running `carina init` updates the lock.",
-        LockMode::Normal | LockMode::Upgrade => "The lock was updated.",
+        LockMode::Locked => format!(
+            "Running `{}` updates the lock.",
+            ProjectCommand::new("init", project_dir)
+        ),
+        LockMode::Normal | LockMode::Upgrade => "The lock was updated.".to_string(),
     };
     format!(
         "Pinned artifact {unavailable_artifact_id} was unavailable; the artifact with the same \
@@ -952,8 +972,8 @@ where
 
     let selected = resolve_revision_artifact(
         &artifact_pin,
-        source,
-        &sha,
+        RevisionArtifactLocation::new(source, &sha),
+        base_dir,
         mode,
         || list_runs(sha.clone()),
         &mut list_artifacts,
@@ -1012,7 +1032,7 @@ where
     if let Some(unavailable_artifact_id) = unavailable_artifact_id {
         eprintln!(
             "{}",
-            revision_artifact_recovery_notice(unavailable_artifact_id, artifact_id, mode)
+            revision_artifact_recovery_notice(unavailable_artifact_id, artifact_id, mode, base_dir)
         );
     }
 
@@ -1730,6 +1750,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| Ok(vec![artifact("build-output", 42, false)]),
             |artifact_id| {
                 assert_eq!(artifact_id.get(), 42);
@@ -1748,6 +1769,7 @@ sha256 = "{}"
             &[workflow_run_id(200), workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |run_id| match run_id.get() {
                 200 => Ok(vec![artifact("docs", 1, false)]),
                 100 => Ok(vec![
@@ -1775,6 +1797,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| {
                 Ok(vec![
                     artifact("docs", 1, false),
@@ -1799,6 +1822,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| {
                 Ok(vec![
                     artifact("linux-build", 1, false),
@@ -1824,6 +1848,7 @@ sha256 = "{}"
             &[workflow_run_id(200), workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |run_id| match run_id.get() {
                 200 => Ok(vec![artifact("newer-build", 2, false)]),
                 100 => Ok(vec![artifact("older-build", 1, false)]),
@@ -1847,6 +1872,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| Ok(vec![artifact("build-output", 1, false)]),
             |_| {
                 Ok(artifact_zip(&[
@@ -1869,10 +1895,12 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_selection_only_expired_artifacts_reports_expired() {
+        let project_dir = Path::new("infra/project");
         let error = select_artifact_from_runs(
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            project_dir,
             |_| {
                 Ok(vec![
                     artifact("first-build", 1, true),
@@ -1888,6 +1916,13 @@ sha256 = "{}"
         assert!(error.contains("expired"), "{error}");
         assert!(error.contains("first-build"), "{error}");
         assert!(error.contains("second-build"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "run `{}`",
+                ProjectCommand::new("init", project_dir).with_argument("--upgrade")
+            )),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1896,6 +1931,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| {
                 Ok(vec![
                     artifact("docs", 1, false),
@@ -1923,6 +1959,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
+            Path::new("."),
             |_| Ok(vec![artifact("provider-build", 1, false)]),
             |_| Ok(zip.clone()),
         )
@@ -1971,8 +2008,8 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            &test_source(),
-            &test_sha(),
+            RevisionArtifactLocation::new(&test_source(), &test_sha()),
+            Path::new("."),
             LockMode::Normal,
             || {
                 listed_runs.set(true);
@@ -2082,15 +2119,24 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_recovery_notice_describes_the_lock_policy_on_one_line() {
+        let project_dir = Path::new("infra/project");
         let locked = revision_artifact_recovery_notice(
             test_artifact_id(42),
             test_artifact_id(99),
             LockMode::Locked,
+            project_dir,
         );
         assert_eq!(
             locked,
-            "Pinned artifact 42 was unavailable; the artifact with the same sha256 was \
-             re-selected (99). Running `carina init` updates the lock."
+            format!(
+                "Pinned artifact 42 was unavailable; the artifact with the same sha256 was \
+                 re-selected (99). Running `{}` updates the lock.",
+                ProjectCommand::new("init", project_dir)
+            )
+        );
+        assert!(
+            locked.contains(&project_dir.display().to_string()),
+            "{locked}"
         );
         assert!(!locked.contains('\n'));
 
@@ -2098,6 +2144,7 @@ sha256 = "{}"
             test_artifact_id(42),
             test_artifact_id(99),
             LockMode::Normal,
+            project_dir,
         );
         assert_eq!(
             normal,
@@ -2110,6 +2157,7 @@ sha256 = "{}"
                 test_artifact_id(42),
                 test_artifact_id(99),
                 LockMode::Upgrade,
+                project_dir,
             ),
             normal
         );
@@ -2143,8 +2191,8 @@ sha256 = "{}"
 
             let selected = resolve_revision_artifact(
                 &pin,
-                &test_source(),
-                &test_sha(),
+                RevisionArtifactLocation::new(&test_source(), &test_sha()),
+                Path::new("."),
                 LockMode::Normal,
                 || Ok(vec![workflow_run_id(100)]),
                 |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -2232,8 +2280,8 @@ sha256 = "{}"
         );
         let selected = resolve_revision_artifact(
             &pin,
-            &source,
-            &test_sha(),
+            RevisionArtifactLocation::new(&source, &test_sha()),
+            Path::new("."),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -2289,8 +2337,8 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            &test_source(),
-            &test_sha(),
+            RevisionArtifactLocation::new(&test_source(), &test_sha()),
+            Path::new("."),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| {
@@ -2339,8 +2387,8 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            &test_source(),
-            &test_sha(),
+            RevisionArtifactLocation::new(&test_source(), &test_sha()),
+            Path::new("."),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("still-current", 42, false)]),
@@ -2381,8 +2429,8 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            &test_source(),
-            &test_sha(),
+            RevisionArtifactLocation::new(&test_source(), &test_sha()),
+            Path::new("."),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> { panic!("locked replay must not list runs") },
             |_| panic!("locked replay must not fetch run artifacts"),
@@ -2434,8 +2482,8 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            &test_source(),
-            &test_sha(),
+            RevisionArtifactLocation::new(&test_source(), &test_sha()),
+            Path::new("."),
             LockMode::Upgrade,
             || {
                 listed_runs.set(true);
@@ -2496,6 +2544,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &source,
             &test_sha(),
+            project.path(),
             |_| Ok(vec![artifact("rebuilt", 99, false)]),
             |_| Ok(artifact_zip(&[("provider.wasm", b"changed provider")])),
         )
