@@ -78,6 +78,17 @@ fn canonical_unresolved(
     .expect("test block-name resolution must succeed")
 }
 
+const TEST_COMMIT_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+fn test_commit_sha() -> carina_provider_resolver::CommitSha {
+    serde_json::from_str(&format!("{TEST_COMMIT_SHA:?}"))
+        .expect("test commit SHA must be canonical")
+}
+
+fn test_artifact_id(value: u64) -> carina_provider_resolver::ArtifactId {
+    serde_json::from_str(&value.to_string()).expect("test artifact ID must be numeric")
+}
+
 fn canonical_pair<E: Clone>(
     evaluated: &carina_core::parser::File<E>,
     unresolved_resources: Vec<Resource>,
@@ -7162,7 +7173,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
     let revision = "main";
-    let resolved_sha = "deadbeefcafe1234567890";
+    let resolved_sha = test_commit_sha();
     let github_source = match source
         .parse::<carina_core::provider_source::ProviderSource>()
         .unwrap()
@@ -7175,7 +7186,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let wasm_path = carina_provider_resolver::revision_resolver::cache_path_revision(
         base,
         &github_source,
-        resolved_sha,
+        &resolved_sha,
     );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -7195,7 +7206,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
             revision: revision.into(),
-            resolved_sha: resolved_sha.into(),
+            resolved_sha: resolved_sha.clone(),
+            artifact_id: test_artifact_id(42),
         },
         sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
         registry: None,
@@ -7236,7 +7248,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     assert!(rendered.contains("Host wasi:http version: 0.2.6"));
     assert!(rendered.contains("carina-providers.lock"));
     assert!(rendered.contains("revision main"));
-    assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+    assert!(rendered.contains(&format!("resolved_sha {TEST_COMMIT_SHA}")));
     assert!(
         rendered.contains(&format!("`carina init --upgrade {}`", base.display())),
         "{rendered}"
@@ -7249,7 +7261,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
     let revision = "main";
-    let resolved_sha = "deadbeefcafe1234567890";
+    let resolved_sha = test_commit_sha();
     let lock_path = base.join("carina-providers.lock");
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
@@ -7257,7 +7269,8 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
             revision: revision.into(),
-            resolved_sha: resolved_sha.into(),
+            resolved_sha,
+            artifact_id: test_artifact_id(42),
         },
         sha256: "fixture".into(),
         registry: None,
@@ -7283,7 +7296,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     assert!(rendered.starts_with("Provider 'awscc' not installed."));
     assert!(rendered.contains(&lock_path.display().to_string()));
     assert!(rendered.contains("revision main"));
-    assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+    assert!(rendered.contains(&format!("resolved_sha {TEST_COMMIT_SHA}")));
     assert!(
         rendered.contains(&format!("Run `carina init {}`", base.display())),
         "{rendered}"
