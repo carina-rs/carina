@@ -4817,7 +4817,6 @@ let first = unrelated { }
         super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), None, true);
 
     let diagnostics = engine.check_composition_ref_types(
-        &doc,
         parsed,
         &semantic_view,
         &binding_input.compositions,
@@ -5838,6 +5837,52 @@ let web2 = issue {
         "the structured call label must anchor the second call, not the first",
     );
     assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn defaulted_composition_argument_mismatch_anchors_the_authored_call() {
+    let engine = module_boundary_identity_engine();
+    let main = r#"let checked = use { source = './module' }
+
+let sg = aws.ec2.SecurityGroup {
+  name = "root"
+}
+
+let instance = checked {
+  source_id = sg.group_id
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "module/arguments.crn",
+            r#"arguments {
+  source_id: aws.ec2.SecurityGroup.Id
+  target_id: aws.ec2.Vpc.Id = source_id
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'instance': argument 'target_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from sg.group_id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(6, 15), Position::new(6, 22)),
+        "a defaulted argument has no authored key, so the call must own the diagnostic",
+    );
 }
 
 #[test]
@@ -9808,6 +9853,170 @@ exports {
             .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
         "secret leaked: {diagnostics:#?}",
     );
+}
+
+#[test]
+fn one_line_module_call_type_mismatch_is_anchored_to_argument_key() {
+    let main = "let m = use { source = './m' }\n\
+let inst = m { n = 'abc' label = 'x' }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'abc'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(1, 15), Position::new(1, 16))
+    );
+}
+
+#[test]
+fn one_line_module_call_unknown_argument_is_anchored_to_argument_key() {
+    let main = "let m = use { source = './m' }\n\
+let inst = m { n = 1 label = 'x' nn = 2 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(1, 33), Position::new(1, 35))
+    );
+}
+
+#[test]
+fn one_line_module_call_missing_argument_is_anchored_to_second_call() {
+    let main = "let m = use { source = './m' }\n\
+let first = m { n = 1 label = 'x' }\n\
+let second = m { n = 2 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(2, 13), Position::new(2, 14))
+    );
+}
+
+#[test]
+fn module_call_diagnostics_use_original_line_after_heredoc() {
+    let main = r#"let m = use { source = './m' }
+let resource = mock.test.resource {
+  name = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+}
+let inst = m { nn = 1 }
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let unknown = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .unwrap_or_else(|| panic!("missing unknown-parameter diagnostic: {diagnostics:#?}"));
+    let missing = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .unwrap_or_else(|| panic!("missing required-parameter diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        unknown.range,
+        Range::new(Position::new(9, 15), Position::new(9, 17))
+    );
+    assert_eq!(
+        missing.range,
+        Range::new(Position::new(9, 11), Position::new(9, 12))
+    );
+}
+
+#[test]
+fn for_body_module_call_diagnostics_are_emitted_once_per_authored_site() {
+    let main = r#"let m = use { source = './m' }
+for x in ['a', 'b', 'c'] {
+  m { nn = 1 }
+}
+"#;
+    let parsed = carina_core::parser::parse(main, &carina_core::parser::ProviderContext::default())
+        .expect("fixture must parse");
+    assert_eq!(parsed.module_calls.len(), 3);
+    assert!(
+        parsed
+            .module_calls
+            .windows(2)
+            .all(|calls| calls[0].source_span() == calls[1].source_span())
+    );
+    assert!(parsed.module_calls.windows(2).all(|calls| {
+        calls[0].argument_source_span("nn") == calls[1].argument_source_span("nn")
+    }));
+
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  label: String\n}\n"),
+    ]);
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+    let missing = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(missing.len(), 1, "diagnostics: {diagnostics:#?}");
 }
 
 #[test]

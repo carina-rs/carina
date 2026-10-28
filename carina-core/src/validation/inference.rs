@@ -1179,6 +1179,7 @@ pub fn format_inference_error(name: &str, err: &InferenceError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ModuleCall;
     use crate::resource::AccessPath;
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
@@ -2124,12 +2125,11 @@ mod tests {
         // such as the LSP can run inference against the `Virtual` arm exercised
         // by the sibling test above; the CLI retry remains report-only.
         let mut parsed = crate::parser::ParsedFile::default();
-        parsed.module_calls.push(crate::parser::ModuleCall {
-            module_name: "github_module".to_string(),
-            binding_name: Some("github_actions_carina".to_string()),
-            source: Default::default(),
-            arguments: std::collections::HashMap::new(),
-        });
+        parsed.module_calls.push(ModuleCall::test(
+            "github_module".to_string(),
+            Some("github_actions_carina".to_string()),
+            std::collections::HashMap::new(),
+        ));
         parsed
             .export_params
             .push(crate::parser::ParsedExportParam::new(

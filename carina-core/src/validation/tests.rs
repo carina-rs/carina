@@ -683,12 +683,11 @@ fn binding_referenced_in_module_call() {
         "vpc_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
-    parsed.module_calls.push(ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments(args),
-    });
+    parsed.module_calls.push(ModuleCall::test(
+        "web_tier".to_string(),
+        None,
+        module_arguments(args),
+    ));
 
     assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
@@ -3213,12 +3212,11 @@ fn validate_module_calls_rejects_custom_type() {
         )])),
     );
 
-    let module_calls = vec![ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments(args),
-    }];
+    let module_calls = vec![ModuleCall::test(
+        "github".to_string(),
+        None,
+        module_arguments(args),
+    )];
 
     let mut imported_modules = HashMap::new();
     imported_modules.insert(
@@ -3245,15 +3243,14 @@ fn validate_module_calls_rejects_custom_type() {
 fn validate_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let module_calls = vec![ModuleCall::test(
+        "web_tier".to_string(),
+        None,
+        module_arguments([(
             "environment".to_string(),
             Value::Concrete(ConcreteValue::String("production".into())),
         )]),
-    }];
+    )];
     let imported_modules = HashMap::from([(
         "web_tier".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3290,17 +3287,16 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
 fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall {
-        module_name: "inner".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let module_calls = vec![ModuleCall::test(
+        "inner".to_string(),
+        None,
+        module_arguments([(
             "name".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "count".to_string(),
             }),
         )]),
-    }];
+    )];
     let imported_modules = HashMap::from([(
         "inner".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3358,11 +3354,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..ProviderContext::default()
     };
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-
-    let module_calls = [ModuleCall::synthetic(
+    let module_calls = [ModuleCall::test(
         "child",
         None,
-        HashMap::from([("mode".to_string(), authored())]),
+        HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
     )];
     let imported_modules = HashMap::from([(
         "child".to_string(),
@@ -3906,18 +3901,17 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let call = ModuleCall {
-        module_name: "consumer".to_string(),
-        binding_name: Some("instance".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "consumer".to_string(),
+        Some("instance".to_string()),
+        module_arguments([(
             "subnet_ids".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
                 Value::resource_ref("web".to_string(), "group_id".to_string(), vec![]),
             ])),
         )]),
-    };
+    );
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3975,15 +3969,14 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         .resources
         .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let call = ModuleCall {
-        module_name: "consumer".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "consumer".to_string(),
+        None,
+        module_arguments([(
             "number".to_string(),
             Value::resource_ref("source", "count", Vec::new()),
         )]),
-    };
+    );
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {

@@ -69,9 +69,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .imported_modules
             .get(&call.module_name)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
-        let call_source_file = call.diagnostic_source().map(|source| source.file);
+        let call_source_file = call.source_file();
         let call_source_path = call_source_file
-            .as_deref()
             .map(crate::utils::normalize_source_path)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unknown source>".to_string());
@@ -108,7 +107,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
         // Validate required arguments
         for arg in &module.arguments {
-            if arg.default.is_none() && !call.arguments.contains_key(&arg.name) {
+            if arg.default.is_none() && !call.contains_argument(&arg.name) {
                 return Err(ModuleError::MissingArgument {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
@@ -119,11 +118,11 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Validate no unknown arguments
         let declared_arg_names: HashSet<&str> =
             module.arguments.iter().map(|a| a.name.as_str()).collect();
-        for arg_name in call.arguments.keys() {
-            if !declared_arg_names.contains(arg_name.as_str()) {
+        for (arg_name, _) in call.arguments() {
+            if !declared_arg_names.contains(arg_name) {
                 return Err(ModuleError::UnknownArgument {
                     module: call.module_name.clone(),
-                    argument: arg_name.clone(),
+                    argument: arg_name.to_string(),
                 });
             }
         }
@@ -147,7 +146,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // (`a = b`, `b = a`); leftover unresolved refs surface to the
         // post-merge scope check as undefined identifiers. #2817.
         let mut resolved_arguments: HashMap<String, ModuleArgument> = HashMap::new();
-        let call_line = call.source_span().map_or(1, |span| span.start_line);
+        let call_line = call.source_span().start_line;
         let argument_lines: HashMap<String, usize> = module
             .arguments
             .iter()
@@ -160,15 +159,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .collect();
         for arg in &module.arguments {
             let argument = call
-                .arguments
-                .get(&arg.name)
+                .argument(&arg.name)
                 .cloned()
                 .or_else(|| arg.default.clone().map(ModuleArgument::new))
                 .unwrap();
             resolved_arguments.insert(arg.name.clone(), argument);
         }
         let caller_supplied_arguments: HashSet<&str> =
-            call.arguments.keys().map(String::as_str).collect();
+            call.arguments().map(|(name, _)| name).collect();
         let max_iterations = module.arguments.len() + 1;
         for _ in 0..max_iterations {
             let mut changed = false;
@@ -181,7 +179,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 arguments: &snapshot,
                 source_lines: &argument_lines,
                 default_line: call_line,
-                caller_source_file: call_source_file.as_deref(),
+                caller_source_file: call_source_file,
                 binding_index,
                 config: self.config,
             };
@@ -240,7 +238,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             arguments: &resolved_arguments,
             source_lines: &argument_lines,
             default_line: call_line,
-            caller_source_file: call_source_file.as_deref(),
+            caller_source_file: call_source_file,
             binding_index,
             config: self.config,
         };
@@ -1034,7 +1032,7 @@ fn bind_module_constraints(
             let source = validation.diagnostic_source();
             let line = source
                 .as_ref()
-                .map_or(arguments.default_line, |source| source.call_span.start_line);
+                .map_or(arguments.default_line, |source| source.span.start_line);
             let source_file = source.as_ref().map(|source| source.file.clone());
             constraints.push(crate::resource::PendingModuleConstraint {
                 id: crate::resource::ModuleConstraintId::argument_validation(
@@ -1058,7 +1056,7 @@ fn bind_module_constraints(
         let source = requirement.diagnostic_source();
         let line = source
             .as_ref()
-            .map_or(arguments.default_line, |source| source.call_span.start_line);
+            .map_or(arguments.default_line, |source| source.span.start_line);
         let source_file = source.as_ref().map(|source| source.file.clone());
         constraints.push(crate::resource::PendingModuleConstraint {
             id: crate::resource::ModuleConstraintId::require(ordinal),
@@ -2328,7 +2326,7 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
 
     let mut features: BTreeMap<String, String> = BTreeMap::new();
     features.insert("_module".to_string(), call.module_name.clone());
-    for (k, v) in &call.arguments {
+    for (k, v) in call.arguments() {
         crate::identifier::flatten_value_for_simhash(k, v.walker_value(), &mut features);
     }
     let simhash = crate::identifier::compute_simhash(&features);

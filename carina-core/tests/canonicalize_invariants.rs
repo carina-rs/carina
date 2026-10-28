@@ -137,7 +137,7 @@ fn parse_resolve_yields_canonical_interpolations() {
         }
     }
     for call in &parsed.module_calls {
-        for (k, v) in &call.arguments {
+        for (k, v) in call.arguments() {
             check_value(
                 v.value().expect("fixture module argument is a value"),
                 &format!("module_call({}).{}", call.module_name, k),

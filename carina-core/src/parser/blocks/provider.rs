@@ -202,17 +202,7 @@ pub(in crate::parser) fn parse_require_statement(
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
     // Constraint diagnostics belong to the offending expression, not to the
     // beginning of a potentially multi-line `require` statement.
-    let span = condition_pair.as_span();
-    let (start_line, start_column) = span.start_pos().line_col();
-    let (end_line, end_column) = span.end_pos().line_col();
-    let source_span = crate::parser::ModuleCallSourceSpan {
-        start_byte: span.start(),
-        end_byte: span.end(),
-        start_line,
-        start_column,
-        end_line,
-        end_column,
-    };
+    let source_span = ctx.source_span(condition_pair.as_span());
     let condition = parse_validate_expr(condition_pair, ctx)?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
     let raw = message_pair.as_str();

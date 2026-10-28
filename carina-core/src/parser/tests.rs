@@ -3489,7 +3489,7 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.module_name, "web_tier");
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
-        call.arguments.get("vpc").and_then(ModuleArgument::value),
+        call.argument("vpc").and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
     );
 }
@@ -4372,7 +4372,7 @@ fn parse_for_expression_with_module_call() {
     // Each module call should have the loop variable substituted in arguments
     for call in &result.module_calls {
         assert_eq!(call.module_name, "web");
-        assert!(call.arguments.contains_key("vpc_cidr"));
+        assert!(call.contains_argument("vpc_cidr"));
     }
 
     // Verify the argument values are the substituted loop values
@@ -4383,8 +4383,7 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         prod_call
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
@@ -4398,8 +4397,7 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         staging_call
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
@@ -4434,8 +4432,7 @@ fn parse_for_expression_with_module_call_over_list() {
 
     assert_eq!(
         result.module_calls[0]
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
@@ -4443,8 +4440,7 @@ fn parse_for_expression_with_module_call_over_list() {
     );
     assert_eq!(
         result.module_calls[1]
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
@@ -8684,6 +8680,30 @@ let policy = 'arn:${env}:root'
     assert_eq!(
         warning.line, 6,
         "warning should report the original source line after heredoc preprocessing"
+    );
+}
+
+#[test]
+fn module_call_source_spans_use_original_line_after_heredoc() {
+    let input = r#"let m = use { source = './m' }
+let document = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+let inst = m { nn = 1 }
+"#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+
+    assert_eq!(call.source_span().start_line, 8);
+    assert_eq!(
+        call.argument_source_span("nn")
+            .expect("argument key span")
+            .start_line,
+        8
     );
 }
 

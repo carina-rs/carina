@@ -1913,12 +1913,7 @@ tags = {
                 .collect(),
             module_calls: calls
                 .into_iter()
-                .map(|name| ModuleCall {
-                    module_name: name.to_string(),
-                    binding_name: None,
-                    source: Default::default(),
-                    arguments: HashMap::new(),
-                })
+                .map(|name| ModuleCall::test(name.to_string(), None, HashMap::new()))
                 .collect(),
             ..ParsedFile::default()
         }

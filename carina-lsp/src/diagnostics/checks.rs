@@ -11,7 +11,7 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, TypeExpr,
+    AttributeParameter, ModuleCall, ModuleCallSourceSpan, ParsedExportParam, ParsedFile, TypeExpr,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
@@ -30,30 +30,30 @@ pub(super) struct MergedParseResult {
     pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
 }
 
-fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
-    let module_pattern = format!("{} {{", call.module_name);
-    line.match_indices(&module_pattern)
-        .find_map(|(byte_pos, _)| {
-            let Some(binding) = call.binding_name.as_deref() else {
-                return Some(byte_pos);
-            };
-            let (lhs, _) = line[..byte_pos].rsplit_once('=')?;
-            let written_binding = lhs.trim().strip_prefix("let")?.trim();
-            (written_binding == binding).then_some(byte_pos)
-        })
+fn source_span_position(span: ModuleCallSourceSpan) -> (u32, u32) {
+    (
+        span.start_line.saturating_sub(1) as u32,
+        span.start_column.saturating_sub(1) as u32,
+    )
 }
 
-fn module_call_occurrence(module_calls: &[ModuleCall], call_index: usize) -> Option<usize> {
-    let call = module_calls.get(call_index)?;
-    Some(
-        module_calls[..call_index]
-            .iter()
-            .filter(|candidate| {
-                candidate.module_name == call.module_name
-                    && candidate.binding_name == call.binding_name
-            })
-            .count(),
-    )
+fn module_call_position(call: &ModuleCall) -> (u32, u32) {
+    source_span_position(call.source_span())
+}
+
+fn deduplicate_identical_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut unique = Vec::new();
+    for diagnostic in diagnostics {
+        let duplicate = unique.iter().any(|existing: &Diagnostic| {
+            existing.range == diagnostic.range
+                && existing.severity == diagnostic.severity
+                && existing.message == diagnostic.message
+        });
+        if !duplicate {
+            unique.push(diagnostic);
+        }
+    }
+    unique
 }
 
 fn value_depends_on_module_output(
@@ -324,13 +324,11 @@ impl SemanticLookup for ModuleCall {
         merged: &'a ParsedFile,
         current_file: &std::path::Path,
     ) -> Option<&'a Self> {
-        let authored_span = self.source_span()?;
+        let authored_span = self.source_span();
         merged.module_calls.iter().find(|candidate| {
-            candidate.diagnostic_source().is_some_and(|source| {
-                source.file == current_file
-                    && source.call_span == authored_span
-                    && source.expansion_key.is_none()
-            })
+            candidate.source_file() == Some(current_file)
+                && candidate.source_span() == authored_span
+                && candidate.expansion_key().is_none()
         })
     }
 
@@ -338,8 +336,7 @@ impl SemanticLookup for ModuleCall {
         let TypecheckValueSlot::ModuleArgument(argument) = slot else {
             return None;
         };
-        self.arguments
-            .get(argument)
+        self.argument(argument)
             .and_then(|argument| argument.value())
     }
 }
@@ -352,9 +349,9 @@ impl SemanticLookup for AttributeParameter {
     ) -> Option<&'a Self> {
         let authored_span = self.source_span()?;
         merged.attribute_params.iter().find(|candidate| {
-            candidate.diagnostic_source().is_some_and(|source| {
-                source.file == current_file && source.call_span == authored_span
-            })
+            candidate
+                .diagnostic_source()
+                .is_some_and(|source| source.file == current_file && source.span == authored_span)
         })
     }
 
@@ -373,9 +370,9 @@ impl SemanticLookup for ParsedExportParam {
     ) -> Option<&'a Self> {
         let authored_span = self.source_span()?;
         merged.export_params.iter().find(|candidate| {
-            candidate.diagnostic_source().is_some_and(|source| {
-                source.file == current_file && source.call_span == authored_span
-            })
+            candidate
+                .diagnostic_source()
+                .is_some_and(|source| source.file == current_file && source.span == authored_span)
         })
     }
 
@@ -1383,61 +1380,54 @@ impl DiagnosticEngine {
             _ => return None,
         };
 
-        parsed
-            .module_calls
-            .iter()
-            .enumerate()
-            .find_map(|(call_index, call)| {
-                let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
-                let owns_failure = constraint_instance.is_some_and(|instance| {
-                    instance == root_instance
-                        || instance
-                            .strip_prefix(&root_instance)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                }) || direct_module
-                    .is_some_and(|module| call.module_name == module)
-                    || owner.is_some_and(|alias| call.module_name == alias);
-                if !owns_failure {
-                    return None;
-                }
-                if constraint_instance.is_some_and(|instance| instance == root_instance) {
-                    return None;
-                }
-                if direct_module.is_some_and(|module| call.module_name == module)
-                    && let Some(line) = direct_error_line.filter(|line| *line > 0)
-                    && direct_error_source.is_some_and(|error_source| {
-                        let error_source = std::path::Path::new(error_source);
-                        let error_source = if error_source.is_absolute() {
-                            error_source.to_path_buf()
-                        } else {
-                            base_path.join(error_source)
-                        };
-                        current_source
-                            .as_ref()
-                            .is_some_and(|current_source| error_source == *current_source)
-                    })
-                {
-                    let line = (line as u32).saturating_sub(1);
-                    let width = doc
-                        .text()
-                        .lines()
-                        .nth(line as usize)
-                        .map_or(1, |source| source.chars().count().max(1))
-                        as u32;
-                    return Some(carina_diagnostic(line, 0, width, severity, message.clone()));
-                }
-                let occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
-                let (line, col, width) = self
-                    .find_module_call_position(doc, call, occurrence)
-                    .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))?;
-                Some(carina_diagnostic(
-                    line,
-                    col,
-                    col + width,
-                    severity,
-                    message.clone(),
-                ))
-            })
+        parsed.module_calls.iter().find_map(|call| {
+            let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
+            let owns_failure = constraint_instance.is_some_and(|instance| {
+                instance == root_instance
+                    || instance
+                        .strip_prefix(&root_instance)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            }) || direct_module.is_some_and(|module| call.module_name == module)
+                || owner.is_some_and(|alias| call.module_name == alias);
+            if !owns_failure {
+                return None;
+            }
+            if constraint_instance.is_some_and(|instance| instance == root_instance) {
+                return None;
+            }
+            if direct_module.is_some_and(|module| call.module_name == module)
+                && let Some(line) = direct_error_line.filter(|line| *line > 0)
+                && direct_error_source.is_some_and(|error_source| {
+                    let error_source = std::path::Path::new(error_source);
+                    let error_source = if error_source.is_absolute() {
+                        error_source.to_path_buf()
+                    } else {
+                        base_path.join(error_source)
+                    };
+                    current_source
+                        .as_ref()
+                        .is_some_and(|current_source| error_source == *current_source)
+                })
+            {
+                let line = (line as u32).saturating_sub(1);
+                let width = doc
+                    .text()
+                    .lines()
+                    .nth(line as usize)
+                    .map_or(1, |source| source.chars().count().max(1))
+                    as u32;
+                return Some(carina_diagnostic(line, 0, width, severity, message.clone()));
+            }
+            let (line, col) = module_call_position(call);
+            let width = call.module_name.chars().count() as u32;
+            Some(carina_diagnostic(
+                line,
+                col,
+                col + width,
+                severity,
+                message.clone(),
+            ))
+        })
     }
 
     /// Check tag-key casing against the directory-wide CLI population while
@@ -1946,7 +1936,6 @@ impl DiagnosticEngine {
     /// Check module calls against imported module definitions
     pub(super) fn check_module_calls(
         &self,
-        doc: &Document,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
@@ -1955,39 +1944,35 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         // Check each module call
-        for (call_index, call) in parsed.module_calls.iter().enumerate() {
-            let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)
-                .expect("enumerated module call has an occurrence");
+        for call in &parsed.module_calls {
             if let Some(signature) = imported_modules.get(&call.module_name) {
                 let module_args = &signature.arguments;
                 // Check for unknown parameters
-                for arg_name in call.arguments.keys() {
-                    let matching_arg = module_args.iter().find(|arg| &arg.name == arg_name);
+                for (arg_name, authored_argument, key_span, _) in call.arguments_with_source_spans()
+                {
+                    let (line, col) = source_span_position(key_span);
+                    let matching_arg = module_args.iter().find(|arg| arg.name == arg_name);
 
                     if matching_arg.is_none() {
-                        if let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, call, call_occurrence, arg_name)
-                        {
-                            // Find similar parameter names for suggestion
-                            let suggestion = module_args
-                                .iter()
-                                .find(|arg| {
-                                    arg.name.contains(arg_name) || arg_name.contains(&arg.name)
-                                })
-                                .map(|arg| format!(". Did you mean '{}'?", arg.name))
-                                .unwrap_or_default();
+                        // Find similar parameter names for suggestion
+                        let suggestion = module_args
+                            .iter()
+                            .find(|arg| {
+                                arg.name.contains(arg_name) || arg_name.contains(arg.name.as_str())
+                            })
+                            .map(|arg| format!(". Did you mean '{}'?", arg.name))
+                            .unwrap_or_default();
 
-                            diagnostics.push(carina_diagnostic(
-                                line,
-                                col,
-                                col + arg_name.len() as u32,
-                                DiagnosticSeverity::WARNING,
-                                format!(
-                                    "Unknown parameter '{}' for module '{}'{}",
-                                    arg_name, call.module_name, suggestion
-                                ),
-                            ));
-                        }
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + arg_name.len() as u32,
+                            DiagnosticSeverity::WARNING,
+                            format!(
+                                "Unknown parameter '{}' for module '{}'{}",
+                                arg_name, call.module_name, suggestion
+                            ),
+                        ));
                         continue;
                     }
 
@@ -2006,22 +1991,13 @@ impl DiagnosticEngine {
                     };
                     let semantic_argument = semantic_view
                         .lookup(call)
-                        .and_then(|semantic_call| semantic_call.arguments.get(arg_name))
-                        .or_else(|| call.arguments.get(arg_name));
-                    if let Some(result) = semantic_argument.and_then(|argument| {
-                        carina_core::validation::check_module_argument_handle_sink(
-                            argument,
-                            &resolved_parameter,
-                        )
-                    }) {
-                        if let Err(error) = result
-                            && let Some((line, col)) = self.find_module_call_arg_position(
-                                doc,
-                                call,
-                                call_occurrence,
-                                arg_name,
-                            )
-                        {
+                        .and_then(|semantic_call| semantic_call.argument(arg_name))
+                        .unwrap_or(authored_argument);
+                    if let Some(result) = carina_core::validation::check_module_argument_handle_sink(
+                        semantic_argument,
+                        &resolved_parameter,
+                    ) {
+                        if let Err(error) = result {
                             diagnostics.push(carina_diagnostic(
                                 line,
                                 col,
@@ -2050,8 +2026,6 @@ impl DiagnosticEngine {
                                     schemas: &self.schemas,
                                 },
                             )
-                        && let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, call, call_occurrence, arg_name)
                     {
                         diagnostics.push(carina_diagnostic(
                             line,
@@ -2065,11 +2039,8 @@ impl DiagnosticEngine {
 
                 // Check for missing required parameters
                 for arg in module_args {
-                    if arg.default.is_none()
-                        && !call.arguments.contains_key(&arg.name)
-                        && let Some((line, col)) =
-                            self.find_module_call_position(doc, call, call_occurrence)
-                    {
+                    if arg.default.is_none() && !call.contains_argument(&arg.name) {
+                        let (line, col) = module_call_position(call);
                         diagnostics.push(carina_diagnostic(
                             line,
                             col,
@@ -2085,7 +2056,7 @@ impl DiagnosticEngine {
             }
         }
 
-        diagnostics
+        deduplicate_identical_diagnostics(diagnostics)
     }
 
     /// Map resolver-owned constraint outcomes onto their parser-authored
@@ -2120,8 +2091,7 @@ impl DiagnosticEngine {
                         report.source.call_span
                     }
                 };
-                let line = span.start_line.saturating_sub(1) as u32;
-                let col = span.start_column.saturating_sub(1) as u32;
+                let (line, col) = source_span_position(span);
                 let width = if span.start_line == span.end_line {
                     span.end_column.saturating_sub(span.start_column) as u32
                 } else {
@@ -2145,14 +2115,13 @@ impl DiagnosticEngine {
     /// parser-native references from the authored call.
     pub(super) fn check_module_call_ref_types(
         &self,
-        doc: &Document,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
         binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        for (call_index, authored_call) in parsed.module_calls.iter().enumerate() {
+        for authored_call in &parsed.module_calls {
             let Some(semantic_call) = semantic_view.reference_owner(authored_call) else {
                 continue;
             };
@@ -2165,32 +2134,15 @@ impl DiagnosticEngine {
                 )
             {
                 if semantic_call
-                    .arguments
-                    .get(&error.argument)
+                    .argument(&error.argument)
                     .is_some_and(|argument| argument.bare_handle_error().is_some())
                 {
                     // `check_module_calls` routes classified handles through
                     // core's shared sink checker at error severity.
                     continue;
                 }
-                let call_occurrence =
-                    module_call_occurrence(&parsed.module_calls, call_index).unwrap_or_default();
-                let argument_position = self
-                    .find_module_call_arg_position(
-                        doc,
-                        authored_call,
-                        call_occurrence,
-                        &error.argument,
-                    )
-                    .map(|(line, col)| (line, col, error.argument.chars().count() as u32));
-                let call_position = self
-                    .find_module_call_position(doc, authored_call, call_occurrence)
-                    .map(|(line, col)| {
-                        (line, col, authored_call.module_name.chars().count() as u32)
-                    });
-                let Some((line, col, width)) = argument_position.or(call_position) else {
-                    continue;
-                };
+                let (line, col) = source_span_position(error.argument_span);
+                let width = error.argument.chars().count() as u32;
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
@@ -2200,7 +2152,7 @@ impl DiagnosticEngine {
                 ));
             }
         }
-        diagnostics
+        deduplicate_identical_diagnostics(diagnostics)
     }
 
     /// Surface BindingIndex-backed user-function argument/return reference
@@ -2254,7 +2206,6 @@ impl DiagnosticEngine {
     /// the directory currently open in the editor.
     pub(super) fn check_composition_ref_types(
         &self,
-        doc: &Document,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         compositions: &[carina_core::resource::Composition],
@@ -2275,43 +2226,33 @@ impl DiagnosticEngine {
                 return None;
             };
 
-            let immediate_call = parsed.module_calls.iter().enumerate().find(|(_, call)| {
+            let immediate_call = parsed.module_calls.iter().find(|call| {
                 semantic_view.lookup(*call).is_some_and(|semantic| {
                     composition_call_matches(&expanded_error.call, semantic)
                 })
             });
-            let (call_index, authored_call, anchor_argument) = match immediate_call {
-                Some((index, call)) => (index, call, true),
+            let (authored_call, anchor_argument) = match immediate_call {
+                Some(call) => (call, true),
                 None => {
-                    let (index, call) =
-                        parsed.module_calls.iter().enumerate().find(|(_, call)| {
-                            semantic_view.lookup(*call).is_some_and(|semantic| {
-                                composition_call_matches(&expanded_error.root_call, semantic)
-                            })
-                        })?;
-                    (index, call, false)
+                    let call = parsed.module_calls.iter().find(|call| {
+                        semantic_view.lookup(*call).is_some_and(|semantic| {
+                            composition_call_matches(&expanded_error.root_call, semantic)
+                        })
+                    })?;
+                    (call, false)
                 }
             };
-            let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
 
-            let position = if anchor_argument {
-                self.find_module_call_arg_position(
-                    doc,
-                    authored_call,
-                    call_occurrence,
-                    &expanded_error.argument,
-                )
-                .map(|(line, col)| (line, col, expanded_error.argument.chars().count() as u32))
+            let argument_span = anchor_argument
+                .then(|| authored_call.argument_source_span(&expanded_error.argument))
+                .flatten();
+            let (line, col, width) = if let Some(span) = argument_span {
+                let (line, col) = source_span_position(span);
+                (line, col, expanded_error.argument.chars().count() as u32)
             } else {
-                None
-            }
-            .or_else(|| {
-                self.find_module_call_position(doc, authored_call, call_occurrence)
-                    .map(|(line, col)| {
-                        (line, col, authored_call.module_name.chars().count() as u32)
-                    })
-            })?;
-            let (line, col, width) = position;
+                let (line, col) = module_call_position(authored_call);
+                (line, col, authored_call.module_name.chars().count() as u32)
+            };
 
             Some(carina_diagnostic(
                 line,
@@ -2322,78 +2263,6 @@ impl DiagnosticEngine {
             ))
         })
         .collect()
-    }
-
-    /// Find the position of a module call in the document
-    pub(super) fn find_module_call_position(
-        &self,
-        doc: &Document,
-        call: &ModuleCall,
-        occurrence: usize,
-    ) -> Option<(u32, u32)> {
-        let text = doc.text();
-        let mut remaining = occurrence;
-
-        for (line_idx, line) in text.lines().enumerate() {
-            if let Some(byte_pos) = module_call_header_position(line, call) {
-                if remaining > 0 {
-                    remaining -= 1;
-                    continue;
-                }
-                return Some((
-                    line_idx as u32,
-                    position::byte_offset_to_char_offset(line, byte_pos),
-                ));
-            }
-        }
-        None
-    }
-
-    /// Find the position of an argument in a module call
-    pub(super) fn find_module_call_arg_position(
-        &self,
-        doc: &Document,
-        call: &ModuleCall,
-        occurrence: usize,
-        arg_name: &str,
-    ) -> Option<(u32, u32)> {
-        if let Some(span) = call.argument_source_span(arg_name) {
-            return Some((
-                span.start_line.saturating_sub(1) as u32,
-                span.start_column.saturating_sub(1) as u32,
-            ));
-        }
-
-        let text = doc.text();
-        let mut in_module_call = false;
-        let mut remaining = occurrence;
-
-        for (line_idx, line) in text.lines().enumerate() {
-            if module_call_header_position(line, call).is_some() {
-                if remaining == 0 {
-                    in_module_call = true;
-                } else {
-                    remaining -= 1;
-                }
-            }
-
-            if in_module_call {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with(arg_name)
-                    && trimmed[arg_name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c == ' ' || c == '=')
-                {
-                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
-                }
-
-                if trimmed == "}" {
-                    in_module_call = false;
-                }
-            }
-        }
-        None
     }
 
     /// Format a stream of unused-binding names into LSP diagnostics.

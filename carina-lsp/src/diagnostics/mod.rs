@@ -542,7 +542,6 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
             if let Some(base_path) = base_path {
                 diagnostics.extend(self.check_module_calls(
-                    doc,
                     parsed,
                     &semantic_view,
                     &module_signatures,
@@ -583,7 +582,6 @@ impl DiagnosticEngine {
             // single TypeInSchema relation.
             if let (Some(_), Some(expanded), true) = (base_path, merged, expansion_succeeded) {
                 diagnostics.extend(self.check_composition_ref_types(
-                    doc,
                     parsed,
                     &semantic_view,
                     &expanded.compositions,
@@ -591,7 +589,6 @@ impl DiagnosticEngine {
                 ));
             } else {
                 diagnostics.extend(self.check_module_call_ref_types(
-                    doc,
                     parsed,
                     &semantic_view,
                     &module_signatures,

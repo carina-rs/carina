@@ -18,13 +18,14 @@ mod types;
 mod util;
 
 pub use ast::{
-    ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpansionError,
-    DeferredForExpression, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
-    InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallSourceSpan,
-    MovedAddresses, ParsedExportParam, ParsedFile, ParserBindingMetadata, ProviderConfig,
-    RequireBlock, ResourceContext, ResourceRef, ResourceTypePath, ShapeMismatch, StateBlock,
-    StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
-    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeclarationDiagnosticSource,
+    DeferredForExpansionError, DeferredForExpression, ExportParamLike, ExportParameter, File,
+    FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
+    ModuleCallDiagnosticSource, ModuleCallSourceSpan, MovedAddresses, ParsedExportParam,
+    ParsedFile, ParserBindingMetadata, ProviderConfig, RequireBlock, ResourceContext, ResourceRef,
+    ResourceTypePath, ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
+    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 #[cfg(test)]

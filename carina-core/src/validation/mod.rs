@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
-    TypeExpr,
+    ForBinding, ModuleCall, ModuleCallSourceSpan, ProviderContext, ResourceContext, ResourceRef,
+    ResourceTypePath, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -606,6 +606,8 @@ pub struct ModuleCallRefError {
     pub call_index: usize,
     call_label: String,
     pub argument: String,
+    /// Parser-authored key span for `argument`.
+    pub argument_span: ModuleCallSourceSpan,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
 }
@@ -684,14 +686,14 @@ fn validate_module_call_argument_ref_types_inner(
             .binding_name
             .as_deref()
             .unwrap_or(call.module_name.as_str());
-        for (argument_name, value) in &call.arguments {
+        for (argument_name, value, argument_span, _) in call.arguments_with_source_spans() {
             let declared_sink = imported_modules
                 .get(&call.module_name)
                 .and_then(|signature| {
                     signature
                         .arguments
                         .iter()
-                        .find(|argument| argument.name == *argument_name)
+                        .find(|argument| argument.name == argument_name)
                 })
                 .map(|argument| &argument.type_expr);
 
@@ -707,7 +709,8 @@ fn validate_module_call_argument_ref_types_inner(
                     errors.push(ModuleCallRefError {
                         call_index,
                         call_label: call_name.to_string(),
-                        argument: argument_name.clone(),
+                        argument: argument_name.to_string(),
+                        argument_span,
                         path: path.to_owned(),
                         kind,
                     });
@@ -1233,7 +1236,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         }
     }
     for call in &parsed.module_calls {
-        for value in call.arguments.values() {
+        for (_, value) in call.arguments() {
             check_function_calls(
                 value.walker_value(),
                 None,
@@ -2907,25 +2910,21 @@ pub fn validate_module_calls(
     for call in module_calls {
         if let Some(signature) = imported_modules.get(&call.module_name) {
             let module_args = &signature.arguments;
-            for (arg_name, arg_value) in &call.arguments {
-                if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name) {
-                    let line = call
-                        .argument_value_source_span(arg_name)
-                        .or_else(|| call.source_span())
-                        .map(|span| span.start_line);
-                    let source_file = call.diagnostic_source().map(|source| source.file);
-                    let context = match (source_file.as_deref(), line) {
-                        (Some(file), Some(line)) => format!(
+            let source_file = call.source_file();
+            for (arg_name, arg_value, _, value_span) in call.arguments_with_source_spans() {
+                if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
+                    let line = value_span.start_line;
+                    let context = match source_file {
+                        Some(file) => format!(
                             "module {} argument '{}' in {} at line {line}",
                             call.module_name,
                             arg_name,
                             file.display(),
                         ),
-                        (None, Some(line)) => format!(
+                        None => format!(
                             "module {} argument '{}' at line {line}",
                             call.module_name, arg_name,
                         ),
-                        _ => format!("module {} argument '{}'", call.module_name, arg_name),
                     };
                     let resolved_parameter =
                         match resolve_parameter_type_for_check(&arg_param.type_expr, config) {
@@ -3220,7 +3219,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
         collect_dependencies(&deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {
-        for value in call.arguments.values() {
+        for (_, value) in call.arguments() {
             collect_dependencies(value.walker_value(), &mut referenced);
         }
     }
