@@ -1431,9 +1431,10 @@ exports {
             Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
         );
 
-        let mut parsed = carina_core::parser::InferredFile::default();
-        parsed.resources.push(resource);
-        parsed
+    carina_core::parser::InferredFile {
+        resources: vec![resource],
+        ..carina_core::parser::InferredFile::default()
+    }
     }
 
     #[test]
