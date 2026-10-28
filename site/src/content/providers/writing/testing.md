@@ -269,13 +269,14 @@ Unit tests cannot tell you whether a resource converges: whether, after `apply`,
 
 The official providers keep acceptance tests in an `acceptance-tests/` directory, one directory per resource type with one or more `.crn` configurations, and a script that runs each one through a full cycle:
 
-1. `carina apply --auto-approve` creates the resources.
-2. `carina plan --detailed-exitcode` must exit with `0`. It exits with `2` when the plan has changes, which means the resource does not converge, usually because `read` returns a value in a different form than the configuration or leaves an attribute out.
-3. `carina destroy --auto-approve` removes everything.
+1. `carina init` installs the component under test. Run it again after every rebuild; otherwise the test runs the copy installed earlier.
+2. `carina apply --auto-approve` creates the resources.
+3. `carina plan --detailed-exitcode` must exit with `0`. It exits with `2` when the plan has changes, which means the resource does not converge, usually because `read` returns a value in a different form than the configuration or leaves an attribute out.
+4. `carina destroy --auto-approve` removes everything.
 
 Updates, attribute removal and replacement need more than one configuration. Keep the steps outside the working directory, such as `step1.crn` and `step2.crn`, and copy each in turn over `main.crn` in one working directory, so the second apply updates what the first created. Do not put the step files in the working directory itself: Carina reads every `.crn` file in a directory, so it would declare the resources twice. Check the plan between steps for the change you expect, and run the converge check after each apply.
 
-Run acceptance tests in an account that holds nothing else, and make the script destroy what it created even when a step fails or the run is interrupted. A test that leaves resources behind costs money and can break the next run. Point `source` at the build under test with a `file://` URL, and use a release build of `carina`: loading a component in a debug build is slow.
+Run acceptance tests in an account that holds nothing else, and make the script destroy what it created even when a step fails or the run is interrupted. A test that leaves resources behind costs money and can break the next run. Point `source` at the build under test with a `file://` URL, which step 1 installs, and use a release build of `carina`: loading a component in a debug build is slow.
 
 ## Next steps
 

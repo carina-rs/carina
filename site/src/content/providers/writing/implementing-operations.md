@@ -3,9 +3,9 @@ title: "Implementing Operations"
 description: "How a Carina provider implements read, create, update and delete: identifiers, the create typestate, patches, long-running operations, errors and secrets."
 ---
 
-This page walks through the operations of `widget`, an example provider for an imaginary API with one resource type. The API creates widgets asynchronously: a create call returns an operation ID, and the widget exists once that operation finishes. That is the shape most cloud APIs have, and it exercises every part of the create typestate described in the [Overview](/providers/writing/overview/#short-calls-the-host-waits).
+This page walks through the operations of `widget`, an example provider for an imaginary API with one resource type. The API creates widgets asynchronously: a create call returns an operation ID, and the widget exists once that operation finishes. That is the shape most cloud APIs have, and it exercises most of the create typestate described in the [Overview](/providers/writing/overview/#short-calls-the-host-waits).
 
-The provider holds an API client behind a trait, so the same code runs against the real client in the component and against a fake in [tests](/providers/writing/testing/). All code on this page compiles and its tests pass against the carina repository at commit `6a7a4c32`. It shows the operations only; the provider still needs `info`, `schemas` and the rest of the trait, and the `export_provider!` line from [Your First Provider](/providers/writing/getting-started/).
+The provider holds an API client behind a trait, so the same code runs against the real client in the component and against a fake in [tests](/providers/writing/testing/). All code on this page compiles and its tests pass against the carina repository at commit `6a7a4c32`; the SDK there is the same as at `6726a1cc`, the commit [Your First Provider](/providers/writing/getting-started/) uses. It shows the operations only; the provider still needs `info`, `schemas` and the rest of the trait.
 
 ## The API client
 
@@ -49,6 +49,43 @@ pub trait Api {
 ```
 
 `ApiError` separates the two failures that matter to Carina: `Rejected`, where the API certainly did nothing, and `Unknown`, where it may have. The client also issues idempotency keys: retrying `start_create` with the same client token returns the operation the first call started instead of creating a second widget. Most cloud APIs offer something like this (a client token or request ID), and a provider should use it.
+
+## The provider type
+
+```rust
+// The SDK's trait returns `ProviderError` by value; match its allowance.
+#![allow(clippy::result_large_err)]
+
+use std::collections::HashMap;
+
+use carina_plugin_sdk::types::*;
+use carina_plugin_sdk::{
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
+    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+};
+use serde::{Deserialize, Serialize};
+
+pub mod api;
+use api::{Api, ApiError, CreateStatus, Widget};
+
+pub struct WidgetProvider<A> {
+    pub api: A,
+}
+```
+
+```rust
+impl<A: Api> CarinaProvider for WidgetProvider<A> {
+    type CreateToken = CreateToken;
+    type UpdateToken = Never;
+    type DeleteToken = Never;
+
+    // info, schemas, and the operations below
+}
+```
+
+`CreateToken` is defined below. Updates and deletes finish in one call, so their token types are `Never`.
+
+The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
 
 ## Helpers
 
@@ -150,7 +187,7 @@ fn read(
 }
 ```
 
-Return `ReadOutcome::NotFound` when the resource is gone. Carina treats it as drift and plans to create the resource again. It treats a `NotFound` error from `read` the same way, but returning the outcome says what you mean.
+`read_found` is a separate method because `poll_create` and `resume_create` read the widget back the same way. Return `ReadOutcome::NotFound` when the resource is gone. Carina treats it as drift and plans to create the resource again. It treats a `NotFound` error from `read` the same way, but returning the outcome says what you mean.
 
 Return every attribute the API reports. Write-only values never come back from an API, and Carina does not expect them in `read`: it keeps the value it last sent.
 
@@ -210,7 +247,7 @@ pub enum CreateToken {
 }
 ```
 
-It holds a client token or an operation ID, never request values. Within one apply, every poll receives the original request again, so the token does not need to repeat it. A create resumed by a later apply receives the request built from the configuration as it is then, which may have changed.
+It holds a client token or an operation ID, never request values. Deriving `Serialize` and `Deserialize` needs `serde` with the `derive` feature: `serde = { version = "1", features = ["derive"] }`. Within one apply, every poll receives the original request again, so the token does not need to repeat it. A create resumed by a later apply receives the request built from the configuration as it is then, which may have changed.
 
 ## poll_create
 
@@ -302,7 +339,9 @@ A rejected retry is `undetermined`, not `untracked`. The first call may have cre
 
 When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails stays pending instead of turning a healthy widget into a failed create.
 
-A create that failed after the widget existed is `failed` with the identifier, so Carina records the widget and the next plan can retry or delete it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. `undetermined` is for the cases where the provider cannot tell what happened, such as the rejected retry or an empty identifier from the API. Carina keeps an undetermined attempt in state, and every later apply resumes and polls it again, so use it when a later poll might settle the create, not as a way to give up.
+A create that failed after the widget existed is `failed` with the identifier, so Carina records the widget and the next plan can retry or delete it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error, so Carina can record the widget's state. `failed` returns a `CreateVerdict`, and `.into()` turns it into the `PollVerdict` that `poll_create` returns.
+
+Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. `undetermined` is for the cases where the provider cannot tell what happened, such as the rejected retry or an empty identifier from the API. Carina keeps an undetermined attempt in state, and every later apply resumes and polls it again, so use it when a later poll might settle the create, not as a way to give up.
 
 ## resume_create
 
@@ -389,7 +428,7 @@ fn update(
 }
 ```
 
-Apply exactly the operations in the patch and nothing else. Check every operation before the first API call, so an operation the provider cannot apply does not leave the others half done. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`.
+Apply exactly the operations in the patch and nothing else. Check every operation before the first API call, so an operation the provider cannot apply does not leave the others half done. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. The SDK's `UpdateOutcome` is either `Done` or `Pending`. `Done` wraps the protocol's own `UpdateOutcome`, whose `Success` variant carries an `AppliedPersistedState`: the resource's identifier and its attributes after the update. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`.
 
 `from` holds a secret value as a hash, never the secret itself. If the update needs a secret, it is in the patch.
 
