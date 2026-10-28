@@ -9,7 +9,7 @@ A provider has two version numbers. Its own release version is yours to choose. 
 
 The host and the provider talk through a versioned protocol. `carina-provider-protocol` defines two numbers: `PROTOCOL_VERSION`, the version this build speaks, and `MIN_SUPPORTED_PROTOCOL_VERSION`, the oldest provider version the host still loads. The SDK writes the version it was built with into the provider's `info` response; you never set it yourself.
 
-Every time Carina loads a provider, for `init`, `validate`, `plan`, `apply` or any other command, it checks that version first and refuses to go further if it is out of range:
+Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
 provider 'hello' was built against protocol version 10 but this host requires at least version 12; rebuild the provider against the current carina protocol
@@ -19,7 +19,7 @@ provider 'hello' was built against protocol version 10 but this host requires at
 provider 'hello' was built against protocol version 13 but this host supports up to version 12; upgrade carina to load this provider
 ```
 
-Both numbers are 12 today, so a provider has to be built for exactly protocol 12 to load in the current Carina. The releases so far:
+So far every release has set the minimum equal to its own version, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
@@ -45,3 +45,7 @@ Users then need both the new Carina and the new provider. A provider release can
 `info` also returns the provider's own version; the SDK examples use `env!("CARGO_PKG_VERSION")`, the crate version. Users choose a release by that version: with a `github.com/<owner>/<repo>` source, `version` is a semver constraint matched against your release tags (`v0.1.0`), and `carina-providers.lock` records the exact release and checksum installed. `carina init --upgrade` re-resolves the constraint to the newest matching release.
 
 Follow semver for your own version as usual. A protocol bump that forces users to upgrade Carina is a breaking change for them, even if your resources did not change.
+
+## Next steps
+
+[Publishing](/providers/writing/publishing/) covers releasing a provider through the registry, which is not open to third parties yet.

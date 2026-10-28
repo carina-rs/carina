@@ -27,16 +27,16 @@ The registry checks every rule when a version is published and refuses a bundle 
 | What | Rule |
 |------|------|
 | Archive | One gzip member holding a POSIX tar archive (`ustar` or `pax`) |
-| Entries | Regular files and directories only: no symbolic or hard links. Paths longer than `ustar` allows need `pax`, not GNU long names |
+| Entries | Regular files and directories only: no symbolic or hard links. A directory entry declares size 0. Paths longer than `ustar` allows need `pax`, not GNU long names. No pax global headers; each pax extended header at most 64 KiB. Only zero bytes after the end-of-archive marker |
 | Paths | Relative, `/`-separated, no empty, `.` or `..` component; one leading `./` is ignored |
 | Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`; nothing else |
 | Slugs | `[a-z0-9][a-z0-9_]*`, at most 128 bytes |
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
 
-Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when one plus the largest number of `|` characters on any line, multiplied by its number of lines, exceeds 250,000. Each page's rendered HTML is capped at 2 MiB, and the rendered pages of one version at 64 MiB in total. Ordinary documentation is far below all of these.
+Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when one plus the largest number of `|` characters on any line, multiplied by its number of lines, exceeds 250,000. Each page's rendered HTML is capped at 2 MiB, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
 
-Docs are accepted only for stable versions, not pre-releases, and a version's docs are fixed when it is first published: corrected docs ship with the next version.
+Docs are accepted only for stable versions. A pre-release publish that carries a docs bundle is refused as a whole, so attach docs only to stable releases. A version's docs are fixed when it is first published: corrected docs ship with the next version.
 
 ## How pages are rendered
 
@@ -44,14 +44,14 @@ The registry treats documentation as untrusted input. It renders GitHub Flavored
 
 - Raw HTML is dropped. An HTML block disappears entirely, and an inline tag is removed while the text around it stays.
 - Images are not rendered. A bundle holds Markdown only.
-- Links can go to `http`, `https` or `mailto` URLs, to a heading on the same page (`#arguments`), or to another page of the same bundle by its relative path (`[greeting](resources/greeting.md)`). A bundle link is rewritten to that page's URL for the same version. Any other link is removed and its text kept.
+- Links can go to `http`, `https` or `mailto` URLs, to a heading on the same page (`#arguments`), or to another page of the same bundle by a path relative to the linking file, without a query string. From `index.md` that is `[greeting](resources/greeting.md)`; from another resource page it is `[greeting](greeting.md)`. A bundle link is rewritten to that page's URL for the same version. Any other link, including one to a file the bundle does not hold, is removed and its text kept.
 - Code blocks with a language the registry recognizes are syntax highlighted.
 
 ## Building the archive
 
 Build the archive reproducibly: entries sorted by name, a fixed modification time, owner and group 0, and no timestamp in the gzip header. A publish that is retried compares the archive's digest, so a rebuild that produces different bytes from the same files is refused as a conflict.
 
-This script uses only the Python standard library and produces the same bytes from the same files on any platform:
+This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, skips hidden files such as `.DS_Store`, and stops on any other file, which the registry would refuse. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
 
 ```python
 #!/usr/bin/env python3
@@ -61,18 +61,28 @@ Usage: build-docs-bundle.py <docs-dir> <output.tar.gz>
 """
 import gzip
 import io
+import re
 import sys
 import tarfile
 from pathlib import Path
 
 src, out = Path(sys.argv[1]), Path(sys.argv[2])
-files = sorted(p for p in src.rglob("*") if p.is_file())
+allowed = re.compile(r"index\.md|(resources|data-sources)/[a-z0-9][a-z0-9_]*\.md")
+
+files, unexpected = [], []
+for path in sorted(p for p in src.rglob("*") if p.is_file()):
+    name = path.relative_to(src).as_posix()
+    if any(part.startswith(".") for part in path.relative_to(src).parts):
+        continue  # editor and OS files such as .DS_Store
+    (files if allowed.fullmatch(name) else unexpected).append((name, path))
+if unexpected:
+    sys.exit("not allowed in a docs bundle: " + ", ".join(n for n, _ in unexpected))
 
 buf = io.BytesIO()
 with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
-    for path in files:
+    for name, path in files:
         data = path.read_bytes()
-        info = tarfile.TarInfo(path.relative_to(src).as_posix())
+        info = tarfile.TarInfo(name)
         info.size = len(data)
         info.mode = 0o644
         info.mtime = 0
@@ -89,7 +99,7 @@ with open(out, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename
 python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 ```
 
-Attach the archive to the same GitHub release as the `.wasm`. The registry fetches it from that URL when the version is published.
+Attach the archive to the same GitHub release as the `.wasm`. The registry fetches it from that URL when the version is published. When the version is signed, the same release workflow run must also sign the archive's digest, in the same way as the `.wasm`; the registry refuses docs signed by another run, or not signed at all. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
 
 There is no standalone checker for these rules yet; the registry runs them at publish. Making the registry's own validator available to providers is tracked in [carina-rs/registry#139](https://github.com/carina-rs/registry/issues/139).
 
