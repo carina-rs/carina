@@ -410,6 +410,21 @@ fn wasm_entries_with_limit(
     Ok(entries)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockedArtifactOperation {
+    Inspect,
+    Download,
+}
+
+impl LockedArtifactOperation {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Download => "download",
+        }
+    }
+}
+
 mod revision_artifact_selection {
     use super::*;
 
@@ -440,7 +455,43 @@ mod revision_artifact_selection {
     pub(super) struct SelectedRevisionArtifact {
         artifact_id: ArtifactId,
         wasm_bytes: Vec<u8>,
-        unavailable_artifact_id: Option<ArtifactId>,
+        recovery: Option<RevisionArtifactRecovery>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct RevisionArtifactRecovery {
+        artifact_id: ArtifactId,
+        reason: String,
+    }
+
+    impl RevisionArtifactRecovery {
+        pub(super) fn unavailable(artifact_id: ArtifactId) -> Self {
+            Self {
+                artifact_id,
+                reason: "was unavailable".to_string(),
+            }
+        }
+
+        pub(super) fn different_commit(
+            artifact_id: ArtifactId,
+            actual_sha: &CommitSha,
+            pinned_sha: &CommitSha,
+        ) -> Self {
+            Self {
+                artifact_id,
+                reason: format!(
+                    "belongs to commit {actual_sha}, not the pinned commit {pinned_sha}"
+                ),
+            }
+        }
+
+        pub(super) fn artifact_id(&self) -> ArtifactId {
+            self.artifact_id
+        }
+
+        pub(super) fn reason(&self) -> &str {
+            &self.reason
+        }
     }
 
     impl SelectedRevisionArtifact {
@@ -448,12 +499,12 @@ mod revision_artifact_selection {
             Self {
                 artifact_id,
                 wasm_bytes,
-                unavailable_artifact_id: None,
+                recovery: None,
             }
         }
 
-        fn recovered_from(mut self, artifact_id: ArtifactId) -> Self {
-            self.unavailable_artifact_id = Some(artifact_id);
+        fn recovered_from(mut self, recovery: RevisionArtifactRecovery) -> Self {
+            self.recovery = Some(recovery);
             self
         }
 
@@ -465,8 +516,8 @@ mod revision_artifact_selection {
             &self.wasm_bytes
         }
 
-        pub(super) fn unavailable_artifact_id(&self) -> Option<ArtifactId> {
-            self.unavailable_artifact_id
+        pub(super) fn recovery(&self) -> Option<&RevisionArtifactRecovery> {
+            self.recovery.as_ref()
         }
     }
 
@@ -526,29 +577,14 @@ mod revision_artifact_selection {
         }
     }
 
+    #[derive(Debug)]
     pub(super) enum LockedReplayError {
-        Metadata(ArtifactDownloadError),
-        Download(ArtifactDownloadError),
+        Github {
+            operation: LockedArtifactOperation,
+            error: ArtifactDownloadError,
+        },
+        DifferentCommit(CommitSha),
         InvalidArtifact(String),
-    }
-
-    impl LockedReplayError {
-        pub(super) fn into_message(
-            self,
-            source: &GithubSource,
-            sha: &CommitSha,
-            artifact_id: ArtifactId,
-        ) -> String {
-            match self {
-                Self::Metadata(error) => {
-                    locked_artifact_metadata_error(source, sha, artifact_id, &error)
-                }
-                Self::Download(error) => {
-                    locked_artifact_download_error(source, sha, artifact_id, &error)
-                }
-                Self::InvalidArtifact(message) => message,
-            }
-        }
     }
 
     pub(super) fn select_artifact_from_runs<F, D>(
@@ -671,7 +707,7 @@ mod revision_artifact_selection {
         source: &GithubSource,
         sha: &CommitSha,
         project_dir: &Path,
-        unavailable_artifact_id: ArtifactId,
+        recovery: RevisionArtifactRecovery,
         fetch: F,
         download: D,
     ) -> Result<SelectedRevisionArtifact, String>
@@ -688,7 +724,7 @@ mod revision_artifact_selection {
             fetch,
             download,
         )
-        .map(|selected| selected.recovered_from(unavailable_artifact_id))
+        .map(|selected| selected.recovered_from(recovery))
     }
 
     pub(super) fn replay_locked_artifact<M, D>(
@@ -703,19 +739,19 @@ mod revision_artifact_selection {
         D: FnMut(ArtifactId) -> Result<Vec<u8>, ArtifactDownloadError>,
     {
         let actual_head_sha =
-            artifact_head_sha(artifact_id).map_err(LockedReplayError::Metadata)?;
-        if actual_head_sha.as_ref() != Some(sha) {
-            let actual_head_sha = actual_head_sha
-                .as_ref()
-                .map(CommitSha::as_str)
-                .unwrap_or("<missing>");
-            return Err(LockedReplayError::Metadata(
-                ArtifactDownloadError::MissingOrGone(format!(
-                    "Locked artifact {artifact_id} belongs to commit {actual_head_sha}, not the pinned commit {sha}"
-                )),
-            ));
+            artifact_head_sha(artifact_id).map_err(|error| LockedReplayError::Github {
+                operation: LockedArtifactOperation::Inspect,
+                error,
+            })?;
+        if let Some(actual_head_sha) = actual_head_sha
+            && &actual_head_sha != sha
+        {
+            return Err(LockedReplayError::DifferentCommit(actual_head_sha));
         }
-        let zip_data = download(artifact_id).map_err(LockedReplayError::Download)?;
+        let zip_data = download(artifact_id).map_err(|error| LockedReplayError::Github {
+            operation: LockedArtifactOperation::Download,
+            error,
+        })?;
         let entries = wasm_entries(zip_data).map_err(|error| {
             LockedReplayError::InvalidArtifact(format!(
                 "Failed to inspect locked artifact {artifact_id} for {source}@{sha}: {error}"
@@ -746,32 +782,21 @@ mod revision_artifact_selection {
 }
 
 use revision_artifact_selection::{
-    LockedReplayError, RevisionArtifactPinState, SelectedRevisionArtifact, replay_locked_artifact,
-    select_artifact_from_runs, select_recovery_artifact_from_runs,
+    LockedReplayError, RevisionArtifactPinState, RevisionArtifactRecovery,
+    SelectedRevisionArtifact, replay_locked_artifact, select_artifact_from_runs,
+    select_recovery_artifact_from_runs,
 };
 
-fn locked_artifact_download_error(
+fn locked_artifact_error(
+    operation: LockedArtifactOperation,
     source: &GithubSource,
     sha: &CommitSha,
     artifact_id: ArtifactId,
     error: &ArtifactDownloadError,
 ) -> String {
+    let verb = operation.verb();
     let mut message =
-        format!("Failed to download locked artifact {artifact_id} for {source}@{sha}: {error}.");
-    if error.is_retryable() {
-        message.push_str(" Retry after resolving the GitHub API or network failure.");
-    }
-    message
-}
-
-fn locked_artifact_metadata_error(
-    source: &GithubSource,
-    sha: &CommitSha,
-    artifact_id: ArtifactId,
-    error: &ArtifactDownloadError,
-) -> String {
-    let mut message =
-        format!("Failed to inspect locked artifact {artifact_id} for {source}@{sha}: {error}.");
+        format!("Failed to {verb} locked artifact {artifact_id} for {source}@{sha}: {error}.");
     if error.is_retryable() {
         message.push_str(" Retry after resolving the GitHub API or network failure.");
     }
@@ -821,7 +846,7 @@ where
     };
     let mut prefetched_artifacts = HashMap::new();
     let mut fallback_run_ids = None;
-    let mut unavailable_artifact_id = None;
+    let mut recovery = None;
     if mode != LockMode::Upgrade
         && let Some((_lock_entry, pin)) = artifact_pin.pinned()
     {
@@ -833,25 +858,45 @@ where
             &mut download,
         ) {
             Ok(selected) => return Ok(selected),
-            Err(LockedReplayError::Metadata(error)) if error.is_missing_or_gone() => {
-                unavailable_artifact_id = Some(pin.artifact_id);
+            Err(LockedReplayError::Github {
+                operation: _,
+                error,
+            }) if error.is_missing_or_gone() => {
+                recovery = Some(RevisionArtifactRecovery::unavailable(pin.artifact_id));
             }
-            Err(LockedReplayError::Metadata(error)) => {
-                return Err(locked_artifact_metadata_error(
+            Err(LockedReplayError::DifferentCommit(actual_sha)) => {
+                recovery = Some(RevisionArtifactRecovery::different_commit(
+                    pin.artifact_id,
+                    &actual_sha,
+                    sha,
+                ));
+            }
+            Err(LockedReplayError::Github {
+                operation: LockedArtifactOperation::Inspect,
+                error,
+            }) => {
+                return Err(locked_artifact_error(
+                    LockedArtifactOperation::Inspect,
                     source,
                     sha,
                     pin.artifact_id,
                     &error,
                 ));
             }
-            Err(LockedReplayError::Download(error)) if error.is_missing_or_gone() => {
-                unavailable_artifact_id = Some(pin.artifact_id);
-            }
-            Err(LockedReplayError::Download(error)) => {
+            Err(LockedReplayError::Github {
+                operation: LockedArtifactOperation::Download,
+                error,
+            }) => {
                 let run_ids = find_runs().map_err(|listing_error| {
                     format!(
                         "{} Could not check whether the artifact expired: {listing_error}",
-                        locked_artifact_download_error(source, sha, pin.artifact_id, &error)
+                        locked_artifact_error(
+                            LockedArtifactOperation::Download,
+                            source,
+                            sha,
+                            pin.artifact_id,
+                            &error,
+                        )
                     )
                 })?;
                 let mut marked_expired = false;
@@ -859,7 +904,13 @@ where
                     let artifacts = fetch(run_id).map_err(|listing_error| {
                         format!(
                             "{} Could not check whether the artifact expired: {listing_error}",
-                            locked_artifact_download_error(source, sha, pin.artifact_id, &error)
+                            locked_artifact_error(
+                                LockedArtifactOperation::Download,
+                                source,
+                                sha,
+                                pin.artifact_id,
+                                &error,
+                            )
                         )
                     })?;
                     marked_expired |= artifacts
@@ -868,18 +919,19 @@ where
                     prefetched_artifacts.insert(run_id, artifacts);
                 }
                 if !marked_expired {
-                    return Err(locked_artifact_download_error(
+                    return Err(locked_artifact_error(
+                        LockedArtifactOperation::Download,
                         source,
                         sha,
                         pin.artifact_id,
                         &error,
                     ));
                 }
-                unavailable_artifact_id = Some(pin.artifact_id);
+                recovery = Some(RevisionArtifactRecovery::unavailable(pin.artifact_id));
                 fallback_run_ids = Some(run_ids);
             }
-            Err(error) => {
-                return Err(error.into_message(source, sha, pin.artifact_id));
+            Err(LockedReplayError::InvalidArtifact(message)) => {
+                return Err(message);
             }
         }
     }
@@ -891,13 +943,13 @@ where
         Some(artifacts) => Ok(artifacts),
         None => fetch(run_id),
     };
-    match unavailable_artifact_id {
-        Some(artifact_id) => select_recovery_artifact_from_runs(
+    match recovery {
+        Some(recovery) => select_recovery_artifact_from_runs(
             &run_ids,
             source,
             sha,
             project_dir,
-            artifact_id,
+            recovery,
             &mut fetch_artifacts,
             &mut download,
         ),
@@ -913,7 +965,6 @@ where
     }
 }
 
-/// Download a GitHub Actions artifact ZIP.
 fn artifact_head_sha<H: GithubHttp + ?Sized>(
     repo: &RepoSlug,
     artifact_id: ArtifactId,
@@ -924,6 +975,7 @@ fn artifact_head_sha<H: GithubHttp + ?Sized>(
         .map_err(ArtifactDownloadError::from_github)
 }
 
+/// Download a GitHub Actions artifact ZIP.
 fn download_artifact_zip<H: GithubHttp + ?Sized>(
     repo: &RepoSlug,
     artifact_id: ArtifactId,
@@ -977,6 +1029,12 @@ pub(crate) fn global_cache_path_revision(
 mod revision_artifact_cache {
     use super::*;
 
+    #[derive(Debug)]
+    pub(super) enum PublishError<E> {
+        Metadata(io::Error),
+        Artifact(E),
+    }
+
     /// Unverified revision cache metadata read alongside a cached WASM path.
     pub(super) struct CachedRevisionArtifact {
         artifact_id: ArtifactId,
@@ -1016,7 +1074,7 @@ mod revision_artifact_cache {
         })
     }
 
-    pub(super) fn write(wasm_path: &Path, artifact_id: ArtifactId) -> io::Result<()> {
+    fn write(wasm_path: &Path, artifact_id: ArtifactId) -> io::Result<()> {
         let sidecar = sidecar_path(wasm_path);
         let parent = sidecar.parent().ok_or_else(|| {
             io::Error::new(
@@ -1035,16 +1093,16 @@ mod revision_artifact_cache {
         Ok(())
     }
 
-    pub(super) fn remove(wasm_path: &Path) -> io::Result<()> {
-        match std::fs::remove_file(sidecar_path(wasm_path)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        std::fs::remove_file(wasm_path)
+    pub(super) fn publish<T, E>(
+        wasm_path: &Path,
+        artifact_id: ArtifactId,
+        publish_artifact: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, PublishError<E>> {
+        write(wasm_path, artifact_id).map_err(PublishError::Metadata)?;
+        publish_artifact().map_err(PublishError::Artifact)
     }
 
-    pub(super) fn remove_if_present(wasm_path: &Path) -> io::Result<()> {
+    pub(super) fn remove(wasm_path: &Path) -> io::Result<()> {
         for path in [sidecar_path(wasm_path), wasm_path.to_path_buf()] {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -1057,10 +1115,6 @@ mod revision_artifact_cache {
 }
 
 use revision_artifact_cache::CachedRevisionArtifact;
-
-pub(crate) fn remove_revision_artifact_cache_entry(wasm_path: &Path) -> io::Result<()> {
-    revision_artifact_cache::remove(wasm_path)
-}
 
 mod verified_revision_artifact {
     use super::*;
@@ -1085,15 +1139,15 @@ mod verified_revision_artifact {
         fn new(
             artifact_id: ArtifactId,
             path: WasmArtifactPath,
-            source: String,
-            name: String,
+            source: &str,
+            name: &str,
             sha256: String,
         ) -> Self {
             Self {
                 artifact_id,
                 path,
-                source,
-                name,
+                source: source.to_string(),
+                name: name.to_string(),
                 sha256,
             }
         }
@@ -1102,25 +1156,9 @@ mod verified_revision_artifact {
             Self::new(
                 artifact_id,
                 artifact.path().clone(),
-                artifact.source().to_string(),
-                name.to_string(),
+                artifact.source(),
+                name,
                 artifact.sha256().to_string(),
-            )
-        }
-
-        fn from_first_use(
-            artifact_id: ArtifactId,
-            path: WasmArtifactPath,
-            source: &str,
-            name: &str,
-            sha256: String,
-        ) -> Self {
-            Self::new(
-                artifact_id,
-                path,
-                source.to_string(),
-                name.to_string(),
-                sha256,
             )
         }
 
@@ -1173,15 +1211,23 @@ mod verified_revision_artifact {
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
-        crate::install_lock::install_project_artifact_from_global_cache(
-            install_lock,
-            cached.path(),
-            destination,
-            lock_entry,
-            name,
-        )
-        .map(|artifact| {
-            VerifiedRevisionArtifact::from_verified(cached.artifact_id(), artifact, name)
+        revision_artifact_cache::publish(destination.as_path(), cached.artifact_id(), || {
+            crate::install_lock::install_project_artifact_from_global_cache(
+                install_lock,
+                cached.path(),
+                destination,
+                lock_entry,
+                name,
+            )
+            .map(|artifact| {
+                VerifiedRevisionArtifact::from_verified(cached.artifact_id(), artifact, name)
+            })
+        })
+        .map_err(|error| match error {
+            revision_artifact_cache::PublishError::Metadata(error) => VerifiedArtifactError::Other(
+                revision_cache_metadata_error(destination.as_path(), error),
+            ),
+            revision_artifact_cache::PublishError::Artifact(error) => error,
         })
     }
 
@@ -1200,15 +1246,9 @@ mod verified_revision_artifact {
                 ),
                 pin,
             },
-            DownloadedArtifact::FirstUse { path, sha256 } => {
-                PublishedRevisionArtifact::FirstUse(VerifiedRevisionArtifact::from_first_use(
-                    selected.artifact_id(),
-                    path,
-                    source,
-                    name,
-                    sha256,
-                ))
-            }
+            DownloadedArtifact::FirstUse { path, sha256 } => PublishedRevisionArtifact::FirstUse(
+                VerifiedRevisionArtifact::new(selected.artifact_id(), path, source, name, sha256),
+            ),
         }
     }
 
@@ -1220,9 +1260,17 @@ mod verified_revision_artifact {
         source: &str,
         name: &str,
     ) -> Result<PublishedRevisionArtifact, String> {
-        let staged = stage_selected_artifact(install_lock, destination, selected)?;
-        crate::verified_artifact::publish_download(staged, pin)
-            .map(|downloaded| from_downloaded(selected, downloaded, source, name))
+        revision_artifact_cache::publish(destination.as_path(), selected.artifact_id(), || {
+            let staged = stage_selected_artifact(install_lock, destination, selected)?;
+            crate::verified_artifact::publish_download(staged, pin)
+                .map(|downloaded| from_downloaded(selected, downloaded, source, name))
+        })
+        .map_err(|error| match error {
+            revision_artifact_cache::PublishError::Metadata(error) => {
+                revision_cache_metadata_error(destination.as_path(), error)
+            }
+            revision_artifact_cache::PublishError::Artifact(error) => error,
+        })
     }
 
     pub(super) fn publish_unchanged_revision_download(
@@ -1233,9 +1281,17 @@ mod verified_revision_artifact {
         source: &str,
         name: &str,
     ) -> Result<PublishedRevisionArtifact, String> {
-        let staged = stage_selected_artifact(install_lock, destination, selected)?;
-        crate::verified_artifact::publish_unchanged_revision_download(staged, pin)
-            .map(|downloaded| from_downloaded(selected, downloaded, source, name))
+        revision_artifact_cache::publish(destination.as_path(), selected.artifact_id(), || {
+            let staged = stage_selected_artifact(install_lock, destination, selected)?;
+            crate::verified_artifact::publish_unchanged_revision_download(staged, pin)
+                .map(|downloaded| from_downloaded(selected, downloaded, source, name))
+        })
+        .map_err(|error| match error {
+            revision_artifact_cache::PublishError::Metadata(error) => {
+                revision_cache_metadata_error(destination.as_path(), error)
+            }
+            revision_artifact_cache::PublishError::Artifact(error) => error,
+        })
     }
 }
 
@@ -1259,16 +1315,11 @@ fn revision_lock_entry(
     }
 }
 
-fn write_revision_cache_artifact_id(
-    wasm_path: &Path,
-    artifact_id: ArtifactId,
-) -> Result<(), String> {
-    revision_artifact_cache::write(wasm_path, artifact_id).map_err(|error| {
-        format!(
-            "Failed to write revision cache metadata {}: {error}",
-            wasm_path.display()
-        )
-    })
+fn revision_cache_metadata_error(wasm_path: &Path, error: io::Error) -> String {
+    format!(
+        "Failed to write revision cache metadata {}: {error}",
+        wasm_path.display()
+    )
 }
 
 fn install_global_revision_artifact(
@@ -1276,28 +1327,38 @@ fn install_global_revision_artifact(
     destination: &GlobalArtifactPath,
     artifact_id: ArtifactId,
 ) -> Result<(), String> {
-    write_revision_cache_artifact_id(destination.as_path(), artifact_id)?;
-    install_global_artifact_atomically(source, destination).map_err(|error| {
-        let cleanup = revision_artifact_cache::remove_if_present(destination.as_path());
-        match cleanup {
-            Ok(()) => format!(
-                "Failed to install global revision cache artifact {}: {error}. The incomplete cache entry was removed.",
-                destination.as_path().display()
-            ),
-            Err(cleanup_error) => format!(
-                "Failed to install global revision cache artifact {}: {error}. Failed to remove the incomplete cache entry: {cleanup_error}.",
-                destination.as_path().display()
-            ),
+    revision_artifact_cache::publish(destination.as_path(), artifact_id, || {
+        install_global_artifact_atomically(source, destination)
+    })
+    .map_err(|error| match error {
+        revision_artifact_cache::PublishError::Metadata(error) => {
+            revision_cache_metadata_error(destination.as_path(), error)
+        }
+        revision_artifact_cache::PublishError::Artifact(error) => {
+            let cleanup = revision_artifact_cache::remove(destination.as_path());
+            match cleanup {
+                Ok(()) => format!(
+                    "Failed to install global revision cache artifact {}: {error}. The incomplete cache entry was removed.",
+                    destination.as_path().display()
+                ),
+                Err(cleanup_error) => format!(
+                    "Failed to install global revision cache artifact {}: {error}. Failed to remove the incomplete cache entry: {cleanup_error}.",
+                    destination.as_path().display()
+                ),
+            }
         }
     })
 }
 
 fn revision_artifact_recovery_notice(
-    unavailable_artifact_id: ArtifactId,
+    recovery: &RevisionArtifactRecovery,
     replacement_artifact_id: ArtifactId,
     mode: LockMode,
     project_dir: &Path,
-) -> String {
+) -> Option<String> {
+    if recovery.artifact_id() == replacement_artifact_id {
+        return None;
+    }
     let lock_status = match mode {
         LockMode::Locked => format!(
             "Running `{}` updates the lock.",
@@ -1305,10 +1366,12 @@ fn revision_artifact_recovery_notice(
         ),
         LockMode::Normal | LockMode::Upgrade => "The lock was updated.".to_string(),
     };
-    format!(
-        "Pinned artifact {unavailable_artifact_id} was unavailable; the artifact with the same \
-         sha256 was re-selected ({replacement_artifact_id}). {lock_status}"
-    )
+    Some(format!(
+        "Pinned artifact {} {}; the artifact with the same sha256 was re-selected \
+         ({replacement_artifact_id}). {lock_status}",
+        recovery.artifact_id(),
+        recovery.reason(),
+    ))
 }
 
 struct RevisionGithubOps<R, F, A, M, D> {
@@ -1430,7 +1493,7 @@ where
             match verified_revision_artifact::from_existing(&cached, lock_entry, name, base_dir) {
                 Ok(verified) => verified,
                 Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
-                    let removal = install_lock.remove_project_artifact(&wasm_path);
+                    let removal = revision_artifact_cache::remove(wasm_path.as_path());
                     return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
                 }
                 Err(VerifiedArtifactError::Other(message)) => return Err(message),
@@ -1465,7 +1528,6 @@ where
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
-        write_revision_cache_artifact_id(verified.path().as_path(), verified.artifact_id())?;
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
                 &verified,
@@ -1498,7 +1560,6 @@ where
         &mut artifact_head_sha,
         &mut download_artifact,
     )?;
-    let unavailable_artifact_id = selected.unavailable_artifact_id();
     if let Some((_resolved_sha, expected_sha256)) = &legacy_pin {
         let actual_sha256 = format!("{:x}", Sha256::digest(selected.wasm_bytes()));
         if &actual_sha256 != expected_sha256 {
@@ -1529,7 +1590,6 @@ where
     }?;
     let verified = match published {
         PublishedRevisionArtifact::Pinned { artifact, pin } => {
-            write_revision_cache_artifact_id(artifact.path().as_path(), artifact.artifact_id())?;
             if mode != LockMode::Locked {
                 lock_file.upsert(revision_lock_entry(
                     &artifact,
@@ -1545,7 +1605,6 @@ where
                     "Locked resolution for provider '{name}' has no matching revision entry"
                 ));
             }
-            write_revision_cache_artifact_id(artifact.path().as_path(), artifact.artifact_id())?;
             lock_file.upsert(revision_lock_entry(&artifact, revision, &sha));
             artifact
         }
@@ -1561,16 +1620,11 @@ where
         )?;
     }
 
-    if let Some(unavailable_artifact_id) = unavailable_artifact_id {
-        eprintln!(
-            "{}",
-            revision_artifact_recovery_notice(
-                unavailable_artifact_id,
-                selected.artifact_id(),
-                mode,
-                base_dir,
-            )
-        );
+    if let Some(recovery) = selected.recovery()
+        && let Some(notice) =
+            revision_artifact_recovery_notice(recovery, selected.artifact_id(), mode, base_dir)
+    {
+        eprintln!("{notice}");
     }
 
     eprintln!("Installed provider '{}' ({source}@{})", name, sha.short());
@@ -1613,6 +1667,11 @@ mod tests {
         let mut sidecar = wasm_path.as_os_str().to_os_string();
         sidecar.push(".artifact-id");
         PathBuf::from(sidecar)
+    }
+
+    fn write_revision_cache_metadata_for_test(wasm_path: &Path, artifact_id: ArtifactId) {
+        revision_artifact_cache::publish(wasm_path, artifact_id, || Ok::<(), io::Error>(()))
+            .unwrap();
     }
 
     fn workflow_run_id(value: u64) -> WorkflowRunId {
@@ -1695,7 +1754,7 @@ mod tests {
         let wasm_path = cache_path_revision(dir.path(), &source, &test_sha());
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::write(&wasm_path, b"tampered provider").unwrap();
-        revision_artifact_cache::write(&wasm_path, test_artifact_id(42)).unwrap();
+        write_revision_cache_metadata_for_test(&wasm_path, test_artifact_id(42));
         let sidecar_path = revision_sidecar_path(&wasm_path);
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
@@ -1806,7 +1865,7 @@ mod tests {
         let global_wasm = global_cache_path_revision(&source, &test_sha()).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
-        revision_artifact_cache::write(global_wasm.as_path(), test_artifact_id(42)).unwrap();
+        write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
         let global_sidecar = revision_sidecar_path(global_wasm.as_path());
         let project_wasm = cache_path_revision(project.path(), &source, &test_sha());
         let actual_sha256 = sha256_file(global_wasm.as_path()).unwrap();
@@ -1935,6 +1994,128 @@ mod tests {
             old_bytes,
             "new bytes must not be installed after their sidecar write fails"
         );
+    }
+
+    #[test]
+    fn revision_project_sidecar_write_failure_after_recovery_does_not_publish_bytes() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = test_source();
+        let wasm = b"locked provider";
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: test_sha(),
+                artifact_id: test_artifact_id(42),
+            },
+            sha256: sha256_bytes(wasm),
+            registry: None,
+        });
+        let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
+        let sidecar = revision_sidecar_path(&wasm_path);
+        std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
+
+        let error = resolve_provider_by_revision_with(
+            &mut guarded,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+            RevisionGithubOps {
+                resolve_ref: || panic!("the locked revision SHA must be reused"),
+                list_runs: |_: CommitSha| Ok(vec![workflow_run_id(7)]),
+                list_artifacts: |_| Ok(vec![artifact("replacement-build", 99, false)]),
+                artifact_head_sha: |_| Ok(Some(test_sha())),
+                download_artifact: |artifact_id: ArtifactId| match artifact_id.get() {
+                    42 => Err(ArtifactDownloadError::missing_or_gone(404)),
+                    99 => Ok(artifact_zip(&[("provider.wasm", wasm)])),
+                    other => panic!("unexpected artifact {other}"),
+                },
+            },
+        )
+        .expect_err("the project revision sidecar failure must be reported");
+
+        assert!(error.contains("revision cache metadata"), "{error}");
+        assert!(
+            !wasm_path.exists(),
+            "replacement bytes must not be published with stale cache metadata"
+        );
+        assert!(matches!(
+            guarded
+                .find_by_source_key_and_sha(&source.source_key(), &test_sha())
+                .unwrap()
+                .kind,
+            crate::provider_resolver::LockEntryKind::Revision { artifact_id, .. }
+                if artifact_id.get() == 42
+        ));
+    }
+
+    #[test]
+    fn revision_cache_crash_state_is_reverified_before_use() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = test_source();
+        let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
+        std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        std::fs::write(&wasm_path, b"bytes left by the previous cache entry").unwrap();
+        let publish_error = revision_artifact_cache::publish(
+            &wasm_path,
+            test_artifact_id(99),
+            || -> Result<(), io::Error> {
+                Err(io::Error::other("simulated byte publication failure"))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            publish_error,
+            revision_artifact_cache::PublishError::Artifact(_)
+        ));
+        let sidecar = revision_sidecar_path(&wasm_path);
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap().trim(), "99");
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: test_sha(),
+                artifact_id: test_artifact_id(42),
+            },
+            sha256: sha256_bytes(b"locked provider"),
+            registry: None,
+        });
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
+
+        let error = resolve_provider_by_revision_with(
+            &mut guarded,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+            RevisionGithubOps {
+                resolve_ref: || panic!("the locked revision SHA must be reused"),
+                list_runs: |_| panic!("an invalid warm cache must fail before origin recovery"),
+                list_artifacts: |_| panic!("an invalid warm cache must not list artifacts"),
+                artifact_head_sha: |_| panic!("an invalid warm cache must not inspect metadata"),
+                download_artifact: |_| panic!("an invalid warm cache must not download"),
+            },
+        )
+        .expect_err("the old bytes must still be checked against the sha256 pin");
+
+        assert!(error.contains("SHA256 mismatch"), "{error}");
+        assert!(!wasm_path.exists());
+        assert!(!sidecar.exists());
     }
 
     #[test]
@@ -2270,6 +2451,98 @@ mod tests {
 
     fn sha256_bytes(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn assert_resolver_ignores_ineligible_workflow_run(
+        rejected_head_repository: &str,
+        rejected_head_sha: &str,
+    ) {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = test_source();
+        let commit_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/commits/main";
+        let runs_url = format!(
+            "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/runs?head_sha={TEST_SHA}&status=success&event=push&per_page=100"
+        );
+        let eligible_artifacts_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/runs/7/artifacts?per_page=100";
+        let rejected_artifacts_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/runs/8/artifacts?per_page=100";
+        let eligible_zip_url =
+            "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/artifacts/42/zip";
+        let rejected_zip_url =
+            "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/artifacts/99/zip";
+        let http = FixtureGithubHttp::default()
+            .json(commit_url, format!(r#"{{"sha":"{TEST_SHA}"}}"#))
+            .json(
+                &runs_url,
+                format!(
+                    r#"{{"workflow_runs":[
+                        {{"id":7,"event":"push","head_repository":{{"full_name":"carina-rs/carina-provider-aws"}},"head_sha":"{TEST_SHA}"}},
+                        {{"id":8,"event":"push","head_repository":{{"full_name":"{rejected_head_repository}"}},"head_sha":"{rejected_head_sha}"}}
+                    ]}}"#
+                ),
+            )
+            .json(
+                eligible_artifacts_url,
+                r#"{"artifacts":[{"id":42,"name":"eligible-build","expired":false}]}"#,
+            )
+            .json(
+                rejected_artifacts_url,
+                r#"{"artifacts":[{"id":99,"name":"rejected-build","expired":false}]}"#,
+            )
+            .bytes(
+                eligible_zip_url,
+                artifact_zip(&[("provider.wasm", b"eligible provider")]),
+            )
+            .bytes(
+                rejected_zip_url,
+                artifact_zip(&[("provider.wasm", b"ineligible provider")]),
+            );
+        let api = GithubApi::new(&http, Some("token"));
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut guarded =
+            install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
+
+        let (installed, resolved_sha) = resolve_provider_by_revision_with_api(
+            &mut guarded,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+            &api,
+        )
+        .expect("only the eligible workflow run's build should be selected");
+
+        assert_eq!(resolved_sha, test_sha());
+        assert_eq!(
+            std::fs::read(installed.as_path()).unwrap(),
+            b"eligible provider"
+        );
+        assert!(matches!(
+            guarded
+                .find_by_source_key_and_sha(&source.source_key(), &test_sha())
+                .unwrap()
+                .kind,
+            crate::provider_resolver::LockEntryKind::Revision { artifact_id, .. }
+                if artifact_id.get() == 42
+        ));
+        assert!(
+            http.requests()
+                .iter()
+                .all(|request| request.url() != rejected_artifacts_url),
+            "the ineligible run must be filtered before artifact inspection"
+        );
+    }
+
+    #[test]
+    fn revision_resolver_filters_other_head_repository_before_artifact_selection() {
+        assert_resolver_ignores_ineligible_workflow_run("other/carina-provider-aws", TEST_SHA);
+    }
+
+    #[test]
+    fn revision_resolver_filters_other_head_sha_before_artifact_selection() {
+        assert_resolver_ignores_ineligible_workflow_run("carina-rs/carina-provider-aws", OTHER_SHA);
     }
 
     #[test]
@@ -2613,12 +2886,7 @@ sha256 = "{}"
             |_| Ok(Some(test_sha())),
             |_| Ok(zip.clone()),
         )
-        .unwrap_or_else(|error| {
-            panic!(
-                "{}",
-                error.into_message(&test_source(), &test_sha(), test_artifact_id(42))
-            )
-        });
+        .expect("byte-identical entries must replay");
 
         assert_eq!(selected.artifact_id().get(), 42);
         assert_eq!(selected.wasm_bytes(), wasm);
@@ -2652,7 +2920,7 @@ sha256 = "{}"
             "{selection_error}"
         );
 
-        let replay_error = replay_locked_artifact(
+        let replay_error = match replay_locked_artifact(
             &test_source(),
             &test_sha(),
             test_artifact_id(1),
@@ -2660,7 +2928,10 @@ sha256 = "{}"
             |_| Ok(zip.clone()),
         )
         .expect_err("different WASM contents must not replay")
-        .into_message(&test_source(), &test_sha(), test_artifact_id(1));
+        {
+            LockedReplayError::InvalidArtifact(message) => message,
+            error => panic!("unexpected replay error: {error:?}"),
+        };
 
         assert!(
             replay_error.contains("dist/provider.wasm"),
@@ -2902,6 +3173,50 @@ sha256 = "{}"
         assert_eq!(selected.wasm_bytes(), wasm);
     }
 
+    #[test]
+    fn revision_artifact_locked_replay_without_head_sha_uses_pinned_download() {
+        let wasm = b"locked provider";
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: test_sha(),
+                artifact_id: test_artifact_id(42),
+            },
+            sha256: sha256_bytes(wasm),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            &test_sha(),
+            "aws",
+        );
+
+        let selected = resolve_revision_artifact(
+            &pin,
+            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            LockMode::Normal,
+            || -> Result<Vec<WorkflowRunId>, String> {
+                panic!("missing replay metadata must not force run discovery")
+            },
+            |_| panic!("missing replay metadata must not list candidate artifacts"),
+            |_| Ok(None),
+            |artifact_id| {
+                assert_eq!(artifact_id.get(), 42);
+                Ok(artifact_zip(&[("provider.wasm", wasm)]))
+            },
+        )
+        .expect("the sha256 pin is sufficient when artifact head_sha is absent");
+
+        assert_eq!(selected.artifact_id().get(), 42);
+        assert_eq!(selected.wasm_bytes(), wasm);
+        assert!(selected.recovery().is_none());
+    }
+
     fn assert_revision_artifact_recovery_mode(mode: LockMode, expected_artifact_id: u64) {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
@@ -3086,12 +3401,14 @@ sha256 = "{}"
     #[test]
     fn revision_artifact_recovery_notice_describes_the_lock_policy_on_one_line() {
         let project_dir = Path::new("infra/project");
+        let recovery = RevisionArtifactRecovery::unavailable(test_artifact_id(42));
         let locked = revision_artifact_recovery_notice(
-            test_artifact_id(42),
+            &recovery,
             test_artifact_id(99),
             LockMode::Locked,
             project_dir,
-        );
+        )
+        .unwrap();
         assert_eq!(
             locked,
             format!(
@@ -3107,11 +3424,12 @@ sha256 = "{}"
         assert!(!locked.contains('\n'));
 
         let normal = revision_artifact_recovery_notice(
-            test_artifact_id(42),
+            &recovery,
             test_artifact_id(99),
             LockMode::Normal,
             project_dir,
-        );
+        )
+        .unwrap();
         assert_eq!(
             normal,
             "Pinned artifact 42 was unavailable; the artifact with the same sha256 was \
@@ -3120,12 +3438,53 @@ sha256 = "{}"
         assert!(!normal.contains('\n'));
         assert_eq!(
             revision_artifact_recovery_notice(
-                test_artifact_id(42),
+                &recovery,
                 test_artifact_id(99),
                 LockMode::Upgrade,
                 project_dir,
-            ),
+            )
+            .unwrap(),
             normal
+        );
+    }
+
+    #[test]
+    fn revision_artifact_recovery_notice_keeps_the_different_commit_reason() {
+        let recovery = RevisionArtifactRecovery::different_commit(
+            test_artifact_id(42),
+            &commit_sha(OTHER_SHA),
+            &test_sha(),
+        );
+
+        let notice = revision_artifact_recovery_notice(
+            &recovery,
+            test_artifact_id(99),
+            LockMode::Normal,
+            Path::new("."),
+        )
+        .unwrap();
+
+        assert!(
+            notice.contains(&format!("artifact 42 belongs to commit {OTHER_SHA}")),
+            "{notice}"
+        );
+        assert!(notice.contains(TEST_SHA), "{notice}");
+        assert!(notice.ends_with("The lock was updated."), "{notice}");
+    }
+
+    #[test]
+    fn revision_artifact_recovery_notice_omits_same_artifact_reselection() {
+        let recovery = RevisionArtifactRecovery::unavailable(test_artifact_id(42));
+
+        assert!(
+            revision_artifact_recovery_notice(
+                &recovery,
+                test_artifact_id(42),
+                LockMode::Normal,
+                Path::new("."),
+            )
+            .is_none(),
+            "the same artifact ID must produce neither a notice nor a lock-update report"
         );
     }
 
@@ -3267,7 +3626,7 @@ sha256 = "{}"
         .expect("missing locked-artifact metadata should recover by pinned-commit content");
 
         assert_eq!(selected.artifact_id().get(), 99);
-        assert_eq!(selected.unavailable_artifact_id().unwrap().get(), 42);
+        assert_eq!(selected.recovery().unwrap().artifact_id().get(), 42);
     }
 
     #[test]
@@ -3315,6 +3674,111 @@ sha256 = "{}"
             "{error}"
         );
         assert!(error.contains("Retry"), "{error}");
+    }
+
+    #[test]
+    fn revision_artifact_different_commit_recovery_carries_reason_to_notice() {
+        let wasm = b"locked provider";
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: test_sha(),
+                artifact_id: test_artifact_id(42),
+            },
+            sha256: sha256_bytes(wasm),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            &test_sha(),
+            "aws",
+        );
+
+        let selected = resolve_revision_artifact(
+            &pin,
+            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            LockMode::Normal,
+            || Ok(vec![workflow_run_id(7)]),
+            |_| Ok(vec![artifact("replacement-build", 99, false)]),
+            |_| Ok(Some(commit_sha(OTHER_SHA))),
+            |artifact_id| {
+                assert_eq!(artifact_id.get(), 99);
+                Ok(artifact_zip(&[("provider.wasm", wasm)]))
+            },
+        )
+        .expect("a cross-commit artifact ID should recover by pinned content");
+        let recovery = selected.recovery().unwrap();
+        let notice = revision_artifact_recovery_notice(
+            recovery,
+            selected.artifact_id(),
+            LockMode::Normal,
+            Path::new("."),
+        )
+        .unwrap();
+
+        assert!(notice.contains(OTHER_SHA), "{notice}");
+        assert!(notice.contains(TEST_SHA), "{notice}");
+    }
+
+    #[test]
+    fn revision_artifact_same_id_recovery_has_no_notice_or_lock_update_report() {
+        let wasm = b"locked provider";
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: test_sha(),
+                artifact_id: test_artifact_id(42),
+            },
+            sha256: sha256_bytes(wasm),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            &test_sha(),
+            "aws",
+        );
+        let download_count = Cell::new(0);
+
+        let selected = resolve_revision_artifact(
+            &pin,
+            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            LockMode::Normal,
+            || Ok(vec![workflow_run_id(7)]),
+            |_| Ok(vec![artifact("same-build", 42, false)]),
+            |_| Ok(Some(test_sha())),
+            |_| {
+                let call = download_count.get();
+                download_count.set(call + 1);
+                if call == 0 {
+                    Err(ArtifactDownloadError::missing_or_gone(404))
+                } else {
+                    Ok(artifact_zip(&[("provider.wasm", wasm)]))
+                }
+            },
+        )
+        .expect("the same artifact can be rediscovered after a transient missing response");
+
+        assert_eq!(download_count.get(), 2);
+        assert_eq!(selected.artifact_id().get(), 42);
+        assert!(
+            revision_artifact_recovery_notice(
+                selected.recovery().unwrap(),
+                selected.artifact_id(),
+                LockMode::Normal,
+                Path::new("."),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3567,7 +4031,7 @@ sha256 = "{}"
         .expect("an expired pin on page 2 must allow content recovery");
 
         assert_eq!(selected.artifact_id().get(), 99);
-        assert_eq!(selected.unavailable_artifact_id().unwrap().get(), 42);
+        assert_eq!(selected.recovery().unwrap().artifact_id().get(), 42);
         assert_eq!(
             http.requests()
                 .iter()
@@ -3636,7 +4100,8 @@ sha256 = "{}"
             let api = GithubApi::new(&http, Some("token"));
             let download_error =
                 download_artifact_zip(&repo, test_artifact_id(42), &api).unwrap_err();
-            let error = locked_artifact_download_error(
+            let error = locked_artifact_error(
+                LockedArtifactOperation::Download,
                 &source,
                 &test_sha(),
                 test_artifact_id(42),
@@ -3674,7 +4139,8 @@ sha256 = "{}"
                 matches!(&download_error, ArtifactDownloadError::RateLimited(_)),
                 "status {status}: {download_error}"
             );
-            let error = locked_artifact_download_error(
+            let error = locked_artifact_error(
+                LockedArtifactOperation::Download,
                 &source,
                 &test_sha(),
                 test_artifact_id(42),
@@ -3695,7 +4161,8 @@ sha256 = "{}"
             },
         );
 
-        let error = locked_artifact_download_error(
+        let error = locked_artifact_error(
+            LockedArtifactOperation::Download,
             &test_source(),
             &test_sha(),
             test_artifact_id(42),
@@ -3707,7 +4174,7 @@ sha256 = "{}"
     }
 
     #[test]
-    fn revision_artifact_locked_replay_rejects_sha256_mismatch() {
+    fn revision_artifact_locked_replay_without_head_sha_rejects_sha256_mismatch() {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
@@ -3734,7 +4201,7 @@ sha256 = "{}"
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> { panic!("locked replay must not list runs") },
             |_| panic!("locked replay must not fetch run artifacts"),
-            |_| Ok(Some(test_sha())),
+            |_| Ok(None),
             |_| Ok(artifact_zip(&[("provider.wasm", b"changed provider")])),
         )
         .unwrap();
