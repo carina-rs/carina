@@ -520,11 +520,16 @@ A struct type represents a nested object with typed fields.
   (`ResourceSchema::write_only_bearing`), never stored, so the flag can't
   disagree with the type. `first_write_only_conflict` rejects shapes that
   can't carry nested write-only provenance (for example, write-only inside a
-  union). On Update, every updatable desired attribute that is write-only or
-  write-only-bearing is re-sent as `PatchOp::Reassert` alongside a real
-  change (carina#3981, carina#3984). Write-only values alone never trigger
-  an Update. Accepted nested write-only leaves are recorded in state (state
-  v18; secrets as hashes) so plans converge.
+  union). The differ compares a write-only value against the accepted value
+  recorded in state, not against the read model (which omits it); see
+  `key_should_enter_patch` in `carina-core/src/differ/comparison.rs`. So an
+  **unchanged** write-only value never causes an Update by itself, and a
+  **changed** one does, sent as a normal `Replace`. When an Update happens,
+  every other updatable desired attribute that is write-only or
+  write-only-bearing is re-sent as `PatchOp::Reassert` alongside the change
+  (carina#3981, carina#3984). Accepted write-only values, including nested
+  leaves, are recorded in state (state v18; secrets as hashes) so plans
+  converge.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
   by `carina-plugin-host/src/wasm_convert.rs`. The `ResourceSchema`,
