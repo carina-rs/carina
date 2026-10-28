@@ -9934,6 +9934,107 @@ let second = m { n = 2 }\n";
 }
 
 #[test]
+fn issue_3859_anonymous_one_line_calls_keep_their_own_ranges() {
+    let main = "let m = use { source = './m' }\n\
+m { n = 'abc' }\n\
+m { label = 'x' }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let mismatch = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'abc'")
+        })
+        .collect::<Vec<_>>();
+    let missing_label = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatch[0].range,
+        Range::new(Position::new(1, 4), Position::new(1, 5))
+    );
+    assert_eq!(missing_label.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        missing_label[0].range,
+        Range::new(Position::new(1, 0), Position::new(1, 1))
+    );
+    assert_ne!(missing_label[0].range.start.line, 0);
+}
+
+#[test]
+fn issue_3859_heredoc_inside_call_keeps_unknown_parameter_range() {
+    let main = "let m = use { source = './m' }\n";
+    let calls = r#"let inst = m {
+  doc = <<EOT
+a
+b
+EOT
+  nn = 1
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("calls.crn", calls),
+        ("m/main.crn", "arguments { doc: String }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(5, 2), Position::new(5, 4))
+    );
+}
+
+#[test]
+fn issue_3859_module_call_diagnostics_stay_in_the_owning_sibling_file() {
+    let main = "let m = use { source = './m' }\n";
+    let calls = "\n\nlet inst = m { nn = 1 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("calls.crn", calls),
+        ("m/main.crn", "arguments { n: Int }\n"),
+    ]);
+
+    let main_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    assert!(
+        main_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Unknown parameter 'nn'")),
+        "main.crn diagnostics: {main_diagnostics:#?}"
+    );
+
+    let call_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
+    let unknown = call_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+    assert_eq!(unknown.len(), 1, "diagnostics: {call_diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(2, 15), Position::new(2, 17))
+    );
+}
+
+#[test]
 fn module_call_diagnostics_use_original_line_after_heredoc() {
     let main = r#"let m = use { source = './m' }
 let resource = mock.test.resource {
@@ -10017,6 +10118,14 @@ for x in ['a', 'b', 'c'] {
 
     assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(missing.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(2, 6), Position::new(2, 8))
+    );
+    assert_eq!(
+        missing[0].range,
+        Range::new(Position::new(2, 2), Position::new(2, 3))
+    );
 }
 
 #[test]

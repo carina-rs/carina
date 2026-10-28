@@ -61,7 +61,7 @@ impl ModuleCallConstraintReport {
     ) -> (ModuleCallSystemIdentity, Self) {
         let identity = ModuleCallSystemIdentity {
             source_file: source.file.clone(),
-            start_byte: source.call_span.start_byte,
+            start_byte: source.call_span.start_byte(),
             expansion_key: source.expansion_key.clone(),
         };
         (identity, Self { source, outcomes })

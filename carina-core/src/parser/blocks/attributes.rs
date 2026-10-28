@@ -6,12 +6,13 @@
 use crate::parser::ProviderContext;
 use crate::parser::Rule;
 use crate::parser::ast::{
-    ArgumentParameter, AttributeParameter, ExportParameter, ModuleCallSourceSpan, ValidationBlock,
+    ArgumentParameter, AttributeParameter, ExportParameter, SourceSpan, ValidationBlock,
 };
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::{ParseError, ParseWarning};
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
+use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
@@ -23,6 +24,7 @@ pub(in crate::parser) fn parse_arguments_block(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     ctx: &mut ParseContext,
+    preprocessed_file: &PreprocessedFile,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
@@ -64,7 +66,10 @@ pub(in crate::parser) fn parse_arguments_block(
                                     default = Some(parse_expression(expr_pair, ctx)?);
                                 }
                                 Rule::arg_validation_block => {
-                                    let source_span = parameter_source_span(&inner_attr, ctx);
+                                    let source_span = SourceSpan::from_pest(
+                                        inner_attr.as_span(),
+                                        preprocessed_file,
+                                    );
                                     let mut condition_source_span = None;
                                     let mut rule = None;
                                     let mut error_msg = None;
@@ -82,9 +87,11 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validate_expr",
                                                         "validation_condition_attr",
                                                     )?;
-                                                    condition_source_span = Some(
-                                                        parameter_source_span(&validate_pair, ctx),
-                                                    );
+                                                    condition_source_span =
+                                                        Some(SourceSpan::from_pest(
+                                                            validate_pair.as_span(),
+                                                            preprocessed_file,
+                                                        ));
                                                     rule = Some(parse_validate_expr(
                                                         validate_pair,
                                                         ctx,
@@ -174,13 +181,14 @@ fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
 pub(in crate::parser) fn parse_attributes_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<AttributeParameter>, ParseError> {
     let mut attribute_params = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::attributes_param {
-            let source_span = parameter_source_span(&param, ctx);
+            let source_span = SourceSpan::from_pest(param.as_span(), preprocessed_file);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
@@ -216,13 +224,14 @@ pub(in crate::parser) fn parse_attributes_block(
 pub(in crate::parser) fn parse_exports_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ExportParameter>, ParseError> {
     let mut export_params = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::exports_param {
-            let source_span = parameter_source_span(&param, ctx);
+            let source_span = SourceSpan::from_pest(param.as_span(), preprocessed_file);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "exports block")?
                 .as_str()
@@ -245,11 +254,4 @@ pub(in crate::parser) fn parse_exports_block(
     }
 
     Ok(export_params)
-}
-
-fn parameter_source_span(
-    param: &pest::iterators::Pair<'_, Rule>,
-    ctx: &ParseContext<'_>,
-) -> ModuleCallSourceSpan {
-    ctx.source_span(param.as_span())
 }

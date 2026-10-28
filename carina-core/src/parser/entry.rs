@@ -603,7 +603,7 @@ fn parse_with_seeded_bindings_inner(
         Vec::new()
     };
 
-    let mut ctx = ParseContext::with_preprocessed_file(config, &preprocessed_file);
+    let mut ctx = ParseContext::new(config);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
@@ -633,7 +633,8 @@ fn parse_with_seeded_bindings_inner(
                     for stmt in inner.into_inner() {
                         match stmt.as_rule() {
                             Rule::backend_block => {
-                                backend = Some(parse_backend_block(stmt, &ctx)?);
+                                backend =
+                                    Some(parse_backend_block(stmt, &ctx, &preprocessed_file)?);
                             }
                             Rule::provider_block => {
                                 let provider = parse_provider_block(stmt, &ctx)?;
@@ -651,6 +652,7 @@ fn parse_with_seeded_bindings_inner(
                                         stmt,
                                         config,
                                         &mut ctx,
+                                        &preprocessed_file,
                                         &mut warnings,
                                     );
                                     ctx.warnings = warnings;
@@ -662,7 +664,12 @@ fn parse_with_seeded_bindings_inner(
                                 let parsed_attribute_params = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_attributes_block(stmt, &ctx, &mut warnings);
+                                    let result = parse_attributes_block(
+                                        stmt,
+                                        &ctx,
+                                        &preprocessed_file,
+                                        &mut warnings,
+                                    );
                                     ctx.warnings = warnings;
                                     result?
                                 };
@@ -672,7 +679,12 @@ fn parse_with_seeded_bindings_inner(
                                 let parsed_export_params = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_exports_block(stmt, &ctx, &mut warnings);
+                                    let result = parse_exports_block(
+                                        stmt,
+                                        &ctx,
+                                        &preprocessed_file,
+                                        &mut warnings,
+                                    );
                                     ctx.warnings = warnings;
                                     result?
                                 };
@@ -688,7 +700,11 @@ fn parse_with_seeded_bindings_inner(
                                 state_blocks.push(parse_moved_block(stmt)?);
                             }
                             Rule::require_statement => {
-                                requires.push(parse_require_statement(stmt, &ctx)?);
+                                requires.push(parse_require_statement(
+                                    stmt,
+                                    &ctx,
+                                    &preprocessed_file,
+                                )?);
                             }
                             Rule::for_expr => {
                                 let iterable_name =
@@ -698,7 +714,12 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_resources,
                                     expanded_data_sources,
                                     expanded_module_calls,
-                                ) = parse_for_expr(stmt, &mut ctx, &iterable_name)?;
+                                ) = parse_for_expr(
+                                    stmt,
+                                    &mut ctx,
+                                    &iterable_name,
+                                    &preprocessed_file,
+                                )?;
                                 resources.extend(expanded_resources);
                                 data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
@@ -713,7 +734,12 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_module_calls,
                                     _import,
                                     _binding_kind,
-                                ) = parse_if_expr(stmt, &mut ctx, &binding_name)?;
+                                ) = parse_if_expr(
+                                    stmt,
+                                    &mut ctx,
+                                    &binding_name,
+                                    &preprocessed_file,
+                                )?;
                                 resources.extend(expanded_resources);
                                 data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
@@ -757,7 +783,7 @@ fn parse_with_seeded_bindings_inner(
                                     maybe_import,
                                     binding_kind,
                                     is_structural,
-                                ) = parse_let_binding_extended(stmt, &mut ctx)?;
+                                ) = parse_let_binding_extended(stmt, &mut ctx, &preprocessed_file)?;
                                 if is_structural {
                                     ctx.structural_bindings.insert(name.clone());
                                 }
@@ -883,7 +909,7 @@ fn parse_with_seeded_bindings_inner(
                                 }
                             }
                             Rule::module_call => {
-                                let call = parse_module_call(stmt, &ctx)?;
+                                let call = parse_module_call(stmt, &ctx, &preprocessed_file)?;
                                 module_calls.push(call);
                             }
                             Rule::anonymous_resource => {

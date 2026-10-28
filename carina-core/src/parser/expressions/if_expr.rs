@@ -12,7 +12,7 @@
 use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::{
-    LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, Rule,
+    LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
     evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
     parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
     parse_resource_expr,
@@ -38,6 +38,7 @@ pub(crate) fn parse_if_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
     binding_name: &str,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
 
@@ -55,7 +56,7 @@ pub(crate) fn parse_if_expr(
         && ctx.defer_provisional_static_conditions
     {
         let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
-        return parse_if_body_to_rhs(if_body_pair, ctx, binding_name);
+        return parse_if_body_to_rhs(if_body_pair, ctx, binding_name, preprocessed_file);
     }
     let condition_value = condition_value
         .into_value()
@@ -95,11 +96,11 @@ pub(crate) fn parse_if_expr(
 
     if condition {
         // Use the if branch
-        parse_if_body_to_rhs(if_body_pair, ctx, binding_name)
+        parse_if_body_to_rhs(if_body_pair, ctx, binding_name, preprocessed_file)
     } else if let Some(else_pair) = else_body_pair {
         // Use the else branch
         let else_body = first_inner(else_pair, "else body", "else clause")?;
-        parse_if_body_to_rhs(else_body, ctx, binding_name)
+        parse_if_body_to_rhs(else_body, ctx, binding_name, preprocessed_file)
     } else {
         // No else clause and condition is false: produce nothing
         Ok((
@@ -118,8 +119,9 @@ pub(crate) fn parse_if_body_to_rhs(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<LetBindingRhs, ParseError> {
-    let result = parse_if_body(pair, ctx, binding_name)?;
+    let result = parse_if_body(pair, ctx, binding_name, preprocessed_file)?;
     match result {
         IfBodyResult::Resource(r) => Ok((
             if_structural_handle(binding_name),
@@ -164,6 +166,7 @@ pub(crate) fn parse_if_body(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<IfBodyResult, ParseError> {
     let mut local_ctx = ctx.clone();
 
@@ -189,7 +192,7 @@ pub(crate) fn parse_if_body(
                 return Ok(IfBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
-                let mut call = parse_module_call(inner, &local_ctx)?;
+                let mut call = parse_module_call(inner, &local_ctx, preprocessed_file)?;
                 call.binding_name = Some(binding_name.to_string());
                 return Ok(IfBodyResult::ModuleCall(call));
             }

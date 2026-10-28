@@ -717,9 +717,9 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 return Err(ParseError::SecretDerivedBackendAttribute {
                     backend_type: backend.backend_type.clone(),
                     attribute: key.clone(),
-                    line: span.start_line,
-                    start_column: span.start_column,
-                    end_column: span.end_column,
+                    line: span.start_line(),
+                    start_column: span.start_column(),
+                    end_column: span.end_column(),
                 });
             }
             *value = evaluated;

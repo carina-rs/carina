@@ -3,9 +3,10 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{AuthoredModuleArgument, ModuleArgument, ModuleCall};
+use crate::parser::ast::{AuthoredModuleArgument, ModuleArgument, ModuleCall, SourceSpan};
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
+use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression_eval;
 use std::collections::HashMap;
 
@@ -13,9 +14,10 @@ use std::collections::HashMap;
 pub(crate) fn parse_module_call(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
-    let call_span = ctx.source_span(span);
+    let call_span = SourceSpan::from_pest(span, preprocessed_file);
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -39,8 +41,8 @@ pub(crate) fn parse_module_call(
             let value_span = value_pair.as_span();
             let value_line = value_pair.line_col().0;
             let eval = parse_expression_eval(value_pair, ctx)?;
-            let key_source_span = ctx.source_span(key_span);
-            let value_source_span = ctx.source_span(value_span);
+            let key_source_span = SourceSpan::from_pest(key_span, preprocessed_file);
+            let value_source_span = SourceSpan::from_pest(value_span, preprocessed_file);
             let argument = match &eval {
                 crate::eval_value::EvalValue::StructuralHandle(handle) => {
                     ModuleArgument::from_handle(handle.clone())

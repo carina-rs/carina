@@ -2356,13 +2356,13 @@ awscc.ec2.SecurityGroup {
             .diagnostic_source()
             .expect("attribute source");
         assert_eq!(attribute_source.file, attributes_path);
-        assert_eq!(attribute_source.span.start_line, 2);
+        assert_eq!(attribute_source.span.start_line(), 2);
         let export_file = parsed[1].1.parsed();
         let export_source = export_file.export_params[0]
             .diagnostic_source()
             .expect("export source");
         assert_eq!(export_source.file, exports_path);
-        assert_eq!(export_source.span.start_line, 2);
+        assert_eq!(export_source.span.start_line(), 2);
     }
 
     fn duplicate_messages(dir: &Path, sources: &[(&str, &str)]) -> Vec<String> {

@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ModuleCallSourceSpan, ProviderContext, ResourceContext, ResourceRef,
-    ResourceTypePath, TypeExpr,
+    ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
+    SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -602,12 +602,10 @@ pub fn suppress_coalesce_existence_error(
 /// never has to recover source identity by parsing that message.
 #[derive(Debug, Clone)]
 pub struct ModuleCallRefError {
-    /// Index into the `module_calls` slice passed to validation.
-    pub call_index: usize,
     call_label: String,
     pub argument: String,
     /// Parser-authored key span for `argument`.
-    pub argument_span: ModuleCallSourceSpan,
+    pub argument_span: SourceSpan,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
 }
@@ -681,12 +679,15 @@ fn validate_module_call_argument_ref_types_inner(
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
-    for (call_index, call) in module_calls.iter().enumerate() {
+    for call in module_calls {
         let call_name = call
             .binding_name
             .as_deref()
             .unwrap_or(call.module_name.as_str());
-        for (argument_name, value, argument_span, _) in call.arguments_with_source_spans() {
+        for authored in call.arguments_with_source_spans() {
+            let argument_name = authored.name();
+            let value = authored.argument();
+            let argument_span = authored.key_span();
             let declared_sink = imported_modules
                 .get(&call.module_name)
                 .and_then(|signature| {
@@ -707,7 +708,6 @@ fn validate_module_call_argument_ref_types_inner(
                         return;
                     };
                     errors.push(ModuleCallRefError {
-                        call_index,
                         call_label: call_name.to_string(),
                         argument: argument_name.to_string(),
                         argument_span,
@@ -2911,9 +2911,12 @@ pub fn validate_module_calls(
         if let Some(signature) = imported_modules.get(&call.module_name) {
             let module_args = &signature.arguments;
             let source_file = call.source_file();
-            for (arg_name, arg_value, _, value_span) in call.arguments_with_source_spans() {
+            for authored in call.arguments_with_source_spans() {
+                let arg_name = authored.name();
+                let arg_value = authored.argument();
+                let value_span = authored.value_span();
                 if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
-                    let line = value_span.start_line;
+                    let line = value_span.start_line();
                     let context = match source_file {
                         Some(file) => format!(
                             "module {} argument '{}' in {} at line {line}",

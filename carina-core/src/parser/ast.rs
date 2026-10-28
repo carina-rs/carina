@@ -526,7 +526,7 @@ impl ValidationBlock {
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
         self.source.span = Some(span);
         self
     }
@@ -614,7 +614,7 @@ impl RequireBlock {
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
         self.source.span = Some(span);
         self
     }
@@ -647,7 +647,7 @@ impl AttributeParameter {
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
         self.source.span = Some(span);
         self
     }
@@ -660,7 +660,7 @@ impl AttributeParameter {
         self.source.diagnostic_source()
     }
 
-    pub fn source_span(&self) -> Option<ModuleCallSourceSpan> {
+    pub fn source_span(&self) -> Option<SourceSpan> {
         self.source.span
     }
 }
@@ -690,7 +690,7 @@ impl ParsedExportParam {
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
         self.source.span = Some(span);
         self
     }
@@ -703,7 +703,7 @@ impl ParsedExportParam {
         self.source.diagnostic_source()
     }
 
-    pub fn source_span(&self) -> Option<ModuleCallSourceSpan> {
+    pub fn source_span(&self) -> Option<SourceSpan> {
         self.source.span
     }
 }
@@ -1144,7 +1144,7 @@ impl ModuleCall {
     pub(crate) fn from_authored_arguments(
         module_name: impl Into<String>,
         binding_name: Option<String>,
-        call_span: ModuleCallSourceSpan,
+        call_span: SourceSpan,
         arguments: HashMap<String, AuthoredModuleArgument>,
     ) -> Self {
         Self {
@@ -1159,29 +1159,13 @@ impl ModuleCall {
         }
     }
 
-    /// Construct a synthetic module call without arguments.
-    pub fn synthetic(
-        module_name: impl Into<String>,
-        binding_name: Option<String>,
-        call_span: ModuleCallSourceSpan,
-    ) -> Self {
-        Self::from_authored_arguments(module_name, binding_name, call_span, HashMap::new())
-    }
-
     #[cfg(test)]
     pub(crate) fn test(
         module_name: impl Into<String>,
         binding_name: Option<String>,
         arguments: HashMap<String, ModuleArgument>,
     ) -> Self {
-        let span = ModuleCallSourceSpan {
-            start_byte: 0,
-            end_byte: 1,
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 2,
-        };
+        let span = SourceSpan::dummy();
         Self::from_authored_arguments(
             module_name,
             binding_name,
@@ -1212,7 +1196,7 @@ impl ModuleCall {
     }
 
     /// Return this call's parser span; every call carries one by construction.
-    pub fn source_span(&self) -> ModuleCallSourceSpan {
+    pub fn source_span(&self) -> SourceSpan {
         self.source.call_span
     }
 
@@ -1223,27 +1207,18 @@ impl ModuleCall {
             .map(|(name, argument)| (name.as_str(), &argument.argument))
     }
 
-    /// Iterate authored arguments with their parser key and value spans.
+    /// Iterate borrowed authored arguments with their parser key and value spans.
     ///
     /// Every authored argument carries both spans by construction.
-    pub fn arguments_with_source_spans(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            &str,
-            &ModuleArgument,
-            ModuleCallSourceSpan,
-            ModuleCallSourceSpan,
-        ),
-    > {
-        self.arguments.iter().map(|(name, argument)| {
-            (
-                name.as_str(),
-                &argument.argument,
-                argument.key_span,
-                argument.value_span,
-            )
-        })
+    pub fn arguments_with_source_spans(&self) -> impl Iterator<Item = AuthoredArgumentRef<'_>> {
+        self.arguments
+            .iter()
+            .map(|(name, argument)| AuthoredArgumentRef {
+                name,
+                argument: &argument.argument,
+                key_span: argument.key_span,
+                value_span: argument.value_span,
+            })
     }
 
     pub fn argument(&self, name: &str) -> Option<&ModuleArgument> {
@@ -1260,14 +1235,13 @@ impl ModuleCall {
             .map(|argument| &mut argument.argument)
     }
 
-    /// Parser-authored span for one call argument before a source file is
-    /// attached by directory loading.
-    pub fn argument_source_span(&self, name: &str) -> Option<ModuleCallSourceSpan> {
+    /// Parser-authored key span for one call argument.
+    pub fn argument_source_span(&self, name: &str) -> Option<SourceSpan> {
         self.arguments.get(name).map(|argument| argument.key_span)
     }
 
     /// Parser-authored span for one call argument's value expression.
-    pub fn argument_value_source_span(&self, name: &str) -> Option<ModuleCallSourceSpan> {
+    pub fn argument_value_source_span(&self, name: &str) -> Option<SourceSpan> {
         self.arguments.get(name).map(|argument| argument.value_span)
     }
 
@@ -1286,18 +1260,45 @@ impl ModuleCall {
     }
 }
 
+/// Borrowed view of one parser-authored module-call argument.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthoredArgumentRef<'a> {
+    name: &'a str,
+    argument: &'a ModuleArgument,
+    key_span: SourceSpan,
+    value_span: SourceSpan,
+}
+
+impl<'a> AuthoredArgumentRef<'a> {
+    pub fn name(self) -> &'a str {
+        self.name
+    }
+
+    pub fn argument(self) -> &'a ModuleArgument {
+        self.argument
+    }
+
+    pub fn key_span(self) -> SourceSpan {
+        self.key_span
+    }
+
+    pub fn value_span(self) -> SourceSpan {
+        self.value_span
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthoredModuleArgument {
     argument: ModuleArgument,
-    key_span: ModuleCallSourceSpan,
-    value_span: ModuleCallSourceSpan,
+    key_span: SourceSpan,
+    value_span: SourceSpan,
 }
 
 impl AuthoredModuleArgument {
     pub(crate) fn new(
         argument: ModuleArgument,
-        key_span: ModuleCallSourceSpan,
-        value_span: ModuleCallSourceSpan,
+        key_span: SourceSpan,
+        value_span: SourceSpan,
     ) -> Self {
         Self {
             argument,
@@ -1310,14 +1311,14 @@ impl AuthoredModuleArgument {
 #[derive(Debug, Clone)]
 struct ModuleCallSite {
     file: Option<std::path::PathBuf>,
-    call_span: ModuleCallSourceSpan,
+    call_span: SourceSpan,
     expansion_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct DeclarationSource {
-    pub(crate) file: Option<std::path::PathBuf>,
-    pub(crate) span: Option<ModuleCallSourceSpan>,
+    file: Option<std::path::PathBuf>,
+    span: Option<SourceSpan>,
 }
 
 impl DeclarationSource {
@@ -1333,21 +1334,24 @@ impl DeclarationSource {
 ///
 /// Module calls, their arguments, and declaration parameters share this
 /// representation. Lines and columns are one-indexed, matching pest positions.
-/// Byte offsets are retained as the stable parser-assigned identity within a
-/// source file.
+/// Calls expanded from one `for` body intentionally share the authored span
+/// and are distinguished by [`ModuleCall::expansion_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ModuleCallSourceSpan {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_column: usize,
-    pub end_line: usize,
-    pub end_column: usize,
+pub struct SourceSpan {
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
 }
 
-impl ModuleCallSourceSpan {
+impl SourceSpan {
     /// Build a parser-authored span while restoring heredoc-collapsed lines.
-    pub(crate) fn from_pest(span: pest::Span<'_>, file: &crate::parser::PreprocessedFile) -> Self {
+    pub(in crate::parser) fn from_pest(
+        span: pest::Span<'_>,
+        file: &crate::parser::PreprocessedFile,
+    ) -> Self {
         let (start_line, start_column) = span.start_pos().line_col();
         let (end_line, end_column) = span.end_pos().line_col();
         Self {
@@ -1359,21 +1363,57 @@ impl ModuleCallSourceSpan {
             end_column,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn dummy() -> Self {
+        Self {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+        }
+    }
+
+    pub const fn start_byte(self) -> usize {
+        self.start_byte
+    }
+
+    pub const fn end_byte(self) -> usize {
+        self.end_byte
+    }
+
+    pub const fn start_line(self) -> usize {
+        self.start_line
+    }
+
+    pub const fn start_column(self) -> usize {
+        self.start_column
+    }
+
+    pub const fn end_line(self) -> usize {
+        self.end_line
+    }
+
+    pub const fn end_column(self) -> usize {
+        self.end_column
+    }
 }
 
-/// Source identity for a declaration with an optional parser-authored span.
+/// Source identity for a declaration with its required parser-authored span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationDiagnosticSource {
     pub file: std::path::PathBuf,
-    pub span: ModuleCallSourceSpan,
+    pub span: SourceSpan,
 }
 
 /// Source identity carried from parsing through module expansion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleCallDiagnosticSource {
     pub file: std::path::PathBuf,
-    pub call_span: ModuleCallSourceSpan,
-    pub argument_spans: HashMap<String, ModuleCallSourceSpan>,
+    pub call_span: SourceSpan,
+    pub argument_spans: HashMap<String, SourceSpan>,
     /// Distinguishes concrete calls expanded from the same authored `for`
     /// body. Direct calls have no expansion key.
     pub expansion_key: Option<String>,
@@ -1541,7 +1581,7 @@ pub struct BackendConfig {
     /// Parser-authored source spans for attribute keys. Runtime and saved-plan
     /// representations deliberately omit this diagnostic-only metadata.
     #[serde(skip)]
-    pub attribute_spans: HashMap<String, ModuleCallSourceSpan>,
+    pub attribute_spans: HashMap<String, SourceSpan>,
 }
 
 /// Upstream state reference: `let <binding> = upstream_state { source = "<dir>" }`.

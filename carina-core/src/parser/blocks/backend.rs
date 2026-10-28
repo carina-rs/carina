@@ -4,10 +4,11 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{BackendConfig, UpstreamState};
+use crate::parser::ast::{BackendConfig, SourceSpan, UpstreamState};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;
+use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::util::unwrap_to_primary;
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 pub(in crate::parser) fn parse_backend_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<BackendConfig, ParseError> {
     let mut inner = pair.into_inner();
     let backend_type = next_pair(&mut inner, "backend type", "backend block")?
@@ -33,7 +35,10 @@ pub(in crate::parser) fn parse_backend_block(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
             )?;
-            attribute_spans.insert(key.clone(), ctx.source_span(key_span));
+            attribute_spans.insert(
+                key.clone(),
+                SourceSpan::from_pest(key_span, preprocessed_file),
+            );
             attributes.insert(key, value);
         }
     }

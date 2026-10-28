@@ -6819,12 +6819,12 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
         .diagnostic_source()
         .expect("attribute source");
     assert_eq!(attribute_source.file, attributes_path);
-    assert_eq!(attribute_source.span.start_line, 2);
+    assert_eq!(attribute_source.span.start_line(), 2);
     let export_source = parsed.export_params[0]
         .diagnostic_source()
         .expect("export source");
     assert_eq!(export_source.file, exports_path);
-    assert_eq!(export_source.span.start_line, 2);
+    assert_eq!(export_source.span.start_line(), 2);
 }
 
 #[test]
