@@ -18,6 +18,121 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("mock-provider.wasm");
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/mock-provider/mock-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"mock fixture").unwrap();
+    std::fs::write(&installed_path, b"mock fixture").unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let invalid = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+    let loader_called = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&loader_called);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[],
+        tmp.path(),
+        false,
+        &invalid,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "unexpected load".into(),
+                ))
+            }
+        },
+    )
+    .unwrap();
+    assert!(factories.is_empty());
+    assert!(errors.is_empty());
+    assert!(invalid.parsed.get().is_none());
+
+    let called = Arc::clone(&loader_called);
+    let result = build_factories_from_providers_impl_using(
+        std::slice::from_ref(&config),
+        tmp.path(),
+        false,
+        &invalid,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "unexpected load".into(),
+                ))
+            }
+        },
+    );
+    let Err(error) = result else {
+        panic!("invalid grants must fail when the first provider load begins")
+    };
+    assert!(matches!(
+        error,
+        AppError::TrustedLocalGrant(
+            carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+        )
+    ));
+    assert!(!loader_called.load(Ordering::SeqCst));
+
+    let valid = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
+    let saw_aws = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&saw_aws);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[config],
+        tmp.path(),
+        false,
+        &valid,
+        move |verified| {
+            observed.store(
+                verified.identity().trust().class()
+                    == carina_provider_resolver::ProviderTrustClass::Aws,
+                Ordering::SeqCst,
+            );
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "stop after trust observation".into(),
+                ))
+            }
+        },
+    )
+    .unwrap();
+
+    assert!(factories.is_empty());
+    assert!(
+        errors
+            .get("aws")
+            .is_some_and(|message| message.contains("stop after trust observation")),
+        "the injected loader error should prove the production path was reached: {errors:?}"
+    );
+    assert!(saw_aws.load(Ordering::SeqCst));
+}
+
+#[test]
+fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
+
+    let error = inputs.get().unwrap_err();
+
+    assert!(matches!(
+        error,
+        carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+    ));
+    assert!(inputs.parsed.get().is_none());
+}
+
 fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
@@ -395,16 +510,187 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
     }
 }
 
-#[test]
-fn source_provider_kind_mismatch_is_rejected() {
-    let source = "file:///tmp/provider.wasm".parse().unwrap();
-    let error = ensure_source_provider_kind_matches("configured", "reported", &source)
-        .expect_err("a source provider must report the configured block kind");
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wasm_path = tmp.path().join("provider.wasm");
+    std::fs::write(&wasm_path, b"fixture").unwrap();
+    let source: ProviderSource = format!("file://{}", wasm_path.display()).parse().unwrap();
+    let config = ProviderConfig {
+        name: "configured".into(),
+        source: Some(source.clone()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let installed =
+        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
 
-    assert_eq!(
-        error.to_string(),
-        "Provider block kind 'configured' does not match loaded provider name 'reported' from source 'file:///tmp/provider.wasm'."
+    let reported_mismatch = installed.with_load_error(
+        carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+            configured: "configured".into(),
+            reported: "reported".into(),
+        },
     );
+    let reported = source_provider_kind_mismatch_from_load_error(&source, &reported_mismatch)
+        .expect("an artifact-reported name mismatch must be fatal");
+    assert_eq!(
+        reported.to_string(),
+        format!(
+            "Provider block kind 'configured' does not match loaded provider name 'reported' from source '{source}'."
+        )
+    );
+
+    let grants = carina_provider_resolver::TrustedLocalGrants::parse(
+        &[format!("{}=aws", wasm_path.display())],
+        None,
+    )
+    .unwrap();
+    let identity_mismatch = installed
+        .load_with(&grants, |_verified| async {
+            Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
+        })
+        .await
+        .unwrap_err();
+    let identity = source_provider_kind_mismatch_from_load_error(&source, &identity_mismatch)
+        .expect("a trusted-identity name mismatch must be fatal");
+    assert_eq!(
+        identity.to_string(),
+        format!(
+            "Provider block kind 'configured' does not match trusted provider identity 'aws or awscc' from source '{source}'."
+        )
+    );
+
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/provider/provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&installed_path, b"fixture").unwrap();
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[config],
+        tmp.path(),
+        false,
+        &inputs,
+        |_verified| async {
+            Err(
+                carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+                    configured: "configured".into(),
+                    reported: "reported".into(),
+                },
+            )
+        },
+    )
+    .unwrap();
+    assert!(factories.is_empty());
+    assert!(
+        errors
+            .get("configured")
+            .is_some_and(|message| message.contains("artifact-reported name 'reported'")),
+        "the factory-discovery path must retain mismatches as load diagnostics: {errors:?}"
+    );
+}
+
+#[test]
+fn unverified_official_factory_load_is_fatal_before_loader() {
+    let _env_guard = crate::test_env_guard();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(unverified_official_factory_load_case());
+}
+
+async fn unverified_official_factory_load_case() {
+    let project = tempfile::tempdir().unwrap();
+    let trust = tempfile::tempdir().unwrap();
+    let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+    let source = "github.com/carina-rs/carina-provider-aws";
+    let version = "0.1.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("official source must be remote")
+    };
+    let wasm_path = carina_provider_resolver::cache_path_wasm(
+        project.path(),
+        &remote_source.source_key(),
+        version,
+    );
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"official provider fixture").unwrap();
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "aws".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            version: version.parse().unwrap(),
+            tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
+            asset_id: serde_json::from_str("42").unwrap(),
+            constraint: None,
+        },
+        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        registry: None,
+    });
+    lock.save(&project.path().join("carina-providers.lock"))
+        .unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let loader_called = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&loader_called);
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+
+    let result = build_factories_from_providers_impl_using(
+        std::slice::from_ref(&config),
+        project.path(),
+        false,
+        &inputs,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "loader must not run".into(),
+                ))
+            }
+        },
+    );
+
+    assert!(!loader_called.load(Ordering::SeqCst));
+    let Err(error) = result else {
+        panic!("unverified official providers must be fatal")
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.starts_with(&format!(
+            "{source} is a carina-rs provider but this user hasn't verified it; run `carina init {}`",
+            project.path().display()
+        )),
+        "{rendered}"
+    );
+    assert!(
+        std::error::Error::source(&error).is_none(),
+        "the transparent AppError must not re-expose the self-contained diagnostic"
+    );
+    assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
+
+    let configs = validated_provider_configs(vec![config]);
+    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
+    let Err(error) =
+        get_provider_with_ctx(&ctx, &configs, project.path(), ProgressSink::Human).await
+    else {
+        panic!("plan/apply wiring must not skip an unverified official provider")
+    };
+    assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -7341,7 +7627,7 @@ mod kind_default_source_tests {
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "github.com/carina-rs/carina-provider-awscc";
+    let source = "github.com/example/carina-provider-awscc";
     let revision = "main";
     let resolved_sha = test_commit_sha();
     let github_source = match source
@@ -7397,13 +7683,17 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let cache = tempfile::tempdir().unwrap();
     let cache_path = cache.path().to_path_buf();
 
-    let error = match load_installed_wasm_provider_using(&installed, |bytes| async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-            bytes.as_bytes(),
-            &cache_path,
-        )
-        .await
-    })
+    let error = match load_installed_wasm_provider_using(
+        &installed,
+        trusted_local_grants().unwrap(),
+        |verified| async move {
+            carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+                verified,
+                &cache_path,
+            )
+            .await
+        },
+    )
     .await
     {
         Ok(_) => panic!("fixture component must not instantiate as a provider"),
@@ -7479,7 +7769,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
 async fn registry_source_reaches_cli_artifact_loader() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "carina-rs/awscc";
+    let source = "example/awscc";
     let version = "0.5.0";
     let provider_source: ProviderSource = source.parse().unwrap();
     let ProviderSource::Remote(remote_source) = &provider_source else {
@@ -7528,7 +7818,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
 async fn registry_source_reaches_plan_apply_provider_loader() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "carina-rs/awscc";
+    let source = "example/awscc";
     let version = "0.5.0";
     let provider_source: ProviderSource = source.parse().unwrap();
     let ProviderSource::Remote(remote_source) = &provider_source else {
@@ -7602,7 +7892,8 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let installed = carina_provider_resolver::find_file_provider_source(&config).unwrap();
+    let installed =
+        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
 
     let error = runtime_instantiation_error_with_provenance(
         &installed,
@@ -7656,7 +7947,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+    let (factories, load_errors) =
+        build_factories_from_providers_for_formatting(&[config], base).unwrap();
 
     assert!(factories.is_empty());
     assert!(!load_errors.is_empty());
@@ -7729,7 +8021,8 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     );
     assert!(std::error::Error::source(&runtime_error).is_none());
 
-    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+    let (factories, load_errors) =
+        build_factories_from_providers_for_formatting(&[config], base).unwrap();
     assert!(factories.is_empty());
     let formatting_error = load_errors
         .get("carina-providers.lock")

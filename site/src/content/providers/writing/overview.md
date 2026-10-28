@@ -20,7 +20,7 @@ You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `
 
 `export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, write `export_provider!(MyProvider, http)` and add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
 
-The host checks every outgoing request against a fixed allow-list: hosts ending in `.amazonaws.com` or `.amazonaws.com.cn`, and the EC2 and ECS metadata addresses. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
+The host checks every outgoing request against a fixed allow-list. Hosts ending in `.amazonaws.com` or `.amazonaws.com.cn` are reachable, while the EC2 and ECS metadata addresses are reachable only by providers the host trusts as AWS. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. The EKS Pod Identity endpoints (`169.254.170.23` and `fd00:ec2::23`) and arbitrary hosts named by `AWS_CONTAINER_CREDENTIALS_FULL_URI` are not reachable. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
 
 ## How the host calls a provider
 
@@ -75,12 +75,14 @@ Create results go through a typestate in the SDK, so a provider must say what it
 A provider runs with no filesystem access. It sees only these environment variables:
 
 - `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
-- AWS credential and region variables, only for providers named `aws` or `awscc`.
-- `GITHUB_TOKEN`, only for a provider named `github`.
+- AWS credential and region variables, only when this user's `carina init` downloaded the exact artifact from the origin for `carina-rs/aws` or `carina-rs/awscc` (including their official GitHub sources) and recorded its source and SHA-256 in the user's trust directory, or for a matching local build explicitly granted the `aws` kind.
+- `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
-The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
+For a remote provider, the host hashes the bytes being loaded and looks for that SHA-256 and canonical source in a user-owned record under `~/.carina/trust/`. It then applies the fixed official-source allow-list. Registry records are written only after the registry signature verifies, and a signer recorded for the source must belong to `carina-rs`. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot create this record and does not grant credentials. This also applies in CI: restoring `.carina/` without the trust directory makes official providers fail before their WebAssembly code runs, so the job must run `carina init` or persist the trust directory (`CARINA_TRUST_RECORD_DIR` can relocate it). An absent, unreadable, malformed, or non-`carina-rs` record produces an error that tells the user to run `carina init`.
 
-Environment variables are not the only route to credentials. On EC2, the metadata address is open to every provider that uses the HTTP world, whatever its name, so such a provider can read the instance role's credentials. Install providers you trust only, especially on EC2. Restricting this is tracked in [carina#4022](https://github.com/carina-rs/carina/issues/4022).
+A local `file://` build receives no credential partition unless its canonical source path is granted with `--trust-local-provider <PATH=KIND>` or `CARINA_TRUST_LOCAL_PROVIDER`; Carina checks that the bytes being loaded still match that source file. A stale entry in `CARINA_TRUST_LOCAL_PROVIDER` makes provider-loading commands fail until it is fixed or removed. Declare other settings as attributes of the `provider` block, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
+
+The same user trust record controls metadata access. Only a recorded artifact from an allow-listed AWS source can reach the EC2 or ECS metadata addresses and read role credentials from them.
 
 ## Protocol version
 

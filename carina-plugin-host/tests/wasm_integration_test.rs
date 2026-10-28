@@ -21,6 +21,15 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
+use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
+
+fn mock_identity() -> ProviderLoadIdentity {
+    ProviderLoadIdentity::for_test("mock", ProviderTrustClass::Untrusted)
+}
+
+fn mock_load(bytes: &[u8]) -> VerifiedLoad {
+    VerifiedLoad::for_test(bytes, mock_identity())
+}
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
@@ -194,9 +203,10 @@ macro_rules! skip_if_no_wasm {
 async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm_bytes, cache.path())
-        .await
-        .expect("Failed to load WASM provider");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(mock_load(&wasm_bytes), cache.path())
+            .await
+            .expect("Failed to load WASM provider");
     (factory, cache)
 }
 

@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use colored::Colorize;
@@ -75,6 +75,68 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
+
+static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
+
+#[derive(Debug)]
+struct TrustedLocalGrantInputs {
+    cli_values: Vec<String>,
+    env_value: Option<std::ffi::OsString>,
+    parsed: OnceLock<carina_provider_resolver::TrustedLocalGrants>,
+}
+
+impl TrustedLocalGrantInputs {
+    fn new(cli_values: Vec<String>, env_value: Option<std::ffi::OsString>) -> Self {
+        Self {
+            cli_values,
+            env_value,
+            parsed: OnceLock::new(),
+        }
+    }
+
+    fn get(
+        &self,
+    ) -> Result<
+        &carina_provider_resolver::TrustedLocalGrants,
+        carina_provider_resolver::GrantParseError,
+    > {
+        if let Some(grants) = self.parsed.get() {
+            return Ok(grants);
+        }
+        let grants = carina_provider_resolver::TrustedLocalGrants::parse_os(
+            &self.cli_values,
+            self.env_value.as_deref(),
+        )?;
+        Ok(self.parsed.get_or_init(|| grants))
+    }
+}
+
+/// Error returned when process-local grant inputs were already installed.
+#[derive(Debug, thiserror::Error)]
+#[error("trusted local provider grant inputs were already installed")]
+pub struct TrustedLocalGrantInputsAlreadySetError;
+
+/// Install the raw process-local grant inputs captured by the CLI entry point.
+///
+/// The grants live only for this process and are never written to project
+/// locks, provider caches, saved plans, or state.
+pub fn set_trusted_local_grant_inputs(
+    cli_values: Vec<String>,
+    env_value: Option<std::ffi::OsString>,
+) -> Result<(), TrustedLocalGrantInputsAlreadySetError> {
+    TRUSTED_LOCAL_GRANT_INPUTS
+        .set(TrustedLocalGrantInputs::new(cli_values, env_value))
+        .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
+}
+
+fn trusted_local_grants() -> Result<
+    &'static carina_provider_resolver::TrustedLocalGrants,
+    carina_provider_resolver::GrantParseError,
+> {
+    TRUSTED_LOCAL_GRANT_INPUTS
+        .get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None))
+        .get()
+}
 
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
@@ -305,9 +367,7 @@ pub fn build_factories_from_providers(
 ) -> Result<ProviderFactoryLoad, AppError> {
     carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
-    Ok(build_factories_from_providers_impl(
-        providers, base_dir, true,
-    ))
+    build_factories_from_providers_impl(providers, base_dir, true)
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -320,32 +380,59 @@ pub fn build_factories_from_providers(
 pub(crate) fn build_factories_from_providers_for_formatting(
     providers: &[ProviderConfig],
     base_dir: &Path,
-) -> FormattingFactoryLoad {
+) -> Result<FormattingFactoryLoad, AppError> {
     if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
-        return (
+        return Ok((
             Vec::new(),
             HashMap::from([(
                 "carina-providers.lock".to_string(),
                 ProviderFactoryDiagnostic::LockConstraint(error),
             )]),
-        );
+        ));
     }
 
-    let (factories, load_errors) = build_factories_from_providers_impl(providers, base_dir, false);
-    (
+    let (factories, load_errors) = build_factories_from_providers_impl(providers, base_dir, false)?;
+    Ok((
         factories,
         load_errors
             .into_iter()
             .map(|(provider, message)| (provider, ProviderFactoryDiagnostic::Message(message)))
             .collect(),
-    )
+    ))
 }
 
 fn build_factories_from_providers_impl(
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
-) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
+) -> Result<ProviderFactoryLoad, AppError> {
+    let grant_inputs =
+        TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
+    build_factories_from_providers_impl_using(
+        providers,
+        base_dir,
+        report_errors,
+        grant_inputs,
+        |verified| async move { carina_plugin_host::WasmProviderFactory::from_bytes(verified).await },
+    )
+}
+
+fn build_factories_from_providers_impl_using<L, Fut>(
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+    report_errors: bool,
+    grant_inputs: &TrustedLocalGrantInputs,
+    mut loader: L,
+) -> Result<ProviderFactoryLoad, AppError>
+where
+    L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                carina_plugin_host::WasmProviderFactory,
+                carina_plugin_host::WasmProviderLoadError,
+            >,
+        >,
+{
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
 
@@ -364,8 +451,9 @@ fn build_factories_from_providers_impl(
             }
         };
 
+        let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(load_installed_wasm_provider(&installed))
+            tokio::runtime::Handle::current().block_on(installed.load_with(grants, &mut loader))
         });
 
         match factory_result {
@@ -385,6 +473,10 @@ fn build_factories_from_providers_impl(
                 factories.push(Box::new(factory));
             }
             Err(error) => {
+                let error = match take_unverified_official_load_error(error) {
+                    Ok(unverified) => return Err(AppError::from(unverified)),
+                    Err(error) => error,
+                };
                 // Final UI boundary: `ProviderArtifactLoadError::Display`
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
@@ -397,30 +489,32 @@ fn build_factories_from_providers_impl(
         }
     }
 
-    (factories, load_errors)
+    Ok((factories, load_errors))
 }
 
 async fn load_installed_wasm_provider(
     installed: &carina_provider_resolver::InstalledProvider,
+    grants: &carina_provider_resolver::TrustedLocalGrants,
 ) -> Result<
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 > {
-    load_installed_wasm_provider_using(installed, |bytes| async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes()).await
+    load_installed_wasm_provider_using(installed, grants, |verified| async move {
+        carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
     })
     .await
 }
 
 async fn load_installed_wasm_provider_using<F, Fut>(
     installed: &carina_provider_resolver::InstalledProvider,
+    grants: &carina_provider_resolver::TrustedLocalGrants,
     loader: F,
 ) -> Result<
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 >
 where
-    F: FnOnce(carina_provider_resolver::ProviderArtifactBytes) -> Fut,
+    F: FnOnce(carina_provider_resolver::VerifiedLoad) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 carina_plugin_host::WasmProviderFactory,
@@ -429,7 +523,7 @@ where
         >,
 {
     // Injection keeps wiring regression tests out of the user's default precompile cache.
-    let factory = installed.load_with(loader).await?;
+    let factory = installed.load_with(grants, loader).await?;
     let runtime_artifact = installed.clone();
     Ok(
         factory.with_runtime_instantiation_error_mapper(move |error| {
@@ -2053,6 +2147,8 @@ async fn try_add_source_provider(
             Err(source_provider_initialization_error(config.name(), e))
         }
         Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
+        Err(LoadSourceError::TrustedLocalGrant(error)) => Err(AppError::from(error)),
+        Err(LoadSourceError::UnverifiedOfficial(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::Wasm(error)) => {
             // Terminal display boundary for the structured host error plus
             // resolver provenance. The underlying error remains typed until
@@ -2074,20 +2170,59 @@ fn source_provider_initialization_error(provider_name: &str, error: ProviderErro
     AppError::Provider(error.for_provider(provider_name.to_string()))
 }
 
-fn ensure_source_provider_kind_matches(
-    configured: &str,
-    loaded: &str,
+fn source_provider_kind_mismatch_from_load_error(
     source: &ProviderSource,
-) -> Result<(), AppError> {
-    if configured == loaded {
-        return Ok(());
+    error: &carina_provider_resolver::ProviderArtifactLoadError<
+        carina_plugin_host::WasmProviderLoadError,
+    >,
+) -> Option<AppError> {
+    if let Some((configured, expected)) = error
+        .identity_error()
+        .and_then(|identity| identity.name_mismatch())
+    {
+        return Some(AppError::SourceProviderTrustMismatch {
+            configured: configured.to_string(),
+            expected: expected.to_string(),
+            provider_source: source.to_string(),
+        });
     }
 
-    Err(AppError::SourceProviderKindMismatch {
-        configured: configured.to_string(),
-        loaded: loaded.to_string(),
-        provider_source: source.to_string(),
-    })
+    match error.loader_error()? {
+        carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+            configured,
+            reported,
+        } => Some(AppError::SourceProviderKindMismatch {
+            configured: configured.clone(),
+            loaded: reported.clone(),
+            provider_source: source.to_string(),
+        }),
+        carina_plugin_host::WasmProviderLoadError::PrecompiledDeserialization(_)
+        | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
+        | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
+        | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
+    }
+}
+
+fn take_unverified_official_load_error<E>(
+    error: carina_provider_resolver::ProviderArtifactLoadError<E>,
+) -> Result<
+    carina_provider_resolver::UnverifiedOfficialProviderError,
+    carina_provider_resolver::ProviderArtifactLoadError<E>,
+> {
+    if error
+        .identity_error()
+        .and_then(|identity| identity.unverified_official())
+        .is_none()
+    {
+        return Err(error);
+    }
+
+    let identity = error
+        .into_identity_error()
+        .unwrap_or_else(|_| unreachable!("the load error was checked as an identity failure"));
+    Ok(identity
+        .into_unverified_official()
+        .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
 /// Failure mode for `load_source_provider`. Distinguishing between a
@@ -2112,6 +2247,10 @@ enum LoadSourceError {
             carina_plugin_host::WasmProviderLoadError,
         >,
     ),
+    /// A process-local privilege grant was invalid when provider loading began.
+    TrustedLocalGrant(carina_provider_resolver::GrantParseError),
+    /// An allow-listed provider did not have usable user-owned verification.
+    UnverifiedOfficial(carina_provider_resolver::UnverifiedOfficialProviderError),
     /// Plumbing failure such as an artifact lookup or configuration error.
     /// Logged and skipped.
     Other(String),
@@ -2134,14 +2273,22 @@ async fn load_source_provider(
         carina_provider_resolver::find_installed_provider(base_dir, config.as_provider_config())
             .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
 
-    let factory: Box<dyn ProviderFactory> = Box::new(
-        load_installed_wasm_provider(&installed)
-            .await
-            .map_err(LoadSourceError::Wasm)?,
-    );
+    let grants = trusted_local_grants().map_err(LoadSourceError::TrustedLocalGrant)?;
+    let factory = match load_installed_wasm_provider(&installed, grants).await {
+        Ok(factory) => factory,
+        Err(error) => {
+            let error = match take_unverified_official_load_error(error) {
+                Ok(unverified) => return Err(LoadSourceError::UnverifiedOfficial(unverified)),
+                Err(error) => error,
+            };
+            if let Some(mismatch) = source_provider_kind_mismatch_from_load_error(source, &error) {
+                return Err(LoadSourceError::KindMismatch(mismatch));
+            }
+            return Err(LoadSourceError::Wasm(error));
+        }
+    };
+    let factory: Box<dyn ProviderFactory> = Box::new(factory);
     let name = factory.name().to_string();
-    ensure_source_provider_kind_matches(config.name(), &name, source)
-        .map_err(LoadSourceError::KindMismatch)?;
 
     let ready_config =
         prepare_provider_ready_config(factory.as_ref(), config).map_err(LoadSourceError::Config)?;
