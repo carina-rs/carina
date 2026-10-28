@@ -363,4 +363,4 @@ A GitHub source is not signature-checked, but `carina init` records the checksum
 
 ## Next steps
 
-The mock provider in the carina repository, [`carina-provider-mock`](https://github.com/carina-rs/carina/tree/main/carina-provider-mock), implements the same trait with pending operations, polling and resume. It is a test fixture rather than a template, but it shows each create outcome in use.
+[Implementing Operations](/providers/writing/implementing-operations/) covers a provider for a real, asynchronous API: pending creates, polling, updates from a patch, and errors. The mock provider in the carina repository, [`carina-provider-mock`](https://github.com/carina-rs/carina/tree/main/carina-provider-mock), is a test fixture that exercises every create outcome.
