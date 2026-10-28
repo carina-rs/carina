@@ -25,4 +25,6 @@ carina plan
 
 The LSP reads only `CARINA_TRUST_LOCAL_PROVIDER`; it does not receive the CLI flag.
 
+A stale path or otherwise invalid `CARINA_TRUST_LOCAL_PROVIDER` entry makes commands that load providers fail until the entry is fixed or removed.
+
 The flag and environment variable are process-local authorization. They are never stored in `carina-providers.lock`, the provider cache, a saved plan, or state.

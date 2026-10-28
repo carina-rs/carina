@@ -16,6 +16,7 @@ use crate::provider_resolver::RegistrySignatureProtection;
 use crate::verified_artifact::OriginDownloadProof;
 
 const TRUST_RECORD_DIR_ENV: &str = "CARINA_TRUST_RECORD_DIR";
+const USER_TRUST_RECORD_VERSION: u32 = 1;
 
 /// A user-owned attestation that this exact provider content was downloaded
 /// from its canonical origin.
@@ -45,6 +46,7 @@ pub struct UserTrustRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserTrustRecordSerde {
+    version: u32,
     source: String,
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +57,7 @@ struct UserTrustRecordSerde {
 impl From<&UserTrustRecord> for UserTrustRecordSerde {
     fn from(record: &UserTrustRecord) -> Self {
         Self {
+            version: USER_TRUST_RECORD_VERSION,
             source: record.source.clone(),
             sha256: record.sha256.clone(),
             signer: record.signer.clone(),
@@ -109,6 +112,17 @@ impl UserTrustRecordError {
             message: message.into(),
             source: Some(Box::new(source)),
         }
+    }
+
+    pub(crate) fn display_chain(&self) -> String {
+        let mut rendered = self.to_string();
+        let mut source = Error::source(self);
+        while let Some(error) = source {
+            rendered.push_str(": ");
+            rendered.push_str(&error.to_string());
+            source = error.source();
+        }
+        rendered
     }
 }
 
@@ -191,21 +205,14 @@ impl UserTrustRecord {
             }
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
                 drop(error.file);
-                let existing = Self::load_at(&path)?;
-                if self.same_attestation(&existing) {
-                    existing.validate_recorded_at(&path)?;
-                    Ok(())
-                } else {
-                    let replacement = Self::stage(&contents, parent, &path)?;
-                    let file = replacement.persist(&path).map_err(|error| {
-                        UserTrustRecordError::with_source(
-                            format!("Failed to replace provider trust record {}", path.display()),
-                            error.error,
-                        )
-                    })?;
-                    drop(file);
-                    sync_directory(parent);
-                    Ok(())
+                let existing_contents = Self::read_at(&path)?;
+                let existing = Self::parse_at(&path, &existing_contents).and_then(|record| {
+                    record.validate_recorded_at(&path)?;
+                    Ok(record)
+                });
+                match existing {
+                    Ok(existing) if self.same_attestation(&existing) => Ok(()),
+                    Ok(_) | Err(_) => Self::replace(&contents, parent, &path),
                 }
             }
             Err(error) => Err(UserTrustRecordError::with_source(
@@ -250,21 +257,48 @@ impl UserTrustRecord {
         Ok(staged)
     }
 
+    fn replace(contents: &[u8], parent: &Path, path: &Path) -> Result<(), UserTrustRecordError> {
+        let replacement = Self::stage(contents, parent, path)?;
+        let file = replacement.persist(path).map_err(|error| {
+            UserTrustRecordError::with_source(
+                format!("Failed to replace provider trust record {}", path.display()),
+                error.error,
+            )
+        })?;
+        drop(file);
+        sync_directory(parent);
+        Ok(())
+    }
+
     fn load_at(path: &Path) -> Result<Self, UserTrustRecordError> {
-        let contents = fs::read(path).map_err(|error| {
+        let contents = Self::read_at(path)?;
+        Self::parse_at(path, &contents)
+    }
+
+    fn read_at(path: &Path) -> Result<Vec<u8>, UserTrustRecordError> {
+        fs::read(path).map_err(|error| {
             UserTrustRecordError::with_source(
                 format!("Failed to read provider trust record {}", path.display()),
                 error,
             )
+        })
+    }
+
+    fn parse_at(path: &Path, contents: &[u8]) -> Result<Self, UserTrustRecordError> {
+        let record = serde_json::from_slice::<UserTrustRecordSerde>(contents).map_err(|error| {
+            UserTrustRecordError::with_source(
+                format!("Failed to parse provider trust record {}", path.display()),
+                error,
+            )
         })?;
-        serde_json::from_slice::<UserTrustRecordSerde>(&contents)
-            .map(UserTrustRecord::from)
-            .map_err(|error| {
-                UserTrustRecordError::with_source(
-                    format!("Failed to parse provider trust record {}", path.display()),
-                    error,
-                )
-            })
+        if record.version != USER_TRUST_RECORD_VERSION {
+            return Err(UserTrustRecordError::message(format!(
+                "Failed to parse provider trust record {}: unsupported version {}",
+                path.display(),
+                record.version
+            )));
+        }
+        Ok(UserTrustRecord::from(record))
     }
 
     fn same_attestation(&self, other: &Self) -> bool {
@@ -359,7 +393,17 @@ mod tests {
 
     use super::*;
     use crate::provider_resolver::{LegacySignerPin, SignerPinState};
-    use crate::verified_artifact::record_verified_origin_download;
+    use crate::verified_artifact::record_test_github_origin_download;
+
+    fn github_source_key() -> RemoteSourceKey {
+        match "github.com/carina-rs/carina-provider-aws"
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::Remote(source) => source.source_key(),
+            ProviderSource::File(_) => unreachable!(),
+        }
+    }
 
     #[test]
     fn user_trust_record_write_replaces_changed_attestation() {
@@ -385,12 +429,67 @@ mod tests {
                 oidc_issuer: "https://token.actions.githubusercontent.com".into(),
             }));
 
-        record_verified_origin_download(&source, &sha256, Some(&first_signer)).unwrap();
-        record_verified_origin_download(&source, &sha256, Some(&new_signer)).unwrap();
+        record_test_github_origin_download(&source, &sha256, Some(&first_signer)).unwrap();
+        record_test_github_origin_download(&source, &sha256, Some(&new_signer)).unwrap();
 
         let stored = load_user_verified_identity(&sha256, &source)
             .unwrap()
             .unwrap();
         assert_eq!(stored.signer(), Some(&new_signer));
+    }
+
+    #[test]
+    fn user_trust_record_serializes_version_one() {
+        let _env_guard = crate::test_env_guard();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = github_source_key();
+        let sha256 = "02".repeat(32);
+
+        record_test_github_origin_download(&source, &sha256, None).unwrap();
+
+        let path = trust_record_path(&sha256, source.as_str()).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 1);
+    }
+
+    #[test]
+    fn user_trust_record_write_replaces_unparsable_existing_record() {
+        let _env_guard = crate::test_env_guard();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = github_source_key();
+        let sha256 = "03".repeat(32);
+        record_test_github_origin_download(&source, &sha256, None).unwrap();
+        let path = trust_record_path(&sha256, source.as_str()).unwrap();
+
+        for broken in [
+            b"{not json".to_vec(),
+            format!(
+                r#"{{"version":2,"source":{:?},"sha256":{:?},"recorded_at":"2026-01-01T00:00:00Z"}}"#,
+                source.as_str(), sha256
+            )
+            .into_bytes(),
+            format!(
+                r#"{{"version":1,"source":{:?},"sha256":{:?},"recorded_at":"2026-01-01T00:00:00Z","unexpected":true}}"#,
+                source.as_str(), sha256
+            )
+            .into_bytes(),
+            format!(
+                r#"{{"version":1,"source":{:?},"sha256":{:?},"recorded_at":"not-a-timestamp"}}"#,
+                source.as_str(), sha256
+            )
+            .into_bytes(),
+        ] {
+            std::fs::write(&path, &broken).unwrap();
+
+            record_test_github_origin_download(&source, &sha256, None)
+                .expect("a fresh origin proof must replace an unparsable record");
+
+            assert!(load_user_verified_identity(&sha256, &source)
+                .unwrap()
+                .is_some());
+        }
     }
 }

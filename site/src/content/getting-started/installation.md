@@ -61,9 +61,13 @@ provider awscc {
 carina init
 ```
 
-`carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. It also records the downloaded artifact's canonical source, SHA-256, and verified signer when available in the current user's trust directory, `~/.carina/trust/` (overridable with `CARINA_TRUST_RECORD_DIR`). If a matching project artifact or global cache entry exists without this user record, `carina init` downloads the artifact from its origin again before creating the record.
+`carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. It also records the downloaded artifact's canonical source, SHA-256, and verified signer when available in the current user's trust directory, `~/.carina/trust/` (overridable with `CARINA_TRUST_RECORD_DIR`). If a matching project artifact or global cache entry exists without this user record, `carina init` downloads the artifact from its origin again before creating the record. The command fails if it cannot write the trust directory.
+
+After upgrading Carina, the first `carina init` re-downloads each `carina-rs` provider from its origin to create the current trust record, so it needs network access. For a GitHub `revision` source whose locked commit artifact has expired (GitHub normally retains artifacts for about 90 days), run `carina init --upgrade` to resolve a current artifact.
 
 Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing. An allow-listed `carina-rs` AWS, AWSCC, or GitHub provider receives credentials and metadata access only when the exact bytes being loaded match this user's trust record. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot grant that access; without the user record, the provider remains untrusted and Carina prints a hint to run `carina init`.
+
+In CI, restoring `.carina/` without `~/.carina/trust/` therefore loads `carina-rs` providers as untrusted, without credentials. Run `carina init` in the job or persist the trust directory; set `CARINA_TRUST_RECORD_DIR` when the CI cache uses another location.
 
 `source` takes one of three forms:
 
@@ -141,6 +145,8 @@ CARINA_TRUST_LOCAL_PROVIDER='/abs/path/carina-provider-aws.wasm=aws' carina plan
 ```
 
 The LSP reads only `CARINA_TRUST_LOCAL_PROVIDER`; it cannot receive `--trust-local-provider` from a Carina CLI invocation.
+
+Every configured entry is validated when a provider-loading command starts. A stale path or otherwise invalid `CARINA_TRUST_LOCAL_PROVIDER` entry makes those commands fail until the entry is fixed or removed.
 
 The other supported kind is `github`, for a local build of the GitHub provider. Grants last only for the current process; Carina never writes them to the provider lock, cache, saved plan, or state.
 

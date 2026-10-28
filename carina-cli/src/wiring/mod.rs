@@ -2194,7 +2194,10 @@ fn source_provider_kind_mismatch_from_load_error(
             loaded: reported.clone(),
             provider_source: source.to_string(),
         }),
-        _ => None,
+        carina_plugin_host::WasmProviderLoadError::PrecompiledDeserialization(_)
+        | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
+        | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
+        | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
     }
 }
 

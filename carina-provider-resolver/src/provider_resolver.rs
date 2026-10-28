@@ -33,10 +33,12 @@ use crate::provider_trust::{ProviderLoadIdentity, ProviderLoadIdentityError, Pro
 use crate::signing;
 use crate::trusted_local::TrustedLocalGrants;
 use crate::user_trust::{load_user_verified_identity, user_trust_record_exists};
+#[cfg(test)]
+use crate::verified_artifact::record_test_github_origin_download;
 use crate::verified_artifact::{
     DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
     VerifiedArtifactError, VerifiedLoad, VersionArtifactPin, lock_artifact_selection,
-    lookup_version_artifact_pin, publish_download, record_verified_origin_download,
+    lookup_version_artifact_pin, publish_download, record_verified_registry_origin_download,
 };
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -4154,7 +4156,7 @@ impl InstalledProvider {
         notice_sink: &mut impl FnMut(&str),
     ) -> Result<ProviderLoadIdentity, ProviderLoadIdentityError> {
         let (trust, notice) = match &self.artifact {
-            InstalledArtifact::LockFile(artifact) => remote_provider_trust(artifact),
+            InstalledArtifact::LockFile(artifact) => remote_provider_trust(artifact, notice_sink),
             InstalledArtifact::File {
                 path: _,
                 bytes,
@@ -4228,21 +4230,33 @@ impl InstalledProvider {
     }
 }
 
-fn remote_provider_trust(artifact: &VerifiedArtifact) -> (ProviderTrust, Option<String>) {
+fn remote_provider_trust(
+    artifact: &VerifiedArtifact,
+    notice_sink: &mut impl FnMut(&str),
+) -> (ProviderTrust, Option<String>) {
     match load_user_verified_identity(artifact.sha256(), artifact.source()) {
         Ok(Some(identity)) => (ProviderTrust::from_verified_remote(&identity), None),
-        Ok(None) | Err(_) => {
-            let notice =
-                ProviderTrust::remote_source_is_allowlisted(artifact.source()).then(|| {
-                    format!(
-                        "carina: run `{}` to verify {} before it receives credentials",
-                        ProjectCommand::new("init", artifact.project_dir()),
-                        artifact.source(),
-                    )
-                });
-            (ProviderTrust::untrusted(), notice)
+        Ok(None) => untrusted_remote_provider(artifact),
+        Err(error) => {
+            notice_sink(&format!(
+                "carina: warning: failed to load user trust for {}: {}",
+                artifact.source(),
+                error.display_chain()
+            ));
+            untrusted_remote_provider(artifact)
         }
     }
+}
+
+fn untrusted_remote_provider(artifact: &VerifiedArtifact) -> (ProviderTrust, Option<String>) {
+    let notice = ProviderTrust::remote_source_is_allowlisted(artifact.source()).then(|| {
+        format!(
+            "carina: run `{}` to verify {} before it receives credentials",
+            ProjectCommand::new("init", artifact.project_dir()),
+            artifact.source(),
+        )
+    });
+    (ProviderTrust::untrusted(), notice)
 }
 
 fn local_provider_trust(
@@ -6337,10 +6351,6 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         None => None,
     };
     let origin_downloaded = artifact.is_origin_download();
-    let origin_signer = origin_downloaded.then(|| match &verified_signature {
-        Some((_, acceptance)) => RegistrySignatureProtection::Required(acceptance.next.clone()),
-        None => RegistrySignatureProtection::NotRequired,
-    });
 
     let kind = match intent {
         RegistryDownloadIntent::Version => LockEntryKind::Version {
@@ -6377,9 +6387,9 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         )
     })?;
 
-    if let Some((_, acceptance)) = verified_signature {
+    if let Some((_, acceptance)) = &verified_signature {
         let transition = acceptance.transition.clone();
-        persistent_lock.record_signer_acceptance(source_key, acceptance)?;
+        persistent_lock.record_signer_acceptance(source_key, acceptance.clone())?;
         if transition != SignerTransition::Unchanged {
             eprintln!("carina: updated verified signer pins for {source_key}: {transition:?}");
         }
@@ -6394,8 +6404,18 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         registry,
         validated_sequence,
     })?;
-    if origin_downloaded {
-        record_verified_origin_download(source_key, &artifact_sha256, origin_signer.as_ref())?;
+    // Registry discovery legitimately permits artifacts on a different host.
+    // `obtain_registry_artifact` already matched the shasum; require the
+    // unforgeable signer identity from verification before minting user trust.
+    if origin_downloaded && let Some((verified_signer, acceptance)) = &verified_signature {
+        let signer = RegistrySignatureProtection::Required(acceptance.next.clone());
+        record_verified_registry_origin_download(
+            source_key,
+            download_url.as_str(),
+            &artifact_sha256,
+            &signer,
+            verified_signer,
+        )?;
     }
     Ok(artifact)
 }
@@ -6512,6 +6532,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     // Downloading from the origin is the only GitHub-direct first-use trust seam.
     let wasm_url = download_url_wasm(github_source, version);
     let wasm_download_url = parse_registry_resource_url(&wasm_url, "provider download URL")?;
+    let artifact_pin = artifact_pin.with_requested_origin_url(wasm_download_url.as_str());
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
     let mut staged = StagedArtifact::for_project(install_lock, &wasm_path).map_err(|error| {
         format!(
@@ -9287,7 +9308,7 @@ transparency_log_present = false
             sha256: cached_sha256.clone(),
             registry: None,
         });
-        record_verified_origin_download(&source_key(source), &cached_sha256, None).unwrap();
+        record_test_github_origin_download(&source_key(source), &cached_sha256, None).unwrap();
         resolve_provider(
             base,
             &provider_source(source),
@@ -14849,16 +14870,14 @@ transparency_log_present = true
     }
 
     #[tokio::test]
-    async fn registry_origin_install_writes_user_trust_and_loads_as_aws() {
+    async fn registry_signed_origin_install_writes_user_trust() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
         let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "carina-rs/aws";
-        let version = "0.5.0";
-        let origin_bytes = b"registry origin provider";
-        let shasum = sha256_bytes(origin_bytes);
-        let http = registry_http(origin_bytes, &shasum);
+        let version = SIGNED_FIXTURE_VERSION;
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock = LockFile::default();
 
         resolve_provider_with_http(
@@ -14890,7 +14909,56 @@ transparency_log_present = true
                 .iter()
                 .any(|(_, contents)| contents.is_some())
         );
-        assert_eq!(class, ProviderTrustClass::Aws);
+        // The fixture signer is intentionally not an official carina-rs
+        // identity, so writing its verified record must not bypass the fixed
+        // provider allow-list.
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+    }
+
+    #[test]
+    fn registry_user_trust_requires_verified_signature() {
+        let _env_guard = crate::test_env_guard();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let unsigned_project = tempfile::tempdir().unwrap();
+        let unsigned_bytes = b"unsigned registry provider";
+        let unsigned_http = registry_http(unsigned_bytes, &sha256_bytes(unsigned_bytes));
+        let mut unsigned_lock = LockFile::default();
+
+        resolve_provider_with_http(
+            unsigned_project.path(),
+            &provider_source("carina-rs/aws"),
+            "0.5.0",
+            "aws",
+            &mut unsigned_lock,
+            &unsigned_http,
+        )
+        .unwrap();
+
+        assert!(
+            snapshot_tree(trust.path()).is_empty(),
+            "checksum-only cross-host downloads must not mint registry trust"
+        );
+
+        let signed_project = tempfile::tempdir().unwrap();
+        let signed_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut signed_lock = LockFile::default();
+        resolve_provider_with_http(
+            signed_project.path(),
+            &provider_source("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
+            "aws",
+            &mut signed_lock,
+            &signed_http,
+        )
+        .unwrap();
+
+        assert!(
+            snapshot_tree(trust.path())
+                .iter()
+                .any(|(_, contents)| contents.is_some()),
+            "checksum plus verified signature must mint registry trust"
+        );
     }
 
     #[test]
@@ -14902,10 +14970,8 @@ transparency_log_present = true
         let _first_trust_env =
             crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", first_trust.path());
         let source = "carina-rs/aws";
-        let version = "0.5.0";
-        let origin_bytes = b"registry installed provider";
-        let shasum = sha256_bytes(origin_bytes);
-        let http = registry_http(origin_bytes, &shasum);
+        let version = SIGNED_FIXTURE_VERSION;
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
         let mut lock = LockFile::default();
 
         resolve_provider_with_http(
@@ -16409,9 +16475,23 @@ transparency_log_present = false
         let shasum = sha256_bytes(body);
         let http = registry_http(body, &shasum);
         let mut lock_file = LockFile::default();
-        let signature = RegistrySignatureProtection::NotRequired;
-        record_verified_origin_download(&source_key("carina-rs/aws"), &shasum, Some(&signature))
-            .unwrap();
+        let signature = signed_fixture_pin();
+        let verified_signer = verified_signer(
+            SIGNED_FIXTURE_IDENTITY,
+            SIGNED_FIXTURE_ISSUER,
+            "260157389",
+            "123",
+            "refs/heads/main",
+            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml",
+        );
+        record_verified_registry_origin_download(
+            &source_key("carina-rs/aws"),
+            "https://downloads.example.test/aws.wasm",
+            &shasum,
+            &signature,
+            &verified_signer,
+        )
+        .unwrap();
         let cached_path = cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0");
         fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
         fs::write(&cached_path, b"stale cached wasm bytes").unwrap();
@@ -17278,7 +17358,7 @@ transparency_log_present = false
         let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
-        record_verified_origin_download(&source_key(source), &expected_sha256, None).unwrap();
+        record_test_github_origin_download(&source_key(source), &expected_sha256, None).unwrap();
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
 
         let error = resolve_all_with_http(
@@ -17365,6 +17445,35 @@ transparency_log_present = false
             "origin verification must persist a user-owned trust record"
         );
         assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[test]
+    fn github_release_origin_escape_fails_without_writing_user_trust() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "1/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/evil/repo/releases/download/t/p.wasm?";
+        let origin_bytes = b"unrelated public GitHub release asset";
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut lock = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .expect_err("a normalized path outside the configured source must be rejected");
+
+        assert!(error.contains("origin"), "{error}");
+        assert!(error.contains(source), "{error}");
+        assert!(snapshot_tree(trust.path()).is_empty());
+        assert!(lock.find_by_source(source).is_none());
     }
 
     #[test]
@@ -17494,7 +17603,7 @@ transparency_log_present = false
         let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, tampered_bytes).unwrap();
-        record_verified_origin_download(&source_key(source), &expected_sha256, None).unwrap();
+        record_test_github_origin_download(&source_key(source), &expected_sha256, None).unwrap();
         let wasm_url = download_url_wasm(&github_source(source), version);
         let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, locked_bytes);
 
@@ -18331,6 +18440,62 @@ transparency_log_present = false
                 "carina: run `{}` to verify {source} before it receives credentials",
                 ProjectCommand::new("init", project.path()),
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_remote_user_trust_record_warns_and_is_untrusted() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let bytes = b"repository-controlled provider";
+        let sha256 = sha256_bytes(bytes);
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        record_test_github_origin_download(&source_key(source), &sha256, None).unwrap();
+        let record_path = snapshot_tree(trust.path())
+            .into_iter()
+            .find_map(|(path, contents)| contents.map(|_| trust.path().join(path)))
+            .unwrap();
+        fs::write(record_path, b"{broken json").unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256,
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &no_local_grants(),
+                |line| emitted.push(line.to_string()),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(
+            emitted.iter().any(|line| {
+                line.contains("warning") && line.contains("Failed to parse provider trust record")
+            }),
+            "a broken record must be surfaced through the notice sink: {emitted:?}"
         );
     }
 
