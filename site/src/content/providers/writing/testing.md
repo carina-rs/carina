@@ -280,4 +280,4 @@ Run acceptance tests in an account that holds nothing else, and make the script 
 
 ## Next steps
 
-The protocol-level details behind these pages are in [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md).
+[Docs Bundle](/providers/writing/docs-bundle/) describes how to ship documentation for your resources. The protocol-level details behind these pages are in [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md).
