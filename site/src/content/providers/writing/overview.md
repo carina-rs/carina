@@ -59,16 +59,16 @@ A write-only attribute (one the API accepts but never returns, such as a passwor
 
 ## Short calls; the host waits
 
-Every call must return quickly: the host stops a call that runs for more than 30 seconds, and caps each HTTP request at the same 30 seconds. A provider never sleeps or polls inside a call. When an operation has not finished, the provider returns a pending result that carries a token it defines and a hint for when to ask again. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
+Every call must return quickly. The host stops a call whose WebAssembly code is still running 30 seconds after the call began, and limits each HTTP request's connect, first-byte and between-bytes waits to 30 seconds each. A stopped call also breaks that provider instance, so its later calls in the same run fail. A provider never sleeps or polls inside a call. When an operation has not finished, the provider returns a pending result that carries a token it defines and a hint for when to ask again. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
 
 A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets.
 
 Create results go through a typestate in the SDK, so a provider must say what it knows. There is no conversion from a plain error into a create result; every failure has to be classified:
 
 - `untracked` means nothing was created. Use it only when you know the API never accepted the request, for example when local validation failed or the API rejected it outright. Carina keeps no record of the resource.
-- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `pending` without an identifier and settle it in `poll_create`, where an outcome you cannot determine is `undetermined`. Carina then keeps the attempt instead of forgetting a resource that may exist.
-- Call `issued` as soon as you see the resource's identifier. From then on the attempt can only finish as succeeded, partially succeeded, failed after creation, discarded, or still pending, so the SDK will not let you report that nothing was created.
-- `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it as failed after creation instead.
+- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `attempt.pending(token, sent, poll_after_secs)`, which carries no identifier, and settle it in `poll_create`, where an outcome you cannot determine is `undetermined`. Carina then keeps the attempt instead of forgetting a resource that may exist.
+- Call `issued` as soon as you see the resource's identifier. From then on the attempt can only finish as `succeeded`, `partial`, `failed`, `discarded` or `pending`, so the only way to leave no record is an explicit `discarded`.
+- `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it with `failed` instead.
 
 ## The sandbox
 
@@ -78,7 +78,7 @@ A provider runs with no filesystem access. It sees only these environment variab
 - AWS credential and region variables, only for providers named `aws` or `awscc`.
 - `GITHUB_TOKEN`, only for a provider named `github`.
 
-The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` masks it in plans and state.
+The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
 
 Environment variables are not the only route to credentials. On EC2, the metadata address is open to every provider that uses the HTTP world, whatever its name, so such a provider can read the instance role's credentials. Install providers you trust only, especially on EC2. Restricting this is tracked in [carina#4022](https://github.com/carina-rs/carina/issues/4022).
 
