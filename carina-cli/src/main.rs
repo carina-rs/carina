@@ -789,8 +789,9 @@ mod error_format_tests {
             .find("import {")
             .expect("rendered error should contain an import block");
         let import_block = &rendered.stderr[import_start..];
-        let parsed = carina_core::parser::parse(
+        let parsed = carina_core::parser::parse_file(
             import_block,
+            std::path::Path::new("rendered_import.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("rendered import block should parse");

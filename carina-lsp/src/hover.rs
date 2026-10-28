@@ -39,7 +39,7 @@ fn find_use_import_path(
                 Err(_) => continue,
             },
         };
-        let Ok(parsed) = carina_core::parser::parse(&content, ctx) else {
+        let Ok(parsed) = carina_core::parser::parse_file(&content, &file, ctx) else {
             continue;
         };
         if let Some(import) = parsed.uses.iter().find(|imp| imp.alias == alias) {

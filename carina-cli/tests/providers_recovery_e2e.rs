@@ -437,11 +437,15 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
             )
             .expect_err("provider-level recovery must not authorize discovery migration");
             assert!(
-                error.contains("lock-format migration requires operator authorization"),
+                error
+                    .to_string()
+                    .contains("lock-format migration requires operator authorization"),
                 "{operation}: {error}"
             );
             assert!(
-                error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+                error
+                    .to_string()
+                    .contains("carina providers repin-discovery registry.carina-rs.dev"),
                 "{operation}: {error}"
             );
         }
@@ -672,11 +676,15 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
     )
     .expect_err("declining must leave migrated discovery resolution blocked");
     assert!(
-        error.contains("lock-format migration requires operator authorization"),
+        error
+            .to_string()
+            .contains("lock-format migration requires operator authorization"),
         "{error}"
     );
     assert!(
-        error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+        error
+            .to_string()
+            .contains("carina providers repin-discovery registry.carina-rs.dev"),
         "{error}"
     );
     assert_eq!(fs::read(lock_path).unwrap(), before);

@@ -3489,7 +3489,7 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.module_name, "web_tier");
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
-        call.arguments.get("vpc").and_then(ModuleArgument::value),
+        call.argument("vpc").and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
     );
 }
@@ -4372,7 +4372,7 @@ fn parse_for_expression_with_module_call() {
     // Each module call should have the loop variable substituted in arguments
     for call in &result.module_calls {
         assert_eq!(call.module_name, "web");
-        assert!(call.arguments.contains_key("vpc_cidr"));
+        assert!(call.contains_argument("vpc_cidr"));
     }
 
     // Verify the argument values are the substituted loop values
@@ -4383,8 +4383,7 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         prod_call
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
@@ -4398,8 +4397,7 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         staging_call
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
@@ -4434,8 +4432,7 @@ fn parse_for_expression_with_module_call_over_list() {
 
     assert_eq!(
         result.module_calls[0]
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".into()
@@ -4443,8 +4440,7 @@ fn parse_for_expression_with_module_call_over_list() {
     );
     assert_eq!(
         result.module_calls[1]
-            .arguments
-            .get("vpc_cidr")
+            .argument("vpc_cidr")
             .and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "10.1.0.0/16".into()
@@ -8688,6 +8684,268 @@ let policy = 'arn:${env}:root'
 }
 
 #[test]
+fn module_call_source_spans_use_original_line_after_heredoc() {
+    let input = r#"let m = use { source = './m' }
+let document = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+let inst = m { nn = 1 }
+"#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+
+    assert_eq!(call.source_span().start_line(), 8);
+    assert_eq!(
+        call.authored_argument("nn")
+            .expect("authored argument")
+            .key_span()
+            .start_line(),
+        8
+    );
+}
+
+#[test]
+fn module_call_argument_span_uses_original_line_for_heredoc_inside_call() {
+    let input = r#"let inst = m {
+  doc = <<EOT
+a
+b
+EOT
+  nn = 1
+}
+"#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+
+    assert_eq!(call.source_span().start_line(), 1);
+    assert_eq!(
+        call.authored_argument("nn")
+            .expect("authored argument")
+            .key_span()
+            .start_line(),
+        6
+    );
+}
+
+#[test]
+fn module_call_heredoc_value_span_uses_original_coordinates_and_bytes() {
+    let input = "let inst = m {\n  doc = <<EOT\nalpha\nbeta\nEOT\n}\n";
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+    let span = call
+        .authored_argument("doc")
+        .expect("authored heredoc argument")
+        .value_span();
+
+    let expected_start = input.find("<<EOT").expect("opening marker");
+    let closing_start = input.rfind("\nEOT").expect("closing marker") + 1;
+    let expected_end = closing_start + "EOT".len();
+
+    assert_eq!(span.start_byte(), expected_start);
+    assert_eq!(span.end_byte(), expected_end);
+    assert_eq!(span.start_line(), 2);
+    assert_eq!(span.start_column(), 9);
+    assert_eq!(span.end_line(), 5);
+    assert_eq!(span.end_column(), 4);
+}
+
+fn assert_module_argument_span(
+    input: &str,
+    argument: &str,
+    expected: (usize, usize, usize, usize, usize, usize),
+) {
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let span = parsed
+        .module_calls
+        .first()
+        .expect("module call")
+        .authored_argument(argument)
+        .expect("authored argument")
+        .value_span();
+    assert_eq!(
+        (
+            span.start_byte(),
+            span.end_byte(),
+            span.start_line(),
+            span.start_column(),
+            span.end_line(),
+            span.end_column(),
+        ),
+        expected,
+    );
+}
+
+#[test]
+fn module_call_indented_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<-EOT\n    alpha\n      beta\n    EOT\n}\n",
+        "doc",
+        (23, 58, 2, 9, 5, 8),
+    );
+}
+
+#[test]
+fn module_call_literal_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<'EOT'\n${name}\nEOT\n}\n",
+        "doc",
+        (23, 42, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_call_empty_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nEOT\n}\n",
+        "doc",
+        (23, 32, 2, 9, 3, 4),
+    );
+}
+
+#[test]
+fn module_call_crlf_heredoc_span_stops_at_the_closing_marker() {
+    assert_module_argument_span(
+        "let inst = m {\r\n  doc = <<EOT\r\nalpha\r\nEOT\r\n}\r\n",
+        "doc",
+        (24, 41, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_call_multibyte_heredoc_span_uses_byte_and_character_coordinates() {
+    assert_module_argument_span(
+        "let inst = m { label = '日本' doc = <<EOT\né🙂\nEOT\n}\n",
+        "doc",
+        (38, 54, 1, 35, 3, 4),
+    );
+}
+
+#[test]
+fn module_call_heredoc_span_excludes_closing_marker_trailing_spaces() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nalpha\nEOT  \n}\n",
+        "doc",
+        (23, 38, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_argument_after_heredoc_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nx\nEOT\n  after = \"ok\"\n}\n",
+        "after",
+        (45, 49, 5, 11, 5, 15),
+    );
+}
+
+#[test]
+fn authored_spans_share_trailing_whitespace_semantics_across_sites() {
+    let input = "attributes {\n  output = {\n    enabled = true\n  }   \n}\nlet inst = m {\n  options = {\n    enabled = true\n  }   \n}\n";
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+
+    let declaration = parsed
+        .attribute_params
+        .first()
+        .expect("attribute declaration")
+        .source_span();
+    let argument = parsed
+        .module_calls
+        .first()
+        .expect("module call")
+        .authored_argument("options")
+        .expect("authored argument")
+        .value_span();
+
+    assert_eq!((declaration.end_line(), declaration.end_column()), (4, 4));
+    assert_eq!((argument.end_line(), argument.end_column()), (9, 4));
+}
+
+#[test]
+fn authored_value_spans_exclude_trailing_comments() {
+    for comment in ["# note", "// note", "/* note */"] {
+        let input = format!(
+            "let inst = m {{\n  arg = value {comment}\n}}\n\
+             attributes {{\n  attr = value {comment}\n}}\n\
+             exports {{\n  out = value {comment}\n}}\n"
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let value_ends = input
+            .match_indices("value")
+            .map(|(start, value)| start + value.len())
+            .collect::<Vec<_>>();
+
+        let argument = parsed.module_calls[0]
+            .authored_argument("arg")
+            .expect("authored argument")
+            .value_span();
+        let attribute = parsed.attribute_params[0].source_span();
+        let export = parsed.export_params[0].source_span();
+
+        assert_eq!(argument.end_byte(), value_ends[0], "comment: {comment}");
+        assert_eq!(
+            (argument.end_line(), argument.end_column()),
+            (2, 14),
+            "comment: {comment}"
+        );
+        assert_eq!(attribute.end_byte(), value_ends[1], "comment: {comment}");
+        assert_eq!(
+            (attribute.end_line(), attribute.end_column()),
+            (5, 15),
+            "comment: {comment}"
+        );
+        assert_eq!(export.end_byte(), value_ends[2], "comment: {comment}");
+        assert_eq!(
+            (export.end_line(), export.end_column()),
+            (8, 14),
+            "comment: {comment}"
+        );
+    }
+}
+
+#[test]
+fn nested_string_comment_markers_do_not_truncate_authored_spans() {
+    for value in [
+        r##""${coalesce(x, "#fragment")}""##,
+        r#""${coalesce(x, "https://a")}""#,
+    ] {
+        let call_source = format!("m {{ url = {value} }}");
+        let input = format!(
+            "fn coalesce(x: String, fallback: String): String {{ fallback }}\n\
+             let x = \"x\"\n\
+             {call_source}"
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let call = parsed.module_calls.first().expect("module call");
+        let value_span = call
+            .authored_argument("url")
+            .expect("url argument")
+            .value_span();
+        let call_start = input.find(&call_source).expect("call in source");
+        let value_start = input.find(value).expect("value in source");
+
+        assert_eq!(
+            (
+                call.source_span().start_byte(),
+                call.source_span().end_byte()
+            ),
+            (call_start, input.len()),
+            "call span for {value}"
+        );
+        assert_eq!(
+            (value_span.start_byte(), value_span.end_byte()),
+            (value_start, value_start + value.len()),
+            "value span for {value}"
+        );
+    }
+}
+
+#[test]
 fn parse_single_quoted_string_escape_sequences() {
     let input = r#"
         let vpc = aws.ec2.Vpc {
@@ -10598,7 +10856,7 @@ fn type_expr_unknown_serde_round_trips() {
 
 #[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p = ParsedExportParam::new("vpc_id".to_string(), None, None);
+    let p = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
     assert!(p.type_expr.is_none());
 }
 

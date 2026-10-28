@@ -97,9 +97,10 @@ fn load_formatting_directory_config(directory: &Path) -> FormattingDirectoryConf
     let Some(loaded) = load_configuration(directory).ok() else {
         return FormattingDirectoryConfig::default();
     };
+    let parsed = loaded.parsed;
     FormattingDirectoryConfig {
-        providers: loaded.parsed.providers,
-        uses: loaded.parsed.uses,
+        providers: parsed.providers,
+        uses: parsed.uses,
     }
 }
 

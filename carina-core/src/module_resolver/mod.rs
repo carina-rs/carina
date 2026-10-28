@@ -26,7 +26,7 @@ mod resolver;
 mod signature;
 mod validation;
 
-pub use error::ModuleError;
+pub use error::{ModuleError, ModuleErrorCallSource};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
@@ -35,9 +35,9 @@ pub use loader::{
 pub(crate) use resolver::resolve_upstream_modules_with_config;
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleCallSystemIdentity,
-    ModuleResolutionDiagnosticReport, RefCheckedModuleGraph, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, resolve_modules, resolve_modules_with_config,
-    resolve_modules_with_diagnostics,
+    ModuleResolutionDiagnosticReport, RefCheckedModuleGraph, ResolvedModuleConstraintOrigin,
+    ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus, resolve_modules,
+    resolve_modules_with_config, resolve_modules_with_diagnostics,
 };
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,

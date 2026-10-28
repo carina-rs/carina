@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use carina_core::parser::{ProviderConfig, ProviderContext};
 use carina_core::provider::ProviderFactory;
 use carina_core::provider_source::ProviderSource;
-use carina_provider_resolver::ProviderArtifactFingerprint;
 use tower_lsp::{LspService, Server};
 
 use carina_lsp::Backend;
@@ -46,9 +45,12 @@ fn resolve_install(
         ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(config),
         ProviderSource::Remote(_) => {
             carina_provider_resolver::find_installed_provider(source_dir, config)
+                .map_err(|error| error.to_string())
         }
     }
-    .map_err(|message| InstallRejection::ResolutionFailed { message })?;
+    .map_err(|error| InstallRejection::ResolutionFailed {
+        message: error.to_string(),
+    })?;
     // Both resolver functions only construct `InstalledProvider` after their
     // selected path exists, so a second `.exists()` check here was unreachable.
     Ok(installed)
@@ -64,7 +66,7 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
 fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut errors: HashMap<String, String> = HashMap::new();
-    let mut fingerprint: Vec<(String, ProviderArtifactFingerprint)> =
+    let mut fingerprint: Vec<(String, carina_lsp::backend::ProviderInstallFingerprint)> =
         Vec::with_capacity(providers.len());
 
     for (source_dir, config) in providers {
@@ -157,6 +159,7 @@ async fn main() {
 mod tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
+    use carina_provider_resolver::ProviderArtifactFingerprint;
     use indexmap::IndexMap;
     use std::path::PathBuf;
 
@@ -226,7 +229,10 @@ mod tests {
         );
         assert_eq!(
             fingerprint,
-            vec![("mock".to_string(), ProviderArtifactFingerprint::default())]
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )]
         );
     }
 
@@ -316,8 +322,10 @@ mod tests {
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
             source: source.into(),
-            kind: carina_provider_resolver::LockEntryKind::Version {
-                version: version.into(),
+            kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                version: version.parse().unwrap(),
+                tag: serde_json::from_str("\"v0.5.0\"").unwrap(),
+                asset_id: serde_json::from_str("42").unwrap(),
                 constraint: None,
             },
             sha256: "pinned-sha256".into(),
@@ -332,11 +340,11 @@ mod tests {
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(
-            probed.artifact.is_some(),
+            probed.as_ref().unwrap().artifact.is_some(),
             "the drift probe observes artifact metadata without hashing"
         );
         assert!(
-            probed.lock_file.is_some(),
+            probed.as_ref().unwrap().lock_file.is_some(),
             "the drift probe observes lock-file metadata"
         );
         assert_eq!(fingerprint, vec![("aws".to_string(), probed)]);
@@ -356,9 +364,9 @@ mod tests {
         let (_, config) = cfg("local", Some(&format!("file://{}", wasm.display())), None);
         let prober = install_prober();
 
-        let before = prober(tmp.path(), &config);
+        let before = prober(tmp.path(), &config).unwrap();
         std::fs::write(&wasm, b"replacement with a different length").unwrap();
-        let after = prober(tmp.path(), &config);
+        let after = prober(tmp.path(), &config).unwrap();
 
         assert!(before.artifact.is_some());
         assert!(after.artifact.is_some());
@@ -366,7 +374,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let before_rename = prober(tmp.path(), &config);
+            let before_rename = prober(tmp.path(), &config).unwrap();
             let before_artifact = before_rename.artifact.as_ref().unwrap();
             let replacement = tmp.path().join("local-provider-replacement.wasm");
             std::fs::write(
@@ -383,7 +391,7 @@ mod tests {
                 .unwrap();
             std::fs::rename(&replacement, &wasm).unwrap();
 
-            let after_rename = prober(tmp.path(), &config);
+            let after_rename = prober(tmp.path(), &config).unwrap();
             let after_artifact = after_rename.artifact.as_ref().unwrap();
             assert_eq!(before_artifact.len, after_artifact.len);
             assert_eq!(before_artifact.modified, after_artifact.modified);

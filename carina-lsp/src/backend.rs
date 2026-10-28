@@ -6,7 +6,7 @@ use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
-use carina_provider_resolver::ProviderArtifactFingerprint;
+use carina_provider_resolver::{LegacyLockEntryError, ProviderArtifactFingerprint};
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -59,7 +59,7 @@ struct ProviderState {
     /// `.carina/` deletions the editor's file watcher did not report
     /// (issue #2023 follow-up: VS Code excludes dot-prefixed directories
     /// from its watcher by default).
-    install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
+    install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
 }
 
 impl ProviderState {
@@ -68,7 +68,7 @@ impl ProviderState {
         provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
         prober: Option<ProviderInstallProber>,
-        install_fingerprint: Vec<(String, ProviderArtifactFingerprint)>,
+        install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
             configs.iter().map(|(_, config)| config),
@@ -144,17 +144,18 @@ impl ProviderState {
 /// Injected from `main.rs` so the poller and factory builder share resolver
 /// path-selection behavior.
 pub type ProviderInstallProber = Arc<
-    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderArtifactFingerprint
-        + Send
-        + Sync,
+    dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> ProviderInstallFingerprint + Send + Sync,
 >;
+
+pub type ProviderInstallFingerprint =
+    std::result::Result<ProviderArtifactFingerprint, LegacyLockEntryError>;
 
 /// Compute `(provider_name, metadata)` pairs for a list of configs.
 /// Ordered to match the input so equality comparisons are stable.
 fn probe_install_fingerprint(
     prober: &ProviderInstallProber,
     configs: &[(PathBuf, carina_core::parser::ProviderConfig)],
-) -> Vec<(String, ProviderArtifactFingerprint)> {
+) -> Vec<(String, ProviderInstallFingerprint)> {
     configs
         .iter()
         .map(|(dir, cfg)| (cfg.name.clone(), prober(dir, cfg)))
@@ -237,7 +238,7 @@ impl ProviderStates {
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
     HashMap<String, String>, // provider name -> error reason
-    Vec<(String, ProviderArtifactFingerprint)>, // install fingerprint
+    Vec<(String, ProviderInstallFingerprint)>, // install fingerprint
 );
 
 /// Function type for building provider factories from configs with their source directories.
@@ -482,8 +483,18 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let doc = Document::new(
+        let Ok(source_file) = uri.to_file_path() else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Cannot analyze non-file document URI: {uri}"),
+                )
+                .await;
+            return;
+        };
+        let doc = Document::new_with_path(
             params.text_document.text,
+            source_file,
             Arc::clone(&self.provider_context),
         );
         self.documents.insert(uri.clone(), doc);
@@ -679,26 +690,19 @@ async fn publish_diagnostics_for(
     let Some(doc) = documents.get(&uri) else {
         return;
     };
-    let base_path = uri
-        .to_file_path()
-        .ok()
+    let current_file_path = uri.to_file_path().ok();
+    let base_path = current_file_path
+        .as_deref()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    let current_file_name: Option<String> = uri
-        .to_file_path()
-        .ok()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str().map(String::from)));
 
     let guard = providers.read().await;
     let state = base_path
         .as_ref()
         .map(|p| guard.state_for_path(p))
         .unwrap_or(&guard.empty);
-    let diagnostics = state.diagnostic_engine.analyze_with_filename(
-        &doc,
-        current_file_name.as_deref(),
-        base_path.as_deref(),
-    );
+    let diagnostics = state
+        .diagnostic_engine
+        .analyze(&doc, current_file_path.as_deref());
     drop(guard);
 
     client.publish_diagnostics(uri, diagnostics, None).await;
@@ -938,8 +942,9 @@ mod tests {
     }
 
     fn provider_state(block_name: &'static str) -> ProviderState {
-        let config = carina_core::parser::parse(
+        let config = carina_core::parser::parse_file(
             "provider mock {}\n",
+            std::path::Path::new("providers.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
@@ -1002,18 +1007,19 @@ mock.test.Thing {
             HashMap::new(),
             configs,
             None,
-            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
         );
         let document = Document::new(
             main.to_string(),
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 
-        let diagnostics = state.diagnostic_engine.analyze_with_filename(
-            &document,
-            Some("main.crn"),
-            Some(temp.path()),
-        );
+        let diagnostics = state
+            .diagnostic_engine
+            .analyze(&document, Some(&temp.path().join("main.crn")));
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -1063,18 +1069,19 @@ mock.test.Thing {
             )]),
             configs,
             None,
-            vec![("mock".to_string(), ProviderArtifactFingerprint::default())],
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
         );
         let document = Document::new(
             main.to_string(),
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 
-        let diagnostics = state.diagnostic_engine.analyze_with_filename(
-            &document,
-            Some("main.crn"),
-            Some(temp.path()),
-        );
+        let diagnostics = state
+            .diagnostic_engine
+            .analyze(&document, Some(&temp.path().join("main.crn")));
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -1254,10 +1261,10 @@ mock.test.Thing {
                     _ => None,
                 })
                 .and_then(|p| test_file_fingerprint(std::path::Path::new(p)));
-            ProviderArtifactFingerprint {
+            Ok(ProviderArtifactFingerprint {
                 artifact,
                 lock_file: test_file_fingerprint(&dir.join("carina-providers.lock")),
-            }
+            })
         })
     }
 
@@ -1298,14 +1305,14 @@ mock.test.Thing {
 
         let before = probe_install_fingerprint(&prober, &configs);
         assert!(
-            before[0].1.artifact.is_some(),
+            before[0].1.as_ref().unwrap().artifact.is_some(),
             "initial probe should see the installed binary metadata"
         );
 
         std::fs::remove_file(&installed).unwrap();
         let after = probe_install_fingerprint(&prober, &configs);
         assert!(
-            after[0].1.artifact.is_none(),
+            after[0].1.as_ref().unwrap().artifact.is_none(),
             "probe after delete must record missing artifact metadata"
         );
         assert_ne!(before, after);
