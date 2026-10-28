@@ -591,6 +591,18 @@ impl WasmProviderLoadError {
             source: Box::new(source),
         }
     }
+
+    /// Whether this load failure came from the wall-clock budget enforced by
+    /// [`GuestStore::call`]. The typed source installed by
+    /// [`wall_budget_load_error`] is the classification boundary; diagnostic
+    /// text is deliberately not inspected.
+    fn is_wall_budget_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Metadata { source, .. }
+                if source.downcast_ref::<WasmWallBudgetError>().is_some()
+        )
+    }
 }
 
 impl From<ProviderInstantiationError> for WasmProviderLoadError {
@@ -2034,9 +2046,25 @@ async fn create_instance_with_http(
 
 /// Instantiate exactly the world selected when the factory was loaded.
 ///
-/// Runtime per-binding instances do not retry another world. Keeping the
-/// selection and typed error construction in one function prevents either
-/// branch from flattening its Wasmtime failure or inventing fallback context.
+/// Runtime per-binding instances and validation-instance rebuilds share this
+/// selection point, so neither path probes or retries a different world.
+async fn create_instance_for_world(
+    engine: &Engine,
+    component: &Component,
+    provider_kind: Option<&str>,
+    world: InstantiationWorld,
+    budget: GuestCallBudget,
+) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
+    match world {
+        InstantiationWorld::HttpEnabled => {
+            create_instance_with_http(engine, component, provider_kind, budget).await
+        }
+        InstantiationWorld::Basic => {
+            create_instance(engine, component, provider_kind, budget).await
+        }
+    }
+}
+
 async fn create_runtime_instance(
     engine: &Engine,
     component: &Component,
@@ -2044,14 +2072,7 @@ async fn create_runtime_instance(
     world: InstantiationWorld,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
-    let result = match world {
-        InstantiationWorld::HttpEnabled => {
-            create_instance_with_http(engine, component, provider_kind, budget).await
-        }
-        InstantiationWorld::Basic => {
-            create_instance(engine, component, provider_kind, budget).await
-        }
-    };
+    let result = create_instance_for_world(engine, component, provider_kind, world, budget).await;
     result.map_err(|failure| match failure {
         WasmBindingCreationError::Instantiation(failure) => {
             WasmProviderInstanceError::Instantiation(
@@ -2066,6 +2087,31 @@ async fn create_runtime_instance(
             WasmProviderInstanceError::ProtocolVersion(message)
         }
     })
+}
+
+fn single_attempt_load_error(
+    engine: &Engine,
+    component: &Component,
+    world: InstantiationWorld,
+    failure: WasmBindingCreationError,
+) -> WasmProviderLoadError {
+    match failure {
+        WasmBindingCreationError::Instantiation(failure) => {
+            ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
+                .into()
+        }
+        WasmBindingCreationError::InfoCall(error) => WasmProviderLoadError::metadata(
+            "Failed to call info()",
+            WasmGuestCallError {
+                context: None,
+                source: error,
+            },
+        ),
+        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
+            wall_budget_load_error(operation, source)
+        }
+        WasmBindingCreationError::ProtocolVersion(message) => message.into(),
+    }
 }
 
 /// Output of `create_instance_auto`: the instantiated store, the
@@ -2347,15 +2393,58 @@ impl FailFastInstance {
 struct RebuildContext {
     engine: Engine,
     component: Component,
+    world: InstantiationWorld,
     budget: GuestCallBudget,
+}
+
+/// A failed validation-instance rebuild, retaining both why the previous
+/// instance was unusable and the typed failure from creating its replacement.
+#[derive(Debug)]
+struct WasmProviderRebuildError {
+    previous_poison: PoisonReason,
+    load_error: WasmProviderLoadError,
+}
+
+impl fmt::Display for WasmProviderRebuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "previous poison reason: {}", self.previous_poison)
+    }
+}
+
+impl std::error::Error for WasmProviderRebuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.load_error)
+    }
+}
+
+fn rebuild_provider_error(
+    previous_poison: PoisonReason,
+    load_error: WasmProviderLoadError,
+) -> ProviderError {
+    let timed_out = load_error.is_wall_budget_timeout();
+    let error = WasmProviderRebuildError {
+        previous_poison,
+        load_error,
+    };
+    if timed_out {
+        ProviderError::timeout_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    } else {
+        ProviderError::internal_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    }
 }
 
 /// Factory-validation instance that rebuilds after poisoning.
 ///
 /// Acquisition holds the slot mutex while recreating the instance from the
-/// already verified component and the same engine and call budget. A failed
-/// rebuild leaves the slot poisoned, preserves the typed load error, and is
-/// retried by the next validation call.
+/// already verified component and the same engine, selected world, and call
+/// budget. A failed rebuild leaves the slot poisoned, preserves the typed load
+/// error, and is retried by the next validation call.
 struct RebuildableInstance {
     slot: Mutex<InstanceSlot>,
     rebuild: RebuildContext,
@@ -2368,6 +2457,7 @@ impl RebuildableInstance {
         engine: Engine,
         component: Component,
         budget: GuestCallBudget,
+        enable_http: bool,
     ) -> Self {
         Self {
             slot: Mutex::new(InstanceSlot::Live(Box::new(LiveInstance::new(
@@ -2376,6 +2466,11 @@ impl RebuildableInstance {
             rebuild: RebuildContext {
                 engine,
                 component,
+                world: if enable_http {
+                    InstantiationWorld::HttpEnabled
+                } else {
+                    InstantiationWorld::Basic
+                },
                 budget,
             },
         }
@@ -2388,23 +2483,27 @@ impl RebuildableInstance {
             InstanceSlot::Poisoned { reason } => Some(reason.clone()),
         };
         if let Some(reason) = poison_reason {
-            let (store, bindings, _enable_http) = create_instance_auto(
+            let (store, bindings) = create_instance_for_world(
                 &self.rebuild.engine,
                 &self.rebuild.component,
                 None,
+                self.rebuild.world,
                 self.rebuild.budget,
             )
             .await
-            .map_err(|error| {
-                ProviderError::internal_caused_by(
-                    "Failed to rebuild WASM provider validation instance",
-                    error,
+            .map_err(|failure| {
+                single_attempt_load_error(
+                    &self.rebuild.engine,
+                    &self.rebuild.component,
+                    self.rebuild.world,
+                    failure,
                 )
-            })?;
+            })
+            .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
             *slot = InstanceSlot::Live(Box::new(LiveInstance::new(store, bindings)));
-            tracing::warn!(
-                reason = %reason,
-                "rebuilt poisoned WASM provider validation instance"
+            log::warn!(
+                "rebuilt poisoned WASM provider validation instance; previous poison reason: \
+                 {reason}"
             );
         }
         LiveInstanceGuard::from_slot(slot, operation)
@@ -2735,8 +2834,14 @@ impl WasmProviderFactory {
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
             Self::load_metadata(&bindings, &mut store, &name, &version).await?;
-        let init_instance =
-            RebuildableInstance::new(store, bindings, engine.clone(), component.clone(), budget);
+        let init_instance = RebuildableInstance::new(
+            store,
+            bindings,
+            engine.clone(),
+            component.clone(),
+            budget,
+            enable_http,
+        );
 
         Ok(Self {
             engine,
@@ -7660,6 +7765,7 @@ mod tests {
             rebuild: RebuildContext {
                 engine,
                 component,
+                world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
             },
         };
@@ -7674,22 +7780,36 @@ mod tests {
                 error.detail().context(),
                 "Failed to rebuild WASM provider validation instance"
             );
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "previous poison reason: WASM provider instance unusable after wall-clock \
+                     timeout in validate_config"
+                ),
+                "rebuild attempt {attempt} must retain the original poison reason: {rendered}"
+            );
             let cause = error
                 .detail()
                 .cause()
-                .expect("rebuild failure must retain its typed load error");
-            let load_error = cause
-                .downcast_ref::<WasmProviderLoadError>()
-                .expect("rebuild failure cause must remain WasmProviderLoadError");
+                .expect("rebuild failure must retain its typed rebuild error");
+            let rebuild_error = cause
+                .downcast_ref::<WasmProviderRebuildError>()
+                .expect("rebuild failure cause must remain typed");
+            let load_error = std::error::Error::source(rebuild_error)
+                .and_then(|source| source.downcast_ref::<WasmProviderLoadError>())
+                .expect("rebuild failure must retain WasmProviderLoadError as its source");
             let WasmProviderLoadError::Instantiation(instantiation) = load_error else {
                 panic!("empty component must produce an instantiation error: {load_error:?}")
             };
             assert!(
                 matches!(
                     instantiation.context.as_ref(),
-                    InstantiationContext::HttpThenBasic { .. }
+                    InstantiationContext::SingleAttempt {
+                        world: InstantiationWorld::Basic,
+                        ..
+                    }
                 ),
-                "rebuild attempt {attempt} must preserve the real dual-attempt context"
+                "rebuild attempt {attempt} must use only the recorded basic world"
             );
             let source_chain: Vec<_> = instantiation
                 .primary_failure
@@ -7712,6 +7832,54 @@ mod tests {
                 "a failed rebuild must leave the original poisoned slot intact"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wall_budget_rebuild_failure_is_timeout_and_keeps_load_error_source() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let wasi_ctx = WasiCtxBuilder::new().build();
+        let mut store = GuestStore::new(
+            &engine,
+            wasi_ctx,
+            None,
+            build_store_limits(),
+            GuestCallBudget::new(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO,
+            ),
+        );
+        let source = store
+            .call(|_store| std::future::pending::<()>())
+            .await
+            .expect_err("a zero wall budget must time out");
+        let load_error = wall_budget_load_error("instantiate", source);
+
+        let error = rebuild_provider_error(PoisonReason::Cancelled, load_error);
+
+        assert_eq!(error.variant_name(), "timeout");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(
+                "previous poison reason: WASM provider is unusable: a prior operation was cancelled"
+            ),
+            "the prior poison reason must remain visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("WASM provider load timed out"),
+            "the typed load failure must remain visible: {rendered}"
+        );
+        let cause = error
+            .detail()
+            .cause()
+            .expect("timeout rebuild failure must retain its typed cause");
+        let rebuild_error = cause
+            .downcast_ref::<WasmProviderRebuildError>()
+            .expect("timeout rebuild failure cause must remain typed");
+        let load_error = std::error::Error::source(rebuild_error)
+            .and_then(|source| source.downcast_ref::<WasmProviderLoadError>())
+            .expect("timeout rebuild failure must retain WasmProviderLoadError as its source");
+        assert!(load_error.is_wall_budget_timeout());
     }
 
     #[test]
