@@ -787,6 +787,25 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         result.is_err(),
         "two anonymous compositions must not match merely because both bindings are None"
     );
+
+    std::fs::remove_file(&current_source).expect("remove current composition source");
+    let error = rehydrate_desired_plan_file(
+        &mut plan_file,
+        &candidates,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+    )
+    .expect_err("an unreadable live call source must fail with its typed identity error");
+    let AppError::CompositionSourceIdentity(identity_error) = error else {
+        panic!("apply flattened the composition identity error: {error:?}");
+    };
+    assert!(
+        std::error::Error::source(&identity_error)
+            .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
+        "apply dropped the composition identity io source: {identity_error:?}",
+    );
 }
 
 #[tokio::test]

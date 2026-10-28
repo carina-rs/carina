@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use carina_core::config_loader::load_configuration;
 use carina_core::effect::Effect;
 use carina_core::module_resolver::{
-    ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintKind,
+    ConstraintOrigin, ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintKind,
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
@@ -272,7 +272,7 @@ fn snapshot_module_constraint_plan_error() {
         PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
-            call_id: None,
+            origin: ConstraintOrigin::Saved,
             call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),
@@ -2408,7 +2408,7 @@ fn snapshot_server_default_struct_leaf() {
 /// `module "<binding>" (<source_path>)` header. The third leaf,
 /// declared at the DSL root with no trace entry, stays at the top
 /// level. The header label was rebadged from the internal
-/// `LiveComposition "<binding>"` term in carina#3322.
+/// `Composition "<binding>"` term in carina#3322.
 #[test]
 fn snapshot_composition_folding() {
     use carina_core::effect::Effect;
@@ -2469,8 +2469,8 @@ fn snapshot_composition_folding() {
         output
     );
     assert!(
-        !output.contains("LiveComposition"),
-        "must not leak internal `LiveComposition` term in:\n{}",
+        !output.contains("Composition"),
+        "must not leak internal `Composition` term in:\n{}",
         output
     );
     assert!(
@@ -2613,8 +2613,8 @@ fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
         output,
     );
     assert!(
-        !output.contains("LiveComposition"),
-        "internal `LiveComposition` term must not surface to operators in:\n{}",
+        !output.contains("Composition"),
+        "internal `Composition` term must not surface to operators in:\n{}",
         output,
     );
 }

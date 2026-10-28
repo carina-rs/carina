@@ -1520,7 +1520,7 @@ let alpha = tokens {{
     );
     let rendered = output_text(&apply);
     assert!(
-        rendered.contains("composition call id main.crn:")
+        rendered.contains("composition call id chain main.crn:")
             && rendered.contains("disagreed with the saved plan")
             && rendered.contains("re-run `carina plan --out plan.json "),
         "stale composition error must name the call location and replan command:\n{rendered}",

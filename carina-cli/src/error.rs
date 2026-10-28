@@ -530,6 +530,11 @@ pub enum AppError {
     #[error(transparent)]
     ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
 
+    /// A composition call source could not be converted to a portable saved
+    /// identity.
+    #[error(transparent)]
+    CompositionSourceIdentity(#[from] carina_core::resource::CompositionSourceIdentityError),
+
     /// A state-bucket argument was not a valid resource identity.
     #[error("State bucket name '{bucket_name}' is not a valid resource identity: {error}")]
     InvalidStateBucketIdentity {
@@ -923,6 +928,42 @@ mod tests {
         }
 
         assert!(found_io_error, "AppError dropped the canonicalize cause");
+    }
+
+    #[test]
+    fn composition_source_identity_preserves_typed_io_source_without_repeating_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-source-root");
+        let identity_error =
+            carina_core::resource::CompositionSourceIdentityResolver::new(&missing)
+                .expect_err("missing source root must fail canonicalization");
+        let app_error = AppError::from(identity_error);
+
+        assert!(
+            matches!(&app_error, AppError::CompositionSourceIdentity(_)),
+            "composition source failure lost its typed AppError variant: {app_error:?}",
+        );
+        assert_eq!(
+            app_error.to_string(),
+            format!(
+                "failed to canonicalize composition source path `{}`",
+                missing.display()
+            ),
+            "Display must leave the io cause to the source chain",
+        );
+        let mut current: &(dyn std::error::Error + 'static) = &app_error;
+        let mut found_io_error = false;
+        while let Some(source) = current.source() {
+            if source.downcast_ref::<std::io::Error>().is_some() {
+                found_io_error = true;
+                break;
+            }
+            current = source;
+        }
+        assert!(
+            found_io_error,
+            "composition identity chain lost the io error: {app_error:?}",
+        );
     }
 
     #[test]

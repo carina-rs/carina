@@ -21,8 +21,8 @@ use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, LiveComposition, Resource, ResourceId, SavedComposition,
-    SavedCompositionOriginId, State, Value,
+    CompositionSourceIdentityResolver, ConcreteValue, Current, DataSource, LiveComposition,
+    Resource, ResourceId, SavedComposition, SavedCompositionOriginId, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -2121,8 +2121,29 @@ impl ReloadedPlanFile {
     pub(crate) fn rehydrate_composition_secrets(
         &mut self,
         evaluated: &[LiveComposition],
-        canonical_source_root: &Path,
+        source_identities: &mut CompositionSourceIdentityResolver,
     ) -> Result<(), ReloadedCompositionRehydrationError> {
+        let needs_rehydration = self.contents.compositions.iter().any(|composition| {
+            composition
+                .signature
+                .arguments
+                .values()
+                .any(|argument| carina_core::value::contains_redacted_secret(argument.value()))
+                || composition.signature.attributes.values().any(|attribute| {
+                    carina_core::value::contains_redacted_secret(&attribute.to_value())
+                })
+        });
+        if !needs_rehydration {
+            return Ok(());
+        }
+
+        let mut candidates = HashMap::with_capacity(evaluated.len());
+        for live in evaluated {
+            let origin = source_identities
+                .saved_origin_id(live.call_path())
+                .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
+            candidates.insert(origin, live);
+        }
         let rehydrated = self
             .contents
             .compositions
@@ -2137,18 +2158,7 @@ impl ReloadedPlanFile {
                 if !has_placeholder {
                     return Ok(composition.clone());
                 }
-                let mut candidate = None;
-                for live in evaluated {
-                    let origin = live
-                        .call_path()
-                        .saved_origin_id(canonical_source_root)
-                        .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
-                    if origin == composition.origin_id {
-                        candidate = Some(live);
-                        break;
-                    }
-                }
-                let candidate = candidate.ok_or_else(|| {
+                let candidate = candidates.get(&composition.origin_id).ok_or_else(|| {
                     ReloadedCompositionRehydrationError::MissingCandidate(Box::new(
                         composition.origin_id.clone(),
                     ))
@@ -2667,11 +2677,8 @@ fn build_plan_file<E>(
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string();
-    let canonical_source_root = get_base_dir(path).canonicalize().unwrap_or_else(|error| {
-        let canonicalize_error = error;
-        drop(canonicalize_error);
-        get_base_dir(path).to_path_buf()
-    });
+    let mut composition_source_identities =
+        CompositionSourceIdentityResolver::new(get_base_dir(path))?;
 
     let desired_resources: HashMap<ResourceId, Resource> = ctx
         .sorted_resources
@@ -2893,7 +2900,9 @@ fn build_plan_file<E>(
             .compositions
             .iter()
             .map(|composition| {
-                let saved = composition.clone().into_saved(&canonical_source_root)?;
+                let saved = composition
+                    .clone()
+                    .into_saved_with_resolver(&mut composition_source_identities)?;
                 carina_core::value::redact_secrets_in_saved_composition(&saved)
                     .map_err(PlanSaveError::from)
             })
@@ -2960,23 +2969,22 @@ fn build_plan_file<E>(
     contents.record(wiring).map_err(PlanSaveError::from)
 }
 
-/// Format a failure from `build_plan_file` into the CLI's
-/// "cannot save plan" diagnostic, suggesting the caller drop `flag` (for
-/// example `--json` or `--out`) to fall back to display-only output.
-fn format_plan_save_error(e: &PlanSaveError, flag: &str) -> String {
-    match e {
+/// Preserve typed plan-save failures where available, while adding the CLI's
+/// display-only fallback guidance to serialization failures that need it.
+fn map_plan_save_error(error: PlanSaveError, flag: &str) -> AppError {
+    match error {
         PlanSaveError::Serialization(
             carina_core::value::SerializationError::UnknownNotAllowed { reason, .. },
-        ) => format!(
+        ) => AppError::Config(format!(
             "Cannot save plan: it depends on values that are not yet \
              applied ({reason}). Apply the upstream module(s) first, \
              or rerun without {flag}."
-        ),
-        PlanSaveError::Serialization(error) => error.to_string(),
-        PlanSaveError::CompositionSourceIdentity(error) => {
-            format!("Cannot save plan: {error}")
+        )),
+        PlanSaveError::Serialization(error) => AppError::Config(error.to_string()),
+        PlanSaveError::CompositionSourceIdentity(error) => AppError::from(error),
+        PlanSaveError::ProviderEvidence(error) => {
+            AppError::Config(format!("Cannot save plan: {error}"))
         }
-        PlanSaveError::ProviderEvidence(error) => format!("Cannot save plan: {error}"),
     }
 }
 
@@ -3419,7 +3427,7 @@ pub async fn run_plan(
             &ctx,
             &wiring,
         )
-        .map_err(|e| format_plan_save_error(&e, "--json"))?;
+        .map_err(|error| map_plan_save_error(error, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
@@ -3479,7 +3487,7 @@ pub async fn run_plan(
             &ctx,
             &wiring,
         )
-        .map_err(|e| format_plan_save_error(&e, "--out"))?;
+        .map_err(|error| map_plan_save_error(error, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         Some(json_out)
@@ -5728,6 +5736,7 @@ mod run_plan_out_tests {
     fn build_plan_file_reports_provider_evidence_failure_without_panicking() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider aws {}\n").expect("write source configuration");
         let configured = ProviderConfig {
             name: "aws".to_string(),
             attributes: indexmap::IndexMap::new(),
@@ -5782,8 +5791,29 @@ mod run_plan_out_tests {
             ) if provider == "aws"
         ));
         assert_eq!(
-            format_plan_save_error(&error, "--out"),
+            map_plan_save_error(error, "--out").to_string(),
             "Cannot save plan: invalid saved-plan provider evidence: provider_artifacts is missing expected provider `aws`"
+        );
+    }
+
+    #[test]
+    fn composition_identity_plan_save_error_stays_typed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-source-root");
+        let identity_error = CompositionSourceIdentityResolver::new(&missing)
+            .expect_err("missing source root must fail canonicalization");
+
+        let error = map_plan_save_error(
+            PlanSaveError::CompositionSourceIdentity(identity_error),
+            "--out",
+        );
+        let AppError::CompositionSourceIdentity(identity_error) = error else {
+            panic!("plan save flattened the composition identity error: {error:?}");
+        };
+        assert!(
+            std::error::Error::source(&identity_error)
+                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
+            "plan save dropped the composition identity io source: {identity_error:?}",
         );
     }
 }

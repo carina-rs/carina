@@ -34,6 +34,16 @@ pub struct ModuleConstraintFailure {
     pub diagnostic: ModuleConstraintDiagnostic,
 }
 
+/// Lifecycle of the composition call that produced a constraint diagnostic.
+/// Live diagnostics retain their parser identity for editor routing; saved
+/// diagnostics deliberately name the absence of live parser state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum ConstraintOrigin {
+    LiveCall(ModuleCallId),
+    #[default]
+    Saved,
+}
+
 impl fmt::Display for ModuleConstraintFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.diagnostic.fmt(f)
@@ -52,10 +62,10 @@ pub struct ModuleConstraintDiagnostic {
     /// Internal call identity used to correlate diagnostics with expansion.
     /// Display must use `call` so anonymous content hashes never leak.
     pub instance: String,
-    /// Parser-minted identity for live resolver diagnostics. Saved-plan
-    /// diagnostics omit this live-only field.
+    /// Parser-minted identity for live resolver diagnostics, or an explicit
+    /// saved-plan lifecycle marker.
     #[serde(skip)]
-    pub call_id: Option<ModuleCallId>,
+    pub origin: ConstraintOrigin,
     pub call: ModuleConstraintCall,
     pub kind: ModuleConstraintKind,
     pub arguments: Vec<String>,
@@ -252,7 +262,10 @@ impl EvaluatedModuleConstraint {
         Some(ModuleConstraintDiagnostic {
             module: module.to_string(),
             instance: instance.to_string(),
-            call_id: call_id.cloned(),
+            origin: call_id
+                .cloned()
+                .map(ConstraintOrigin::LiveCall)
+                .unwrap_or(ConstraintOrigin::Saved),
             call: ModuleConstraintCall::from_binding(binding),
             kind: self.kind.clone(),
             arguments: self.arguments.clone(),
@@ -576,7 +589,11 @@ fn evaluate_pending_constraint_views<'a>(
                         diagnostic: ModuleConstraintDiagnostic {
                             module: composition.module_name().to_string(),
                             instance: composition.instance().to_string(),
-                            call_id: composition.call_id().cloned(),
+                            origin: composition
+                                .call_id()
+                                .cloned()
+                                .map(ConstraintOrigin::LiveCall)
+                                .unwrap_or(ConstraintOrigin::Saved),
                             call: ModuleConstraintCall::from_binding(composition.binding()),
                             kind: evaluated.kind().clone(),
                             arguments: arguments.clone(),
@@ -1386,14 +1403,17 @@ mod tests {
         let ModuleError::Constraint(diagnostic) = &resolver_error else {
             panic!("constraint evaluation must produce a constraint error");
         };
-        assert_eq!(diagnostic.call_id.as_ref(), Some(call_id));
+        assert_eq!(
+            diagnostic.origin,
+            ConstraintOrigin::LiveCall(call_id.clone())
+        );
         let apply_failure = ModuleConstraintFailure {
             composition_id: ResourceId::with_identity("_virtual", "c"),
             constraint_id: ModuleConstraintId::argument_validation("name", 0),
             diagnostic: ModuleConstraintDiagnostic {
                 module: "mod".to_string(),
                 instance: "c".to_string(),
-                call_id: None,
+                origin: ConstraintOrigin::Saved,
                 call: ModuleConstraintCall::Named("c".to_string()),
                 kind: ModuleConstraintKind::ArgumentValidation {
                     argument: "name".to_string(),
@@ -1407,7 +1427,7 @@ mod tests {
         let plan_error = PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
-            call_id: None,
+            origin: ConstraintOrigin::Saved,
             call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),

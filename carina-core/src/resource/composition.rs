@@ -15,8 +15,8 @@
 //! non-provider resource). `module_source` display metadata is flattened to
 //! `module_name` + `instance`; parser-minted identity lives in `call_path`.
 
-use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -595,9 +595,10 @@ impl CompositionCallPath {
 
     pub fn saved_origin_id(
         &self,
-        canonical_source_root: &Path,
+        source_root: &Path,
     ) -> Result<SavedCompositionOriginId, CompositionSourceIdentityError> {
-        SavedCompositionOriginId::from_live(self, canonical_source_root)
+        let mut resolver = CompositionSourceIdentityResolver::new(source_root)?;
+        resolver.saved_origin_id(self)
     }
 }
 
@@ -621,48 +622,143 @@ impl Default for CompositionCallPath {
 #[serde(tag = "location", content = "path", rename_all = "snake_case")]
 enum SavedSourceFileId {
     SourceRootRelative(PathBuf),
-    External(PathBuf),
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("failed to canonicalize composition source path `{path}`: {source}")]
-pub struct CompositionSourceIdentityError {
-    path: PathBuf,
-    #[source]
-    source: std::io::Error,
+/// A composition call source could not be converted into a portable saved
+/// identity.
+#[derive(Debug)]
+pub enum CompositionSourceIdentityError {
+    Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    DifferentRoot {
+        path: PathBuf,
+        source_root: PathBuf,
+    },
 }
 
 impl CompositionSourceIdentityError {
     fn canonicalize(path: &Path) -> Result<PathBuf, Self> {
-        path.canonicalize().map_err(|source| Self {
+        path.canonicalize().map_err(|source| Self::Canonicalize {
             path: path.to_path_buf(),
             source,
         })
     }
 }
 
-impl SavedSourceFileId {
-    fn from_live(
-        path: &Path,
-        canonical_source_root: &Path,
-    ) -> Result<Self, CompositionSourceIdentityError> {
-        let root = CompositionSourceIdentityError::canonicalize(canonical_source_root)?;
-        // The loader preserves the path as supplied by the process. Relative
-        // source paths therefore resolve against the process CWD, not against
-        // the already-resolved source root.
-        let source = CompositionSourceIdentityError::canonicalize(path)?;
-        Ok(match source.strip_prefix(&root) {
-            Ok(relative) => Self::SourceRootRelative(relative.to_path_buf()),
-            Err(error) => {
-                let _outside_source_root = error;
-                Self::External(source)
-            }
+impl std::fmt::Display for CompositionSourceIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Canonicalize { path, source: _ } => write!(
+                formatter,
+                "failed to canonicalize composition source path `{}`",
+                path.display(),
+            ),
+            Self::DifferentRoot { path, source_root } => write!(
+                formatter,
+                "composition source path `{}` cannot be expressed relative to source root `{}`",
+                path.display(),
+                source_root.display(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompositionSourceIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Canonicalize { source, .. } => Some(source),
+            Self::DifferentRoot { .. } => None,
+        }
+    }
+}
+
+fn relative_path_from_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root_components = root.components().collect::<Vec<_>>();
+    let path_components = path.components().collect::<Vec<_>>();
+    let anchor_len = |components: &[Component<'_>]| {
+        components
+            .iter()
+            .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+            .count()
+    };
+    let root_anchor_len = anchor_len(&root_components);
+    let path_anchor_len = anchor_len(&path_components);
+    if root_components[..root_anchor_len] != path_components[..path_anchor_len] {
+        return None;
+    }
+
+    let common = root_components
+        .iter()
+        .zip(&path_components)
+        .take_while(|(root, path)| root == path)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in &root_components[common..] {
+        relative.push(Component::ParentDir.as_os_str());
+    }
+    for component in &path_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+/// Operation-scoped converter from live parser paths to portable saved call
+/// identities. The source root is canonicalized once and each distinct live
+/// source file is canonicalized at most once.
+#[derive(Debug)]
+pub struct CompositionSourceIdentityResolver {
+    canonical_source_root: PathBuf,
+    canonical_source_files: HashMap<PathBuf, PathBuf>,
+}
+
+impl CompositionSourceIdentityResolver {
+    pub fn new(source_root: &Path) -> Result<Self, CompositionSourceIdentityError> {
+        Ok(Self {
+            canonical_source_root: CompositionSourceIdentityError::canonicalize(source_root)?,
+            canonical_source_files: HashMap::new(),
         })
     }
 
+    fn saved_source_file(
+        &mut self,
+        path: &Path,
+    ) -> Result<SavedSourceFileId, CompositionSourceIdentityError> {
+        let source = match self.canonical_source_files.get(path) {
+            Some(source) => source.clone(),
+            None => {
+                // The loader preserves the path as supplied by the process.
+                // Relative source paths therefore resolve against the process
+                // CWD, not against the already-resolved source root.
+                let source = CompositionSourceIdentityError::canonicalize(path)?;
+                self.canonical_source_files
+                    .insert(path.to_path_buf(), source.clone());
+                source
+            }
+        };
+        let relative =
+            relative_path_from_root(&self.canonical_source_root, &source).ok_or_else(|| {
+                CompositionSourceIdentityError::DifferentRoot {
+                    path: source.clone(),
+                    source_root: self.canonical_source_root.clone(),
+                }
+            })?;
+        Ok(SavedSourceFileId::SourceRootRelative(relative))
+    }
+
+    pub fn saved_origin_id(
+        &mut self,
+        path: &CompositionCallPath,
+    ) -> Result<SavedCompositionOriginId, CompositionSourceIdentityError> {
+        SavedCompositionOriginId::from_live(path, self)
+    }
+}
+
+impl SavedSourceFileId {
     fn display_path(&self) -> &Path {
         match self {
-            Self::SourceRootRelative(path) | Self::External(path) => path,
+            Self::SourceRootRelative(path) => path,
         }
     }
 }
@@ -707,7 +803,7 @@ pub struct SavedModuleCallId {
 impl SavedModuleCallId {
     fn from_live(
         id: &crate::parser::ModuleCallId,
-        canonical_source_root: &Path,
+        resolver: &mut CompositionSourceIdentityResolver,
     ) -> Result<Self, CompositionSourceIdentityError> {
         let expansion = match id.expansion() {
             crate::parser::CallExpansion::Direct => SavedCallExpansion::Direct,
@@ -716,7 +812,7 @@ impl SavedModuleCallId {
             }
         };
         Ok(Self {
-            source_file: SavedSourceFileId::from_live(id.source_file(), canonical_source_root)?,
+            source_file: resolver.saved_source_file(id.source_file())?,
             call_span: id.call_span().into(),
             expansion,
         })
@@ -746,13 +842,13 @@ pub struct SavedCompositionOriginId {
 impl SavedCompositionOriginId {
     fn from_live(
         path: &CompositionCallPath,
-        canonical_source_root: &Path,
+        resolver: &mut CompositionSourceIdentityResolver,
     ) -> Result<Self, CompositionSourceIdentityError> {
         let CompositionCallPath { root, descendants } = path;
-        let root = SavedModuleCallId::from_live(&root.id, canonical_source_root)?;
+        let root = SavedModuleCallId::from_live(&root.id, resolver)?;
         let descendants = descendants
             .iter()
-            .map(|call| SavedModuleCallId::from_live(&call.id, canonical_source_root))
+            .map(|call| SavedModuleCallId::from_live(&call.id, resolver))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { root, descendants })
     }
@@ -763,6 +859,10 @@ impl SavedCompositionOriginId {
 
     pub fn immediate(&self) -> &SavedModuleCallId {
         self.descendants.last().unwrap_or(&self.root)
+    }
+
+    pub fn calls(&self) -> impl Iterator<Item = &SavedModuleCallId> {
+        std::iter::once(&self.root).chain(self.descendants.iter())
     }
 }
 
@@ -900,7 +1000,15 @@ impl LiveComposition {
 
     pub fn into_saved(
         self,
-        canonical_source_root: &Path,
+        source_root: &Path,
+    ) -> Result<SavedComposition, CompositionSourceIdentityError> {
+        let mut resolver = CompositionSourceIdentityResolver::new(source_root)?;
+        self.into_saved_with_resolver(&mut resolver)
+    }
+
+    pub fn into_saved_with_resolver(
+        self,
+        resolver: &mut CompositionSourceIdentityResolver,
     ) -> Result<SavedComposition, CompositionSourceIdentityError> {
         let Self {
             id,
@@ -912,7 +1020,7 @@ impl LiveComposition {
             call_path,
             quoted_string_attrs,
         } = self;
-        let origin_id = call_path.saved_origin_id(canonical_source_root)?;
+        let origin_id = resolver.saved_origin_id(&call_path)?;
         let LiveCompositionSignature {
             arguments,
             attributes,
@@ -1388,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_origin_uses_explicit_external_source_representation() {
+    fn saved_origin_uses_source_root_relative_parent_segments_for_sibling_tree() {
         let source_root = tempfile::tempdir().expect("source root");
         let external_root = tempfile::tempdir().expect("external root");
         let source_file = external_root.path().join("module.crn");
@@ -1415,15 +1523,39 @@ mod tests {
         .saved_origin_id(source_root.path())
         .expect("save external origin");
 
-        let json = serde_json::to_value(origin).expect("serialize external origin");
-        assert_eq!(json["root"]["source_file"]["location"], "external");
+        let relative = origin.root().source_file();
+        assert!(
+            relative.starts_with(".."),
+            "a sibling module must be represented with parent segments: {}",
+            relative.display(),
+        );
+        assert!(
+            !relative.is_absolute(),
+            "a saved module identity must never retain a host-absolute path: {}",
+            relative.display(),
+        );
         assert_eq!(
-            json["root"]["source_file"]["path"],
+            source_root
+                .path()
+                .join(relative)
+                .canonicalize()
+                .expect("resolve saved relative source"),
             source_file
                 .canonicalize()
-                .expect("canonical external source")
-                .display()
-                .to_string()
+                .expect("canonical external source"),
+        );
+
+        let json = serde_json::to_value(origin).expect("serialize external origin");
+        assert_eq!(
+            json["root"]["source_file"]["location"],
+            "source_root_relative"
+        );
+        assert!(
+            !json["root"]["source_file"]["path"]
+                .as_str()
+                .expect("saved source path string")
+                .starts_with('/'),
+            "serialized composition identity leaked an absolute path: {json}",
         );
     }
 
@@ -1450,6 +1582,18 @@ mod tests {
         .saved_origin_id(source_root.path())
         .expect_err("a missing source path must not mint a fallback identity");
 
-        assert!(error.to_string().contains("missing.crn"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed to canonicalize composition source path `{}`",
+                missing.display()
+            ),
+        );
+        let source = std::error::Error::source(&error)
+            .expect("canonicalization failure must preserve its io source");
+        assert!(
+            source.downcast_ref::<std::io::Error>().is_some(),
+            "composition source identity lost its typed io cause: {source:?}",
+        );
     }
 }

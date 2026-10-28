@@ -35,7 +35,8 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
-    Current, DataSource, ResolvedResource, Resource, ResourceId, State, Value,
+    CompositionSourceIdentityResolver, Current, DataSource, ResolvedResource, Resource, ResourceId,
+    State, Value,
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
@@ -2919,24 +2920,32 @@ fn rehydrate_desired_plan_file(
         carina_core::value::rehydrate_resource_secrets,
     )?;
 
-    let canonical_source_root = carina_core::config_loader::get_base_dir(apply_target.source_dir())
-        .canonicalize()
-        .unwrap_or_else(|error| {
-            let canonicalize_error = error;
-            drop(canonicalize_error);
-            carina_core::config_loader::get_base_dir(apply_target.source_dir()).to_path_buf()
-        });
+    let mut composition_source_identities = CompositionSourceIdentityResolver::new(
+        carina_core::config_loader::get_base_dir(apply_target.source_dir()),
+    )
+    .map_err(AppError::from)?;
     plan_file
-        .rehydrate_composition_secrets(&parsed.compositions, &canonical_source_root)
+        .rehydrate_composition_secrets(
+            &parsed.compositions,
+            &mut composition_source_identities,
+        )
         .map_err(|error| match error {
             ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
-                let call = origin_id.immediate();
+                let call_chain = origin_id
+                    .calls()
+                    .map(|call| {
+                        format!(
+                            "{}:{}:{}",
+                            call.source_file().display(),
+                            call.start_line(),
+                            call.start_column(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
                 saved_plan_secret_shape_error(
                     format!(
-                        "composition call id {}:{}:{} disagreed with the saved plan",
-                        call.source_file().display(),
-                        call.start_line(),
-                        call.start_column(),
+                        "composition call id chain {call_chain} disagreed with the saved plan",
                     ),
                     apply_target,
                 )
@@ -2944,9 +2953,7 @@ fn rehydrate_desired_plan_file(
             ReloadedCompositionRehydrationError::Secret(error) => {
                 saved_plan_secret_rehydration_error(error, apply_target)
             }
-            ReloadedCompositionRehydrationError::SourceIdentity(error) => {
-                AppError::Config(error.to_string())
-            }
+            ReloadedCompositionRehydrationError::SourceIdentity(error) => AppError::from(error),
         })?;
 
     rehydrate_saved_resource_like(

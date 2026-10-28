@@ -1248,9 +1248,9 @@ impl DiagnosticEngine {
         }
 
         let relative_message = error.display_relative_to(base_path);
-        let (constraint_call_id, direct_error_location, severity, message) = match error {
+        let (constraint_origin, direct_error_location, severity, message) = match error {
             carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
-                diagnostic.call_id.as_ref(),
+                Some(&diagnostic.origin),
                 None,
                 DiagnosticSeverity::ERROR,
                 relative_message,
@@ -1325,8 +1325,15 @@ impl DiagnosticEngine {
                 carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
             }
         })?;
-        if constraint_call_id.is_some_and(|constraint_call_id| constraint_call_id == call.id()) {
-            return None;
+        match constraint_origin {
+            Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(call_id))
+                if call_id == call.id() =>
+            {
+                return None;
+            }
+            Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(_))
+            | Some(carina_core::module_resolver::ConstraintOrigin::Saved)
+            | None => {}
         }
 
         if let Some((line, error_source)) = direct_error_location.filter(|(line, _)| *line > 0) {

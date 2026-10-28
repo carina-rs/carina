@@ -6632,7 +6632,7 @@ mod tests {
     }
 
     /// `UnknownReason::Display` flows into the user-facing error from
-    /// `format_plan_save_error` / `SerializationError::Display`. Pin
+    /// `map_plan_save_error` / `SerializationError::Display`. Pin
     /// the wording so a future regression does not silently degrade
     /// the diagnostic.
     #[test]

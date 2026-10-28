@@ -7547,11 +7547,11 @@ pub mod persistent_id;
 
 pub(crate) use composition::CompositionRuntimeRef;
 pub use composition::{
-    CompositionCall, CompositionCallPath, CompositionSourceIdentityError, LiveComposition,
-    LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, SavedComposition, SavedCompositionArgument,
-    SavedCompositionAttribute, SavedCompositionOriginId, SavedCompositionSignature,
-    SavedModuleCallId,
+    CompositionCall, CompositionCallPath, CompositionSourceIdentityError,
+    CompositionSourceIdentityResolver, LiveComposition, LiveCompositionArgument,
+    LiveCompositionAttribute, LiveCompositionSignature, ModuleConstraintId,
+    PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
+    SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
 };
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};
