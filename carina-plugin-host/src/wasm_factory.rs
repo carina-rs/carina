@@ -45,7 +45,9 @@ use carina_core::resource::{
     Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
     value_contains_unknown,
 };
-use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
+use carina_core::schema::{
+    CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedResourceSchema,
+};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
@@ -3202,14 +3204,14 @@ pub struct WasmProviderFactory {
     budget: GuestCallBudget,
     display_name: String,
     version: String,
-    schemas: Arc<Vec<ResourceSchema>>,
+    schemas: Arc<Vec<ValidatedResourceSchema>>,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
     /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
     /// Used by `ProviderFactory::provider_config_attribute_types()` so the host
     /// validates provider attributes against these types using its own carina-core,
     /// catching format bugs without requiring a provider rebuild.
-    cached_provider_config_types: HashMap<String, carina_core::schema::AttributeType>,
+    cached_provider_config_types: ValidatedConfigSchema,
     enable_http: bool,
     /// Reusable, rebuildable WASM instance for editor-facing validation.
     /// A poisoned instance is recreated from `engine` + `component`; each input
@@ -3336,7 +3338,7 @@ impl WasmProviderFactory {
         (
             ProviderConfigCompletions,
             Vec<String>,
-            HashMap<String, carina_core::schema::AttributeType>,
+            ValidatedConfigSchema,
         ),
         WasmProviderLoadError,
     > {
@@ -3842,9 +3844,7 @@ impl ProviderFactory for WasmProviderFactory {
         &self.display_name
     }
 
-    fn provider_config_attribute_types(
-        &self,
-    ) -> HashMap<String, carina_core::schema::AttributeType> {
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
         self.cached_provider_config_types.clone()
     }
 
@@ -3955,7 +3955,7 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         self.schemas.as_ref().clone()
     }
 }
@@ -3965,7 +3965,7 @@ impl ProviderFactory for WasmProviderFactory {
 pub struct WasmProvider {
     instance: Arc<FailFastInstance>,
     name: String,
-    schemas: Arc<Vec<ResourceSchema>>,
+    schemas: Arc<Vec<ValidatedResourceSchema>>,
 }
 
 struct PendingCreate {
@@ -4170,8 +4170,8 @@ impl WasmProvider {
     ) -> std::time::Duration {
         self.schemas
             .iter()
-            .find(|schema| schema.resource_type() == id.resource_type)
-            .and_then(|schema| schema.operation_config())
+            .find(|schema| schema.as_schema().resource_type() == id.resource_type)
+            .and_then(|schema| schema.as_schema().operation_config())
             .map_or(
                 carina_provider_protocol::DEFAULT_OPERATION_BUDGET,
                 |config| config.budget(kind),

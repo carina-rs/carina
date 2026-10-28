@@ -4155,6 +4155,7 @@ pub fn merge_default_tags(
         // Some providers use the same attribute name for list/struct shapes;
         // presence alone is therefore not enough to opt a resource in.
         let has_tags = registry.get_for(resource).is_some_and(|schema| {
+            let schema = schema.as_schema();
             let Some(tags) = schema.attributes.get("tags") else {
                 return false;
             };
@@ -4464,15 +4465,15 @@ pub trait ProviderFactory: Send + Sync {
     /// Display name for user-facing messages (e.g., "AWS provider", "AWS Cloud Control provider")
     fn display_name(&self) -> &str;
 
-    /// Return the types of the provider block's configuration attributes
-    /// (e.g., `region`).
+    /// Return the validated schema witness for the provider block's
+    /// configuration attributes (e.g., `region`).
     ///
     /// These are used by the host to validate provider config attributes
-    /// against their declared types *before* calling `validate_config`.
+    /// against their effective path types *before* calling `validate_config`.
     /// Keeping format validation (namespace structure, enum membership) on
     /// the host side means fixes to generic validation logic in
     /// `carina-core` take effect without rebuilding provider binaries.
-    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType>;
+    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema;
 
     /// Validate provider-specific configuration semantics that cannot be
     /// expressed in the attribute type schema (e.g., cross-attribute
@@ -4562,7 +4563,7 @@ pub trait ProviderFactory: Send + Sync {
     }
 
     /// Get all resource schemas for this provider.
-    fn schemas(&self) -> Vec<crate::schema::ResourceSchema>;
+    fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema>;
 
     /// Attribute names (beyond schema create-only properties) that contribute
     /// to anonymous resource identity. For example, AWS providers return
@@ -4619,6 +4620,7 @@ pub fn collect_custom_type_validators(
     let mut validators: HashMap<TypeIdentity, crate::parser::ValidatorFn> = HashMap::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
+        let schema = schema.as_schema();
         for attr_schema in schema.attributes.values() {
             collect_validators_from_type(&attr_schema.attr_type, &mut validators);
         }
@@ -4649,6 +4651,7 @@ pub fn collect_custom_type_attribute_types(
 ) -> HashMap<TypeIdentity, crate::schema::AttributeType> {
     let mut types = HashMap::new();
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
+        let schema = schema.as_schema();
         for attr_schema in schema.attributes.values() {
             collect_identified_attribute_types_from_type(&attr_schema.attr_type, &mut types);
         }
@@ -4718,6 +4721,7 @@ pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity>
     let mut names = std::collections::HashSet::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
+        let schema = schema.as_schema();
         for attr_schema in schema.attributes.values() {
             collect_type_names_from_type(&attr_schema.attr_type, &mut names);
         }
@@ -4741,17 +4745,17 @@ fn collect_validators_from_type(
     match attr_type.raw_shape() {
         RawShape::String {
             identity: Some(id),
-            validate,
+            validate: Some(validate),
             ..
         }
         | RawShape::Int {
             identity: Some(id),
-            validate,
+            validate: Some(validate),
             ..
         }
         | RawShape::Float {
             identity: Some(id),
-            validate,
+            validate: Some(validate),
             ..
         } => {
             validators.entry(id.clone()).or_insert_with(|| {
@@ -4764,9 +4768,7 @@ fn collect_validators_from_type(
                 })
             });
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
-        | RawShape::Float { identity: None, .. } => {}
+        RawShape::String { .. } | RawShape::Int { .. } | RawShape::Float { .. } => {}
         RawShape::List {
             element_type: inner,
             ..
@@ -5369,12 +5371,15 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::new(
+            (crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::optional(
                     "tags",
                     crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-                ),
-            ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         merge_default_tags(&config, &mut resources, &registry).unwrap();
@@ -5424,12 +5429,15 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::new(
+            (crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::optional(
                     "tags",
                     crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-                ),
-            ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         merge_default_tags(&config, &mut resources, &registry).unwrap();
@@ -5492,8 +5500,8 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::new(
+            (crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::optional(
                     "status",
                     crate::schema::AttributeType::enum_(
                         crate::schema::enum_identity("Status", Some("aws.service.Widget")),
@@ -5502,8 +5510,11 @@ mod tests {
                         None,
                         None,
                     ),
-                ),
-            ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         registry
     }
@@ -5559,19 +5570,24 @@ mod tests {
 
         let statement = AttributeType::struct_(
             "Statement".to_string(),
-            vec![StructField::new(
-                "action",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
-            )],
+            vec![
+                StructField::optional(
+                    "action",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            ],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            ResourceSchema::new("iam.policy")
-                .attribute(AttributeSchema::new("statement", statement)),
+            (ResourceSchema::new("iam.policy")
+                .attribute(AttributeSchema::optional("statement", statement).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let id = ResourceId::with_provider_identity("aws", "iam.policy", "p1", None);
@@ -5641,24 +5657,34 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            ResourceSchema::new("service.Widget")
-                .attribute(AttributeSchema::new(
-                    "status",
-                    crate::schema::AttributeType::enum_(
-                        crate::schema::enum_identity("Status", Some("aws.service.Widget")),
-                        Some(vec!["Enabled".to_string()]),
-                        vec![("Enabled".to_string(), "enabled".to_string())],
-                        None,
-                        None,
-                    ),
+            (ResourceSchema::new("service.Widget")
+                .attribute(
+                    AttributeSchema::optional(
+                        "status",
+                        crate::schema::AttributeType::enum_(
+                            crate::schema::enum_identity("Status", Some("aws.service.Widget")),
+                            Some(vec!["Enabled".to_string()]),
+                            vec![("Enabled".to_string(), "enabled".to_string())],
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "subjects",
+                        crate::schema::AttributeType::union(vec![
+                            crate::schema::AttributeType::string(),
+                            crate::schema::AttributeType::list(
+                                crate::schema::AttributeType::string(),
+                            ),
+                        ]),
+                    )
+                    .build(),
                 ))
-                .attribute(AttributeSchema::new(
-                    "subjects",
-                    crate::schema::AttributeType::union(vec![
-                        crate::schema::AttributeType::string(),
-                        crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
-                    ]),
-                )),
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
         let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
@@ -5700,18 +5726,24 @@ mod tests {
 
         let config = AttributeType::struct_(
             "Config".to_string(),
-            vec![StructField::new(
-                "password",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
-            )],
+            vec![
+                StructField::optional(
+                    "password",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            ],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new("config", config)),
+            (ResourceSchema::new("service.Widget")
+                .attribute(AttributeSchema::optional("config", config).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let id = ResourceId::with_provider_identity("test", "service.Widget", "widget", None);
@@ -5761,16 +5793,21 @@ mod tests {
         );
         let settings = AttributeType::struct_(
             "Settings".to_string(),
-            vec![StructField::new(
-                "mode",
-                AttributeType::union(vec![mode.clone(), AttributeType::list(mode)]),
-            )],
+            vec![
+                StructField::optional(
+                    "mode",
+                    AttributeType::union(vec![mode.clone(), AttributeType::list(mode)]),
+                )
+                .build(),
+            ],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            ResourceSchema::new("example.Widget")
-                .attribute(AttributeSchema::new("settings", settings)),
+            (ResourceSchema::new("example.Widget")
+                .attribute(AttributeSchema::optional("settings", settings).build()))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
 
         let id = ResourceId::with_provider_identity("awscc", "example.Widget", "widget", None);
@@ -6835,24 +6872,35 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, StructField};
 
         let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::new("description", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "default_actions",
-                AttributeType::list(AttributeType::struct_(
-                    "Action",
-                    vec![StructField::new(
-                        "authenticate_oidc_config",
-                        AttributeType::struct_(
-                            "AuthenticateOidcConfig",
-                            vec![
-                                StructField::new("issuer", AttributeType::string()),
-                                StructField::new("client_secret", AttributeType::string())
-                                    .write_only(),
-                            ],
-                        ),
-                    )],
-                )),
-            ));
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "default_actions",
+                    AttributeType::list(AttributeType::struct_(
+                        "Action",
+                        vec![
+                            StructField::optional(
+                                "authenticate_oidc_config",
+                                AttributeType::struct_(
+                                    "AuthenticateOidcConfig",
+                                    vec![
+                                        StructField::optional("issuer", AttributeType::string())
+                                            .build(),
+                                        StructField::optional(
+                                            "client_secret",
+                                            AttributeType::string(),
+                                        )
+                                        .write_only()
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            );
         let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(IndexMap::from([(
                 "authenticate_oidc_config".to_string(),
@@ -6878,14 +6926,21 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, StructField};
 
         let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "credentials",
-                AttributeType::struct_(
-                    "Credentials",
-                    vec![StructField::new("password", AttributeType::string()).write_only()],
-                ),
-            ));
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "credentials",
+                    AttributeType::struct_(
+                        "Credentials",
+                        vec![
+                            StructField::optional("password", AttributeType::string())
+                                .write_only()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            );
         let attributes = IndexMap::from([
             ("name".to_string(), patch_test_value("example")),
             (
@@ -6965,15 +7020,28 @@ mod tests {
                 .with_attribute("create_token", patch_test_value("create")),
         );
         let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::new("description", AttributeType::string()))
-            .attribute(AttributeSchema::new("token_b", AttributeType::string()).write_only())
-            .attribute(AttributeSchema::new("token_a", AttributeType::string()).write_only())
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("create_token", AttributeType::string())
+                AttributeSchema::optional("token_b", AttributeType::string())
                     .write_only()
-                    .create_only(),
+                    .build(),
             )
-            .attribute(AttributeSchema::new("omitted_token", AttributeType::string()).write_only());
+            .attribute(
+                AttributeSchema::optional("token_a", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("create_token", AttributeType::string())
+                    .write_only()
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("omitted_token", AttributeType::string())
+                    .write_only()
+                    .build(),
+            );
 
         let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
 
@@ -7010,9 +7078,21 @@ mod tests {
                 .with_attribute("added", patch_test_value("added")),
         );
         let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::new("replaced", AttributeType::string()).write_only())
-            .attribute(AttributeSchema::new("added", AttributeType::string()).write_only())
-            .attribute(AttributeSchema::new("removed", AttributeType::string()).write_only());
+            .attribute(
+                AttributeSchema::optional("replaced", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("added", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("removed", AttributeType::string())
+                    .write_only()
+                    .build(),
+            );
 
         let patch = build_update_patch(
             &[
@@ -7052,8 +7132,11 @@ mod tests {
         let to = resolved_for_test(
             Resource::new("test", "example").with_attribute("token", patch_test_value("same")),
         );
-        let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::new("token", AttributeType::string()).write_only());
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional("token", AttributeType::string())
+                .write_only()
+                .build(),
+        );
 
         assert!(build_update_patch(&[], &to, &from, &schema).ops.is_empty());
         assert!(
@@ -7102,14 +7185,17 @@ mod tests {
                                 if desired_mask & bit != 0 {
                                     desired.set_attr((*key).to_string(), patch_test_value("to"));
                                 }
-                                let mut attribute =
-                                    AttributeSchema::new(*key, AttributeType::string());
-                                if write_only_mask & bit != 0 {
-                                    attribute = attribute.write_only();
-                                }
-                                if create_only_mask & bit != 0 {
-                                    attribute = attribute.create_only();
-                                }
+                                let builder =
+                                    AttributeSchema::optional(*key, AttributeType::string());
+                                let attribute =
+                                    match (write_only_mask & bit != 0, create_only_mask & bit != 0)
+                                    {
+                                        (false, false) => builder,
+                                        (true, false) => builder.write_only(),
+                                        (false, true) => builder.create_only(),
+                                        (true, true) => builder.write_only().create_only(),
+                                    }
+                                    .build();
                                 schema = schema.attribute(attribute);
                                 if changed_mask & bit != 0 {
                                     changed.push((*key).to_string());
@@ -7372,8 +7458,6 @@ mod tests {
         // (e.g. allowed_account_ids mismatch). The trait method must
         // return ProviderResult so the host can surface the error
         // verbatim instead of panicking with .expect(...).
-        use crate::schema::ResourceSchema;
-
         struct FailingFactory;
 
         impl ProviderFactory for FailingFactory {
@@ -7383,10 +7467,8 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Failing provider"
             }
-            fn provider_config_attribute_types(
-                &self,
-            ) -> HashMap<String, crate::schema::AttributeType> {
-                HashMap::new()
+            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+                Default::default()
             }
             fn validate_config(
                 &self,
@@ -7410,7 +7492,7 @@ mod tests {
                     ))
                 })
             }
-            fn schemas(&self) -> Vec<ResourceSchema> {
+            fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }
         }
@@ -7458,8 +7540,6 @@ mod tests {
         use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
 
-        use crate::schema::ResourceSchema;
-
         #[derive(Default)]
         struct BindingCapturingFactory {
             calls: Arc<StdMutex<Vec<Option<String>>>>,
@@ -7472,10 +7552,8 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Capturing provider"
             }
-            fn provider_config_attribute_types(
-                &self,
-            ) -> HashMap<String, crate::schema::AttributeType> {
-                HashMap::new()
+            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+                Default::default()
             }
             fn validate_config(
                 &self,
@@ -7497,7 +7575,7 @@ mod tests {
                     .push(binding.map(|s| s.to_string()));
                 Box::pin(async { Ok(Box::new(MockProvider) as Box<dyn Provider>) })
             }
-            fn schemas(&self) -> Vec<ResourceSchema> {
+            fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }
         }

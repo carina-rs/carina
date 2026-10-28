@@ -438,12 +438,20 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
+        (ResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
+                AttributeSchema::optional("bucket_name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .with_unique_name_attribute("bucket_name"),
+            .attribute(
+                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("bucket_name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -529,13 +537,19 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("logs.LogGroup")
+        (ResourceSchema::new("logs.LogGroup")
             .attribute(
                 // log_group_name is NOT create-only in this test (can be renamed)
-                AttributeSchema::new("log_group_name", AttributeType::string()),
+                AttributeSchema::optional("log_group_name", AttributeType::string()).build(),
             )
-            .attribute(AttributeSchema::new("kms_key_id", AttributeType::string()).create_only())
-            .with_unique_name_attribute("log_group_name"),
+            .attribute(
+                AttributeSchema::optional("kms_key_id", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("log_group_name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -604,12 +618,20 @@ fn no_temporary_name_without_create_before_destroy() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
+        (ResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
+                AttributeSchema::optional("bucket_name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .with_unique_name_attribute("bucket_name"),
+            .attribute(
+                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("bucket_name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -677,12 +699,20 @@ fn no_temporary_name_when_name_prefix_is_used() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
+        (ResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
+                AttributeSchema::optional("bucket_name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .with_unique_name_attribute("bucket_name"),
+            .attribute(
+                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("bucket_name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -737,10 +767,16 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .with_conflicting_replacement(),
-        // No unique_name_attribute set
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_conflicting_replacement())
+        .validate()
+        .expect("schema fixture must be valid"),
+        // No unique_name_attribute set.
     );
 
     let plan = create_plan(
@@ -805,9 +841,15 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .with_coexisting_replacement(),
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_coexisting_replacement())
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -911,12 +953,20 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
+        (ResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
+                AttributeSchema::optional("bucket_name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .with_unique_name_attribute("bucket_name"),
+            .attribute(
+                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("bucket_name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2057,8 +2107,13 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("example.Producer")
-            .attribute(AttributeSchema::new("replace_key", AttributeType::string()).create_only()),
+        (ResourceSchema::new("example.Producer").attribute(
+            AttributeSchema::optional("replace_key", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2386,12 +2441,18 @@ fn create_plan_filters_non_removable_attribute_removal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("region", AttributeType::string()).non_removable())
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            )),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(
+                AttributeSchema::optional("region", AttributeType::string())
+                    .non_removable()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2464,9 +2525,15 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string()).required())
-            .attribute(AttributeSchema::new("region", AttributeType::string()).non_removable()),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::required("bucket", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("region", AttributeType::string())
+                    .non_removable()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2613,8 +2680,13 @@ fn prevent_destroy_blocks_replace() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+        (ResourceSchema::new("ec2.Vpc").attribute(
+            AttributeSchema::optional("cidr_block", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2770,16 +2842,24 @@ fn route53_union_non_enum_literal_reaches_plan_as_string() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("route53.RecordSet").attribute(AttributeSchema::new(
-            "alias_target",
-            AttributeType::struct_(
-                "AliasTarget",
-                vec![StructField::new(
-                    "hosted_zone_id",
-                    AttributeType::union(vec![hosted_zone, AttributeType::string()]),
-                )],
-            ),
-        )),
+        (ResourceSchema::new("route53.RecordSet").attribute(
+            AttributeSchema::optional(
+                "alias_target",
+                AttributeType::struct_(
+                    "AliasTarget",
+                    vec![
+                        StructField::optional(
+                            "hosted_zone_id",
+                            AttributeType::union(vec![hosted_zone, AttributeType::string()]),
+                        )
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let literal = Value::Concrete(ConcreteValue::String("Z05136711ZXUHBDOA8D5O".into()));
     let mut resources = vec![
@@ -2957,9 +3037,15 @@ fn wait_binding_lowers_to_wait_effect() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("acm.Certificate").attribute(
-            crate::schema::AttributeSchema::new("status", crate::schema::AttributeType::string()),
-        ),
+        (crate::schema::ResourceSchema::new("acm.Certificate").attribute(
+            crate::schema::AttributeSchema::optional(
+                "status",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let plan = create_plan(
         &resources,
@@ -3028,9 +3114,15 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("job.Job").attribute(
-            crate::schema::AttributeSchema::new("state", crate::schema::AttributeType::string()),
-        ),
+        (crate::schema::ResourceSchema::new("job.Job").attribute(
+            crate::schema::AttributeSchema::optional(
+                "state",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let plan = create_plan(
         &[job, consumer],
@@ -3093,13 +3185,15 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
     );
     let renewal_summary = AttributeType::struct_(
         "RenewalSummary",
-        vec![StructField::new("renewal_status", renewal_status)],
+        vec![StructField::optional("renewal_status", renewal_status).build()],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+        (ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -3167,10 +3261,12 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("job.Job").attribute(AttributeSchema::new(
-            "labels",
-            AttributeType::map(AttributeType::string()),
-        )),
+        (ResourceSchema::new("job.Job").attribute(
+            AttributeSchema::optional("labels", AttributeType::map(AttributeType::string()))
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -3240,8 +3336,10 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("job.Job")
-            .attribute(AttributeSchema::new("statuses", AttributeType::map(status))),
+        (ResourceSchema::new("job.Job")
+            .attribute(AttributeSchema::optional("statuses", AttributeType::map(status)).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -3299,13 +3397,15 @@ fn nested_wait_resolution_error_matches_validation_message() {
     );
     let renewal_summary = AttributeType::struct_(
         "RenewalSummary",
-        vec![StructField::new("renewal_status", renewal_status)],
+        vec![StructField::optional("renewal_status", renewal_status).build()],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::new("renewal_summary", renewal_summary)),
+        (ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let source = r#"
 let cert = aws.acm.Certificate {}
@@ -3612,10 +3712,12 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::new("status", AttributeType::string()))
+        (ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
             .with_default_wait_timeout(std::time::Duration::from_secs(99))
-            .with_default_wait_interval(std::time::Duration::from_secs(7)),
+            .with_default_wait_interval(std::time::Duration::from_secs(7)))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let wait = WaitBinding {
@@ -3883,16 +3985,21 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
-            "status",
-            AttributeType::enum_(
-                TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
-                Some(vec!["ISSUED".to_string()]),
-                vec![("ISSUED".to_string(), "issued".to_string())],
-                None,
-                None,
-            ),
-        )),
+        (ResourceSchema::new("acm.Certificate").attribute(
+            AttributeSchema::optional(
+                "status",
+                AttributeType::enum_(
+                    TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
+                    Some(vec!["ISSUED".to_string()]),
+                    vec![("ISSUED".to_string(), "issued".to_string())],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(

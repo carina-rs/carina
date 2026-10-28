@@ -14,6 +14,8 @@ use carina_core::parser::{ProviderConfig, UseStatement};
 use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
+#[cfg(test)]
+use crate::wiring::LoadedProviderFactory;
 use crate::wiring::{
     FormattingFactoryLoad, ProviderFactoryDiagnostic, WiringContext,
     build_factories_from_providers_for_formatting,
@@ -470,8 +472,8 @@ mod tests {
             "Example"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -493,14 +495,28 @@ mod tests {
             Box::pin(async { unreachable!("formatting does not instantiate providers") })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            let entries = AttributeType::list(AttributeType::struct_(
-                "Entry",
-                vec![StructField::new("value", AttributeType::string())],
-            ));
-            vec![ResourceSchema::new("example.resource").attribute(
-                AttributeSchema::new("entries", entries).with_block_name(self.block_name),
-            )]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                let entries = AttributeType::list(AttributeType::struct_(
+                    "Entry",
+                    vec![StructField::optional("value", AttributeType::string()).build()],
+                ));
+                vec![
+                    ResourceSchema::new("example.resource").attribute(
+                        AttributeSchema::optional("entries", entries)
+                            .with_block_name(self.block_name)
+                            .build(),
+                    ),
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -523,7 +539,7 @@ mod tests {
             let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(FactoryWithBlockSchema {
                 block_name: "entry_from_factory",
             })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 
@@ -582,12 +598,12 @@ mod tests {
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
         let skipped = block_names_for_dir(tmp.path(), |_, _| {
-            Ok((Vec::<Box<dyn ProviderFactory>>::new(), HashMap::new()))
+            Ok((Vec::<LoadedProviderFactory>::new(), HashMap::new()))
         })
         .unwrap();
         let failed = block_names_for_dir(tmp.path(), |_, _| {
             Ok((
-                Vec::<Box<dyn ProviderFactory>>::new(),
+                Vec::<LoadedProviderFactory>::new(),
                 HashMap::from([(
                     "example".to_string(),
                     ProviderFactoryDiagnostic::Message("load failed".into()),
@@ -656,7 +672,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 
@@ -721,7 +737,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 

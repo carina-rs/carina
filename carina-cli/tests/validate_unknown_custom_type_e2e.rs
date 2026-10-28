@@ -45,8 +45,8 @@ impl ProviderFactory for AwsccTestFactory {
     fn display_name(&self) -> &str {
         "AWSCC (carina#3239 test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -78,35 +78,50 @@ impl ProviderFactory for AwsccTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        let iam_policy_arn = AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
-            None,
-            None,
-            legacy_validator(|_| Ok(())),
-            None,
-        );
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            let iam_policy_arn = AttributeType::refined_string_with_validator(
+                TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn"),
+                None,
+                None,
+                legacy_validator(|_| Ok(())),
+                None,
+            );
 
-        let generic_arn = AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
-            None,
-            None,
-            legacy_validator(|_| Ok(())),
-            None,
-        );
+            let generic_arn = AttributeType::refined_string_with_validator(
+                TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn"),
+                None,
+                None,
+                legacy_validator(|_| Ok(())),
+                None,
+            );
 
-        let mut iam_role = ResourceSchema::new("iam.Role")
-            .attribute(AttributeSchema::new("policy_arn", iam_policy_arn));
-        if self.include_generic_arn {
-            iam_role = iam_role.attribute(AttributeSchema::new("role_arn", generic_arn));
-        }
+            let mut iam_role = ResourceSchema::new("iam.Role")
+                .attribute(AttributeSchema::optional("policy_arn", iam_policy_arn).build());
+            if self.include_generic_arn {
+                iam_role =
+                    iam_role.attribute(AttributeSchema::optional("role_arn", generic_arn).build());
+            }
 
-        vec![
-            ResourceSchema::new("ec2.Vpc")
-                .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::string())),
-            iam_role,
-        ]
+            vec![
+                ResourceSchema::new("ec2.Vpc")
+                    .attribute(
+                        AttributeSchema::optional("cidr_block", AttributeType::string()).build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("vpc_id", AttributeType::string()).build(),
+                    ),
+                iam_role,
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -193,16 +208,16 @@ impl Provider for NoopProvider {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory {
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: false,
-    }) as Box<dyn ProviderFactory>]
+    }) as Box<dyn ProviderFactory>])
 }
 
-fn factories_with_generic_arn() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory {
+fn factories_with_generic_arn() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: true,
-    }) as Box<dyn ProviderFactory>]
+    }) as Box<dyn ProviderFactory>])
 }
 
 /// Two-directory fixture: a module that *declares* an unknown

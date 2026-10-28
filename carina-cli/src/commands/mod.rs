@@ -38,16 +38,16 @@ pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
-    resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
-    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
-    validate_module_calls_with_imported, validate_module_internal_ref_types,
-    validate_no_backend_in_modules, validate_no_empty_interpolations,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
-    validate_provider_region_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    LoadedProviderFactory, WiringContext, build_factories_from_providers,
+    compute_anonymous_identifiers_with_ctx, compute_canonical_pair_anonymous_identifiers_with_ctx,
+    resolve_config_names_with_ctx, resolve_file_names_with_ctx,
+    validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
+    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
+    validate_module_internal_ref_types, validate_no_backend_in_modules,
+    validate_no_empty_interpolations, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -371,7 +371,7 @@ pub fn validate_and_resolve_errors(
 
 /// Factory-injected variant of [`validate_and_resolve_errors`]. The CLI
 /// validation pipeline runs against caller-provided
-/// [`Box<dyn ProviderFactory>`] instances rather than building them from
+/// [`LoadedProviderFactory`] instances rather than building them from
 /// the parsed file's `provider` blocks.
 ///
 /// Exposed so e2e tests can drive the full pipeline (parse → resolve →
@@ -382,7 +382,7 @@ pub fn validate_and_resolve_errors_with_factories(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+    factories: Vec<LoadedProviderFactory>,
     load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
@@ -393,6 +393,27 @@ pub fn validate_and_resolve_errors_with_factories(
         base_dir,
         skip_resource_validation,
         &ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn validate_and_resolve_errors_with_test_factories(
+    parsed: &mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Vec<AppError> {
+    validate_and_resolve_errors_with_factories(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        LoadedProviderFactory::for_test(factories),
         load_errors,
         prior_inference_errors,
         duplicate_declarations,
@@ -1361,10 +1382,8 @@ exports {
             "AWSCC resource create-only enum test provider"
         }
 
-        fn provider_config_attribute_types(
-            &self,
-        ) -> HashMap<String, carina_core::schema::AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -1408,26 +1427,37 @@ exports {
             })
         }
 
-        fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
-            vec![
-                carina_core::schema::ResourceSchema::new("ec2.Subnet").attribute(
-                    carina_core::schema::AttributeSchema::new(
-                        "placement_region",
-                        carina_core::schema::AttributeType::enum_(
-                            carina_core::schema::TypeIdentity::new(
-                                Some(self.enum_provider),
-                                Vec::<String>::new(),
-                                "Region",
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                vec![
+                    carina_core::schema::ResourceSchema::new("ec2.Subnet").attribute(
+                        carina_core::schema::AttributeSchema::optional(
+                            "placement_region",
+                            carina_core::schema::AttributeType::enum_(
+                                carina_core::schema::TypeIdentity::new(
+                                    Some(self.enum_provider),
+                                    Vec::<String>::new(),
+                                    "Region",
+                                ),
+                                None,
+                                Vec::new(),
+                                None,
+                                Some(carina_core::schema::DslTransform::HyphenToUnderscore),
                             ),
-                            None,
-                            Vec::new(),
-                            None,
-                            Some(carina_core::schema::DslTransform::HyphenToUnderscore),
-                        ),
-                    )
-                    .create_only(),
-                ),
-            ]
+                        )
+                        .create_only()
+                        .build(),
+                    ),
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -1451,7 +1481,7 @@ exports {
         let mut awscc = resource_create_only_enum_file("awscc.Region.ap_northeast_1");
         let mut aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
 
-        let errors = validate_and_resolve_errors_with_factories(
+        let errors = validate_and_resolve_errors_with_test_factories(
             &mut awscc,
             base_dir.path(),
             false,
@@ -1464,7 +1494,7 @@ exports {
         );
         assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
 
-        let errors = validate_and_resolve_errors_with_factories(
+        let errors = validate_and_resolve_errors_with_test_factories(
             &mut aws,
             base_dir.path(),
             false,

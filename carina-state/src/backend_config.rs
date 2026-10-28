@@ -2,7 +2,9 @@
 
 use carina_core::parser;
 use carina_core::resource::{ConcreteValue, Value, ValueString};
-use carina_core::schema::{AttributeType, DslTransform, Schema, TypeError, TypeIdentity};
+use carina_core::schema::{
+    AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
+};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
@@ -239,12 +241,12 @@ impl BackendAttributeError {
     }
 }
 
-fn s3_schema() -> HashMap<&'static str, AttributeType> {
-    HashMap::from([
-        ("bucket", AttributeType::string()),
-        ("key", AttributeType::string()),
+fn s3_schema() -> ValidatedConfigSchema {
+    ValidatedConfigSchema::validate(HashMap::from([
+        ("bucket".to_string(), AttributeType::string()),
+        ("key".to_string(), AttributeType::string()),
         (
-            "region",
+            "region".to_string(),
             AttributeType::enum_(
                 TypeIdentity::new(Some(AWS_PROVIDER_NAME), Vec::<String>::new(), "Region"),
                 None,
@@ -253,18 +255,23 @@ fn s3_schema() -> HashMap<&'static str, AttributeType> {
                 Some(DslTransform::HyphenToUnderscore),
             ),
         ),
-        ("encrypt", AttributeType::bool()),
-        ("auto_create", AttributeType::bool()),
-    ])
+        ("encrypt".to_string(), AttributeType::bool()),
+        ("auto_create".to_string(), AttributeType::bool()),
+    ]))
+    .expect("the built-in S3 backend config schema must be valid")
 }
 
-fn local_schema() -> HashMap<&'static str, AttributeType> {
-    HashMap::from([("path", AttributeType::string())])
+fn local_schema() -> ValidatedConfigSchema {
+    ValidatedConfigSchema::validate(HashMap::from([(
+        "path".to_string(),
+        AttributeType::string(),
+    )]))
+    .expect("the built-in local backend config schema must be valid")
 }
 
 fn canonicalize_attributes(
     config: &parser::BackendConfig,
-    schema: &HashMap<&'static str, AttributeType>,
+    schema: &ValidatedConfigSchema,
     required: &[&'static str],
 ) -> (HashMap<String, Value>, Vec<BackendAttributeError>) {
     let mut errors = Vec::new();
@@ -277,10 +284,9 @@ fn canonicalize_attributes(
         }
     }
 
-    let schema_view = Schema::with_defs(Default::default());
     let mut canonicalized = HashMap::new();
     for (attribute, value) in &config.attributes {
-        let Some(attr_type) = schema.get(attribute.as_str()) else {
+        let Some(rootless_type) = schema.rootless_type(attribute) else {
             errors.push(BackendAttributeError::UnknownAttribute {
                 backend_type: config.backend_type.clone(),
                 attribute: attribute.clone(),
@@ -290,22 +296,19 @@ fn canonicalize_attributes(
         // Passing the schema identity's own provider name deliberately
         // disables the provider-block alias rule: backend regions accept
         // `aws.Region.<member>`, never `awscc.Region.<member>`.
-        let canonical = match carina_core::value::canonicalize_provider_config_with_type(
-            AWS_PROVIDER_NAME,
-            value.clone(),
-            attr_type,
-        ) {
-            Ok(canonical) => canonical,
-            Err(error) => {
-                errors.push(BackendAttributeError::InvalidAttribute {
-                    backend_type: config.backend_type.clone(),
-                    attribute: attribute.clone(),
-                    error: Box::new(error),
-                });
-                continue;
-            }
-        };
-        if let Err(error) = schema_view.validate_attr(attr_type, &canonical) {
+        let canonical =
+            match rootless_type.canonicalize_provider_config(AWS_PROVIDER_NAME, value.clone()) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    errors.push(BackendAttributeError::InvalidAttribute {
+                        backend_type: config.backend_type.clone(),
+                        attribute: attribute.clone(),
+                        error: Box::new(error),
+                    });
+                    continue;
+                }
+            };
+        if let Err(error) = rootless_type.validate(&canonical) {
             errors.push(BackendAttributeError::InvalidAttribute {
                 backend_type: config.backend_type.clone(),
                 attribute: attribute.clone(),
@@ -513,13 +516,14 @@ mod tests {
 
     #[test]
     fn quoted_region_with_underscores_matches_provider_config_canonicalization() {
-        let region_type = s3_schema().remove("region").unwrap();
-        let provider_value = carina_core::value::canonicalize_provider_config_with_type(
-            AWS_PROVIDER_NAME,
-            Value::Concrete(ConcreteValue::String("us_west_2".into())),
-            &region_type,
-        )
-        .unwrap();
+        let provider_value = s3_schema()
+            .rootless_type("region")
+            .expect("S3 schema must contain region")
+            .canonicalize_provider_config(
+                AWS_PROVIDER_NAME,
+                Value::Concrete(ConcreteValue::String("us_west_2".into())),
+            )
+            .unwrap();
         let Value::Concrete(ConcreteValue::CanonicalEnum(expected)) = provider_value else {
             panic!("provider config must canonicalize the quoted region")
         };

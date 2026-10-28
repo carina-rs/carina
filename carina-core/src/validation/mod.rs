@@ -70,7 +70,7 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
             .iter()
             .map(|(name, field_type)| {
                 lift_type_expr(field_type)
-                    .map(|field_type| StructField::new(name.clone(), field_type))
+                    .map(|field_type| StructField::optional(name.clone(), field_type).build())
             })
             .collect::<Option<Vec<_>>>()
             .map(|fields| AttributeType::struct_("anonymous", fields)),
@@ -114,19 +114,28 @@ static STRING_REF_SINK: TypeExpr = TypeExpr::String;
 #[derive(Clone, Copy)]
 pub(crate) enum RefSink<'a> {
     TypeExpr(&'a TypeExpr),
-    AttributeType {
+    EffectiveType {
         attr_type: &'a AttributeType,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
     },
     String,
 }
 
 impl<'a> RefSink<'a> {
+    fn from_effective_type(effective: crate::schema::EffectiveType<'a>) -> Self {
+        Self::EffectiveType {
+            attr_type: effective.as_type(),
+            defs: effective.defs(),
+            ancestry: effective.ancestry(),
+        }
+    }
+
     fn as_type_expr(self) -> Option<&'a TypeExpr> {
         match self {
             Self::TypeExpr(type_expr) => Some(type_expr),
             Self::String => Some(&STRING_REF_SINK),
-            Self::AttributeType { .. } => None,
+            Self::EffectiveType { .. } => None,
         }
     }
 
@@ -140,18 +149,24 @@ impl<'a> RefSink<'a> {
                 }))
                 .map(Self::TypeExpr)
             }
-            Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
+            Self::EffectiveType {
+                attr_type,
+                defs,
+                ancestry,
+            } => match attr_type.shape_with_defs(defs) {
                 Shape::List {
                     element_type: inner,
                     ..
-                } => Some(Self::AttributeType {
+                } => Some(Self::EffectiveType {
                     attr_type: inner,
                     defs,
+                    ancestry,
                 }),
                 Shape::Union => {
-                    unique_union_list_element(attr_type, defs).map(|inner| Self::AttributeType {
+                    unique_union_list_element(attr_type, defs).map(|inner| Self::EffectiveType {
                         attr_type: inner,
                         defs,
+                        ancestry,
                     })
                 }
                 _ => None,
@@ -173,25 +188,32 @@ impl<'a> RefSink<'a> {
                     .filter(|member| matches!(member, TypeExpr::Map(_) | TypeExpr::Struct { .. })),
             )
             .and_then(|member| Self::TypeExpr(member).map_entry(key)),
-            Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
-                Shape::Map { value: inner, .. } => Some(Self::AttributeType {
+            Self::EffectiveType {
+                attr_type,
+                defs,
+                ancestry,
+            } => match attr_type.shape_with_defs(defs) {
+                Shape::Map { value: inner, .. } => Some(Self::EffectiveType {
                     attr_type: inner,
                     defs,
+                    ancestry,
                 }),
                 Shape::Struct { .. } => {
                     let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                         .expect("Shape::Struct must expose struct fields internally");
-                    crate::schema::struct_field_for_key(fields, key).map(|field| {
-                        Self::AttributeType {
+                    crate::schema::struct_field_for_key(fields, key, ancestry).map(|field| {
+                        Self::EffectiveType {
                             attr_type: &field.field_type,
                             defs,
+                            ancestry: ancestry.descend(field),
                         }
                     })
                 }
                 Shape::Union => unique_union_map_member(attr_type, defs).and_then(|member| {
-                    Self::AttributeType {
+                    Self::EffectiveType {
                         attr_type: member,
                         defs,
+                        ancestry,
                     }
                     .map_entry(key)
                 }),
@@ -1732,7 +1754,7 @@ fn validate_resource_ref_types_inner<E>(
                 registry.get_for(m)
             }
         };
-        let Some(schema) = schema else {
+        let Some(validated_schema) = schema else {
             continue;
         };
         let resource_id = rref.id();
@@ -1745,13 +1767,9 @@ fn validate_resource_ref_types_inner<E>(
 
         let attrs = rref.attributes();
         for (attr_name, attr_value) in attrs.iter() {
-            let sink = schema
-                .attributes
-                .get(attr_name)
-                .map(|attribute| RefSink::AttributeType {
-                    attr_type: &attribute.attr_type,
-                    defs: &schema.defs,
-                });
+            let sink = validated_schema
+                .effective_attribute_by_authored_name(attr_name)
+                .map(|attribute| RefSink::from_effective_type(attribute.value_type()));
             let string_sink = AttributeType::string();
             visit_refs_with_sink(attr_value, sink, &mut |reference, sink, usage| {
                 let Some(source) = resolve_resource_reference(
@@ -1772,9 +1790,9 @@ fn validate_resource_ref_types_inner<E>(
                     return;
                 }
                 let Some(sink_type) = (match sink {
-                    Some(RefSink::AttributeType { attr_type, defs }) => {
-                        Some(attr_type.in_schema(defs))
-                    }
+                    Some(RefSink::EffectiveType {
+                        attr_type, defs, ..
+                    }) => Some(attr_type.in_schema(defs)),
                     Some(RefSink::String) => {
                         Some(crate::schema::TypeInSchema::schemaless(&string_sink))
                     }
@@ -1799,7 +1817,9 @@ fn validate_resource_ref_types_inner<E>(
             });
             visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
                 let sink_type = match sink {
-                    Some(RefSink::AttributeType { attr_type, defs }) => attr_type.in_schema(defs),
+                    Some(RefSink::EffectiveType {
+                        attr_type, defs, ..
+                    }) => attr_type.in_schema(defs),
                     Some(RefSink::String) => crate::schema::TypeInSchema::schemaless(&string_sink),
                     Some(RefSink::TypeExpr(_)) | None => return,
                 };
@@ -2880,8 +2900,9 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
 /// Attributes containing unresolved references (e.g.
 /// `assume_role = { role_arn = upstream.arn }` at validate time, before
 /// plan/apply has fetched upstream state) are passed through host-side
-/// type validation — `AttributeType::validate` is deferred-aware and
-/// no-ops on `Value::Deferred` — but **excluded from the plugin-side
+/// type validation — the config witness's [`crate::schema::EffectiveType`]
+/// validator is deferred-aware and no-ops on `Value::Deferred` — but
+/// **excluded from the plugin-side
 /// `validate_config` call**, because the WASM serializer rejects
 /// deferred values. The same `validate_config` runs again at the typed
 /// provider-construction boundary once the refs have been substituted by
@@ -3352,6 +3373,7 @@ pub(crate) fn narrow_type_expr(
                             crate::schema::SchemaKind::DataSource,
                         )
                     })?;
+                let schema = schema.as_schema();
                 let attribute = schema.attributes.get(name)?;
                 inference::attribute_type_to_type_expr(&attribute.attr_type)
             }

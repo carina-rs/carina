@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::resource::Value;
-use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
+use crate::schema::{
+    AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
+};
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -47,21 +49,23 @@ pub(crate) fn schema_aware_equal(
 pub fn resource_attribute_values_equal(
     old: &Value,
     new: &Value,
-    schema: Option<&ResourceSchema>,
+    schema: Option<&ValidatedResourceSchema>,
     attribute_name: &str,
 ) -> bool {
-    let Some((attr_type, defs)) = schema.and_then(|schema| {
-        schema
-            .attributes
-            .get(attribute_name)
-            .map(|attribute| (&attribute.attr_type, &schema.defs))
-    }) else {
+    let Some(attribute) = schema.and_then(|schema| schema.effective_attribute(attribute_name))
+    else {
         return old.semantically_equal(new);
     };
 
-    let old = crate::value::canonicalize_state_with_type(old.clone(), attr_type, defs);
-    let new = crate::value::canonicalize_state_with_type(new.clone(), attr_type, defs);
-    schema_aware_equal(&old, &new, Some(attr_type), defs)
+    let effective_type = attribute.value_type();
+    let old = attribute.canonicalize_state(old.clone());
+    let new = attribute.canonicalize_state(new.clone());
+    schema_aware_equal(
+        &old,
+        &new,
+        Some(effective_type.as_type()),
+        effective_type.defs(),
+    )
 }
 
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
@@ -70,8 +74,10 @@ pub fn resource_attribute_values_equal(
 /// `Struct`; nested `List<Map>`/`List<Struct>` types therefore still resolve
 /// their entries (carina#3073). This differs intentionally from
 /// [`list_element_type`], which consumes exactly one list boundary. Uses the
-/// canonical `struct_field_for_key` lookup so a `block_name`-aliased struct field
-/// resolves like `validate_struct`.
+/// canonical struct-field lookup. Block aliases have already been resolved at
+/// the authored-value seam before values reach comparison/detail walkers, so
+/// consulting declaration aliases here would incorrectly revive an inert alias
+/// below provider-populated output.
 ///
 /// `defs` is the enclosing schema's `defs` map; any [`AttributeType::Ref`]
 /// reached during unwrap is peeled against it. Without this, a
@@ -99,7 +105,9 @@ pub(crate) fn map_entry_subtype<'a>(
             crate::schema::Shape::Struct { .. } => {
                 let fields = crate::schema::struct_fields_with_defs(t, defs)
                     .expect("Shape::Struct must expose struct fields internally");
-                return crate::schema::struct_field_for_key(fields, key)
+                return fields
+                    .iter()
+                    .find(|field| field.name() == key)
                     .map(|field| &field.field_type);
             }
             crate::schema::Shape::Union => {
@@ -402,13 +410,91 @@ pub(crate) fn compute_string_list_diff_by<T, U>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::ConcreteValue;
-    use crate::schema::{StructField, empty_defs_for_schema_walks};
+    use crate::resource::{ConcreteValue, ValueString};
+    use crate::schema::{
+        AttributeSchema, ResourceSchema, StructField, empty_defs_for_schema_walks,
+    };
+
+    #[test]
+    fn resource_equality_canonicalizes_provider_output_with_effective_ancestry() {
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "output",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "Output",
+                            vec![
+                                StructField::required("eventual", AttributeType::string()).build(),
+                                StructField::optional(
+                                    "mode",
+                                    AttributeType::union(vec![
+                                        AttributeType::string(),
+                                        AttributeType::list(AttributeType::string()),
+                                    ]),
+                                )
+                                .build(),
+                            ],
+                        ),
+                        AttributeType::map(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let old = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "mode".to_string(),
+            Value::Concrete(ConcreteValue::String("api_value".into())),
+        )])));
+        let new = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "mode".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![ValueString::from(
+                "api_value",
+            )])),
+        )])));
+
+        assert!(resource_attribute_values_equal(
+            &old,
+            &new,
+            Some(&schema),
+            "output",
+        ));
+    }
+
+    #[test]
+    fn resource_equality_does_not_resolve_top_level_block_aliases() {
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .with_block_name("rule")
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let old = Value::Concrete(ConcreteValue::String("api_value".into()));
+        let new = Value::Concrete(ConcreteValue::StringList(vec![ValueString::from(
+            "api_value",
+        )]));
+
+        assert!(!resource_attribute_values_equal(
+            &old,
+            &new,
+            Some(&schema),
+            "rule",
+        ));
+    }
 
     fn struct_or_list_union(struct_first: bool) -> AttributeType {
         let struct_member = AttributeType::struct_(
             "Entry",
-            vec![StructField::new("enabled", AttributeType::bool())],
+            vec![StructField::optional("enabled", AttributeType::bool()).build()],
         );
         let list_member = AttributeType::list(AttributeType::string());
         AttributeType::union(if struct_first {
@@ -505,7 +591,7 @@ mod tests {
         let defs = empty_defs_for_schema_walks();
         let attr_type = AttributeType::list(AttributeType::list(AttributeType::struct_(
             "Entry",
-            vec![StructField::new("sid", AttributeType::string())],
+            vec![StructField::optional("sid", AttributeType::string()).build()],
         )));
 
         let immediate_element =

@@ -36,8 +36,8 @@ impl ProviderFactory for WaitTestFactory {
     fn display_name(&self) -> &str {
         "AWS (wait-construct test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -69,12 +69,22 @@ impl ProviderFactory for WaitTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            cert_schema(),
-            cert_data_source_schema(),
-            nested_holder_schema(),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                cert_schema(),
+                cert_data_source_schema(),
+                nested_holder_schema(),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -87,34 +97,31 @@ fn cert_schema() -> ResourceSchema {
         None,
     );
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "validation_method",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("status", AttributeType::string()))
-        .attribute(AttributeSchema::new("enum_status", status_enum))
-        .attribute(AttributeSchema::new(
-            "certificate_arn",
-            AttributeType::string(),
-        ))
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("validation_method", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("enum_status", status_enum).build())
+        .attribute(AttributeSchema::optional("certificate_arn", AttributeType::string()).build())
 }
 
 fn cert_data_source_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
         .as_data_source()
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("status", AttributeType::string()))
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
 }
 
 fn nested_holder_schema() -> ResourceSchema {
-    ResourceSchema::new("test.NestedHolder").attribute(AttributeSchema::new(
-        "inner",
-        AttributeType::struct_(
-            "CertificateRef".to_string(),
-            vec![StructField::new("certificate_arn", AttributeType::string())],
-        ),
-    ))
+    ResourceSchema::new("test.NestedHolder").attribute(
+        AttributeSchema::optional(
+            "inner",
+            AttributeType::struct_(
+                "CertificateRef".to_string(),
+                vec![StructField::optional("certificate_arn", AttributeType::string()).build()],
+            ),
+        )
+        .build(),
+    )
 }
 
 struct NoopProvider;
@@ -200,8 +207,10 @@ impl Provider for NoopProvider {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(WaitTestFactory) as Box<dyn ProviderFactory>]
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(WaitTestFactory) as Box<dyn ProviderFactory>
+    ])
 }
 
 fn write_fixture(files: &[(&str, &str)]) -> TempDir {

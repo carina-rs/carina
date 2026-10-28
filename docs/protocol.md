@@ -126,6 +126,20 @@ does not reclassify reads from a partial dependency view. Read state lives only
 in this outcome field; `current_states` contains managed resources only, so
 secret verification cannot observe a second, divergent copy (carina#3993).
 
+Saved-plan format 26 records the artifact loaded for every provider kind.
+Built-in providers are recorded as `built_in`; WASM providers record the SHA256
+of the exact bytes handed to the loader and, for lock-installed artifacts, the
+lock-resolved source and resolved version, revision SHA, or registry revision
+and version.
+`file://` artifacts record only their SHA256. This identity is minted only from
+the resolver's verified load. Apply compares the saved identities with the
+artifacts actually loaded before normalizer construction, secret evaluation,
+or provider effects, and providers execute from that same single load. The
+user-authored version constraint and download coordinates (release tag, asset
+id, and artifact id) are not part of the identity because the SHA256 already
+pins the exact bytes. Apply fails with re-plan guidance on any difference, and
+older saved-plan formats are rejected (carina#4045).
+
 Hosts and providers must both use protocol v10. The minimum supported protocol
 version is 10.
 

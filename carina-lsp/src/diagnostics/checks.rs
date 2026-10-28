@@ -1482,6 +1482,9 @@ impl DiagnosticEngine {
                     DeclarationKind::UserFunction => {
                         self.find_user_function_position(doc, duplicate.name())
                     }
+                    DeclarationKind::ProviderKind => {
+                        self.find_provider_kind_position(doc, duplicate.name())
+                    }
                 }?;
                 Some(carina_diagnostic(
                     position.0,
@@ -1492,6 +1495,35 @@ impl DiagnosticEngine {
                 ))
             })
             .collect()
+    }
+
+    fn find_provider_kind_position(
+        &self,
+        doc: &Document,
+        provider_name: &str,
+    ) -> Option<(u32, u32)> {
+        const PREFIX: &str = "provider ";
+        for (line_index, line) in doc.text().lines().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(after_prefix) = trimmed.strip_prefix(PREFIX) else {
+                continue;
+            };
+            let Some(after_name) = after_prefix.strip_prefix(provider_name) else {
+                continue;
+            };
+            if after_name
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_whitespace() && character != '{')
+            {
+                continue;
+            }
+            return Some((
+                line_index as u32,
+                position::leading_whitespace_chars(line) + PREFIX.chars().count() as u32,
+            ));
+        }
+        None
     }
 
     fn find_declaration_block_param_position(
@@ -2758,7 +2790,8 @@ impl DiagnosticEngine {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().values() {
+            let config_schema = factory.provider_config_attribute_types();
+            for attr_type in config_schema.parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut provider_config_enum_namespaces);
             }
         }

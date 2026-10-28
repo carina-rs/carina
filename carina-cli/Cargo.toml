@@ -16,6 +16,9 @@ path = "src/main.rs"
 name = "plan-fixture"
 path = "examples/plan-fixture.rs"
 
+[features]
+test-utils = ["carina-provider-resolver/test-utils"]
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-plugin-host = { path = "../carina-plugin-host" }
@@ -52,6 +55,7 @@ tokio-util = "0.7"
 [dev-dependencies]
 argon2 = "0.5"
 async-trait = "0.1"
+carina-cli = { path = ".", features = ["test-utils"] }
 carina-core = { path = "../carina-core", features = ["test-shutdown", "test-utils"] }
 carina-plugin-host = { path = "../carina-plugin-host", features = ["test-utils"] }
 carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }

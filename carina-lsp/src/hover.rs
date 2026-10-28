@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
-use crate::attribute_path::{ResolvedAttribute, resolve_attribute_path};
 use crate::document::Document;
 use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, StructPath, enclosing_block};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, display_string_literal};
 use carina_core::resource::{ConcreteValue, Value};
-use carina_core::schema::{CompletionValue, ResourceSchema, SchemaRegistry};
+use carina_core::schema::EffectiveSchemaNode;
+#[cfg(test)]
+use carina_core::schema::ResourceSchema;
+use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
 
 /// Find the `source` path of a `let <alias> = use {...}` declaration
 /// for `alias`. Tries the buffer's own parse first, then walks sibling
@@ -393,24 +395,25 @@ impl HoverProvider {
         None
     }
 
-    fn schema_hover(&self, resource_name: &str, schema: &ResourceSchema) -> Option<Hover> {
+    fn schema_hover(&self, resource_name: &str, schema: &ValidatedResourceSchema) -> Option<Hover> {
         let description = convert_markdown_links_to_plain_text(
-            schema.description().unwrap_or("No description available"),
+            schema
+                .as_schema()
+                .description()
+                .unwrap_or("No description available"),
         );
 
         let mut content = format!("## {}\n\n{}\n", resource_name, description);
 
         // Split attributes into arguments (writable) and attributes (read-only)
-        let mut arguments: Vec<&carina_core::schema::AttributeSchema> = schema
-            .attributes()
-            .values()
+        let mut arguments: Vec<_> = schema
+            .effective_attributes()
             .filter(|a| !a.is_read_only())
             .collect();
         arguments.sort_by_key(|a| a.name());
 
-        let mut read_only_attrs: Vec<&carina_core::schema::AttributeSchema> = schema
-            .attributes()
-            .values()
+        let mut read_only_attrs: Vec<_> = schema
+            .effective_attributes()
             .filter(|a| a.is_read_only())
             .collect();
         read_only_attrs.sort_by_key(|a| a.name());
@@ -492,11 +495,11 @@ impl HoverProvider {
         }?;
         let mut path = struct_path.to_vec();
         path.push(word.to_string());
-        let attribute = resolve_attribute_path(schema, &path)?;
+        let attribute = schema.effective_node_at_authored_path(&path)?;
         Some(self.build_attribute_hover(&attribute))
     }
 
-    fn build_attribute_hover(&self, attr: &ResolvedAttribute<'_>) -> Hover {
+    fn build_attribute_hover(&self, attr: &EffectiveSchemaNode<'_>) -> Hover {
         let description =
             convert_markdown_links_to_plain_text(attr.description().unwrap_or("No description"));
         let required = if attr.is_required() {
@@ -504,7 +507,7 @@ impl HoverProvider {
         } else {
             "Optional"
         };
-        let type_name = format!("{}", attr.attr_type());
+        let type_name = format!("{}", attr.field_type());
 
         let content = format!(
             "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
@@ -682,7 +685,7 @@ mod tests {
     ) -> HoverProvider {
         let mut schemas = SchemaRegistry::new();
         let schema = ResourceSchema::new(resource_type).with_description(description);
-        schemas.insert("", schema);
+        schemas.insert("", schema.validate().expect("schema fixture must be valid"));
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -693,10 +696,11 @@ mod tests {
     ) -> HoverProvider {
         let mut schemas = SchemaRegistry::new();
         let schema = ResourceSchema::new(resource_type).attribute(
-            AttributeSchema::new(attr_name, AttributeType::string())
-                .with_description(attr_description),
+            AttributeSchema::optional(attr_name, AttributeType::string())
+                .with_description(attr_description)
+                .build(),
         );
-        schemas.insert("", schema);
+        schemas.insert("", schema.validate().expect("schema fixture must be valid"));
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -736,50 +740,66 @@ mod tests {
         let alias_target = AttributeType::struct_(
             "AliasTarget",
             vec![
-                StructField::new("hosted_zone_id", AttributeType::string())
+                StructField::required("hosted_zone_id", AttributeType::string())
                     .with_description("NESTED alias zone")
-                    .required(),
-                StructField::new("dns_name", AttributeType::string())
-                    .with_description("Alias DNS name"),
-                StructField::new("evaluate_target_health", AttributeType::bool())
-                    .with_description("Whether to evaluate target health"),
+                    .build(),
+                StructField::optional("dns_name", AttributeType::string())
+                    .with_description("Alias DNS name")
+                    .build(),
+                StructField::optional("evaluate_target_health", AttributeType::bool())
+                    .with_description("Whether to evaluate target health")
+                    .build(),
             ],
         );
         let record_set = ResourceSchema::new("route53.RecordSet")
             .attribute(
-                AttributeSchema::new("hosted_zone_id", AttributeType::string())
-                    .with_description("TOP-LEVEL zone"),
+                AttributeSchema::optional("hosted_zone_id", AttributeType::string())
+                    .with_description("TOP-LEVEL zone")
+                    .build(),
             )
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("alias_target", alias_target)
-                    .with_description("Alias target configuration"),
+                AttributeSchema::optional("alias_target", alias_target)
+                    .with_description("Alias target configuration")
+                    .build(),
             );
         let bucket = ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "hosted_zone_id",
-                AttributeType::string(),
-            ));
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("hosted_zone_id", AttributeType::string()).build(),
+            );
 
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("aws", record_set);
-        schemas.insert("aws", bucket);
+        schemas.insert(
+            "aws",
+            record_set.validate().expect("schema fixture must be valid"),
+        );
+        schemas.insert(
+            "aws",
+            bucket.validate().expect("schema fixture must be valid"),
+        );
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
     fn resource_header_hover_provider() -> HoverProvider {
         let security_group = ResourceSchema::new("ec2.SecurityGroup").attribute(
-            AttributeSchema::new("description", AttributeType::string())
-                .with_description("REAL RESOURCE DESCRIPTION"),
+            AttributeSchema::optional("description", AttributeType::string())
+                .with_description("REAL RESOURCE DESCRIPTION")
+                .build(),
         );
         let vpc = ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::new("description", AttributeType::string())
-                .with_description("REAL RESOURCE DESCRIPTION"),
+            AttributeSchema::optional("description", AttributeType::string())
+                .with_description("REAL RESOURCE DESCRIPTION")
+                .build(),
         );
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("aws", security_group);
-        schemas.insert("aws", vpc);
+        schemas.insert(
+            "aws",
+            security_group
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
+        schemas.insert("aws", vpc.validate().expect("schema fixture must be valid"));
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -787,26 +807,37 @@ mod tests {
         let x = AttributeType::struct_(
             "X",
             vec![
-                StructField::new("field", AttributeType::string()).with_description("NESTED field"),
+                StructField::optional("field", AttributeType::string())
+                    .with_description("NESTED field")
+                    .build(),
             ],
         );
         let rule = AttributeType::struct_(
             "Rule",
-            vec![StructField::new("name", AttributeType::string()).with_description("NESTED name")],
+            vec![
+                StructField::optional("name", AttributeType::string())
+                    .with_description("NESTED name")
+                    .build(),
+            ],
         );
         let schema = ResourceSchema::new("Review")
-            .attribute(AttributeSchema::new("x", x))
-            .attribute(AttributeSchema::new("rules", AttributeType::list(rule)))
+            .attribute(AttributeSchema::optional("x", x).build())
+            .attribute(AttributeSchema::optional("rules", AttributeType::list(rule)).build())
             .attribute(
-                AttributeSchema::new("field", AttributeType::string())
-                    .with_description("TOP-LEVEL field"),
+                AttributeSchema::optional("field", AttributeType::string())
+                    .with_description("TOP-LEVEL field")
+                    .build(),
             )
             .attribute(
-                AttributeSchema::new("name", AttributeType::string())
-                    .with_description("TOP-LEVEL name"),
+                AttributeSchema::optional("name", AttributeType::string())
+                    .with_description("TOP-LEVEL name")
+                    .build(),
             );
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -1002,18 +1033,27 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
 
         let igw_schema = ResourceSchema::new("ec2.internet_gateway").attribute(
-            AttributeSchema::new("internet_gateway_id", AttributeType::string())
-                .with_description("The ID of the internet gateway (from internet_gateway schema)."),
+            AttributeSchema::optional("internet_gateway_id", AttributeType::string())
+                .with_description("The ID of the internet gateway (from internet_gateway schema).")
+                .build(),
         );
-        schemas.insert("awscc", igw_schema);
+        schemas.insert(
+            "awscc",
+            igw_schema.validate().expect("schema fixture must be valid"),
+        );
 
         let attachment_schema = ResourceSchema::new("ec2.vpc_gateway_attachment").attribute(
-            AttributeSchema::new("internet_gateway_id", AttributeType::string())
+            AttributeSchema::optional("internet_gateway_id", AttributeType::string())
                 .with_description(
                     "The ID of the internet gateway attached to the VPC (from vpc_gateway_attachment schema).",
-                ),
+                ).build(),
         );
-        schemas.insert("awscc", attachment_schema);
+        schemas.insert(
+            "awscc",
+            attachment_schema
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
 
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
@@ -1066,17 +1106,29 @@ awscc.ec2.vpc_gateway_attachment {
 
         // `account_id` lives on organizations.account only.
         let account_schema = ResourceSchema::new("organizations.account").attribute(
-            AttributeSchema::new("account_id", AttributeType::string())
-                .with_description("The unique identifier (ID) of the new account."),
+            AttributeSchema::optional("account_id", AttributeType::string())
+                .with_description("The unique identifier (ID) of the new account.")
+                .build(),
         );
-        schemas.insert("awscc", account_schema);
+        schemas.insert(
+            "awscc",
+            account_schema
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
 
         // `awscc.sso.Assignment` intentionally has NO `account_id`.
         let assignment_schema = ResourceSchema::new("sso.Assignment").attribute(
-            AttributeSchema::new("target_id", AttributeType::string())
-                .with_description("Target id."),
+            AttributeSchema::optional("target_id", AttributeType::string())
+                .with_description("Target id.")
+                .build(),
         );
-        schemas.insert("awscc", assignment_schema);
+        schemas.insert(
+            "awscc",
+            assignment_schema
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
 
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
@@ -1226,21 +1278,27 @@ aws.route53.RecordSet {
         let rule_type = AttributeType::struct_(
             "Rule",
             vec![
-                StructField::new("name", AttributeType::string())
-                    .with_description("NESTED rule name"),
+                StructField::optional("name", AttributeType::string())
+                    .with_description("NESTED rule name")
+                    .build(),
             ],
         );
         let schema = ResourceSchema::new("Policy")
             .attribute(
-                AttributeSchema::new("name", AttributeType::string())
-                    .with_description("TOP-LEVEL policy name"),
+                AttributeSchema::optional("name", AttributeType::string())
+                    .with_description("TOP-LEVEL policy name")
+                    .build(),
             )
             .attribute(
-                AttributeSchema::new("rules", AttributeType::list(rule_type))
-                    .with_block_name("rule"),
+                AttributeSchema::optional("rules", AttributeType::list(rule_type))
+                    .with_block_name("rule")
+                    .build(),
             );
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
         let list_text = r#"test.Policy {
@@ -1289,28 +1347,28 @@ aws.route53.RecordSet {
     fn nested_struct_hover_resolves_ref_fields_two_levels_deep() {
         let outer = AttributeType::struct_(
             "Outer",
-            vec![StructField::new(
-                "inner",
-                AttributeType::ref_("Inner".to_string()),
-            )],
+            vec![StructField::optional("inner", AttributeType::ref_("Inner".to_string())).build()],
         );
         let inner = AttributeType::struct_(
             "Inner",
             vec![
-                StructField::new("leaf", AttributeType::string())
+                StructField::required("leaf", AttributeType::string())
                     .with_description("NESTED field behind refs")
-                    .required(),
+                    .build(),
             ],
         );
         let schema = ResourceSchema::new("RefResource")
-            .attribute(AttributeSchema::new(
-                "config",
-                AttributeType::ref_("Outer".to_string()),
-            ))
+            .attribute(
+                AttributeSchema::optional("config", AttributeType::ref_("Outer".to_string()))
+                    .build(),
+            )
             .with_def("Outer", outer)
             .with_def("Inner", inner);
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
         let text = r#"test.RefResource {
   config = {
@@ -1332,16 +1390,20 @@ aws.route53.RecordSet {
     fn nested_struct_value_identifier_has_no_attribute_hover() {
         let alias_target = AttributeType::struct_(
             "AliasTarget",
-            vec![StructField::new("dns_name", AttributeType::string())],
+            vec![StructField::optional("dns_name", AttributeType::string()).build()],
         );
         let schema = ResourceSchema::new("RecordSet")
-            .attribute(AttributeSchema::new("alias_target", alias_target))
+            .attribute(AttributeSchema::optional("alias_target", alias_target).build())
             .attribute(
-                AttributeSchema::new("foo_binding", AttributeType::string())
-                    .with_description("TOP-LEVEL lookalike"),
+                AttributeSchema::optional("foo_binding", AttributeType::string())
+                    .with_description("TOP-LEVEL lookalike")
+                    .build(),
             );
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
         let text = r#"test.RecordSet {
   alias_target = {
@@ -1471,20 +1533,24 @@ EOT
         let union = AttributeType::union(vec![
             AttributeType::struct_(
                 "First",
-                vec![StructField::new("first_only", AttributeType::string())],
+                vec![StructField::optional("first_only", AttributeType::string()).build()],
             ),
             AttributeType::struct_(
                 "Second",
                 vec![
-                    StructField::new("second_only", AttributeType::string())
-                        .with_description("FIELD FROM SECOND UNION MEMBER"),
+                    StructField::optional("second_only", AttributeType::string())
+                        .with_description("FIELD FROM SECOND UNION MEMBER")
+                        .build(),
                 ],
             ),
         ]);
-        let schema =
-            ResourceSchema::new("UnionResource").attribute(AttributeSchema::new("config", union));
+        let schema = ResourceSchema::new("UnionResource")
+            .attribute(AttributeSchema::optional("config", union).build());
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
         let text = r#"test.UnionResource {
   config = {
@@ -1550,19 +1616,24 @@ EOT
         let nested = AttributeType::struct_(
             "Nested",
             vec![
-                StructField::new("field", AttributeType::string())
-                    .with_description("NESTED expression field"),
+                StructField::optional("field", AttributeType::string())
+                    .with_description("NESTED expression field")
+                    .build(),
             ],
         );
         let schema = ResourceSchema::new("Review")
-            .attribute(AttributeSchema::new("outer", nested.clone()))
-            .attribute(AttributeSchema::new("x", nested))
+            .attribute(AttributeSchema::optional("outer", nested.clone()).build())
+            .attribute(AttributeSchema::optional("x", nested).build())
             .attribute(
-                AttributeSchema::new("field", AttributeType::string())
-                    .with_description("TOP-LEVEL field"),
+                AttributeSchema::optional("field", AttributeType::string())
+                    .with_description("TOP-LEVEL field")
+                    .build(),
             );
         let mut schemas = SchemaRegistry::new();
-        schemas.insert("test", schema);
+        schemas.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
         for text in [

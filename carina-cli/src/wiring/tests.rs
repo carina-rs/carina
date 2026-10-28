@@ -15,7 +15,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
-use carina_core::schema::StructField;
+use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -120,6 +120,83 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     assert!(saw_aws.load(Ordering::SeqCst));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("duplicate-provider.wasm");
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/duplicate-provider/duplicate-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"duplicate fixture").unwrap();
+    std::fs::write(&installed_path, b"duplicate fixture").unwrap();
+    let config = ProviderConfig {
+        name: "duplicate".into(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let configs = [config.clone(), config];
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+    let hard_loads = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&hard_loads);
+
+    let result = build_factories_from_providers_impl_using(
+        &configs,
+        tmp.path(),
+        true,
+        &inputs,
+        move |_verified| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "first load failed".into(),
+                ))
+            }
+        },
+    );
+    let Err(error) = result else {
+        panic!("duplicate sourced defaults must be a hard validation error")
+    };
+
+    let AppError::Validation(message) = error else {
+        panic!("expected duplicate-provider validation error")
+    };
+    assert!(message.contains("duplicate"), "{message}");
+    assert_eq!(hard_loads.load(Ordering::SeqCst), 1);
+
+    let formatting_loads = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&formatting_loads);
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &configs,
+        tmp.path(),
+        false,
+        &inputs,
+        move |_verified| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "first load failed".into(),
+                ))
+            }
+        },
+    )
+    .expect("formatting must retain duplicate-provider failure as a diagnostic");
+
+    assert!(factories.is_empty());
+    assert_eq!(formatting_loads.load(Ordering::SeqCst), 1);
+    assert!(
+        errors
+            .get("duplicate")
+            .is_some_and(|message| message.contains("declared more than once")),
+        "formatting must report the duplicate provider kind: {errors:?}"
+    );
+}
+
 #[test]
 fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
@@ -138,6 +215,16 @@ fn parse(
     config: &carina_core::parser::ProviderContext,
 ) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
     carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+}
+
+fn pathless_test_type(attr_type: AttributeType) -> carina_core::schema::RootlessType {
+    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+        "value".to_string(),
+        attr_type,
+    )]))
+    .expect("test config type must be valid")
+    .rootless_type("value")
+    .expect("test config type must exist")
 }
 
 macro_rules! unexpected_resume_create {
@@ -247,7 +334,7 @@ fn resolved_provider_configs<E>(
 fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -> TypeError {
     let rejecting_member = |attribute: &'static str, pattern: &'static str| {
         AttributeType::refined_string_with_validator(
-            None,
+            TypeIdentity::bare("TestValidator"),
             None,
             None,
             carina_core::schema::validator(move |_| {
@@ -266,14 +353,14 @@ fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -
         rejecting_member(second, "^second$"),
     ]);
 
-    carina_core::schema::Schema::flat(union)
+    pathless_test_type(union)
         .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
         .expect_err("both union members must reject the value")
 }
 
 fn tied_union_error_with_one_unattributed_failure() -> TypeError {
     let attributed = AttributeType::refined_string_with_validator(
-        None,
+        TypeIdentity::bare("TestValidator"),
         None,
         None,
         carina_core::schema::validator(|_| {
@@ -287,7 +374,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         None,
     );
     let unattributed = AttributeType::refined_string_with_validator(
-        None,
+        TypeIdentity::bare("TestValidator"),
         None,
         None,
         carina_core::schema::validator(|_| {
@@ -298,7 +385,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         None,
     );
 
-    carina_core::schema::Schema::flat(AttributeType::union(vec![attributed, unattributed]))
+    pathless_test_type(AttributeType::union(vec![attributed, unattributed]))
         .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
         .expect_err("both union members must reject the value")
 }
@@ -337,7 +424,7 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
         binding: None,
     };
     let provider_configs = vec![provider_config];
-    let ctx = WiringContext::new(Vec::new(), &provider_configs);
+    let ctx = WiringContext::new_for_test(Vec::new(), &provider_configs);
     let mut resources = vec![Resource::with_provider(
         BUILTIN_PROVIDER_NAME,
         "test.resource",
@@ -378,8 +465,8 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             "test"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -401,36 +488,58 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             unreachable!("plan canonicalization test does not create providers")
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            let mode = AttributeType::enum_(
-                carina_core::schema::enum_identity("Mode", Some("test.thing")),
-                Some(vec!["Allow".to_string()]),
-                vec![("Allow".to_string(), "allow".to_string())],
-                None,
-                None,
-            );
-            vec![
-                ResourceSchema::new("thing")
-                    .attribute(AttributeSchema::new("top", mode.clone()))
-                    .attribute(AttributeSchema::new(
-                        "nested",
-                        AttributeType::struct_(
-                            "Settings",
-                            vec![carina_core::schema::StructField::new("mode", mode.clone())],
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                let mode = AttributeType::enum_(
+                    carina_core::schema::enum_identity("Mode", Some("test.thing")),
+                    Some(vec!["Allow".to_string()]),
+                    vec![("Allow".to_string(), "allow".to_string())],
+                    None,
+                    None,
+                );
+                vec![
+                    ResourceSchema::new("thing")
+                        .attribute(AttributeSchema::optional("top", mode.clone()).build())
+                        .attribute(
+                            AttributeSchema::optional(
+                                "nested",
+                                AttributeType::struct_(
+                                    "Settings",
+                                    vec![
+                                        carina_core::schema::StructField::optional(
+                                            "mode",
+                                            mode.clone(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        )
+                        .attribute(
+                            AttributeSchema::optional("items", AttributeType::list(mode.clone()))
+                                .build(),
+                        )
+                        .attribute(
+                            AttributeSchema::optional(
+                                "unselected_union",
+                                AttributeType::union(vec![
+                                    AttributeType::list(mode),
+                                    AttributeType::map(AttributeType::string()),
+                                ]),
+                            )
+                            .build(),
                         ),
-                    ))
-                    .attribute(AttributeSchema::new(
-                        "items",
-                        AttributeType::list(mode.clone()),
-                    ))
-                    .attribute(AttributeSchema::new(
-                        "unselected_union",
-                        AttributeType::union(vec![
-                            AttributeType::list(mode),
-                            AttributeType::map(AttributeType::string()),
-                        ]),
-                    )),
-            ]
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -457,7 +566,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
 
     for (attribute, value) in cases {
         let provider_configs = Vec::new();
-        let ctx = WiringContext::new(vec![Box::new(EnumSchemaFactory)], &provider_configs);
+        let ctx = WiringContext::new_for_test(vec![Box::new(EnumSchemaFactory)], &provider_configs);
         let mut resources = vec![
             Resource::with_provider("test", "thing", attribute, None)
                 .with_attribute(attribute, value),
@@ -538,8 +647,44 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
     std::fs::write(&installed_path, b"fixture").unwrap();
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+    let result = build_factories_from_providers_impl_using(
+        std::slice::from_ref(&config),
+        tmp.path(),
+        true,
+        &inputs,
+        |_verified| async {
+            Err(
+                carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
+                    configured: "configured".into(),
+                    reported: "reported".into(),
+                },
+            )
+        },
+    );
+    let Err(error) = result else {
+        panic!("artifact-reported provider kind mismatch must be fatal")
+    };
+    assert!(matches!(error, AppError::SourceProviderKindMismatch { .. }));
+
+    let trusted_inputs =
+        TrustedLocalGrantInputs::new(vec![format!("{}=aws", wasm_path.display())], None);
+    let result = build_factories_from_providers_impl_using(
+        std::slice::from_ref(&config),
+        tmp.path(),
+        true,
+        &trusted_inputs,
+        |_verified| async { panic!("trusted identity mismatch must fail before the WASM loader") },
+    );
+    let Err(error) = result else {
+        panic!("trusted provider kind mismatch must be fatal")
+    };
+    assert!(matches!(
+        error,
+        AppError::SourceProviderTrustMismatch { .. }
+    ));
+
     let (factories, errors) = build_factories_from_providers_impl_using(
-        &[config],
+        std::slice::from_ref(&config),
         tmp.path(),
         false,
         &inputs,
@@ -650,15 +795,6 @@ async fn unverified_official_factory_load_case() {
         "the transparent AppError must not re-expose the self-contained diagnostic"
     );
     assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
-
-    let configs = validated_provider_configs(vec![config]);
-    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
-    let Err(error) =
-        get_provider_with_ctx(&ctx, &configs, project.path(), ProgressSink::Human).await
-    else {
-        panic!("plan/apply wiring must not skip an unverified official provider")
-    };
-    assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -718,7 +854,6 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
-        base_dir,
     )
     .await
     .map(ExpandedPlanContext::into_context)
@@ -805,7 +940,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     let normalizer = FailingNormalizer {
         state_called: Arc::clone(&state_called),
     };
-    let ctx = WiringContext::new(Vec::new(), &[]);
+    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
@@ -996,7 +1131,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     )
     .await
     .unwrap();
-    PlanPreprocessor::new(&normalizer, &WiringContext::new(Vec::new(), &[]))
+    PlanPreprocessor::new(&normalizer, &WiringContext::new_for_test(Vec::new(), &[]))
         .prepare(
             &mut resources,
             &resource_origins,
@@ -1179,8 +1314,8 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             "Failing normalizer factory"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -1210,12 +1345,20 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            Vec::new()
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
-    let ctx = WiringContext::new(vec![Box::new(FailingNormalizerFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(FailingNormalizerFactory)], &[]);
     let config = ProviderConfig {
         name: "failing".to_string(),
         attributes: IndexMap::new(),
@@ -1229,16 +1372,10 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let configs = validated_provider_configs(vec![config]);
     let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
-    let error = instantiate_provider_into_router(
-        &ctx,
-        &mut router,
-        config,
-        Path::new("."),
-        None,
-        ProgressSink::Human,
-    )
-    .await
-    .expect_err("normalizer creation failure must abort provider router setup");
+    let error =
+        instantiate_provider_into_router(&ctx, &mut router, config, None, ProgressSink::Human)
+            .await
+            .expect_err("normalizer creation failure must abort provider router setup");
 
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
@@ -1247,8 +1384,108 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
 }
 
+#[test]
+fn named_provider_reports_unavailable_sourced_default() {
+    let configs = validated_provider_configs(vec![ProviderConfig {
+        name: "missing".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: Some("named".to_string()),
+    }]);
+    let source: ProviderSource = "file:///missing.wasm".parse().unwrap();
+
+    assert_eq!(
+        missing_provider_message(configs.iter().next().unwrap(), Some(&source)).as_deref(),
+        Some(
+            "Named provider instance 'named' (kind 'missing') cannot be loaded because the kind's default instance is unavailable."
+        )
+    );
+}
+
 #[tokio::test]
-async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
+async fn provider_progress_is_emitted_after_provider_initialization() {
+    struct ProgressOrderingFactory {
+        lines: &'static RecordedProgressLines,
+    }
+
+    impl ProviderFactory for ProgressOrderingFactory {
+        fn name(&self) -> &str {
+            "ordering"
+        }
+
+        fn display_name(&self) -> &str {
+            "Progress ordering factory"
+        }
+
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test-region".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async move {
+                if self.lines.is_empty() {
+                    Ok(Box::new(MockProvider::new()) as Box<dyn Provider>)
+                } else {
+                    Err(ProviderError::internal(
+                        "provider progress was emitted before initialization",
+                    ))
+                }
+            })
+        }
+
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let lines = Box::leak(Box::new(RecordedProgressLines::default()));
+    let ctx = WiringContext::new_for_test(vec![Box::new(ProgressOrderingFactory { lines })], &[]);
+    let configs = validated_provider_configs(vec![ProviderConfig {
+        name: "ordering".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }]);
+    let mut router = ProviderRouter::new();
+
+    instantiate_provider_into_router(
+        &ctx,
+        &mut router,
+        configs.iter().next().unwrap(),
+        None,
+        ProgressSink::Recorded(lines),
+    )
+    .await
+    .expect("provider initialization must precede its progress line");
+
+    assert_eq!(lines.len(), 1);
+}
+
+#[tokio::test]
+async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     struct FailingInitializeFactory;
 
     impl ProviderFactory for FailingInitializeFactory {
@@ -1260,8 +1497,8 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
             "Failing initialize factory"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -1289,17 +1526,25 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            Vec::new()
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
-    let ctx = WiringContext::new(vec![Box::new(FailingInitializeFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(FailingInitializeFactory)], &[]);
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
-        source: None,
+        source: Some("file:///provider.wasm".parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -1310,7 +1555,6 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
         &ctx,
         &mut router,
         configs.iter().next().unwrap(),
-        Path::new("."),
         None,
         ProgressSink::Human,
     )
@@ -1321,19 +1565,6 @@ async fn ordinary_provider_initialization_error_keeps_provider_and_phase() {
         panic!("expected provider error")
     };
     assert_eq!(error.detail().provider_name.as_deref(), Some("aws"));
-    assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
-}
-
-#[test]
-fn source_provider_initialization_error_keeps_provider_and_phase() {
-    let decoded = carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
-        "initialization rejected",
-    );
-    let AppError::Provider(error) = source_provider_initialization_error("awscc", decoded) else {
-        panic!("expected provider error")
-    };
-
-    assert_eq!(error.detail().provider_name.as_deref(), Some("awscc"));
     assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
 }
 
@@ -1350,8 +1581,8 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         "provider config constraint test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::from([(
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
             "role_arn".to_string(),
             AttributeType::refined_string(
                 None,
@@ -1359,7 +1590,8 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
                 None,
                 None,
             ),
-        )])
+        )]))
+        .expect("test provider config schema must be valid")
     }
 
     fn validate_config(
@@ -1382,9 +1614,51 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        Vec::new()
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
+}
+
+#[tokio::test]
+async fn sourced_default_provider_executes_the_factory_retained_by_wiring_context() {
+    let project = tempfile::tempdir().unwrap();
+    let source_path = project.path().join("provider.wasm");
+    std::fs::write(&source_path, b"artifact loaded into the context").unwrap();
+    let config = ProviderConfig {
+        name: "test".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let configs = validated_provider_configs(vec![config]);
+    let creates = Arc::new(AtomicUsize::new(0));
+    let ctx = WiringContext::new_for_test(
+        vec![Box::new(ProviderConfigConstraintFactory {
+            creates: Arc::clone(&creates),
+        })],
+        configs.as_provider_configs(),
+    );
+
+    std::fs::write(&source_path, b"artifact swapped after context construction").unwrap();
+
+    let router = create_providers_from_configs_with_ctx(&ctx, &configs)
+        .await
+        .expect("router construction must use the already-loaded context factory");
+
+    assert_eq!(creates.load(Ordering::SeqCst), 1);
+    assert!(!router.is_empty());
 }
 
 fn resolved_invalid_provider_config() -> (
@@ -1434,13 +1708,12 @@ fn assert_provider_config_constraint_error(error: &AppError) {
 async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
     let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
         provider_configs.as_provider_configs(),
     );
-    let temp = tempfile::tempdir().unwrap();
     let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
@@ -1452,7 +1725,6 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
-        temp.path(),
     )
     .await;
     let error = match result {
@@ -1468,22 +1740,13 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
 async fn apply_provider_construction_revalidates_resolved_upstream_config() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
         provider_configs.as_provider_configs(),
     );
-    let temp = tempfile::tempdir().unwrap();
-
-    let error = match get_provider_with_ctx(
-        &ctx,
-        &provider_configs,
-        temp.path(),
-        ProgressSink::Human,
-    )
-    .await
-    {
+    let error = match get_provider_with_ctx(&ctx, &provider_configs, ProgressSink::Human).await {
         Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
         Err(error) => error,
     };
@@ -1503,8 +1766,8 @@ impl ProviderFactory for CascadeAwsccFactory {
         "AWSCC cascade test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1526,26 +1789,51 @@ impl ProviderFactory for CascadeAwsccFactory {
         Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("ec2.Vpc")
-                .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-                )
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
-                .with_coexisting_replacement(),
-            ResourceSchema::new("ec2.Subnet")
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
-                .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("availability_zone", AttributeType::string())
-                        .create_only(),
-                )
-                .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
-                .with_coexisting_replacement(),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("ec2.Vpc")
+                    .attribute(
+                        AttributeSchema::optional("cidr_block", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::provider_populated("vpc_id", AttributeType::string())
+                            .build(),
+                    )
+                    .with_coexisting_replacement(),
+                ResourceSchema::new("ec2.Subnet")
+                    .attribute(
+                        AttributeSchema::optional("vpc_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("cidr_block", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("availability_zone", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::provider_populated("subnet_id", AttributeType::string())
+                            .build(),
+                    )
+                    .with_coexisting_replacement(),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1807,8 +2095,8 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         "managed/data-source collision test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1842,11 +2130,21 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("shared.Type"),
-            ResourceSchema::new("shared.Type").as_data_source(),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("shared.Type"),
+                ResourceSchema::new("shared.Type").as_data_source(),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1896,11 +2194,10 @@ let shared = read test.shared.Type {}
         .expect("test state row is unique");
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ManagedAndDataSourceFactory)],
         provider_configs.as_provider_configs(),
     );
-    let temp = tempfile::tempdir().expect("tempdir");
     let canonical_resources = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
@@ -1917,7 +2214,6 @@ let shared = read test.shared.Type {}
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
-        temp.path(),
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
@@ -2013,7 +2309,7 @@ use carina_core::parser::ParsedFile;
 fn test_normalize_state_prevents_false_enum_diff() {
     use carina_core::resource::Directives;
 
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
 
     // Desired resource with the parser-authored typed enum value.
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
@@ -2110,8 +2406,8 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             "block-in-place validation test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -2139,8 +2435,16 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             Box::pin(async { unreachable!("state normalization does not create providers") })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            Vec::new()
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -2160,7 +2464,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         binding: None,
     }];
     let provider_configs = validated_provider_configs(raw_configs);
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(BlockInPlaceValidationFactory {
             validated: Arc::clone(&validated),
             received_region: Arc::clone(&received_region),
@@ -2184,7 +2488,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
 #[test]
 fn normalize_state_with_ctx_renders_provider_config_error_once() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::new(AtomicUsize::new(0)),
         })],
@@ -2220,8 +2524,8 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             "capture"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -2243,8 +2547,16 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             unreachable!("config selection test does not construct a provider")
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            Vec::new()
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -2312,12 +2624,14 @@ fn test_merge_default_tags_prevents_false_diff() {
 
     // Build a minimal schema with the map(string) `tags` attribute required by
     // host default-tag merging.
-    let schema = ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-        "tags",
-        AttributeType::map(AttributeType::string()),
-    ));
+    let schema = ResourceSchema::new("s3.Bucket").attribute(
+        AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Desired resource without explicit tags
     let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
@@ -3530,7 +3844,7 @@ fn test_plan_fails_on_two_moves_from_same_source() {
 
 #[test]
 fn test_plan_fails_on_removed_from_colliding_with_desired() {
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
     let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
     let mut resource = Resource::with_provider(
@@ -3711,10 +4025,8 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         "AWSCC association create-only test provider"
     }
 
-    fn provider_config_attribute_types(
-        &self,
-    ) -> HashMap<String, carina_core::schema::AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -3755,23 +4067,39 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         })
     }
 
-    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
-        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-        vec![
-            ResourceSchema::new("s3.Bucket")
-                .with_unique_name_attribute("bucket_name")
-                .attribute(
-                    AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
-                ),
-            ResourceSchema::new("ec2.SubnetRouteTableAssociation")
-                .attribute(
-                    AttributeSchema::new("route_table_id", AttributeType::string()).create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("subnet_id", AttributeType::string()).create_only(),
-                ),
-        ]
+            vec![
+                ResourceSchema::new("s3.Bucket")
+                    .with_unique_name_attribute("bucket_name")
+                    .attribute(
+                        AttributeSchema::optional("bucket_name", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ),
+                ResourceSchema::new("ec2.SubnetRouteTableAssociation")
+                    .attribute(
+                        AttributeSchema::optional("route_table_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("subnet_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -3829,7 +4157,7 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
 fn assert_claimed_association_stays_orphaned_after_reconcile() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let old_name = "ec2_subnet_route_table_association_11111111";
     let desired_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut state_file = StateFile::new();
@@ -3893,7 +4221,7 @@ fn claimed_state_entry_survives_orphan_reconcile_for_destroy_and_refresh() {
 fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_state_bindings() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -3972,11 +4300,19 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
     use carina_state::state::{ResourceState, StateFile};
 
     let managed_schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("bucket", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .validate()
+        .expect("managed fixture schema must be valid");
     let data_source_schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket", AttributeType::string()))
-        .as_data_source();
-    let ctx = WiringContext::new_with_additional_schemas(
+        .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
+        .as_data_source()
+        .validate()
+        .expect("data-source fixture schema must be valid");
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
         Vec::new(),
         &[],
         [
@@ -4026,7 +4362,7 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
 fn test_stale_moved_block_releases_claims() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -4078,7 +4414,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     use carina_core::resource::ResourceId;
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     let mut resources = Vec::new();
     let mut state_blocks = Vec::new();
@@ -4237,7 +4573,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         }
     "#;
 
-    let ctx = WiringContext::new(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
     let mut parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let mut unresolved_parsed = parsed.clone();
     compute_initial_anonymous_ids(&ctx, &mut parsed);
@@ -4278,7 +4614,6 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .upsert_resource(subnet_state)
         .expect("test state setup must be valid");
 
-    let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_pair(
         &parsed,
@@ -4295,7 +4630,6 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
-        tmp.path(),
     )
     .await
     .expect("plan should build");
@@ -4787,8 +5121,13 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert(
         "test",
-        ResourceSchema::new("Role")
-            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("Role").attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let resolved = resolve_data_source_refs_for_refresh(
@@ -4950,9 +5289,17 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert(
         "test",
-        ResourceSchema::new("Role")
-            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+        (ResourceSchema::new("Role")
+            .attribute(
+                AttributeSchema::optional("role_name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let resolved = resolve_data_source_refs_for_refresh(
@@ -5041,12 +5388,17 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("Lookup")
-            .attribute(AttributeSchema::new(
-                "filter",
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
-            ))
-            .as_data_source(),
+        (ResourceSchema::new("Lookup")
+            .attribute(
+                AttributeSchema::optional(
+                    "filter",
+                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                )
+                .build(),
+            )
+            .as_data_source())
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
@@ -5091,7 +5443,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
 // the driver can accumulate diagnostics across validators.
 #[test]
 fn validate_resources_with_ctx_returns_each_error_as_app_error() {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
 
     // Empty provider string sidesteps the "unknown provider, skip"
     // escape hatch (`known_providers` is empty), so each bad resource
@@ -5116,7 +5468,7 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
 // type. A regression back to `Result` fails to compile here.
 #[test]
 fn dependency_chain_wrappers_return_vec_app_error() {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<ProviderConfig> = Vec::new();
 
@@ -5135,18 +5487,25 @@ fn dependency_chain_wrappers_return_vec_app_error() {
 
 #[test]
 fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
-    let schema = ResourceSchema::new("thing").attribute(
-        AttributeSchema::new(
-            "rules",
-            AttributeType::list(AttributeType::struct_(
-                "Rule",
-                vec![StructField::new("action", AttributeType::string())],
-            )),
+    let schema = ResourceSchema::new("thing")
+        .attribute(
+            AttributeSchema::optional(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::optional("action", AttributeType::string()).build()],
+                )),
+            )
+            .with_block_name("rule")
+            .build(),
         )
-        .with_block_name("rule"),
+        .validate()
+        .expect("block-name fixture schema must be valid");
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
     );
-    let ctx =
-        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
     let rule = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(IndexMap::from([(
             "action".to_string(),
@@ -5208,18 +5567,25 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
 
 #[test]
 fn paired_block_name_resolution_reports_shared_conflict_once() {
-    let schema = ResourceSchema::new("thing").attribute(
-        AttributeSchema::new(
-            "rules",
-            AttributeType::list(AttributeType::struct_(
-                "Rule",
-                vec![StructField::new("action", AttributeType::string())],
-            )),
+    let schema = ResourceSchema::new("thing")
+        .attribute(
+            AttributeSchema::optional(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::optional("action", AttributeType::string()).build()],
+                )),
+            )
+            .with_block_name("rule")
+            .build(),
         )
-        .with_block_name("rule"),
+        .validate()
+        .expect("block-name fixture schema must be valid");
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
     );
-    let ctx =
-        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
     let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
     let resource = Resource::with_provider("test", "thing", "direct", None)
         .with_attribute("rule", rules.clone())
@@ -5247,9 +5613,14 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
 #[test]
 fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     let schema = ResourceSchema::new("thing")
-        .attribute(AttributeSchema::new("name", AttributeType::string()));
-    let ctx =
-        WiringContext::new_with_additional_schemas(Vec::new(), &[], [("test".to_string(), schema)]);
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .validate()
+        .expect("name fixture schema must be valid");
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
+    );
     let evaluated = carina_core::parser::ParsedFile {
         resources: vec![
             Resource::with_provider("test", "thing", "direct", None).with_attribute(
@@ -5289,10 +5660,8 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         "AWSCC region identity test provider"
     }
 
-    fn provider_config_attribute_types(
-        &self,
-    ) -> HashMap<String, carina_core::schema::AttributeType> {
-        HashMap::from([(
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -5301,7 +5670,8 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
                 None,
                 None,
             ),
-        )])
+        )]))
+        .expect("test provider config schema must be valid")
     }
 
     fn validate_config(
@@ -5342,15 +5712,26 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         })
     }
 
-    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
-        vec![
-            carina_core::schema::ResourceSchema::new("ec2.Route").attribute(
-                carina_core::schema::AttributeSchema::new(
-                    "route_table_id",
-                    carina_core::schema::AttributeType::string(),
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                carina_core::schema::ResourceSchema::new("ec2.Route").attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "route_table_id",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
                 ),
-            ),
-        ]
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 
     fn identity_attributes(&self) -> Vec<&str> {
@@ -5359,7 +5740,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
 }
 
 fn region_identity_ctx() -> WiringContext {
-    WiringContext::new(vec![Box::new(RegionIdentityFactory)], &[])
+    WiringContext::new_for_test(vec![Box::new(RegionIdentityFactory)], &[])
 }
 
 fn region_provider_config(raw_region: &str) -> ProviderConfig {
@@ -5388,7 +5769,7 @@ fn anonymous_route_resource() -> Resource {
 
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(
             vec![
@@ -5558,7 +5939,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 // back to `Result` fails to compile here.
 #[test]
 fn module_and_provider_wrappers_return_vec_app_error() {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
     let provider_ctx = carina_core::parser::ProviderContext::default();
 
@@ -6323,7 +6704,7 @@ mod expand_same_config_deferred_for_tests {
         let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
-        let wiring = WiringContext::new(Vec::new(), &[]);
+        let wiring = WiringContext::new_for_test(Vec::new(), &[]);
         let claims = resolve_state_block_claims(
             &parsed.state_blocks,
             &state_file,
@@ -7509,27 +7890,31 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let installed = carina_provider_resolver::find_installed_provider(base, &config).unwrap();
     let cache = tempfile::tempdir().unwrap();
     let cache_path = cache.path().to_path_buf();
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
-    let error = match load_installed_wasm_provider_using(
-        &installed,
-        trusted_local_grants().unwrap(),
-        |verified| async move {
-            carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-                verified,
-                &cache_path,
-            )
-            .await
+    let (factories, errors) = build_factories_from_providers_impl_using(
+        &[config],
+        base,
+        false,
+        &inputs,
+        move |verified| {
+            let cache_path = cache_path.clone();
+            async move {
+                carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+                    verified,
+                    &cache_path,
+                )
+                .await
+            }
         },
     )
-    .await
-    {
-        Ok(_) => panic!("fixture component must not instantiate as a provider"),
-        Err(error) => error,
-    };
-    let rendered = error.to_string();
+    .unwrap();
+    assert!(factories.is_empty());
+    let rendered = errors
+        .get("awscc")
+        .expect("factory loading must retain resolver provenance");
 
     assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
     assert!(rendered.contains("Provider: awscc"));
@@ -7672,7 +8057,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
 
-    let configs = validated_provider_configs(vec![ProviderConfig {
+    let config = ProviderConfig {
         name: "awscc".into(),
         source: Some(provider_source),
         version: None,
@@ -7681,18 +8066,12 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         binding: None,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
-    }]);
-    let config = configs.iter().next().unwrap();
-    let provider_source = config.source().unwrap();
-
-    let load_error = match load_source_provider(provider_source, config, base).await {
-        Err(LoadSourceError::Wasm(error)) => error.to_string(),
-        Err(LoadSourceError::Other(error)) => {
-            panic!("registry source was rejected before artifact loading: {error}")
-        }
-        Err(_) => panic!("unexpected provider load error variant"),
-        Ok(_) => panic!("invalid WASM fixture unexpectedly loaded"),
     };
+    let (factories, errors) = build_factories_from_providers(std::slice::from_ref(&config), base)
+        .expect("registry source must reach the single factory-load boundary");
+    let load_error = errors
+        .get("awscc")
+        .expect("invalid WASM fixture must be reported during factory loading");
     assert!(
         load_error.contains("Failed to load WASM component"),
         "{load_error}"
@@ -7700,10 +8079,11 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     assert!(load_error.contains("carina-providers.lock"), "{load_error}");
     assert!(load_error.contains("version 0.5.0"), "{load_error}");
 
-    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
-    let router = get_provider_with_ctx(&ctx, &configs, base, ProgressSink::Human)
+    let configs = validated_provider_configs(vec![config]);
+    let ctx = WiringContext::new(factories, configs.as_provider_configs());
+    let router = get_provider_with_ctx(&ctx, &configs, ProgressSink::Human)
         .await
-        .expect("artifact load errors are rendered by the plan/apply wiring boundary");
+        .expect("the router must not retry a factory load that already failed");
     assert!(router.is_empty());
 }
 
@@ -7950,21 +8330,10 @@ mod resolved_value_constraint_gate {
         AccessPath, Composition, DataSource, InterpolationPart, ModuleConstraintId,
         PendingModuleConstraint, Signature, UnknownReason,
     };
-    use carina_core::schema::{TypeError, TypeIdentity};
+    use carina_core::schema::{TypeIdentity, ValidatorType};
 
     fn text(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
-    }
-
-    fn reject_bad_target(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        if attributes.get("target") == Some(&text("bad")) {
-            Err(vec![TypeError::ResourceValidationFailed {
-                message: "target pair rejected".to_string(),
-                attribute: Some("target".to_string()),
-            }])
-        } else {
-            Ok(())
-        }
     }
 
     struct ConstraintFactory;
@@ -7978,8 +8347,8 @@ mod resolved_value_constraint_gate {
             "resolved constraint test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -8025,29 +8394,54 @@ mod resolved_value_constraint_gate {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            let pattern_type =
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
-            let custom_type = AttributeType::refined_string(
-                Some(TypeIdentity::bare("ExternalId")),
-                None,
-                None,
-                None,
-            );
-            vec![
-                ResourceSchema::new("source")
-                    .attribute(AttributeSchema::new("value", AttributeType::string())),
-                ResourceSchema::new("consumer.Pattern")
-                    .attribute(AttributeSchema::new("target", pattern_type.clone())),
-                ResourceSchema::new("consumer.Custom")
-                    .attribute(AttributeSchema::new("target", custom_type)),
-                ResourceSchema::new("consumer.Validated")
-                    .attribute(AttributeSchema::new("target", AttributeType::string()))
-                    .with_validator(reject_bad_target),
-                ResourceSchema::new("lookup.Pattern")
-                    .attribute(AttributeSchema::new("target", pattern_type))
-                    .as_data_source(),
-            ]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                let pattern_type =
+                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+                let custom_type = AttributeType::refined_string(
+                    Some(TypeIdentity::bare("ExternalId")),
+                    None,
+                    None,
+                    None,
+                );
+                vec![
+                    ResourceSchema::new("source").attribute(
+                        AttributeSchema::optional(
+                            "value",
+                            AttributeType::union(vec![
+                                AttributeType::string(),
+                                AttributeType::map(AttributeType::string()),
+                            ]),
+                        )
+                        .build(),
+                    ),
+                    ResourceSchema::new("consumer.Pattern").attribute(
+                        AttributeSchema::optional("target", pattern_type.clone()).build(),
+                    ),
+                    ResourceSchema::new("consumer.Custom")
+                        .attribute(AttributeSchema::optional("target", custom_type).build()),
+                    ResourceSchema::new("consumer.Validated")
+                        .attribute(
+                            AttributeSchema::optional(
+                                "tags",
+                                AttributeType::map(AttributeType::string()),
+                            )
+                            .build(),
+                        )
+                        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck]),
+                    ResourceSchema::new("lookup.Pattern")
+                        .attribute(AttributeSchema::optional("target", pattern_type).build())
+                        .as_data_source(),
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -8068,8 +8462,8 @@ mod resolved_value_constraint_gate {
             "module constraint refresh test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -8094,8 +8488,17 @@ mod resolved_value_constraint_gate {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            vec![ResourceSchema::new("lookup").as_data_source()]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+                vec![ResourceSchema::new("lookup").as_data_source()];
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
@@ -8220,9 +8623,14 @@ mod resolved_value_constraint_gate {
         let producer = Resource::with_provider("test", "source", "producer", None)
             .with_binding("producer")
             .with_attribute("value", producer_value);
+        let resolved_attribute = if consumer_type == "consumer.Validated" {
+            "tags"
+        } else {
+            "target"
+        };
         let consumer = Resource::with_provider("test", consumer_type, "consumer", None)
             .with_binding("consumer")
-            .with_attribute("target", ref_value());
+            .with_attribute(resolved_attribute, ref_value());
         let source = vec![producer, consumer];
         let compositions = Vec::<Composition>::new();
         let current_states = HashMap::new();
@@ -8250,7 +8658,7 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
@@ -8317,7 +8725,7 @@ mod resolved_value_constraint_gate {
         producer_values: Vec<(&str, Value)>,
         composition: &mut Composition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let mut producer =
             Resource::with_provider("test", "source", "producer", None).with_binding("producer");
         for (name, value) in producer_values {
@@ -8367,6 +8775,7 @@ mod resolved_value_constraint_gate {
     fn assert_resolved_error(
         errors: &[carina_core::plan::PlanError],
         expected_type: &str,
+        expected_attribute: &str,
         expected_message: &str,
     ) {
         assert_eq!(errors.len(), 1, "{errors:#?}");
@@ -8377,7 +8786,7 @@ mod resolved_value_constraint_gate {
                 origins,
                 message,
             } => {
-                assert_eq!(attributes, &["target"]);
+                assert_eq!(attributes, &[expected_attribute]);
                 assert_eq!(origins, &["producer.value"]);
                 assert!(message.contains(expected_message), "{message}");
             }
@@ -8385,7 +8794,7 @@ mod resolved_value_constraint_gate {
         }
         let rendered = errors[0].to_string();
         assert!(rendered.contains(expected_type), "{rendered}");
-        assert!(rendered.contains("target"), "{rendered}");
+        assert!(rendered.contains(expected_attribute), "{rendered}");
         assert!(rendered.contains("producer.value"), "{rendered}");
     }
 
@@ -8396,7 +8805,7 @@ mod resolved_value_constraint_gate {
             .await
             .expect_err("resolved invalid pattern must fail planning");
 
-        assert_resolved_error(&errors, "consumer.Pattern", "required pattern");
+        assert_resolved_error(&errors, "consumer.Pattern", "target", "required pattern");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -8443,24 +8852,33 @@ mod resolved_value_constraint_gate {
             .await
             .expect_err("provider custom type must run at the resolution gate");
 
-        assert_resolved_error(&errors, "consumer.Custom", "external id rejected");
+        assert_resolved_error(&errors, "consumer.Custom", "target", "external id rejected");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn resolved_reference_runs_resource_validator() {
         let normalizer = RewritingNormalizer::default();
-        let errors = prepare_managed("consumer.Validated", text("bad"), &normalizer)
+        let malformed_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("key".to_string(), text("Project")),
+            ("value".to_string(), text("carina")),
+        ])));
+        let errors = prepare_managed("consumer.Validated", malformed_tags, &normalizer)
             .await
             .expect_err("resource validator must run at the resolution gate");
 
-        assert_resolved_error(&errors, "consumer.Validated", "target pair rejected");
+        assert_resolved_error(
+            &errors,
+            "consumer.Validated",
+            "tags",
+            "tags map contains both 'key' and 'value'",
+        );
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn resolved_data_source_input_uses_the_same_gate() {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let normalizer = RewritingNormalizer::default();
         let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(Vec::new(), ctx.schemas()),
@@ -8504,7 +8922,7 @@ mod resolved_value_constraint_gate {
             .expect_err("invalid resolved data-source input must fail planning");
         let errors = into_plan_errors(errors);
 
-        assert_resolved_error(&errors, "lookup.Pattern", "required pattern");
+        assert_resolved_error(&errors, "lookup.Pattern", "target", "required pattern");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -8618,7 +9036,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("upstream state fixture must load");
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &remote_bindings,
@@ -8636,7 +9054,6 @@ exports { team_prefix: String = "x" }"#,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
-            &consumer_dir,
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
@@ -8688,13 +9105,12 @@ exports { team_prefix: String = "x" }"#,
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
         let reads = Arc::new(AtomicUsize::new(0));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(RecordingDataSourceFactory {
                 reads: reads.clone(),
             })],
             &[],
         );
-        let temp = tempfile::tempdir().unwrap();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -8712,7 +9128,6 @@ exports { team_prefix: String = "x" }"#,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
-            temp.path(),
         )
         .await
         .expect("module violations must be represented by the plan");

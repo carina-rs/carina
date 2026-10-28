@@ -104,6 +104,44 @@ impl std::fmt::Display for SavedPlanSchemaMismatchError {
 
 impl std::error::Error for SavedPlanSchemaMismatchError {}
 
+/// Recorded and currently loaded artifact summaries for one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanProviderArtifactDifference {
+    pub recorded: Option<String>,
+    pub loaded: Option<String>,
+}
+
+/// All provider-artifact differences that invalidate one saved plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanProviderArtifactMismatchError {
+    pub providers: BTreeMap<String, SavedPlanProviderArtifactDifference>,
+    pub replan_command: String,
+}
+
+impl std::fmt::Display for SavedPlanProviderArtifactMismatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Provider artifact mismatch:")?;
+        for (provider, difference) in &self.providers {
+            let recorded = difference.recorded.as_deref().unwrap_or("missing");
+            let loaded = difference
+                .loaded
+                .as_deref()
+                .unwrap_or("not loaded (see the provider load error above)");
+            write!(
+                formatter,
+                "\n  - provider `{provider}`: recorded {recorded}; loaded {loaded}"
+            )?;
+        }
+        write!(
+            formatter,
+            "\nRe-run `{}` to produce a new saved plan before applying.",
+            self.replan_command
+        )
+    }
+}
+
+impl std::error::Error for SavedPlanProviderArtifactMismatchError {}
+
 /// A backend-selection failure annotated with the upstream project whose
 /// state was being resolved.
 #[derive(Debug)]
@@ -731,6 +769,10 @@ pub enum AppError {
     #[error("{0}")]
     SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError),
 
+    /// A saved plan was computed with different provider artifacts.
+    #[error("{0}")]
+    SavedPlanProviderArtifactMismatch(SavedPlanProviderArtifactMismatchError),
+
     /// Apply completed with one or more partial create results.
     #[error("{0}")]
     PartialSuccess(String),
@@ -906,6 +948,41 @@ mod tests {
             !rendered.contains("[\"") && !rendered.contains("\\\""),
             "schema changes must not use Debug list formatting: {rendered}"
         );
+    }
+
+    #[test]
+    fn saved_plan_provider_artifact_mismatch_renders_every_difference_and_guidance() {
+        let error =
+            AppError::SavedPlanProviderArtifactMismatch(SavedPlanProviderArtifactMismatchError {
+                providers: BTreeMap::from([
+                    (
+                        "aws".to_string(),
+                        SavedPlanProviderArtifactDifference {
+                            recorded: Some("wasm sha256 aaaa (file)".to_string()),
+                            loaded: None,
+                        },
+                    ),
+                    (
+                        "mock".to_string(),
+                        SavedPlanProviderArtifactDifference {
+                            recorded: Some("built-in".to_string()),
+                            loaded: Some("wasm sha256 bbbb (file)".to_string()),
+                        },
+                    ),
+                ]),
+                replan_command: "carina plan --out plan.json .".to_string(),
+            });
+
+        let rendered = error.to_string();
+        assert!(rendered.contains(
+            "provider `aws`: recorded wasm sha256 aaaa (file); loaded not loaded (see the provider load error above)"
+        ));
+        assert!(
+            rendered.contains("provider `mock`: recorded built-in; loaded wasm sha256 bbbb (file)")
+        );
+        assert!(rendered.ends_with(
+            "Re-run `carina plan --out plan.json .` to produce a new saved plan before applying."
+        ));
     }
 
     #[test]

@@ -24,7 +24,9 @@ use carina_core::provider::{
 use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
 };
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedResourceSchema,
+};
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
 
@@ -97,147 +99,205 @@ pub fn uses_builtin_provider<'a>(
 }
 
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
-pub fn builtin_schemas() -> Vec<ResourceSchema> {
-    vec![
+pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
+    let schemas = vec![
         ResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::new("name", AttributeType::string())
-                    .required()
-                    .create_only(),
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            ))
             .attribute(
-                AttributeSchema::new(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
                     "rules",
                     AttributeType::list(AttributeType::struct_(
                         "Rule",
                         vec![
-                            StructField::new("action", AttributeType::string()),
-                            StructField::new(
+                            StructField::optional("action", AttributeType::string()).build(),
+                            StructField::optional(
                                 "conditions",
                                 AttributeType::list(AttributeType::struct_(
                                     "Condition",
-                                    vec![StructField::new("value", AttributeType::string())],
+                                    vec![
+                                        StructField::optional("value", AttributeType::string())
+                                            .build(),
+                                    ],
                                 )),
                             )
-                            .with_block_name("condition"),
+                            .with_block_name("condition")
+                            .build(),
                         ],
                     )),
                 )
-                .with_block_name("rule"),
-            )
-            .attribute(AttributeSchema::new(
-                "lifecycle_configuration",
-                AttributeType::struct_(
-                    "LifecycleConfiguration",
-                    vec![
-                        StructField::new(
-                            "transitions",
-                            AttributeType::list(AttributeType::struct_(
-                                "Transition",
-                                vec![StructField::new("storage_class", AttributeType::string())],
-                            )),
-                        )
-                        .with_block_name("transition"),
-                        StructField::new(
-                            "transition",
-                            AttributeType::struct_(
-                                "Transition",
-                                vec![StructField::new("storage_class", AttributeType::string())],
-                            ),
-                        ),
-                    ],
-                ),
-            ))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
-            .attribute(AttributeSchema::new("comment", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                NESTED_WRITE_ONLY_ATTRIBUTE,
-                AttributeType::struct_(
-                    "OidcConfig",
-                    vec![
-                        StructField::new("issuer", AttributeType::string()).required(),
-                        StructField::new(NESTED_WRITE_ONLY_FIELD, AttributeType::string())
-                            .required()
-                            .write_only(),
-                    ],
-                ),
-            ))
-            .attribute(
-                AttributeSchema::new(WRITE_ONLY_PASSWORD_ATTRIBUTE, AttributeType::string())
-                    .write_only(),
+                .with_block_name("rule")
+                .build(),
             )
             .attribute(
-                AttributeSchema::new("replacement_key", AttributeType::string()).create_only(),
+                AttributeSchema::optional(
+                    "lifecycle_configuration",
+                    AttributeType::struct_(
+                        "LifecycleConfiguration",
+                        vec![
+                            StructField::optional(
+                                "transitions",
+                                AttributeType::list(AttributeType::struct_(
+                                    "Transition",
+                                    vec![
+                                        StructField::optional(
+                                            "storage_class",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                    ],
+                                )),
+                            )
+                            .with_block_name("transition")
+                            .build(),
+                            StructField::optional(
+                                "transition",
+                                AttributeType::struct_(
+                                    "Transition",
+                                    vec![
+                                        StructField::optional(
+                                            "storage_class",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
             )
-            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
-            .attribute(AttributeSchema::new("parent", AttributeType::string()))
-            .attribute(AttributeSchema::new("parent_name", AttributeType::string()))
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            )
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    NESTED_WRITE_ONLY_ATTRIBUTE,
+                    AttributeType::struct_(
+                        "OidcConfig",
+                        vec![
+                            StructField::required("issuer", AttributeType::string()).build(),
+                            StructField::required(NESTED_WRITE_ONLY_FIELD, AttributeType::string())
+                                .write_only()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(WRITE_ONLY_PASSWORD_ATTRIBUTE, AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("replacement_key", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("web_acl_arn", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
         ResourceSchema::new("test.deferred_source")
             .attribute(
-                AttributeSchema::new("name", AttributeType::string())
-                    .required()
-                    .create_only(),
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
             .attribute(
-                AttributeSchema::new(
+                AttributeSchema::optional(
                     "replacement_options",
                     AttributeType::map(AttributeType::string()),
                 )
-                .create_only(),
+                .create_only()
+                .build(),
             )
             .attribute(
-                AttributeSchema::new(
+                AttributeSchema::provider_populated(
                     "generated_rules",
                     AttributeType::list(AttributeType::struct_(
                         "GeneratedRule",
-                        vec![StructField::new("action", AttributeType::string())],
+                        vec![StructField::optional("action", AttributeType::string()).build()],
                     )),
                 )
-                .read_only(),
+                .build(),
             )
             .with_unique_name_attribute("name"),
         ResourceSchema::new("compute.Instance")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("cluster_name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
-        ResourceSchema::new("example.thing")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
-        ResourceSchema::new("example.consumer")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("plain", AttributeType::string()))
-            .attribute(AttributeSchema::new("ref_only", AttributeType::string()))
-            .attribute(AttributeSchema::new("prefix", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "nested",
-                AttributeType::map(AttributeType::string()),
-            ))
-            .attribute(AttributeSchema::new(
-                "list",
-                AttributeType::list(AttributeType::string()),
-            )),
-        ResourceSchema::new("iam.Role")
-            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("path", AttributeType::string()).create_only())
             .attribute(
-                AttributeSchema::new("max_session_duration", AttributeType::int()).create_only(),
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .attribute(AttributeSchema::new("description", AttributeType::string())),
+            .attribute(
+                AttributeSchema::optional("cluster_name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build()),
+        ResourceSchema::new("example.thing")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()),
+        ResourceSchema::new("example.consumer")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("ref_only", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("prefix", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("nested", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("list", AttributeType::list(AttributeType::string()))
+                    .build(),
+            ),
+        ResourceSchema::new("iam.Role")
+            .attribute(
+                AttributeSchema::optional("role_name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("path", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("max_session_duration", AttributeType::int())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
         ResourceSchema::new("iam.Roles")
-            .attribute(AttributeSchema::new("name_regex", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "names",
-                AttributeType::list(AttributeType::string()),
-            ))
+            .attribute(AttributeSchema::optional("name_regex", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
             .as_data_source(),
         ResourceSchema::new("test.Thing")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
-    ]
+    ];
+
+    schemas
+        .into_iter()
+        .map(|schema| {
+            schema
+                .validate()
+                .expect("built-in mock resource schema must be valid")
+        })
+        .collect()
 }
 
 pub struct MockProvider {
@@ -1324,6 +1384,17 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn builtin_schemas_are_all_valid() {
+        let schemas = builtin_schemas();
+        assert!(!schemas.is_empty());
+        assert!(
+            schemas
+                .iter()
+                .any(|schema| schema.as_schema().resource_type() == "test.deferred_source")
+        );
+    }
+
     struct EnvGuard {
         name: &'static str,
         previous: Option<OsString>,
@@ -2100,7 +2171,9 @@ mod tests {
             let mut schemas = carina_core::schema::SchemaRegistry::new();
             schemas.insert(
                 "mock",
-                carina_core::schema::ResourceSchema::new("test.resource"),
+                carina_core::schema::ResourceSchema::new("test.resource")
+                    .validate()
+                    .expect("test schema must be valid"),
             );
             let preparation = carina_core::executor::ProviderPreparationContext::new(
                 &bindings,

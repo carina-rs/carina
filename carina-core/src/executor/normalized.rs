@@ -138,6 +138,7 @@ fn reject_provider_boundary_block_aliases(
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
+        let schema = schema.as_schema();
         if let Some(alias) = find_resource_block_name_alias(resource, schema) {
             return Err(crate::provider::ProviderError::invalid_input(format!(
                 "{}: block-name alias `{}` reached the provider boundary at `{}`; expected canonical attribute `{}`",

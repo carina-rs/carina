@@ -44,7 +44,7 @@ use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfi
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityInputs, ProviderUpstreamScope,
+    CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityData, ProviderUpstreamScope,
     ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
     collect_historical_display_attributes, load_and_resolve_provider_configs,
     prepare_plan_identity_and_provider_inputs_with_wiring,
@@ -90,6 +90,7 @@ use carina_core::hint::ProjectCommand;
 use saved_plan::{
     DesiredPlanFile, ExecutablePlanFile, HistoricalResourceAddresses, InspectedPlanFile,
     SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile, SchemaCheckedPlanFile,
+    VerifiedWiringContext,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -229,7 +230,9 @@ async fn create_checked_bootstrap_resource(
                 &resolved,
                 &state,
                 None,
-                schemas.get_for(resolved.as_resource()),
+                schemas
+                    .get_for(resolved.as_resource())
+                    .map(|schema| schema.as_schema()),
                 RowBasis::Applied(&accepted_request),
                 None,
             )
@@ -266,7 +269,9 @@ async fn create_checked_bootstrap_resource(
                     &resolved,
                     created,
                     None,
-                    schemas.get_for(resolved.as_resource()),
+                    schemas
+                        .get_for(resolved.as_resource())
+                        .map(|schema| schema.as_schema()),
                     None,
                 )
                 .map(Some)
@@ -278,7 +283,9 @@ async fn create_checked_bootstrap_resource(
                     &resolved,
                     pending,
                     None,
-                    schemas.get_for(resolved.as_resource()),
+                    schemas
+                        .get_for(resolved.as_resource())
+                        .map(|schema| schema.as_schema()),
                     None,
                 )
                 .map(Some)
@@ -1796,8 +1803,7 @@ async fn run_apply_locked_owned(
             let remote_bindings = provider_inputs.remote_bindings();
             // Select appropriate Provider based on configuration
             let provider =
-                get_provider_with_ctx(ctx, provider_configs, project_dir, ProgressSink::Human)
-                    .await?;
+                get_provider_with_ctx(ctx, provider_configs, ProgressSink::Human).await?;
 
             // carina#3132: `sorted_resources` is `mut` because deferred-for
             // expansion now runs post-refresh (after phase-2, below) via the
@@ -2782,11 +2788,11 @@ async fn prepare_saved_plan_secret_candidates(
     state_file: &Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
-    wiring: WiringContext,
-) -> Result<(SavedPlanSecretCandidates, WiringContext), AppError> {
+    verified_wiring: &VerifiedWiringContext,
+) -> Result<SavedPlanSecretCandidates, AppError> {
     let mut candidate_state = state_file.clone();
-    let PreparedPlanIdentityInputs {
-        wiring,
+    let wiring = verified_wiring.context();
+    let PreparedPlanIdentityData {
         provider_inputs,
         state_blocks,
     } = prepare_plan_identity_and_provider_inputs_with_wiring(
@@ -2814,7 +2820,7 @@ async fn prepare_saved_plan_secret_candidates(
     let prepared_expansion = expansion_prelude
         .reconcile_addresses(
             crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: &wiring,
+                ctx: wiring,
                 parsed,
                 provider_configs: provider_inputs.configs().as_provider_configs(),
                 state_block_claims: &state_blocks.claims,
@@ -2833,7 +2839,7 @@ async fn prepare_saved_plan_secret_candidates(
     )?;
 
     let normalizers =
-        create_normalizers_from_configs_with_ctx(&wiring, provider_inputs.configs()).await?;
+        create_normalizers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
     expanded_canonical_resources
         .prepare_desired_side_for_plan(
             provider_inputs.configs().as_provider_configs(),
@@ -2846,7 +2852,7 @@ async fn prepare_saved_plan_secret_candidates(
     let candidates =
         SavedPlanSecretCandidates::from_expansion(expanded_canonical_resources, provider_inputs);
 
-    Ok((candidates, wiring))
+    Ok(candidates)
 }
 
 fn rehydrate_desired_plan_file(
@@ -3030,8 +3036,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 25 persists every
-    // data-source outcome so apply never re-derives it from a partial graph.
+    // Validate version compatibility. Plan-file version 26 persists the exact
+    // provider artifacts used to compute the plan. Plan-file version 25
+    // persists every data-source outcome so apply never re-derives it from a
+    // partial graph.
     // Plan-file version 24 removes the
     // redundant wait target schema kind now that waits are managed-only.
     // Version 23 persists the provider-schema fingerprints checked before
@@ -3384,11 +3392,11 @@ async fn run_apply_from_plan_locked_owned(
             let (factories, _) =
                 build_factories_from_providers(saved_provider_configs, project_dir)?;
             let ctx = WiringContext::new(factories, saved_provider_configs);
-            let schema_checked_plan =
-                inspected_plan.verify_schema_fingerprints(ctx.schemas(), apply_target)?;
+            let (schema_checked_plan, verified_wiring) =
+                inspected_plan.verify_loaded_providers(ctx, apply_target)?;
 
-            let (desired_plan, ctx) = match schema_checked_plan {
-                SchemaCheckedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), ctx),
+            let desired_plan = match schema_checked_plan {
+                SchemaCheckedPlanFile::Verified(plan) => DesiredPlanFile::Verified(plan),
                 SchemaCheckedPlanFile::NeedsSecretVerification(pending) => {
                     let canonical_resources = current_resources.ok_or_else(|| {
                         saved_plan_secret_evaluation_error(
@@ -3398,19 +3406,20 @@ async fn run_apply_from_plan_locked_owned(
                             apply_target,
                         )
                     })?;
-                    let (candidates, wiring) = prepare_saved_plan_secret_candidates(
+                    let candidates = prepare_saved_plan_secret_candidates(
                         canonical_resources,
                         &pending,
                         &state_file,
                         project_dir,
                         provider_context,
-                        ctx,
+                        &verified_wiring,
                     )
                     .await
                     .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-                    (pending.verify_desired(candidates, apply_target)?, wiring)
+                    pending.verify_desired(candidates, apply_target)?
                 }
             };
+            let wiring = verified_wiring.context();
 
             let resolved_provider_configs =
                 ResolvedProviderConfigs::try_from(desired_plan.provider_configs().clone())
@@ -3420,12 +3429,8 @@ async fn run_apply_from_plan_locked_owned(
             // Desired/config secret verification is complete before a CRUD-capable
             // provider is constructed. Historical placeholders are verified by the
             // drift reads below before the executor gate is minted.
-            let provider = create_providers_from_configs_with_ctx(
-                &ctx,
-                &resolved_provider_configs,
-                project_dir,
-            )
-            .await?;
+            let provider =
+                create_providers_from_configs_with_ctx(wiring, &resolved_provider_configs).await?;
 
             // Drift detection: re-read actual infrastructure state and compare against planned states
             println!("{}", "Checking for infrastructure drift...".cyan());
@@ -3436,7 +3441,7 @@ async fn run_apply_from_plan_locked_owned(
                 &historical_addresses,
                 &provider,
                 state_file.as_ref(),
-                ctx.schemas(),
+                wiring.schemas(),
                 apply_target,
             )
             .await?;
@@ -3517,7 +3522,7 @@ async fn run_apply_from_plan_locked_owned(
                     .collect();
                 let terminal_input_current = carina_core::resource::into_plan_input_current_map(
                     managed_current.clone(),
-                    ctx.schemas(),
+                    wiring.schemas(),
                     sorted_resources,
                 );
                 let terminal_bindings =
@@ -3544,7 +3549,7 @@ async fn run_apply_from_plan_locked_owned(
                 &summary,
                 DetailLevel::Full,
                 &historical_display,
-                Some(ctx.schemas()),
+                Some(wiring.schemas()),
                 &HashMap::new(),
                 None,
                 None,
@@ -3595,7 +3600,7 @@ async fn run_apply_from_plan_locked_owned(
             // resolves through the data source's attribute map.
             let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
                 managed_current.clone(),
-                ctx.schemas(),
+                wiring.schemas(),
                 sorted_resources,
             );
             let mut bindings =
@@ -3611,7 +3616,7 @@ async fn run_apply_from_plan_locked_owned(
                 sorted_resources,
                 &pre_apply_input_current,
                 plan,
-                ctx.schemas(),
+                wiring.schemas(),
             );
 
             let apply_phase_started = Instant::now();
@@ -3633,7 +3638,7 @@ async fn run_apply_from_plan_locked_owned(
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
                 (*plan).clone(),
-                ctx.schemas().clone(),
+                wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
             ));
             let saver =
@@ -3650,8 +3655,8 @@ async fn run_apply_from_plan_locked_owned(
                 &provider,
                 &provider,
                 raw_provider_configs,
-                ctx.factories(),
-                ctx.schemas(),
+                wiring.factories(),
+                wiring.schemas(),
                 &mut bindings,
                 &mut managed_current,
                 executable_data_source_values,

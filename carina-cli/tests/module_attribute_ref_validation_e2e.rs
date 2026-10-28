@@ -28,8 +28,8 @@ impl ProviderFactory for AwsccTestFactory {
         "AWSCC (carina#3710 validation stub)"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -67,19 +67,30 @@ impl ProviderFactory for AwsccTestFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![target_group_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![target_group_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn target_group_schema() -> ResourceSchema {
     ResourceSchema::new("elbv2.TargetGroup")
         .attribute(
-            AttributeSchema::new("name", AttributeType::string())
-                .required()
-                .create_only(),
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .build(),
         )
-        .attribute(AttributeSchema::new("target_group_arn", AttributeType::string()).read_only())
+        .attribute(
+            AttributeSchema::provider_populated("target_group_arn", AttributeType::string())
+                .build(),
+        )
         .with_unique_name_attribute("name")
 }
 
@@ -172,8 +183,10 @@ impl Provider for NoopProvider {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory) as Box<dyn ProviderFactory>]
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(AwsccTestFactory) as Box<dyn ProviderFactory>
+    ])
 }
 
 struct Fixture {

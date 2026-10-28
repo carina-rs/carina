@@ -50,7 +50,7 @@ struct ValidateWarning {
 /// Not used outside test code.
 pub fn validate_with_factories(
     path: &Path,
-    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
     let provider_context = ProviderContext::default();
     let loaded = match load_configuration_with_config(
@@ -105,7 +105,7 @@ pub fn validate_with_factories(
 /// Not used outside test code.
 pub fn validated_resource_ids_with_factories(
     path: &Path,
-    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
     let provider_context = ProviderContext::default();
     let loaded = match load_configuration_with_config(
@@ -301,7 +301,14 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, load_errors) = match build_factories_from_providers(&parsed.providers, base_dir)
+    {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            error_reports.push(error.to_string());
+            (Vec::new(), Default::default())
+        }
+    };
     let ctx = WiringContext::new(factories, &parsed.providers);
     let validation_errors = super::validate_and_resolve_errors_with_context(
         &mut parsed,

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
+use carina_cli::wiring::{LoadedProviderFactory, WiringContext};
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::parser::{
     BackendConfig, DeferredForExpression, ForBinding, ProviderConfig, ProviderContext,
@@ -51,11 +52,18 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
 }
 
 fn record_mock_schema_fingerprints(plan_file: &mut PlanFile) {
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    for schema in carina_provider_mock::builtin_schemas() {
-        schemas.insert("mock", schema);
-    }
-    plan_file.record_schema_fingerprints(&schemas);
+    let configs = [ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }];
+    let ctx = WiringContext::new(Vec::<LoadedProviderFactory>::new(), &configs);
+    plan_file.record_loaded_providers(&ctx);
 }
 
 struct Scenario {
@@ -321,6 +329,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         upstream_sources: vec![],
         wait_bindings: vec![],
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     record_mock_schema_fingerprints(&mut plan_file);
     plan_file

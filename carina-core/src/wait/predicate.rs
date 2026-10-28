@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-use crate::schema::{AttributePathTypeError, ResourceSchema};
+use crate::schema::{AttributePathTypeError, ValidatedResourceSchema};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AttrPathError {
@@ -158,7 +158,7 @@ impl WaitResolutionError {
 pub fn resolve_wait_predicate(
     lhs_segments: &[String],
     value: Value,
-    schema: Option<&ResourceSchema>,
+    schema: Option<&ValidatedResourceSchema>,
 ) -> Result<WaitPredicate, WaitResolutionError> {
     let (target, attribute_segments) = lhs_segments
         .split_first()
@@ -169,41 +169,39 @@ pub fn resolve_wait_predicate(
     let mut resolved = value;
 
     if let Some(schema) = schema {
-        let attr_type =
-            schema
-                .type_at_attribute_path(attr.segments())
-                .map_err(|error| match error {
-                    AttributePathTypeError::Empty => {
-                        WaitResolutionError::InvalidPath(AttrPathError::Empty)
-                    }
-                    AttributePathTypeError::UnknownAttribute { attribute } => {
-                        WaitResolutionError::UnknownAttribute {
-                            target: target.clone(),
-                            attribute,
-                            resource_type: schema.resource_type.clone(),
-                        }
-                    }
-                    AttributePathTypeError::UnknownStructField {
-                        parent_path,
-                        field,
-                        struct_name,
-                    } => WaitResolutionError::UnknownStructField {
+        let effective_type = schema
+            .effective_type_at_attribute_path(attr.segments())
+            .map_err(|error| match error {
+                AttributePathTypeError::Empty => {
+                    WaitResolutionError::InvalidPath(AttrPathError::Empty)
+                }
+                AttributePathTypeError::UnknownAttribute { attribute } => {
+                    WaitResolutionError::UnknownAttribute {
                         target: target.clone(),
-                        full_path: format!("{parent_path}.{field}"),
-                        struct_name,
-                    },
-                    AttributePathTypeError::CannotTraverse { path, type_name } => {
-                        WaitResolutionError::CannotTraverse {
-                            target: target.clone(),
-                            full_path: attribute.clone(),
-                            traversed: path,
-                            type_name,
-                        }
+                        attribute,
+                        resource_type: schema.as_schema().resource_type().to_string(),
                     }
-                })?;
+                }
+                AttributePathTypeError::UnknownStructField {
+                    parent_path,
+                    field,
+                    struct_name,
+                } => WaitResolutionError::UnknownStructField {
+                    target: target.clone(),
+                    full_path: format!("{parent_path}.{field}"),
+                    struct_name,
+                },
+                AttributePathTypeError::CannotTraverse { path, type_name } => {
+                    WaitResolutionError::CannotTraverse {
+                        target: target.clone(),
+                        full_path: attribute.clone(),
+                        traversed: path,
+                        type_name,
+                    }
+                }
+            })?;
         if matches!(resolved, Value::Concrete(ConcreteValue::EnumIdentifier(_))) {
-            resolved =
-                crate::value::canonicalize_wait_rhs_with_type(resolved, attr_type, &schema.defs);
+            resolved = crate::value::canonicalize_wait_rhs_with_type(resolved, &effective_type);
         }
     }
 

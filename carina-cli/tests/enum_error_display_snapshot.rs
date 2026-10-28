@@ -20,13 +20,27 @@
 use std::collections::HashMap;
 
 use carina_core::resource::{ConcreteValue, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, RootlessType, ValidatedConfigSchema,
+    legacy_validator,
+};
+
+fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
+    ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+        .expect("test config type must be valid")
+        .rootless_type("value")
+        .expect("test config type must exist")
+}
 
 fn render_first_error(
     schema: &ResourceSchema,
     attrs: HashMap<String, Value>,
     string_literal: bool,
 ) -> String {
+    let schema = schema
+        .clone()
+        .validate()
+        .expect("snapshot schema must be valid");
     let result = if string_literal {
         schema.validate_with_origins(&attrs, &|_| true)
     } else {
@@ -41,7 +55,7 @@ fn render_first_error(
 #[test]
 fn invalid_enum_variant_namespaced_display() {
     let schema = ResourceSchema::new("test.bucket").attribute(
-        AttributeSchema::new(
+        AttributeSchema::required(
             "versioning",
             AttributeType::enum_(
                 carina_core::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
@@ -51,7 +65,7 @@ fn invalid_enum_variant_namespaced_display() {
                 None,
             ),
         )
-        .required(),
+        .build(),
     );
     // Phase 4 of carina#2986: the test exercises the wrong-variant
     // path (`InvalidEnumVariant`), which is reached only by the
@@ -80,7 +94,7 @@ fn invalid_enum_variant_bare_display() {
         None,
         None,
     );
-    let err = carina_core::schema::Schema::flat(t.clone())
+    let err = pathless_test_type(t.clone())
         .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
@@ -101,7 +115,7 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
         None,
         None,
     );
-    let err = carina_core::schema::Schema::flat(t.clone())
+    let err = pathless_test_type(t.clone())
         .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
@@ -112,7 +126,7 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
 #[test]
 fn string_literal_expected_enum_enum_display() {
     let schema = ResourceSchema::new("test.assignment").attribute(
-        AttributeSchema::new(
+        AttributeSchema::required(
             "target_type",
             AttributeType::enum_(
                 carina_core::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
@@ -122,7 +136,7 @@ fn string_literal_expected_enum_enum_display() {
                 None,
             ),
         )
-        .required(),
+        .build(),
     );
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -145,7 +159,7 @@ fn string_literal_expected_enum_custom_namespaced_display() {
         }
     }
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
-        AttributeSchema::new(
+        AttributeSchema::required(
             "mode",
             AttributeType::enum_(
                 // Structured identity matching the legacy `namespace: "test.r"`
@@ -160,7 +174,7 @@ fn string_literal_expected_enum_custom_namespaced_display() {
                 None,
             ),
         )
-        .required(),
+        .build(),
     );
     let mut attrs = HashMap::new();
     attrs.insert(

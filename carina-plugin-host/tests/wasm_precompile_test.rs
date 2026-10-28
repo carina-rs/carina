@@ -307,7 +307,7 @@ async fn test_from_bytes_uses_cache() {
             factory
                 .schemas()
                 .iter()
-                .any(|schema| schema.resource_type() == "test.short_budget"),
+                .any(|schema| schema.parts().resource_type == "test.short_budget"),
             "cached and uncached factories must retain mock schema metadata"
         );
     }

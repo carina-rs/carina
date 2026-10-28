@@ -2,11 +2,190 @@
 //!
 //! Providers define schemas for each resource type,
 //! enabling type validation at parse time.
+//!
+//! Input mode is selected once, when a schema component builder is created.
+//! Transition methods and modifiers that do not make sense for that mode are
+//! intentionally absent:
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::new("value", AttributeType::string());
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::optional("value", AttributeType::string()).required();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::optional("value", AttributeType::string()).read_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::required("value", AttributeType::string())
+//!     .with_default(Default::default());
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::required("value", AttributeType::string()).removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::required("value", AttributeType::string()).non_removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string())
+//!     .with_default(Default::default());
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).write_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).create_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).identity();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).non_removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string())
+//!     .with_block_name("values");
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::provider_populated("value", AttributeType::string())
+//!     .with_completions(vec![]);
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::optional("value", AttributeType::string()).deferred_populate();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::required("value", AttributeType::string()).deferred_populate();
+//! ```
+//!
+//! Struct-field builders expose only nested-field modifiers:
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::new("value", AttributeType::string());
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).required();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).read_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string())
+//!     .with_default(Default::default());
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).create_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).identity();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).with_completions(vec![]);
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::optional("value", AttributeType::string()).non_removable();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::provider_populated("value", AttributeType::string()).write_only();
+//! ```
+//!
+//! Callback-bearing refinements require an identity, and lists have only
+//! declarative constraints:
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, legacy_validator};
+//! let _ = AttributeType::refined_string_with_validator(
+//!     None, None, None, legacy_validator(|_| Ok(())), None,
+//! );
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, legacy_validator};
+//! let _ = AttributeType::refined_int_with_validator(
+//!     None, None, legacy_validator(|_| Ok(())),
+//! );
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, legacy_validator};
+//! let _ = AttributeType::refined_float_with_validator(
+//!     None, None, legacy_validator(|_| Ok(())),
+//! );
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, legacy_validator};
+//! let _ = AttributeType::refined_list(
+//!     AttributeType::string(), true, None, legacy_validator(|_| Ok(())),
+//! );
+//! ```
+//!
+//! Resource-level callbacks are not portable and cannot be attached:
+//!
+//! ```compile_fail
+//! use carina_core::schema::ResourceSchema;
+//! let _ = ResourceSchema::new("test.Widget").with_validator(|_| Ok(()));
+//! ```
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -50,8 +229,7 @@ impl fmt::Display for RefEncountered {
     }
 }
 
-/// Type alias for resource validator functions
-pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
+type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
 
 /// Validator stored on refined primitive/list shapes. Boxed as `Arc<dyn Fn>` so it
 /// can capture provider-side state (region, account ID, schema handles) and
@@ -70,8 +248,42 @@ where
     Arc::new(f)
 }
 
-fn noop_validator() -> CustomValidator {
-    validator(|_| Ok(()))
+#[derive(Clone)]
+pub(crate) enum RefinementBinding {
+    MetadataOnly(Option<TypeIdentity>),
+    Validator {
+        identity: TypeIdentity,
+        callback: CustomValidator,
+    },
+}
+
+impl RefinementBinding {
+    pub(crate) fn identity(&self) -> Option<&TypeIdentity> {
+        match self {
+            Self::MetadataOnly(identity) => identity.as_ref(),
+            Self::Validator {
+                identity,
+                callback: _,
+            } => Some(identity),
+        }
+    }
+
+    pub(crate) fn callback(&self) -> Option<&CustomValidator> {
+        match self {
+            Self::MetadataOnly(_) => None,
+            Self::Validator {
+                identity: _,
+                callback,
+            } => Some(callback),
+        }
+    }
+
+    fn validator_parts(&self) -> Option<(&TypeIdentity, &CustomValidator)> {
+        match self {
+            Self::MetadataOnly(_) => None,
+            Self::Validator { identity, callback } => Some((identity, callback)),
+        }
+    }
 }
 
 /// Build a [`CustomValidator`] from a closure that still uses the legacy
@@ -248,10 +460,10 @@ fn walk_custom_lookup_on_path<'a>(
         return;
     }
     match &attr_type.kind {
-        AttrTypeKind::String { identity, .. }
-        | AttrTypeKind::Int { identity, .. }
-        | AttrTypeKind::Float { identity, .. } => {
-            run_identified_lookup(identity.as_ref(), value, attr_name, lookup, errors)
+        AttrTypeKind::String { binding, .. }
+        | AttrTypeKind::Int { binding, .. }
+        | AttrTypeKind::Float { binding, .. } => {
+            run_identified_lookup(binding.identity(), value, attr_name, lookup, errors)
         }
         AttrTypeKind::Enum { identity, .. } => {
             let resolver = EnumValueResolver::with_defs(attr_type, defs);
@@ -368,7 +580,7 @@ fn walk_custom_lookup_on_path<'a>(
         // `Ref`: resolve via the schema's def map and continue the
         // walk. The resolved target (typically a `Struct`) may carry
         // identity-bearing custom types whose validators must run.
-        // A missing def name is reported by `Schema::validate_attr`
+        // A missing def name is reported by the effective/rootless validator
         // as `ValidationFailed`; here we just skip the custom-lookup
         // walk so a user-facing dangling-Ref does not abort the
         // process (carina#3345).
@@ -525,18 +737,6 @@ impl InputMode {
     pub const fn is_provider_populated(self) -> bool {
         matches!(self, Self::ProviderPopulated)
     }
-
-    fn transition_to(&mut self, requested: Self) {
-        let conflicts = matches!(
-            (*self, requested),
-            (Self::Required, Self::ProviderPopulated) | (Self::ProviderPopulated, Self::Required)
-        );
-        assert!(
-            !conflicts,
-            "schema input mode cannot be both required and provider-populated"
-        );
-        *self = requested;
-    }
 }
 
 /// A field within a Struct type.
@@ -549,15 +749,43 @@ impl InputMode {
 ///
 /// let _ = StructField {
 ///     write_only: true,
-///     ..StructField::new("client_secret", AttributeType::string())
+///     ..StructField::optional("client_secret", AttributeType::string()).build()
 /// };
 /// ```
 ///
 /// ```compile_fail
 /// use carina_core::schema::{AttributeType, StructField};
 ///
-/// let mut field = StructField::new("client_secret", AttributeType::string());
+/// let mut field = StructField::optional("client_secret", AttributeType::string()).build();
 /// field.write_only = true;
+/// ```
+///
+/// A nested field's declared mode is not a public read API. Its effective
+/// mode is available only from a path-carrying view produced by a validated
+/// schema witness:
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+/// let field = StructField::required("value", AttributeType::string()).build();
+/// let _ = field.input_mode();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+/// let field = StructField::required("value", AttributeType::string()).build();
+/// let _ = field.is_required();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+/// let field = StructField::provider_populated("value", AttributeType::string()).build();
+/// let _ = field.is_read_only();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+/// let field = StructField::optional("value", AttributeType::string()).write_only().build();
+/// let _ = field.is_write_only();
 /// ```
 ///
 /// The read-only view remains exhaustively destructurable for conversion
@@ -566,11 +794,11 @@ impl InputMode {
 /// ```
 /// use carina_core::schema::{AttributeType, StructField, StructFieldParts};
 ///
-/// let field = StructField::new("client_secret", AttributeType::string());
+/// let field = StructField::optional("client_secret", AttributeType::string()).build();
 /// let StructFieldParts {
 ///     name,
 ///     field_type,
-///     input_mode,
+///     declared_input_mode,
 ///     description,
 ///     provider_name,
 ///     block_name,
@@ -580,7 +808,7 @@ impl InputMode {
 /// let _ = (
 ///     name,
 ///     field_type,
-///     input_mode,
+///     declared_input_mode,
 ///     description,
 ///     provider_name,
 ///     block_name,
@@ -595,7 +823,7 @@ pub struct StructField {
     /// Field type
     pub(crate) field_type: AttributeType,
     /// Whether user input for this field is optional, required, or forbidden.
-    pub(crate) input_mode: InputMode,
+    declared_input_mode: InputMode,
     /// Description of this field
     pub(crate) description: Option<String>,
     /// Provider-side property name (e.g., "IpProtocol")
@@ -623,7 +851,10 @@ pub struct StructField {
 pub struct StructFieldParts<'a> {
     pub name: &'a str,
     pub field_type: &'a AttributeType,
-    pub input_mode: InputMode,
+    /// The mode written on this field declaration, before reference-path
+    /// ancestry is applied. Ordinary consumers must use an [`EffectiveField`]
+    /// obtained from a validated schema witness instead.
+    pub declared_input_mode: InputMode,
     pub description: Option<&'a str>,
     pub provider_name: Option<&'a str>,
     pub block_name: Option<&'a str>,
@@ -631,12 +862,31 @@ pub struct StructFieldParts<'a> {
     pub write_only: bool,
 }
 
+/// Builder for an optional user-input struct field.
+pub struct OptionalStructFieldBuilder {
+    field: StructField,
+}
+
+/// Builder for a required user-input struct field.
+pub struct RequiredStructFieldBuilder {
+    field: StructField,
+}
+
+/// Builder for a provider-populated struct field.
+pub struct ProviderPopulatedStructFieldBuilder {
+    field: StructField,
+}
+
 impl StructField {
-    pub fn new(name: impl Into<String>, field_type: AttributeType) -> Self {
+    fn with_input_mode(
+        name: impl Into<String>,
+        field_type: AttributeType,
+        input_mode: InputMode,
+    ) -> Self {
         Self {
             name: name.into(),
             field_type,
-            input_mode: InputMode::Optional,
+            declared_input_mode: input_mode,
             description: None,
             provider_name: None,
             block_name: None,
@@ -645,11 +895,38 @@ impl StructField {
         }
     }
 
+    pub fn optional(
+        name: impl Into<String>,
+        field_type: AttributeType,
+    ) -> OptionalStructFieldBuilder {
+        OptionalStructFieldBuilder {
+            field: Self::with_input_mode(name, field_type, InputMode::Optional),
+        }
+    }
+
+    pub fn required(
+        name: impl Into<String>,
+        field_type: AttributeType,
+    ) -> RequiredStructFieldBuilder {
+        RequiredStructFieldBuilder {
+            field: Self::with_input_mode(name, field_type, InputMode::Required),
+        }
+    }
+
+    pub fn provider_populated(
+        name: impl Into<String>,
+        field_type: AttributeType,
+    ) -> ProviderPopulatedStructFieldBuilder {
+        ProviderPopulatedStructFieldBuilder {
+            field: Self::with_input_mode(name, field_type, InputMode::ProviderPopulated),
+        }
+    }
+
     pub fn parts(&self) -> StructFieldParts<'_> {
         StructFieldParts {
             name: &self.name,
             field_type: &self.field_type,
-            input_mode: self.input_mode,
+            declared_input_mode: self.declared_input_mode,
             description: self.description.as_deref(),
             provider_name: self.provider_name.as_deref(),
             block_name: self.block_name.as_deref(),
@@ -666,10 +943,6 @@ impl StructField {
         &self.field_type
     }
 
-    pub fn input_mode(&self) -> InputMode {
-        self.input_mode
-    }
-
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
@@ -677,73 +950,118 @@ impl StructField {
     pub fn provider_name(&self) -> Option<&str> {
         self.provider_name.as_deref()
     }
+}
 
-    pub fn block_name(&self) -> Option<&str> {
-        self.block_name.as_deref()
+/// An internal cursor describing the mode inherited by fields of the current
+/// type. Keeping ancestry in a type forces every schema/value walker to choose
+/// a concrete reference path before consulting field mode or block aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FieldAncestry {
+    provider_populated: bool,
+}
+
+impl FieldAncestry {
+    pub(crate) const WRITABLE: Self = Self {
+        provider_populated: false,
+    };
+    pub(crate) const PROVIDER_POPULATED: Self = Self {
+        provider_populated: true,
+    };
+
+    pub(crate) fn from_input_mode(mode: InputMode) -> Self {
+        if mode.is_provider_populated() {
+            Self::PROVIDER_POPULATED
+        } else {
+            Self::WRITABLE
+        }
     }
 
-    pub fn is_deferred_populate(&self) -> bool {
-        self.deferred_populate
+    pub(crate) fn effective_input_mode(self, field: &StructField) -> InputMode {
+        if self.provider_populated {
+            InputMode::ProviderPopulated
+        } else {
+            field.declared_input_mode
+        }
     }
 
-    pub fn is_write_only(&self) -> bool {
-        self.write_only
+    pub(crate) fn block_name(self, field: &StructField) -> Option<&str> {
+        (!self.effective_input_mode(field).is_provider_populated())
+            .then_some(field.block_name.as_deref())
+            .flatten()
     }
 
-    pub fn required(mut self) -> Self {
-        self.input_mode.transition_to(InputMode::Required);
+    pub(crate) fn descend(self, field: &StructField) -> Self {
+        Self::from_input_mode(self.effective_input_mode(field))
+    }
+}
+
+macro_rules! impl_user_input_struct_field_builder {
+    ($builder:ident) => {
+        impl $builder {
+            pub fn write_only(mut self) -> Self {
+                self.field.write_only = true;
+                self
+            }
+
+            pub fn with_description(mut self, description: impl Into<String>) -> Self {
+                self.field.description = Some(description.into());
+                self
+            }
+
+            pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+                self.field.provider_name = Some(name.into());
+                self
+            }
+
+            pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
+                self.field.block_name = Some(name.into());
+                self
+            }
+
+            /// Mark this field as populated asynchronously on output paths.
+            /// Final schema validation rejects the field if any reachable path
+            /// leaves it as effective user input.
+            pub fn deferred_populate(mut self) -> Self {
+                self.field.deferred_populate = true;
+                self
+            }
+
+            pub fn build(self) -> StructField {
+                self.field
+            }
+        }
+    };
+}
+
+impl_user_input_struct_field_builder!(OptionalStructFieldBuilder);
+impl_user_input_struct_field_builder!(RequiredStructFieldBuilder);
+
+impl ProviderPopulatedStructFieldBuilder {
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.field.description = Some(description.into());
         self
     }
 
-    pub fn is_required(&self) -> bool {
-        self.input_mode.is_required()
-    }
-
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(desc.into());
+    pub fn deferred_populate(mut self) -> Self {
+        self.field.deferred_populate = true;
         self
     }
 
     pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
-        self.provider_name = Some(name.into());
+        self.field.provider_name = Some(name.into());
         self
     }
 
+    /// Preserve a declared authoring block name. It is inert below a
+    /// provider-populated ancestor and rejected by final validation when this
+    /// field itself is the first provider-populated node on a path.
     pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
-        self.block_name = Some(name.into());
+        self.field.block_name = Some(name.into());
         self
     }
 
-    /// Mark this nested field as provider-populated and therefore not
-    /// assignable by users.
-    pub fn read_only(mut self) -> Self {
-        assert!(
-            !self.write_only,
-            "struct field cannot be both write-only and provider-populated"
-        );
-        self.input_mode.transition_to(InputMode::ProviderPopulated);
-        self
-    }
-
-    pub fn is_read_only(&self) -> bool {
-        self.input_mode.is_provider_populated()
-    }
-
-    /// Mark this nested field as accepted on write but omitted from reads.
-    pub fn write_only(mut self) -> Self {
-        assert!(
-            !self.input_mode.is_provider_populated(),
-            "struct field cannot be both write-only and provider-populated"
-        );
-        self.write_only = true;
-        self
-    }
-
-    /// Mark this nested field as populated asynchronously by the
-    /// provider after Create. See the field doc on `deferred_populate`.
-    pub fn deferred_populate(mut self) -> Self {
-        self.deferred_populate = true;
-        self
+    pub fn build(self) -> StructField {
+        self.field
     }
 }
 
@@ -808,10 +1126,9 @@ pub struct TypeInSchema<'a> {
 pub(crate) enum AttrTypeKind {
     /// String
     String {
-        identity: Option<TypeIdentity>,
+        binding: RefinementBinding,
         pattern: Option<String>,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: CustomValidator,
         to_dsl: Option<DslTransform>,
     },
     /// A resource handle used only by the schema-level boundary relation.
@@ -822,26 +1139,20 @@ pub(crate) enum AttrTypeKind {
     ResourceHandle {
         provider: String,
         resource_type: String,
-        validate: CustomValidator,
     },
     /// A closed set of string literals lifted from a module-boundary type.
     /// Kept distinct from plain String so a ResourceHandle cannot satisfy a
     /// closed literal sink merely because handles are currently string-backed.
-    StringLiteralSet {
-        values: Vec<String>,
-        validate: CustomValidator,
-    },
+    StringLiteralSet { values: Vec<String> },
     /// Integer
     Int {
-        identity: Option<TypeIdentity>,
+        binding: RefinementBinding,
         range: Option<(Option<i64>, Option<i64>)>,
-        validate: CustomValidator,
     },
     /// Floating-point number
     Float {
-        identity: Option<TypeIdentity>,
+        binding: RefinementBinding,
         range: Option<(Option<f64>, Option<f64>)>,
-        validate: CustomValidator,
     },
     /// Boolean
     Bool,
@@ -877,7 +1188,6 @@ pub(crate) enum AttrTypeKind {
         element_type: Box<AttributeType>,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: CustomValidator,
     },
     /// Map with typed keys and values.
     /// `key`: type constraint for map keys (e.g., `String` for unconstrained,
@@ -894,17 +1204,17 @@ pub(crate) enum AttrTypeKind {
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(UnionMemberTypes),
-    /// Named reference into the enclosing [`Schema`]'s definition map.
+    /// Named reference into the enclosing resource or rootless definition map.
     ///
     /// Used to express cyclic struct definitions
     /// (e.g. `Statement -> AndStatement -> List<Statement>` in
     /// `AWS::WAFv2::WebACL`) without recursing at codegen time.
-    /// Resolved lazily by [`Schema::validate`] at the point of use.
+    /// Resolved lazily by [`EffectiveType::validate`] or
+    /// [`RootlessType::validate`] at the point of use.
     ///
-    /// A `Ref` outside of a `Schema` context cannot be self-validated —
-    /// [`AttrTypeKind::validate`] returns a `TypeError::ValidationFailed`
-    /// in that case. Callers who need to validate a schema that contains
-    /// `Ref` must go through [`Schema::validate`].
+    /// Callers validating a resource path must use an [`EffectiveType`];
+    /// genuinely rootless callers obtain this view from a pathless owner such
+    /// as [`ValidatedConfigSchema::rootless_type`].
     Ref(String),
 }
 
@@ -933,20 +1243,20 @@ pub enum Shape<'a> {
         identity: Option<&'a TypeIdentity>,
         pattern: Option<&'a str>,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
         identity: Option<&'a TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
         range: Option<(Option<f64>, Option<f64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
     Bool,
@@ -966,7 +1276,6 @@ pub enum Shape<'a> {
         element_type: &'a AttributeType,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1062,7 +1371,6 @@ impl fmt::Debug for Shape<'_> {
                 element_type,
                 ordered,
                 length,
-                validate: _,
             } => f
                 .debug_struct("Shape::List")
                 .field("element_type", element_type)
@@ -1088,7 +1396,7 @@ impl fmt::Debug for Shape<'_> {
 ///
 /// [`Shape`] is the right view for **walk-sites** (differ, detail_rows,
 /// LSP, validation): it resolves `Ref` against the enclosing
-/// [`Schema`]'s `defs` map and is structurally guaranteed not to carry
+/// the enclosing definition map and is structurally guaranteed not to carry
 /// `Ref`. [`RawShape`] is the right view for **transport-sites**: the
 /// caller is not consuming the schema's meaning, only relaying its
 /// structural form, and resolving `Ref` would either (a) infinite-loop
@@ -1107,20 +1415,20 @@ pub enum RawShape<'a> {
         identity: Option<&'a TypeIdentity>,
         pattern: Option<&'a str>,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
         identity: Option<&'a TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
         range: Option<(Option<f64>, Option<f64>)>,
-        validate: &'a CustomValidator,
+        validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
     Bool,
@@ -1140,7 +1448,6 @@ pub enum RawShape<'a> {
         element_type: &'a AttributeType,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1154,7 +1461,7 @@ pub enum RawShape<'a> {
     },
     /// Union of types — see [`AttrTypeKind::Union`].
     Union(&'a [AttributeType]),
-    /// Named reference into the enclosing [`Schema`]'s `defs` map.
+    /// Named reference into the enclosing schema's definition map.
     /// Carries the name; the receiver re-emits an `AttributeType::ref_(name)`
     /// and looks up the definition in its own copy of `defs`.
     Ref(&'a str),
@@ -1213,7 +1520,6 @@ impl fmt::Debug for RawShape<'_> {
                 element_type,
                 ordered,
                 length,
-                validate: _,
             } => f
                 .debug_struct("RawShape::List")
                 .field("element_type", element_type)
@@ -1236,22 +1542,116 @@ impl fmt::Debug for RawShape<'_> {
     }
 }
 
-/// A complete schema: a root attribute type together with the named
-/// definitions it can reference via [`AttrTypeKind::Ref`].
-///
-/// Introduced in carina#3340 to model cyclic CloudFormation definition
-/// graphs (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`,
-/// StepFunctions state machine bodies, ...). The validate / diff / LSP
-/// walk-sites that may encounter a `Ref` take `&Schema` as `&self`, so
-/// the resolve step is required by the type signature rather than by
-/// convention.
+/// Internal rootless-schema walker. Path-derived resource types enter value
+/// walkers through [`EffectiveType`] instead.
 #[derive(Debug, Clone)]
-pub struct Schema {
+pub(crate) struct Schema {
     /// The root attribute type. May be a `Ref` into `defs`, or any
     /// other shape (`Struct`, `List`, primitive, ...).
-    pub root: AttributeType,
+    pub(crate) root: AttributeType,
     /// Named definitions reachable via [`AttrTypeKind::Ref`].
-    pub defs: std::collections::BTreeMap<String, AttributeType>,
+    pub(crate) defs: std::collections::BTreeMap<String, AttributeType>,
+}
+
+/// A genuinely rootless type owned by a validated pathless schema source.
+///
+/// This is the public entry point for values that do not originate at a
+/// resource-schema path, such as backend configuration and standalone type
+/// diagnostics. Resource attributes and nested fields must instead be
+/// validated through [`EffectiveAttribute`] or [`EffectiveType`], which carry
+/// provider-populated ancestry.
+///
+/// A path-derived cursor cannot be passed back through this API:
+///
+/// ```compile_fail
+/// use carina_core::schema::{
+///     AttributeSchema, AttributeType, ResourceSchema, RootlessType,
+/// };
+///
+/// let schema = ResourceSchema::new("test.Widget")
+///     .attribute(
+///         AttributeSchema::provider_populated("output", AttributeType::string()).build(),
+///     )
+///     .validate()
+///     .unwrap();
+/// let path_type = schema.effective_attribute("output").unwrap().value_type();
+/// let raw_type = path_type.as_type().clone();
+/// let _ = RootlessType::new(raw_type);
+/// ```
+///
+/// Supplying the resource definitions explicitly cannot reopen the same hole:
+///
+/// ```compile_fail
+/// use carina_core::schema::{
+///     AttributeSchema, AttributeType, ResourceSchema, RootlessType,
+/// };
+///
+/// let schema = ResourceSchema::new("test.Widget")
+///     .attribute(
+///         AttributeSchema::provider_populated("output", AttributeType::string()).build(),
+///     )
+///     .validate()
+///     .unwrap();
+/// let path_type = schema.effective_attribute("output").unwrap().value_type();
+/// let raw_type = path_type.as_type().clone();
+/// let defs = schema.as_schema().defs().clone();
+/// let _ = RootlessType::with_defs(raw_type, defs);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RootlessType {
+    schema: Schema,
+}
+
+impl RootlessType {
+    #[cfg(test)]
+    pub(crate) fn new(root: AttributeType) -> Self {
+        Self::with_defs(root, BTreeMap::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_defs(root: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
+        Self {
+            schema: Schema { root, defs },
+        }
+    }
+
+    fn from_validated_config_type(root: AttributeType) -> Self {
+        Self {
+            schema: Schema {
+                root,
+                defs: BTreeMap::new(),
+            },
+        }
+    }
+
+    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        self.schema.validate(value)
+    }
+
+    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+        self.schema.validate_collect(value)
+    }
+
+    /// Canonicalize provider or persisted state for this rootless type.
+    pub fn canonicalize_state(&self, value: Value) -> Value {
+        self.schema.canonicalize_state(value)
+    }
+
+    /// Canonicalize one provider-configuration value without accepting a
+    /// resource-path cursor that carries different ancestry.
+    pub fn canonicalize_provider_config(
+        &self,
+        provider_name: &str,
+        value: Value,
+    ) -> Result<Value, TypeError> {
+        crate::value::canonicalize_provider_config_with_type_and_ancestry(
+            provider_name,
+            value,
+            &self.schema.root,
+            &self.schema.defs,
+            FieldAncestry::WRITABLE,
+        )
+    }
 }
 
 /// Maximum number of non-consuming `Ref` hops retained on one traversal path.
@@ -1368,68 +1768,47 @@ impl Schema {
     /// in the enclosing schema`); callers expecting `Ref` to resolve
     /// must populate `defs`. Typical uses: unit-test fixtures, leaf
     /// validation, provider-config schemas that are known flat.
-    pub fn flat(root: AttributeType) -> Self {
+    #[cfg(test)]
+    pub(crate) fn flat(root: AttributeType) -> Self {
         Self {
             root,
             defs: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Construct a `Schema` that carries only `defs`, with a
-    /// placeholder `root`. Use when the call shape is "iterate
-    /// attributes against a shared def map" and the per-call
-    /// attribute is supplied through [`Self::validate_attr`]
-    /// (which ignores `self.root`). Examples:
-    /// `ResourceSchema::validate_inner`, provider-config validation
-    /// in `carina-core::validation` and `carina-lsp::diagnostics`.
-    ///
-    /// **Do not** call [`Self::validate`] or [`Self::validate_collect`]
-    /// on a Schema produced by `with_defs`; those entry points walk
-    /// `self.root`, which here is a non-load-bearing
-    /// `AttrTypeKind::String { .. }` and will silently validate every
-    /// value as a String.
-    pub fn with_defs(defs: std::collections::BTreeMap<String, AttributeType>) -> Self {
-        Self {
-            // `validate_attr(attr, value)` ignores `self.root`; pick
-            // the cheapest leaf as a non-load-bearing placeholder.
-            root: AttributeType::string(),
-            defs,
-        }
-    }
-
     /// Look up a named definition. Returns `None` if `name` is not in
     /// `defs`; callers should treat that as a type error.
-    pub fn resolve(&self, name: &str) -> Option<&AttributeType> {
+    #[cfg(test)]
+    pub(crate) fn resolve(&self, name: &str) -> Option<&AttributeType> {
         self.defs.get(name)
     }
 
     /// Resolve `ty` against this schema's definition map.
-    pub fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
+    #[cfg(test)]
+    pub(crate) fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
         ty.resolve_refs_with_defs(&self.defs)
     }
 
     /// Project `ty` onto a [`Shape`] using this schema's definition map.
-    pub fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
+    #[cfg(test)]
+    pub(crate) fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
         ty.shape_with_defs(&self.defs)
     }
 
     /// Validate a `Value` against this schema's `root`, resolving
     /// any `Ref` it encounters by looking it up in `defs`.
-    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
         self.validate_attr(&self.root, value)
     }
 
-    /// Canonicalize provider or persisted state against `attr_type` using this
-    /// schema's `defs` map. Unrecognized enum-positioned strings remain
-    /// literal state text. Desired values use the strict host pipeline rather
-    /// than this state-only entry point.
-    pub fn canonicalize_state_attr(&self, attr: &AttributeType, value: Value) -> Value {
-        crate::value::canonicalize_state_with_type(value, attr, &self.defs)
-    }
-
     /// Canonicalize provider or persisted state against this schema's root.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
-        self.canonicalize_state_attr(&self.root, value)
+    pub(crate) fn canonicalize_state(&self, value: Value) -> Value {
+        crate::value::canonicalize_state_with_type_and_ancestry(
+            value,
+            &self.root,
+            &self.defs,
+            FieldAncestry::WRITABLE,
+        )
     }
 
     /// Schema-aware path-collecting validator. Equivalent to
@@ -1442,24 +1821,34 @@ impl Schema {
     /// Returns `(FieldPath, TypeError)` pairs anchored at each
     /// offending location, mirroring the non-Schema-aware variant for
     /// downstream consumers like the LSP range mapper.
-    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+    pub(crate) fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
         let mut out = Vec::new();
-        self.collect_attr_into(&self.root, &FieldPath::new(), value, &mut out);
+        Self::collect_attr_into(
+            &self.root,
+            &self.defs,
+            &FieldPath::new(),
+            value,
+            FieldAncestry::WRITABLE,
+            &mut out,
+        );
         out
     }
 
     fn collect_attr_into(
-        &self,
         attr: &AttributeType,
+        defs: &BTreeMap<String, AttributeType>,
         path: &FieldPath,
         value: &Value,
+        ancestry: FieldAncestry,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
-        if fit_value_to_type(
+        if fit_value_to_type_on_path(
             attr,
             value,
-            &self.defs,
+            defs,
+            ancestry,
             CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+            &mut Vec::new(),
         )
         .is_some()
         {
@@ -1468,26 +1857,34 @@ impl Schema {
 
         let error_count = out.len();
         let mut visited_refs = Vec::new();
-        self.collect_attr_into_on_path(attr, path, value, out, &mut visited_refs);
+        Self::collect_attr_into_on_path(attr, defs, path, value, ancestry, out, &mut visited_refs);
         if out.len() == error_count {
-            let error = self
-                .validate_attr(attr, value)
+            let error = validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)
                 .expect_err("a rejected fit must produce a validation diagnostic");
             out.push((path.clone(), error));
         }
     }
 
     fn collect_attr_into_on_path<'a>(
-        &'a self,
         attr: &'a AttributeType,
+        defs: &'a BTreeMap<String, AttributeType>,
         path: &FieldPath,
         value: &Value,
+        ancestry: FieldAncestry,
         out: &mut Vec<(FieldPath, TypeError)>,
         visited_refs: &mut Vec<&'a str>,
     ) {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
             let mut secret_errors = Vec::new();
-            self.collect_attr_into_on_path(attr, path, inner, &mut secret_errors, visited_refs);
+            Self::collect_attr_into_on_path(
+                attr,
+                defs,
+                path,
+                inner,
+                ancestry,
+                &mut secret_errors,
+                visited_refs,
+            );
             out.extend(
                 secret_errors
                     .into_iter()
@@ -1497,9 +1894,17 @@ impl Schema {
         }
         // Peel Ref so the downstream arms never have to think about it.
         if matches!(&attr.kind, AttrTypeKind::Ref(_)) {
-            match resolve_refs_on_path(attr, &self.defs, visited_refs) {
+            match resolve_refs_on_path(attr, defs, visited_refs) {
                 Ok(resolution) => {
-                    self.collect_attr_into_on_path(resolution.attr, path, value, out, visited_refs);
+                    Self::collect_attr_into_on_path(
+                        resolution.attr,
+                        defs,
+                        path,
+                        value,
+                        ancestry,
+                        out,
+                        visited_refs,
+                    );
                     visited_refs.truncate(resolution.restore_len);
                 }
                 Err(failure) => {
@@ -1545,7 +1950,9 @@ impl Schema {
 
                 // Required-field check.
                 for f in fields {
-                    if f.is_required() && !struct_field_is_present(fields, map, f) {
+                    if ancestry.effective_input_mode(f).is_required()
+                        && !struct_field_is_present(fields, map, f, ancestry)
+                    {
                         let field_path = path.push_field(f.name.clone());
                         out.push((
                             field_path,
@@ -1557,14 +1964,23 @@ impl Schema {
                 }
 
                 for (k, v) in map {
-                    match struct_field_for_key(fields, k) {
+                    match struct_field_for_key(fields, k, ancestry) {
                         Some(field) => {
                             let next_path = path.push_field(k.clone());
-                            if let Some(error) = validate_struct_field_assignment(field, k) {
+                            if let Some(error) =
+                                validate_struct_field_assignment(field, k, ancestry)
+                            {
                                 out.push((next_path, error));
                                 continue;
                             }
-                            self.collect_attr_into(&field.field_type, &next_path, v, out);
+                            Self::collect_attr_into(
+                                &field.field_type,
+                                defs,
+                                &next_path,
+                                v,
+                                ancestry.descend(field),
+                                out,
+                            );
                         }
                         None => {
                             let suggestion = suggest_similar_name(k, &canonical_field_names);
@@ -1583,7 +1999,6 @@ impl Schema {
             AttrTypeKind::List {
                 element_type: inner,
                 length,
-                validate,
                 ..
             } => {
                 let Some(items) = (match concrete {
@@ -1603,15 +2018,9 @@ impl Schema {
                     out.push((path.clone(), error));
                     return;
                 }
-                let error_count = out.len();
                 for (i, item) in items.iter().enumerate() {
                     let next_path = path.push_index(i);
-                    self.collect_attr_into(inner, &next_path, item, out);
-                }
-                if out.len() == error_count
-                    && let Err(error) = validate(value)
-                {
-                    out.push((path.clone(), error));
+                    Self::collect_attr_into(inner, defs, &next_path, item, ancestry, out);
                 }
             }
             // Keep Union membership and best-scoring failure selection
@@ -1620,7 +2029,9 @@ impl Schema {
             // collecting a failed Struct member would improve LSP path
             // precision but would not change validation acceptance.
             AttrTypeKind::Union(_) => {
-                if let Err(e) = self.validate_attr_on_path(attr, value, visited_refs) {
+                if let Err(e) =
+                    validate_attr_with_defs_on_path(attr, value, defs, ancestry, visited_refs)
+                {
                     out.push((path.clone(), e));
                 }
             }
@@ -1628,29 +2039,20 @@ impl Schema {
                 // For non-recursive shapes the existing single-shot
                 // dispatcher is correct. Forward any error under the
                 // current path.
-                if let Err(e) = self.validate_attr(attr, value) {
+                if let Err(e) = validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry) {
                     out.push((path.clone(), e));
                 }
             }
         }
     }
 
-    /// Validate against an arbitrary `AttributeType` in the context of
-    /// this schema. Used internally to recurse through `Ref`; exposed
-    /// publicly so callers that already hold a sub-attribute (e.g. a
-    /// resource's attribute type plus the resource's struct-definition
-    /// map) can validate without re-rooting the schema.
-    pub fn validate_attr(&self, attr: &AttributeType, value: &Value) -> Result<(), TypeError> {
-        validate_attr_with_defs(attr, value, &self.defs)
-    }
-
-    fn validate_attr_on_path<'a>(
-        &'a self,
-        attr: &'a AttributeType,
+    /// Validate one recursive child against this rootless schema's definitions.
+    pub(crate) fn validate_attr(
+        &self,
+        attr: &AttributeType,
         value: &Value,
-        visited_refs: &mut Vec<&'a str>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs_on_path(attr, value, &self.defs, visited_refs)
+        validate_attr_with_defs(attr, value, &self.defs)
     }
 }
 
@@ -1659,11 +2061,22 @@ fn validate_attr_with_defs(
     value: &Value,
     defs: &BTreeMap<String, AttributeType>,
 ) -> Result<(), TypeError> {
-    if fit_value_to_type(
+    validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
+}
+
+fn validate_attr_with_defs_and_ancestry(
+    attr: &AttributeType,
+    value: &Value,
+    defs: &BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
+) -> Result<(), TypeError> {
+    if fit_value_to_type_on_path(
         attr,
         value,
         defs,
+        ancestry,
         CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        &mut Vec::new(),
     )
     .is_some()
     {
@@ -1671,24 +2084,28 @@ fn validate_attr_with_defs(
     }
 
     let mut visited_refs = Vec::new();
-    validation_error_with_defs_on_path(attr, value, defs, &mut visited_refs).and_then(|()| {
-        Err(TypeError::TypeMismatch {
-            expected: attr.type_name(),
-            got: value.type_name(),
-        })
-    })
+    validation_error_with_defs_on_path(attr, value, defs, ancestry, &mut visited_refs).and_then(
+        |()| {
+            Err(TypeError::TypeMismatch {
+                expected: attr.type_name(),
+                got: value.type_name(),
+            })
+        },
+    )
 }
 
 fn validate_attr_with_defs_on_path<'a>(
     attr: &'a AttributeType,
     value: &Value,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if fit_value_to_type_on_path(
         attr,
         value,
         defs,
+        ancestry,
         CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
         visited_refs,
     )
@@ -1697,7 +2114,7 @@ fn validate_attr_with_defs_on_path<'a>(
         return Ok(());
     }
 
-    validation_error_with_defs_on_path(attr, value, defs, visited_refs).and_then(|()| {
+    validation_error_with_defs_on_path(attr, value, defs, ancestry, visited_refs).and_then(|()| {
         Err(TypeError::TypeMismatch {
             expected: attr.type_name(),
             got: value.type_name(),
@@ -1713,63 +2130,87 @@ fn validation_error_with_defs_on_path<'a>(
     attr: &'a AttributeType,
     value: &Value,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return validation_error_with_defs_on_path(attr, inner, defs, visited_refs)
+        return validation_error_with_defs_on_path(attr, inner, defs, ancestry, visited_refs)
             .map_err(TypeError::masked_for_secret);
+    }
+    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+        validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
+        return validate_attr_with_defs_and_ancestry(attr, default, defs, ancestry);
     }
     match &attr.kind {
         AttrTypeKind::Ref(_) => {
             let resolution = resolve_refs_on_path(attr, defs, visited_refs)
                 .map_err(RefResolutionFailure::into_validation_error)?;
-            let result =
-                validation_error_with_defs_on_path(resolution.attr, value, defs, visited_refs);
+            let result = validation_error_with_defs_on_path(
+                resolution.attr,
+                value,
+                defs,
+                ancestry,
+                visited_refs,
+            );
             visited_refs.truncate(resolution.restore_len);
             result
         }
         AttrTypeKind::List {
             element_type: inner,
-            ordered,
             length,
-            validate,
+            ordered: _,
         } => {
             if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
                 validate_list_length(*length, items.len())?;
                 for (i, item) in items.iter().enumerate() {
-                    if let Err(inner_err) = validate_attr_with_defs(inner, item, defs) {
+                    if let Err(inner_err) =
+                        validate_attr_with_defs_and_ancestry(inner, item, defs, ancestry)
+                    {
                         return Err(TypeError::ListItemError {
                             index: i,
                             inner: Box::new(inner_err),
                         });
                     }
                 }
-                validate(value)
+                Ok(())
+            } else if let Some(ConcreteValueRef::StringList(items)) = value.as_concrete() {
+                validate_list_length(*length, items.len())?;
+                for (i, item) in items.iter().enumerate() {
+                    let item = Value::Concrete(ConcreteValue::String(item.clone()));
+                    if let Err(inner_err) =
+                        validate_attr_with_defs_and_ancestry(inner, &item, defs, ancestry)
+                    {
+                        return Err(TypeError::ListItemError {
+                            index: i,
+                            inner: Box::new(inner_err),
+                        });
+                    }
+                }
+                Ok(())
             } else if value.as_concrete().is_none() {
                 Ok(())
             } else {
-                AttributeType {
-                    kind: AttrTypeKind::List {
-                        element_type: inner.clone(),
-                        ordered: *ordered,
-                        length: *length,
-                        validate: validate.clone(),
-                    },
-                }
-                .validate(value)
+                Err(TypeError::TypeMismatch {
+                    expected: attr.type_name(),
+                    got: value.type_name(),
+                })
             }
         }
         AttrTypeKind::Map { key, value: val_ty } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                 for (k, v) in map.iter() {
                     let key_val = lift_map_key(key, k, defs);
-                    if let Err(inner_err) = validate_attr_with_defs(key, &key_val, defs) {
+                    if let Err(inner_err) =
+                        validate_attr_with_defs_and_ancestry(key, &key_val, defs, ancestry)
+                    {
                         return Err(TypeError::MapKeyError {
                             key: k.clone(),
                             inner: Box::new(inner_err),
                         });
                     }
-                    if let Err(inner_err) = validate_attr_with_defs(val_ty, v, defs) {
+                    if let Err(inner_err) =
+                        validate_attr_with_defs_and_ancestry(val_ty, v, defs, ancestry)
+                    {
                         return Err(TypeError::MapValueError {
                             key: k.clone(),
                             inner: Box::new(inner_err),
@@ -1777,14 +2218,13 @@ fn validation_error_with_defs_on_path<'a>(
                     }
                 }
                 Ok(())
+            } else if value.as_concrete().is_none() {
+                Ok(())
             } else {
-                AttributeType {
-                    kind: AttrTypeKind::Map {
-                        key: key.clone(),
-                        value: val_ty.clone(),
-                    },
-                }
-                .validate(value)
+                Err(TypeError::TypeMismatch {
+                    expected: attr.type_name(),
+                    got: value.type_name(),
+                })
             }
         }
         AttrTypeKind::Struct { name, fields } => {
@@ -1793,26 +2233,34 @@ fn validation_error_with_defs_on_path<'a>(
                     name,
                     fields,
                     map,
+                    ancestry,
                     |field| TypeError::MissingRequired {
                         name: field.name.clone(),
                     },
                     |input_name, field, field_value| {
-                        validate_attr_with_defs(&field.field_type, field_value, defs).map_err(
-                            |inner_err| TypeError::StructFieldError {
-                                field: input_name.to_string(),
-                                inner: Box::new(inner_err),
-                            },
+                        validate_attr_with_defs_and_ancestry(
+                            &field.field_type,
+                            field_value,
+                            defs,
+                            ancestry.descend(field),
                         )
+                        .map_err(|inner_err| TypeError::StructFieldError {
+                            field: input_name.to_string(),
+                            inner: Box::new(inner_err),
+                        })
                     },
                 )
+            } else if matches!(value.as_concrete(), Some(ConcreteValueRef::List(_))) {
+                Err(TypeError::BlockSyntaxNotAllowed {
+                    attribute: name.clone(),
+                })
+            } else if value.as_concrete().is_none() {
+                Ok(())
             } else {
-                AttributeType {
-                    kind: AttrTypeKind::Struct {
-                        name: name.clone(),
-                        fields: fields.clone(),
-                    },
-                }
-                .validate(value)
+                Err(TypeError::TypeMismatch {
+                    expected: attr.type_name(),
+                    got: value.type_name(),
+                })
             }
         }
         AttrTypeKind::Union(members) => {
@@ -1825,11 +2273,12 @@ fn validation_error_with_defs_on_path<'a>(
                 concrete,
                 attr.type_name(),
                 defs,
+                ancestry,
                 visited_refs,
             )
             .map(|_| ())
         }
-        _ => attr.validate(value),
+        _ => attr.validate_leaf_value(value),
     }
 }
 
@@ -1852,51 +2301,40 @@ impl fmt::Debug for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             AttrTypeKind::String {
-                identity,
+                binding,
                 pattern,
                 length,
                 to_dsl,
-                validate: _,
             } => f
                 .debug_struct("String")
-                .field("identity", identity)
+                .field("identity", &binding.identity())
                 .field("pattern", pattern)
                 .field("length", length)
                 .field("to_dsl", to_dsl)
-                .field("validate", &"<closure>")
+                .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
             AttrTypeKind::ResourceHandle {
                 provider,
                 resource_type,
-                validate: _,
             } => f
                 .debug_struct("ResourceHandle")
                 .field("provider", provider)
                 .field("resource_type", resource_type)
                 .finish(),
-            AttrTypeKind::StringLiteralSet {
-                values,
-                validate: _,
-            } => f.debug_tuple("StringLiteralSet").field(values).finish(),
-            AttrTypeKind::Int {
-                identity,
-                range,
-                validate: _,
-            } => f
+            AttrTypeKind::StringLiteralSet { values } => {
+                f.debug_tuple("StringLiteralSet").field(values).finish()
+            }
+            AttrTypeKind::Int { binding, range } => f
                 .debug_struct("Int")
-                .field("identity", identity)
+                .field("identity", &binding.identity())
                 .field("range", range)
-                .field("validate", &"<closure>")
+                .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
-            AttrTypeKind::Float {
-                identity,
-                range,
-                validate: _,
-            } => f
+            AttrTypeKind::Float { binding, range } => f
                 .debug_struct("Float")
-                .field("identity", identity)
+                .field("identity", &binding.identity())
                 .field("range", range)
-                .field("validate", &"<closure>")
+                .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
             AttrTypeKind::Bool => f.write_str("Bool"),
             AttrTypeKind::Duration => f.write_str("Duration"),
@@ -1920,13 +2358,11 @@ impl fmt::Debug for AttributeType {
                 element_type,
                 ordered,
                 length,
-                validate: _,
             } => f
                 .debug_struct("List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
                 .field("length", length)
-                .field("validate", &"<closure>")
                 .finish(),
             AttrTypeKind::Map { key, value } => f
                 .debug_struct("Map")
@@ -2026,9 +2462,8 @@ impl fmt::Display for FieldPath {
 /// users write in source; every other key type lowers to `String`
 /// (carina#2996). Top-level key-type Refs are peeled through `defs`;
 /// an unresolved Ref stays on the ordinary validation-error path rather
-/// than panicking here. Shared between `Schema::validate_attr`'s Map arm
-/// and the standalone `validate_map` so the two walkers cannot
-/// drift again (carina#3347).
+/// than panicking here. Shared by the ancestry-aware fit and diagnostic
+/// walkers so map-key validation cannot drift (carina#3347).
 pub(crate) fn lift_map_key(
     key_type: &AttributeType,
     key: &str,
@@ -2206,43 +2641,35 @@ impl AttributeType {
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
             AttrTypeKind::String {
-                identity,
+                binding,
                 pattern,
                 length,
-                validate,
                 to_dsl,
             } => Shape::String {
-                identity: identity.as_ref(),
+                identity: binding.identity(),
                 pattern: pattern.as_deref(),
                 length: *length,
-                validate,
+                validate: binding.callback(),
                 to_dsl: to_dsl.as_ref(),
             },
-            AttrTypeKind::ResourceHandle { validate, .. }
-            | AttrTypeKind::StringLiteralSet { validate, .. } => Shape::String {
-                identity: None,
-                pattern: None,
-                length: None,
-                validate,
-                to_dsl: None,
-            },
-            AttrTypeKind::Int {
-                identity,
-                range,
-                validate,
-            } => Shape::Int {
-                identity: identity.as_ref(),
+            AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
+                Shape::String {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                }
+            }
+            AttrTypeKind::Int { binding, range } => Shape::Int {
+                identity: binding.identity(),
                 range: *range,
-                validate,
+                validate: binding.callback(),
             },
-            AttrTypeKind::Float {
-                identity,
-                range,
-                validate,
-            } => Shape::Float {
-                identity: identity.as_ref(),
+            AttrTypeKind::Float { binding, range } => Shape::Float {
+                identity: binding.identity(),
                 range: *range,
-                validate,
+                validate: binding.callback(),
             },
             AttrTypeKind::Bool => Shape::Bool,
             AttrTypeKind::Duration => Shape::Duration,
@@ -2265,12 +2692,10 @@ impl AttributeType {
                 element_type,
                 ordered,
                 length,
-                validate,
             } => Shape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
                 length: *length,
-                validate,
             },
             AttrTypeKind::Map { key, value } => Shape::Map {
                 key: key.as_ref(),
@@ -2306,43 +2731,35 @@ impl AttributeType {
     pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
         match &self.kind {
             AttrTypeKind::String {
-                identity,
+                binding,
                 pattern,
                 length,
-                validate,
                 to_dsl,
             } => RawShape::String {
-                identity: identity.as_ref(),
+                identity: binding.identity(),
                 pattern: pattern.as_deref(),
                 length: *length,
-                validate,
+                validate: binding.callback(),
                 to_dsl: to_dsl.as_ref(),
             },
-            AttrTypeKind::ResourceHandle { validate, .. }
-            | AttrTypeKind::StringLiteralSet { validate, .. } => RawShape::String {
-                identity: None,
-                pattern: None,
-                length: None,
-                validate,
-                to_dsl: None,
-            },
-            AttrTypeKind::Int {
-                identity,
-                range,
-                validate,
-            } => RawShape::Int {
-                identity: identity.as_ref(),
+            AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
+                RawShape::String {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                }
+            }
+            AttrTypeKind::Int { binding, range } => RawShape::Int {
+                identity: binding.identity(),
                 range: *range,
-                validate,
+                validate: binding.callback(),
             },
-            AttrTypeKind::Float {
-                identity,
-                range,
-                validate,
-            } => RawShape::Float {
-                identity: identity.as_ref(),
+            AttrTypeKind::Float { binding, range } => RawShape::Float {
+                identity: binding.identity(),
                 range: *range,
-                validate,
+                validate: binding.callback(),
             },
             AttrTypeKind::Bool => RawShape::Bool,
             AttrTypeKind::Duration => RawShape::Duration,
@@ -2365,12 +2782,10 @@ impl AttributeType {
                 element_type,
                 ordered,
                 length,
-                validate,
             } => RawShape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
                 length: *length,
-                validate,
             },
             AttrTypeKind::Map { key, value } => RawShape::Map {
                 key: key.as_ref(),
@@ -2398,10 +2813,9 @@ impl AttributeType {
     pub fn string() -> Self {
         AttributeType {
             kind: AttrTypeKind::String {
-                identity: None,
+                binding: RefinementBinding::MetadataOnly(None),
                 pattern: None,
                 length: None,
-                validate: noop_validator(),
                 to_dsl: None,
             },
         }
@@ -2418,7 +2832,6 @@ impl AttributeType {
             kind: AttrTypeKind::ResourceHandle {
                 provider: provider.into(),
                 resource_type: resource_type.into(),
-                validate: noop_validator(),
             },
         }
     }
@@ -2427,10 +2840,7 @@ impl AttributeType {
     /// distinction needed for resource-handle assignability.
     pub(crate) fn string_literal_set(values: Vec<String>) -> Self {
         AttributeType {
-            kind: AttrTypeKind::StringLiteralSet {
-                values,
-                validate: noop_validator(),
-            },
+            kind: AttrTypeKind::StringLiteralSet { values },
         }
     }
 
@@ -2441,12 +2851,19 @@ impl AttributeType {
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        Self::refined_string_with_validator(identity, pattern, length, noop_validator(), to_dsl)
+        AttributeType {
+            kind: AttrTypeKind::String {
+                binding: RefinementBinding::MetadataOnly(identity),
+                pattern,
+                length,
+                to_dsl,
+            },
+        }
     }
 
     /// Create a String type with refinement metadata and a custom validator.
     pub fn refined_string_with_validator(
-        identity: Option<TypeIdentity>,
+        identity: TypeIdentity,
         pattern: Option<String>,
         length: Option<(Option<u64>, Option<u64>)>,
         validate: CustomValidator,
@@ -2454,10 +2871,12 @@ impl AttributeType {
     ) -> Self {
         AttributeType {
             kind: AttrTypeKind::String {
-                identity,
+                binding: RefinementBinding::Validator {
+                    identity,
+                    callback: validate,
+                },
                 pattern,
                 length,
-                validate,
                 to_dsl,
             },
         }
@@ -2467,9 +2886,8 @@ impl AttributeType {
     pub fn int() -> Self {
         AttributeType {
             kind: AttrTypeKind::Int {
-                identity: None,
+                binding: RefinementBinding::MetadataOnly(None),
                 range: None,
-                validate: noop_validator(),
             },
         }
     }
@@ -2479,20 +2897,27 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
     ) -> Self {
-        Self::refined_int_with_validator(identity, range, noop_validator())
+        AttributeType {
+            kind: AttrTypeKind::Int {
+                binding: RefinementBinding::MetadataOnly(identity),
+                range,
+            },
+        }
     }
 
     /// Create an Int type with refinement metadata and a custom validator.
     pub fn refined_int_with_validator(
-        identity: Option<TypeIdentity>,
+        identity: TypeIdentity,
         range: Option<(Option<i64>, Option<i64>)>,
         validate: CustomValidator,
     ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Int {
-                identity,
+                binding: RefinementBinding::Validator {
+                    identity,
+                    callback: validate,
+                },
                 range,
-                validate,
             },
         }
     }
@@ -2501,9 +2926,8 @@ impl AttributeType {
     pub fn float() -> Self {
         AttributeType {
             kind: AttrTypeKind::Float {
-                identity: None,
+                binding: RefinementBinding::MetadataOnly(None),
                 range: None,
-                validate: noop_validator(),
             },
         }
     }
@@ -2513,20 +2937,27 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<f64>, Option<f64>)>,
     ) -> Self {
-        Self::refined_float_with_validator(identity, range, noop_validator())
+        AttributeType {
+            kind: AttrTypeKind::Float {
+                binding: RefinementBinding::MetadataOnly(identity),
+                range,
+            },
+        }
     }
 
     /// Create a Float type with refinement metadata and a custom validator.
     pub fn refined_float_with_validator(
-        identity: Option<TypeIdentity>,
+        identity: TypeIdentity,
         range: Option<(Option<f64>, Option<f64>)>,
         validate: CustomValidator,
     ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Float {
-                identity,
+                binding: RefinementBinding::Validator {
+                    identity,
+                    callback: validate,
+                },
                 range,
-                validate,
             },
         }
     }
@@ -2656,7 +3087,7 @@ impl AttributeType {
     }
 
     /// Create a `Ref` type referencing a named definition in the
-    /// enclosing [`Schema`]'s `defs` map.
+    /// enclosing resource or rootless definition map.
     pub fn ref_(name: impl Into<String>) -> Self {
         AttributeType {
             kind: AttrTypeKind::Ref(name.into()),
@@ -2665,7 +3096,7 @@ impl AttributeType {
 
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: AttributeType) -> Self {
-        Self::refined_list(inner, true, None, noop_validator())
+        Self::refined_list(inner, true, None)
     }
 
     /// Create a List type with protocol-carried refinement metadata.
@@ -2673,21 +3104,19 @@ impl AttributeType {
         element_type: AttributeType,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: CustomValidator,
     ) -> Self {
         AttributeType {
             kind: AttrTypeKind::List {
                 element_type: Box::new(element_type),
                 ordered,
                 length,
-                validate,
             },
         }
     }
 
     /// Create an unordered List type (insertionOrder=false).
     pub fn unordered_list(inner: AttributeType) -> Self {
-        Self::refined_list(inner, false, None, noop_validator())
+        Self::refined_list(inner, false, None)
     }
 
     /// Create a Map type with unconstrained string keys.
@@ -2758,29 +3187,33 @@ impl AttributeType {
     /// the same definition map again, so each nested element is
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
+    #[cfg(test)]
     pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
-        self.validate_with_defs(value, empty_defs_for_schema_walks())
+        validate_attr_with_defs(self, value, empty_defs_for_schema_walks())
     }
 
-    fn validate_with_defs(
-        &self,
-        value: &Value,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
+    /// Validate a non-container value after the ancestry-aware structural
+    /// walker has selected the leaf type. Keeping Struct/Union/List/Map out of
+    /// this dispatcher prevents a second walker from silently re-rooting at
+    /// writable ancestry.
+    fn validate_leaf_value(&self, value: &Value) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
             return self
-                .validate_with_defs(inner, defs)
+                .validate_leaf_value(inner)
                 .map_err(TypeError::masked_for_secret);
         }
         if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-            self.validate_with_defs(value, defs)?;
-            return self.validate_with_defs(default, defs);
+            self.validate_leaf_value(value)?;
+            return self.validate_leaf_value(default);
         }
-        if matches!(&self.kind, AttrTypeKind::Ref(_)) {
-            let resolution = resolve_refs_on_path(self, defs, &mut Vec::new())
-                .map_err(RefResolutionFailure::into_validation_error)?;
-            return resolution.attr.validate_with_defs(value, defs);
-        }
+        debug_assert!(!matches!(
+            self.kind,
+            AttrTypeKind::Ref(_)
+                | AttrTypeKind::List { .. }
+                | AttrTypeKind::Map { .. }
+                | AttrTypeKind::Struct { .. }
+                | AttrTypeKind::Union(_)
+        ));
         // Enum attributes assigned a bare `BindingRef` are the
         // shadowing collision case described in #2978: the user wrote a
         // bare identifier that happens to be a `let` binding *and* is
@@ -2812,14 +3245,6 @@ impl AttributeType {
         let Some(concrete) = value.as_concrete() else {
             return Ok(());
         };
-        self.validate_concrete(concrete, defs)
-    }
-
-    fn validate_concrete(
-        &self,
-        value: ConcreteValueRef<'_>,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
         match &self.kind {
             AttrTypeKind::Enum {
                 identity,
@@ -2835,28 +3260,22 @@ impl AttributeType {
                 DslMap::new(dsl_aliases, to_dsl.as_ref()),
                 validate.as_ref(),
                 to_dsl.as_ref(),
-                value,
+                concrete,
             ),
-            AttrTypeKind::List { .. } => self.validate_list(value, defs),
-            AttrTypeKind::Map { .. } => self.validate_map(value, defs),
-            AttrTypeKind::Struct { .. } => self.validate_struct(value, defs),
-            AttrTypeKind::Union(_) => self.validate_union(value, defs),
             AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
             | AttrTypeKind::Float { .. }
             | AttrTypeKind::Bool
-            | AttrTypeKind::Duration => self.validate_primitive(value),
-            // Unreachable: `validate` rejects `Ref` early before
-            // descending into the concrete-value dispatch. Kept as an
-            // explicit arm so the compiler enforces handling.
-            AttrTypeKind::Ref(name) => Err(TypeError::ValidationFailed {
-                message: format!(
-                    "internal: AttributeType::Ref(\"{name}\") in validate_concrete; \
-                     this attribute must be validated through Schema::validate"
-                ),
-            }),
+            | AttrTypeKind::Duration => self.validate_primitive(concrete),
+            AttrTypeKind::Ref(_)
+            | AttrTypeKind::List { .. }
+            | AttrTypeKind::Map { .. }
+            | AttrTypeKind::Struct { .. }
+            | AttrTypeKind::Union(_) => {
+                unreachable!("validate_leaf_value must only be called after structural dispatch")
+            }
         }
     }
 
@@ -2873,57 +3292,48 @@ impl AttributeType {
         match (&self.kind, value) {
             (
                 AttrTypeKind::String {
-                    identity,
+                    binding,
                     pattern,
                     length,
-                    validate,
                     ..
                 },
                 ConcreteValueRef::String(s),
             ) => {
-                validate_string_refinement(identity.as_ref(), pattern.as_deref(), *length, s)?;
-                validate(&value.to_owned_value())
+                validate_string_refinement(binding.identity(), pattern.as_deref(), *length, s)?;
+                binding
+                    .callback()
+                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (AttrTypeKind::ResourceHandle { validate, .. }, ConcreteValueRef::String(_)) => {
-                validate(&value.to_owned_value())
+            (AttrTypeKind::ResourceHandle { .. }, ConcreteValueRef::String(_)) => Ok(()),
+            (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
+                if values.iter().any(|candidate| candidate == value) =>
+            {
+                Ok(())
             }
-            (
-                AttrTypeKind::StringLiteralSet { values, validate },
-                ConcreteValueRef::String(value),
-            ) if values.iter().any(|candidate| candidate == value) => {
-                validate(&ConcreteValueRef::String(value).to_owned_value())
-            }
-            (
-                AttrTypeKind::Int {
-                    range, validate, ..
-                },
-                ConcreteValueRef::Int(i),
-            ) => {
+            (AttrTypeKind::Int { binding, range }, ConcreteValueRef::Int(i)) => {
                 validate_int_range(*range, i)?;
-                validate(&value.to_owned_value())
+                binding
+                    .callback()
+                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (
-                AttrTypeKind::Float {
-                    range, validate, ..
-                },
-                ConcreteValueRef::Float(f),
-            ) if f.is_finite() => {
+            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f))
+                if f.is_finite() =>
+            {
                 validate_float_range(*range, f)?;
-                validate(&value.to_owned_value())
+                binding
+                    .callback()
+                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
             (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
                 Err(TypeError::ValidationFailed {
                     message: format!("non-finite float value: {f}"),
                 })
             }
-            (
-                AttrTypeKind::Float {
-                    range, validate, ..
-                },
-                ConcreteValueRef::Int(i),
-            ) => {
+            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
                 validate_float_range(*range, i as f64)?;
-                validate(&value.to_owned_value())
+                binding
+                    .callback()
+                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
@@ -3102,204 +3512,17 @@ impl AttributeType {
         }
     }
 
-    /// Validate a `List` variant by validating each item with the inner type.
-    ///
-    /// Phase 2 of RFC #2972 (closes #2954): takes [`ConcreteValueRef`].
-    /// The pre-Phase-2 path was reachable from any `Value` and produced
-    /// a spurious `Type mismatch: expected List<T>, got ResourceRef(...)`
-    /// for upstream-typed list refs. After Phase 2, deferred values
-    /// cannot reach this helper — the dispatcher's `as_concrete()`
-    /// projection returns `None` for them and the dispatcher returns
-    /// `Ok(())` immediately. Type fitness for upstream list refs is
-    /// the deferred-aware checker's job.
-    fn validate_list(
-        &self,
-        value: ConcreteValueRef<'_>,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
-        let AttrTypeKind::List {
-            element_type: inner,
-            length,
-            validate,
-            ..
-        } = &self.kind
-        else {
-            unreachable!("validate_list called on non-List");
-        };
-        // `ConcreteValueRef::StringList` is the canonicalized form for
-        // fields typed as `Union[String, list(String)]` (see #2510).
-        // Structurally equivalent to a `List` of strings — accept the
-        // same way.
-        if let ConcreteValueRef::StringList(items) = value {
-            validate_list_length(*length, items.len())?;
-            for (i, s) in items.iter().enumerate() {
-                inner
-                    .validate_with_defs(&Value::Concrete(ConcreteValue::String(s.clone())), defs)
-                    .map_err(|e| TypeError::ListItemError {
-                        index: i,
-                        inner: Box::new(e),
-                    })?;
-            }
-            return validate(&value.to_owned_value());
-        }
-        let ConcreteValueRef::List(items) = value else {
-            return Err(TypeError::TypeMismatch {
-                expected: self.type_name(),
-                got: value.type_name().to_string(),
-            });
-        };
-        validate_list_length(*length, items.len())?;
-        for (i, item) in items.iter().enumerate() {
-            inner
-                .validate_with_defs(item, defs)
-                .map_err(|e| TypeError::ListItemError {
-                    index: i,
-                    inner: Box::new(e),
-                })?;
-        }
-        validate(&value.to_owned_value())
-    }
-
-    /// Validate a `Map` variant: keys against `key`, values against `value`.
-    ///
-    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Mirrors the
-    /// `validate_list` migration — deferred values are filtered at the
-    /// dispatcher and cannot reach here.
-    fn validate_map(
-        &self,
-        value: ConcreteValueRef<'_>,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
-        let AttrTypeKind::Map {
-            key: key_type,
-            value: inner,
-        } = &self.kind
-        else {
-            unreachable!("validate_map called on non-Map");
-        };
-        let ConcreteValueRef::Map(map) = value else {
-            return Err(TypeError::TypeMismatch {
-                expected: self.type_name(),
-                got: value.type_name().to_string(),
-            });
-        };
-        for k in map.keys() {
-            let key_value = lift_map_key(key_type, k, defs);
-            key_type
-                .validate_with_defs(&key_value, defs)
-                .map_err(|e| TypeError::MapKeyError {
-                    key: k.clone(),
-                    inner: Box::new(e),
-                })?;
-        }
-        for (k, v) in map {
-            inner
-                .validate_with_defs(v, defs)
-                .map_err(|e| TypeError::MapValueError {
-                    key: k.clone(),
-                    inner: Box::new(e),
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Validate a `Struct` variant: required fields, known field names, and
-    /// recursively check each field's value.
-    ///
-    /// Block syntax produces `Value::Concrete(ConcreteValue::List([Value::Map(...)]))`, but bare
-    /// `Struct` requires map assignment syntax (`attr = { ... }`); a
-    /// `List` is rejected explicitly with `BlockSyntaxNotAllowed`.
-    ///
-    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]; deferred values
-    /// are filtered upstream by the dispatcher.
-    fn validate_struct(
-        &self,
-        value: ConcreteValueRef<'_>,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
-        let AttrTypeKind::Struct { name, fields } = &self.kind else {
-            unreachable!("validate_struct called on non-Struct");
-        };
-
-        // Struct type rejects List (block syntax)
-        if matches!(value, ConcreteValueRef::List(_)) {
-            return Err(TypeError::BlockSyntaxNotAllowed {
-                attribute: name.clone(),
-            });
-        }
-        let ConcreteValueRef::Map(map) = value else {
-            return Err(TypeError::TypeMismatch {
-                expected: self.type_name(),
-                got: value.type_name().to_string(),
-            });
-        };
-
-        validate_struct_fields(
-            name,
-            fields,
-            map,
-            |field| TypeError::StructFieldError {
-                field: field.name.clone(),
-                inner: Box::new(TypeError::MissingRequired {
-                    name: field.name.clone(),
-                }),
-            },
-            |input_name, field, field_value| {
-                field
-                    .field_type
-                    .validate_with_defs(field_value, defs)
-                    .map_err(|inner_err| TypeError::StructFieldError {
-                        field: input_name.to_string(),
-                        inner: Box::new(inner_err),
-                    })
-            },
-        )
-    }
-
-    /// Validate a `Union` variant: succeed if any member accepts the value.
-    ///
-    /// On failure, return the structurally-closest member error rather
-    /// than a generic `TypeMismatch`. "Closest" is measured by
-    /// [`union_member_judgement_on_path`]: members whose outer constructor matches
-    /// the input's (Map↔Struct, List↔List, String↔Enum, scalar↔
-    /// scalar) outscore unrelated members. A unique maximum preserves
-    /// that member's error verbatim. Tied non-Struct failures retain every
-    /// distinct arm error in declaration order; tied closed-Struct failures
-    /// keep the specialized alternatives diagnostic from #3754. When no member
-    /// shares any structural similarity, fall through to `TypeMismatch`. See
-    /// #2219, #3754, and #3834.
-    fn validate_union(
-        &self,
-        value: ConcreteValueRef<'_>,
-        defs: &BTreeMap<String, AttributeType>,
-    ) -> Result<(), TypeError> {
-        let AttrTypeKind::Union(types) = &self.kind else {
-            unreachable!("validate_union called on non-Union");
-        };
-        let original = value.to_owned_value();
-        let mut visited_refs = Vec::new();
-        select_union_member_on_path(
-            types.as_raw_slice(),
-            &original,
-            value,
-            self.type_name(),
-            defs,
-            &mut visited_refs,
-        )
-        .map(|_| ())
-    }
-
     pub fn type_name(&self) -> String {
         match &self.kind {
             AttrTypeKind::Bool => "Bool".to_string(),
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
             AttrTypeKind::String {
-                identity,
+                binding,
                 pattern,
                 length,
                 ..
-            } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
+            } => custom_display_name(binding.identity(), pattern.as_deref(), length.as_ref()),
             AttrTypeKind::ResourceHandle {
                 provider,
                 resource_type,
@@ -3310,12 +3533,12 @@ impl AttributeType {
                 .map(|value| display_string_literal(value))
                 .collect::<Vec<_>>()
                 .join(" | "),
-            AttrTypeKind::Int { identity, .. } => identity
-                .as_ref()
+            AttrTypeKind::Int { binding, .. } => binding
+                .identity()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "Int".to_string()),
-            AttrTypeKind::Float { identity, .. } => identity
-                .as_ref()
+            AttrTypeKind::Float { binding, .. } => binding
+                .identity()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "Float".to_string()),
             AttrTypeKind::List {
@@ -3337,19 +3560,15 @@ impl AttributeType {
     /// Used for cross-schema type compatibility: all String-based Custom types
     /// are considered compatible with each other.
     pub fn is_string_based_custom(&self) -> bool {
-        matches!(
-            &self.kind,
+        match &self.kind {
             AttrTypeKind::String {
-                identity: Some(_),
+                binding,
+                pattern,
+                length,
                 ..
-            } | AttrTypeKind::String {
-                pattern: Some(_),
-                ..
-            } | AttrTypeKind::String {
-                length: Some(_),
-                ..
-            }
-        )
+            } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -3565,13 +3784,16 @@ impl<'source> TypeInSchema<'source> {
             (ResourceHandle { .. }, _) => false,
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
-            (StringLiteralSet { .. }, String { identity: None, .. }) => true,
             (
                 StringLiteralSet { .. },
                 String {
-                    identity: Some(_), ..
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
                 },
-            ) => false,
+            ) => true,
+            (StringLiteralSet { .. }, String { binding, .. }) if binding.identity().is_some() => {
+                false
+            }
             (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
                 source.iter().all(|value| sink.contains(value))
             }
@@ -3659,16 +3881,21 @@ impl<'source> TypeInSchema<'source> {
             }),
             (
                 String {
-                    identity: Some(s_id),
+                    binding: source_binding,
                     length: s_len,
                     ..
                 },
                 String {
-                    identity: Some(k_id),
+                    binding: sink_binding,
                     length: k_len,
                     ..
                 },
-            ) => s_id.assignable_to(k_id) && length_contains(s_len.as_ref(), k_len.as_ref()),
+            ) if let (Some(source_identity), Some(sink_identity)) =
+                (source_binding.identity(), sink_binding.identity()) =>
+            {
+                source_identity.assignable_to(sink_identity)
+                    && length_contains(s_len.as_ref(), k_len.as_ref())
+            }
             (Enum { identity: s_id, .. }, Enum { identity: k_id, .. })
                 if !s_id.assignable_to(k_id) =>
             {
@@ -3695,42 +3922,49 @@ impl<'source> TypeInSchema<'source> {
             }
             // Anonymous source → identified sink has no proof of identity.
             (
-                String { identity: None, .. }
-                | Int { identity: None, .. }
-                | Float { identity: None, .. },
                 String {
-                    identity: Some(_), ..
-                }
-                | Int {
-                    identity: Some(_), ..
-                }
-                | Float {
-                    identity: Some(_), ..
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
                 },
-            ) => false,
+                String { binding, .. },
+            ) if binding.identity().is_some() => false,
+            (
+                Int {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+                Int { binding, .. },
+            ) if binding.identity().is_some() => false,
+            (
+                Float {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+                Float { binding, .. },
+            ) if binding.identity().is_some() => false,
             // Numeric widening is directional: an Int source may flow into
             // a Float sink, matching concrete-value validation. Preserve
             // identity and range evidence when either side carries it.
             (
                 Int {
-                    identity: source_identity,
+                    binding: source_binding,
                     range: source_range,
                     ..
                 },
                 Float {
-                    identity: sink_identity,
+                    binding: sink_binding,
                     range: sink_range,
                     ..
                 },
             ) => {
-                if let Some(sink_identity) = sink_identity
-                    && !source_identity
-                        .as_ref()
+                if let Some(sink_identity) = sink_binding.identity()
+                    && !source_binding
+                        .identity()
                         .is_some_and(|source_identity| source_identity.assignable_to(sink_identity))
                 {
                     return false;
                 }
-                if source_range.is_none() && sink_identity.is_none() {
+                if source_range.is_none() && sink_binding.identity().is_none() {
                     return true;
                 }
                 i64_range_assignable_to_f64(source_range.as_ref(), sink_range.as_ref())
@@ -3741,28 +3975,37 @@ impl<'source> TypeInSchema<'source> {
             // The identified-sink arm above must remain ahead of this one.
             (
                 String {
-                    identity: None,
+                    binding: RefinementBinding::MetadataOnly(None),
                     pattern: None,
                     length: None,
                     ..
                 },
-                String { identity: None, .. },
+                String {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
             ) => true,
             (
                 Int {
-                    identity: None,
+                    binding: RefinementBinding::MetadataOnly(None),
                     range: None,
                     ..
                 },
-                Int { identity: None, .. },
+                Int {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
             ) => true,
             (
                 Float {
-                    identity: None,
+                    binding: RefinementBinding::MetadataOnly(None),
                     range: None,
                     ..
                 },
-                Float { identity: None, .. },
+                Float {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
             ) => true,
             (
                 String {
@@ -3786,31 +4029,41 @@ impl<'source> TypeInSchema<'source> {
             }
             (
                 Int {
-                    identity: Some(s_id),
+                    binding: source_binding,
                     range: s_range,
                     ..
                 },
                 Int {
-                    identity: Some(k_id),
+                    binding: sink_binding,
                     range: k_range,
                     ..
                 },
-            ) => s_id.assignable_to(k_id) && i64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            ) if let (Some(source_identity), Some(sink_identity)) =
+                (source_binding.identity(), sink_binding.identity()) =>
+            {
+                source_identity.assignable_to(sink_identity)
+                    && i64_range_contains(s_range.as_ref(), k_range.as_ref())
+            }
             (Int { range: s_range, .. }, Int { range: k_range, .. }) => {
                 i64_range_contains(s_range.as_ref(), k_range.as_ref())
             }
             (
                 Float {
-                    identity: Some(s_id),
+                    binding: source_binding,
                     range: s_range,
                     ..
                 },
                 Float {
-                    identity: Some(k_id),
+                    binding: sink_binding,
                     range: k_range,
                     ..
                 },
-            ) => s_id.assignable_to(k_id) && f64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            ) if let (Some(source_identity), Some(sink_identity)) =
+                (source_binding.identity(), sink_binding.identity()) =>
+            {
+                source_identity.assignable_to(sink_identity)
+                    && f64_range_contains(s_range.as_ref(), k_range.as_ref())
+            }
             (Float { range: s_range, .. }, Float { range: k_range, .. }) => {
                 f64_range_contains(s_range.as_ref(), k_range.as_ref())
             }
@@ -4097,25 +4350,18 @@ struct UnionFit<'a> {
 /// Ref paths are retained only while examining the same value node. Container
 /// descent starts a fresh path because it consumes one value level, allowing a
 /// recursive schema to revisit the same definition for a child value.
-pub(crate) fn fit_value_to_type<'a>(
-    attr: &'a AttributeType,
-    value: &Value,
-    defs: &'a BTreeMap<String, AttributeType>,
-    purpose: CanonicalizationPurpose<'_>,
-) -> Option<Fit<'a>> {
-    fit_value_to_type_on_path(attr, value, defs, purpose, &mut Vec::new())
-}
-
 fn fit_value_to_type_on_path<'a>(
     attr: &'a AttributeType,
     value: &Value,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<Fit<'a>> {
     let resolution = resolve_refs_on_path(attr, defs, visited_refs).ok()?;
     let resolved = resolution.attr;
-    let fit = fit_value_to_resolved_type_on_path(resolved, value, defs, purpose, visited_refs);
+    let fit =
+        fit_value_to_resolved_type_on_path(resolved, value, defs, ancestry, purpose, visited_refs);
     visited_refs.truncate(resolution.restore_len);
     fit
 }
@@ -4124,13 +4370,15 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
     attr: &'a AttributeType,
     value: &Value,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<Fit<'a>> {
     use AttrTypeKind as AT;
 
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner = fit_value_to_resolved_type_on_path(attr, inner, defs, purpose, visited_refs)?;
+        let inner =
+            fit_value_to_resolved_type_on_path(attr, inner, defs, ancestry, purpose, visited_refs)?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,
@@ -4140,8 +4388,10 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
     }
 
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        let value_fit = fit_value_to_type(attr, value, defs, purpose)?;
-        let default_fit = fit_value_to_type(attr, default, defs, purpose)?;
+        let value_fit =
+            fit_value_to_type_on_path(attr, value, defs, ancestry, purpose, &mut Vec::new())?;
+        let default_fit =
+            fit_value_to_type_on_path(attr, default, defs, ancestry, purpose, &mut Vec::new())?;
         let mut exactness = value_fit.exactness;
         exactness.combine(default_fit.exactness);
         return Some(Fit::with_kind(
@@ -4225,7 +4475,6 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             AT::List {
                 element_type,
                 length,
-                validate,
                 ..
             },
             ConcreteValueRef::List(items),
@@ -4234,18 +4483,23 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
             for item in items {
-                let child = fit_value_to_type(element_type, item, defs, purpose)?;
+                let child = fit_value_to_type_on_path(
+                    element_type,
+                    item,
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            validate(value).ok()?;
             Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
         }
         (
             AT::List {
                 element_type,
                 length,
-                validate,
                 ..
             },
             ConcreteValueRef::StringList(items),
@@ -4255,11 +4509,17 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             let mut item_fits = Vec::with_capacity(items.len());
             for item in items {
                 let item = Value::Concrete(ConcreteValue::String(item.clone()));
-                let child = fit_value_to_type(element_type, &item, defs, purpose)?;
+                let child = fit_value_to_type_on_path(
+                    element_type,
+                    &item,
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            validate(value).ok()?;
             Some(Fit::with_kind(
                 exactness,
                 attr,
@@ -4277,10 +4537,24 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
                 let lifted_key = lift_map_key(key, map_key, defs);
-                let key_fit = fit_value_to_type(key, &lifted_key, defs, purpose)?;
+                let key_fit = fit_value_to_type_on_path(
+                    key,
+                    &lifted_key,
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
                 exactness.combine(key_fit.exactness);
                 let canonical_key = canonical_enum_key_from_fit(&key_fit);
-                let value_fit = fit_value_to_type(value_type, map_value, defs, purpose)?;
+                let value_fit = fit_value_to_type_on_path(
+                    value_type,
+                    map_value,
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
                 exactness.combine(value_fit.exactness);
                 entry_fits.push(MapEntryFit {
                     canonical_key,
@@ -4291,7 +4565,9 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
         }
         (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => {
             for field in fields {
-                if field.is_required() && !struct_field_is_present(fields, map, field) {
+                if ancestry.effective_input_mode(field).is_required()
+                    && !struct_field_is_present(fields, map, field, ancestry)
+                {
                     return None;
                 }
             }
@@ -4299,13 +4575,20 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             let mut exactness = FitExactness::EXACT;
             let mut field_fits = Vec::with_capacity(map.len());
             for (input_name, field_value) in map {
-                let field = struct_field_for_key(fields, input_name)?;
+                let field = struct_field_for_key(fields, input_name, ancestry)?;
                 if purpose.validates_struct_assignments()
-                    && validate_struct_field_assignment(field, input_name).is_some()
+                    && validate_struct_field_assignment(field, input_name, ancestry).is_some()
                 {
                     return None;
                 }
-                let child = fit_value_to_type(&field.field_type, field_value, defs, purpose)?;
+                let child = fit_value_to_type_on_path(
+                    &field.field_type,
+                    field_value,
+                    defs,
+                    ancestry.descend(field),
+                    purpose,
+                    &mut Vec::new(),
+                )?;
                 exactness.combine(child.exactness);
                 field_fits.push(child);
             }
@@ -4316,6 +4599,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
                 members.as_raw_slice(),
                 value,
                 defs,
+                ancestry,
                 purpose,
                 visited_refs,
             )?;
@@ -4340,7 +4624,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             | AT::Duration,
             _,
         ) => {
-            attr.validate_concrete(concrete, defs).ok()?;
+            attr.validate_primitive(concrete).ok()?;
             let exactness = if matches!(
                 (&attr.kind, concrete),
                 (AT::Float { .. }, ConcreteValueRef::Int(_))
@@ -4359,12 +4643,14 @@ fn fit_union_members_on_path<'a>(
     members: &'a [AttributeType],
     value: &Value,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<UnionFit<'a>> {
     let mut best: Option<UnionFit<'a>> = None;
     for member in members {
-        let Some(fit) = fit_value_to_type_on_path(member, value, defs, purpose, visited_refs)
+        let Some(fit) =
+            fit_value_to_type_on_path(member, value, defs, ancestry, purpose, visited_refs)
         else {
             continue;
         };
@@ -4409,10 +4695,10 @@ impl UnionFailureRank {
 struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
-    fn new(fields: &[StructField], map: &IndexMap<String, Value>) -> Self {
+    fn new(fields: &[StructField], map: &IndexMap<String, Value>, ancestry: FieldAncestry) -> Self {
         Self(
             map.keys()
-                .filter(|field| struct_field_for_key(fields, field).is_some())
+                .filter(|field| struct_field_for_key(fields, field, ancestry).is_some())
                 .cloned()
                 .collect(),
         )
@@ -4482,6 +4768,7 @@ fn union_member_judgement_on_path<'a>(
     member: &'a AttributeType,
     value: ConcreteValueRef<'_>,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> UnionMemberJudgement {
     use AttrTypeKind as AT;
@@ -4495,7 +4782,7 @@ fn union_member_judgement_on_path<'a>(
         (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => UnionMemberJudgement {
             failure_rank: UnionFailureRank::MAP_TO_STRUCT,
             diagnostic_identity: UnionDiagnosticIdentity::ClosedStruct(
-                RecognizedStructFields::new(fields, map),
+                RecognizedStructFields::new(fields, map, ancestry),
             ),
         },
         // Same-constructor match — second tier.
@@ -4529,7 +4816,8 @@ fn union_member_judgement_on_path<'a>(
         // re-projecting the first element through `as_concrete()` —
         // a deferred element contributes no bonus (the projection
         // returns `None`). List descent consumes one value level, matching
-        // `Schema::validate_attr`'s fresh-path element recursion; retaining an
+        // The ancestry-aware validator's fresh-path element recursion;
+        // retaining an
         // outer Union alias here would make selection disagree with validation.
         (
             AT::List {
@@ -4543,7 +4831,7 @@ fn union_member_judgement_on_path<'a>(
                 .and_then(|first| first.as_concrete())
                 .map(|first| {
                     let mut element_path = Vec::new();
-                    union_member_judgement_on_path(inner, first, defs, &mut element_path)
+                    union_member_judgement_on_path(inner, first, defs, ancestry, &mut element_path)
                         .failure_rank
                 })
                 .unwrap_or(UnionFailureRank::NO_MATCH);
@@ -4553,7 +4841,7 @@ fn union_member_judgement_on_path<'a>(
         (AT::Union(inner), v) => inner
             .as_raw_slice()
             .iter()
-            .map(|member| union_member_judgement_on_path(member, v, defs, visited_refs))
+            .map(|member| union_member_judgement_on_path(member, v, defs, ancestry, visited_refs))
             .reduce(|best, candidate| {
                 if candidate.failure_rank > best.failure_rank {
                     candidate
@@ -4594,7 +4882,12 @@ impl BestUnionMemberFailures {
         }
     }
 
-    fn into_error(self, value: ConcreteValueRef<'_>, members: UnionMembers<'_>) -> TypeError {
+    fn into_error(
+        self,
+        value: ConcreteValueRef<'_>,
+        members: UnionMembers<'_>,
+        ancestry: FieldAncestry,
+    ) -> TypeError {
         let BestUnionMemberFailures {
             failure_rank: _,
             first,
@@ -4603,7 +4896,7 @@ impl BestUnionMemberFailures {
 
         let struct_context = if let ConcreteValueRef::Map(map) = value
             && !tied.is_empty()
-            && let Some(alternatives) = describe_struct_union_members(members)
+            && let Some(alternatives) = describe_struct_union_members(members, ancestry)
             && std::iter::once(&first).chain(&tied).all(|failure| {
                 matches!(
                     &failure.diagnostic_identity,
@@ -4679,7 +4972,10 @@ impl BestUnionMemberFailures {
     }
 }
 
-fn describe_struct_union_members(members: UnionMembers<'_>) -> Option<Vec<UnionStructAlternative>> {
+fn describe_struct_union_members(
+    members: UnionMembers<'_>,
+    ancestry: FieldAncestry,
+) -> Option<Vec<UnionStructAlternative>> {
     members
         .iter()
         .map(|member| {
@@ -4690,15 +4986,15 @@ fn describe_struct_union_members(members: UnionMembers<'_>) -> Option<Vec<UnionS
             let mut accepted_fields = Vec::with_capacity(fields.len() * 2);
             for field in fields {
                 accepted_fields.push(field.name.clone());
-                if let Some(block_name) = &field.block_name
-                    && !accepted_fields.contains(block_name)
+                if let Some(block_name) = ancestry.block_name(field)
+                    && !accepted_fields.iter().any(|name| name == block_name)
                 {
-                    accepted_fields.push(block_name.clone());
+                    accepted_fields.push(block_name.to_string());
                 }
             }
             let required_fields = fields
                 .iter()
-                .filter(|field| field.is_required())
+                .filter(|field| ancestry.effective_input_mode(field).is_required())
                 .map(|field| field.name.clone())
                 .collect();
             Some(UnionStructAlternative {
@@ -4720,6 +5016,7 @@ pub(crate) fn closest_union_member_for_value_on_path<'a>(
     union: &'a AttributeType,
     value: ConcreteValueRef<'_>,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<&'a AttributeType> {
     let AttrTypeKind::Union(members) = &union.kind else {
@@ -4728,7 +5025,8 @@ pub(crate) fn closest_union_member_for_value_on_path<'a>(
 
     let mut best: Option<(UnionFailureRank, &'a AttributeType)> = None;
     for member in members.as_raw_slice() {
-        let rank = union_member_judgement_on_path(member, value, defs, visited_refs).failure_rank;
+        let rank = union_member_judgement_on_path(member, value, defs, ancestry, visited_refs)
+            .failure_rank;
         if rank.is_match() && best.is_none_or(|(current, _)| rank > current) {
             best = Some((rank, member));
         }
@@ -4756,12 +5054,14 @@ pub(crate) fn select_union_member_on_path<'a>(
     value: ConcreteValueRef<'_>,
     expected: String,
     defs: &'a BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<&'a AttributeType, TypeError> {
     if let Some(selected) = fit_union_members_on_path(
         members,
         original,
         defs,
+        ancestry,
         CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
         visited_refs,
     ) {
@@ -4775,14 +5075,15 @@ pub(crate) fn select_union_member_on_path<'a>(
     let mut best_failure: Option<BestUnionMemberFailures> = None;
 
     for member in members {
-        let Err(error) = validate_attr_with_defs_on_path(member, original, defs, visited_refs)
+        let Err(error) =
+            validate_attr_with_defs_on_path(member, original, defs, ancestry, visited_refs)
         else {
             // The authoritative whole-Union fit above proved that no member
             // accepts. Reaching this branch would mean diagnostic validation
             // had drifted from fit acceptance.
             continue;
         };
-        let judgement = union_member_judgement_on_path(member, value, defs, visited_refs);
+        let judgement = union_member_judgement_on_path(member, value, defs, ancestry, visited_refs);
         if !judgement.failure_rank.is_match() {
             continue;
         }
@@ -4808,7 +5109,7 @@ pub(crate) fn select_union_member_on_path<'a>(
     }
 
     Err(best_failure
-        .map(|best| best.into_error(value, resolved_members))
+        .map(|best| best.into_error(value, resolved_members, ancestry))
         .unwrap_or(TypeError::TypeMismatch {
             expected,
             got: value.type_name().to_string(),
@@ -4827,20 +5128,23 @@ pub(crate) fn select_union_member_on_path<'a>(
 pub(crate) fn struct_field_for_key<'a>(
     fields: &'a [StructField],
     key: &str,
+    ancestry: FieldAncestry,
 ) -> Option<&'a StructField> {
     fields
         .iter()
         .rev()
-        .find(|field| field.name == key || field.block_name.as_deref() == Some(key))
+        .find(|field| field.name == key || ancestry.block_name(field) == Some(key))
 }
 
 fn struct_field_is_present(
     fields: &[StructField],
     map: &IndexMap<String, Value>,
     expected: &StructField,
+    ancestry: FieldAncestry,
 ) -> bool {
     map.keys().any(|key| {
-        struct_field_for_key(fields, key).is_some_and(|found| std::ptr::eq(found, expected))
+        struct_field_for_key(fields, key, ancestry)
+            .is_some_and(|found| std::ptr::eq(found, expected))
     })
 }
 
@@ -4849,10 +5153,17 @@ fn struct_field_is_present(
 /// Both the single-error validator and the path-collecting LSP validator call
 /// this gate before type-checking the field value, keeping writability policy
 /// and diagnostic precedence identical across the two walkers.
-fn validate_struct_field_assignment(field: &StructField, input_name: &str) -> Option<TypeError> {
-    field.is_read_only().then(|| TypeError::ReadOnlyAttribute {
-        name: input_name.to_string(),
-    })
+fn validate_struct_field_assignment(
+    field: &StructField,
+    input_name: &str,
+    ancestry: FieldAncestry,
+) -> Option<TypeError> {
+    ancestry
+        .effective_input_mode(field)
+        .is_provider_populated()
+        .then(|| TypeError::ReadOnlyAttribute {
+            name: input_name.to_string(),
+        })
 }
 
 /// Validate the shared structural contract for a struct map, then route each
@@ -4865,6 +5176,7 @@ fn validate_struct_fields<M, V>(
     struct_name: &str,
     fields: &[StructField],
     map: &IndexMap<String, Value>,
+    ancestry: FieldAncestry,
     missing_required: M,
     mut validate_value: V,
 ) -> Result<(), TypeError>
@@ -4873,21 +5185,23 @@ where
     V: FnMut(&str, &StructField, &Value) -> Result<(), TypeError>,
 {
     for field in fields {
-        if field.is_required() && !struct_field_is_present(fields, map, field) {
+        if ancestry.effective_input_mode(field).is_required()
+            && !struct_field_is_present(fields, map, field, ancestry)
+        {
             return Err(missing_required(field));
         }
     }
 
     let canonical_names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
     for (input_name, value) in map {
-        let Some(field) = struct_field_for_key(fields, input_name) else {
+        let Some(field) = struct_field_for_key(fields, input_name, ancestry) else {
             return Err(TypeError::UnknownStructField {
                 struct_name: struct_name.to_string(),
                 field: input_name.clone(),
                 suggestion: suggest_similar_name(input_name, &canonical_names),
             });
         };
-        if let Some(inner) = validate_struct_field_assignment(field, input_name) {
+        if let Some(inner) = validate_struct_field_assignment(field, input_name, ancestry) {
             return Err(TypeError::StructFieldError {
                 field: input_name.clone(),
                 inner: Box::new(inner),
@@ -6109,9 +6423,9 @@ impl TypeError {
     /// attribute context; other variants return `self` unchanged.
     ///
     /// Callers that know which attribute produced the error (e.g. the
-    /// attribute loop in `ResourceSchema::validate`) wrap the primitive
+    /// attribute loop in [`ValidatedResourceSchema::validate`]) wrap the primitive
     /// error before it reaches CLI/LSP diagnostic text. This keeps
-    /// `AttrTypeKind::validate` unaware of attribute names while still
+    /// leaf validator unaware of attribute names while still
     /// letting the final message say `for 'target_id'`.
     ///
     /// See #2098. Adding the same slot to `ValidationFailed` /
@@ -6371,14 +6685,14 @@ impl CompletionValue {
 ///
 /// let _ = AttributeSchema {
 ///     write_only: true,
-///     ..AttributeSchema::new("arn", AttributeType::string())
+///     ..AttributeSchema::optional("arn", AttributeType::string()).build()
 /// };
 /// ```
 ///
 /// ```compile_fail
 /// use carina_core::schema::{AttributeSchema, AttributeType};
 ///
-/// let mut attribute = AttributeSchema::new("arn", AttributeType::string());
+/// let mut attribute = AttributeSchema::optional("arn", AttributeType::string()).build();
 /// attribute.write_only = true;
 /// ```
 ///
@@ -6388,11 +6702,11 @@ impl CompletionValue {
 /// ```
 /// use carina_core::schema::{AttributeSchema, AttributeSchemaParts, AttributeType};
 ///
-/// let attribute = AttributeSchema::new("arn", AttributeType::string());
+/// let attribute = AttributeSchema::optional("arn", AttributeType::string()).build();
 /// let AttributeSchemaParts {
 ///     name,
 ///     attr_type,
-///     input_mode,
+///     declared_input_mode,
 ///     default,
 ///     description,
 ///     completions,
@@ -6407,7 +6721,7 @@ impl CompletionValue {
 /// let _ = (
 ///     name,
 ///     attr_type,
-///     input_mode,
+///     declared_input_mode,
 ///     default,
 ///     description,
 ///     completions,
@@ -6478,7 +6792,9 @@ pub struct AttributeSchema {
 pub struct AttributeSchemaParts<'a> {
     pub name: &'a str,
     pub attr_type: &'a AttributeType,
-    pub input_mode: InputMode,
+    /// The declared top-level mode. Top-level attributes have no schema
+    /// ancestor, so this is also their effective mode.
+    pub declared_input_mode: InputMode,
     pub default: Option<&'a Value>,
     pub description: Option<&'a str>,
     pub completions: Option<&'a [CompletionValue]>,
@@ -6491,12 +6807,31 @@ pub struct AttributeSchemaParts<'a> {
     pub deferred_populate: bool,
 }
 
+/// Builder for an optional user-input attribute.
+pub struct OptionalAttributeSchemaBuilder {
+    attribute: AttributeSchema,
+}
+
+/// Builder for a required user-input attribute.
+pub struct RequiredAttributeSchemaBuilder {
+    attribute: AttributeSchema,
+}
+
+/// Builder for a provider-populated attribute.
+pub struct ProviderPopulatedAttributeSchemaBuilder {
+    attribute: AttributeSchema,
+}
+
 impl AttributeSchema {
-    pub fn new(name: impl Into<String>, attr_type: AttributeType) -> Self {
+    fn with_input_mode(
+        name: impl Into<String>,
+        attr_type: AttributeType,
+        input_mode: InputMode,
+    ) -> Self {
         Self {
             name: name.into(),
             attr_type,
-            input_mode: InputMode::Optional,
+            input_mode,
             default: None,
             description: None,
             completions: None,
@@ -6510,11 +6845,38 @@ impl AttributeSchema {
         }
     }
 
+    pub fn optional(
+        name: impl Into<String>,
+        attr_type: AttributeType,
+    ) -> OptionalAttributeSchemaBuilder {
+        OptionalAttributeSchemaBuilder {
+            attribute: Self::with_input_mode(name, attr_type, InputMode::Optional),
+        }
+    }
+
+    pub fn required(
+        name: impl Into<String>,
+        attr_type: AttributeType,
+    ) -> RequiredAttributeSchemaBuilder {
+        RequiredAttributeSchemaBuilder {
+            attribute: Self::with_input_mode(name, attr_type, InputMode::Required),
+        }
+    }
+
+    pub fn provider_populated(
+        name: impl Into<String>,
+        attr_type: AttributeType,
+    ) -> ProviderPopulatedAttributeSchemaBuilder {
+        ProviderPopulatedAttributeSchemaBuilder {
+            attribute: Self::with_input_mode(name, attr_type, InputMode::ProviderPopulated),
+        }
+    }
+
     pub fn parts(&self) -> AttributeSchemaParts<'_> {
         AttributeSchemaParts {
             name: &self.name,
             attr_type: &self.attr_type,
-            input_mode: self.input_mode,
+            declared_input_mode: self.input_mode,
             default: self.default.as_ref(),
             description: self.description.as_deref(),
             completions: self.completions.as_deref(),
@@ -6580,62 +6942,12 @@ impl AttributeSchema {
         self.deferred_populate
     }
 
-    pub fn required(mut self) -> Self {
-        self.input_mode.transition_to(InputMode::Required);
-        self
-    }
-
     pub fn is_required(&self) -> bool {
         self.input_mode.is_required()
     }
 
-    pub fn create_only(mut self) -> Self {
-        self.create_only = true;
-        self
-    }
-
-    pub fn read_only(mut self) -> Self {
-        assert!(
-            !self.write_only,
-            "attribute cannot be both write-only and provider-populated"
-        );
-        self.input_mode.transition_to(InputMode::ProviderPopulated);
-        self
-    }
-
     pub fn is_read_only(&self) -> bool {
         self.input_mode.is_provider_populated()
-    }
-
-    pub fn write_only(mut self) -> Self {
-        assert!(
-            !self.input_mode.is_provider_populated(),
-            "attribute cannot be both write-only and provider-populated"
-        );
-        self.write_only = true;
-        self
-    }
-
-    pub fn identity(mut self) -> Self {
-        self.identity = true;
-        self
-    }
-
-    /// Mark this attribute as populated asynchronously by the provider
-    /// after Create. See the field doc on `deferred_populate`.
-    pub fn deferred_populate(mut self) -> Self {
-        self.deferred_populate = true;
-        self
-    }
-
-    pub fn removable(mut self) -> Self {
-        self.removable = Some(true);
-        self
-    }
-
-    pub fn non_removable(mut self) -> Self {
-        self.removable = Some(false);
-        self
     }
 
     /// Whether this attribute can be removed from infrastructure.
@@ -6646,30 +6958,91 @@ impl AttributeSchema {
         self.removable
             .unwrap_or(!self.is_required() && !self.create_only && !self.is_read_only())
     }
+}
 
+macro_rules! impl_user_input_attribute_builder {
+    ($builder:ident) => {
+        impl $builder {
+            pub fn write_only(mut self) -> Self {
+                self.attribute.write_only = true;
+                self
+            }
+
+            pub fn create_only(mut self) -> Self {
+                self.attribute.create_only = true;
+                self
+            }
+
+            pub fn identity(mut self) -> Self {
+                self.attribute.identity = true;
+                self
+            }
+
+            pub fn with_description(mut self, description: impl Into<String>) -> Self {
+                self.attribute.description = Some(description.into());
+                self
+            }
+
+            pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+                self.attribute.provider_name = Some(name.into());
+                self
+            }
+
+            pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
+                self.attribute.block_name = Some(name.into());
+                self
+            }
+
+            pub fn with_completions(mut self, completions: Vec<CompletionValue>) -> Self {
+                self.attribute.completions = Some(completions);
+                self
+            }
+
+            pub fn build(self) -> AttributeSchema {
+                self.attribute
+            }
+        }
+    };
+}
+
+impl_user_input_attribute_builder!(OptionalAttributeSchemaBuilder);
+impl_user_input_attribute_builder!(RequiredAttributeSchemaBuilder);
+
+impl OptionalAttributeSchemaBuilder {
     pub fn with_default(mut self, value: Value) -> Self {
-        self.default = Some(value);
+        self.attribute.default = Some(value);
         self
     }
 
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(desc.into());
+    pub fn removable(mut self) -> Self {
+        self.attribute.removable = Some(true);
         self
     }
 
-    pub fn with_completions(mut self, completions: Vec<CompletionValue>) -> Self {
-        self.completions = Some(completions);
+    pub fn non_removable(mut self) -> Self {
+        self.attribute.removable = Some(false);
+        self
+    }
+}
+
+impl ProviderPopulatedAttributeSchemaBuilder {
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.attribute.description = Some(description.into());
         self
     }
 
     pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
-        self.provider_name = Some(name.into());
+        self.attribute.provider_name = Some(name.into());
         self
     }
 
-    pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
-        self.block_name = Some(name.into());
+    pub fn deferred_populate(mut self) -> Self {
+        self.attribute.deferred_populate = true;
         self
+    }
+
+    pub fn build(self) -> AttributeSchema {
+        self.attribute
     }
 }
 
@@ -6806,6 +7179,7 @@ pub enum UniqueNameSpec {
 pub struct ResourceSchema {
     pub(crate) resource_type: String,
     pub(crate) attributes: HashMap<String, AttributeSchema>,
+    duplicate_attributes: Vec<String>,
     pub(crate) description: Option<String>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
@@ -6869,19 +7243,1210 @@ pub enum ResourceValidation {
     None,
     /// Portable declarations received from a WASM provider by the plugin host.
     Declared(Vec<ValidatorType>),
-    /// A native callback; fingerprints use a fixed marker because callback
-    /// identity is not portable across processes.
-    InProcess(ResourceValidator),
 }
 
 impl ResourceValidation {
     /// Return the executable validator represented by this source, if any.
-    pub fn validator(&self) -> Option<ResourceValidator> {
+    fn validator(&self) -> Option<ResourceValidator> {
         match self {
             Self::None => None,
             Self::Declared(types) => build_validator_from_types(types),
-            Self::InProcess(validator) => Some(*validator),
         }
+    }
+}
+
+/// Structured location of one whole-schema validation issue.
+///
+/// Attribute paths are kept distinct from schema-level declarations so wire
+/// decoders and other adapters cannot accidentally present
+/// `exclusive_required[0]` or `defs.Tag.key` as a resource attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SchemaValidationIssueLocation {
+    Attribute(String),
+    Definition(String),
+    ExclusiveRequired(usize),
+    UniqueName,
+}
+
+impl SchemaValidationIssueLocation {
+    fn with_suffix(&self, suffix: impl fmt::Display) -> Self {
+        match self {
+            Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
+            Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
+            Self::ExclusiveRequired(_) | Self::UniqueName => {
+                unreachable!("schema-level issue locations cannot have type-path descendants")
+            }
+        }
+    }
+
+    pub fn attribute_path(&self) -> Option<&str> {
+        match self {
+            Self::Attribute(path) => Some(path),
+            Self::Definition(_) | Self::ExclusiveRequired(_) | Self::UniqueName => None,
+        }
+    }
+}
+
+impl fmt::Display for SchemaValidationIssueLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attribute(path) => f.write_str(path),
+            Self::Definition(path) => write!(f, "defs.{path}"),
+            Self::ExclusiveRequired(index) => write!(f, "exclusive_required[{index}]"),
+            Self::UniqueName => f.write_str("unique_name"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaDefinitionIssue {
+    location: SchemaValidationIssueLocation,
+    path: String,
+    message: String,
+}
+
+impl fmt::Display for SchemaDefinitionIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path, self.message)
+    }
+}
+
+/// Error returned when a resource-schema draft fails whole-schema validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceSchemaValidationError {
+    resource_type: String,
+    issues: Vec<SchemaDefinitionIssue>,
+}
+
+impl ResourceSchemaValidationError {
+    /// Return the stable schema path and message for every rejected rule.
+    pub fn issues(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.issues
+            .iter()
+            .map(|issue| (issue.path.as_str(), issue.message.as_str()))
+    }
+
+    /// Return each issue's typed location and message.
+    pub fn located_issues(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&SchemaValidationIssueLocation, &str)> {
+        self.issues
+            .iter()
+            .map(|issue| (&issue.location, issue.message.as_str()))
+    }
+}
+
+impl fmt::Display for ResourceSchemaValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "resource schema `{}` is invalid: ", self.resource_type)?;
+        for (index, issue) in self.issues.iter().enumerate() {
+            if index != 0 {
+                f.write_str("; ")?;
+            }
+            issue.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ResourceSchemaValidationError {}
+
+/// Error returned when provider-config attribute types fail graph validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSchemaValidationError {
+    issues: Vec<SchemaDefinitionIssue>,
+}
+
+impl ConfigSchemaValidationError {
+    pub fn issues(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.issues
+            .iter()
+            .map(|issue| (issue.path.as_str(), issue.message.as_str()))
+    }
+
+    /// Return each issue's typed location and message.
+    pub fn located_issues(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&SchemaValidationIssueLocation, &str)> {
+        self.issues
+            .iter()
+            .map(|issue| (&issue.location, issue.message.as_str()))
+    }
+}
+
+impl fmt::Display for ConfigSchemaValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("provider config schema is invalid: ")?;
+        for (index, issue) in self.issues.iter().enumerate() {
+            if index != 0 {
+                f.write_str("; ")?;
+            }
+            issue.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConfigSchemaValidationError {}
+
+/// A top-level resource attribute read through a validated schema witness.
+///
+/// Top-level attributes have no schema ancestor, so their declared and
+/// effective modes are identical. Descending through [`Self::value_type`]
+/// carries that effective mode into every nested [`EffectiveField`].
+#[derive(Debug, Clone)]
+pub struct EffectiveAttribute<'a> {
+    attribute: &'a AttributeSchema,
+    defs: &'a BTreeMap<String, AttributeType>,
+    path: Vec<String>,
+}
+
+impl<'a> EffectiveAttribute<'a> {
+    pub fn name(&self) -> &'a str {
+        &self.attribute.name
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub fn field_type(&self) -> &'a AttributeType {
+        &self.attribute.attr_type
+    }
+
+    pub fn description(&self) -> Option<&'a str> {
+        self.attribute.description.as_deref()
+    }
+
+    pub fn provider_name(&self) -> Option<&'a str> {
+        self.attribute.provider_name.as_deref()
+    }
+
+    pub fn block_name(&self) -> Option<&'a str> {
+        self.attribute.block_name.as_deref()
+    }
+
+    pub fn effective_input_mode(&self) -> InputMode {
+        self.attribute.input_mode
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.effective_input_mode().is_required()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.effective_input_mode().is_provider_populated()
+    }
+
+    pub fn is_write_only(&self) -> bool {
+        self.attribute.write_only
+    }
+
+    pub fn is_deferred_populate(&self) -> bool {
+        self.attribute.deferred_populate
+    }
+
+    pub fn is_create_only(&self) -> bool {
+        self.attribute.create_only
+    }
+
+    pub fn value_type(&self) -> EffectiveType<'a> {
+        EffectiveType {
+            attr_type: &self.attribute.attr_type,
+            defs: self.defs,
+            path: self.path.clone(),
+            field_ancestry: FieldAncestry::from_input_mode(self.effective_input_mode()),
+        }
+    }
+
+    /// Validate an authored value with this attribute's effective ancestry.
+    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        self.value_type().validate(value)
+    }
+
+    /// Validate an authored value and retain paths for every diagnostic.
+    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+        self.value_type().validate_collect(value)
+    }
+
+    /// Canonicalize provider or persisted state with this attribute's
+    /// effective ancestry.
+    pub fn canonicalize_state(&self, value: Value) -> Value {
+        self.value_type().canonicalize_state(value)
+    }
+
+    pub fn field_candidates_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates_with_budget(budget)
+    }
+
+    pub fn field_candidates(&self) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates()
+    }
+}
+
+/// A nested struct field whose input mode has been resolved for one concrete
+/// reference path from a validated resource or config root.
+///
+/// This type has no public constructor. Consequently, callers cannot inspect
+/// a nested field mode without first choosing the path that determines it.
+#[derive(Debug, Clone)]
+pub struct EffectiveField<'a> {
+    field: &'a StructField,
+    defs: &'a BTreeMap<String, AttributeType>,
+    path: Vec<String>,
+    ancestry: FieldAncestry,
+}
+
+impl<'a> EffectiveField<'a> {
+    pub fn name(&self) -> &'a str {
+        &self.field.name
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub fn field_type(&self) -> &'a AttributeType {
+        &self.field.field_type
+    }
+
+    pub fn description(&self) -> Option<&'a str> {
+        self.field.description.as_deref()
+    }
+
+    pub fn provider_name(&self) -> Option<&'a str> {
+        self.field.provider_name.as_deref()
+    }
+
+    /// Return the authoring block alias only when it is active on this path.
+    /// A declared alias below provider-populated output is inert.
+    pub fn block_name(&self) -> Option<&'a str> {
+        self.ancestry.block_name(self.field)
+    }
+
+    pub fn effective_input_mode(&self) -> InputMode {
+        self.ancestry.effective_input_mode(self.field)
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.effective_input_mode().is_required()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.effective_input_mode().is_provider_populated()
+    }
+
+    pub fn is_write_only(&self) -> bool {
+        self.field.write_only
+    }
+
+    pub fn is_deferred_populate(&self) -> bool {
+        self.field.deferred_populate
+    }
+
+    pub fn value_type(&self) -> EffectiveType<'a> {
+        EffectiveType {
+            attr_type: &self.field.field_type,
+            defs: self.defs,
+            path: self.path.clone(),
+            field_ancestry: self.ancestry.descend(self.field),
+        }
+    }
+
+    pub fn field_candidates_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates_with_budget(budget)
+    }
+
+    pub fn field_candidates(&self) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates()
+    }
+}
+
+/// A type cursor that retains the effective ancestry of the schema node whose
+/// value it describes. Transparent list/union descent therefore cannot lose
+/// the mode context needed when the cursor next reaches a struct field.
+#[derive(Debug, Clone)]
+pub struct EffectiveType<'a> {
+    attr_type: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+    path: Vec<String>,
+    field_ancestry: FieldAncestry,
+}
+
+impl<'a> EffectiveType<'a> {
+    pub fn as_type(&self) -> &'a AttributeType {
+        self.attr_type
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub(crate) fn defs(&self) -> &'a BTreeMap<String, AttributeType> {
+        self.defs
+    }
+
+    pub(crate) fn ancestry(&self) -> FieldAncestry {
+        self.field_ancestry
+    }
+
+    pub fn shape(&self) -> Shape<'a> {
+        self.attr_type.shape_with_defs(self.defs)
+    }
+
+    /// Validate an authored value without discarding the reference path that
+    /// determines nested field modes.
+    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        validate_attr_with_defs_and_ancestry(self.attr_type, value, self.defs, self.field_ancestry)
+    }
+
+    /// Validate an authored value and retain paths for every diagnostic.
+    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+        let mut out = Vec::new();
+        Schema::collect_attr_into(
+            self.attr_type,
+            self.defs,
+            &FieldPath::new(),
+            value,
+            self.field_ancestry,
+            &mut out,
+        );
+        out
+    }
+
+    /// Canonicalize provider or persisted state without discarding the
+    /// reference path that determines nested field modes.
+    pub fn canonicalize_state(&self, value: Value) -> Value {
+        crate::value::canonicalize_state_with_type_and_ancestry(
+            value,
+            self.attr_type,
+            self.defs,
+            self.field_ancestry,
+        )
+    }
+
+    pub fn list_element(&self) -> Option<Self> {
+        let Shape::List { element_type, .. } = self.shape() else {
+            return None;
+        };
+        Some(Self {
+            attr_type: element_type,
+            defs: self.defs,
+            path: self.path.clone(),
+            field_ancestry: self.field_ancestry,
+        })
+    }
+
+    pub fn map_value(&self) -> Option<Self> {
+        let Shape::Map { value, .. } = self.shape() else {
+            return None;
+        };
+        Some(Self {
+            attr_type: value,
+            defs: self.defs,
+            path: self.path.clone(),
+            field_ancestry: self.field_ancestry,
+        })
+    }
+
+    pub fn field_candidates_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Vec<EffectiveField<'a>> {
+        let mut fields = Vec::new();
+        collect_effective_field_candidates(
+            self.attr_type,
+            self.defs,
+            &self.path,
+            self.field_ancestry,
+            budget,
+            &mut fields,
+        );
+        fields
+    }
+
+    pub fn field_candidates(&self) -> Vec<EffectiveField<'a>> {
+        let mut budget = ShapeWalkBudget::new(64);
+        self.field_candidates_with_budget(&mut budget)
+    }
+
+    pub fn find_field_with_budget(
+        &self,
+        name: &str,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<EffectiveField<'a>> {
+        self.field_candidates_with_budget(budget)
+            .into_iter()
+            .find(|field| field.name() == name || field.block_name() == Some(name))
+    }
+
+    fn find_field_by_canonical_name_with_budget(
+        &self,
+        name: &str,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<EffectiveField<'a>> {
+        self.field_candidates_with_budget(budget)
+            .into_iter()
+            .find(|field| field.name() == name)
+    }
+}
+
+fn collect_effective_field_candidates<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+    parent_path: &[String],
+    ancestry: FieldAncestry,
+    budget: &mut ShapeWalkBudget,
+    out: &mut Vec<EffectiveField<'a>>,
+) {
+    if !budget.take() {
+        return;
+    }
+    match attr_type.shape_with_defs(defs) {
+        Shape::Struct { name: _ } => {
+            let Some(fields) = struct_fields_with_defs(attr_type, defs) else {
+                return;
+            };
+            out.extend(fields.iter().map(|field| {
+                let mut path = parent_path.to_vec();
+                path.push(field.name.clone());
+                EffectiveField {
+                    field,
+                    defs,
+                    path,
+                    ancestry,
+                }
+            }));
+        }
+        Shape::List { element_type, .. } => collect_effective_field_candidates(
+            element_type,
+            defs,
+            parent_path,
+            ancestry,
+            budget,
+            out,
+        ),
+        Shape::Union => {
+            let Some(members) = union_members_with_defs(attr_type, defs) else {
+                return;
+            };
+            for member in members.iter().flatten() {
+                collect_effective_field_candidates(
+                    member.as_attr(),
+                    defs,
+                    parent_path,
+                    ancestry,
+                    budget,
+                    out,
+                );
+            }
+        }
+        Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. }
+        | Shape::Map { .. } => {}
+    }
+}
+
+/// One resolved node on a path that begins at a resource attribute root.
+#[derive(Debug, Clone)]
+pub enum EffectiveSchemaNode<'a> {
+    Attribute(EffectiveAttribute<'a>),
+    Field(EffectiveField<'a>),
+}
+
+impl<'a> EffectiveSchemaNode<'a> {
+    pub fn name(&self) -> &'a str {
+        match self {
+            Self::Attribute(attribute) => attribute.name(),
+            Self::Field(field) => field.name(),
+        }
+    }
+
+    pub fn path(&self) -> &[String] {
+        match self {
+            Self::Attribute(attribute) => attribute.path(),
+            Self::Field(field) => field.path(),
+        }
+    }
+
+    pub fn field_type(&self) -> &'a AttributeType {
+        match self {
+            Self::Attribute(attribute) => attribute.field_type(),
+            Self::Field(field) => field.field_type(),
+        }
+    }
+
+    pub fn description(&self) -> Option<&'a str> {
+        match self {
+            Self::Attribute(attribute) => attribute.description(),
+            Self::Field(field) => field.description(),
+        }
+    }
+
+    pub fn block_name(&self) -> Option<&'a str> {
+        match self {
+            Self::Attribute(attribute) => attribute.block_name(),
+            Self::Field(field) => field.block_name(),
+        }
+    }
+
+    pub fn effective_input_mode(&self) -> InputMode {
+        match self {
+            Self::Attribute(attribute) => attribute.effective_input_mode(),
+            Self::Field(field) => field.effective_input_mode(),
+        }
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.effective_input_mode().is_required()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.effective_input_mode().is_provider_populated()
+    }
+
+    pub fn is_write_only(&self) -> bool {
+        match self {
+            Self::Attribute(attribute) => attribute.is_write_only(),
+            Self::Field(field) => field.is_write_only(),
+        }
+    }
+
+    pub fn is_deferred_populate(&self) -> bool {
+        match self {
+            Self::Attribute(attribute) => attribute.is_deferred_populate(),
+            Self::Field(field) => field.is_deferred_populate(),
+        }
+    }
+
+    pub fn value_type(&self) -> EffectiveType<'a> {
+        match self {
+            Self::Attribute(attribute) => attribute.value_type(),
+            Self::Field(field) => field.value_type(),
+        }
+    }
+
+    pub fn field_candidates_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates_with_budget(budget)
+    }
+
+    pub fn field_candidates(&self) -> Vec<EffectiveField<'a>> {
+        self.value_type().field_candidates()
+    }
+}
+
+/// A resource schema that has passed every whole-schema rule.
+#[derive(Debug, Clone)]
+pub struct ValidatedResourceSchema {
+    schema: ResourceSchema,
+}
+
+impl ValidatedResourceSchema {
+    pub fn as_schema(&self) -> &ResourceSchema {
+        &self.schema
+    }
+
+    pub fn parts(&self) -> ResourceSchemaParts<'_> {
+        self.schema.parts()
+    }
+
+    pub fn effective_attributes(&self) -> impl Iterator<Item = EffectiveAttribute<'_>> {
+        self.schema
+            .attributes
+            .values()
+            .map(|attribute| EffectiveAttribute {
+                attribute,
+                defs: &self.schema.defs,
+                path: vec![attribute.name.clone()],
+            })
+    }
+
+    /// Look up a top-level attribute by its canonical schema name.
+    ///
+    /// Provider/state/differ paths must use this lookup. Block aliases are an
+    /// authored-DSL concern and are accepted only by
+    /// [`Self::effective_attribute_by_authored_name`].
+    pub fn effective_attribute(&self, name: &str) -> Option<EffectiveAttribute<'_>> {
+        let attribute = self.schema.attributes.get(name)?;
+        Some(EffectiveAttribute {
+            attribute,
+            defs: &self.schema.defs,
+            path: vec![attribute.name.clone()],
+        })
+    }
+
+    /// Look up a top-level attribute by either its canonical name or its
+    /// authored block alias.
+    pub fn effective_attribute_by_authored_name(
+        &self,
+        name: &str,
+    ) -> Option<EffectiveAttribute<'_>> {
+        let attribute = self.schema.attributes.get(name).or_else(|| {
+            self.schema
+                .attributes
+                .values()
+                .find(|attribute| attribute.block_name.as_deref() == Some(name))
+        })?;
+        Some(EffectiveAttribute {
+            attribute,
+            defs: &self.schema.defs,
+            path: vec![attribute.name.clone()],
+        })
+    }
+
+    /// Resolve a canonical provider/state path while retaining the
+    /// provider-populated ancestry of the selected reference path.
+    pub fn effective_node_at_path(&self, path: &[String]) -> Option<EffectiveSchemaNode<'_>> {
+        let (root, rest) = path.split_first()?;
+        let mut node = EffectiveSchemaNode::Attribute(self.effective_attribute(root)?);
+        for segment in rest {
+            let mut budget = ShapeWalkBudget::new(64);
+            let field = node
+                .value_type()
+                .find_field_by_canonical_name_with_budget(segment, &mut budget)?;
+            node = EffectiveSchemaNode::Field(field);
+        }
+        Some(node)
+    }
+
+    /// Resolve an authored DSL path, including active block aliases, while
+    /// retaining provider-populated ancestry.
+    pub fn effective_node_at_authored_path(
+        &self,
+        path: &[String],
+    ) -> Option<EffectiveSchemaNode<'_>> {
+        let (root, rest) = path.split_first()?;
+        let mut node =
+            EffectiveSchemaNode::Attribute(self.effective_attribute_by_authored_name(root)?);
+        for segment in rest {
+            // Bound each transparent-shape search independently. A long valid
+            // field path must not turn a later lookup into `None` merely
+            // because earlier segments consumed a shared traversal budget.
+            let mut budget = ShapeWalkBudget::new(64);
+            let field = node
+                .value_type()
+                .find_field_with_budget(segment, &mut budget)?;
+            node = EffectiveSchemaNode::Field(field);
+        }
+        Some(node)
+    }
+
+    /// Resolve the type at a runtime attribute path while retaining the
+    /// provider-populated ancestry of every struct-field descent. Map keys are
+    /// runtime path segments and therefore preserve the current ancestry.
+    pub fn effective_type_at_attribute_path(
+        &self,
+        path: &[String],
+    ) -> Result<EffectiveType<'_>, AttributePathTypeError> {
+        let (first, rest) = path.split_first().ok_or(AttributePathTypeError::Empty)?;
+        let attribute = self.schema.attributes.get(first).ok_or_else(|| {
+            AttributePathTypeError::UnknownAttribute {
+                attribute: first.clone(),
+            }
+        })?;
+        let mut current = EffectiveAttribute {
+            attribute,
+            defs: &self.schema.defs,
+            path: vec![attribute.name.clone()],
+        }
+        .value_type();
+        let mut traversed = first.clone();
+
+        for segment in rest {
+            current = match current.shape() {
+                Shape::Struct { name: struct_name } => {
+                    let fields = struct_fields_with_defs(current.attr_type, current.defs)
+                        .expect("Shape::Struct must expose struct fields internally");
+                    let field = fields
+                        .iter()
+                        .find(|field| field.name == *segment)
+                        .ok_or_else(|| AttributePathTypeError::UnknownStructField {
+                            parent_path: traversed.clone(),
+                            field: segment.clone(),
+                            struct_name: struct_name.to_string(),
+                        })?;
+                    let mut field_path = current.path.clone();
+                    field_path.push(field.name.clone());
+                    EffectiveField {
+                        field,
+                        defs: current.defs,
+                        path: field_path,
+                        ancestry: current.field_ancestry,
+                    }
+                    .value_type()
+                }
+                Shape::Map { .. } => current
+                    .map_value()
+                    .expect("Shape::Map must expose its value type"),
+                _ => {
+                    return Err(AttributePathTypeError::CannotTraverse {
+                        path: traversed,
+                        type_name: current.attr_type.type_name(),
+                    });
+                }
+            };
+            traversed.push('.');
+            traversed.push_str(segment);
+        }
+
+        Ok(current)
+    }
+
+    pub fn validate(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        self.schema.validate_values(attributes)
+    }
+
+    pub fn validate_with_origins(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Vec<TypeError>> {
+        self.schema
+            .validate_values_with_origins(attributes, is_string_literal)
+    }
+
+    pub fn validate_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        self.schema
+            .validate_values_with_origins_and_lookup(attributes, is_string_literal, lookup)
+    }
+
+    pub fn validate_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        self.schema.validate_known_values_with_origins_and_lookup(
+            attributes,
+            is_string_literal,
+            lookup,
+        )
+    }
+
+    pub(crate) fn validate_selected_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        selected: &HashSet<String>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        self.schema
+            .validate_selected_known_values_with_origins_and_lookup(
+                attributes,
+                selected,
+                is_string_literal,
+                lookup,
+            )
+    }
+}
+
+/// Provider-config attribute types that have passed the shared graph validator.
+#[derive(Debug, Clone, Default)]
+pub struct ValidatedConfigSchema {
+    attribute_types: HashMap<String, AttributeType>,
+}
+
+impl ValidatedConfigSchema {
+    pub fn validate(
+        attribute_types: HashMap<String, AttributeType>,
+    ) -> Result<Self, ConfigSchemaValidationError> {
+        let defs = BTreeMap::new();
+        let mut issues = Vec::new();
+        let mut visited_definitions = HashSet::new();
+        for (name, attr_type) in &attribute_types {
+            validate_type_definition(
+                attr_type,
+                &defs,
+                SchemaValidationIssueLocation::Attribute(name.clone()),
+                Some(false),
+                &mut visited_definitions,
+                &mut issues,
+            );
+        }
+        normalize_issues(&mut issues);
+        if issues.is_empty() {
+            Ok(Self { attribute_types })
+        } else {
+            Err(ConfigSchemaValidationError { issues })
+        }
+    }
+
+    pub fn parts(&self) -> &HashMap<String, AttributeType> {
+        &self.attribute_types
+    }
+
+    /// Start an ancestry-carrying traversal at one provider-config type.
+    /// Config roots have no input mode, so their first fields have no
+    /// provider-populated ancestor.
+    pub fn effective_type(&self, name: &str) -> Option<EffectiveType<'_>> {
+        self.attribute_types
+            .get(name)
+            .map(|attr_type| EffectiveType {
+                attr_type,
+                defs: empty_defs_for_schema_walks(),
+                path: vec![name.to_string()],
+                field_ancestry: FieldAncestry::WRITABLE,
+            })
+    }
+
+    /// Own one validated, genuinely pathless config type for APIs that need a
+    /// standalone value validator/canonicalizer.
+    ///
+    /// There is deliberately no constructor that accepts an arbitrary
+    /// [`AttributeType`]: a type cloned from an [`EffectiveType`] must not be
+    /// re-rooted and lose its resource-path ancestry.
+    pub fn rootless_type(&self, name: &str) -> Option<RootlessType> {
+        self.attribute_types
+            .get(name)
+            .cloned()
+            .map(RootlessType::from_validated_config_type)
+    }
+
+    pub fn effective_field_at_path(&self, path: &[String]) -> Option<EffectiveField<'_>> {
+        let (root, rest) = path.split_first()?;
+        let mut current = self.effective_type(root)?;
+        let mut resolved = None;
+        for segment in rest {
+            let mut budget = ShapeWalkBudget::new(64);
+            let field = current.find_field_with_budget(segment, &mut budget)?;
+            current = field.value_type();
+            resolved = Some(field);
+        }
+        resolved
+    }
+}
+
+fn normalize_issues(issues: &mut Vec<SchemaDefinitionIssue>) {
+    issues.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    issues.dedup();
+}
+
+fn push_schema_issue(
+    issues: &mut Vec<SchemaDefinitionIssue>,
+    location: &SchemaValidationIssueLocation,
+    message: impl Into<String>,
+) {
+    issues.push(SchemaDefinitionIssue {
+        path: location.to_string(),
+        location: location.clone(),
+        message: message.into(),
+    });
+}
+
+fn validate_attribute_mode(
+    attribute: &AttributeSchema,
+    location: &SchemaValidationIssueLocation,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    match attribute.input_mode {
+        InputMode::Optional => {
+            if attribute.deferred_populate {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "optional user input cannot be deferred-populate",
+                );
+            }
+        }
+        InputMode::Required => {
+            if attribute.default.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "required user input cannot have a default",
+                );
+            }
+            if attribute.removable.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "required user input cannot override removability",
+                );
+            }
+            if attribute.deferred_populate {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "required user input cannot be deferred-populate",
+                );
+            }
+        }
+        InputMode::ProviderPopulated => {
+            if attribute.default.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot have a default",
+                );
+            }
+            if attribute.write_only {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot be write-only",
+                );
+            }
+            if attribute.create_only {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot be create-only",
+                );
+            }
+            if attribute.identity {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot be an identity attribute",
+                );
+            }
+            if attribute.removable.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot override removability",
+                );
+            }
+            if attribute.block_name.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot have a block name",
+                );
+            }
+            if attribute.completions.is_some() {
+                push_schema_issue(
+                    issues,
+                    location,
+                    "provider-populated output cannot have completions",
+                );
+            }
+        }
+    }
+}
+
+fn validate_struct_field_mode(
+    field: &StructField,
+    location: &SchemaValidationIssueLocation,
+    provider_populated_ancestor: Option<bool>,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    if provider_populated_ancestor == Some(true) && field.write_only {
+        push_schema_issue(
+            issues,
+            location,
+            "write-only field appears below a provider-populated ancestor",
+        );
+    }
+    if field.declared_input_mode.is_provider_populated() {
+        if field.write_only {
+            push_schema_issue(
+                issues,
+                location,
+                "provider-populated field cannot be write-only",
+            );
+        }
+        if provider_populated_ancestor == Some(false) && field.block_name.is_some() {
+            push_schema_issue(
+                issues,
+                location,
+                "provider-populated field cannot have a block name",
+            );
+        }
+    }
+
+    if let Some(provider_populated_ancestor) = provider_populated_ancestor {
+        let effectively_provider_populated =
+            provider_populated_ancestor || field.declared_input_mode.is_provider_populated();
+        if field.deferred_populate && !effectively_provider_populated {
+            push_schema_issue(
+                issues,
+                location,
+                "user-input field cannot be deferred-populate",
+            );
+        }
+    }
+}
+
+fn validate_type_definition(
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    location: SchemaValidationIssueLocation,
+    provider_populated_ancestor: Option<bool>,
+    visited_definitions: &mut HashSet<(String, Option<bool>)>,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            let Some(definition) = defs.get(name) else {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    format!("schema reference `{name}` is not defined in the enclosing schema"),
+                );
+                return;
+            };
+            let path_entry = (name.clone(), provider_populated_ancestor);
+            if !visited_definitions.insert(path_entry) {
+                return;
+            }
+            validate_type_definition(
+                definition,
+                defs,
+                location,
+                provider_populated_ancestor,
+                visited_definitions,
+                issues,
+            );
+        }
+        AttrTypeKind::List { element_type, .. } => validate_type_definition(
+            element_type,
+            defs,
+            location.with_suffix("[]"),
+            provider_populated_ancestor,
+            visited_definitions,
+            issues,
+        ),
+        AttrTypeKind::Map { key, value } => {
+            validate_type_definition(
+                key,
+                defs,
+                location.with_suffix(".<key>"),
+                provider_populated_ancestor,
+                visited_definitions,
+                issues,
+            );
+            validate_type_definition(
+                value,
+                defs,
+                location.with_suffix(".<value>"),
+                provider_populated_ancestor,
+                visited_definitions,
+                issues,
+            );
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let mut names = HashSet::new();
+            for field in fields {
+                let field_location = location.with_suffix(format_args!(".{}", field.name));
+                if !names.insert(field.name.as_str()) {
+                    push_schema_issue(
+                        issues,
+                        &field_location,
+                        format!("duplicate struct-field name `{}`", field.name),
+                    );
+                }
+                validate_struct_field_mode(
+                    field,
+                    &field_location,
+                    provider_populated_ancestor,
+                    issues,
+                );
+                validate_type_definition(
+                    &field.field_type,
+                    defs,
+                    field_location,
+                    provider_populated_ancestor.map(|ancestor| {
+                        ancestor || field.declared_input_mode.is_provider_populated()
+                    }),
+                    visited_definitions,
+                    issues,
+                );
+            }
+        }
+        AttrTypeKind::Union(members) => {
+            for (index, member) in members.as_raw_slice().iter().enumerate() {
+                validate_type_definition(
+                    member,
+                    defs,
+                    location.with_suffix(format_args!(".<union:{index}>")),
+                    provider_populated_ancestor,
+                    visited_definitions,
+                    issues,
+                );
+            }
+        }
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
+fn validate_portable_default(
+    value: &Value,
+    location: SchemaValidationIssueLocation,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    match value {
+        Value::Deferred(_) => push_schema_issue(
+            issues,
+            &location,
+            "schema default is not a portable wire value",
+        ),
+        Value::Concrete(ConcreteValue::Float(value)) if !value.is_finite() => {
+            push_schema_issue(issues, &location, "schema default float must be finite");
+        }
+        Value::Concrete(ConcreteValue::List(values)) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_portable_default(
+                    value,
+                    location.with_suffix(format_args!("[{index}]")),
+                    issues,
+                );
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            for (name, value) in values {
+                validate_portable_default(
+                    value,
+                    location.with_suffix(format_args!(".{name}")),
+                    issues,
+                );
+            }
+        }
+        Value::Concrete(
+            ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Duration(_),
+        ) => push_schema_issue(
+            issues,
+            &location,
+            "schema default is not a portable wire value",
+        ),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::StringList(_),
+        ) => {}
     }
 }
 
@@ -6969,7 +8534,8 @@ fn type_write_only_analysis<'schema>(
                         union_conflict: analysis.union_conflict || nested.union_conflict,
                         field_mode_conflict: analysis.field_mode_conflict
                             || nested.field_mode_conflict
-                            || (field.write_only && field.input_mode.is_provider_populated()),
+                            || (field.write_only
+                                && field.declared_input_mode.is_provider_populated()),
                     }
                 })
         }
@@ -7347,6 +8913,7 @@ impl ResourceSchema {
         Self {
             resource_type: resource_type.into(),
             attributes: HashMap::new(),
+            duplicate_attributes: Vec::new(),
             description: None,
             validation: ResourceValidation::None,
             kind: SchemaKind::Resource,
@@ -7356,6 +8923,108 @@ impl ResourceSchema {
             default_wait_timeout: None,
             default_wait_interval: None,
             defs: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Validate the complete schema graph and produce the only resource
+    /// schema type accepted at admission boundaries.
+    pub fn validate(mut self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+        let mut issues = Vec::new();
+        let mut visited_definitions = HashSet::new();
+
+        for name in &self.duplicate_attributes {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            push_schema_issue(
+                &mut issues,
+                &location,
+                format!("duplicate top-level attribute name `{name}`"),
+            );
+        }
+
+        for (name, attribute) in &self.attributes {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            validate_attribute_mode(attribute, &location, &mut issues);
+            if let Some(default) = &attribute.default {
+                validate_portable_default(default, location.clone(), &mut issues);
+            }
+            validate_type_definition(
+                &attribute.attr_type,
+                &self.defs,
+                location,
+                Some(attribute.input_mode.is_provider_populated()),
+                &mut visited_definitions,
+                &mut issues,
+            );
+        }
+
+        for (name, definition) in &self.defs {
+            if !visited_definitions.insert((name.clone(), None)) {
+                continue;
+            }
+            validate_type_definition(
+                definition,
+                &self.defs,
+                SchemaValidationIssueLocation::Definition(name.clone()),
+                None,
+                &mut visited_definitions,
+                &mut issues,
+            );
+        }
+
+        for (group_index, group) in self.exclusive_required.iter().enumerate() {
+            for name in group {
+                match self.attributes.get(name) {
+                    None => {
+                        let location =
+                            SchemaValidationIssueLocation::ExclusiveRequired(group_index);
+                        push_schema_issue(
+                            &mut issues,
+                            &location,
+                            format!("exclusive_required names unknown attribute `{name}`"),
+                        );
+                    }
+                    Some(attribute) if attribute.input_mode.is_provider_populated() => {
+                        let location =
+                            SchemaValidationIssueLocation::ExclusiveRequired(group_index);
+                        push_schema_issue(
+                            &mut issues,
+                            &location,
+                            format!(
+                                "exclusive_required names provider-populated attribute `{name}`"
+                            ),
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        if let UniqueNameSpec::Attribute(name) = &self.unique_name
+            && !self.attributes.contains_key(name)
+        {
+            let location = SchemaValidationIssueLocation::UniqueName;
+            push_schema_issue(
+                &mut issues,
+                &location,
+                format!("unique name names unknown attribute `{name}`"),
+            );
+        }
+
+        if let Some(conflict) = self.first_write_only_conflict() {
+            let location =
+                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
+            push_schema_issue(&mut issues, &location, conflict.message());
+        }
+
+        normalize_issues(&mut issues);
+        if issues.is_empty() {
+            self.duplicate_attributes.clear();
+            Ok(ValidatedResourceSchema { schema: self })
+        } else {
+            Err(ResourceSchemaValidationError {
+                resource_type: self.resource_type.clone(),
+                issues,
+            })
         }
     }
 
@@ -7427,7 +9096,6 @@ impl ResourceSchema {
     /// against this map.
     pub fn with_def(mut self, name: impl Into<String>, ty: AttributeType) -> Self {
         self.defs.insert(name.into(), ty);
-        self.assert_write_only_invariants();
         self
     }
 
@@ -7443,30 +9111,13 @@ impl ResourceSchema {
         self
     }
 
-    pub fn attribute(self, schema: AttributeSchema) -> Self {
-        self.try_attribute(schema)
-            .unwrap_or_else(|conflict| panic!("{}", conflict.message()))
-    }
-
-    /// Add an attribute while preserving schema invariants without panicking.
-    ///
-    /// Provider wire decoders use this form to turn an invalid schema into a
-    /// typed decode error. Ordinary schema declarations use [`Self::attribute`].
-    pub fn try_attribute(
-        mut self,
-        schema: AttributeSchema,
-    ) -> Result<Self, WriteOnlySchemaConflict> {
-        self.attributes.insert(schema.name.clone(), schema);
-        match self.first_write_only_conflict() {
-            Some(conflict) => Err(conflict),
-            None => Ok(self),
+    pub fn attribute(mut self, schema: AttributeSchema) -> Self {
+        if self.attributes.contains_key(&schema.name) {
+            self.duplicate_attributes.push(schema.name.clone());
+        } else {
+            self.attributes.insert(schema.name.clone(), schema);
         }
-    }
-
-    fn assert_write_only_invariants(&self) {
-        if let Some(conflict) = self.first_write_only_conflict() {
-            panic!("{}", conflict.message());
-        }
+        self
     }
 
     /// Return the first schema shape that cannot safely represent nested
@@ -7553,57 +9204,6 @@ impl ResourceSchema {
             return None;
         }
         struct_fields_with_defs(ty, &self.defs)
-    }
-
-    /// Resolve the type at a full dotted attribute path.
-    ///
-    /// The path excludes a resource binding root, so
-    /// `cert.renewal_summary.renewal_status` is supplied as
-    /// `["renewal_summary", "renewal_status"]`. Nested descent follows
-    /// named `Struct` fields and arbitrary `Map` keys, matching the runtime
-    /// [`crate::wait::predicate::AttrPath`] evaluator.
-    pub fn type_at_attribute_path<'a>(
-        &'a self,
-        path: &[String],
-    ) -> Result<&'a AttributeType, AttributePathTypeError> {
-        let (first, rest) = path.split_first().ok_or(AttributePathTypeError::Empty)?;
-        let attribute =
-            self.attributes
-                .get(first)
-                .ok_or_else(|| AttributePathTypeError::UnknownAttribute {
-                    attribute: first.clone(),
-                })?;
-        let mut current = &attribute.attr_type;
-        let mut traversed = first.clone();
-
-        for segment in rest {
-            current = match self.shape_of(current) {
-                Shape::Struct { name: struct_name } => {
-                    let fields = struct_fields_with_defs(current, &self.defs)
-                        .expect("Shape::Struct must expose struct fields internally");
-                    &fields
-                        .iter()
-                        .find(|field| field.name == *segment)
-                        .ok_or_else(|| AttributePathTypeError::UnknownStructField {
-                            parent_path: traversed.clone(),
-                            field: segment.clone(),
-                            struct_name: struct_name.to_string(),
-                        })?
-                        .field_type
-                }
-                Shape::Map { value, .. } => value,
-                _ => {
-                    return Err(AttributePathTypeError::CannotTraverse {
-                        path: traversed,
-                        type_name: current.type_name(),
-                    });
-                }
-            };
-            traversed.push('.');
-            traversed.push_str(segment);
-        }
-
-        Ok(current)
     }
 
     pub fn union_members_with_budget<'a>(
@@ -7695,11 +9295,6 @@ impl ResourceSchema {
         self
     }
 
-    pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
-        self.validation = ResourceValidation::InProcess(validator);
-        self
-    }
-
     /// Attach portable validator declarations received from a provider.
     pub fn with_declared_validators(mut self, validators: Vec<ValidatorType>) -> Self {
         self.validation = ResourceValidation::Declared(validators);
@@ -7707,7 +9302,7 @@ impl ResourceSchema {
     }
 
     /// Return this schema's executable cross-attribute validator, if any.
-    pub fn validator(&self) -> Option<ResourceValidator> {
+    fn validator(&self) -> Option<ResourceValidator> {
         self.validation.validator()
     }
 
@@ -7841,23 +9436,6 @@ impl ResourceSchema {
             .collect()
     }
 
-    /// Construct a [`Schema`] view rooted at `root` and carrying this
-    /// resource's `defs` map.
-    ///
-    /// Use this in every place that needs to validate or canonicalize
-    /// against a single attribute of the resource: the resulting
-    /// `Schema` is the only API that resolves `AttrTypeKind::Ref`
-    /// against this resource's def map, so a future caller that needs
-    /// per-attribute validation cannot accidentally drop `defs`
-    /// (carina#3345). The `root` argument is typically
-    /// `attr_schema.attr_type.clone()`.
-    pub fn schema_view_for(&self, root: AttributeType) -> Schema {
-        Schema {
-            root,
-            defs: self.defs.clone(),
-        }
-    }
-
     /// Validate resource attributes.
     ///
     /// This variant does not have origin information for string values, so
@@ -7866,7 +9444,7 @@ impl ResourceSchema {
     /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
     /// knows which attributes were written as quoted string literals
     /// (see #2094).
-    pub fn validate(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
         self.validate_inner(attributes, &|_attr_name| false, no_lookup())
     }
 
@@ -7880,7 +9458,7 @@ impl ResourceSchema {
     /// `StringLiteralExpectedEnum` so the error message describes the
     /// form mismatch instead of asking the user to match a list of
     /// variants. Non-enum errors are passed through unchanged.
-    pub fn validate_with_origins(
+    fn validate_values_with_origins(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -7892,7 +9470,7 @@ impl ResourceSchema {
     /// refined primitive identity reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
-    pub fn validate_with_origins_and_lookup(
+    fn validate_values_with_origins_and_lookup(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -7903,7 +9481,7 @@ impl ResourceSchema {
 
     /// Validate constraints on values that are currently known.
     ///
-    /// Unlike [`Self::validate_with_origins_and_lookup`], this entry point
+    /// Unlike the full validation entry point, this method
     /// deliberately omits shape-of-resource checks that were already made
     /// when the source was expanded: required attributes, unknown
     /// attributes, provider-populated attributes, and exclusive-required
@@ -7913,7 +9491,7 @@ impl ResourceSchema {
     /// Deferred leaves are ignored while concrete siblings in the same
     /// collection are still checked. The resource validator is re-run because
     /// it may express cross-attribute value constraints.
-    pub fn validate_known_values_with_origins_and_lookup(
+    fn validate_known_values_with_origins_and_lookup(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -7948,7 +9526,7 @@ impl ResourceSchema {
     /// provider custom-type checks are restricted to `selected`; every other
     /// value was checked at an earlier boundary and may now be in a normalized
     /// representation that intentionally differs from the authored form.
-    pub(crate) fn validate_selected_known_values_with_origins_and_lookup(
+    fn validate_selected_known_values_with_origins_and_lookup(
         &self,
         attributes: &HashMap<String, Value>,
         selected: &HashSet<String>,
@@ -8041,16 +9619,6 @@ impl ResourceSchema {
             known.push(bn.as_str());
         }
 
-        // Build a `Schema` view over this resource's `defs` once so
-        // every attribute validation walks the same def map. Routing
-        // through `Schema::validate_attr` is what makes cyclic CFN
-        // attributes (`AttrTypeKind::Ref`) resolve correctly; the
-        // `defs`-less `AttrTypeKind::validate(value)` call this
-        // replaced trips the "reached the standalone validator"
-        // sentinel for every Ref-containing attribute (carina#3345,
-        // post-#3340 awscc `s3.Bucket/*` failures).
-        let schema_view = Schema::with_defs(self.defs.clone());
-
         // Type check each attribute and reject unknown ones
         for (name, value) in attributes {
             if selected.is_some_and(|selected| !selected.contains(name)) {
@@ -8061,6 +9629,11 @@ impl ResourceSchema {
             let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
 
             if let Some(schema) = self.attributes.get(canonical) {
+                let effective_attribute = EffectiveAttribute {
+                    attribute: schema,
+                    defs: &self.defs,
+                    path: vec![schema.name.clone()],
+                };
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
@@ -8069,7 +9642,7 @@ impl ResourceSchema {
                     continue;
                 }
 
-                if let Err(e) = schema_view.validate_attr(&schema.attr_type, value) {
+                if let Err(e) = effective_attribute.validate(value) {
                     // Tag the error with the attribute name the user actually
                     // wrote (which may be a block-name alias), so diagnostics
                     // point back at a token that appears in their source.
@@ -8078,7 +9651,7 @@ impl ResourceSchema {
                     // `InvalidEnumVariant`; quoted-form reshaping belongs only
                     // to an Enum attribute.
                     let reshaped = if is_string_literal(name.as_str())
-                        && matches!(self.shape_of(&schema.attr_type), Shape::Enum { .. })
+                        && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
                     {
                         tagged.into_string_literal_diagnostic()
                     } else {
@@ -8119,53 +9692,72 @@ enum ValueEntryValidation {
 pub fn collect_all_block_names(registry: &SchemaRegistry) -> HashMap<String, String> {
     let mut result = HashMap::new();
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
+        let schema = schema.as_schema();
         for (attr_name, attr_schema) in &schema.attributes {
             if let Some(bn) = &attr_schema.block_name {
                 result.insert(attr_name.clone(), bn.clone());
             }
-            // Also collect from nested struct fields
-            collect_block_names_from_type(&attr_schema.attr_type, &mut result);
-        }
-        // Walk cyclic-struct definitions separately so block names on
-        // fields inside a `Ref` target (e.g. `Statement.AndStatement`)
-        // are picked up. The `Ref` arm in `collect_block_names_from_type`
-        // stops recursion to avoid loops; the visit-defs pass closes
-        // the gap (carina#3340).
-        for def in schema.defs.values() {
-            collect_block_names_from_type(def, &mut result);
+            collect_block_names_from_type(
+                &attr_schema.attr_type,
+                &schema.defs,
+                FieldAncestry::from_input_mode(attr_schema.input_mode),
+                &mut HashSet::new(),
+                &mut result,
+            );
         }
     }
     result
 }
 
-fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap<String, String>) {
+fn collect_block_names_from_type(
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
+    visited_definitions: &mut HashSet<(String, FieldAncestry)>,
+    result: &mut HashMap<String, String>,
+) {
     match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if visited_definitions.insert((name.clone(), ancestry))
+                && let Some(definition) = defs.get(name)
+            {
+                collect_block_names_from_type(
+                    definition,
+                    defs,
+                    ancestry,
+                    visited_definitions,
+                    result,
+                );
+            }
+        }
         AttrTypeKind::Struct { fields, .. } => {
             for field in fields {
-                if let Some(bn) = &field.block_name {
-                    result.insert(field.name.clone(), bn.clone());
+                if let Some(block_name) = ancestry.block_name(field) {
+                    result.insert(field.name.clone(), block_name.to_string());
                 }
-                collect_block_names_from_type(&field.field_type, result);
+                collect_block_names_from_type(
+                    &field.field_type,
+                    defs,
+                    ancestry.descend(field),
+                    visited_definitions,
+                    result,
+                );
             }
         }
         AttrTypeKind::List {
             element_type: inner,
             ..
         } => {
-            collect_block_names_from_type(inner, result);
+            collect_block_names_from_type(inner, defs, ancestry, visited_definitions, result);
         }
         AttrTypeKind::Map { value: inner, .. } => {
-            collect_block_names_from_type(inner, result);
+            collect_block_names_from_type(inner, defs, ancestry, visited_definitions, result);
         }
         AttrTypeKind::Union(types) => {
             for t in types.as_raw_slice() {
-                collect_block_names_from_type(t, result);
+                collect_block_names_from_type(t, defs, ancestry, visited_definitions, result);
             }
         }
-        // `Ref`: do not follow — the caller visits `schema.defs`
-        // entries directly to avoid infinite recursion on cyclic
-        // schemas (carina#3340).
-        AttrTypeKind::Ref(_) => {}
         AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -8218,6 +9810,7 @@ struct BlockFieldRef<'a> {
     name: &'a str,
     block_name: Option<&'a str>,
     field_type: &'a AttributeType,
+    child_ancestry: FieldAncestry,
 }
 
 #[derive(Clone, Copy)]
@@ -8303,8 +9896,7 @@ fn resolve_block_names_in_map(
     map: &mut IndexMap<String, Value>,
     authored_map: Option<&IndexMap<String, Value>>,
     fields: &[BlockFieldRef<'_>],
-    defs: &BTreeMap<String, AttributeType>,
-    resource_id: &str,
+    context: BlockNameResolutionContext<'_>,
     parent_path: &str,
     conflicts: &mut Vec<BlockNameConflict>,
 ) {
@@ -8320,14 +9912,14 @@ fn resolve_block_names_in_map(
             .and_then(|authored| authored.get(&key))
             .unwrap_or(value);
         let Some(BlockFieldMatch::Alias(field)) =
-            match_block_field(&key, decision_value, fields, defs)
+            match_block_field(&key, decision_value, fields, context.defs)
         else {
             continue;
         };
 
         if map.contains_key(field.name) {
             conflicts.push(block_name_conflict(
-                resource_id,
+                context.resource_id,
                 parent_path,
                 &key,
                 field.name,
@@ -8340,8 +9932,8 @@ fn resolve_block_names_in_map(
     }
 
     for field in fields {
-        let authored_value =
-            authored_map.and_then(|authored| value_for_field(authored, *field, fields, defs));
+        let authored_value = authored_map
+            .and_then(|authored| value_for_field(authored, *field, fields, context.defs));
         let Some(value) = map.get_mut(field.name) else {
             continue;
         };
@@ -8349,8 +9941,8 @@ fn resolve_block_names_in_map(
             value,
             authored_value,
             field.field_type,
-            defs,
-            resource_id,
+            field.child_ancestry,
+            context,
             &nested_path(parent_path, field.name),
             conflicts,
         );
@@ -8361,57 +9953,54 @@ fn resolve_block_names_in_value(
     value: &mut Value,
     authored_value: Option<&Value>,
     attr_type: &AttributeType,
-    defs: &BTreeMap<String, AttributeType>,
-    resource_id: &str,
+    ancestry: FieldAncestry,
+    context: BlockNameResolutionContext<'_>,
     path: &str,
     conflicts: &mut Vec<BlockNameConflict>,
 ) {
-    match attr_type.shape_with_defs(defs) {
+    match attr_type.shape_with_defs(context.defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(attr_type, defs) else {
+            let Some(struct_fields) = struct_fields_with_defs(attr_type, context.defs) else {
                 return;
             };
             let fields = struct_fields
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
-                    block_name: field.block_name.as_deref(),
+                    block_name: ancestry.block_name(field),
                     field_type: &field.field_type,
+                    child_ancestry: ancestry.descend(field),
                 })
                 .collect::<Vec<_>>();
             let authored_map = match authored_value {
                 Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
                 _ => None,
             };
-            resolve_block_names_in_map(
-                map,
-                authored_map,
-                &fields,
-                defs,
-                resource_id,
-                path,
-                conflicts,
-            );
+            resolve_block_names_in_map(map, authored_map, &fields, context, path, conflicts);
         }
         Shape::List { element_type, .. } => {
-            if !matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) {
+            if !matches!(
+                element_type.shape_with_defs(context.defs),
+                Shape::Struct { .. }
+            ) {
                 return;
             }
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(element_type, defs) else {
+            let Some(struct_fields) = struct_fields_with_defs(element_type, context.defs) else {
                 return;
             };
             let fields = struct_fields
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
-                    block_name: field.block_name.as_deref(),
+                    block_name: ancestry.block_name(field),
                     field_type: &field.field_type,
+                    child_ancestry: ancestry.descend(field),
                 })
                 .collect::<Vec<_>>();
             let authored_items = match authored_value {
@@ -8432,8 +10021,7 @@ fn resolve_block_names_in_value(
                     map,
                     authored_map,
                     &fields,
-                    defs,
-                    resource_id,
+                    context,
                     &format!("{path}[{index}]"),
                     conflicts,
                 );
@@ -8441,6 +10029,12 @@ fn resolve_block_names_in_value(
         }
         _ => {}
     }
+}
+
+#[derive(Clone, Copy)]
+struct BlockNameResolutionContext<'a> {
+    defs: &'a BTreeMap<String, AttributeType>,
+    resource_id: &'a str,
 }
 
 fn block_fields(schema: &ResourceSchema) -> Vec<BlockFieldRef<'_>> {
@@ -8451,6 +10045,7 @@ fn block_fields(schema: &ResourceSchema) -> Vec<BlockFieldRef<'_>> {
             name: &attribute.name,
             block_name: attribute.block_name.as_deref(),
             field_type: &attribute.attr_type,
+            child_ancestry: FieldAncestry::from_input_mode(attribute.input_mode),
         })
         .collect()
 }
@@ -8463,12 +10058,15 @@ fn resolve_attribute_block_names(
 ) -> Vec<BlockNameConflict> {
     let fields = block_fields(schema);
     let mut conflicts = Vec::new();
+    let resource_id = resource_id.to_string();
     resolve_block_names_in_map(
         attributes,
         authored_attributes,
         &fields,
-        &schema.defs,
-        &resource_id.to_string(),
+        BlockNameResolutionContext {
+            defs: &schema.defs,
+            resource_id: &resource_id,
+        },
         "",
         &mut conflicts,
     );
@@ -8501,6 +10099,7 @@ fn find_block_name_alias_in_map(
             value,
             field.field_type,
             defs,
+            field.child_ancestry,
             resource_id,
             &nested_path(parent_path, field.name),
         ) {
@@ -8514,6 +10113,7 @@ fn find_block_name_alias_in_value(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
     resource_id: &str,
     path: &str,
 ) -> Option<BlockNameConflict> {
@@ -8526,8 +10126,9 @@ fn find_block_name_alias_in_value(
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
-                    block_name: field.block_name.as_deref(),
+                    block_name: ancestry.block_name(field),
                     field_type: &field.field_type,
+                    child_ancestry: ancestry.descend(field),
                 })
                 .collect::<Vec<_>>();
             find_block_name_alias_in_map(map, &fields, defs, resource_id, path)
@@ -8542,8 +10143,9 @@ fn find_block_name_alias_in_value(
                 .iter()
                 .map(|field| BlockFieldRef {
                     name: &field.name,
-                    block_name: field.block_name.as_deref(),
+                    block_name: ancestry.block_name(field),
                     field_type: &field.field_type,
+                    child_ancestry: ancestry.descend(field),
                 })
                 .collect::<Vec<_>>();
             items.iter().enumerate().find_map(|(index, item)| {
@@ -8593,7 +10195,7 @@ fn resolve_block_names_detailed(
                 &resource.id,
                 &mut resource.attributes,
                 None,
-                schema,
+                schema.as_schema(),
             ))
         })
         .flatten()
@@ -8617,7 +10219,7 @@ fn resolve_block_names_detailed_with_authored(
                 &resource.id,
                 &mut resource.attributes,
                 authored_attributes,
-                schema,
+                schema.as_schema(),
             ))
         })
         .flatten()
@@ -8652,7 +10254,7 @@ fn resolve_file_block_names<E>(
                 &data_source.id,
                 &mut data_source.attributes,
                 None,
-                schema,
+                schema.as_schema(),
             ));
         }
     }
@@ -8692,7 +10294,7 @@ fn resolve_file_block_names_with_authored<E, A>(
                 &data_source.id,
                 &mut data_source.attributes,
                 authored_attributes,
-                schema,
+                schema.as_schema(),
             ));
         }
     }
@@ -8764,7 +10366,7 @@ pub mod types {
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
         AttributeType::refined_int_with_validator(
-            Some(TypeIdentity::bare("PositiveInt")),
+            TypeIdentity::bare("PositiveInt"),
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::Int(n)) = value {
@@ -8783,7 +10385,7 @@ pub mod types {
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Ipv4Cidr")),
+            TypeIdentity::bare("Ipv4Cidr"),
             None,
             None,
             legacy_validator(|value| {
@@ -8800,7 +10402,7 @@ pub mod types {
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Ipv4Address")),
+            TypeIdentity::bare("Ipv4Address"),
             None,
             None,
             legacy_validator(|value| {
@@ -8817,7 +10419,7 @@ pub mod types {
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Ipv6Address")),
+            TypeIdentity::bare("Ipv6Address"),
             None,
             None,
             legacy_validator(|value| {
@@ -8834,7 +10436,7 @@ pub mod types {
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Ipv6Cidr")),
+            TypeIdentity::bare("Ipv6Cidr"),
             None,
             None,
             legacy_validator(|value| {
@@ -8860,7 +10462,7 @@ pub mod types {
     /// contains at least one dot with non-empty labels.
     pub fn email() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Email")),
+            TypeIdentity::bare("Email"),
             None,
             None,
             legacy_validator(|value| {
@@ -8882,7 +10484,7 @@ pub mod types {
     /// added as a sibling if a non-restricted consumer appears.
     pub fn http_response_status_code() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("HttpResponseStatusCode")),
+            TypeIdentity::bare("HttpResponseStatusCode"),
             None,
             None,
             legacy_validator(|value| {
@@ -8906,7 +10508,7 @@ pub mod types {
     /// ```
     pub fn redirect_protocol() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("RedirectProtocol")),
+            TypeIdentity::bare("RedirectProtocol"),
             None,
             None,
             legacy_validator(|value| {
@@ -8929,7 +10531,7 @@ pub mod types {
     /// ```
     pub fn redirect_host() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("RedirectHost")),
+            TypeIdentity::bare("RedirectHost"),
             None,
             None,
             legacy_validator(|value| {
@@ -8952,7 +10554,7 @@ pub mod types {
     /// ```
     pub fn redirect_port() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("RedirectPort")),
+            TypeIdentity::bare("RedirectPort"),
             None,
             None,
             legacy_validator(|value| {
@@ -8975,7 +10577,7 @@ pub mod types {
     /// ```
     pub fn redirect_path() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("RedirectPath")),
+            TypeIdentity::bare("RedirectPath"),
             None,
             None,
             legacy_validator(|value| {
@@ -8998,7 +10600,7 @@ pub mod types {
     /// ```
     pub fn redirect_query() -> AttributeType {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("RedirectQuery")),
+            TypeIdentity::bare("RedirectQuery"),
             None,
             None,
             legacy_validator(|value| {
@@ -9011,6 +10613,48 @@ pub mod types {
             None,
         )
     }
+}
+
+/// Return the validators for every core-owned identified refinement.
+///
+/// The registry is built from the same constructors providers use, so schema
+/// construction and process-boundary reconstruction cannot drift onto two
+/// hand-maintained identity lists.
+pub fn builtin_validator_registry() -> &'static HashMap<TypeIdentity, CustomValidator> {
+    static REGISTRY: OnceLock<HashMap<TypeIdentity, CustomValidator>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let builtins = [
+            types::positive_int(),
+            types::ipv4_cidr(),
+            types::ipv4_address(),
+            types::ipv6_address(),
+            types::ipv6_cidr(),
+            types::email(),
+            types::http_response_status_code(),
+            types::redirect_protocol(),
+            types::redirect_host(),
+            types::redirect_port(),
+            types::redirect_path(),
+            types::redirect_query(),
+        ];
+        let mut validators = HashMap::new();
+        for attr_type in builtins {
+            let binding = match &attr_type.kind {
+                AttrTypeKind::String { binding, .. }
+                | AttrTypeKind::Int { binding, .. }
+                | AttrTypeKind::Float { binding, .. } => binding,
+                _ => continue,
+            };
+            if let Some((identity, callback)) = binding.validator_parts() {
+                validators.insert(identity.clone(), callback.clone());
+            }
+        }
+        validators
+    })
+}
+
+pub fn builtin_validator(identity: &TypeIdentity) -> Option<CustomValidator> {
+    builtin_validator_registry().get(identity).cloned()
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -9415,8 +11059,8 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    managed: HashMap<(String, String), ResourceSchema>,
-    data_sources: HashMap<(String, String), ResourceSchema>,
+    managed: HashMap<(String, String), ValidatedResourceSchema>,
+    data_sources: HashMap<(String, String), ValidatedResourceSchema>,
 }
 
 impl SchemaRegistry {
@@ -9424,11 +11068,19 @@ impl SchemaRegistry {
         Self::default()
     }
 
-    /// Insert a schema under the given provider. The `kind` field on the
-    /// schema decides which sub-map it goes into.
-    pub fn insert(&mut self, provider: impl Into<String>, schema: ResourceSchema) {
-        let key = (provider.into(), schema.resource_type.clone());
-        match schema.kind {
+    /// Insert a validated schema under the given provider. The `kind` field
+    /// on the schema decides which sub-map it goes into. Raw drafts cannot
+    /// cross this admission boundary:
+    ///
+    /// ```compile_fail
+    /// use carina_core::schema::{ResourceSchema, SchemaRegistry};
+    ///
+    /// let mut registry = SchemaRegistry::new();
+    /// registry.insert("test", ResourceSchema::new("test.Widget"));
+    /// ```
+    pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
+        let key = (provider.into(), schema.as_schema().resource_type.clone());
+        match schema.as_schema().kind {
             SchemaKind::Resource => {
                 self.managed.insert(key, schema);
             }
@@ -9444,7 +11096,7 @@ impl SchemaRegistry {
         provider: &str,
         resource_type: &str,
         kind: SchemaKind,
-    ) -> Option<&ResourceSchema> {
+    ) -> Option<&ValidatedResourceSchema> {
         let key = (provider.to_string(), resource_type.to_string());
         match kind {
             SchemaKind::Resource => self.managed.get(&key),
@@ -9453,7 +11105,10 @@ impl SchemaRegistry {
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
-    pub fn get_for(&self, resource: &crate::resource::Resource) -> Option<&ResourceSchema> {
+    pub fn get_for(
+        &self,
+        resource: &crate::resource::Resource,
+    ) -> Option<&ValidatedResourceSchema> {
         self.get(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -9465,7 +11120,7 @@ impl SchemaRegistry {
     pub fn get_for_data_source(
         &self,
         resource: &crate::resource::DataSource,
-    ) -> Option<&ResourceSchema> {
+    ) -> Option<&ValidatedResourceSchema> {
         self.get(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -9483,9 +11138,12 @@ impl SchemaRegistry {
             .is_some()
     }
 
-    /// Iterate every schema in the registry, yielding `(provider,
-    /// resource_type, kind, &ResourceSchema)`.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, SchemaKind, &ResourceSchema)> + '_ {
+    /// Iterate every schema in the registry without discarding its validation
+    /// witness. Consumers that need the raw conversion view must opt in with
+    /// [`ValidatedResourceSchema::as_schema`].
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, SchemaKind, &ValidatedResourceSchema)> + '_ {
         self.managed
             .iter()
             .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::Resource, s))

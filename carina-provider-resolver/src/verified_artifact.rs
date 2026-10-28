@@ -52,6 +52,92 @@ impl fmt::Debug for ProviderArtifactBytes {
     }
 }
 
+/// Identity of the exact provider artifact retained for one verified load.
+///
+/// Only the resolver can construct this value, so callers cannot attach
+/// verified provenance to arbitrary provider bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedArtifactIdentity {
+    sha256: String,
+    origin: LoadedArtifactOrigin,
+}
+
+impl LoadedArtifactIdentity {
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn origin(&self) -> &LoadedArtifactOrigin {
+        &self.origin
+    }
+
+    fn new(bytes: &ProviderArtifactBytes, origin: LoadedArtifactOrigin) -> Self {
+        Self {
+            sha256: format!("{:x}", Sha256::digest(bytes.as_bytes())),
+            origin,
+        }
+    }
+
+    pub(crate) fn locked(
+        bytes: &ProviderArtifactBytes,
+        source: RemoteSourceKey,
+        pin: &LockedProviderPin,
+    ) -> Self {
+        let version = match pin {
+            LockedProviderPin::Version {
+                version,
+                constraint: _constraint,
+            } => LockedArtifactVersion::Version {
+                version: version.clone(),
+            },
+            LockedProviderPin::GithubRelease {
+                version,
+                tag: _tag,
+                asset_id: _asset_id,
+                constraint: _constraint,
+            } => LockedArtifactVersion::Version {
+                version: version.clone(),
+            },
+            LockedProviderPin::Revision {
+                revision: _revision,
+                resolved_sha,
+                artifact_id: _artifact_id,
+            } => LockedArtifactVersion::Revision {
+                resolved_sha: resolved_sha.to_string(),
+            },
+            LockedProviderPin::RegistryRevision { revision, version } => {
+                LockedArtifactVersion::RegistryRevision {
+                    revision: revision.clone(),
+                    version: version.clone(),
+                }
+            }
+        };
+        Self::new(bytes, LoadedArtifactOrigin::Locked { source, version })
+    }
+
+    pub(crate) fn file(bytes: &ProviderArtifactBytes) -> Self {
+        Self::new(bytes, LoadedArtifactOrigin::File)
+    }
+}
+
+/// Resolver provenance for a loaded provider artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedArtifactOrigin {
+    Locked {
+        source: RemoteSourceKey,
+        version: LockedArtifactVersion,
+    },
+    File,
+}
+
+/// Lock-resolved provider version facts that participate in artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockedArtifactVersion {
+    Version { version: String },
+    Revision { resolved_sha: String },
+    RegistryRevision { revision: String, version: String },
+}
+
 /// Resolver-owned provider bytes bound to the load identity derived for those
 /// exact bytes.
 ///
@@ -61,6 +147,7 @@ impl fmt::Debug for ProviderArtifactBytes {
 pub struct VerifiedLoad {
     bytes: ProviderArtifactBytes,
     identity: ProviderLoadIdentity,
+    artifact: LoadedArtifactIdentity,
 }
 
 impl VerifiedLoad {
@@ -72,16 +159,31 @@ impl VerifiedLoad {
         &self.identity
     }
 
-    pub(crate) fn new(bytes: ProviderArtifactBytes, identity: ProviderLoadIdentity) -> Self {
-        Self { bytes, identity }
+    pub fn artifact(&self) -> &LoadedArtifactIdentity {
+        &self.artifact
+    }
+
+    pub(crate) fn new(
+        bytes: ProviderArtifactBytes,
+        identity: ProviderLoadIdentity,
+        artifact: LoadedArtifactIdentity,
+    ) -> Self {
+        Self {
+            bytes,
+            identity,
+            artifact,
+        }
     }
 
     /// Construct a bound load for host tests that do not run the resolver.
     #[cfg(feature = "test-utils")]
     pub fn for_test(bytes: impl AsRef<[u8]>, identity: ProviderLoadIdentity) -> Self {
+        let bytes = ProviderArtifactBytes(Arc::from(bytes.as_ref()));
+        let artifact = LoadedArtifactIdentity::file(&bytes);
         Self {
-            bytes: ProviderArtifactBytes(Arc::from(bytes.as_ref())),
+            bytes,
             identity,
+            artifact,
         }
     }
 }
@@ -1326,6 +1428,40 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    #[test]
+    fn locked_artifact_identity_drops_user_authored_constraint() {
+        let retained_bytes = ProviderArtifactBytes(Arc::from(&b"locked retained bytes"[..]));
+        let source = match "github.com/carina-rs/carina-provider-aws"
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::Remote(source) => source.source_key(),
+            ProviderSource::File(_) => unreachable!(),
+        };
+        let without_constraint = LoadedArtifactIdentity::locked(
+            &retained_bytes,
+            source.clone(),
+            &LockedProviderPin::Version {
+                version: "1.2.3".to_string(),
+                constraint: None,
+            },
+        );
+        let with_constraint = LoadedArtifactIdentity::locked(
+            &retained_bytes,
+            source,
+            &LockedProviderPin::Version {
+                version: "1.2.3".to_string(),
+                constraint: Some("^1.0".to_string()),
+            },
+        );
+
+        assert_eq!(without_constraint, with_constraint);
+        assert_eq!(
+            without_constraint.sha256(),
+            format!("{:x}", Sha256::digest(retained_bytes.as_bytes()))
+        );
+    }
 
     fn trust_record_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn visit(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {

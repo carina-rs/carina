@@ -35,9 +35,11 @@ fn versioning_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("versioning", versioning)),
+        (ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("versioning", versioning).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -219,9 +221,11 @@ fn bare_mode_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("mode", mode)),
+        (ResourceSchema::new("r.mode_holder")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("mode", mode).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -302,9 +306,11 @@ fn all_enum_union_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("mode", mode)),
+        (ResourceSchema::new("r.mode_holder")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("mode", mode).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }

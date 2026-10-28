@@ -503,11 +503,12 @@ fn plan_file_serde_round_trip() {
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(wire["version"], serde_json::json!(25));
+    assert_eq!(wire["version"], serde_json::json!(26));
     assert_eq!(wire["current_states"][0]["kind"], "managed");
     assert_eq!(wire["current_states"][0]["current"]["status"], "absent");
     assert_eq!(wire["current_states"][1]["kind"], "managed");
@@ -1473,9 +1474,15 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let result = detect_drift(
@@ -2364,7 +2371,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test(vec![], &parsed.providers);
 
     assert!(
         ctx.factories().is_empty(),
@@ -2390,7 +2397,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
 
 #[test]
 fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
 
     assert!(ctx.known_providers().contains("mock"));
     assert!(ctx.schemas().has_managed("mock", "test.resource"));
@@ -2828,11 +2835,15 @@ fn build_state_after_apply_persists_write_only_attributes() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
-            ),
+                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(
@@ -2913,12 +2924,15 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("ec2.Eip")
-            .attribute(AttributeSchema::new(
-                "allocation_id",
-                AttributeType::string(),
+        (ResourceSchema::new("ec2.Eip")
+            .attribute(AttributeSchema::optional("allocation_id", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("domain", domain_type)
+                    .write_only()
+                    .build(),
             ))
-            .attribute(AttributeSchema::new("domain", domain_type).write_only()),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(
@@ -3024,11 +3038,15 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
-            ),
+                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(
@@ -3117,6 +3135,7 @@ fn plan_file_serialization_redacts_secrets() {
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
@@ -3167,6 +3186,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
 
     let error = serde_json::to_string(&plan_file)
@@ -3206,6 +3226,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     let mut json = serde_json::to_value(plan_file).unwrap();
     json["sorted_resources"][0]["id"]
@@ -3271,6 +3292,7 @@ fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     }
 }
 
@@ -3365,6 +3387,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
 
     let error = plan_file
@@ -3387,6 +3410,19 @@ fn plan_file_decode_requires_data_source_values_field() {
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("format 25 must require the total data-source outcome field");
     assert!(error.to_string().contains("data_source_values"), "{error}");
+}
+
+#[test]
+fn plan_file_decode_requires_provider_artifacts_field() {
+    let mut encoded = serde_json::to_value(plan_file_with_unchanged_managed_wait_target()).unwrap();
+    encoded
+        .as_object_mut()
+        .expect("saved plan object")
+        .remove("provider_artifacts");
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("format 26 must require provider artifact identities");
+    assert!(error.to_string().contains("provider_artifacts"), "{error}");
 }
 
 /// Backend that captures the state written to it.

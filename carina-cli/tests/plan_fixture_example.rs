@@ -14,9 +14,13 @@ use carina_cli::display::{
     format_destroy_plan_with_delete_instances, format_plan_with_delete_instances,
 };
 use carina_cli::fixture_plan::{
-    build_fixture_plan_change_summary, build_plan_from_fixture_name,
+    FixturePlan, build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
     delete_instance_attributes_from_plan,
 };
+
+fn build_plan_from_fixture_name(fixture: &str) -> FixturePlan {
+    build_plan_from_fixture_name_using(fixture, carina_cli::wiring::LoadedProviderFactory::for_test)
+}
 
 /// Render a fixture the way the `plan-fixture` example does for a normal
 /// (non-destroy) plan and return the formatted output string.

@@ -259,16 +259,42 @@ fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
     InspectedPlanFile::inspect(plan_file)
 }
 
-fn mock_schema_registry(schemas: impl IntoIterator<Item = ResourceSchema>) -> SchemaRegistry {
+trait IntoValidatedTestSchema {
+    fn into_validated_test_schema(self) -> carina_core::schema::ValidatedResourceSchema;
+}
+
+impl IntoValidatedTestSchema for ResourceSchema {
+    fn into_validated_test_schema(self) -> carina_core::schema::ValidatedResourceSchema {
+        self.validate().expect("schema fixture must be valid")
+    }
+}
+
+impl IntoValidatedTestSchema for carina_core::schema::ValidatedResourceSchema {
+    fn into_validated_test_schema(self) -> carina_core::schema::ValidatedResourceSchema {
+        self
+    }
+}
+
+fn mock_schema_registry<T>(schemas: impl IntoIterator<Item = T>) -> SchemaRegistry
+where
+    T: IntoValidatedTestSchema,
+{
     let mut registry = SchemaRegistry::new();
     for schema in schemas {
-        registry.insert("mock", schema);
+        registry.insert("mock", schema.into_validated_test_schema());
     }
     registry
 }
 
+fn record_test_provider_artifacts(plan_file: &mut PlanFile) {
+    let ctx =
+        WiringContext::new_for_test(Vec::new(), plan_file.provider_configs.as_provider_configs());
+    plan_file.record_loaded_providers(&ctx);
+}
+
 fn record_builtin_mock_schema_fingerprints(plan_file: &mut PlanFile) {
-    plan_file.record_schema_fingerprints(&mock_schema_registry(
+    record_test_provider_artifacts(plan_file);
+    plan_file.record_schema_fingerprints_for_test(&mock_schema_registry(
         carina_provider_mock::builtin_schemas(),
     ));
 }
@@ -347,8 +373,10 @@ async fn run_saved_plan_schema_fingerprint_case(
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
-    plan_file.record_schema_fingerprints(planning_schemas);
+    plan_file.record_loaded_providers(&WiringContext::new_for_test(Vec::new(), &[]));
+    plan_file.record_schema_fingerprints_for_test(planning_schemas);
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
@@ -375,7 +403,7 @@ async fn run_saved_plan_schema_fingerprint_case(
 #[tokio::test]
 async fn saved_plan_apply_rejects_removed_provider_type_before_provider_call() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())]);
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
     let (result, operations) =
         run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "gone", false)
@@ -407,7 +435,7 @@ async fn saved_plan_apply_rejects_removed_provider_type_before_provider_call() {
 #[tokio::test]
 async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())]);
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
     let (result, operations) =
         run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "secret", true)
@@ -425,13 +453,28 @@ async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
 
 #[tokio::test]
 async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() {
-    let mut planned_schema = carina_provider_mock::builtin_schemas()
+    let builtin_schema = carina_provider_mock::builtin_schemas()
         .into_iter()
-        .find(|schema| schema.resource_type() == "test.resource")
+        .find(|schema| schema.parts().resource_type == "test.resource")
         .expect("built-in test.resource schema");
-    let comment_type = planned_schema.attributes()["comment"].attr_type().clone();
-    planned_schema = planned_schema
-        .attribute(carina_core::schema::AttributeSchema::new("comment", comment_type).write_only());
+    let mut planned_schema =
+        ResourceSchema::new("test.resource").with_unique_name_attribute("name");
+    for attribute in builtin_schema
+        .as_schema()
+        .attributes()
+        .values()
+        .filter(|attribute| attribute.name() != "comment")
+    {
+        planned_schema = planned_schema.attribute(attribute.clone());
+    }
+    let comment_type = builtin_schema.as_schema().attributes()["comment"]
+        .attr_type()
+        .clone();
+    planned_schema = planned_schema.attribute(
+        carina_core::schema::AttributeSchema::optional("comment", comment_type)
+            .write_only()
+            .build(),
+    );
     let planning_schemas = mock_schema_registry([planned_schema]);
 
     let (result, operations) = run_saved_plan_schema_fingerprint_case(
@@ -513,14 +556,17 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
-    plan_file.record_schema_fingerprints(&schemas);
+    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
+    plan_file.record_loaded_providers(&ctx);
+    plan_file.record_schema_fingerprints_for_test(&schemas);
 
     let reloaded = inspected_saved_plan(plan_file)
         .reload_in_flight_from_locked_state(None)
         .expect("current-state snapshot should reload");
-    let checked = reloaded.verify_schema_fingerprints(
-        &schemas,
+    let checked = reloaded.verify_loaded_providers(
+        ctx,
         ApplyTarget::SavedPlan {
             plan_file: Path::new("reviewed-plan.json"),
             source_dir: Path::new("."),
@@ -528,7 +574,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     );
 
     assert!(
-        matches!(checked, Ok(SchemaCheckedPlanFile::Verified(_))),
+        matches!(checked, Ok((SchemaCheckedPlanFile::Verified(_), _))),
         "the immutable pre-reload reference inventory must verify unchanged schemas"
     );
 }
@@ -703,6 +749,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
 
     let mut plan_file = plan_file
@@ -793,6 +840,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     record_builtin_mock_schema_fingerprints(&mut plan_file);
     let backend =
@@ -852,8 +900,8 @@ impl ProviderFactory for FailBCreateFactory {
         "Mock provider with B create failure"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -883,12 +931,22 @@ impl ProviderFactory for FailBCreateFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::new("id", AttributeType::string()))
-                .attribute(AttributeSchema::new("name", AttributeType::string())),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("test.resource")
+                    .attribute(AttributeSchema::optional("id", AttributeType::string()).build())
+                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build()),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -900,7 +958,7 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
         .await
         .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -1042,7 +1100,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     )
     .expect("bootstrap reload must succeed");
     let received_role_arn = Arc::new(Mutex::new(None));
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -1309,8 +1367,8 @@ impl ProviderFactory for ApplyTimeReadFactory {
         "Mock provider for apply-time data-source reads"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1341,54 +1399,91 @@ impl ProviderFactory for ApplyTimeReadFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("iam.Role")
-                .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-                .attribute(AttributeSchema::new("path", AttributeType::string()).create_only())
-                .attribute(
-                    AttributeSchema::new("max_session_duration", AttributeType::int())
-                        .create_only(),
-                )
-                .attribute(AttributeSchema::new("description", AttributeType::string())),
-            ResourceSchema::new("iam.Roles")
-                .attribute(AttributeSchema::new("name_regex", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "names",
-                    AttributeType::list(AttributeType::string()),
-                ))
-                .as_data_source(),
-            ResourceSchema::new("ec2.InternetGateway")
-                .attribute(AttributeSchema::new("name", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "tags",
-                    AttributeType::map(AttributeType::string()),
-                ))
-                .attribute(AttributeSchema::new(
-                    "settings",
-                    AttributeType::struct_(
-                        "InternetGatewaySettings",
-                        vec![
-                            StructField::new("enabled", AttributeType::bool()),
-                            StructField::new("description", AttributeType::string()),
-                        ],
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("iam.Role")
+                    .attribute(
+                        AttributeSchema::optional("role_name", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("path", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("max_session_duration", AttributeType::int())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("description", AttributeType::string()).build(),
                     ),
-                ))
-                .attribute(AttributeSchema::new(
-                    "rules",
-                    AttributeType::list(AttributeType::struct_(
-                        "InternetGatewayRule",
-                        vec![
-                            StructField::new("port", AttributeType::int()),
-                            StructField::new("description", AttributeType::string()),
-                        ],
-                    )),
-                )),
-            ResourceSchema::new("ec2.NatGateway").attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            )),
-        ]
+                ResourceSchema::new("iam.Roles")
+                    .attribute(
+                        AttributeSchema::optional("name_regex", AttributeType::string()).build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "names",
+                            AttributeType::list(AttributeType::string()),
+                        )
+                        .build(),
+                    )
+                    .as_data_source(),
+                ResourceSchema::new("ec2.InternetGateway")
+                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                    .attribute(
+                        AttributeSchema::optional(
+                            "tags",
+                            AttributeType::map(AttributeType::string()),
+                        )
+                        .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "settings",
+                            AttributeType::struct_(
+                                "InternetGatewaySettings",
+                                vec![
+                                    StructField::optional("enabled", AttributeType::bool()).build(),
+                                    StructField::optional("description", AttributeType::string())
+                                        .build(),
+                                ],
+                            ),
+                        )
+                        .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "rules",
+                            AttributeType::list(AttributeType::struct_(
+                                "InternetGatewayRule",
+                                vec![
+                                    StructField::optional("port", AttributeType::int()).build(),
+                                    StructField::optional("description", AttributeType::string())
+                                        .build(),
+                                ],
+                            )),
+                        )
+                        .build(),
+                    ),
+                ResourceSchema::new("ec2.NatGateway").attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                ),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1436,8 +1531,8 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         "AWSCC apply cascade test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -1468,26 +1563,51 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("ec2.Vpc")
-                .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-                )
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
-                .with_coexisting_replacement(),
-            ResourceSchema::new("ec2.Subnet")
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
-                .attribute(
-                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-                )
-                .attribute(
-                    AttributeSchema::new("availability_zone", AttributeType::string())
-                        .create_only(),
-                )
-                .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
-                .with_coexisting_replacement(),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("ec2.Vpc")
+                    .attribute(
+                        AttributeSchema::optional("cidr_block", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::provider_populated("vpc_id", AttributeType::string())
+                            .build(),
+                    )
+                    .with_coexisting_replacement(),
+                ResourceSchema::new("ec2.Subnet")
+                    .attribute(
+                        AttributeSchema::optional("vpc_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("cidr_block", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("availability_zone", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::provider_populated("subnet_id", AttributeType::string())
+                            .build(),
+                    )
+                    .with_coexisting_replacement(),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -1790,7 +1910,7 @@ async fn run_apply_cascade_fixture(
     fixture: &ApplyCancellationFixture,
     shared: &ApplyCascadeShared,
 ) -> Result<Option<Duration>, AppError> {
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -1805,7 +1925,7 @@ async fn run_apply_cascade_fixture(
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -2149,7 +2269,7 @@ fn load_and_resolve_module_data_source_fixture(
     .expect("module data-source fixture must load");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         get_base_dir(fixture.config_path()),
         false,
@@ -2182,7 +2302,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         "module resolution must prefix the data-source binding"
     );
 
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -2200,7 +2320,6 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        get_base_dir(fixture.config_path()),
     )
     .await
     .expect("module data-source plan should build");
@@ -2245,7 +2364,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (fixture, shared) = module_data_source_fixture();
     let (mut parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -2312,7 +2431,7 @@ let lookup = read mock.iam.Roles {{
     .expect("phase-2 module constraint fixture must load");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         get_base_dir(fixture.config_path()),
         false,
@@ -2334,7 +2453,7 @@ let lookup = read mock.iam.Roles {{
         "name_regex",
         Value::resource_ref("checked", "value", Vec::new()),
     );
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -2647,6 +2766,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     record_builtin_mock_schema_fingerprints(&mut plan_file);
     let recorded = &plan_file.schema_fingerprints.providers["mock"].schemas;
@@ -2777,6 +2897,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     record_builtin_mock_schema_fingerprints(&mut plan_file);
 
@@ -2826,7 +2947,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -2847,7 +2968,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
+    record_test_provider_artifacts(&mut plan_file);
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
@@ -2887,7 +3010,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
@@ -2920,7 +3043,9 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
+    record_test_provider_artifacts(&mut plan_file);
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
     std::fs::write(
         &plan_path,
@@ -3000,7 +3125,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
             .get("Owner"),
         Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
     ));
-    let plan_file = PlanFile {
+    let mut plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
@@ -3021,7 +3146,9 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
+    record_test_provider_artifacts(&mut plan_file);
     let plan_path = tmp.path().join("deferred-default-tags.plan.json");
     std::fs::write(
         &plan_path,
@@ -3067,7 +3194,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let ctx = WiringContext::new(Vec::new(), &[]);
+    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
@@ -3436,6 +3563,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
         schema_fingerprints: Default::default(),
+        provider_artifacts: Default::default(),
     };
     record_builtin_mock_schema_fingerprints(&mut plan_file);
     let observer_factory = fixture.observer_factory();
@@ -3579,7 +3707,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3592,7 +3720,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(vec![Box::new(FailBCreateFactory)], &[]);
+    let ctx = WiringContext::new_for_test(vec![Box::new(FailBCreateFactory)], &[]);
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
         &ctx,
@@ -3656,7 +3784,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3671,7 +3799,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3736,7 +3864,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("vpc-old");
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -3752,7 +3880,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3806,7 +3934,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("subnet-old");
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -3822,7 +3950,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4018,7 +4146,7 @@ awscc.ec2.Subnet {{
     );
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -4034,7 +4162,7 @@ awscc.ec2.Subnet {{
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4123,7 +4251,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4138,7 +4266,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -4177,7 +4305,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     .expect("fixture must reload");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4227,7 +4355,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("post-apply plan should succeed");
@@ -4264,7 +4391,7 @@ let nat = mock.ec2.NatGateway {{
     let fixture = fixture.with_raw_config(config("one"));
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -4278,7 +4405,7 @@ let nat = mock.ec2.NatGateway {{
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -4346,7 +4473,6 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("plan after create should succeed");
@@ -4408,7 +4534,6 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("plan after sibling update should succeed");
@@ -4443,7 +4568,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let fixture = fixture.with_raw_config(config(true));
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -4457,7 +4582,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -4540,7 +4665,6 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("retry plan should succeed");
@@ -4610,7 +4734,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let fixture = fixture.with_raw_config(case.config(&state_path, true));
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -4624,7 +4748,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -4679,7 +4803,6 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("the removal plan should succeed");
@@ -4758,7 +4881,6 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("retry plan should succeed");
@@ -4831,7 +4953,6 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
-        base_dir,
     )
     .await
     .expect("plan after the successful retry should succeed");
@@ -4904,7 +5025,7 @@ let consumer = mock.iam.Role {{
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4919,7 +5040,7 @@ let consumer = mock.iam.Role {{
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(
+    let ctx = WiringContext::new_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -5229,9 +5350,11 @@ async fn bootstrap_declared_state_bucket(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string()))
-            .attribute(AttributeSchema::new("versioning", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("versioning", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
@@ -5487,10 +5610,15 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
-            "bucket",
-            AttributeType::refined_string(None, Some("^state-".to_string()), None, None),
-        )),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional(
+                "bucket",
+                AttributeType::refined_string(None, Some("^state-".to_string()), None, None),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let parsed = carina_core::parser::InferredFile::default();
@@ -5558,8 +5686,10 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let provider_configs = empty_resolved_provider_configs();
@@ -5611,8 +5741,10 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let provider_configs = empty_resolved_provider_configs();
@@ -5656,9 +5788,11 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string()))
-            .attribute(AttributeSchema::new("observed", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("observed", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
@@ -5729,8 +5863,10 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
@@ -5793,8 +5929,10 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let provider_configs = empty_resolved_provider_configs();
 
@@ -5909,10 +6047,17 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // includes the provider prefix.
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .build(),
+        );
     // Schema is registered with provider-prefixed key
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
@@ -5984,21 +6129,29 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
 
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
         .attribute(
-            AttributeSchema::new(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
                 "policies",
                 AttributeType::unordered_list(AttributeType::struct_(
                     "Policy".to_string(),
                     vec![
-                        StructField::new("policy_name", AttributeType::string()).required(),
-                        StructField::new("policy_document", AttributeType::string()).required(),
+                        StructField::required("policy_name", AttributeType::string()).build(),
+                        StructField::required("policy_document", AttributeType::string()).build(),
                     ],
                 )),
             )
-            .with_block_name("policy"),
+            .with_block_name("policy")
+            .build(),
         );
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Resource with resolved block name (policy -> policies)
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
@@ -6136,19 +6289,24 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     use carina_core::schema::StructField;
 
     let schema = ResourceSchema::new("awscc.iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
         .attribute(
-            AttributeSchema::new(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
                 "policies",
                 AttributeType::unordered_list(AttributeType::struct_(
                     "Policy".to_string(),
                     vec![
-                        StructField::new("policy_name", AttributeType::string()).required(),
-                        StructField::new("policy_document", AttributeType::string()).required(),
+                        StructField::required("policy_name", AttributeType::string()).build(),
+                        StructField::required("policy_document", AttributeType::string()).build(),
                     ],
                 )),
             )
-            .with_block_name("policy"),
+            .with_block_name("policy")
+            .build(),
         );
 
     // Desired resource (after resolve_block_names: "policy" -> "policies")
@@ -6253,17 +6411,21 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.ipam")
         .attribute(
-            AttributeSchema::new(
+            AttributeSchema::optional(
                 "operating_regions",
                 AttributeType::unordered_list(AttributeType::struct_(
                     "IpamOperatingRegion".to_string(),
-                    vec![StructField::new("region_name", AttributeType::string()).required()],
+                    vec![StructField::required("region_name", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("operating_region"),
+            .with_block_name("operating_region")
+            .build(),
         )
-        .attribute(AttributeSchema::new("description", AttributeType::string()));
-    schemas.insert("awscc", schema);
+        .attribute(AttributeSchema::optional("description", AttributeType::string()).build());
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Resource with resolved block name
     let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
@@ -6396,9 +6558,16 @@ fn move_plus_update_keeps_post_update_attributes() {
 
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.Tag")
-        .attribute(AttributeSchema::new("key", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("value", AttributeType::string()));
-    schemas.insert("awscc", schema);
+        .attribute(
+            AttributeSchema::optional("key", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("value", AttributeType::string()).build());
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let new_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_new", None);
     let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
@@ -6494,8 +6663,13 @@ fn move_alone_carries_attributes_via_managed_current() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("bucket_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let new_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "bucket_new", None);
@@ -6623,8 +6797,13 @@ fn failed_refresh_preserves_existing_row() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("bucket_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "stuck", None);
@@ -6683,8 +6862,13 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("bucket_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "collision", None);
@@ -6743,8 +6927,13 @@ fn remove_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("bucket_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "collision", None);
@@ -6799,8 +6988,13 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("bucket_name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "self", None);
@@ -7861,9 +8055,10 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 25 persists total
+    //! `carina plan` is the supported migration. Version 26 persists exact
+    //! provider artifact identities (carina#4045); version 25 persists total
     //! data-source outcomes (carina#3993); version 24 removed the wait target
-    //! schema kind (carina#3916), and version 23 added the mandatory provider-
+    //! schema kind (carina#3916), and version 23 added the mandatory provider
     //! schema fingerprint snapshot (carina#3983).
 
     use std::path::Path;
@@ -7875,11 +8070,43 @@ mod saved_plan_version_tests {
     };
 
     #[tokio::test]
+    async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan.json");
+        let old_plan = serde_json::json!({
+            "version": 25,
+            "timestamp": "2026-10-28T00:00:00Z",
+            "source_path": "infra",
+        });
+        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("format 25 must be rejected before its body is decoded");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found, expected, ..
+        } = error
+        else {
+            panic!("expected typed unsupported plan version error")
+        };
+        assert_eq!((found, expected), (25, 26));
+    }
+
+    #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            25,
-            "persisting total data-source outcomes must bump the saved-plan format",
+            26,
+            "persisting loaded provider artifacts must bump the saved-plan format",
         );
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
@@ -7926,7 +8153,7 @@ mod saved_plan_version_tests {
         else {
             panic!("expected typed version error, got {error:?}");
         };
-        assert_eq!((*found, *expected), (22, 25));
+        assert_eq!((*found, *expected), (22, 26));
         let expected_replan = format!("carina plan --out {} infra", plan_path.display());
         assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
         assert!(
@@ -8576,9 +8803,13 @@ mod saved_plan_version_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            ResourceSchema::new("ec2.Vpc").attribute(
-                AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
-            ),
+            (ResourceSchema::new("ec2.Vpc").attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         let plan_input_states = crate::plan_input_current_from_states(
             current_states.clone(),
@@ -8626,6 +8857,7 @@ mod saved_plan_version_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
             schema_fingerprints: Default::default(),
+            provider_artifacts: Default::default(),
         };
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
         (dir, plan_path, json)

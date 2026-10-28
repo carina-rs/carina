@@ -37,7 +37,7 @@ pub enum ProvidersCommands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Reset a registry provider's sequence observation and anchor
+    /// Reset a registry provider's sequence observation, anchor and presence record
     #[command(name = "re-bootstrap")]
     ReBootstrap {
         /// Registry provider source: [hostname/]namespace/name

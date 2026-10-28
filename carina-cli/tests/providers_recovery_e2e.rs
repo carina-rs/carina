@@ -558,8 +558,12 @@ fn v1_discovery_repin_preview_folds_the_complete_migration_report() {
     );
     assert!(
         stderr.contains(
-            "Registry resolution remains blocked for each other migrated host until its legacy pin is explicitly authorized for discard."
+            "registry discovery for host registry.example.test is blocked because its legacy lock-format migration requires operator authorization"
         ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Registry resolution remains blocked for each other migrated host"),
         "{stderr}"
     );
 
@@ -604,9 +608,12 @@ fn init_reports_v2_lock_migration_once_before_authorization_error() {
         1,
         "carina init must report migration exactly once: {stderr}"
     );
-    assert!(
-        stderr.contains("lock-format migration requires operator authorization"),
-        "{stderr}"
+    assert_eq!(
+        stderr
+            .matches("lock-format migration requires operator authorization")
+            .count(),
+        2,
+        "the migration report and the resolve-time refusal must each name the authorization gate: {stderr}"
     );
 }
 
@@ -637,9 +644,12 @@ fn init_reports_v1_lock_migration_once_before_authorization_error() {
         1,
         "carina init must report migration exactly once: {stderr}"
     );
-    assert!(
-        stderr.contains("lock-format migration requires operator authorization"),
-        "{stderr}"
+    assert_eq!(
+        stderr
+            .matches("lock-format migration requires operator authorization")
+            .count(),
+        2,
+        "the migration report and the resolve-time refusal must each name the authorization gate: {stderr}"
     );
 }
 

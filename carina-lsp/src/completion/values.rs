@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
-use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema, legacy_validator};
+use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
 
@@ -85,7 +85,7 @@ impl CompletionProvider {
 
         // Get schema for specific resource type
         if let Some(schema) = self.lookup_schema(resource_type) {
-            for attr in schema.attributes().values().filter(|a| !a.is_read_only()) {
+            for attr in schema.effective_attributes().filter(|a| !a.is_read_only()) {
                 let detail = attr.description().map(str::to_owned);
                 let required_marker = if attr.is_required() {
                     " (required)"
@@ -111,9 +111,9 @@ impl CompletionProvider {
                 // class as carina#3349.
                 if let Some(bn) = attr.block_name()
                     && matches!(
-                        schema.shape_of(attr.attr_type()),
+                        schema.as_schema().shape_of(attr.field_type()),
                         Shape::List { element_type: inner, .. } if matches!(
-                            schema.shape_of(inner),
+                            schema.as_schema().shape_of(inner),
                             Shape::Struct { .. }
                         )
                     )
@@ -165,6 +165,7 @@ impl CompletionProvider {
                 attr_name,
             } => self.lookup_schema(resource_type).and_then(|schema| {
                 schema
+                    .as_schema()
                     .attributes()
                     .get(attr_name)
                     .map(|attribute| (resource_type.as_str(), schema, attribute))
@@ -231,7 +232,7 @@ impl CompletionProvider {
                         continue;
                     }
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
-                        for binding_attr in binding_schema.attributes().values() {
+                        for binding_attr in binding_schema.as_schema().attributes().values() {
                             if let Some(binding_type_name) =
                                 Self::extract_custom_type_name(binding_attr.attr_type())
                                 && binding_type_name == target_name
@@ -275,7 +276,7 @@ impl CompletionProvider {
                     if !type_expr_source_is_assignable_to(
                         export_type,
                         attr_schema.attr_type(),
-                        schema.defs(),
+                        schema.as_schema().defs(),
                     ) {
                         continue;
                     }
@@ -304,7 +305,7 @@ impl CompletionProvider {
         // for-binding filter further down; `defs` stays paired with the
         // target while directional assignability resolves any schema `Ref`.
         let target_attr_type = schema_target.map(|(_, _, attribute)| attribute.attr_type());
-        let target_defs = schema_target.map(|(_, schema, _)| schema.defs());
+        let target_defs = schema_target.map(|(_, schema, _)| schema.as_schema().defs());
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -386,7 +387,7 @@ impl CompletionProvider {
             // (cyclic-CFN case) also gets the snippet (same bug class as
             // carina#3349).
             if matches!(
-                schema.shape_of(attr_schema.attr_type()),
+                schema.as_schema().shape_of(attr_schema.attr_type()),
                 Shape::Struct { .. }
             ) {
                 completions.push(CompletionItem {
@@ -504,7 +505,7 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(binding_resource_type) {
-            for attr in schema.attributes().values() {
+            for attr in schema.as_schema().attributes().values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
                     label: full_ref.clone(),
@@ -1475,8 +1476,8 @@ impl CompletionProvider {
             let Some(schema) = self.lookup_schema(&resource_type) else {
                 continue;
             };
-            for attr in schema.attributes().values() {
-                let source_type = schema.type_in_schema(attr.attr_type());
+            for attr in schema.as_schema().attributes().values() {
+                let source_type = schema.as_schema().type_in_schema(attr.attr_type());
                 if !source_type.is_assignable_to(target) {
                     continue;
                 }
@@ -1755,7 +1756,10 @@ impl CompletionProvider {
                 } else {
                     format!("{}.{}", provider, resource_type)
                 };
-                let description = schema.description().unwrap_or("Resource reference");
+                let description = schema
+                    .as_schema()
+                    .description()
+                    .unwrap_or("Resource reference");
                 type_completion_item(key, format!("{} reference", description), replacement_range)
             });
 
@@ -2136,11 +2140,10 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
         name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
         {
-            Some(AttributeType::refined_string_with_validator(
+            Some(AttributeType::refined_string(
                 Some(carina_core::schema::TypeIdentity::bare(name)),
                 None,
                 None,
-                legacy_validator(noop_validate),
                 None,
             ))
         }
@@ -2156,10 +2159,6 @@ fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
     let rest = rest.strip_prefix('(')?;
     let rest = rest.strip_suffix(')')?;
     Some(rest)
-}
-
-fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
-    Ok(())
 }
 
 /// Scan `ancestor` for directories that look like carina projects.

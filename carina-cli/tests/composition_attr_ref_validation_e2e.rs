@@ -27,8 +27,8 @@ impl ProviderFactory for AwsccTestFactory {
         "AWSCC (carina#3712 validation stub)"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -66,61 +66,73 @@ impl ProviderFactory for AwsccTestFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![target_group_schema(), consumer_schema(), policy_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![target_group_schema(), consumer_schema(), policy_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn target_group_schema() -> ResourceSchema {
     let tags = AttributeType::struct_(
         "Tags",
-        vec![StructField::new("environment", AttributeType::string())],
+        vec![StructField::optional("environment", AttributeType::string()).build()],
     );
     ResourceSchema::new("elbv2.TargetGroup")
         .attribute(
-            AttributeSchema::new("name", AttributeType::string())
-                .required()
-                .create_only(),
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .build(),
         )
-        .attribute(AttributeSchema::new("target_group_arn", AttributeType::string()).read_only())
-        .attribute(AttributeSchema::new("tags", tags).read_only())
+        .attribute(
+            AttributeSchema::provider_populated("target_group_arn", AttributeType::string())
+                .build(),
+        )
+        .attribute(AttributeSchema::provider_populated("tags", tags).build())
         .with_unique_name_attribute("name")
 }
 
 fn consumer_schema() -> ResourceSchema {
     ResourceSchema::new("test.Consumer")
         .attribute(
-            AttributeSchema::new("name", AttributeType::string())
-                .required()
-                .create_only(),
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .build(),
         )
-        .attribute(AttributeSchema::new("target_group_arn", AttributeType::string()).required())
+        .attribute(AttributeSchema::required("target_group_arn", AttributeType::string()).build())
         .with_unique_name_attribute("name")
 }
 
 fn policy_schema() -> ResourceSchema {
     let statement = AttributeType::struct_(
         "Statement",
-        vec![StructField::new(
-            "principal",
-            AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
-        )],
+        vec![
+            StructField::optional(
+                "principal",
+                AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
+            )
+            .build(),
+        ],
     );
     let policy_document = AttributeType::struct_(
         "PolicyDocument",
-        vec![StructField::new(
-            "statement",
-            AttributeType::list(statement),
-        )],
+        vec![StructField::optional("statement", AttributeType::list(statement)).build()],
     );
 
     ResourceSchema::new("iam.Policy")
         .attribute(
-            AttributeSchema::new("name", AttributeType::string())
-                .required()
-                .create_only(),
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .build(),
         )
-        .attribute(AttributeSchema::new("policy_document", policy_document).read_only())
+        .attribute(AttributeSchema::provider_populated("policy_document", policy_document).build())
         .with_unique_name_attribute("name")
 }
 
@@ -213,8 +225,10 @@ impl Provider for NoopProvider {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory) as Box<dyn ProviderFactory>]
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(AwsccTestFactory) as Box<dyn ProviderFactory>
+    ])
 }
 
 struct Fixture {
