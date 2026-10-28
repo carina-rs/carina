@@ -2985,21 +2985,6 @@ impl LockFileMigration {
                 writeln!(f, "{refusal}")?;
             }
         }
-        match (repinned_host, self.discarded_discovery_pins.len()) {
-            (Some(_), remaining) if remaining > 1 => {
-                writeln!(
-                    f,
-                    "Registry resolution remains blocked for each other migrated host until its legacy pin is explicitly authorized for discard."
-                )?;
-            }
-            (None, _) => {
-                writeln!(
-                    f,
-                    "Registry resolution is blocked for each migrated host until its legacy pin is explicitly authorized for discard."
-                )?;
-            }
-            (Some(_), _) => {}
-        }
         writeln!(
             f,
             "All provider entries and provider security state will be retained."
@@ -4858,11 +4843,12 @@ impl ProviderLockState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostLockState {
     DiscoveryPin,
+    LegacyDiscoveryValues,
 }
 
 impl HostLockState {
     #[cfg(test)]
-    const ALL: [Self; 1] = [Self::DiscoveryPin];
+    const ALL: [Self; 2] = [Self::DiscoveryPin, Self::LegacyDiscoveryValues];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4956,15 +4942,21 @@ mod recovery {
     impl HostLockState {
         pub(super) const fn cleared_by(self) -> Option<HostRecovery> {
             match self {
-                Self::DiscoveryPin => Some(HostRecovery::DiscoveryRepin),
+                Self::DiscoveryPin | Self::LegacyDiscoveryValues => {
+                    Some(HostRecovery::DiscoveryRepin)
+                }
             }
         }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RemediationKind<'a> {
-        Provider(ProviderRecovery, &'a ProviderRefusalTarget),
-        Host(HostRecovery, &'a HostRefusalTarget),
+        Provider(
+            ProviderRecovery,
+            ProviderLockState,
+            &'a ProviderRefusalTarget,
+        ),
+        Host(HostRecovery, HostLockState, &'a HostRefusalTarget),
     }
 
     /// A recovery paired with the only target scope accepted by that operation.
@@ -4979,7 +4971,7 @@ mod recovery {
             target: &'a ProviderRefusalTarget,
         ) -> Option<Self> {
             match cause.cleared_by() {
-                Some(operation) => Some(Self(RemediationKind::Provider(operation, target))),
+                Some(operation) => Some(Self(RemediationKind::Provider(operation, cause, target))),
                 None => None,
             }
         }
@@ -4989,18 +4981,18 @@ mod recovery {
             target: &'a HostRefusalTarget,
         ) -> Option<Self> {
             match cause.cleared_by() {
-                Some(operation) => Some(Self(RemediationKind::Host(operation, target))),
+                Some(operation) => Some(Self(RemediationKind::Host(operation, cause, target))),
                 None => None,
             }
         }
 
         pub(super) fn command(self) -> ProjectCommand<'a> {
             match self.0 {
-                RemediationKind::Provider(operation, target) => {
+                RemediationKind::Provider(operation, _, target) => {
                     ProjectCommand::new(operation.subcommand(), &target.project_dir)
                         .with_argument(&target.source_key)
                 }
-                RemediationKind::Host(operation, target) => {
+                RemediationKind::Host(operation, _, target) => {
                     ProjectCommand::new(operation.subcommand(), &target.project_dir)
                         .with_argument(&target.host)
                 }
@@ -5009,16 +5001,16 @@ mod recovery {
 
         fn project_dir(self) -> &'a Path {
             match self.0 {
-                RemediationKind::Provider(_, target) => &target.project_dir,
-                RemediationKind::Host(_, target) => &target.project_dir,
+                RemediationKind::Provider(_, _, target) => &target.project_dir,
+                RemediationKind::Host(_, _, target) => &target.project_dir,
             }
         }
 
         #[cfg(test)]
         pub(super) const fn subcommand(self) -> &'static str {
             match self.0 {
-                RemediationKind::Provider(operation, _) => operation.subcommand(),
-                RemediationKind::Host(operation, _) => operation.subcommand(),
+                RemediationKind::Provider(operation, _, _) => operation.subcommand(),
+                RemediationKind::Host(operation, _, _) => operation.subcommand(),
             }
         }
 
@@ -5026,17 +5018,29 @@ mod recovery {
             let command = self.command();
             let init = ProjectCommand::new("init", self.project_dir());
             match self.0 {
-                RemediationKind::Provider(ProviderRecovery::Rebootstrap, _) => write!(
+                RemediationKind::Provider(ProviderRecovery::Rebootstrap, _, _) => write!(
                     formatter,
-                    "After verifying out-of-band that resetting registry freshness is intended, run `{command}` to clear only the persisted sequence observation and anchor, then re-run `{init}`."
+                    "After verifying out-of-band that resetting registry freshness is intended, run `{command}` to clear only the persisted sequence observation, anchor and presence record, then re-run `{init}`."
                 ),
-                RemediationKind::Provider(ProviderRecovery::IdentityRepin, _) => write!(
+                RemediationKind::Provider(ProviderRecovery::IdentityRepin, _, _) => write!(
                     formatter,
                     "After verifying out-of-band that the signing-identity change is intended, run `{command}` to clear only the identity pin, then re-run `{init}` to acquire and verify a new pin."
                 ),
-                RemediationKind::Host(HostRecovery::DiscoveryRepin, _) => write!(
+                RemediationKind::Host(
+                    HostRecovery::DiscoveryRepin,
+                    HostLockState::DiscoveryPin,
+                    _,
+                ) => write!(
                     formatter,
                     "After verifying out-of-band that the change to the pinned discovery values (today, the resolved API base) is intended, run `{command}` to clear only those host discovery values, then re-run `{init}` to acquire and verify new values."
+                ),
+                RemediationKind::Host(
+                    HostRecovery::DiscoveryRepin,
+                    HostLockState::LegacyDiscoveryValues,
+                    _,
+                ) => write!(
+                    formatter,
+                    "After verifying out of band that discarding this host's legacy discovery values is intended, run `{command}` to clear only those legacy host discovery values, then re-run `{init}`."
                 ),
             }
         }
@@ -5160,8 +5164,13 @@ impl RegistryRefusal {
                 cause: ProviderLockState::ValidUntilPresence,
                 target,
             },
-            Self::DiscoveryMigrationAuthorizationRequired { target, .. }
-            | Self::DiscoveryPinMismatch { target, .. } => ScopedRegistryRefusal::Host {
+            Self::DiscoveryMigrationAuthorizationRequired { target, .. } => {
+                ScopedRegistryRefusal::Host {
+                    cause: HostLockState::LegacyDiscoveryValues,
+                    target,
+                }
+            }
+            Self::DiscoveryPinMismatch { target, .. } => ScopedRegistryRefusal::Host {
                 cause: HostLockState::DiscoveryPin,
                 target,
             },
@@ -7001,17 +7010,15 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         &mut persistent_lock,
         http,
     )?;
-    let purpose = if persistent_lock
-        .lock_file()
-        .find_by_source_key_and_version(source_key, version)
-        .is_some()
-    {
-        ListedVersionPurpose::ConfirmLockedPin
-    } else {
-        ListedVersionPurpose::SelectNewPin
-    };
-    let listed_version =
-        require_listed_registry_version(&versions, version, source_key.as_str(), purpose)?;
+    let listed_version = require_listed_registry_version(
+        &versions,
+        version,
+        source_key.as_str(),
+        persistent_lock
+            .lock_file()
+            .find_by_source_key_and_version(source_key, version)
+            .is_some(),
+    )?;
     let download = fetch_registry_download(&registry, source, version, http)?;
     accept_registry_download_with_http(
         PendingRegistryDownload {
@@ -7088,12 +7095,8 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
             &mut persistent_lock,
             http,
         )?;
-        let listed_version = require_listed_registry_version(
-            &versions,
-            &locked_version,
-            source_key.as_str(),
-            ListedVersionPurpose::ConfirmLockedPin,
-        )?;
+        let listed_version =
+            require_listed_registry_version(&versions, &locked_version, source_key.as_str(), true)?;
         let download = fetch_registry_download(&registry, source, &locked_version, http)?;
         (listed_version, download, RegistryRevisionSelection::Locked)
     } else {
@@ -7110,7 +7113,7 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
             &versions,
             &response.version,
             source_key.as_str(),
-            ListedVersionPurpose::SelectNewPin,
+            false,
         )?;
         (
             listed_version,
@@ -7137,17 +7140,11 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListedVersionPurpose {
-    ConfirmLockedPin,
-    SelectNewPin,
-}
-
 fn require_listed_registry_version(
     versions: &RegistryVersions,
     version: &str,
     source_key: &str,
-    purpose: ListedVersionPurpose,
+    permit_locked_yanked: bool,
 ) -> Result<ListedVersion, String> {
     let entry = versions
         .versions
@@ -7156,17 +7153,15 @@ fn require_listed_registry_version(
         .ok_or_else(|| {
             format!("Registry provider {source_key} does not contain version {version}")
         })?;
+    if entry.yanked && !permit_locked_yanked {
+        return Err(format!(
+            "Registry provider {source_key} version {version} is yanked and cannot be newly pinned"
+        ));
+    }
     if entry.yanked {
-        match purpose {
-            ListedVersionPurpose::ConfirmLockedPin => eprintln!(
-                "carina: warning: registry provider {source_key}@{version} is yanked; continuing because carina-providers.lock pins this version"
-            ),
-            ListedVersionPurpose::SelectNewPin => {
-                return Err(format!(
-                    "Registry provider {source_key} version {version} is yanked and cannot be newly pinned"
-                ));
-            }
-        }
+        eprintln!(
+            "carina: warning: registry provider {source_key}@{version} is yanked; continuing because carina-providers.lock pins this version"
+        );
     }
     ListedVersion::parse(&entry.version)
 }
@@ -11305,27 +11300,6 @@ sha256 = "malformed"
         assert!(listing.versions[2].yanked);
     }
 
-    #[test]
-    fn missing_registry_version_is_a_plain_selection_error_for_both_purposes() {
-        let listing = RegistryVersions {
-            sequence: None,
-            valid_until: None,
-            versions: Vec::new(),
-        };
-        for purpose in [
-            ListedVersionPurpose::ConfirmLockedPin,
-            ListedVersionPurpose::SelectNewPin,
-        ] {
-            let error =
-                require_listed_registry_version(&listing, "0.5.0", "carina-rs/aws", purpose)
-                    .unwrap_err();
-            assert_eq!(
-                error,
-                "Registry provider carina-rs/aws does not contain version 0.5.0"
-            );
-        }
-    }
-
     fn listed_version(version: &str, yanked: bool) -> RegistryVersion {
         RegistryVersion {
             version: version.into(),
@@ -13088,6 +13062,16 @@ discovery_pin_present = false
             "{error}"
         );
         assert!(
+            error.contains(
+                "verifying out of band that discarding this host's legacy discovery values is intended"
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("change to the pinned discovery values"),
+            "{error}"
+        );
+        assert!(
             error.contains(&format!(
                 "`carina providers repin-discovery registry.carina-rs.dev {}`",
                 project_dir.path().display()
@@ -13566,6 +13550,14 @@ discovery_pin_present = true
                 "`carina providers repin-discovery registry.carina-rs.dev {}`",
                 project_dir.path().display()
             )),
+            "{error}"
+        );
+        assert!(
+            error.contains("change to the pinned discovery values"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("discarding this host's legacy discovery values"),
             "{error}"
         );
         assert!(
@@ -14285,6 +14277,30 @@ transparency_log_present = false
         .unwrap();
         let (mut lock, migration) = loaded.into_parts();
         let migration = migration.unwrap();
+        let migration_report = migration.to_string();
+        assert!(
+            migration_report.contains(
+                "verifying out of band that discarding this host's legacy discovery values is intended"
+            ),
+            "{migration_report}"
+        );
+        assert!(
+            !migration_report.contains("change to the pinned discovery values"),
+            "{migration_report}"
+        );
+        assert_eq!(
+            migration_report
+                .matches("lock-format migration requires operator authorization")
+                .count(),
+            1,
+            "{migration_report}"
+        );
+        assert!(
+            !migration_report.contains(
+                "Registry resolution is blocked for each migrated host until its legacy pin"
+            ),
+            "{migration_report}"
+        );
 
         let prepared = lock
             .prepare_registry_discovery_repin("Registry.Carina-RS.dev")
@@ -14969,14 +14985,25 @@ transparency_log_present = false
     }
 
     fn observe_host_lock_state(lock: &LockFile, state: HostLockState) -> String {
+        let discovery = &lock
+            .registry_host
+            .get("registry.carina-rs.dev")
+            .expect("fixture host must remain present")
+            .discovery;
         match state {
-            HostLockState::DiscoveryPin => format!(
-                "{:?}",
-                lock.registry_host
-                    .get("registry.carina-rs.dev")
-                    .expect("fixture host must remain present")
-                    .discovery
-            ),
+            HostLockState::DiscoveryPin => match discovery {
+                RegistryDiscoveryPinState::Pinned(pin) => format!("{pin:?}"),
+                RegistryDiscoveryPinState::Unpinned(_)
+                | RegistryDiscoveryPinState::MigrationPendingAuthorization(_) => "absent".into(),
+            },
+            HostLockState::LegacyDiscoveryValues => match discovery {
+                RegistryDiscoveryPinState::MigrationPendingAuthorization(pins) => {
+                    format!("{pins:?}")
+                }
+                RegistryDiscoveryPinState::Pinned(_) | RegistryDiscoveryPinState::Unpinned(_) => {
+                    "absent".into()
+                }
+            },
         }
     }
 
@@ -14986,6 +15013,15 @@ transparency_log_present = false
             .filter(|state| {
                 observe_provider_lock_state(before, *state)
                     != observe_provider_lock_state(after, *state)
+            })
+            .collect()
+    }
+
+    fn changed_host_lock_states(before: &LockFile, after: &LockFile) -> Vec<HostLockState> {
+        HostLockState::ALL
+            .into_iter()
+            .filter(|state| {
+                observe_host_lock_state(before, *state) != observe_host_lock_state(after, *state)
             })
             .collect()
     }
@@ -15065,20 +15101,40 @@ transparency_log_present = false
             .prepare_registry_discovery_repin("registry.carina-rs.dev")
             .unwrap()
             .commit();
-        let changed = HostLockState::ALL
-            .into_iter()
-            .filter(|state| {
-                observe_host_lock_state(&before, *state) != observe_host_lock_state(&after, *state)
-            })
-            .collect::<Vec<_>>();
-        let expected = HostLockState::ALL
-            .into_iter()
-            .filter(|state| state.cleared_by() == Some(HostRecovery::DiscoveryRepin))
-            .collect::<Vec<_>>();
-        assert_eq!(changed, expected);
+        assert_eq!(
+            changed_host_lock_states(&before, &after),
+            vec![HostLockState::DiscoveryPin]
+        );
+        assert_eq!(
+            HostLockState::DiscoveryPin.cleared_by(),
+            Some(HostRecovery::DiscoveryRepin)
+        );
         assert!(
             changed_provider_lock_states(&before, &after).is_empty(),
             "discovery re-pin changed provider-owned state"
+        );
+
+        let before = LockFile::from_toml_str(
+            fully_protected_v2_lock_toml(),
+            Path::new("carina-providers.lock"),
+        )
+        .unwrap();
+        let mut after = before.clone();
+        after
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        assert_eq!(
+            changed_host_lock_states(&before, &after),
+            vec![HostLockState::LegacyDiscoveryValues]
+        );
+        assert_eq!(
+            HostLockState::LegacyDiscoveryValues.cleared_by(),
+            Some(HostRecovery::DiscoveryRepin)
+        );
+        assert!(
+            changed_provider_lock_states(&before, &after).is_empty(),
+            "legacy discovery re-pin changed provider-owned state"
         );
     }
 
@@ -15107,7 +15163,10 @@ transparency_log_present = false
                 .into_iter()
                 .filter(|state| state.cleared_by() == Some(HostRecovery::DiscoveryRepin))
                 .collect::<Vec<_>>(),
-            vec![HostLockState::DiscoveryPin]
+            vec![
+                HostLockState::DiscoveryPin,
+                HostLockState::LegacyDiscoveryValues,
+            ]
         );
 
         for state in ProviderLockState::ALL {
@@ -15326,6 +15385,19 @@ transparency_log_present = false
                 );
             }
         }
+    }
+
+    #[test]
+    fn rebootstrap_remediation_names_every_cleared_sequence_state() {
+        let rendered = RegistryRefusal::SequenceFieldDisappeared {
+            target: ProviderRefusalTarget::new("carina-rs/aws", "."),
+        }
+        .to_string();
+
+        assert!(
+            rendered.contains("persisted sequence observation, anchor and presence record"),
+            "{rendered}"
+        );
     }
 
     #[test]
