@@ -1433,6 +1433,23 @@ impl WasmBindingCreationError {
     }
 }
 
+fn map_binding_creation_error<T>(
+    failure: WasmBindingCreationError,
+    instantiation: impl FnOnce(wasmtime::Error) -> T,
+    info_call: impl FnOnce(wasmtime::Error) -> T,
+    wall_budget_exceeded: impl FnOnce(&'static str, WallBudgetExceeded) -> T,
+    protocol_version: impl FnOnce(String) -> T,
+) -> T {
+    match failure {
+        WasmBindingCreationError::Instantiation(error) => instantiation(error),
+        WasmBindingCreationError::InfoCall(error) => info_call(error),
+        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
+            wall_budget_exceeded(operation, source)
+        }
+        WasmBindingCreationError::ProtocolVersion(message) => protocol_version(message),
+    }
+}
+
 use version_checked_bindings::wit_types;
 
 /// Owns all generated world bindings and enforces protocol preflight before
@@ -2344,20 +2361,31 @@ async fn create_runtime_instance(
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
     let result = create_instance_for_world(engine, component, provider_kind, world, budget).await;
-    result.map_err(|failure| match failure {
-        WasmBindingCreationError::Instantiation(failure) => {
-            WasmProviderInstanceError::Instantiation(
-                ProviderInstantiationError::from_single_attempt(engine, component, world, failure),
-            )
-        }
-        WasmBindingCreationError::InfoCall(error) => WasmProviderInstanceError::InfoCall(error),
-        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
-            WasmProviderInstanceError::WallBudgetExceeded { operation, source }
-        }
-        WasmBindingCreationError::ProtocolVersion(message) => {
-            WasmProviderInstanceError::ProtocolVersion(message)
-        }
+    result.map_err(|failure| {
+        map_binding_creation_error(
+            failure,
+            |failure| {
+                WasmProviderInstanceError::Instantiation(
+                    ProviderInstantiationError::from_single_attempt(
+                        engine, component, world, failure,
+                    ),
+                )
+            },
+            WasmProviderInstanceError::InfoCall,
+            |operation, source| WasmProviderInstanceError::WallBudgetExceeded { operation, source },
+            WasmProviderInstanceError::ProtocolVersion,
+        )
     })
+}
+
+fn info_call_load_error(error: wasmtime::Error) -> WasmProviderLoadError {
+    WasmProviderLoadError::metadata(
+        "Failed to call info()",
+        WasmGuestCallError {
+            context: None,
+            source: error,
+        },
+    )
 }
 
 fn single_attempt_load_error(
@@ -2366,28 +2394,20 @@ fn single_attempt_load_error(
     world: InstantiationWorld,
     failure: WasmBindingCreationError,
 ) -> WasmProviderLoadError {
-    match failure {
-        WasmBindingCreationError::Instantiation(failure) => {
+    map_binding_creation_error(
+        failure,
+        |failure| {
             ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
                 .into()
-        }
-        WasmBindingCreationError::InfoCall(error) => WasmProviderLoadError::metadata(
-            "Failed to call info()",
-            WasmGuestCallError {
-                context: None,
-                source: error,
-            },
-        ),
-        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
-            wall_budget_load_error(operation, source)
-        }
-        WasmBindingCreationError::ProtocolVersion(message) => message.into(),
-    }
+        },
+        info_call_load_error,
+        wall_budget_load_error,
+        WasmProviderLoadError::from,
+    )
 }
 
-/// Output of `create_instance_auto`: the instantiated store, the
-/// bindings, and whether the HTTP-enabled world was used.
-type CreateInstanceResult = Result<(GuestStore, WasmBindings, bool), WasmProviderLoadError>;
+/// Output of `create_instance_auto`: the instantiated store and bindings.
+type CreateInstanceResult = Result<(GuestStore, WasmBindings), WasmProviderLoadError>;
 
 /// Try HTTP instantiation first, then basic. On double failure, retain the
 /// complete HTTP-path error and component-derived compatibility context. The
@@ -2404,50 +2424,38 @@ type CreateInstanceResult = Result<(GuestStore, WasmBindings, bool), WasmProvide
 /// which combined with the deep call chain from `carina-cli` trips
 /// rustc's layout-computation query depth limit on recent stable
 /// toolchains (observed in `cargo check --all-features` CI).
-fn create_instance_auto<'a>(
-    engine: &'a Engine,
-    component: &'a Component,
-    provider_kind: Option<ProviderKind>,
-    budget: GuestCallBudget,
-) -> BoxFuture<'a, CreateInstanceResult> {
+fn create_instance_auto(rebuild: &mut RebuildContext) -> BoxFuture<'_, CreateInstanceResult> {
     Box::pin(async move {
-        match create_instance_with_http(engine, component, provider_kind, budget).await {
-            Ok((store, bindings)) => Ok((store, bindings, true)),
-            Err(WasmBindingCreationError::InfoCall(error)) => Err(WasmProviderLoadError::metadata(
-                "Failed to call info()",
-                WasmGuestCallError {
-                    context: None,
-                    source: error,
-                },
-            )),
-            Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
-                Err(wall_budget_load_error(operation, source))
-            }
-            Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
-            Err(WasmBindingCreationError::Instantiation(http_err)) => {
-                match create_instance(engine, component, provider_kind, budget).await {
-                    Ok((store, bindings)) => Ok((store, bindings, false)),
-                    Err(WasmBindingCreationError::InfoCall(error)) => {
-                        Err(WasmProviderLoadError::metadata(
-                            "Failed to call info()",
-                            WasmGuestCallError {
-                                context: None,
-                                source: error,
-                            },
-                        ))
-                    }
-                    Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
-                        Err(wall_budget_load_error(operation, source))
-                    }
-                    Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
-                    Err(WasmBindingCreationError::Instantiation(basic_err)) => {
-                        Err(ProviderInstantiationError::from_attempts(
-                            engine, component, http_err, basic_err,
-                        )
-                        .into())
+        let map_load_error = |failure| {
+            map_binding_creation_error(
+                failure,
+                Result::<wasmtime::Error, WasmProviderLoadError>::Ok,
+                |error| Err(info_call_load_error(error)),
+                |operation, source| Err(wall_budget_load_error(operation, source)),
+                |message| Err(message.into()),
+            )
+        };
+        match rebuild.create_instance().await {
+            Ok(instance) => Ok(instance),
+            Err(failure) => match map_load_error(failure) {
+                Err(error) => Err(error),
+                Ok(http_err) => {
+                    rebuild.world = InstantiationWorld::Basic;
+                    match rebuild.create_instance().await {
+                        Ok(instance) => Ok(instance),
+                        Err(failure) => match map_load_error(failure) {
+                            Err(error) => Err(error),
+                            Ok(basic_err) => Err(ProviderInstantiationError::from_attempts(
+                                &rebuild.engine,
+                                &rebuild.component,
+                                http_err,
+                                basic_err,
+                            )
+                            .into()),
+                        },
                     }
                 }
-            }
+            },
         }
     })
 }
@@ -2664,8 +2672,34 @@ impl FailFastInstance {
 struct RebuildContext {
     engine: Engine,
     component: Component,
+    provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
+}
+
+impl RebuildContext {
+    fn new(engine: Engine, component: Component, budget: GuestCallBudget) -> Self {
+        Self {
+            engine,
+            component,
+            provider_kind: None,
+            world: InstantiationWorld::HttpEnabled,
+            budget,
+        }
+    }
+
+    async fn create_instance(
+        &self,
+    ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
+        create_instance_for_world(
+            &self.engine,
+            &self.component,
+            self.provider_kind,
+            self.world,
+            self.budget,
+        )
+        .await
+    }
 }
 
 /// A failed validation-instance rebuild, retaining both why the previous
@@ -2722,28 +2756,12 @@ struct RebuildableInstance {
 }
 
 impl RebuildableInstance {
-    fn new(
-        store: GuestStore,
-        bindings: WasmBindings,
-        engine: Engine,
-        component: Component,
-        budget: GuestCallBudget,
-        enable_http: bool,
-    ) -> Self {
+    fn new(store: GuestStore, bindings: WasmBindings, rebuild: RebuildContext) -> Self {
         Self {
             slot: Mutex::new(InstanceSlot::Live(Box::new(LiveInstance::new(
                 store, bindings,
             )))),
-            rebuild: RebuildContext {
-                engine,
-                component,
-                world: if enable_http {
-                    InstantiationWorld::HttpEnabled
-                } else {
-                    InstantiationWorld::Basic
-                },
-                budget,
-            },
+            rebuild,
         }
     }
 
@@ -2754,23 +2772,19 @@ impl RebuildableInstance {
             InstanceSlot::Poisoned { reason } => Some(reason.clone()),
         };
         if let Some(reason) = poison_reason {
-            let (store, bindings) = create_instance_for_world(
-                &self.rebuild.engine,
-                &self.rebuild.component,
-                None,
-                self.rebuild.world,
-                self.rebuild.budget,
-            )
-            .await
-            .map_err(|failure| {
-                single_attempt_load_error(
-                    &self.rebuild.engine,
-                    &self.rebuild.component,
-                    self.rebuild.world,
-                    failure,
-                )
-            })
-            .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
+            let (store, bindings) = self
+                .rebuild
+                .create_instance()
+                .await
+                .map_err(|failure| {
+                    single_attempt_load_error(
+                        &self.rebuild.engine,
+                        &self.rebuild.component,
+                        self.rebuild.world,
+                        failure,
+                    )
+                })
+                .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
             *slot = InstanceSlot::Live(Box::new(LiveInstance::new(store, bindings)));
             log::warn!(
                 "rebuilt poisoned WASM provider validation instance; previous poison reason: \
@@ -3087,8 +3101,9 @@ impl WasmProviderFactory {
         configured: ConfiguredProvider,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
-        let (mut store, bindings, enable_http) =
-            create_instance_auto(&engine, &component, None, budget).await?;
+        let mut rebuild = RebuildContext::new(engine.clone(), component.clone(), budget);
+        let (mut store, bindings) = create_instance_auto(&mut rebuild).await?;
+        let enable_http = rebuild.world == InstantiationWorld::HttpEnabled;
         let info_json = bindings.info_json().to_owned();
 
         let (reported_name, display_name, version) =
@@ -3114,14 +3129,7 @@ impl WasmProviderFactory {
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
             Self::load_metadata(&bindings, &mut store, name, &version).await?;
-        let init_instance = RebuildableInstance::new(
-            store,
-            bindings,
-            engine.clone(),
-            component.clone(),
-            budget,
-            enable_http,
-        );
+        let init_instance = RebuildableInstance::new(store, bindings, rebuild);
 
         Ok(Self {
             engine,
@@ -8582,6 +8590,7 @@ mod tests {
             rebuild: RebuildContext {
                 engine,
                 component,
+                provider_kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
             },
