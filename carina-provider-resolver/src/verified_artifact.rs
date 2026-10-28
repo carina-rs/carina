@@ -206,6 +206,17 @@ impl ChecksumMismatch {
             ProjectCommand::new("init", &self.project_dir),
         )
     }
+
+    fn unchanged_revision_download_message(self) -> String {
+        format!(
+            "Downloaded provider '{}' ({}@{}) does not match the sha256 pinned in carina-providers.lock. Expected: {}, got: {}. The artifact for an unchanged commit changed after it was pinned; refusing to replace the lock entry.",
+            self.provider_name,
+            self.locked_source,
+            self.locked_identity,
+            self.expected_sha256,
+            self.actual_sha256,
+        )
+    }
 }
 
 pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
@@ -440,32 +451,51 @@ pub(crate) fn publish_cached<R>(
     Ok(verified)
 }
 
-pub(crate) fn publish_download<R, P>(
+fn publish_download_verified<R, P>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
-) -> Result<DownloadedArtifact<P>, String> {
+) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
     match pin {
         ArtifactPin::Pinned {
             lock_entry,
             provider_name,
             pin,
         } => publish_cached(staged, lock_entry, provider_name)
-            .map(|artifact| DownloadedArtifact::Verified { artifact, pin })
-            .map_err(VerifiedArtifactError::into_download_message),
+            .map(|artifact| DownloadedArtifact::Verified { artifact, pin }),
         ArtifactPin::Unpinned(FirstUse(())) => {
-            let sha256 = sha256_file(staged.path())
-                .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
+            let sha256 = sha256_file(staged.path()).map_err(|error| {
+                VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
+            })?;
             let path = staged.destination().clone();
             let published_path = path.as_path().to_path_buf();
             staged.publish().map_err(|error| {
-                format!(
+                VerifiedArtifactError::Other(format!(
                     "Failed to publish provider artifact {}: {error}",
                     published_path.display()
-                )
+                ))
             })?;
             Ok(DownloadedArtifact::FirstUse { path, sha256 })
         }
     }
+}
+
+pub(crate) fn publish_download<R, P>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+) -> Result<DownloadedArtifact<P>, String> {
+    publish_download_verified(staged, pin).map_err(VerifiedArtifactError::into_download_message)
+}
+
+pub(crate) fn publish_unchanged_revision_download<R, P>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+) -> Result<DownloadedArtifact<P>, String> {
+    publish_download_verified(staged, pin).map_err(|error| match error {
+        VerifiedArtifactError::ChecksumMismatch(mismatch) => {
+            mismatch.unchanged_revision_download_message()
+        }
+        VerifiedArtifactError::Other(message) => message,
+    })
 }
 
 pub(crate) fn lock_artifact_selection<'lock, R>(

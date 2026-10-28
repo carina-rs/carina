@@ -2178,6 +2178,26 @@ struct LockFileVersion {
 
 /// Discard the one pre-artifact-pin lock shape at the raw-value boundary, then
 /// let the canonical lock-entry types validate every retained table.
+fn is_legacy_revision_entry(entry: &toml::Table) -> bool {
+    const LEGACY_KEYS: [&str; 6] = [
+        "name",
+        "source",
+        "mode",
+        "revision",
+        "resolved_sha",
+        "sha256",
+    ];
+
+    if entry.get("mode").and_then(toml::Value::as_str) != Some("revision") {
+        return false;
+    }
+
+    // LockEntry already allowed optional registry metadata before artifact IDs
+    // were introduced, so that is the only additional legacy key accepted.
+    let expected_len = LEGACY_KEYS.len() + usize::from(entry.contains_key("registry"));
+    entry.len() == expected_len && LEGACY_KEYS.iter().all(|key| entry.contains_key(*key))
+}
+
 fn deserialize_provider_entries<'de, D, R>(deserializer: D) -> Result<Vec<LockEntry<R>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2186,10 +2206,7 @@ where
     let entries = Vec::<toml::Table>::deserialize(deserializer)?;
     entries
         .into_iter()
-        .filter(|entry| {
-            entry.get("mode").and_then(toml::Value::as_str) != Some("revision")
-                || entry.contains_key("artifact_id")
-        })
+        .filter(|entry| !is_legacy_revision_entry(entry))
         .map(|entry| {
             toml::Value::Table(entry)
                 .try_into()
@@ -6481,7 +6498,7 @@ fn resolve_config_with_http<H: RegistryHttp>(
                 github_source,
                 revision,
                 &config.name,
-                mode == LockMode::Upgrade,
+                mode,
             )?;
             Ok(path)
         }
@@ -9043,6 +9060,27 @@ sha256 = "legacy"
     }
 
     #[test]
+    fn legacy_revision_filter_requires_exact_keys_and_allows_registry() {
+        let mut entry = toml::Table::new();
+        for (key, value) in [
+            ("name", "awscc"),
+            ("source", "github.com/carina-rs/carina-provider-awscc"),
+            ("mode", "revision"),
+            ("revision", "main"),
+            ("resolved_sha", "deadbeef"),
+            ("sha256", "legacy"),
+        ] {
+            entry.insert(key.to_string(), toml::Value::String(value.to_string()));
+        }
+
+        assert!(is_legacy_revision_entry(&entry));
+        entry.insert("registry".into(), toml::Value::Table(toml::Table::new()));
+        assert!(is_legacy_revision_entry(&entry));
+        entry.insert("artifact_ld".into(), toml::Value::Integer(42));
+        assert!(!is_legacy_revision_entry(&entry));
+    }
+
+    #[test]
     fn malformed_revision_artifact_id_is_a_parse_error() {
         let serialized = format!(
             r#"version = {}
@@ -9065,6 +9103,31 @@ sha256 = "malformed"
         assert!(matches!(&error, LockFileError::Parse { .. }), "{error}");
         let rendered = error.to_string();
         assert!(rendered.contains("expected u64"), "{rendered}");
+    }
+
+    #[test]
+    fn misspelled_revision_artifact_id_is_not_treated_as_legacy() {
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "deadbeef"
+artifact_ld = 42
+sha256 = "malformed"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+
+        let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect_err("a misspelled artifact ID must reach typed deserialization");
+
+        assert!(matches!(&error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("artifact_id"), "{rendered}");
     }
 
     fn provider_config(source: &str, revision: Option<&str>) -> ProviderConfig {
@@ -13086,6 +13149,27 @@ transparency_log_present = true
         let entry = lock.find_by_source(&source).unwrap();
         assert_eq!(entry.kind, LockEntryKind::File);
         assert!(!entry.sha256.is_empty());
+    }
+
+    #[test]
+    fn resolve_all_locked_saves_file_provider_lock_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_path = tmp.path().join("locked-file-provider.wasm");
+        let wasm = b"locked file provider";
+        fs::write(&wasm_path, wasm).unwrap();
+
+        let source = format!("file://{}", wasm_path.display());
+        let config = provider_config(&source, None);
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+
+        resolve_all(&install_lock, &[config], LockMode::Locked).unwrap();
+
+        let lock = load_lock_file_for_test(&provider_lock_path(tmp.path()))
+            .unwrap()
+            .expect("a Locked run must still save non-revision lock state");
+        let entry = lock.find_by_source(&source).unwrap();
+        assert_eq!(entry.kind, LockEntryKind::File);
+        assert_eq!(entry.sha256, sha256_bytes(wasm));
     }
 
     #[test]
