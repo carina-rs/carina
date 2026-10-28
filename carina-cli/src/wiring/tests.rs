@@ -472,7 +472,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -1321,7 +1321,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -1428,7 +1428,7 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> ProviderResult<()> {
             Ok(())
         }
 
@@ -1504,7 +1504,7 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -1597,7 +1597,7 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -1773,7 +1773,7 @@ impl ProviderFactory for CascadeAwsccFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -2102,7 +2102,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -2413,7 +2413,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         fn validate_config(
             &self,
             attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(tokio::time::sleep(std::time::Duration::ZERO));
@@ -2531,7 +2531,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -4032,7 +4032,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -5677,7 +5677,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -8354,7 +8354,7 @@ mod resolved_value_constraint_gate {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
@@ -8362,9 +8362,11 @@ mod resolved_value_constraint_gate {
             &self,
             identity: &TypeIdentity,
             value: &carina_core::provider::CanonicalCustomTypeValue,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             if identity.kind == "ExternalId" && value.as_str() == "bad" {
-                Err("external id rejected".to_string())
+                Err(carina_core::provider::ProviderError::invalid_input(
+                    "external id rejected",
+                ))
             } else {
                 Ok(())
             }
@@ -8467,7 +8469,7 @@ mod resolved_value_constraint_gate {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 

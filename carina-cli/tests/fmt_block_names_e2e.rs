@@ -53,7 +53,7 @@ impl ProviderFactory for FormattingFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 

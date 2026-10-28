@@ -1060,7 +1060,7 @@ impl ProviderFactory for AliasFactory {
     fn validate_config(
         &self,
         _attributes: &crate::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> crate::provider::ProviderResult<()> {
         Ok(())
     }
     fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {

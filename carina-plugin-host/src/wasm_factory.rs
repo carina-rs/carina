@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -351,6 +352,16 @@ enum InstantiationWorld {
     Basic,
 }
 
+impl InstantiationWorld {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn test_name(self) -> &'static str {
+        match self {
+            Self::HttpEnabled => "http-enabled",
+            Self::Basic => "basic",
+        }
+    }
+}
+
 /// The attempt shape is explicit: the load path carries its dual-attempt
 /// fallback disposition, while the runtime path carries exactly one selected
 /// world and cannot represent a fallback that never happened.
@@ -608,6 +619,18 @@ impl WasmProviderLoadError {
             source: Box::new(source),
         }
     }
+
+    /// Whether this load failure came from the wall-clock budget enforced by
+    /// [`GuestStore::call`]. The typed source installed by
+    /// [`wall_budget_load_error`] is the classification boundary; diagnostic
+    /// text is deliberately not inspected.
+    fn is_wall_budget_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Metadata { source, .. }
+                if source.downcast_ref::<WasmWallBudgetError>().is_some()
+        )
+    }
 }
 
 impl From<ProviderInstantiationError> for WasmProviderLoadError {
@@ -853,152 +876,6 @@ impl Drop for EpochTicker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-    }
-}
-
-/// If `poisoned` is set, return the fail-fast error a poisoned instance
-/// must give for `operation`; otherwise `None` and the caller may proceed.
-/// Component traps and observed wall timeouts retain their originating
-/// operation; cancellation before a timeout is observed retains the legacy
-/// generic diagnostic.
-fn poisoned_guard(
-    poisoned: &AtomicBool,
-    poisoned_reason: &OnceLock<String>,
-    operation: &str,
-) -> Option<ProviderError> {
-    if !poisoned.load(Ordering::Acquire) {
-        return None;
-    }
-
-    Some(match poisoned_reason.get() {
-        Some(reason) => ProviderError::internal(format!(
-            "{reason} (operation '{operation}'); re-run the command"
-        )),
-        None => ProviderError::internal(format!(
-            "WASM provider is unusable: a prior operation timed out and left \
-             the plugin instance in an undefined state (operation \
-             '{operation}'); re-run the command"
-        )),
-    })
-}
-
-fn poison_after_trap(
-    poisoned: &AtomicBool,
-    poisoned_reason: &OnceLock<String>,
-    operation: &'static str,
-    error: &wasmtime::Error,
-) {
-    let root_cause = error.root_cause().to_string();
-    let root_cause = root_cause.lines().next().unwrap_or("unknown WASM trap");
-    let cause = match error.downcast_ref::<wasmtime::Trap>() {
-        Some(trap) => {
-            let trap = trap.to_string();
-            if trap == root_cause {
-                trap
-            } else {
-                format!("{trap}: {root_cause}")
-            }
-        }
-        None => root_cause.to_string(),
-    };
-    let _ = poisoned_reason.set(format!(
-        "WASM provider instance unusable after trap in {operation}: {cause}"
-    ));
-    poisoned.store(true, Ordering::Release);
-}
-
-/// A held store lock that poisons its instance on drop **unless
-/// [`disarm`](Self::disarm)ed** after the guest call completed.
-///
-/// Field order is load-bearing: Rust drops fields in declaration order,
-/// so `poison` (the [`PoisonOnDrop`] guard) drops *before* `store` (the
-/// `MutexGuard`). When the wall timeout in `GuestStore::call` drops only the
-/// guest future, this whole value is dropped afterwards as the caller
-/// propagates the timeout error with the guard still armed, so the flag is set
-/// **while the store `Mutex` is still held**, closing the window where a
-/// sibling operation already queued on the lock could otherwise acquire the
-/// freed-but-not-yet-flagged store and call into the unusable wasmtime `Store`
-/// (carina#3106). On timeout the caller immediately propagates the error while
-/// this guard remains armed, so the same drop-order guarantee applies even
-/// though lock acquisition is now outside the timeout. A returned guest call
-/// is disarmed; returned component traps are then poisoned explicitly with
-/// their origin preserved.
-struct LockedStore<'a> {
-    poison: PoisonOnDrop<'a>,
-    store: tokio::sync::MutexGuard<'a, GuestStore>,
-}
-
-/// Sets `poisoned` on drop unless disarmed. Separate from [`LockedStore`]
-/// only so the drop-order guarantee is expressed by field ordering.
-struct PoisonOnDrop<'a> {
-    poisoned: &'a AtomicBool,
-    poisoned_reason: &'a OnceLock<String>,
-    armed: bool,
-}
-
-impl Drop for PoisonOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.poisoned.store(true, Ordering::Release);
-        }
-    }
-}
-
-impl<'a> LockedStore<'a> {
-    /// Acquire the store lock for `operation`, re-checking the poison
-    /// flag *after* the lock is held (an op queued on the `Mutex` when a
-    /// sibling poisoned the instance passed an earlier pre-flight check while
-    /// the flag was still clear).
-    async fn acquire(
-        instance: &'a SharedWasmInstance,
-        operation: &str,
-    ) -> ProviderResult<LockedStore<'a>> {
-        if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
-        {
-            return Err(err);
-        }
-        let store = instance.store.lock().await;
-        if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
-        {
-            return Err(err);
-        }
-        Ok(LockedStore {
-            poison: PoisonOnDrop {
-                poisoned: &instance.poisoned,
-                poisoned_reason: &instance.poisoned_reason,
-                armed: true,
-            },
-            store,
-        })
-    }
-
-    /// The guest call returned rather than being cancelled. Disable automatic
-    /// cancellation poisoning; a caller handling a returned component trap can
-    /// still mark the instance explicitly before releasing the store lock.
-    fn disarm(&mut self) {
-        self.poison.armed = false;
-    }
-
-    /// Run one guest call under the wall-clock budget stored with this store.
-    ///
-    /// If the deadline elapses, the guest future is dropped while this guard
-    /// remains armed. Dropping the guard then poisons the instance before the
-    /// store lock is released.
-    async fn call<'s, T, F>(
-        &'s mut self,
-        operation: &'static str,
-        f: impl FnOnce(&'s mut Store<HostState>) -> F,
-    ) -> ProviderResult<T>
-    where
-        T: 'static,
-        F: Future<Output = T> + 's,
-    {
-        self.store.call(f).await.map_err(|error| {
-            let _ = self.poison.poisoned_reason.set(format!(
-                "WASM provider instance unusable after wall-clock timeout in {operation}"
-            ));
-            wall_budget_provider_error(operation, error)
-        })
     }
 }
 
@@ -1566,6 +1443,23 @@ impl WasmBindingCreationError {
             }
             Self::ProtocolVersion(message) => Self::ProtocolVersion(message),
         }
+    }
+}
+
+fn map_binding_creation_error<T>(
+    failure: WasmBindingCreationError,
+    instantiation: impl FnOnce(wasmtime::Error) -> T,
+    info_call: impl FnOnce(wasmtime::Error) -> T,
+    wall_budget_exceeded: impl FnOnce(&'static str, WallBudgetExceeded) -> T,
+    protocol_version: impl FnOnce(String) -> T,
+) -> T {
+    match failure {
+        WasmBindingCreationError::Instantiation(error) => instantiation(error),
+        WasmBindingCreationError::InfoCall(error) => info_call(error),
+        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
+            wall_budget_exceeded(operation, source)
+        }
+        WasmBindingCreationError::ProtocolVersion(message) => protocol_version(message),
     }
 }
 
@@ -2453,43 +2347,82 @@ async fn create_instance_with_http(
 
 /// Instantiate exactly the world selected when the factory was loaded.
 ///
-/// Runtime per-binding instances do not retry another world. Keeping the
-/// selection and typed error construction in one function prevents either
-/// branch from flattening its Wasmtime failure or inventing fallback context.
-async fn create_runtime_instance(
+/// Runtime per-binding instances and validation-instance rebuilds share this
+/// selection point, so neither path probes or retries a different world.
+async fn create_instance_for_world(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
-) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
-    let result = match world {
+) -> Result<LiveInstance, WasmBindingCreationError> {
+    let (store, bindings) = match world {
         InstantiationWorld::HttpEnabled => {
             create_instance_with_http(engine, component, provider_kind, budget).await
         }
         InstantiationWorld::Basic => {
             create_instance(engine, component, provider_kind, budget).await
         }
-    };
-    result.map_err(|failure| match failure {
-        WasmBindingCreationError::Instantiation(failure) => {
-            WasmProviderInstanceError::Instantiation(
-                ProviderInstantiationError::from_single_attempt(engine, component, world, failure),
-            )
-        }
-        WasmBindingCreationError::InfoCall(error) => WasmProviderInstanceError::InfoCall(error),
-        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
-            WasmProviderInstanceError::WallBudgetExceeded { operation, source }
-        }
-        WasmBindingCreationError::ProtocolVersion(message) => {
-            WasmProviderInstanceError::ProtocolVersion(message)
-        }
+    }?;
+    Ok(LiveInstance::new(store, bindings, world))
+}
+
+async fn create_runtime_instance(
+    engine: &Engine,
+    component: &Component,
+    provider_kind: Option<ProviderKind>,
+    world: InstantiationWorld,
+    budget: GuestCallBudget,
+) -> Result<LiveInstance, WasmProviderInstanceError> {
+    let result = create_instance_for_world(engine, component, provider_kind, world, budget).await;
+    result.map_err(|failure| {
+        map_binding_creation_error(
+            failure,
+            |failure| {
+                WasmProviderInstanceError::Instantiation(
+                    ProviderInstantiationError::from_single_attempt(
+                        engine, component, world, failure,
+                    ),
+                )
+            },
+            WasmProviderInstanceError::InfoCall,
+            |operation, source| WasmProviderInstanceError::WallBudgetExceeded { operation, source },
+            WasmProviderInstanceError::ProtocolVersion,
+        )
     })
 }
 
-/// Output of `create_instance_auto`: the instantiated store, the
-/// bindings, and whether the HTTP-enabled world was used.
-type CreateInstanceResult = Result<(GuestStore, WasmBindings, bool), WasmProviderLoadError>;
+fn info_call_load_error(error: wasmtime::Error) -> WasmProviderLoadError {
+    WasmProviderLoadError::metadata(
+        "Failed to call info()",
+        WasmGuestCallError {
+            context: None,
+            source: error,
+        },
+    )
+}
+
+fn single_attempt_load_error(
+    engine: &Engine,
+    component: &Component,
+    world: InstantiationWorld,
+    failure: WasmBindingCreationError,
+) -> WasmProviderLoadError {
+    map_binding_creation_error(
+        failure,
+        |failure| {
+            ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
+                .into()
+        },
+        info_call_load_error,
+        wall_budget_load_error,
+        WasmProviderLoadError::from,
+    )
+}
+
+/// Output of `create_instance_auto`: one callable instance tagged with the
+/// world whose linker instantiated it.
+type CreateInstanceResult = Result<LiveInstance, WasmProviderLoadError>;
 
 /// Try HTTP instantiation first, then basic. On double failure, retain the
 /// complete HTTP-path error and component-derived compatibility context. The
@@ -2506,91 +2439,754 @@ type CreateInstanceResult = Result<(GuestStore, WasmBindings, bool), WasmProvide
 /// which combined with the deep call chain from `carina-cli` trips
 /// rustc's layout-computation query depth limit on recent stable
 /// toolchains (observed in `cargo check --all-features` CI).
-fn create_instance_auto<'a>(
-    engine: &'a Engine,
-    component: &'a Component,
-    provider_kind: Option<ProviderKind>,
-    budget: GuestCallBudget,
-) -> BoxFuture<'a, CreateInstanceResult> {
+fn create_instance_auto(rebuild: &mut RebuildContext) -> BoxFuture<'_, CreateInstanceResult> {
     Box::pin(async move {
-        match create_instance_with_http(engine, component, provider_kind, budget).await {
-            Ok((store, bindings)) => Ok((store, bindings, true)),
-            Err(WasmBindingCreationError::InfoCall(error)) => Err(WasmProviderLoadError::metadata(
-                "Failed to call info()",
-                WasmGuestCallError {
-                    context: None,
-                    source: error,
-                },
-            )),
-            Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
-                Err(wall_budget_load_error(operation, source))
-            }
-            Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
-            Err(WasmBindingCreationError::Instantiation(http_err)) => {
-                match create_instance(engine, component, provider_kind, budget).await {
-                    Ok((store, bindings)) => Ok((store, bindings, false)),
-                    Err(WasmBindingCreationError::InfoCall(error)) => {
-                        Err(WasmProviderLoadError::metadata(
-                            "Failed to call info()",
-                            WasmGuestCallError {
-                                context: None,
-                                source: error,
-                            },
-                        ))
-                    }
-                    Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
-                        Err(wall_budget_load_error(operation, source))
-                    }
-                    Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
-                    Err(WasmBindingCreationError::Instantiation(basic_err)) => {
-                        Err(ProviderInstantiationError::from_attempts(
-                            engine, component, http_err, basic_err,
-                        )
-                        .into())
+        let map_load_error = |failure| {
+            map_binding_creation_error(
+                failure,
+                Result::<wasmtime::Error, WasmProviderLoadError>::Ok,
+                |error| Err(info_call_load_error(error)),
+                |operation, source| Err(wall_budget_load_error(operation, source)),
+                |message| Err(message.into()),
+            )
+        };
+        match rebuild.create_instance().await {
+            Ok(instance) => Ok(instance),
+            Err(failure) => match map_load_error(failure) {
+                Err(error) => Err(error),
+                Ok(http_err) => {
+                    rebuild.world = InstantiationWorld::Basic;
+                    match rebuild.create_instance().await {
+                        Ok(instance) => Ok(instance),
+                        Err(failure) => match map_load_error(failure) {
+                            Err(error) => Err(error),
+                            Ok(basic_err) => Err(ProviderInstantiationError::from_attempts(
+                                &rebuild.engine,
+                                &rebuild.component,
+                                http_err,
+                                basic_err,
+                            )
+                            .into()),
+                        },
                     }
                 }
-            }
+            },
         }
     })
 }
 
-// -- SharedWasmInstance --
+// -- Shared WASM instance state --
 
-/// A single WASM instance (store + bindings) shared between `WasmProvider`
-/// and `WasmProviderNormalizer`. Both hold an `Arc` to this struct and
-/// serialize access through the `Mutex<GuestStore>`.
-struct SharedWasmInstance {
-    store: Mutex<GuestStore>,
-    bindings: WasmBindings,
-    /// Set once a timeout/cancellation or a component trap leaves the shared
-    /// component instance unusable. Once set, every subsequent operation fails
-    /// fast instead of touching the instance and producing a secondary,
-    /// misleading trap or silent corruption across the remaining resources in
-    /// the plan/apply (carina#3106).
-    poisoned: AtomicBool,
-    /// Stable diagnostic for a trap or observed wall timeout that made the
-    /// component instance non-reentrant. Cancellation before the timeout is
-    /// observed retains the generic poisoned message; returned traps and wall
-    /// timeouts record their originating operation so a later call cannot
-    /// misattribute the failure to itself.
-    poisoned_reason: OnceLock<String>,
+/// A validation operation whose input participates in rebuild suspension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ValidationOperation {
+    ValidateConfig,
+    ValidateCustomType,
 }
 
-impl SharedWasmInstance {
-    fn new(store: GuestStore, bindings: WasmBindings) -> Self {
-        Self {
-            store: Mutex::new(store),
-            bindings,
-            poisoned: AtomicBool::new(false),
-            poisoned_reason: OnceLock::new(),
+impl ValidationOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidateConfig => "validate_config",
+            Self::ValidateCustomType => "validate_custom_type",
         }
     }
 }
 
-// Safety: The GuestStore is behind a Mutex, so concurrent access is serialized.
-// The bindings are only used while the store mutex is held.
-unsafe impl Send for SharedWasmInstance {}
-unsafe impl Sync for SharedWasmInstance {}
+/// Secret-safe identity of one validation call.
+///
+/// Provider bytes are fixed for the lifetime of a factory, so the operation
+/// and keyed SHA-256 digest of the already-converted WIT arguments are
+/// sufficient to distinguish validation contexts. No cleartext validation
+/// value is retained.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ValidationContextFingerprint {
+    operation: ValidationOperation,
+    keyed_input_sha256: [u8; 32],
+}
+
+impl fmt::Debug for ValidationContextFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidationContextFingerprint")
+            .field("operation", &self.operation)
+            .field("digest", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ValidationContextFingerprint {
+    fn validate_config(key: &[u8; 32], attributes: &[(String, wit_types::Value)]) -> Self {
+        let operation = ValidationOperation::ValidateConfig;
+        let mut hasher = validation_fingerprint_hasher(key, operation);
+        let mut attributes = attributes.iter().collect::<Vec<_>>();
+        attributes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (name, value) in attributes {
+            hash_validation_bytes(&mut hasher, name.as_bytes());
+            hash_wit_validation_value(&mut hasher, value);
+        }
+        Self {
+            operation,
+            keyed_input_sha256: hasher.finalize().into_bytes().into(),
+        }
+    }
+
+    fn validate_custom_type(
+        key: &[u8; 32],
+        identity: &wit_types::TypeIdentity,
+        value: &str,
+    ) -> Self {
+        let operation = ValidationOperation::ValidateCustomType;
+        let mut hasher = validation_fingerprint_hasher(key, operation);
+        hash_validation_bytes(&mut hasher, identity.provider.as_bytes());
+        let segment_count = u64::try_from(identity.segments.len())
+            .expect("validation type segment count must fit in u64");
+        hasher.update(&segment_count.to_be_bytes());
+        for segment in &identity.segments {
+            hash_validation_bytes(&mut hasher, segment.as_bytes());
+        }
+        hash_validation_bytes(&mut hasher, identity.kind.as_bytes());
+        hash_validation_bytes(&mut hasher, value.as_bytes());
+        Self {
+            operation,
+            keyed_input_sha256: hasher.finalize().into_bytes().into(),
+        }
+    }
+
+    const fn operation(&self) -> &'static str {
+        self.operation.as_str()
+    }
+
+    const fn suspended_validation_id(&self) -> carina_core::provider::SuspendedValidationId {
+        carina_core::provider::SuspendedValidationId::from_keyed_fingerprint(
+            self.keyed_input_sha256,
+        )
+    }
+}
+
+type ValidationFingerprintHasher = Hmac<Sha256>;
+
+fn validation_fingerprint_hasher(
+    key: &[u8; 32],
+    operation: ValidationOperation,
+) -> ValidationFingerprintHasher {
+    let mut hasher = ValidationFingerprintHasher::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts every 32-byte validation fingerprint key");
+    hash_validation_bytes(&mut hasher, operation.as_str().as_bytes());
+    hasher
+}
+
+fn random_validation_fingerprint_key() -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key)
+        .expect("the host must provide randomness for validation fingerprints");
+    key
+}
+
+fn hash_validation_bytes(hasher: &mut ValidationFingerprintHasher, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).expect("validation input length must fit in u64");
+    hasher.update(&len.to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_wit_validation_value(hasher: &mut ValidationFingerprintHasher, value: &wit_types::Value) {
+    match value {
+        wit_types::Value::BoolVal(value) => {
+            hasher.update(&[0]);
+            hasher.update(&[u8::from(*value)]);
+        }
+        wit_types::Value::IntVal(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_be_bytes());
+        }
+        wit_types::Value::FloatVal(value) => {
+            hasher.update(&[2]);
+            hasher.update(&value.to_bits().to_be_bytes());
+        }
+        wit_types::Value::StrVal(value) => {
+            hasher.update(&[3]);
+            hash_validation_bytes(hasher, value.as_bytes());
+        }
+        wit_types::Value::StringListVal(value) => {
+            hasher.update(&[4]);
+            hash_validation_bytes(hasher, value.as_bytes());
+        }
+        wit_types::Value::ListVal(value) => {
+            hasher.update(&[5]);
+            hash_validation_bytes(hasher, value.as_bytes());
+        }
+        wit_types::Value::MapVal(value) => {
+            hasher.update(&[6]);
+            hash_validation_bytes(hasher, value.as_bytes());
+        }
+        wit_types::Value::SecretVal(value) => {
+            hasher.update(&[7]);
+            hash_validation_bytes(hasher, value.as_bytes());
+        }
+    }
+}
+
+/// Why a component instance can no longer be entered safely.
+///
+/// The originating operation and typed Wasmtime trap classification are kept
+/// separately from the rejected follow-up operation, so fail-fast diagnostics
+/// never misattribute an earlier failure to a later guest call.
+#[derive(Clone, Debug)]
+enum PoisonReason {
+    /// A guest future was cancelled before Wasmtime returned a result.
+    Cancelled,
+    /// The host observed the wall-clock deadline while the guest was in flight.
+    WallClockTimeout { operation: &'static str },
+    /// Wasmtime returned a component trap.
+    Trap {
+        operation: &'static str,
+        trap: Option<wasmtime::Trap>,
+        root_cause: Box<str>,
+    },
+}
+
+impl PoisonReason {
+    fn from_trap(operation: &'static str, error: &wasmtime::Error) -> Self {
+        let root_cause = error.root_cause().to_string();
+        let root_cause = root_cause
+            .lines()
+            .next()
+            .unwrap_or("unknown WASM trap")
+            .into();
+        Self::Trap {
+            operation,
+            trap: error.downcast_ref::<wasmtime::Trap>().copied(),
+            root_cause,
+        }
+    }
+
+    fn fail_fast_error(&self, operation: &'static str) -> ProviderError {
+        ProviderError::internal(format!(
+            "{self} (operation '{operation}'); re-run the command"
+        ))
+    }
+}
+
+impl fmt::Display for PoisonReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str(
+                "WASM provider is unusable: a prior operation was cancelled and left the plugin \
+                 instance in an undefined state",
+            ),
+            Self::WallClockTimeout { operation } => write!(
+                f,
+                "WASM provider instance unusable after wall-clock timeout in {operation}"
+            ),
+            Self::Trap {
+                operation,
+                trap,
+                root_cause,
+            } => {
+                write!(
+                    f,
+                    "WASM provider instance unusable after trap in {operation}: "
+                )?;
+                match trap {
+                    Some(trap) if trap.to_string() == root_cause.as_ref() => trap.fmt(f),
+                    Some(trap) => write!(f, "{trap}: {root_cause}"),
+                    None => f.write_str(root_cause),
+                }
+            }
+        }
+    }
+}
+
+/// A callable component instance. Store and bindings live and die together,
+/// so a poisoned instance slot has neither object available for a guest call.
+struct LiveInstance {
+    store: GuestStore,
+    bindings: WasmBindings,
+    world: InstantiationWorld,
+}
+
+impl LiveInstance {
+    fn new(store: GuestStore, bindings: WasmBindings, world: InstantiationWorld) -> Self {
+        Self {
+            store,
+            bindings,
+            world,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn instantiation_world(&self) -> InstantiationWorld {
+        self.world
+    }
+}
+
+/// The complete health state protected by a configured provider instance.
+///
+/// There is deliberately no representation containing a poisoned store or
+/// bindings: poisoning replaces `Live` wholesale and drops both while the
+/// mutex remains held.
+enum FailFastSlot {
+    Live(Box<LiveInstance>),
+    Poisoned { reason: PoisonReason },
+}
+
+/// Exclusive access to a [`LiveInstance`]. This guard can only be constructed
+/// after matching [`FailFastSlot::Live`].
+///
+/// The one-call shape is enforced by ownership: [`LiveInstanceGuard::call`]
+/// consumes this armed guard, classifies the Wasmtime result, and releases the
+/// lock before returning the guest value. A well-typed caller therefore cannot
+/// start a second guest call, forget to classify a returned trap, or retain a
+/// guard while decoding the guest value.
+///
+/// Cancellation replaces the slot with `Poisoned` from `Drop` before the mutex
+/// guard is released. An observed timeout or returned trap replaces the slot
+/// immediately. This preserves the carina#3106 guarantee that a queued sibling
+/// can never acquire and enter the dead store.
+struct LiveInstanceGuard<'a> {
+    slot: Option<tokio::sync::MutexGuard<'a, FailFastSlot>>,
+}
+
+impl<'a> LiveInstanceGuard<'a> {
+    fn from_slot(
+        slot: tokio::sync::MutexGuard<'a, FailFastSlot>,
+        operation: &'static str,
+    ) -> ProviderResult<Self> {
+        match &*slot {
+            FailFastSlot::Live(_) => {}
+            FailFastSlot::Poisoned { reason } => {
+                return Err(reason.fail_fast_error(operation));
+            }
+        }
+        Ok(Self { slot: Some(slot) })
+    }
+
+    /// Replace the live slot while its mutex is held, dropping the unusable
+    /// store and bindings before any queued operation can acquire the lock.
+    fn poison(mut self, reason: PoisonReason) {
+        let mut slot = self
+            .slot
+            .take()
+            .expect("an armed LiveInstanceGuard always owns its slot");
+        *slot = FailFastSlot::Poisoned { reason };
+    }
+
+    /// Run one guest call under the live store's wall-clock budget.
+    async fn call<U, F>(mut self, operation: &'static str, f: F) -> ProviderResult<U>
+    where
+        U: 'static,
+        F: AsyncFnOnce(&WasmBindings, &mut Store<HostState>) -> wasmtime::Result<U>,
+    {
+        let slot = self
+            .slot
+            .as_mut()
+            .expect("an armed LiveInstanceGuard always owns its slot");
+        let FailFastSlot::Live(live) = &mut **slot else {
+            unreachable!("LiveInstanceGuard can only hold a live slot");
+        };
+        let (store, bindings) = (&mut live.store, &live.bindings);
+        let call = match store.call(|store| f(bindings, store)).await {
+            Ok(call) => call,
+            Err(error) => {
+                self.poison(PoisonReason::WallClockTimeout { operation });
+                return Err(wall_budget_provider_error(operation, error));
+            }
+        };
+        match call {
+            Ok(value) => {
+                drop(
+                    self.slot
+                        .take()
+                        .expect("a successful guest call must still own its slot"),
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                let reason = PoisonReason::from_trap(operation, &error);
+                self.poison(reason);
+                Err(wasm_trap_provider_error(operation, error))
+            }
+        }
+    }
+}
+
+impl Drop for LiveInstanceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = &mut self.slot {
+            **slot = FailFastSlot::Poisoned {
+                reason: PoisonReason::Cancelled,
+            };
+        }
+    }
+}
+
+/// Shared configured provider/normalizer instance with fail-fast poisoning.
+///
+/// A trap, timeout, or cancellation permanently changes its slot to
+/// [`FailFastSlot::Poisoned`]. Later plan/apply operations receive the original
+/// reason and never continue on a freshly configured instance (carina#3106).
+struct FailFastInstance {
+    slot: Mutex<FailFastSlot>,
+}
+
+impl FailFastInstance {
+    fn new(live: LiveInstance) -> Self {
+        Self {
+            slot: Mutex::new(FailFastSlot::Live(Box::new(live))),
+        }
+    }
+
+    async fn acquire(&self, operation: &'static str) -> ProviderResult<LiveInstanceGuard<'_>> {
+        LiveInstanceGuard::from_slot(self.slot.lock().await, operation)
+    }
+}
+
+const MAX_VALIDATION_INPUT_HEALTH_ENTRIES: usize = 64;
+
+/// Timeout history for one secret-safe validation input fingerprint.
+#[derive(Clone, Debug)]
+enum InputHealth {
+    TimedOutOnce,
+    Suspended { reason: PoisonReason },
+}
+
+/// Whether the reusable validation instance is safe to enter.
+enum ValidationInstanceState {
+    Live(Box<LiveInstance>),
+    Poisoned { reason: PoisonReason },
+}
+
+/// Complete mutex-protected policy state for factory validation.
+///
+/// Instance health and per-input timeout history deliberately live in one
+/// state object so rebuilding or successfully validating another input cannot
+/// reset a suspended input's history.
+struct RebuildableState {
+    instance: ValidationInstanceState,
+    input_health: IndexMap<ValidationContextFingerprint, InputHealth>,
+}
+
+impl RebuildableState {
+    fn new(live: LiveInstance) -> Self {
+        Self {
+            instance: ValidationInstanceState::Live(Box::new(live)),
+            input_health: IndexMap::new(),
+        }
+    }
+
+    fn suspended_reason(&self, context: &ValidationContextFingerprint) -> Option<&PoisonReason> {
+        match self.input_health.get(context) {
+            Some(InputHealth::Suspended { reason }) => Some(reason),
+            Some(InputHealth::TimedOutOnce) | None => None,
+        }
+    }
+
+    fn record_wall_clock_timeout(
+        &mut self,
+        context: ValidationContextFingerprint,
+        reason: PoisonReason,
+    ) {
+        let previous = self.input_health.shift_remove(&context);
+        let health = match previous {
+            Some(InputHealth::TimedOutOnce | InputHealth::Suspended { .. }) => {
+                InputHealth::Suspended {
+                    reason: reason.clone(),
+                }
+            }
+            None => InputHealth::TimedOutOnce,
+        };
+        if self.input_health.len() == MAX_VALIDATION_INPUT_HEALTH_ENTRIES {
+            self.input_health.shift_remove_index(0);
+        }
+        self.input_health.insert(context, health);
+        self.instance = ValidationInstanceState::Poisoned { reason };
+    }
+
+    fn record_success(&mut self, context: &ValidationContextFingerprint) {
+        self.input_health.shift_remove(context);
+    }
+}
+
+fn suspended_validation_error(
+    reason: &PoisonReason,
+    context: &ValidationContextFingerprint,
+) -> ProviderError {
+    let original_operation = match reason {
+        PoisonReason::WallClockTimeout { operation, .. } => *operation,
+        PoisonReason::Cancelled | PoisonReason::Trap { .. } => context.operation(),
+    };
+    ProviderError::timeout(format!(
+        "provider validation is suspended after repeated wall-clock timeouts for this input in \
+         {original_operation}; changing this value (or restarting with a new provider version) \
+         resumes validation"
+    ))
+    .with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended(
+        context.suspended_validation_id(),
+    ))
+}
+
+/// Exclusive, one-call access to a rebuildable validation instance.
+///
+/// Like [`LiveInstanceGuard`], this guard owns the slot lock through the guest
+/// call and replaces the live state before releasing it on timeout, trap, or
+/// cancellation. This preserves the carina#3106 lock/drop ordering guarantee.
+struct RebuildableLiveInstanceGuard<'a> {
+    state: Option<tokio::sync::MutexGuard<'a, RebuildableState>>,
+    context: ValidationContextFingerprint,
+}
+
+impl<'a> RebuildableLiveInstanceGuard<'a> {
+    fn from_state(
+        state: tokio::sync::MutexGuard<'a, RebuildableState>,
+        context: ValidationContextFingerprint,
+    ) -> ProviderResult<Self> {
+        match &state.instance {
+            ValidationInstanceState::Live(_) => Ok(Self {
+                state: Some(state),
+                context,
+            }),
+            ValidationInstanceState::Poisoned { reason } => {
+                Err(reason.fail_fast_error(context.operation()))
+            }
+        }
+    }
+
+    fn poison(mut self, reason: PoisonReason) {
+        let mut state = self
+            .state
+            .take()
+            .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+        state.instance = ValidationInstanceState::Poisoned { reason };
+    }
+
+    fn wall_clock_timeout(mut self) {
+        let mut state = self
+            .state
+            .take()
+            .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+        let reason = PoisonReason::WallClockTimeout {
+            operation: self.context.operation(),
+        };
+        state.record_wall_clock_timeout(self.context.clone(), reason);
+    }
+
+    async fn call<U, F>(mut self, f: F) -> ProviderResult<U>
+    where
+        U: 'static,
+        F: AsyncFnOnce(&WasmBindings, &mut Store<HostState>) -> wasmtime::Result<U>,
+    {
+        let call = {
+            let state = self
+                .state
+                .as_mut()
+                .expect("an armed RebuildableLiveInstanceGuard always owns its state");
+            let ValidationInstanceState::Live(live) = &mut state.instance else {
+                unreachable!("RebuildableLiveInstanceGuard can only hold a live instance");
+            };
+            let (store, bindings) = (&mut live.store, &live.bindings);
+            store.call(|store| f(bindings, store)).await
+        };
+        let call = match call {
+            Ok(call) => call,
+            Err(error) => {
+                let operation = self.context.operation();
+                self.wall_clock_timeout();
+                return Err(wall_budget_provider_error(operation, error));
+            }
+        };
+        match call {
+            Ok(value) => {
+                let mut state = self
+                    .state
+                    .take()
+                    .expect("a successful guest call must still own its state");
+                state.record_success(&self.context);
+                drop(state);
+                Ok(value)
+            }
+            Err(error) => {
+                let operation = self.context.operation();
+                let reason = PoisonReason::from_trap(operation, &error);
+                self.poison(reason);
+                Err(wasm_trap_provider_error(operation, error))
+            }
+        }
+    }
+}
+
+impl Drop for RebuildableLiveInstanceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.instance = ValidationInstanceState::Poisoned {
+                reason: PoisonReason::Cancelled,
+            };
+        }
+    }
+}
+
+struct RebuildContext {
+    engine: Engine,
+    component: Component,
+    provider_kind: Option<ProviderKind>,
+    world: InstantiationWorld,
+    budget: GuestCallBudget,
+}
+
+impl RebuildContext {
+    fn new(engine: Engine, component: Component, budget: GuestCallBudget) -> Self {
+        Self {
+            engine,
+            component,
+            provider_kind: None,
+            world: InstantiationWorld::HttpEnabled,
+            budget,
+        }
+    }
+
+    async fn create_instance(&self) -> Result<LiveInstance, WasmBindingCreationError> {
+        create_instance_for_world(
+            &self.engine,
+            &self.component,
+            self.provider_kind,
+            self.world,
+            self.budget,
+        )
+        .await
+    }
+}
+
+/// A failed validation-instance rebuild, retaining both why the previous
+/// instance was unusable and the typed failure from creating its replacement.
+#[derive(Debug)]
+struct WasmProviderRebuildError {
+    previous_poison: PoisonReason,
+    load_error: WasmProviderLoadError,
+}
+
+impl fmt::Display for WasmProviderRebuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "previous poison reason: {}", self.previous_poison)
+    }
+}
+
+impl std::error::Error for WasmProviderRebuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.load_error)
+    }
+}
+
+fn rebuild_provider_error(
+    previous_poison: PoisonReason,
+    load_error: WasmProviderLoadError,
+) -> ProviderError {
+    let timed_out = load_error.is_wall_budget_timeout();
+    let error = WasmProviderRebuildError {
+        previous_poison,
+        load_error,
+    };
+    if timed_out {
+        ProviderError::timeout_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    } else {
+        ProviderError::internal_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    }
+}
+
+/// Factory-validation instance that rebuilds after poisoning and independently
+/// tracks wall-clock timeout history for each validation input.
+///
+/// Acquisition holds the slot mutex while recreating the instance from the
+/// already verified component and the same engine, selected world, and call
+/// budget. A failed rebuild leaves the slot poisoned, preserves the typed load
+/// error, and is retried by the next non-suspended validation call. A suspended
+/// input fails fast without inspecting or rebuilding the instance; other inputs
+/// continue to rebuild and use the shared instance normally.
+struct RebuildableInstance {
+    state: Mutex<RebuildableState>,
+    rebuild: RebuildContext,
+    fingerprint_key: [u8; 32],
+}
+
+impl RebuildableInstance {
+    fn new(live: LiveInstance, rebuild: RebuildContext) -> Self {
+        Self {
+            state: Mutex::new(RebuildableState::new(live)),
+            rebuild,
+            fingerprint_key: random_validation_fingerprint_key(),
+        }
+    }
+
+    fn validate_config_context(
+        &self,
+        attributes: &[(String, wit_types::Value)],
+    ) -> ValidationContextFingerprint {
+        ValidationContextFingerprint::validate_config(&self.fingerprint_key, attributes)
+    }
+
+    fn validate_custom_type_context(
+        &self,
+        identity: &wit_types::TypeIdentity,
+        value: &str,
+    ) -> ValidationContextFingerprint {
+        ValidationContextFingerprint::validate_custom_type(&self.fingerprint_key, identity, value)
+    }
+
+    async fn acquire(
+        &self,
+        context: ValidationContextFingerprint,
+    ) -> ProviderResult<RebuildableLiveInstanceGuard<'_>> {
+        let mut state = self.state.lock().await;
+        if let Some(reason) = state.suspended_reason(&context) {
+            return Err(suspended_validation_error(reason, &context));
+        }
+        let rebuild = match &state.instance {
+            ValidationInstanceState::Live(_) => None,
+            ValidationInstanceState::Poisoned { reason } => Some(reason.clone()),
+        };
+        if let Some(reason) = rebuild {
+            let live = self
+                .rebuild
+                .create_instance()
+                .await
+                .map_err(|failure| {
+                    single_attempt_load_error(
+                        &self.rebuild.engine,
+                        &self.rebuild.component,
+                        self.rebuild.world,
+                        failure,
+                    )
+                })
+                .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
+            state.instance = ValidationInstanceState::Live(Box::new(live));
+            log::warn!(
+                "rebuilt poisoned WASM provider validation instance; previous poison reason: \
+                 {reason}"
+            );
+        }
+        RebuildableLiveInstanceGuard::from_state(state, context)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn live_world(&self) -> Option<InstantiationWorld> {
+        match &self.state.lock().await.instance {
+            ValidationInstanceState::Live(live) => Some(live.instantiation_world()),
+            ValidationInstanceState::Poisoned { reason: _ } => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn set_budget(&mut self, budget: GuestCallBudget) {
+        self.rebuild.budget = budget;
+        match &mut self.state.get_mut().instance {
+            ValidationInstanceState::Live(live) => live.store.set_budget(budget),
+            ValidationInstanceState::Poisoned { reason: _ } => {}
+        }
+    }
+}
 
 // -- WasmProviderFactory --
 
@@ -2617,9 +3213,12 @@ pub struct WasmProviderFactory {
     /// catching format bugs without requiring a provider rebuild.
     cached_provider_config_types: ValidatedConfigSchema,
     enable_http: bool,
-    /// Reusable WASM instance from factory initialization.
-    /// Used by `validate_config()` to avoid creating a throwaway instance.
-    init_instance: SharedWasmInstance,
+    /// Reusable, rebuildable WASM instance for editor-facing validation.
+    /// A poisoned instance is recreated from `engine` + `component`; each input
+    /// is suspended after its second wall-clock timeout. A successful retry
+    /// after one timeout clears that input's history; suspension lasts for this
+    /// factory, so loading a new provider version starts with a fresh map.
+    init_instance: RebuildableInstance,
     /// Lazily created shared instances for provider + normalizer, keyed
     /// by binding name. `None` is the kind's default instance;
     /// `Some(name)` is a named instance (`let <name> = provider <kind>
@@ -2629,7 +3228,7 @@ pub struct WasmProviderFactory {
     /// every binding onto a single shared instance would pin each kind
     /// to the first instance's attributes (e.g. region) regardless of
     /// what later instances configure.
-    shared_instances: Mutex<HashMap<Option<String>, Arc<SharedWasmInstance>>>,
+    shared_instances: Mutex<HashMap<Option<String>, Arc<FailFastInstance>>>,
     /// Maps the host's typed runtime-instantiation error into the public
     /// `ProviderError` trait boundary. Composition roots can wrap it with
     /// resolver-owned artifact provenance without stringifying either layer.
@@ -2888,9 +3487,10 @@ impl WasmProviderFactory {
         configured: ConfiguredProvider,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
-        let (mut store, bindings, enable_http) =
-            create_instance_auto(&engine, &component, None, budget).await?;
-        let info_json = bindings.info_json().to_owned();
+        let mut rebuild = RebuildContext::new(engine.clone(), component.clone(), budget);
+        let mut live = create_instance_auto(&mut rebuild).await?;
+        let enable_http = live.world == InstantiationWorld::HttpEnabled;
+        let info_json = live.bindings.info_json().to_owned();
 
         let (reported_name, display_name, version) =
             wasm_convert::json_to_provider_info(&info_json).map_err(|source| {
@@ -2904,8 +3504,9 @@ impl WasmProviderFactory {
         }
         let name = configured.name.as_str();
 
-        let schemas_json = store
-            .call(|store| bindings.call_schemas(store))
+        let schemas_json = live
+            .store
+            .call(|store| live.bindings.call_schemas(store))
             .await
             .map_err(|source| wall_budget_load_error("schemas", source))?
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
@@ -2914,7 +3515,8 @@ impl WasmProviderFactory {
             .map_err(|e| provider_schema_decode_error(name, &version, e))?;
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
-            Self::load_metadata(&bindings, &mut store, name, &version).await?;
+            Self::load_metadata(&live.bindings, &mut live.store, name, &version).await?;
+        let init_instance = RebuildableInstance::new(live, rebuild);
 
         Ok(Self {
             engine,
@@ -2928,7 +3530,7 @@ impl WasmProviderFactory {
             cached_identity_attributes,
             cached_provider_config_types,
             enable_http,
-            init_instance: SharedWasmInstance::new(store, bindings),
+            init_instance,
             shared_instances: Mutex::new(HashMap::new()),
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
@@ -3111,7 +3713,7 @@ impl WasmProviderFactory {
     async fn create_initialized_instance(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
+    ) -> Result<LiveInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
@@ -3122,13 +3724,13 @@ impl WasmProviderFactory {
         } else {
             InstantiationWorld::Basic
         };
-        let (mut store, bindings) =
+        let mut live =
             create_runtime_instance(&self.engine, &self.component, kind, world, self.budget)
                 .await?;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
             .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
-        store
-            .call(|store| bindings.call_initialize(store, &wit_attrs))
+        live.store
+            .call(|store| live.bindings.call_initialize(store, &wit_attrs))
             .await
             .map_err(|source| WasmProviderInstanceError::WallBudgetExceeded {
                 operation: "initialize",
@@ -3143,7 +3745,7 @@ impl WasmProviderFactory {
                 )
             })?;
 
-        Ok((store, bindings))
+        Ok(live)
     }
 
     /// Get or create the shared WASM instance for the given binding's
@@ -3159,14 +3761,14 @@ impl WasmProviderFactory {
         &self,
         binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<Arc<SharedWasmInstance>, WasmProviderInstanceError> {
+    ) -> Result<Arc<FailFastInstance>, WasmProviderInstanceError> {
         let key: Option<String> = binding.map(|s| s.to_string());
         let mut guard = self.shared_instances.lock().await;
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let (store, bindings) = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(SharedWasmInstance::new(store, bindings));
+        let live = self.create_initialized_instance(attributes).await?;
+        let instance = Arc::new(FailFastInstance::new(live));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -3191,8 +3793,18 @@ impl WasmProviderFactory {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_guest_call_budget(mut self, budget: GuestCallBudget) -> Self {
         self.budget = budget;
-        self.init_instance.store.get_mut().set_budget(budget);
+        self.init_instance.set_budget(budget);
         self
+    }
+
+    /// Exposes the validation instance's actual linker world to integration
+    /// tests that exercise rebuild behavior.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn validation_instance_world_for_test(&self) -> Option<&'static str> {
+        self.init_instance
+            .live_world()
+            .await
+            .map(InstantiationWorld::test_name)
     }
 
     pub fn version(&self) -> &str {
@@ -3239,24 +3851,22 @@ impl ProviderFactory for WasmProviderFactory {
     fn validate_config(
         &self,
         attributes: &CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> ProviderResult<()> {
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes.attributes())
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| wasm_value_encode_provider_error("validate_config", error))?;
+        let context = self.init_instance.validate_config_context(&wit_attrs);
 
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async {
-                    let instance = &self.init_instance;
-                    let mut locked = LockedStore::acquire(instance, "validate_config").await?;
-                    let call = locked
-                        .call("validate_config", |store| {
-                            instance.bindings.call_validate_config(store, &wit_attrs)
-                        })
-                        .await?;
-                    finish_guest_call(instance, "validate_config", &mut locked, call)?
-                        .map_err(wasm_convert::wit_to_core_provider_error)
-                })
-                .map_err(|error: ProviderError| error.to_string())
+            tokio::runtime::Handle::current().block_on(async {
+                let instance = &self.init_instance;
+                let locked = instance.acquire(context).await?;
+                let result = locked
+                    .call(async |bindings, store| {
+                        bindings.call_validate_config(store, &wit_attrs).await
+                    })
+                    .await?;
+                result.map_err(wasm_convert::wit_to_core_provider_error)
+            })
         })
     }
 
@@ -3264,26 +3874,24 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         identity: &TypeIdentity,
         value: &CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> ProviderResult<()> {
         let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
+        let context = self
+            .init_instance
+            .validate_custom_type_context(&wit_identity, value.as_str());
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async {
-                    let instance = &self.init_instance;
-                    let mut locked = LockedStore::acquire(instance, "validate_custom_type").await?;
-                    let call = locked
-                        .call("validate_custom_type", |store| {
-                            instance.bindings.call_validate_custom_type(
-                                store,
-                                &wit_identity,
-                                value.as_str(),
-                            )
-                        })
-                        .await?;
-                    finish_guest_call(instance, "validate_custom_type", &mut locked, call)?
-                        .map_err(wasm_convert::wit_to_core_provider_error)
-                })
-                .map_err(|error: ProviderError| error.to_string())
+            tokio::runtime::Handle::current().block_on(async {
+                let instance = &self.init_instance;
+                let locked = instance.acquire(context).await?;
+                let result = locked
+                    .call(async |bindings, store| {
+                        bindings
+                            .call_validate_custom_type(store, &wit_identity, value.as_str())
+                            .await
+                    })
+                    .await?;
+                result.map_err(wasm_convert::wit_to_core_provider_error)
+            })
         })
     }
 
@@ -3355,15 +3963,10 @@ impl ProviderFactory for WasmProviderFactory {
 // -- WasmProvider --
 
 pub struct WasmProvider {
-    instance: Arc<SharedWasmInstance>,
+    instance: Arc<FailFastInstance>,
     name: String,
     schemas: Arc<Vec<ValidatedResourceSchema>>,
 }
-
-// Safety: SharedWasmInstance.store is behind a Mutex, so concurrent access is
-// serialized. The bindings are only used while the store mutex is held.
-unsafe impl Send for WasmProvider {}
-unsafe impl Sync for WasmProvider {}
 
 struct PendingCreate {
     id: ResourceId,
@@ -3591,13 +4194,19 @@ impl WasmProvider {
     ) -> ProviderResult<Progress>
     where
         WitOutcome: 'static,
-        GuestCall: for<'a> FnOnce(&'a mut Store<HostState>) -> GuestOperationFuture<'a, WitOutcome>,
+        GuestCall: for<'a> FnOnce(
+            &'a WasmBindings,
+            &'a mut Store<HostState>,
+        ) -> GuestOperationFuture<'a, WitOutcome>,
         Decode: FnOnce(WitOutcome, ResourceId) -> Result<Progress, DecodeError>,
         DecodeError: std::error::Error + Send + Sync + 'static,
     {
-        let mut locked = LockedStore::acquire(&self.instance, operation).await?;
-        let call = locked.call(operation, guest_call).await?;
-        let outcome = finish_guest_call(&self.instance, operation, &mut locked, call)?;
+        let locked = self.instance.acquire(operation).await?;
+        let outcome = locked
+            .call(operation, async move |bindings, store| {
+                guest_call(bindings, store).await
+            })
+            .await?;
         match outcome {
             Ok(outcome) => decode(outcome, id.clone()).map_err(|error| {
                 wasm_value_decode_provider_error(operation, error).for_resource(id)
@@ -4292,22 +4901,17 @@ impl WasmProvider {
     ) -> ResumeProgress {
         let wit_pending =
             wasm_convert::core_to_wit_resume_pending(resume.token(), resume.identifier());
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_request = wit_request.clone();
         let call_result = async {
-            let mut locked = LockedStore::acquire(&self.instance, "resume_create").await?;
-            let call = locked
-                .call("resume_create", |store| {
-                    call_instance.bindings.call_resume_create(
-                        store,
-                        &call_id,
-                        &call_request,
-                        &wit_pending,
-                    )
+            let locked = self.instance.acquire("resume_create").await?;
+            locked
+                .call("resume_create", async |bindings, store| {
+                    bindings
+                        .call_resume_create(store, &call_id, &call_request, &wit_pending)
+                        .await
                 })
-                .await?;
-            finish_guest_call(&self.instance, "resume_create", &mut locked, call)
+                .await
         }
         .await;
         let result = match call_result {
@@ -4373,25 +4977,18 @@ impl WasmProvider {
                 ));
             }
         };
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_request = wit_request.clone();
-        let mut locked = match LockedStore::acquire(&self.instance, "create").await {
+        let locked = match self.instance.acquire("create").await {
             Ok(locked) => locked,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
-        let call = match locked
-            .call("create", |store| {
-                call_instance
-                    .bindings
-                    .call_create(store, &call_id, &call_request)
+        let result = match locked
+            .call("create", async |bindings, store| {
+                bindings.call_create(store, &call_id, &call_request).await
             })
             .await
         {
-            Ok(call) => call,
-            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
-        };
-        let result = match finish_guest_call(&self.instance, "create", &mut locked, call) {
             Ok(result) => result,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
@@ -4426,22 +5023,17 @@ impl WasmProvider {
     async fn call_poll_create(&self, starting: PendingCreate) -> CreateProgress {
         let id = starting.id.clone();
         let wit_pending = wasm_convert::core_to_wit_pending_create(&starting.pending);
-        let call_instance = Arc::clone(&self.instance);
         let call_id = starting.wit_id.clone();
         let call_request = starting.wit_request.clone();
         let call_result = async {
-            let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
-            let call = locked
-                .call("poll_create", |store| {
-                    call_instance.bindings.call_poll_create(
-                        store,
-                        &call_id,
-                        &call_request,
-                        &wit_pending,
-                    )
+            let locked = self.instance.acquire("poll_create").await?;
+            locked
+                .call("poll_create", async |bindings, store| {
+                    bindings
+                        .call_poll_create(store, &call_id, &call_request, &wit_pending)
+                        .await
                 })
-                .await?;
-            finish_guest_call(&self.instance, "poll_create", &mut locked, call)
+                .await
         }
         .await;
         let result = match call_result {
@@ -4483,22 +5075,17 @@ impl WasmProvider {
             starting.pending.sent(),
             starting.pending.poll_after_secs(),
         );
-        let call_instance = Arc::clone(&self.instance);
         let call_id = starting.wit_id.clone();
         let call_request = starting.wit_request.clone();
         let call_result = async {
-            let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
-            let call = locked
-                .call("poll_create", |store| {
-                    call_instance.bindings.call_poll_create(
-                        store,
-                        &call_id,
-                        &call_request,
-                        &wit_pending,
-                    )
+            let locked = self.instance.acquire("poll_create").await?;
+            locked
+                .call("poll_create", async |bindings, store| {
+                    bindings
+                        .call_poll_create(store, &call_id, &call_request, &wit_pending)
+                        .await
                 })
-                .await?;
-            finish_guest_call(&self.instance, "poll_create", &mut locked, call)
+                .await
         }
         .await;
         let result = match call_result {
@@ -4614,17 +5201,15 @@ impl WasmProvider {
         let wit_request = wasm_convert::core_to_wit_update_request(&request).map_err(|error| {
             wasm_value_encode_provider_error("update", error).for_resource(id.clone())
         })?;
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_identifier = identifier.clone();
         let call_request = wit_request.clone();
         self.call_operation(
             "update",
             id,
-            move |store| {
+            move |bindings, store| {
                 Box::pin(async move {
-                    call_instance
-                        .bindings
+                    bindings
                         .call_update(store, &call_id, &call_identifier, &call_request)
                         .await
                 })
@@ -4657,17 +5242,15 @@ impl WasmProvider {
             operation,
         } = pending;
         let wit_pending = operation.into_wit();
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_identifier = identifier.clone();
         let call_request = wit_request.clone();
         self.call_operation(
             "poll_update",
             id,
-            move |store| {
+            move |bindings, store| {
                 Box::pin(async move {
-                    call_instance
-                        .bindings
+                    bindings
                         .call_poll_update(
                             store,
                             &call_id,
@@ -4705,17 +5288,15 @@ impl WasmProvider {
     ) -> ProviderResult<DeleteProgress> {
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
         let wit_request = wasm_convert::core_to_wit_delete_request(&request);
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_identifier = identifier.clone();
         let call_request = wit_request;
         self.call_operation(
             "delete",
             id,
-            move |store| {
+            move |bindings, store| {
                 Box::pin(async move {
-                    call_instance
-                        .bindings
+                    bindings
                         .call_delete(store, &call_id, &call_identifier, call_request)
                         .await
                 })
@@ -4749,17 +5330,15 @@ impl WasmProvider {
             operation,
         } = pending;
         let wit_pending = operation.into_wit();
-        let call_instance = Arc::clone(&self.instance);
         let call_id = wit_id.clone();
         let call_identifier = identifier.clone();
         let call_request = wit_request;
         self.call_operation(
             "poll_delete",
             id,
-            move |store| {
+            move |bindings, store| {
                 Box::pin(async move {
-                    call_instance
-                        .bindings
+                    bindings
                         .call_poll_delete(
                             store,
                             &call_id,
@@ -4807,15 +5386,14 @@ impl Provider for WasmProvider {
         let identifier = identifier.as_str().to_string();
         let id = id.clone();
         Box::pin(async move {
-            let mut locked = LockedStore::acquire(&self.instance, "read").await?;
-            let call = locked
-                .call("read", |store| {
-                    self.instance
-                        .bindings
+            let locked = self.instance.acquire("read").await?;
+            let result = locked
+                .call("read", async |bindings, store| {
+                    bindings
                         .call_read(store, &wit_id, &identifier, wit_request)
+                        .await
                 })
                 .await?;
-            let result = finish_guest_call(&self.instance, "read", &mut locked, call)?;
             match result {
                 Ok(wit_outcome) => wasm_convert::wit_to_core_read_outcome(wit_outcome, &id)
                     .map_err(|error| {
@@ -4836,15 +5414,12 @@ impl Provider for WasmProvider {
         };
         let id = resource.id.clone();
         Box::pin(async move {
-            let mut locked = LockedStore::acquire(&self.instance, "read_data_source").await?;
-            let call = locked
-                .call("read_data_source", |store| {
-                    self.instance
-                        .bindings
-                        .call_read_data_source(store, &wit_resource)
+            let locked = self.instance.acquire("read_data_source").await?;
+            let result = locked
+                .call("read_data_source", async |bindings, store| {
+                    bindings.call_read_data_source(store, &wit_resource).await
                 })
                 .await?;
-            let result = finish_guest_call(&self.instance, "read_data_source", &mut locked, call)?;
             match result {
                 Ok(wit_state) => {
                     wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
@@ -4919,16 +5494,12 @@ impl Provider for WasmProvider {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut locked =
-                    LockedStore::acquire(&self.instance, "required_permissions").await?;
-                let call = locked
-                    .call("required_permissions", |store| {
-                        self.instance
-                            .bindings
-                            .call_required_permissions(store, &wit_id, op)
+                let locked = self.instance.acquire("required_permissions").await?;
+                locked
+                    .call("required_permissions", async |bindings, store| {
+                        bindings.call_required_permissions(store, &wit_id, op).await
                     })
-                    .await?;
-                finish_guest_call(&self.instance, "required_permissions", &mut locked, call)
+                    .await
             })
         })
     }
@@ -4942,16 +5513,14 @@ impl Provider for WasmProvider {
         let wit_attr_path = attr_path.segments().to_vec();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut locked = LockedStore::acquire(&self.instance, "satisfier_hint").await?;
-                let call = locked
-                    .call("satisfier_hint", |store| {
-                        self.instance
-                            .bindings
+                let locked = self.instance.acquire("satisfier_hint").await?;
+                let patterns = locked
+                    .call("satisfier_hint", async |bindings, store| {
+                        bindings
                             .call_satisfier_hint(store, &wit_id, &wit_attr_path)
+                            .await
                     })
                     .await?;
-                let patterns =
-                    finish_guest_call(&self.instance, "satisfier_hint", &mut locked, call)?;
                 patterns
                     .into_iter()
                     .map(wasm_convert::wit_to_core_binding_pattern)
@@ -4968,12 +5537,8 @@ impl Provider for WasmProvider {
 // -- WasmProviderNormalizer --
 
 pub struct WasmProviderNormalizer {
-    instance: Arc<SharedWasmInstance>,
+    instance: Arc<FailFastInstance>,
 }
-
-// Safety: Same rationale as WasmProvider.
-unsafe impl Send for WasmProviderNormalizer {}
-unsafe impl Sync for WasmProviderNormalizer {}
 
 #[derive(Debug)]
 struct WasmNormalizerResultKeysError {
@@ -5162,42 +5727,6 @@ fn apply_wit_state_attribute_updates<M: StateValueAccess>(
     Ok(())
 }
 
-fn finish_guest_call<T>(
-    instance: &SharedWasmInstance,
-    operation: &'static str,
-    locked: &mut LockedStore<'_>,
-    call: wasmtime::Result<T>,
-) -> ProviderResult<T> {
-    // A returned `Result` means the async wasmtime call was not cancelled, so
-    // dropping the store guard must not apply the timeout/cancellation poison.
-    locked.disarm();
-    match call {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            // A component trap still makes this instance non-reentrant. Record
-            // the originating operation while the store lock remains held so
-            // queued calls fail fast with the real cause.
-            poison_after_trap(
-                &instance.poisoned,
-                &instance.poisoned_reason,
-                operation,
-                &error,
-            );
-            Err(wasm_trap_provider_error(operation, error))
-        }
-    }
-}
-
-fn finish_normalizer_guest_call<T>(
-    instance: &SharedWasmInstance,
-    operation: &'static str,
-    locked: &mut LockedStore<'_>,
-    call: wasmtime::Result<Result<T, wit_types::ProviderError>>,
-) -> ProviderResult<T> {
-    finish_guest_call(instance, operation, locked, call)?
-        .map_err(wasm_convert::wit_to_core_provider_error)
-}
-
 /// One stripped attribute retained so it can be reinserted at its original
 /// position after WASM desired normalization returns.
 struct StrippedAttribute {
@@ -5289,19 +5818,13 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     // apply-path `renormalize` calling this once per resource cannot
                     // self-deadlock (carina#3112).
                     let result = {
-                        let mut locked =
-                            LockedStore::acquire(&instance, "normalize_desired").await?;
-                        let call = locked
-                            .call("normalize_desired", |store| {
-                                instance.bindings.call_normalize_desired(store, &sealed)
+                        let locked = instance.acquire("normalize_desired").await?;
+                        let result = locked
+                            .call("normalize_desired", async |bindings, store| {
+                                bindings.call_normalize_desired(store, &sealed).await
                             })
                             .await?;
-                        finish_normalizer_guest_call(
-                            &instance,
-                            "normalize_desired",
-                            &mut locked,
-                            call,
-                        )
+                        result.map_err(wasm_convert::wit_to_core_provider_error)
                     }?;
 
                     // The scoped host helper hides ref/Unknown-bearing attributes only
@@ -5363,21 +5886,15 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             if !resolved_wit_states.is_empty() {
                 // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
                 let result = {
-                    let mut locked =
-                        LockedStore::acquire(&self.instance, "normalize_state").await?;
-                    let call = locked
-                        .call("normalize_state", |store| {
-                            self.instance
-                                .bindings
+                    let locked = self.instance.acquire("normalize_state").await?;
+                    let result = locked
+                        .call("normalize_state", async |bindings, store| {
+                            bindings
                                 .call_normalize_state(store, &resolved_wit_states)
+                                .await
                         })
                         .await?;
-                    finish_normalizer_guest_call(
-                        &self.instance,
-                        "normalize_state",
-                        &mut locked,
-                        call,
-                    )
+                    result.map_err(wasm_convert::wit_to_core_provider_error)
                 };
                 let result = result?;
                 updates.extend(validate_wit_state_result_keys(
@@ -5395,21 +5912,13 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             for (id, key, wit_state) in single_wit_states {
                 let wit_states = [(key, wit_state)];
                 let result = {
-                    let mut locked =
-                        LockedStore::acquire(&self.instance, "normalize_state").await?;
-                    let call = locked
-                        .call("normalize_state", |store| {
-                            self.instance
-                                .bindings
-                                .call_normalize_state(store, &wit_states)
+                    let locked = self.instance.acquire("normalize_state").await?;
+                    let result = locked
+                        .call("normalize_state", async |bindings, store| {
+                            bindings.call_normalize_state(store, &wit_states).await
                         })
                         .await?;
-                    finish_normalizer_guest_call(
-                        &self.instance,
-                        "normalize_state",
-                        &mut locked,
-                        call,
-                    )
+                    result.map_err(wasm_convert::wit_to_core_provider_error)
                 };
                 let result = result?;
                 updates.push(take_single_wit_state_result("normalize_state", id, result)?);
@@ -5484,23 +5993,19 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             if !resolved_wit_states.is_empty() {
                 // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
                 let result = {
-                    let mut locked =
-                        LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
-                    let call = locked
-                        .call("hydrate_read_state", |store| {
-                            self.instance.bindings.call_hydrate_read_state(
-                                store,
-                                &resolved_wit_states,
-                                &resolved_wit_saved,
-                            )
+                    let locked = self.instance.acquire("hydrate_read_state").await?;
+                    let result = locked
+                        .call("hydrate_read_state", async |bindings, store| {
+                            bindings
+                                .call_hydrate_read_state(
+                                    store,
+                                    &resolved_wit_states,
+                                    &resolved_wit_saved,
+                                )
+                                .await
                         })
                         .await?;
-                    finish_normalizer_guest_call(
-                        &self.instance,
-                        "hydrate_read_state",
-                        &mut locked,
-                        call,
-                    )
+                    result.map_err(wasm_convert::wit_to_core_provider_error)
                 };
                 let result = result?;
                 updates.extend(validate_wit_state_result_keys(
@@ -5519,23 +6024,15 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     .map(|attrs| vec![(key, attrs)])
                     .unwrap_or_default();
                 let result = {
-                    let mut locked =
-                        LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
-                    let call = locked
-                        .call("hydrate_read_state", |store| {
-                            self.instance.bindings.call_hydrate_read_state(
-                                store,
-                                &wit_states,
-                                &wit_saved,
-                            )
+                    let locked = self.instance.acquire("hydrate_read_state").await?;
+                    let result = locked
+                        .call("hydrate_read_state", async |bindings, store| {
+                            bindings
+                                .call_hydrate_read_state(store, &wit_states, &wit_saved)
+                                .await
                         })
                         .await?;
-                    finish_normalizer_guest_call(
-                        &self.instance,
-                        "hydrate_read_state",
-                        &mut locked,
-                        call,
-                    )
+                    result.map_err(wasm_convert::wit_to_core_provider_error)
                 };
                 let result = result?;
                 updates.push(take_single_wit_state_result(
@@ -5565,6 +6062,27 @@ mod tests {
 
     fn test_load_identity(name: &str) -> ProviderLoadIdentity {
         ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
+    }
+
+    async fn rebuildable_state_test_factory() -> Option<WasmProviderFactory> {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return None;
+        };
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        Some(
+            WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
+                .await
+                .expect("mock WASM provider should load"),
+        )
     }
 
     #[test]
@@ -6657,21 +7175,20 @@ mod tests {
                 wit_types::Value::ListVal("not-json".to_string()),
             )],
         };
-        let mut locked = LockedStore::acquire(&instance, "normalize_desired")
+        let locked = instance
+            .acquire("normalize_desired")
             .await
             .expect("fresh instance should be usable");
         let malformed = [malformed];
-        let call = locked
-            .call("normalize_desired", |store| {
-                instance
-                    .bindings
-                    .call_normalize_desired_raw(store, &malformed)
+        let result = locked
+            .call("normalize_desired", async |bindings, store| {
+                bindings.call_normalize_desired_raw(store, &malformed).await
             })
             .await
             .expect("the guest call should return its provider error");
-        let error = finish_normalizer_guest_call(&instance, "normalize_desired", &mut locked, call)
+        let error = result
+            .map_err(wasm_convert::wit_to_core_provider_error)
             .expect_err("malformed guest input must return provider-error");
-        drop(locked);
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
@@ -6693,7 +7210,7 @@ mod tests {
             "the guest decode detail must be preserved: {error}"
         );
         assert!(
-            !instance.poisoned.load(Ordering::Acquire),
+            matches!(&*instance.slot.lock().await, FailFastSlot::Live(_)),
             "a returned boundary provider-error must not poison the instance"
         );
 
@@ -6704,21 +7221,21 @@ mod tests {
                 wit_types::PersistedValue::ListVal("not-json".to_string()),
             )],
         )];
-        let mut locked = LockedStore::acquire(&instance, "hydrate_read_state")
+        let locked = instance
+            .acquire("hydrate_read_state")
             .await
             .expect("the decode error must leave the instance usable");
-        let call = locked
-            .call("hydrate_read_state", |store| {
-                instance
-                    .bindings
+        let result = locked
+            .call("hydrate_read_state", async |bindings, store| {
+                bindings
                     .call_hydrate_read_state(store, &[], &malformed_saved_attrs)
+                    .await
             })
             .await
             .expect("the guest call should return its provider error");
-        let error =
-            finish_normalizer_guest_call(&instance, "hydrate_read_state", &mut locked, call)
-                .expect_err("malformed saved attributes must return provider-error");
-        drop(locked);
+        let error = result
+            .map_err(wasm_convert::wit_to_core_provider_error)
+            .expect_err("malformed saved attributes must return provider-error");
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
@@ -6733,7 +7250,7 @@ mod tests {
             "the boundary error message must retain its failing sub-part: {error}"
         );
         assert!(
-            !instance.poisoned.load(Ordering::Acquire),
+            matches!(&*instance.slot.lock().await, FailFastSlot::Live(_)),
             "a returned saved-attribute decode error must not poison the instance"
         );
 
@@ -8381,42 +8898,9 @@ mod tests {
         );
     }
 
-    /// A fresh (un-poisoned) instance lets an operation proceed: the
-    /// guard returns `None`.
     #[test]
-    fn poisoned_guard_allows_a_fresh_instance() {
-        let flag = AtomicBool::new(false);
-        let reason = OnceLock::new();
-        assert!(poisoned_guard(&flag, &reason, "create").is_none());
-    }
-
-    /// Dropping an *armed* `PoisonOnDrop` (the carina#3106 cancellation
-    /// path: `tokio::time::timeout` drops the in-flight operation while it
-    /// is suspended inside a `wasmtime` async call, leaving the shared
-    /// `Store` unreusable) poisons the instance, and every subsequent
-    /// operation then fails fast instead of touching the poisoned store.
-    #[test]
-    fn armed_drop_poisons_then_guard_fails_fast_naming_the_operation() {
-        let flag = AtomicBool::new(false);
-        let reason = OnceLock::new();
-
-        // Operation cancelled before completion: the armed guard is
-        // dropped and must poison the instance.
-        {
-            let _armed = PoisonOnDrop {
-                poisoned: &flag,
-                poisoned_reason: &reason,
-                armed: true,
-            };
-        }
-        assert!(
-            flag.load(Ordering::Acquire),
-            "an armed PoisonOnDrop must poison the instance when dropped"
-        );
-
-        // A later operation on the same (now poisoned) instance fails fast.
-        let guard_err = poisoned_guard(&flag, &reason, "delete")
-            .expect("a poisoned instance must reject subsequent operations");
+    fn cancellation_poison_fails_fast_naming_the_rejected_operation() {
+        let guard_err = PoisonReason::Cancelled.fail_fast_error("delete");
         assert!(
             matches!(guard_err, ProviderError::Internal(_)),
             "poisoned fail-fast must be a hard error, got {guard_err:?}"
@@ -8429,16 +8913,302 @@ mod tests {
     }
 
     #[test]
+    fn validation_context_fingerprint_is_canonical_and_secret_safe() {
+        let key = [7_u8; 32];
+        let other_key = [8_u8; 32];
+        let attributes = [
+            (
+                "secret".to_string(),
+                wit_types::Value::SecretVal("do-not-retain-me".to_string()),
+            ),
+            ("count".to_string(), wit_types::Value::IntVal(3)),
+        ];
+        let first = ValidationContextFingerprint::validate_config(&key, &attributes);
+        let reordered = ValidationContextFingerprint::validate_config(
+            &key,
+            &[
+                ("count".to_string(), wit_types::Value::IntVal(3)),
+                (
+                    "secret".to_string(),
+                    wit_types::Value::SecretVal("do-not-retain-me".to_string()),
+                ),
+            ],
+        );
+        let changed = ValidationContextFingerprint::validate_config(
+            &key,
+            &[
+                ("count".to_string(), wit_types::Value::IntVal(4)),
+                (
+                    "secret".to_string(),
+                    wit_types::Value::SecretVal("do-not-retain-me".to_string()),
+                ),
+            ],
+        );
+        let different_factory =
+            ValidationContextFingerprint::validate_config(&other_key, &attributes);
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, changed);
+        assert_ne!(first, different_factory);
+        assert_eq!(
+            first.suspended_validation_id(),
+            reordered.suspended_validation_id()
+        );
+        assert_ne!(
+            first.suspended_validation_id(),
+            changed.suspended_validation_id()
+        );
+        assert_ne!(
+            first.suspended_validation_id(),
+            different_factory.suspended_validation_id()
+        );
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("do-not-retain-me"));
+        assert!(debug.contains("<redacted>"), "fingerprint debug: {debug}");
+        assert!(
+            !debug.contains("input_sha256"),
+            "the keyed digest must not be exposed through Debug: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuildable_state_retains_timeout_history_across_other_input_successes() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let context_x =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(1))]);
+        let context_y =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(2))]);
+
+        assert!(matches!(
+            &instance.state.lock().await.instance,
+            ValidationInstanceState::Live(_)
+        ));
+
+        instance
+            .acquire(context_x.clone())
+            .await
+            .expect("fresh validation instance should be live")
+            .wall_clock_timeout();
+        let rebuilt_for_y = instance
+            .acquire(context_y.clone())
+            .await
+            .expect("another input should rebuild the poisoned instance");
+        rebuilt_for_y
+            .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
+            .await
+            .expect("the other input should succeed");
+
+        instance
+            .acquire(context_x.clone())
+            .await
+            .expect("the second call for X should use the live instance")
+            .wall_clock_timeout();
+
+        let started = std::time::Instant::now();
+        let suspended = match instance.acquire(context_x.clone()).await {
+            Ok(_) => panic!("X must be suspended after its second timeout"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            suspended.detail().host_cause(),
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+                context_x.suspended_validation_id()
+            ))
+        );
+
+        instance
+            .acquire(context_y)
+            .await
+            .expect("Y should rebuild while X remains suspended")
+            .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
+            .await
+            .expect("Y should remain usable");
+        assert!(
+            instance.acquire(context_x).await.is_err(),
+            "Y's success must not clear X's suspension"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_input_clears_its_own_first_timeout() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let context =
+            instance.validate_config_context(&[("probe".to_string(), wit_types::Value::IntVal(1))]);
+
+        instance
+            .acquire(context.clone())
+            .await
+            .unwrap()
+            .wall_clock_timeout();
+        instance
+            .acquire(context.clone())
+            .await
+            .expect("one timeout still permits a retry")
+            .call(async |_bindings, _store| Ok::<_, wasmtime::Error>(()))
+            .await
+            .expect("the retry should succeed");
+        assert!(
+            !instance
+                .state
+                .lock()
+                .await
+                .input_health
+                .contains_key(&context)
+        );
+
+        instance
+            .acquire(context.clone())
+            .await
+            .unwrap()
+            .wall_clock_timeout();
+        instance
+            .acquire(context)
+            .await
+            .expect("a timeout after success must be treated as the first timeout again");
+    }
+
+    #[tokio::test]
+    async fn validation_input_health_evicts_the_oldest_entry_at_the_bound() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let contexts = (0..=MAX_VALIDATION_INPUT_HEALTH_ENTRIES)
+            .map(|value| {
+                instance.validate_config_context(&[(
+                    "probe".to_string(),
+                    wit_types::Value::IntVal(i64::try_from(value).unwrap()),
+                )])
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = instance.state.lock().await;
+        for context in &contexts {
+            state.record_wall_clock_timeout(
+                context.clone(),
+                PoisonReason::WallClockTimeout {
+                    operation: "validate_config",
+                },
+            );
+        }
+
+        assert_eq!(
+            state.input_health.len(),
+            MAX_VALIDATION_INPUT_HEALTH_ENTRIES
+        );
+        assert!(!state.input_health.contains_key(&contexts[0]));
+        assert!(state.input_health.contains_key(contexts.last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn trap_after_timeout_rebuild_poisoned_but_does_not_suspend() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let instance = &factory.init_instance;
+        let context = instance.validate_config_context(&[]);
+
+        instance
+            .acquire(context.clone())
+            .await
+            .expect("fresh validation instance should be live")
+            .wall_clock_timeout();
+        let rebuilt = instance
+            .acquire(context.clone())
+            .await
+            .expect("the timeout should permit one rebuild");
+        let error = rebuilt
+            .call(async |_bindings, _store| {
+                Err::<(), _>(wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached))
+            })
+            .await
+            .expect_err("the synthetic trap must fail");
+        assert_eq!(error.variant_name(), "internal");
+        assert!(matches!(
+            &instance.state.lock().await.instance,
+            ValidationInstanceState::Poisoned {
+                reason: PoisonReason::Trap { .. }
+            }
+        ));
+
+        let rebuilt_after_trap = instance
+            .acquire(context)
+            .await
+            .expect("traps should continue to rebuild on every call");
+        assert!(matches!(
+            rebuilt_after_trap
+                .state
+                .as_deref()
+                .map(|state| &state.instance),
+            Some(ValidationInstanceState::Live(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn returned_trap_poison_is_classified_inside_call() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
+            .await
+            .expect("mock WASM provider should load");
+        let instance = factory
+            .get_or_create_shared_instance(None, &IndexMap::new())
+            .await
+            .expect("mock WASM provider should initialize");
+
+        let locked = instance
+            .acquire("normalize_state")
+            .await
+            .expect("fresh instance should be usable");
+        let call_error = locked
+            .call("normalize_state", async |_bindings, _store| {
+                Err::<(), _>(wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached))
+            })
+            .await
+            .expect_err("the returned trap must fail the guest call");
+        assert_eq!(call_error.detail().context(), "WASM guest trapped");
+
+        let next_error = instance
+            .acquire("create")
+            .await
+            .err()
+            .expect("the returned trap must poison the slot before call returns");
+        let rendered = next_error.to_string();
+        assert!(
+            rendered.contains("WASM provider instance unusable after trap in normalize_state"),
+            "the fail-fast error must retain the trap origin: {rendered}"
+        );
+        assert!(
+            rendered.contains("operation 'create'"),
+            "the fail-fast error must name the rejected operation: {rendered}"
+        );
+    }
+
+    #[test]
     fn trap_poison_names_the_origin_and_keeps_only_the_structured_cause() {
-        let flag = AtomicBool::new(false);
-        let reason = OnceLock::new();
         let trap = wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached)
             .context("error while executing at wasm backtrace:\n    0: test-frame");
-
-        poison_after_trap(&flag, &reason, "normalize_state", &trap);
-
-        let error = poisoned_guard(&flag, &reason, "create")
-            .expect("the later operation must reject a trap-poisoned instance");
+        let reason = PoisonReason::from_trap("normalize_state", &trap);
+        let error = reason.fail_fast_error("create");
         let rendered = error.to_string();
         assert!(
             rendered.contains(
@@ -8460,29 +9230,207 @@ mod tests {
         );
     }
 
-    /// A completed guest call disarms the guard, so a normal operation
-    /// (success *or* a clean provider error — both mean the wasmtime call
-    /// returned, not a cancellation) must NOT poison the instance.
-    #[test]
-    fn disarmed_drop_does_not_poison() {
-        let flag = AtomicBool::new(false);
-        let reason = OnceLock::new();
+    #[tokio::test]
+    async fn rebuild_uses_the_recorded_basic_world() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+
+        let config = build_engine_config();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let component = Component::new(&engine, wasm_bytes)
+            .expect("mock WASM provider component should compile");
+        let initial = match create_instance_for_world(
+            &engine,
+            &component,
+            None,
+            InstantiationWorld::Basic,
+            GuestCallBudget::PRODUCTION,
+        )
+        .await
         {
-            let mut guard = PoisonOnDrop {
-                poisoned: &flag,
-                poisoned_reason: &reason,
-                armed: true,
+            Ok(initial) => initial,
+            Err(_) => panic!("the mock provider must support the basic world"),
+        };
+        assert_eq!(initial.instantiation_world(), InstantiationWorld::Basic);
+        let instance = RebuildableInstance::new(
+            initial,
+            RebuildContext {
+                engine,
+                component,
+                provider_kind: None,
+                world: InstantiationWorld::Basic,
+                budget: GuestCallBudget::PRODUCTION,
+            },
+        );
+        instance.state.lock().await.instance = ValidationInstanceState::Poisoned {
+            reason: PoisonReason::Cancelled,
+        };
+
+        let context = instance.validate_config_context(&[]);
+        let locked = instance
+            .acquire(context)
+            .await
+            .expect("the poisoned basic-world instance should rebuild");
+        locked
+            .call(async |bindings, store| bindings.call_validate_config(store, &[]).await)
+            .await
+            .expect("the rebuilt basic-world guest call should not trap")
+            .expect("the mock provider should accept an empty config");
+
+        assert_eq!(
+            instance.live_world().await,
+            Some(InstantiationWorld::Basic),
+            "the rebuilt live instance must record the basic world actually instantiated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_failure_is_typed_leaves_slot_poisoned_and_retries() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let component =
+            Component::new(&engine, "(component)").expect("empty test component should compile");
+        let fingerprint_key = [9_u8; 32];
+        let context = ValidationContextFingerprint::validate_config(&fingerprint_key, &[]);
+        let instance = RebuildableInstance {
+            state: Mutex::new(RebuildableState {
+                instance: ValidationInstanceState::Poisoned {
+                    reason: PoisonReason::WallClockTimeout {
+                        operation: "validate_config",
+                    },
+                },
+                input_health: IndexMap::new(),
+            }),
+            rebuild: RebuildContext {
+                engine,
+                component,
+                provider_kind: None,
+                world: InstantiationWorld::Basic,
+                budget: GuestCallBudget::PRODUCTION,
+            },
+            fingerprint_key,
+        };
+
+        for attempt in 1..=2 {
+            let error = match instance.acquire(context.clone()).await {
+                Ok(_) => panic!("the empty component rebuild must fail"),
+                Err(error) => error,
             };
-            guard.armed = false; // mirrors LockedStore::disarm()
+            assert_eq!(error.variant_name(), "internal");
+            assert_eq!(
+                error.detail().context(),
+                "Failed to rebuild WASM provider validation instance"
+            );
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "previous poison reason: WASM provider instance unusable after wall-clock \
+                     timeout in validate_config"
+                ),
+                "rebuild attempt {attempt} must retain the original poison reason: {rendered}"
+            );
+            let cause = error
+                .detail()
+                .cause()
+                .expect("rebuild failure must retain its typed rebuild error");
+            let rebuild_error = cause
+                .downcast_ref::<WasmProviderRebuildError>()
+                .expect("rebuild failure cause must remain typed");
+            let load_error = std::error::Error::source(rebuild_error)
+                .and_then(|source| source.downcast_ref::<WasmProviderLoadError>())
+                .expect("rebuild failure must retain WasmProviderLoadError as its source");
+            let WasmProviderLoadError::Instantiation(instantiation) = load_error else {
+                panic!("empty component must produce an instantiation error: {load_error:?}")
+            };
+            assert!(
+                matches!(
+                    instantiation.context.as_ref(),
+                    InstantiationContext::SingleAttempt {
+                        world: InstantiationWorld::Basic,
+                        ..
+                    }
+                ),
+                "rebuild attempt {attempt} must use only the recorded basic world"
+            );
+            let source_chain: Vec<_> = instantiation
+                .primary_failure
+                .chain()
+                .map(ToString::to_string)
+                .collect();
+            assert!(
+                source_chain.len() >= 2,
+                "rebuild attempt {attempt} must retain Wasmtime's source chain: {source_chain:?}"
+            );
+            assert!(
+                matches!(
+                    &instance.state.lock().await.instance,
+                    ValidationInstanceState::Poisoned {
+                        reason: PoisonReason::WallClockTimeout {
+                            operation: "validate_config"
+                        }
+                    }
+                ),
+                "a failed rebuild must leave the original poisoned slot intact"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn wall_budget_rebuild_failure_is_timeout_and_keeps_load_error_source() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let mut store = GuestStore::new(
+            &engine,
+            None,
+            None,
+            build_store_limits(),
+            GuestCallBudget::new(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO,
+            ),
+        );
+        let source = store
+            .call(|_store| std::future::pending::<()>())
+            .await
+            .expect_err("a zero wall budget must time out");
+        let load_error = wall_budget_load_error("instantiate", source);
+
+        let error = rebuild_provider_error(PoisonReason::Cancelled, load_error);
+
+        assert_eq!(error.variant_name(), "timeout");
+        let rendered = error.to_string();
         assert!(
-            !flag.load(Ordering::Acquire),
-            "a disarmed PoisonOnDrop must not poison the instance"
+            rendered.contains(
+                "previous poison reason: WASM provider is unusable: a prior operation was cancelled"
+            ),
+            "the prior poison reason must remain visible: {rendered}"
         );
         assert!(
-            poisoned_guard(&flag, &reason, "read").is_none(),
-            "an un-poisoned instance must keep accepting operations"
+            rendered.contains("WASM provider load timed out"),
+            "the typed load failure must remain visible: {rendered}"
         );
+        let cause = error
+            .detail()
+            .cause()
+            .expect("timeout rebuild failure must retain its typed cause");
+        let rebuild_error = cause
+            .downcast_ref::<WasmProviderRebuildError>()
+            .expect("timeout rebuild failure cause must remain typed");
+        let load_error = std::error::Error::source(rebuild_error)
+            .and_then(|source| source.downcast_ref::<WasmProviderLoadError>())
+            .expect("timeout rebuild failure must retain WasmProviderLoadError as its source");
+        assert!(load_error.is_wall_budget_timeout());
     }
 
     #[test]
