@@ -8,7 +8,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
-use super::AllowListHttpHooks;
+use super::{AllowListHttpHooks, ProviderKind, build_sandboxed_wasi_ctx};
 
 /// Period between increments of the wasmtime engine epoch.
 pub(super) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -172,16 +172,18 @@ impl GuestStore {
     /// compute time.
     pub(super) fn new(
         engine: &Engine,
-        wasi_ctx: WasiCtx,
+        provider_kind: Option<ProviderKind>,
         http_ctx: Option<WasiHttpCtx>,
         limits: StoreLimits,
         budget: GuestCallBudget,
     ) -> Self {
+        let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
+        let http_hooks = AllowListHttpHooks::new(provider_kind);
         let host_state = HostState {
             wasi_ctx,
             http_ctx,
             table: ResourceTable::new(),
-            http_hooks: AllowListHttpHooks,
+            http_hooks,
             limits,
             guest: GuestStoreState::new(budget),
         };
@@ -275,11 +277,10 @@ mod tests {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config).expect("test engine should be valid");
-        let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new().build();
         let limits = wasmtime::StoreLimitsBuilder::new().build();
         let mut store = GuestStore::new(
             &engine,
-            wasi_ctx,
+            None,
             None,
             limits,
             GuestCallBudget::new(Duration::from_secs(30), Duration::from_millis(20)),

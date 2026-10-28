@@ -6,7 +6,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::github_location::{
-    ArtifactId, AssetId, CommitSha, GitRef, GithubLocationError, RepoSlug, WorkflowRunId,
+    ArtifactId, AssetId, CommitSha, GitRef, GithubLocationError, ReleaseTag, RepoSlug,
+    WorkflowRunId,
+};
+use crate::verified_artifact::{GithubReleaseDownloadLocation, GithubRevisionDownloadLocation};
+use crate::version_resolver::{
+    ReleaseAssetVerificationError, VerifiedReleaseAsset,
+    verify_locked_release_asset as validate_locked_release_asset,
 };
 
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
@@ -45,6 +51,44 @@ impl GithubResponse {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
+    }
+}
+
+/// Bytes returned by GitHub together with the typed location used to fetch
+/// them. Only this module can mint the accompanying fetched-location token.
+#[derive(Debug)]
+pub(crate) struct DownloadedFrom<L> {
+    bytes: Vec<u8>,
+    location: L,
+}
+
+impl<L> DownloadedFrom<L> {
+    fn new(bytes: Vec<u8>, location: L) -> Self {
+        Self { bytes, location }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, FetchedLocation<L>) {
+        (self.bytes, FetchedLocation(self.location))
+    }
+}
+
+/// Proof that the typed GitHub client successfully fetched a location.
+#[derive(Debug)]
+pub(crate) struct FetchedLocation<L>(L);
+
+impl<L> FetchedLocation<L> {
+    pub(crate) fn into_inner(self) -> L {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(location: L) -> Self {
+        Self(location)
+    }
+
+    #[cfg(test)]
+    fn as_ref(&self) -> &L {
+        &self.0
     }
 }
 
@@ -271,6 +315,7 @@ pub(crate) enum GithubApiError {
     PaginationCycle {
         endpoint: String,
     },
+    ReleaseAssetVerification(ReleaseAssetVerificationError),
 }
 
 impl std::fmt::Display for GithubApiError {
@@ -327,6 +372,7 @@ impl std::fmt::Display for GithubApiError {
             Self::PaginationCycle { endpoint } => {
                 write!(formatter, "GitHub pagination cycle revisited {endpoint}")
             }
+            Self::ReleaseAssetVerification(error) => error.fmt(formatter),
         }
     }
 }
@@ -336,6 +382,12 @@ impl std::error::Error for GithubApiError {}
 impl From<GithubLocationError> for GithubApiError {
     fn from(error: GithubLocationError) -> Self {
         Self::Location(error)
+    }
+}
+
+impl From<ReleaseAssetVerificationError> for GithubApiError {
+    fn from(error: ReleaseAssetVerificationError) -> Self {
+        Self::ReleaseAssetVerification(error)
     }
 }
 
@@ -401,14 +453,36 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         parse_json(&response.body, &url)
     }
 
-    pub(crate) fn download_release_asset(
+    pub(crate) fn release_by_tag(
         &self,
         repo: &RepoSlug,
+        tag: &ReleaseTag,
+    ) -> Result<GithubReleaseResponse, GithubApiError> {
+        let url = repo.release_by_tag_url(tag)?;
+        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Optional)?;
+        parse_json(&response.body, &url)
+    }
+
+    pub(crate) fn verify_locked_release_asset(
+        &self,
+        repo: &RepoSlug,
+        version: &semver::Version,
+        tag: &ReleaseTag,
         asset_id: AssetId,
-    ) -> Result<Vec<u8>, GithubApiError> {
-        let url = repo.release_asset_url(asset_id)?;
+    ) -> Result<VerifiedReleaseAsset, GithubApiError> {
+        let release = self.release_by_tag(repo, tag)?;
+        validate_locked_release_asset(repo.clone(), version, tag, asset_id, release)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn download_release_asset(
+        &self,
+        asset: VerifiedReleaseAsset,
+    ) -> Result<DownloadedFrom<GithubReleaseDownloadLocation>, GithubApiError> {
+        let url = asset.repo().release_asset_url(asset.asset_id())?;
+        let location = GithubReleaseDownloadLocation::from_verified_asset(&asset);
         self.get(&url, OCTET_STREAM_ACCEPT, GithubAuthentication::Optional)
-            .map(|response| response.body)
+            .map(|response| DownloadedFrom::new(response.body, location))
     }
 
     pub(crate) fn commit(
@@ -478,15 +552,16 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         repo: &RepoSlug,
         artifact_id: ArtifactId,
         response_body_limit: u64,
-    ) -> Result<Vec<u8>, GithubApiError> {
+    ) -> Result<DownloadedFrom<GithubRevisionDownloadLocation>, GithubApiError> {
         let url = repo.artifact_zip_url(artifact_id)?;
+        let location = GithubRevisionDownloadLocation::new(repo.clone(), artifact_id);
         self.get_with_body_limit(
             &url,
             GITHUB_JSON_ACCEPT,
             GithubAuthentication::Required,
             Some(response_body_limit),
         )
-        .map(|response| response.body)
+        .map(|response| DownloadedFrom::new(response.body, location))
     }
 
     fn paginate<T>(
@@ -650,16 +725,16 @@ fn next_link(header: &str) -> Option<&str> {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone, Default)]
-pub(crate) struct FixtureGithubHttp {
+pub struct FixtureGithubHttp {
     responses: std::sync::Arc<
         std::sync::Mutex<BTreeMap<String, std::collections::VecDeque<GithubFixtureResponse>>>,
     >,
     requests: std::sync::Arc<std::sync::Mutex<Vec<GithubRequest>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone)]
 struct GithubFixtureResponse {
     status: u16,
@@ -667,12 +742,13 @@ struct GithubFixtureResponse {
     body: Vec<u8>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl FixtureGithubHttp {
-    pub(crate) fn json(self, url: &str, body: impl AsRef<[u8]>) -> Self {
+    pub fn json(self, url: &str, body: impl AsRef<[u8]>) -> Self {
         self.response(url, 200, body, &[])
     }
 
+    #[cfg(test)]
     pub(crate) fn json_with_headers(
         self,
         url: &str,
@@ -682,7 +758,7 @@ impl FixtureGithubHttp {
         self.response(url, 200, body, headers)
     }
 
-    pub(crate) fn bytes(self, url: &str, body: impl AsRef<[u8]>) -> Self {
+    pub fn bytes(self, url: &str, body: impl AsRef<[u8]>) -> Self {
         self.response(url, 200, body, &[])
     }
 
@@ -709,12 +785,22 @@ impl FixtureGithubHttp {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn requests(&self) -> Vec<GithubRequest> {
         self.requests.lock().unwrap().clone()
     }
+
+    pub fn requested_urls(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.url.clone())
+            .collect()
+    }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl GithubHttp for FixtureGithubHttp {
     fn get(&self, request: GithubRequest) -> Result<GithubResponse, GithubApiError> {
         self.requests.lock().unwrap().push(request.clone());
@@ -780,6 +866,30 @@ mod tests {
         RepoSlug::try_from(&github_source()).unwrap()
     }
 
+    fn verified_release_asset(tag: &str, asset_id: u64) -> VerifiedReleaseAsset {
+        let release = crate::version_resolver::GithubRelease::from_api(GithubReleaseResponse {
+            tag_name: tag.into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![GithubAssetResponse {
+                id: asset_id,
+                name: "provider.wasm".into(),
+            }],
+        })
+        .unwrap();
+        crate::version_resolver::verify_fresh_release_asset(repo_slug(), release).unwrap()
+    }
+
+    #[test]
+    fn github_api_error_does_not_expose_displayed_child_as_source() {
+        let error = GithubApiError::Decode {
+            endpoint: "https://api.github.com/repos/acme/widget/releases".into(),
+            source: serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+        };
+
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
     #[test]
     fn release_listing_sends_bearer_when_token_is_present() {
         let url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
@@ -805,6 +915,24 @@ mod tests {
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].authorization(), None);
+    }
+
+    #[test]
+    fn release_by_tag_uses_the_typed_repository_endpoint() {
+        let url = "https://api.github.com/repos/acme/widget/releases/tags/v1.2.3+build_1";
+        let http =
+            FixtureGithubHttp::default().json(url, r#"{"tag_name":"v1.2.3+build_1","assets":[]}"#);
+        let api = GithubApi::new(&http, Some("test-token"));
+        let tag = ReleaseTag::from_lock("v1.2.3+build_1".into());
+
+        let release = api.release_by_tag(&repo_slug(), &tag).unwrap();
+
+        assert_eq!(release.tag_name, tag.as_str());
+        let requests = http.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url(), url);
+        assert_eq!(requests[0].accept(), "application/vnd.github+json");
+        assert_eq!(requests[0].authorization(), Some("Bearer test-token"));
     }
 
     #[test]
@@ -843,16 +971,46 @@ mod tests {
         let url = "https://api.github.com/repos/acme/widget/releases/assets/42";
         let http = FixtureGithubHttp::default().bytes(url, b"wasm");
         let api = GithubApi::new(&http, Some("test-token"));
+        let repo = repo_slug();
+        let tag = ReleaseTag::from_lock("v1.2.3".into());
+        let asset_id = AssetId::from_lock(42);
+        let verified = verified_release_asset(tag.as_str(), asset_id.get());
 
-        let bytes = api
-            .download_release_asset(&repo_slug(), AssetId::from_lock(42))
-            .unwrap();
+        let (bytes, location) = api.download_release_asset(verified).unwrap().into_parts();
 
         assert_eq!(bytes, b"wasm");
+        assert_eq!(
+            location.as_ref(),
+            &GithubReleaseDownloadLocation::for_test(repo, tag, asset_id)
+        );
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url(), url);
         assert_eq!(requests[0].accept(), "application/octet-stream");
+        assert_eq!(requests[0].authorization(), Some("Bearer test-token"));
+    }
+
+    #[test]
+    fn authenticated_actions_artifact_download_returns_typed_location() {
+        let url = "https://api.github.com/repos/acme/widget/actions/artifacts/42/zip";
+        let http = FixtureGithubHttp::default().bytes(url, b"zip");
+        let api = GithubApi::new(&http, Some("test-token"));
+        let repo = repo_slug();
+        let artifact_id = ArtifactId::from_lock(42);
+
+        let (bytes, location) = api
+            .download_artifact_zip(&repo, artifact_id, 1024)
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(bytes, b"zip");
+        assert_eq!(
+            location.as_ref(),
+            &GithubRevisionDownloadLocation::new(repo, artifact_id)
+        );
+        let requests = http.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url(), url);
         assert_eq!(requests[0].authorization(), Some("Bearer test-token"));
     }
 
@@ -887,7 +1045,7 @@ mod tests {
         let api = GithubApi::with_token_provider(&http, &tokens);
 
         api.list_releases(&repo_slug()).unwrap();
-        api.download_release_asset(&repo_slug(), AssetId::from_lock(42))
+        api.download_release_asset(verified_release_asset("v1.2.3", 42))
             .unwrap();
 
         assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);

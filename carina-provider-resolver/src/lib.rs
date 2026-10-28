@@ -4,15 +4,26 @@ mod github;
 mod github_location;
 mod install_lock;
 pub mod provider_resolver;
+mod provider_trust;
 pub mod revision_resolver;
 mod signing;
+mod trusted_local;
+mod user_trust;
 mod verified_artifact;
 mod version_resolver;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub use github::FixtureGithubHttp;
 pub use github_location::{ArtifactId, AssetId, CommitSha, ReleaseTag};
 pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
-pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact};
+pub use provider_trust::{
+    ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust, ProviderTrustClass,
+    UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
+};
+pub use trusted_local::{GrantParseError, TrustedLocalGrants};
+pub use user_trust::{UserTrustRecord, UserTrustRecordDirError, user_trust_record_dir};
+pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact, VerifiedLoad};
 
 #[cfg(test)]
 pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -20,6 +31,15 @@ pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn isolated_test_storage_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        tempfile::tempdir().expect("create isolated per-process provider storage for tests")
+    })
+    .path()
 }
 
 #[cfg(test)]
@@ -34,6 +54,13 @@ impl ScopedEnvVar {
         let previous = std::env::var_os(name);
         // SAFETY: callers hold test_env_guard() while this process-wide override is active.
         unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+
+    pub(crate) fn remove(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: callers hold test_env_guard() while this process-wide override is active.
+        unsafe { std::env::remove_var(name) };
         Self { name, previous }
     }
 }
