@@ -17,6 +17,7 @@ mod tests {
     use super::*;
     use carina_plugin_sdk::protocol::types::{
         CreateStep as WireCreateStep, CreateVerdict as WireCreateVerdict,
+        PollVerdict as WirePollVerdict,
     };
     use std::cell::RefCell;
 
@@ -35,24 +36,42 @@ mod tests {
         fn new_client_token(&self) -> String {
             "token-1".to_string()
         }
-        fn start_create(&self, client_token: &str, name: &str, size: i64) -> Result<String, ApiError> {
+        fn start_create(
+            &self,
+            client_token: &str,
+            name: &str,
+            size: i64,
+        ) -> Result<String, ApiError> {
             if let Some(operation) = self.operations.borrow().get(client_token) {
                 return Ok(operation.clone());
             }
             if !self.start_errors.borrow().is_empty() {
                 return Err(self.start_errors.borrow_mut().remove(0));
             }
-            self.widgets.borrow_mut().push(Widget { id: format!("w-{name}"), name: name.into(), size });
+            self.widgets.borrow_mut().push(Widget {
+                id: format!("w-{name}"),
+                name: name.into(),
+                size,
+            });
             let operation = format!("op-{name}");
-            self.operations.borrow_mut().insert(client_token.into(), operation.clone());
+            self.operations
+                .borrow_mut()
+                .insert(client_token.into(), operation.clone());
             Ok(operation)
         }
         fn create_status(&self, operation: &str) -> Result<CreateStatus, ApiError> {
             let name = operation.trim_start_matches("op-");
-            Ok(CreateStatus::Done { id: format!("w-{name}") })
+            Ok(CreateStatus::Done {
+                id: format!("w-{name}"),
+            })
         }
         fn get(&self, id: &str) -> Result<Widget, ApiError> {
-            self.widgets.borrow().iter().find(|w| w.id == id).cloned().ok_or(ApiError::NotFound)
+            self.widgets
+                .borrow()
+                .iter()
+                .find(|w| w.id == id)
+                .cloned()
+                .ok_or(ApiError::NotFound)
         }
         fn set_size(&self, id: &str, size: i64) -> Result<(), ApiError> {
             self.size_calls.borrow_mut().push((id.to_string(), size));
@@ -64,7 +83,10 @@ mod tests {
     }
 
     fn api_failing_with(errors: Vec<ApiError>) -> FakeApi {
-        FakeApi { start_errors: RefCell::new(errors), ..Default::default() }
+        FakeApi {
+            start_errors: RefCell::new(errors),
+            ..Default::default()
+        }
     }
 
     /// Poll a pending create once, the way the host does.
@@ -111,8 +133,9 @@ mod tests {
         };
         // `CreateAttempt` can only be minted by the SDK; dispatch_create
         // goes through the same entry point the host uses.
-        let verdict = carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 99))
-            .expect_err("a rejected create must not succeed");
+        let verdict =
+            carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 99))
+                .expect_err("a rejected create must not succeed");
         assert!(matches!(*verdict, WireCreateVerdict::Untracked(_)));
     }
 
@@ -121,28 +144,73 @@ mod tests {
         let provider = WidgetProvider {
             api: api_failing_with(vec![ApiError::Unknown("connection reset".into())]),
         };
-        let step = carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
-            .expect("an unknown outcome must not be reported as a failure");
-        let WireCreateStep::Pending(pending) = step else { panic!("expected pending") };
+        let step =
+            carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
+                .expect("an unknown outcome must not be reported as a failure");
+        let WireCreateStep::Pending(pending) = step else {
+            panic!("expected pending")
+        };
         assert!(pending.identifier.is_none());
 
         // The retry starts the create once; no second widget appears.
-        let WireCreateStep::Pending(pending) = poll(&provider, pending) else { panic!("expected pending") };
+        let WireCreateStep::Pending(pending) = poll(&provider, pending) else {
+            panic!("expected pending")
+        };
         assert!(matches!(pending.token, CreateToken::Operation(_)));
         assert_eq!(provider.api.widgets.borrow().len(), 1);
     }
 
     #[test]
+    fn rejected_retry_is_undetermined_not_untracked() {
+        let provider = WidgetProvider {
+            api: api_failing_with(vec![
+                ApiError::Unknown("timeout".into()),
+                ApiError::Rejected("client token reused with different parameters".into()),
+            ]),
+        };
+        let step =
+            carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
+                .expect("an unknown outcome must not be reported as a failure");
+        let WireCreateStep::Pending(pending) = step else {
+            panic!("expected pending")
+        };
+        let verdict = carina_plugin_sdk::dispatch_poll_create(
+            &provider,
+            &resource_id(),
+            create_request("a", 1),
+            pending.identifier,
+            pending.sent,
+            pending.token,
+        )
+        .expect_err("a rejected retry must not succeed");
+        assert!(matches!(*verdict, WirePollVerdict::Undetermined(_)));
+    }
+
+    #[test]
     fn poll_records_the_identifier_then_reads_the_widget() {
-        let provider = WidgetProvider { api: FakeApi::default() };
-        let step = carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
-            .expect("create should start");
-        let WireCreateStep::Pending(pending) = step else { panic!("expected pending") };
+        let provider = WidgetProvider {
+            api: FakeApi::default(),
+        };
+        let step =
+            carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
+                .expect("create should start");
+        let WireCreateStep::Pending(pending) = step else {
+            panic!("expected pending")
+        };
 
-        let WireCreateStep::Pending(pending) = poll(&provider, pending) else { panic!("expected pending") };
-        assert_eq!(pending.identifier.as_ref().map(|id| id.as_str()), Some("w-a"));
+        let WireCreateStep::Pending(pending) = poll(&provider, pending) else {
+            panic!("expected pending")
+        };
+        assert_eq!(
+            pending.identifier.as_ref().map(|id| id.as_str()),
+            Some("w-a")
+        );
 
-        let WireCreateStep::Success { identifier, attributes } = poll(&provider, pending) else {
+        let WireCreateStep::Success {
+            identifier,
+            attributes,
+        } = poll(&provider, pending)
+        else {
             panic!("expected success")
         };
         assert_eq!(identifier.as_str(), "w-a");
@@ -151,7 +219,9 @@ mod tests {
 
     #[test]
     fn update_sends_only_patched_keys() {
-        let provider = WidgetProvider { api: FakeApi::default() };
+        let provider = WidgetProvider {
+            api: FakeApi::default(),
+        };
         let identifier = AppliedIdentifier::new("w-a").unwrap();
         let request = UpdateRequest {
             from: PersistedState {
@@ -164,16 +234,26 @@ mod tests {
                 exists: true,
             },
             patch: UpdatePatch {
-                ops: vec![PatchOp::Replace { key: "size".into(), value: Value::Int(2) }],
+                ops: vec![PatchOp::Replace {
+                    key: "size".into(),
+                    value: Value::Int(2),
+                }],
             },
         };
-        provider.update(&resource_id(), &identifier, request).expect("update should succeed");
-        assert_eq!(*provider.api.size_calls.borrow(), vec![("w-a".to_string(), 2)]);
+        provider
+            .update(&resource_id(), &identifier, request)
+            .expect("update should succeed");
+        assert_eq!(
+            *provider.api.size_calls.borrow(),
+            vec![("w-a".to_string(), 2)]
+        );
     }
 
     #[test]
     fn deleting_a_missing_widget_succeeds() {
-        let provider = WidgetProvider { api: FakeApi::default() };
+        let provider = WidgetProvider {
+            api: FakeApi::default(),
+        };
         let identifier = AppliedIdentifier::new("w-gone").unwrap();
         let outcome = provider.delete(&resource_id(), &identifier, DeleteRequest::default());
         assert!(matches!(outcome, Ok(DeleteOutcome::Deleted)));
@@ -181,7 +261,7 @@ mod tests {
 }
 ```
 
-Test the classification as well as the happy path. A test like `create_with_unknown_outcome_is_retried_with_the_same_client_token` is what keeps a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
+Test the classification as well as the happy path. Tests like `create_with_unknown_outcome_is_retried_with_the_same_client_token` and `rejected_retry_is_undetermined_not_untracked` are what keep a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
 
 ## Acceptance tests
 
