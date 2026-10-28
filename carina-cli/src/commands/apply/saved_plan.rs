@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
@@ -8,11 +8,15 @@ use carina_core::resource::{Composition, Current, DataSource, Resource, Resource
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, ReloadedCurrentStateEntry,
-    ReloadedPlanFile, ResolvedProviderInputs, UpstreamSource,
+    MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
+    ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs, UpstreamSource,
+    recorded_provider_artifacts,
 };
-use crate::error::{AppError, SavedPlanSchemaMismatchError};
-use crate::wiring::ExpandedCanonicalResources;
+use crate::error::{
+    AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
+    SavedPlanSchemaMismatchError,
+};
+use crate::wiring::{ExpandedCanonicalResources, WiringContext};
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -208,6 +212,16 @@ pub(super) struct ReloadedVerifiedPlanFile {
     schema_references: PlanSchemaReferences,
 }
 
+/// The exact provider context whose artifacts and schemas matched a saved plan.
+/// Only the verification transition below can construct this witness.
+pub(super) struct VerifiedWiringContext(WiringContext);
+
+impl VerifiedWiringContext {
+    pub(super) fn context(&self) -> &WiringContext {
+        &self.0
+    }
+}
+
 impl ReloadedInspectedPlanFile {
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
         match self {
@@ -216,40 +230,76 @@ impl ReloadedInspectedPlanFile {
         }
     }
 
-    /// Check the persisted schema snapshot immediately after schema loading.
+    /// Check artifact identities and schemas immediately after provider loading.
     /// Every later secret/normalizer/provider transition consumes this proof.
-    pub(super) fn verify_schema_fingerprints(
+    pub(super) fn verify_loaded_providers(
         self,
-        schemas: &carina_core::schema::SchemaRegistry,
+        ctx: WiringContext,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<SchemaCheckedPlanFile, AppError> {
+    ) -> Result<(SchemaCheckedPlanFile, VerifiedWiringContext), AppError> {
+        let recorded_artifacts = match &self {
+            Self::Verified(plan) => plan.plan_file.provider_artifacts(),
+            Self::NeedsSecretVerification(plan) => plan.plan_file.provider_artifacts(),
+        };
+        let loaded_artifacts = recorded_provider_artifacts(&ctx);
+        let provider_names = recorded_artifacts
+            .keys()
+            .chain(loaded_artifacts.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let providers = provider_names
+            .into_iter()
+            .filter_map(|provider| {
+                let recorded = recorded_artifacts.get(&provider);
+                let loaded = loaded_artifacts.get(&provider);
+                if recorded == loaded {
+                    None
+                } else {
+                    Some((
+                        provider,
+                        SavedPlanProviderArtifactDifference {
+                            recorded: recorded.map(RecordedProviderArtifact::summary),
+                            loaded: loaded.map(RecordedProviderArtifact::summary),
+                        },
+                    ))
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !providers.is_empty() {
+            return Err(AppError::SavedPlanProviderArtifactMismatch(
+                SavedPlanProviderArtifactMismatchError {
+                    providers,
+                    replan_command: apply_target.replan_command().to_string(),
+                },
+            ));
+        }
+
         let map_mismatch = |mismatch: crate::commands::plan::PlanSchemaFingerprintMismatch| {
             AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
                 providers: mismatch.providers,
                 replan_command: apply_target.replan_command().to_string(),
             })
         };
-        match self {
+        let checked_plan = match self {
             Self::Verified(plan) => {
                 plan.plan_file
-                    .verify_schema_fingerprints(&plan.schema_references, schemas)
+                    .verify_schema_fingerprints(&plan.schema_references, ctx.schemas())
                     .map_err(map_mismatch)?;
-                Ok(SchemaCheckedPlanFile::Verified(RehydratedPlanFile {
+                SchemaCheckedPlanFile::Verified(RehydratedPlanFile {
                     plan_file: plan.plan_file,
                     planned_secret_hashes: HashMap::new(),
-                }))
+                })
             }
             Self::NeedsSecretVerification(plan) => {
                 plan.plan_file
-                    .verify_schema_fingerprints(&plan.schema_references, schemas)
+                    .verify_schema_fingerprints(&plan.schema_references, ctx.schemas())
                     .map_err(map_mismatch)?;
-                Ok(SchemaCheckedPlanFile::NeedsSecretVerification(
-                    SchemaCheckedPendingPlanFile {
-                        plan_file: plan.plan_file,
-                    },
-                ))
+                SchemaCheckedPlanFile::NeedsSecretVerification(SchemaCheckedPendingPlanFile {
+                    plan_file: plan.plan_file,
+                })
             }
-        }
+        };
+        Ok((checked_plan, VerifiedWiringContext(ctx)))
     }
 }
 
@@ -696,12 +746,205 @@ mod tests {
     use std::path::Path;
 
     use carina_core::data_source_value::DataSourceValue;
+    use carina_core::parser::ProviderConfig;
     use carina_core::plan::Plan;
+    use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
     use carina_core::resource::{ConcreteValue, DataSource, DeferredValue, State, Value};
+    use carina_core::schema::{AttributeType, ResourceSchema};
+    use indexmap::IndexMap;
 
-    use super::{DesiredVerifiedPlanFile, HistoricalResourceAddresses};
+    use super::{
+        DesiredVerifiedPlanFile, HistoricalResourceAddresses, InspectedPlanFile,
+        SchemaCheckedPlanFile,
+    };
     use crate::commands::apply::ApplyTarget;
-    use crate::commands::plan::{PlanFile, SavedDataSourceValue};
+    use crate::commands::plan::{PlanFile, RecordedProviderArtifact, SavedDataSourceValue};
+    use crate::error::AppError;
+    use crate::wiring::{LoadedProviderFactory, WiringContext};
+
+    struct ArtifactFactory {
+        name: &'static str,
+    }
+
+    impl ProviderFactory for ArtifactFactory {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn display_name(&self) -> &str {
+            "Saved-plan artifact test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test-region".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async {
+                Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    fn provider_config(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            source: Some(format!("file://{name}.wasm").parse().unwrap()),
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+        }
+    }
+
+    fn wasm_context(name: &'static str, bytes: &[u8]) -> WiringContext {
+        WiringContext::new(
+            vec![LoadedProviderFactory::for_test_with_bytes(
+                Box::new(ArtifactFactory { name }),
+                bytes,
+            )],
+            &[provider_config(name)],
+        )
+    }
+
+    fn builtin_context() -> WiringContext {
+        WiringContext::new_for_test(Vec::new(), &[])
+    }
+
+    fn empty_plan_file() -> PlanFile {
+        PlanFile {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-28T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: serde_json::from_value(serde_json::json!([]))
+                .expect("empty saved provider configs"),
+            backend_config: None,
+            plan: Plan::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+            schema_fingerprints: Default::default(),
+            provider_artifacts: Default::default(),
+        }
+    }
+
+    fn plan_recorded_with(ctx: &WiringContext) -> PlanFile {
+        let mut plan = empty_plan_file();
+        plan.record_loaded_providers(ctx);
+        plan
+    }
+
+    fn apply_target() -> ApplyTarget<'static> {
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("."),
+        }
+    }
+
+    fn reloaded(plan: PlanFile) -> super::ReloadedInspectedPlanFile {
+        InspectedPlanFile::inspect(plan)
+            .reload_in_flight_from_locked_state(None)
+            .expect("reload saved plan")
+    }
+
+    #[test]
+    fn changed_artifact_with_identical_schemas_fails_before_schema_checked_state() {
+        let planned = wasm_context("mock", b"artifact A");
+        let loaded = wasm_context("mock", b"artifact B");
+
+        let result =
+            reloaded(plan_recorded_with(&planned)).verify_loaded_providers(loaded, apply_target());
+
+        let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = result else {
+            panic!("changed provider bytes must not produce SchemaCheckedPlanFile")
+        };
+        assert_eq!(mismatch.providers.keys().collect::<Vec<_>>(), vec!["mock"]);
+    }
+
+    #[test]
+    fn unchanged_artifact_and_schemas_produce_schema_checked_state() {
+        let planned = wasm_context("mock", b"artifact A");
+        let loaded = wasm_context("mock", b"artifact A");
+
+        let result =
+            reloaded(plan_recorded_with(&planned)).verify_loaded_providers(loaded, apply_target());
+
+        assert!(matches!(
+            result,
+            Ok((SchemaCheckedPlanFile::Verified(_), _))
+        ));
+    }
+
+    #[test]
+    fn builtin_artifact_records_and_verifies_as_builtin() {
+        let planned = builtin_context();
+        let plan = plan_recorded_with(&planned);
+        assert_eq!(
+            plan.provider_artifacts.get("mock"),
+            Some(&RecordedProviderArtifact::BuiltIn)
+        );
+
+        let result = reloaded(plan).verify_loaded_providers(builtin_context(), apply_target());
+
+        assert!(matches!(
+            result,
+            Ok((SchemaCheckedPlanFile::Verified(_), _))
+        ));
+    }
+
+    #[test]
+    fn builtin_vs_wasm_and_missing_or_extra_provider_keys_are_mismatches() {
+        let builtin_plan = plan_recorded_with(&builtin_context());
+
+        let same_name = reloaded(builtin_plan.clone())
+            .verify_loaded_providers(wasm_context("mock", b"artifact"), apply_target());
+        assert!(matches!(
+            same_name,
+            Err(AppError::SavedPlanProviderArtifactMismatch(ref mismatch))
+                if mismatch.providers.contains_key("mock")
+        ));
+
+        let changed_keys = reloaded(builtin_plan)
+            .verify_loaded_providers(wasm_context("other", b"artifact"), apply_target());
+        let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = changed_keys else {
+            panic!("missing and extra provider keys must invalidate a saved plan")
+        };
+        assert_eq!(
+            mismatch.providers.keys().collect::<Vec<_>>(),
+            vec!["mock", "other"]
+        );
+    }
 
     #[tokio::test]
     async fn historical_verification_rehydrates_read_outcome_without_current_state_row() {
@@ -747,6 +990,7 @@ mod tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
             schema_fingerprints: Default::default(),
+            provider_artifacts: Default::default(),
         }
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan");

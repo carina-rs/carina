@@ -23,7 +23,10 @@ pub use provider_trust::{
 };
 pub use trusted_local::{GrantParseError, TrustedLocalGrants};
 pub use user_trust::{UserTrustRecord, UserTrustRecordDirError, user_trust_record_dir};
-pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact, VerifiedLoad};
+pub use verified_artifact::{
+    LoadedArtifactIdentity, LoadedArtifactOrigin, LockedArtifactVersion, ProviderArtifactBytes,
+    VerifiedArtifact, VerifiedLoad,
+};
 
 #[cfg(test)]
 pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {

@@ -20,6 +20,7 @@ pub enum DeclarationKind {
     ModuleAttribute,
     Binding,
     UserFunction,
+    ProviderKind,
 }
 
 impl DeclarationKind {
@@ -30,6 +31,7 @@ impl DeclarationKind {
             Self::ModuleAttribute => "module attribute",
             Self::Binding => "binding",
             Self::UserFunction => "function",
+            Self::ProviderKind => "provider kind",
         }
     }
 }
@@ -43,6 +45,7 @@ enum UniquenessNamespace {
     Binding,
     ModuleAttribute,
     UserFunction,
+    ProviderKind,
 }
 
 impl DeclarationKind {
@@ -52,6 +55,7 @@ impl DeclarationKind {
             Self::Argument | Self::Binding => UniquenessNamespace::Binding,
             Self::ModuleAttribute => UniquenessNamespace::ModuleAttribute,
             Self::UserFunction => UniquenessNamespace::UserFunction,
+            Self::ProviderKind => UniquenessNamespace::ProviderKind,
         }
     }
 }
@@ -467,6 +471,14 @@ fn collect_file_declarations(
     // function maps would otherwise retain whichever file merged last.
     for name in parsed.user_functions.keys() {
         record(DeclarationKind::UserFunction, name);
+    }
+
+    // Provider configuration is kind-level. Named provider instances reuse a
+    // kind's single top-level default and remain ordinary binding declarations.
+    for provider in &parsed.providers {
+        if provider.is_default() {
+            record(DeclarationKind::ProviderKind, &provider.name);
+        }
     }
 }
 
@@ -2582,6 +2594,43 @@ awscc.ec2.SecurityGroup {
             duplicate_messages_for_two_copies(parsed),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
+    }
+
+    #[test]
+    fn duplicate_extraction_rejects_default_provider_kind_across_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[
+                (
+                    "providers.crn",
+                    "provider mock {\n  source = 'file:///mock.wasm'\n}\n",
+                ),
+                ("main.crn", "provider mock {}\n"),
+            ],
+        );
+
+        assert_eq!(
+            messages,
+            vec!["duplicate provider kind 'mock': declared in main.crn and providers.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_allows_named_instances_of_the_same_provider_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[
+                ("providers.crn", "provider mock {}\n"),
+                (
+                    "main.crn",
+                    "let first = provider mock {}\nlet second = provider mock {}\n",
+                ),
+            ],
+        );
+
+        assert!(messages.is_empty(), "unexpected duplicates: {messages:#?}");
     }
 
     #[test]

@@ -55,8 +55,8 @@ impl ProviderFactory for DuplicateTestFactory {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(DuplicateTestFactory)]
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(DuplicateTestFactory)])
 }
 
 fn write_fixture(files: &[(&str, &str)]) -> TempDir {

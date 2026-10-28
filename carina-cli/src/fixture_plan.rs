@@ -30,8 +30,9 @@ use crate::commands::plan::compute_export_diffs;
 use crate::commands::validate_and_resolve_config_pair_with_context;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
-    add_deferred_create_effects, compute_canonical_pair_anonymous_identifiers_with_ctx,
+    LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
+    WiringContext, add_deferred_create_effects,
+    compute_canonical_pair_anonymous_identifiers_with_ctx,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities,
 };
@@ -174,13 +175,22 @@ pub struct FixturePlan {
 
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
 /// the fixture under `CARGO_MANIFEST_DIR/tests/fixtures/plan_display/<name>`.
+#[cfg(test)]
 pub fn build_plan_from_fixture_name(fixture_dir: &str) -> FixturePlan {
+    build_plan_from_fixture_name_using(fixture_dir, LoadedProviderFactory::for_test)
+}
+
+/// Build a fixture plan with caller-supplied, identity-carrying factories.
+pub fn build_plan_from_fixture_name_using<F>(fixture_dir: &str, load_factories: F) -> FixturePlan
+where
+    F: Fn(Vec<Box<dyn ProviderFactory>>) -> Vec<LoadedProviderFactory>,
+{
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let fixture_path = PathBuf::from(format!(
         "{}/{}/{}",
         manifest_dir, FIXTURE_SUBPATH, fixture_dir
     ));
-    build_plan_from_fixture_path(&fixture_path)
+    build_plan_from_fixture_path_using(&fixture_path, load_factories)
 }
 
 /// Build the exact non-destroy display summary for a fixture, including its
@@ -202,7 +212,16 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
 /// Build a plan from an absolute fixture path. Loads the configuration,
 /// validates with `skip_resource_validation=true` (no provider plugin load),
 /// and produces a provider-less fixture plan from the persisted state.
+#[cfg(test)]
 pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
+    build_plan_from_fixture_path_using(fixture_path, LoadedProviderFactory::for_test)
+}
+
+/// Build a fixture plan with caller-supplied, identity-carrying factories.
+pub fn build_plan_from_fixture_path_using<F>(fixture_path: &Path, load_factories: F) -> FixturePlan
+where
+    F: Fn(Vec<Box<dyn ProviderFactory>>) -> Vec<LoadedProviderFactory>,
+{
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
@@ -217,7 +236,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // catalog would assign anonymous identities earlier than the real plan
     // path and make the harness observe the wrong inputs.
     let validation_wiring = WiringContext::new_with_additional_schemas(
-        fixture_provider_config_factories(),
+        load_factories(fixture_provider_config_factories()),
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
@@ -246,7 +265,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     };
 
     let wiring = WiringContext::new_with_additional_schemas(
-        fixture_provider_factories(&fixture_pathbuf),
+        load_factories(fixture_provider_factories(&fixture_pathbuf)),
         &parsed.providers,
         fixture_schemas(),
     );

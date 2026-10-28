@@ -14,6 +14,8 @@ use carina_core::parser::{ProviderConfig, UseStatement};
 use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
+#[cfg(test)]
+use crate::wiring::LoadedProviderFactory;
 use crate::wiring::{
     FormattingFactoryLoad, ProviderFactoryDiagnostic, WiringContext,
     build_factories_from_providers_for_formatting,
@@ -523,7 +525,7 @@ mod tests {
             let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(FactoryWithBlockSchema {
                 block_name: "entry_from_factory",
             })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 
@@ -582,12 +584,12 @@ mod tests {
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
         let skipped = block_names_for_dir(tmp.path(), |_, _| {
-            Ok((Vec::<Box<dyn ProviderFactory>>::new(), HashMap::new()))
+            Ok((Vec::<LoadedProviderFactory>::new(), HashMap::new()))
         })
         .unwrap();
         let failed = block_names_for_dir(tmp.path(), |_, _| {
             Ok((
-                Vec::<Box<dyn ProviderFactory>>::new(),
+                Vec::<LoadedProviderFactory>::new(),
                 HashMap::from([(
                     "example".to_string(),
                     ProviderFactoryDiagnostic::Message("load failed".into()),
@@ -656,7 +658,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 
@@ -721,7 +723,7 @@ let imported = use {{
             };
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok((factories, HashMap::new()))
+            Ok((LoadedProviderFactory::for_test(factories), HashMap::new()))
         })
         .unwrap();
 

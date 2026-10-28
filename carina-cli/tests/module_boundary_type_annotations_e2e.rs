@@ -240,8 +240,10 @@ fn nested_domain_consumer_schema() -> ResourceSchema {
         .with_unique_name_attribute("name")
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsTestFactory) as Box<dyn ProviderFactory>]
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(AwsTestFactory) as Box<dyn ProviderFactory>
+    ])
 }
 
 struct Fixture {

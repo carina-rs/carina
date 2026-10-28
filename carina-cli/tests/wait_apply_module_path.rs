@@ -305,7 +305,9 @@ fn apply_path_propagates_module_wait_binding() {
         // schema, only that the module's `wait` survives apply
         // expansion).
         true,
-        vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
+        carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+            Box::new(AwsStub) as Box<dyn ProviderFactory>
+        ]),
         HashMap::new(),
         &inference_errors,
         &[],
@@ -417,7 +419,9 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         &mut parsed,
         base_dir,
         false,
-        vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
+        carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+            Box::new(AwsStub) as Box<dyn ProviderFactory>
+        ]),
         HashMap::new(),
         &inference_errors,
         &[],
@@ -478,12 +482,16 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AwsStub)];
+    let factories = carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(AwsStub) as Box<dyn ProviderFactory>
+    ]);
     let errs = validate_and_resolve_errors_with_factories(
         &mut parsed,
         base_dir,
         true,
-        vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
+        carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+            Box::new(AwsStub) as Box<dyn ProviderFactory>
+        ]),
         HashMap::new(),
         &inference_errors,
         &[],
