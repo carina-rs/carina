@@ -659,7 +659,7 @@ impl WasmProviderInstanceError {
             WasmProviderInstanceError::Instantiation(error) => mapper(error),
             WasmProviderInstanceError::InfoCall(error) => wasm_trap_provider_error("info", error),
             WasmProviderInstanceError::WallBudgetExceeded { operation, source } => {
-                ProviderError::timeout(wall_budget_error_message(operation, source))
+                wall_budget_provider_error(operation, source)
             }
             WasmProviderInstanceError::InitializeValueEncode(error) => {
                 wasm_value_encode_provider_error("initialize", error)
@@ -834,8 +834,9 @@ impl Drop for EpochTicker {
 
 /// If `poisoned` is set, return the fail-fast error a poisoned instance
 /// must give for `operation`; otherwise `None` and the caller may proceed.
-/// Component traps retain their originating operation and top-level cause;
-/// cancellation/timeouts retain the legacy generic diagnostic.
+/// Component traps and observed wall timeouts retain their originating
+/// operation; cancellation before a timeout is observed retains the legacy
+/// generic diagnostic.
 fn poisoned_guard(
     poisoned: &AtomicBool,
     poisoned_reason: &OnceLock<String>,
@@ -882,14 +883,6 @@ fn poison_after_trap(
     poisoned.store(true, Ordering::Release);
 }
 
-fn wall_budget_error_message(operation: &str, error: WallBudgetExceeded) -> String {
-    format!(
-        "WASM guest call '{operation}' exceeded its {}s wall-clock budget (time spent in host \
-         I/O counts toward it; check network connectivity to the provider's endpoints)",
-        error.wall().as_secs_f64()
-    )
-}
-
 /// A held store lock that poisons its instance on drop **unless
 /// [`disarm`](Self::disarm)ed** after the guest call completed.
 ///
@@ -914,6 +907,7 @@ struct LockedStore<'a> {
 /// only so the drop-order guarantee is expressed by field ordering.
 struct PoisonOnDrop<'a> {
     poisoned: &'a AtomicBool,
+    poisoned_reason: &'a OnceLock<String>,
     armed: bool,
 }
 
@@ -946,6 +940,7 @@ impl<'a> LockedStore<'a> {
         Ok(LockedStore {
             poison: PoisonOnDrop {
                 poisoned: &instance.poisoned,
+                poisoned_reason: &instance.poisoned_reason,
                 armed: true,
             },
             store,
@@ -966,17 +961,19 @@ impl<'a> LockedStore<'a> {
     /// store lock is released.
     async fn call<'s, T, F>(
         &'s mut self,
-        operation: &str,
+        operation: &'static str,
         f: impl FnOnce(&'s mut Store<HostState>) -> F,
     ) -> ProviderResult<T>
     where
         T: 'static,
         F: Future<Output = T> + 's,
     {
-        self.store
-            .call(f)
-            .await
-            .map_err(|error| ProviderError::timeout(wall_budget_error_message(operation, error)))
+        self.store.call(f).await.map_err(|error| {
+            let _ = self.poison.poisoned_reason.set(format!(
+                "WASM provider instance unusable after wall-clock timeout in {operation}"
+            ));
+            wall_budget_provider_error(operation, error)
+        })
     }
 }
 
@@ -2294,11 +2291,23 @@ struct SharedWasmInstance {
     /// misleading trap or silent corruption across the remaining resources in
     /// the plan/apply (carina#3106).
     poisoned: AtomicBool,
-    /// Stable diagnostic for a trap that made the component instance
-    /// non-reentrant. Timeouts retain the legacy generic poisoned message;
-    /// component traps record their originating operation and cause so a
-    /// later CRUD call cannot misattribute the failure to itself.
+    /// Stable diagnostic for a trap or observed wall timeout that made the
+    /// component instance non-reentrant. Cancellation before the timeout is
+    /// observed retains the generic poisoned message; returned traps and wall
+    /// timeouts record their originating operation so a later call cannot
+    /// misattribute the failure to itself.
     poisoned_reason: OnceLock<String>,
+}
+
+impl SharedWasmInstance {
+    fn new(store: GuestStore, bindings: WasmBindings) -> Self {
+        Self {
+            store: Mutex::new(store),
+            bindings,
+            poisoned: AtomicBool::new(false),
+            poisoned_reason: OnceLock::new(),
+        }
+    }
 }
 
 // Safety: The GuestStore is behind a Mutex, so concurrent access is serialized.
@@ -2333,7 +2342,7 @@ pub struct WasmProviderFactory {
     enable_http: bool,
     /// Reusable WASM instance from factory initialization.
     /// Used by `validate_config()` to avoid creating a throwaway instance.
-    init_instance: Mutex<(GuestStore, WasmBindings)>,
+    init_instance: SharedWasmInstance,
     /// Lazily created shared instances for provider + normalizer, keyed
     /// by binding name. `None` is the kind's default instance;
     /// `Some(name)` is a named instance (`let <name> = provider <kind>
@@ -2374,7 +2383,7 @@ struct WasmWallBudgetError {
 
 impl fmt::Display for WasmWallBudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&wall_budget_error_message(self.operation, self.source))
+        write!(f, "WASM guest call '{}' timed out", self.operation)
     }
 }
 
@@ -2382,6 +2391,16 @@ impl std::error::Error for WasmWallBudgetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
+}
+
+fn wall_budget_provider_error(
+    operation: &'static str,
+    source: WallBudgetExceeded,
+) -> ProviderError {
+    ProviderError::timeout_caused_by(
+        "WASM plugin timed out",
+        WasmWallBudgetError { operation, source },
+    )
 }
 
 fn wall_budget_load_error(
@@ -2623,7 +2642,7 @@ impl WasmProviderFactory {
             cached_identity_attributes,
             cached_provider_config_types,
             enable_http,
-            init_instance: Mutex::new((store, bindings)),
+            init_instance: SharedWasmInstance::new(store, bindings),
             shared_instances: Mutex::new(HashMap::new()),
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
@@ -2814,12 +2833,7 @@ impl WasmProviderFactory {
             return Ok(Arc::clone(instance));
         }
         let (store, bindings) = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(SharedWasmInstance {
-            store: Mutex::new(store),
-            bindings,
-            poisoned: AtomicBool::new(false),
-            poisoned_reason: OnceLock::new(),
-        });
+        let instance = Arc::new(SharedWasmInstance::new(store, bindings));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -2844,7 +2858,7 @@ impl WasmProviderFactory {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_guest_call_budget(mut self, budget: GuestCallBudget) -> Self {
         self.budget = budget;
-        self.init_instance.get_mut().0.set_budget(budget);
+        self.init_instance.store.get_mut().set_budget(budget);
         self
     }
 
@@ -2895,16 +2909,19 @@ impl ProviderFactory for WasmProviderFactory {
             .map_err(|e| e.to_string())?;
 
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.init_instance.lock().await;
-                let (ref mut store, ref bindings) = *guard;
-                store
-                    .call(|store| bindings.call_validate_config(store, &wit_attrs))
-                    .await
-                    .map_err(|error| wall_budget_error_message("validate_config", error))?
-                    .map_err(|e| format!("Failed to call validate_config(): {e}"))?
-                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async {
+                    let instance = &self.init_instance;
+                    let mut locked = LockedStore::acquire(instance, "validate_config").await?;
+                    let call = locked
+                        .call("validate_config", |store| {
+                            instance.bindings.call_validate_config(store, &wit_attrs)
+                        })
+                        .await?;
+                    finish_guest_call(instance, "validate_config", &mut locked, call)?
+                        .map_err(wasm_convert::wit_to_core_provider_error)
+                })
+                .map_err(|error: ProviderError| error.to_string())
         })
     }
 
@@ -2915,18 +2932,23 @@ impl ProviderFactory for WasmProviderFactory {
     ) -> Result<(), String> {
         let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.init_instance.lock().await;
-                let (ref mut store, ref bindings) = *guard;
-                store
-                    .call(|store| {
-                        bindings.call_validate_custom_type(store, &wit_identity, value.as_str())
-                    })
-                    .await
-                    .map_err(|error| wall_budget_error_message("validate_custom_type", error))?
-                    .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
-                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async {
+                    let instance = &self.init_instance;
+                    let mut locked = LockedStore::acquire(instance, "validate_custom_type").await?;
+                    let call = locked
+                        .call("validate_custom_type", |store| {
+                            instance.bindings.call_validate_custom_type(
+                                store,
+                                &wit_identity,
+                                value.as_str(),
+                            )
+                        })
+                        .await?;
+                    finish_guest_call(instance, "validate_custom_type", &mut locked, call)?
+                        .map_err(wasm_convert::wit_to_core_provider_error)
+                })
+                .map_err(|error: ProviderError| error.to_string())
         })
     }
 
@@ -7333,6 +7355,70 @@ mod tests {
         assert!(cause.source().is_none());
     }
 
+    #[tokio::test]
+    async fn runtime_wall_timeout_keeps_typed_budget_source_without_duplicate_text() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let wasi_ctx = WasiCtxBuilder::new().build();
+        let mut store = GuestStore::new(
+            &engine,
+            wasi_ctx,
+            None,
+            build_store_limits(),
+            GuestCallBudget::new(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO,
+            ),
+        );
+        let source = store
+            .call(|_store| std::future::pending::<()>())
+            .await
+            .expect_err("a zero wall budget must time out");
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error = WasmProviderInstanceError::WallBudgetExceeded {
+            operation: "initialize",
+            source,
+        }
+        .into_provider_error_with(&mapper);
+
+        assert_eq!(provider_error.variant_name(), "timeout");
+        let operation_cause = provider_error
+            .detail()
+            .cause()
+            .expect("wall timeout must retain an operation-aware typed cause");
+        assert!(
+            operation_cause
+                .downcast_ref::<WasmWallBudgetError>()
+                .is_some(),
+            "unexpected cause type: {operation_cause:?}"
+        );
+        let budget_cause = operation_cause
+            .source()
+            .expect("operation-aware timeout must retain WallBudgetExceeded");
+        assert!(budget_cause.downcast_ref::<WallBudgetExceeded>().is_some());
+
+        let rendered = provider_error.to_string();
+        assert!(
+            rendered.contains("WASM guest call 'initialize' timed out"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("wall-clock budget"), "{rendered}");
+        assert_eq!(
+            rendered.matches("wall-clock budget").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("check network connectivity"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("credential"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn initialization_value_encode_failure_keeps_typed_internal_error() {
         let mapper: ProviderInstantiationErrorMapper =
@@ -7495,6 +7581,7 @@ mod tests {
         {
             let _armed = PoisonOnDrop {
                 poisoned: &flag,
+                poisoned_reason: &reason,
                 armed: true,
             };
         }
@@ -7559,6 +7646,7 @@ mod tests {
         {
             let mut guard = PoisonOnDrop {
                 poisoned: &flag,
+                poisoned_reason: &reason,
                 armed: true,
             };
             guard.armed = false; // mirrors LockedStore::disarm()
@@ -7597,17 +7685,20 @@ mod tests {
             std::time::Duration::from_secs(5);
         const AWS_RETRY_POLICY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
 
-        // Neither carina-provider-aws nor carina-provider-awscc configures
-        // RetryConfig or TimeoutConfig on origin/main. Mirror the AWS SDK
-        // standard retry defaults used by each SDK operation.
-        const AWS_SDK_STANDARD_MAX_ATTEMPTS: u32 = 3;
-        const AWS_SDK_STANDARD_INITIAL_DELAY: std::time::Duration =
-            std::time::Duration::from_secs(1);
-        const AWS_SDK_STANDARD_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+        // Mirrors the bounded policy in both carina-provider-aws/src/sdk_config.rs
+        // and carina-provider-awscc/src/sdk_config.rs on origin/main.
+        const AWS_SDK_CONNECT_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_millis(3_100);
+        const AWS_SDK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const AWS_SDK_OPERATION_ATTEMPT_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        const AWS_SDK_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        const AWS_SDK_MAX_ATTEMPTS: u32 = 3;
 
         // Mirrors carina-provider-aws/src/services/ec2/flow_log.rs on
         // origin/main: up to 12 send() attempts with a 5s IAM-propagation
-        // sleep between attempts.
+        // sleep between attempts, followed by one read_ec2_flow_log SDK
+        // operation in the same create call.
         const AWS_FLOW_LOG_SEND_ATTEMPTS: u32 = 12;
         const AWS_FLOW_LOG_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -7618,24 +7709,25 @@ mod tests {
         const AWS_ACM_DVO_WAIT_ATTEMPTS: u32 = 6;
         const AWS_ACM_DVO_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-        let sdk_backoff = retry_backoff_total(
-            AWS_SDK_STANDARD_MAX_ATTEMPTS,
-            AWS_SDK_STANDARD_INITIAL_DELAY,
-            AWS_SDK_STANDARD_MAX_DELAY,
-        );
-        assert_eq!(sdk_backoff, std::time::Duration::from_secs(3));
-
-        // Connect and first-byte caps apply sequentially. TLS handshakes are
-        // uncapped, and a body can keep trickling chunks below the per-chunk
-        // between-bytes cap; those unmodelled hangs are why the whole-call
-        // wall backstop still exists.
-        let http_attempt_worst_case = HTTP_API_REQUEST_TIMEOUT + HTTP_API_REQUEST_TIMEOUT;
-        assert_eq!(http_attempt_worst_case, std::time::Duration::from_secs(60));
-        let sdk_operation_worst_case =
-            http_attempt_worst_case * AWS_SDK_STANDARD_MAX_ATTEMPTS + sdk_backoff;
+        assert_eq!(AWS_SDK_MAX_ATTEMPTS, 3);
         assert_eq!(
-            sdk_operation_worst_case,
-            std::time::Duration::from_secs(183)
+            AWS_SDK_OPERATION_ATTEMPT_TIMEOUT,
+            std::time::Duration::from_secs(30)
+        );
+        let bounded_attempt_worst_case = AWS_SDK_CONNECT_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT)
+            + AWS_SDK_READ_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT);
+        assert_eq!(
+            bounded_attempt_worst_case,
+            std::time::Duration::from_millis(33_100)
+        );
+        // In WASM, attempt/operation deadlines are observed only between
+        // attempts, so one SDK operation can overrun its operation timeout by
+        // one bounded connect+read attempt.
+        let bounded_sdk_operation_worst_case =
+            AWS_SDK_OPERATION_TIMEOUT + bounded_attempt_worst_case;
+        assert_eq!(
+            bounded_sdk_operation_worst_case,
+            std::time::Duration::from_millis(93_100)
         );
 
         let aws_outer_backoff = retry_backoff_total(
@@ -7645,20 +7737,53 @@ mod tests {
         );
         assert_eq!(aws_outer_backoff, std::time::Duration::from_secs(395));
         let aws_retry_operation_worst_case =
-            sdk_operation_worst_case * AWS_RETRY_POLICY_MAX_ATTEMPTS + aws_outer_backoff;
+            bounded_sdk_operation_worst_case * AWS_RETRY_POLICY_MAX_ATTEMPTS + aws_outer_backoff;
 
-        let aws_flow_log_worst_case = sdk_operation_worst_case * AWS_FLOW_LOG_SEND_ATTEMPTS
+        let aws_flow_log_worst_case = bounded_sdk_operation_worst_case
+            * (AWS_FLOW_LOG_SEND_ATTEMPTS + 1)
             + AWS_FLOW_LOG_RETRY_INTERVAL * (AWS_FLOW_LOG_SEND_ATTEMPTS - 1);
+        assert_eq!(
+            aws_flow_log_worst_case,
+            std::time::Duration::from_millis(1_265_300)
+        );
 
-        let aws_acm_dns_validation_worst_case = sdk_operation_worst_case
+        let aws_acm_dns_validation_worst_case = bounded_sdk_operation_worst_case
             * AWS_ACM_REQUEST_CERTIFICATE_SENDS
-            + sdk_operation_worst_case * AWS_ACM_DVO_WAIT_ATTEMPTS
+            + bounded_sdk_operation_worst_case * AWS_ACM_DVO_WAIT_ATTEMPTS
             + AWS_ACM_DVO_WAIT_INTERVAL * (AWS_ACM_DVO_WAIT_ATTEMPTS - 1);
 
         // carina-provider-awscc/src/provider/cloudcontrol.rs `finish_issue`
         // and `poll_phase` on origin/main return retries as `poll_after_secs`
         // on a pending step, so one AWSCC guest call is one SDK operation.
-        let awscc_guest_call_worst_case = sdk_operation_worst_case;
+        let awscc_guest_call_worst_case = bounded_sdk_operation_worst_case;
+
+        // A host patch release must still run provider releases predating the
+        // bounded SDK configuration. Their standard SDK policy used three
+        // attempts with 1s + 2s backoff, while wasi:http could consume the
+        // host cap once for connect and once for first byte per attempt.
+        const LEGACY_AWS_SDK_MAX_ATTEMPTS: u32 = 3;
+        const LEGACY_AWS_SDK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+        const LEGACY_AWS_SDK_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+        let legacy_sdk_backoff = retry_backoff_total(
+            LEGACY_AWS_SDK_MAX_ATTEMPTS,
+            LEGACY_AWS_SDK_INITIAL_DELAY,
+            LEGACY_AWS_SDK_MAX_DELAY,
+        );
+        assert_eq!(legacy_sdk_backoff, std::time::Duration::from_secs(3));
+        let legacy_attempt_worst_case = HTTP_API_REQUEST_TIMEOUT + HTTP_API_REQUEST_TIMEOUT;
+        let legacy_sdk_operation_worst_case =
+            legacy_attempt_worst_case * LEGACY_AWS_SDK_MAX_ATTEMPTS + legacy_sdk_backoff;
+        assert_eq!(
+            legacy_sdk_operation_worst_case,
+            std::time::Duration::from_secs(183)
+        );
+        let legacy_aws_flow_log_worst_case = legacy_sdk_operation_worst_case
+            * (AWS_FLOW_LOG_SEND_ATTEMPTS + 1)
+            + AWS_FLOW_LOG_RETRY_INTERVAL * (AWS_FLOW_LOG_SEND_ATTEMPTS - 1);
+        assert_eq!(
+            legacy_aws_flow_log_worst_case,
+            std::time::Duration::from_secs(2_434)
+        );
 
         assert!(
             GuestCallBudget::PRODUCTION.wall() > aws_retry_operation_worst_case,
@@ -7675,6 +7800,10 @@ mod tests {
         assert!(
             GuestCallBudget::PRODUCTION.wall() > awscc_guest_call_worst_case,
             "the production wall budget must exceed one AWSCC guest call's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > legacy_aws_flow_log_worst_case,
+            "the production wall budget must exceed the legacy VPC flow-log loop's worst case"
         );
         assert!(
             GuestCallBudget::PRODUCTION.wall() > GuestCallBudget::PRODUCTION.compute(),

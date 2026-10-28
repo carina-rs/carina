@@ -24,13 +24,15 @@ const GUEST_COMPUTE_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// # Sizing — why this is 60 minutes, not the 30s compute budget
 ///
-/// The largest known single-guest-call worst case is the AWS VPC flow-log
-/// IAM-propagation loop at about 38 minutes. The test
-/// `production_wall_budget_exceeds_each_provider_single_call_worst_case` pins
-/// this value above that loop and every other enumerated provider worst case.
-/// The remaining headroom is a finite backstop for hangs that per-request caps
-/// cannot reach, including an uncapped TLS handshake or a body that keeps
-/// trickling chunks without ever exceeding the between-bytes timeout.
+/// The largest enumerated current-provider single-call worst case is the AWS
+/// VPC flow-log IAM-propagation loop at about 21 minutes; legacy provider
+/// releases from before the bounded SDK policy can take about 41 minutes. The
+/// test `production_wall_budget_exceeds_each_provider_single_call_worst_case`
+/// pins this value above both models and every enumerated current-provider
+/// case. The remaining headroom is a finite hang backstop for work the model
+/// cannot bound, including an uncapped TLS handshake, a body that keeps
+/// trickling chunks, and unbounded in-call loops such as `empty_s3_bucket`
+/// paging during bucket deletion.
 const WASM_OPERATION_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The compute and wall-clock limits for one WASM guest call.
@@ -71,17 +73,12 @@ pub(super) struct WallBudgetExceeded {
     wall: Duration,
 }
 
-impl WallBudgetExceeded {
-    pub(super) const fn wall(self) -> Duration {
-        self.wall
-    }
-}
-
 impl fmt::Display for WallBudgetExceeded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "guest call exceeded its {}s wall-clock budget",
+            "guest call exceeded its {}s wall-clock budget (time spent in host I/O counts toward \
+             it; check network connectivity to the provider's endpoints)",
             self.wall.as_secs_f64()
         )
     }

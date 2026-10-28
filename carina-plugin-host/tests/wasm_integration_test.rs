@@ -1360,7 +1360,20 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
     let rendered = error.to_string();
 
     assert!(matches!(error, ProviderError::Timeout(_)), "{rendered}");
+    let cause = error
+        .detail()
+        .cause()
+        .expect("wall timeout must retain its typed cause");
+    assert!(
+        cause.source().is_some(),
+        "the operation-aware timeout cause must retain WallBudgetExceeded"
+    );
     assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert_eq!(
+        rendered.matches("wall-clock budget").count(),
+        1,
+        "{rendered}"
+    );
     assert!(
         !rendered.to_lowercase().contains("credential"),
         "{rendered}"
@@ -1435,6 +1448,26 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
     assert!(
         elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
         "validate_config should time out after about 2s; elapsed {elapsed:?}"
+    );
+
+    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    let retry_started = Instant::now();
+    let retry_error = carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect_err("the timed-out init instance must remain poisoned");
+    let retry_elapsed = retry_started.elapsed();
+    let retry_rendered = retry_error.to_string();
+
+    assert!(
+        retry_rendered.contains("unusable after wall-clock timeout in validate_config"),
+        "{retry_rendered}"
+    );
+    assert!(
+        !retry_rendered.contains("cannot enter component instance"),
+        "the follow-up must report the original poison reason: {retry_rendered}"
+    );
+    assert!(
+        retry_elapsed < Duration::from_secs(1),
+        "a poisoned init instance must fail fast; elapsed {retry_elapsed:?}"
     );
 }
 
