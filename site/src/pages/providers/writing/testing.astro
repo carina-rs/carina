@@ -1,0 +1,13 @@
+---
+import Doc from '../../../layouts/Doc.astro';
+import { Content, getHeadings, frontmatter } from '../../../content/providers/writing/testing.md';
+
+const headings = getHeadings();
+---
+<Doc
+  title={frontmatter.title ?? 'Testing a Provider'}
+  description={frontmatter.description}
+  headings={headings}
+>
+  <Content />
+</Doc>
