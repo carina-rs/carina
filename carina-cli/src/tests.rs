@@ -101,7 +101,7 @@ fn provider_config_for_evidence_test(name: &str) -> ProviderConfig {
         name: name.to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
-        source: None,
+        source: Some(format!("file:///{name}.wasm").parse().unwrap()),
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
@@ -550,7 +550,7 @@ fn plan_file_serde_round_trip() {
                     Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into())),
                 )]),
                 default_tags: IndexMap::new(),
-                source: None,
+                source: Some("file:///aws.wasm".parse().unwrap()),
                 version: None,
                 revision: None,
                 unresolved_attributes: IndexMap::new(),
@@ -3561,9 +3561,19 @@ fn encoded_plan_with_mock_provider_evidence() -> serde_json::Value {
         }
     });
     encoded["provider_artifacts"] = serde_json::json!({
-        "mock": { "kind": "built_in" }
+        "mock": {
+            "kind": "wasm",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "origin": { "kind": "file" }
+        }
     });
     encoded
+}
+
+#[test]
+fn plan_file_decode_accepts_base_mock_provider_evidence() {
+    serde_json::from_value::<PlanFile>(encoded_plan_with_mock_provider_evidence())
+        .expect("base provider evidence fixture must decode");
 }
 
 #[test]
@@ -3573,10 +3583,9 @@ fn plan_file_decode_rejects_empty_schema_fingerprints_for_referenced_provider() 
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("referenced provider schemas must be recorded");
-    let message = error.to_string();
-    assert!(
-        message.contains("mock") && message.contains("test.resource"),
-        "{message}"
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints is missing provider `mock`, managed type `test.resource`"
     );
 }
 
@@ -3587,10 +3596,9 @@ fn plan_file_decode_rejects_provider_with_empty_schema_inventory() {
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("a provider fingerprint entry must contain schemas");
-    let message = error.to_string();
-    assert!(
-        message.contains("mock") && message.contains("empty"),
-        "{message}"
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints provider `mock` has an empty schemas list"
     );
 }
 
@@ -3601,7 +3609,10 @@ fn plan_file_decode_rejects_missing_artifact_for_configured_provider() {
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("referenced providers must have artifact evidence");
-    assert!(error.to_string().contains("mock"), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts is missing expected provider `mock`"
+    );
 }
 
 #[test]
@@ -3611,10 +3622,22 @@ fn plan_file_decode_rejects_artifact_for_unconfigured_provider() {
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("artifact keys must exactly match configured provider kinds");
-    let message = error.to_string();
-    assert!(
-        message.contains("retired") && message.contains("unexpected"),
-        "{message}"
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts contains unexpected provider `retired`"
+    );
+}
+
+#[test]
+fn plan_file_decode_rejects_wrong_artifact_kind_for_configured_provider() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["provider_artifacts"]["mock"] = serde_json::json!({ "kind": "built_in" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("artifact kind must match the configured provider implementation");
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: provider_artifacts records provider `mock` as built-in, expected wasm"
     );
 }
 
@@ -3632,10 +3655,9 @@ fn plan_file_decode_rejects_extra_schema_fingerprint() {
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("unreferenced schema evidence must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("mock") && message.contains("test.extra"),
-        "{message}"
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: schema_fingerprints contains unreferenced provider `mock`, managed type `test.extra`"
     );
 }
 
@@ -3650,34 +3672,33 @@ fn plan_file_decode_rejects_duplicate_schema_fingerprint() {
 
     let error = serde_json::from_value::<PlanFile>(encoded)
         .expect_err("duplicate schema evidence must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("mock")
-            && message.contains("test.resource")
-            && message.contains("duplicate"),
-        "{message}"
+    assert_eq!(
+        error.to_string(),
+        "invalid saved-plan provider evidence: duplicate schema fingerprint for provider `mock`, managed type `test.resource`"
     );
 }
 
+fn builtin_mock_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }
+}
+
 fn builtin_mock_recording_context() -> WiringContext {
-    WiringContext::new_for_test(
-        Vec::new(),
-        &[ProviderConfig {
-            name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        }],
-    )
+    WiringContext::new_for_test(Vec::new(), &[builtin_mock_provider_config()])
 }
 
 #[test]
 fn recorded_builtin_only_plan_round_trips_with_format_26_top_level_keys() {
-    let contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
         .record(&builtin_mock_recording_context())
         .expect("built-in provider evidence must record");
@@ -3782,6 +3803,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_26_top_level_keys() {
 #[test]
 fn zero_referenced_provider_plan_round_trips() {
     let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(Vec::new());
     contents.plan = Plan::new();
     contents.sorted_resources.clear();
     contents.current_states.clear();
@@ -3810,6 +3832,7 @@ fn zero_referenced_provider_plan_round_trips() {
 fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
     let retired = ResourceId::with_provider_identity("retired", "legacy.Widget", "gone", None);
     let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    contents.provider_configs = saved_provider_configs(Vec::new());
     contents.plan = Plan::new();
     contents.plan.add(Effect::Remove {
         id: carina_core::resource::ResolvedResourceId::new(retired.clone()),

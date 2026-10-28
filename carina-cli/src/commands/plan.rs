@@ -53,7 +53,7 @@ use crate::plan_image::{
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LoadedProviderArtifact, WiringContext, build_factories_from_providers,
-    create_plan_from_parsed_with_upstream_with_ctx,
+    create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
 use carina_core::hint::ProjectCommand;
@@ -138,6 +138,22 @@ pub enum RecordedProviderArtifact {
     },
 }
 
+/// Provider artifact implementation selected by a saved provider configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderArtifactKind {
+    BuiltIn,
+    Wasm,
+}
+
+impl std::fmt::Display for ProviderArtifactKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BuiltIn => "built-in",
+            Self::Wasm => "wasm",
+        })
+    }
+}
+
 /// Resolver origin persisted for one WASM provider artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -203,6 +219,13 @@ impl From<&LoadedProviderArtifact> for RecordedProviderArtifact {
 }
 
 impl RecordedProviderArtifact {
+    fn kind(&self) -> ProviderArtifactKind {
+        match self {
+            Self::BuiltIn => ProviderArtifactKind::BuiltIn,
+            Self::Wasm { .. } => ProviderArtifactKind::Wasm,
+        }
+    }
+
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::BuiltIn => "built-in".to_string(),
@@ -260,11 +283,18 @@ mod recorded_provider_artifact_tests {
 /// and loaded provider artifacts are captured together.
 ///
 /// ```compile_fail
+/// use carina_cli::commands::plan::PlanFile;
+///
+/// fn rebuild(plan: PlanFile) -> PlanFile {
+///     PlanFile { ..plan }
+/// }
+/// ```
+///
+/// ```compile_fail
 /// use carina_cli::commands::plan::PlanFileContents;
 ///
-/// fn require_serializable<T: serde::Serialize>(_: &T) {}
-/// fn bypass_recording(contents: &PlanFileContents) {
-///     require_serializable(contents);
+/// fn serialize_unrecorded(contents: &PlanFileContents) {
+///     let _ = serde_json::to_string(contents);
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -486,6 +516,11 @@ pub enum ProviderEvidenceError {
     UnexpectedProviderArtifact {
         provider: String,
     },
+    UnexpectedProviderArtifactKind {
+        provider: String,
+        expected: ProviderArtifactKind,
+        recorded: ProviderArtifactKind,
+    },
 }
 
 impl std::fmt::Display for ProviderEvidenceError {
@@ -531,31 +566,43 @@ impl std::fmt::Display for ProviderEvidenceError {
                 formatter,
                 "provider_artifacts contains unexpected provider `{provider}`"
             ),
+            Self::UnexpectedProviderArtifactKind {
+                provider,
+                expected,
+                recorded,
+            } => write!(
+                formatter,
+                "provider_artifacts records provider `{provider}` as {recorded}, expected {expected}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ProviderEvidenceError {}
 
-/// Provider factory names determined by the saved provider configuration.
+/// Provider artifact kinds determined by the saved provider configuration.
 ///
-/// Factories are loaded once per provider kind, so named instances collapse to
-/// their shared `ProviderConfig::name`. The built-in mock occupies the same
-/// `mock` key as a plugin factory and is also selected for the providerless
-/// fallback, making the empty configuration's expected set `{mock}`.
-fn expected_provider_artifact_names(provider_configs: &SavedProviderConfigs) -> BTreeSet<String> {
+/// Factory-backed providers use the same source-presence rule as
+/// [`build_factories_from_providers`]. Source-less named instances therefore do
+/// not add an artifact. The built-in mock occupies the same `mock` key as a
+/// plugin factory and is also selected for the providerless fallback.
+fn expected_provider_artifacts(
+    provider_configs: &SavedProviderConfigs,
+) -> BTreeMap<String, ProviderArtifactKind> {
     let configs = provider_configs.as_provider_configs();
     let mut expected = configs
         .iter()
-        .map(|config| config.name.clone())
-        .collect::<BTreeSet<_>>();
+        .filter(|config| provider_factory_source(config).is_some())
+        .map(|config| (config.name.clone(), ProviderArtifactKind::Wasm))
+        .collect::<BTreeMap<_, _>>();
     let uses_builtin_mock = carina_provider_mock::uses_builtin_provider(configs, |provider_name| {
-        configs
-            .iter()
-            .any(|config| config.name == provider_name && config.source.is_some())
+        expected.get(provider_name) == Some(&ProviderArtifactKind::Wasm)
     });
     if uses_builtin_mock {
-        expected.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
+        expected.insert(
+            carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
+            ProviderArtifactKind::BuiltIn,
+        );
     }
     expected
 }
@@ -631,21 +678,32 @@ impl ProviderEvidence {
             });
         }
 
-        let expected_artifacts = expected_provider_artifact_names(provider_configs);
+        let expected_artifacts = expected_provider_artifacts(provider_configs);
         let recorded_artifacts = self
             .provider_artifacts
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if let Some(provider) = expected_artifacts.difference(&recorded_artifacts).next() {
+        let expected_names = expected_artifacts.keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(provider) = expected_names.difference(&recorded_artifacts).next() {
             return Err(ProviderEvidenceError::MissingProviderArtifact {
                 provider: provider.clone(),
             });
         }
-        if let Some(provider) = recorded_artifacts.difference(&expected_artifacts).next() {
+        if let Some(provider) = recorded_artifacts.difference(&expected_names).next() {
             return Err(ProviderEvidenceError::UnexpectedProviderArtifact {
                 provider: provider.clone(),
             });
+        }
+        for (provider, expected) in expected_artifacts {
+            let recorded = self.provider_artifacts[&provider].kind();
+            if recorded != expected {
+                return Err(ProviderEvidenceError::UnexpectedProviderArtifactKind {
+                    provider,
+                    expected,
+                    recorded,
+                });
+            }
         }
         Ok(())
     }
@@ -923,11 +981,15 @@ impl PlanFile {
     /// acquired its state lock. The plan contains only an address and marker;
     /// any status change in either direction invalidates it.
     pub(crate) fn reload_in_flight_from_locked_state(
-        mut self,
+        self,
         state_file: Option<&StateFile>,
     ) -> Result<ReloadedPlanFile, String> {
-        let moved_origins = MovedOrigins::from_plan(&self.plan);
-        let planned_in_flight_origins: HashSet<_> = self
+        let PlanFile {
+            mut contents,
+            evidence,
+        } = self;
+        let moved_origins = MovedOrigins::from_plan(&contents.plan);
+        let planned_in_flight_origins: HashSet<_> = contents
             .current_states
             .iter()
             .filter_map(|entry| match entry {
@@ -977,8 +1039,8 @@ impl PlanFile {
             }
         }
 
-        let mut current_states = Vec::with_capacity(self.current_states.len());
-        for entry in std::mem::take(&mut self.contents.current_states) {
+        let mut current_states = Vec::with_capacity(contents.current_states.len());
+        for entry in std::mem::take(&mut contents.current_states) {
             match entry {
                 CurrentStateEntry::Managed { id, current } => {
                     let persisted_id = moved_origins.origin_for(&id);
@@ -986,8 +1048,10 @@ impl PlanFile {
                         .map(|state| state.build_state_for_resource(persisted_id))
                         .unwrap_or_else(|| Current::absent(id.clone()));
                     if persisted_id != &id {
-                        let authority =
-                            self.plan.move_authority(persisted_id, &id).ok_or_else(|| {
+                        let authority = contents
+                            .plan
+                            .move_authority(persisted_id, &id)
+                            .ok_or_else(|| {
                                 format!("saved plan has no move edge from {persisted_id} to {id}")
                             })?;
                         locked_current = rebind_current_for_move(locked_current, &authority)
@@ -1018,7 +1082,8 @@ impl PlanFile {
             }
         }
         Ok(ReloadedPlanFile {
-            plan_file: self,
+            contents,
+            evidence,
             current_states,
         })
     }
@@ -1589,21 +1654,27 @@ mod schema_fingerprint_tests {
     #[test]
     fn providerless_artifact_inventory_is_the_builtin_mock() {
         assert_eq!(
-            expected_provider_artifact_names(&saved_provider_configs(Vec::new())),
-            BTreeSet::from(["mock".to_string()])
+            expected_provider_artifacts(&saved_provider_configs(Vec::new())),
+            BTreeMap::from([("mock".to_string(), ProviderArtifactKind::BuiltIn)])
         );
     }
 
     #[test]
     fn configured_provider_aliases_share_one_artifact_key() {
-        let configs = saved_provider_configs(vec![
-            provider_config("aws", None),
-            provider_config("aws", Some("us")),
-        ]);
+        let mut default = provider_config("aws", None);
+        default.source = Some("file:///aws.wasm".parse().unwrap());
+        let configs = saved_provider_configs(vec![default, provider_config("aws", Some("us"))]);
         assert_eq!(
-            expected_provider_artifact_names(&configs),
-            BTreeSet::from(["aws".to_string()])
+            expected_provider_artifacts(&configs),
+            BTreeMap::from([("aws".to_string(), ProviderArtifactKind::Wasm)])
         );
+    }
+
+    #[test]
+    fn named_instance_without_a_default_does_not_expect_an_artifact() {
+        let configs = saved_provider_configs(vec![provider_config("aws", Some("secondary"))]);
+
+        assert!(expected_provider_artifacts(&configs).is_empty());
     }
 
     #[test]
@@ -1967,10 +2038,13 @@ impl ReloadedCurrentStateEntry {
 ///
 /// The embedded [`PlanFileContents::current_states`] has been consumed and is never
 /// exposed through this type. Runtime current states live only in the sibling
-/// `current_states` field below.
+/// `current_states` field below. Contents and provider evidence are stored as
+/// siblings so apply-time mutation cannot make an in-memory [`PlanFile`]
+/// inconsistent with its evidence.
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
-    plan_file: PlanFile,
+    contents: PlanFileContents,
+    evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
 }
 
@@ -1980,93 +2054,93 @@ impl ReloadedPlanFile {
         references: &PlanSchemaReferences,
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> Result<(), PlanSchemaFingerprintMismatch> {
-        self.plan_file
-            .schema_fingerprints()
+        self.evidence
+            .schema_fingerprints
             .verify(references, schemas)
     }
 
     pub(crate) fn provider_artifacts(&self) -> &PlanProviderArtifacts {
-        self.plan_file.provider_artifacts()
+        &self.evidence.provider_artifacts
     }
 
     pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
-        &self.plan_file.provider_configs
+        &self.contents.provider_configs
     }
 
     pub(crate) fn provider_configs_mut(&mut self) -> &mut SavedProviderConfigs {
-        &mut self.plan_file.contents.provider_configs
+        &mut self.contents.provider_configs
     }
 
     pub(crate) fn plan(&self) -> &Plan {
-        &self.plan_file.plan
+        &self.contents.plan
     }
 
     pub(crate) fn plan_mut(&mut self) -> &mut Plan {
-        &mut self.plan_file.contents.plan
+        &mut self.contents.plan
     }
 
     pub(crate) fn sorted_resources(&self) -> &[Resource] {
-        &self.plan_file.sorted_resources
+        &self.contents.sorted_resources
     }
 
     pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource> {
-        &mut self.plan_file.contents.sorted_resources
+        &mut self.contents.sorted_resources
     }
 
     pub(crate) fn unresolved_resources(&self) -> &[Resource] {
-        &self.plan_file.unresolved_resources
+        &self.contents.unresolved_resources
     }
 
     pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<Resource> {
-        &mut self.plan_file.contents.unresolved_resources
+        &mut self.contents.unresolved_resources
     }
 
     pub(crate) fn compositions(&self) -> &[Composition] {
-        &self.plan_file.compositions
+        &self.contents.compositions
     }
 
     pub(crate) fn compositions_mut(&mut self) -> &mut Vec<Composition> {
-        &mut self.plan_file.contents.compositions
+        &mut self.contents.compositions
     }
 
     pub(crate) fn data_sources(&self) -> &[DataSource] {
-        &self.plan_file.data_sources
+        &self.contents.data_sources
     }
 
     pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<DataSource> {
-        &mut self.plan_file.contents.data_sources
+        &mut self.contents.data_sources
     }
 
     pub(crate) fn data_source_origins(&self) -> &[DataSource] {
-        &self.plan_file.data_source_origins
+        &self.contents.data_source_origins
     }
 
     pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
-        &mut self.plan_file.contents.data_source_origins
+        &mut self.contents.data_source_origins
     }
 
     pub(crate) fn data_source_values(&self) -> &[SavedDataSourceValue] {
-        &self.plan_file.data_source_values
+        &self.contents.data_source_values
     }
 
     pub(crate) fn data_source_values_mut(&mut self) -> &mut [SavedDataSourceValue] {
-        &mut self.plan_file.contents.data_source_values
+        &mut self.contents.data_source_values
     }
 
     pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value>> {
-        &self.plan_file.upstream_snapshot
+        &self.contents.upstream_snapshot
     }
 
     pub(crate) fn upstream_snapshot_mut(&mut self) -> &mut HashMap<String, HashMap<String, Value>> {
-        &mut self.plan_file.contents.upstream_snapshot
+        &mut self.contents.upstream_snapshot
     }
 
     pub(crate) fn upstream_sources(&self) -> &[UpstreamSource] {
-        &self.plan_file.upstream_sources
+        &self.contents.upstream_sources
     }
 
     pub(crate) fn wait_bindings(&self) -> &[PlanWaitBinding] {
-        &self.plan_file.wait_bindings
+        &self.contents.wait_bindings
     }
 
     pub(crate) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
