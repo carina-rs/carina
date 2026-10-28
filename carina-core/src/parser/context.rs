@@ -5,11 +5,10 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ast::{
-    DeferredForExpression, ModuleCallSourceSpan, PendingFunctionTypeCheck, ProviderConfig,
-    UpstreamState, UserFunction, WaitBinding,
+    DeferredForExpression, PendingFunctionTypeCheck, ProviderConfig, UpstreamState, UserFunction,
+    WaitBinding,
 };
 use super::error::{ParseError, ParseWarning};
-use super::grammar::PreprocessedFile;
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
 use crate::resource::Resource;
@@ -47,8 +46,6 @@ pub(super) enum ParseBindingRef<'a> {
 /// Parse context (variable scope)
 #[derive(Clone)]
 pub(crate) struct ParseContext<'cfg> {
-    /// File whose pest source backs parser-authored spans in this context.
-    preprocessed_file: Option<&'cfg PreprocessedFile>,
     /// All lexical bindings, with value and structural bindings represented
     /// as disjoint variants. Value bindings carry `EvalValue` because partial
     /// applications can live until a later pipe finishes the application.
@@ -106,7 +103,6 @@ pub(crate) struct ParseContext<'cfg> {
 impl<'cfg> ParseContext<'cfg> {
     pub(super) fn new(config: &'cfg ProviderContext) -> Self {
         Self {
-            preprocessed_file: None,
             bindings: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
@@ -125,24 +121,6 @@ impl<'cfg> ParseContext<'cfg> {
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
         }
-    }
-
-    pub(super) fn with_preprocessed_file(
-        config: &'cfg ProviderContext,
-        preprocessed_file: &'cfg PreprocessedFile,
-    ) -> Self {
-        let mut context = Self::new(config);
-        context.preprocessed_file = Some(preprocessed_file);
-        context
-    }
-
-    /// Convert a pest span to original source coordinates for this parse.
-    pub(super) fn source_span(&self, span: pest::Span<'_>) -> ModuleCallSourceSpan {
-        ModuleCallSourceSpan::from_pest(
-            span,
-            self.preprocessed_file
-                .expect("parser-authored spans require a preprocessed file"),
-        )
     }
 
     pub(super) fn record_pending_function_type_check(&self, check: PendingFunctionTypeCheck) {

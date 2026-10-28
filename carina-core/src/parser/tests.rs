@@ -8696,12 +8696,35 @@ let inst = m { nn = 1 }
     let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
     let call = parsed.module_calls.first().expect("module call");
 
-    assert_eq!(call.source_span().start_line, 8);
+    assert_eq!(call.source_span().start_line(), 8);
     assert_eq!(
         call.argument_source_span("nn")
             .expect("argument key span")
-            .start_line,
+            .start_line(),
         8
+    );
+}
+
+#[test]
+fn module_call_argument_span_uses_original_line_for_heredoc_inside_call() {
+    let input = r#"let inst = m {
+  doc = <<EOT
+a
+b
+EOT
+  nn = 1
+}
+"#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+
+    assert_eq!(call.source_span().start_line(), 1);
+    assert_eq!(
+        call.argument_source_span("nn")
+            .expect("argument key span")
+            .start_line(),
+        6
     );
 }
 

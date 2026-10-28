@@ -197,12 +197,14 @@ fn reject_kind_level_attr(field: &str, binding: &str, kind: &str) -> ParseError 
 pub(in crate::parser) fn parse_require_statement(
     pair: pest::iterators::Pair<Rule>,
     ctx: &crate::parser::ParseContext,
+    preprocessed_file: &crate::parser::PreprocessedFile,
 ) -> Result<RequireBlock, ParseError> {
     let mut inner = pair.into_inner();
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
     // Constraint diagnostics belong to the offending expression, not to the
     // beginning of a potentially multi-line `require` statement.
-    let source_span = ctx.source_span(condition_pair.as_span());
+    let source_span =
+        crate::parser::SourceSpan::from_pest(condition_pair.as_span(), preprocessed_file);
     let condition = parse_validate_expr(condition_pair, ctx)?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
     let raw = message_pair.as_str();

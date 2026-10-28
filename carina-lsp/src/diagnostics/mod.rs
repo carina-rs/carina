@@ -45,6 +45,23 @@ pub(crate) fn carina_diagnostic(
     }
 }
 
+fn deduplicate_identical_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut seen = HashSet::new();
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| {
+            seen.insert((
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+                diagnostic.range.end.line,
+                diagnostic.range.end.character,
+                format!("{:?}", diagnostic.severity),
+                diagnostic.message.clone(),
+            ))
+        })
+        .collect()
+}
+
 /// Create a `Diagnostic` with an arbitrary `Range` and the standard "carina" source.
 pub(crate) fn carina_diagnostic_range(
     range: Range,
@@ -540,8 +557,9 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
+            let mut module_call_diagnostics = Vec::new();
             if let Some(base_path) = base_path {
-                diagnostics.extend(self.check_module_calls(
+                module_call_diagnostics.extend(self.check_module_calls(
                     parsed,
                     &semantic_view,
                     &module_signatures,
@@ -557,7 +575,7 @@ impl DiagnosticEngine {
                     })
                     .unwrap_or_default();
                 let has_source_owned_constraint_diagnostic = !constraint_diagnostics.is_empty();
-                diagnostics.extend(constraint_diagnostics);
+                module_call_diagnostics.extend(constraint_diagnostics);
                 if !has_source_owned_constraint_diagnostic
                     && let Some(error) = merged_result
                         .as_ref()
@@ -581,20 +599,21 @@ impl DiagnosticEngine {
             // by the mandatory graph pass; both branches use BindingIndex's
             // single TypeInSchema relation.
             if let (Some(_), Some(expanded), true) = (base_path, merged, expansion_succeeded) {
-                diagnostics.extend(self.check_composition_ref_types(
+                module_call_diagnostics.extend(self.check_composition_ref_types(
                     parsed,
                     &semantic_view,
                     &expanded.compositions,
                     &binding_index,
                 ));
             } else {
-                diagnostics.extend(self.check_module_call_ref_types(
+                module_call_diagnostics.extend(self.check_module_call_ref_types(
                     parsed,
                     &semantic_view,
                     &module_signatures,
                     &binding_index,
                 ));
             }
+            diagnostics.extend(deduplicate_identical_diagnostics(module_call_diagnostics));
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see

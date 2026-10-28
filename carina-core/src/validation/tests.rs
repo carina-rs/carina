@@ -3298,6 +3298,49 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
 }
 
 #[test]
+fn validate_module_calls_uses_original_line_after_heredoc() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let m = use { source = './m' }
+let document = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+let inst = m { n = 'abc' }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let imported_modules = HashMap::from([(
+        "m".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "n".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let error = validate_module_calls(
+        &parsed.module_calls,
+        &imported_modules,
+        &ProviderContext::default(),
+    )
+    .expect_err("the string argument must be rejected");
+
+    assert!(error.contains("at line 8"), "unexpected error: {error}");
+    assert!(!error.contains("at line 4"), "unexpected error: {error}");
+}
+
+#[test]
 fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
     use crate::parser::ArgumentParameter;
 

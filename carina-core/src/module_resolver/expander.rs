@@ -146,14 +146,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // (`a = b`, `b = a`); leftover unresolved refs surface to the
         // post-merge scope check as undefined identifiers. #2817.
         let mut resolved_arguments: HashMap<String, ModuleArgument> = HashMap::new();
-        let call_line = call.source_span().start_line;
+        let call_line = call.source_span().start_line();
         let argument_lines: HashMap<String, usize> = module
             .arguments
             .iter()
             .map(|argument| {
                 let line = call
                     .argument_value_source_span(&argument.name)
-                    .map_or(call_line, |span| span.start_line);
+                    .map_or(call_line, |span| span.start_line());
                 (argument.name.clone(), line)
             })
             .collect();
@@ -255,7 +255,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             let argument = resolved_arguments.get(&arg.name).unwrap();
             let line = call
                 .argument_value_source_span(&arg.name)
-                .map_or(call_line, |span| span.start_line);
+                .map_or(call_line, |span| span.start_line());
             let Some(resolved_parameter) =
                 crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config)
                     .map_err(|message| {
@@ -1032,7 +1032,7 @@ fn bind_module_constraints(
             let source = validation.diagnostic_source();
             let line = source
                 .as_ref()
-                .map_or(arguments.default_line, |source| source.span.start_line);
+                .map_or(arguments.default_line, |source| source.span.start_line());
             let source_file = source.as_ref().map(|source| source.file.clone());
             constraints.push(crate::resource::PendingModuleConstraint {
                 id: crate::resource::ModuleConstraintId::argument_validation(
@@ -1056,7 +1056,7 @@ fn bind_module_constraints(
         let source = requirement.diagnostic_source();
         let line = source
             .as_ref()
-            .map_or(arguments.default_line, |source| source.span.start_line);
+            .map_or(arguments.default_line, |source| source.span.start_line());
         let source_file = source.as_ref().map(|source| source.file.clone());
         constraints.push(crate::resource::PendingModuleConstraint {
             id: crate::resource::ModuleConstraintId::require(ordinal),

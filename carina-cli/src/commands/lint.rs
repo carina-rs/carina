@@ -261,7 +261,7 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
 mod tests {
     use super::*;
     use carina_core::lint::collect_tag_keys_for_file;
-    use carina_core::parser::{ModuleCall, ModuleCallSourceSpan, ParsedFile, UseStatement};
+    use carina_core::parser::ParsedFile;
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {
@@ -297,28 +297,15 @@ mod tests {
     }
 
     fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
-        let span = ModuleCallSourceSpan {
-            start_byte: 0,
-            end_byte: 1,
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 2,
-        };
-        ParsedFile {
-            uses: uses
-                .into_iter()
-                .map(|(alias, path)| UseStatement {
-                    alias: alias.to_string(),
-                    path: path.to_string(),
-                })
-                .collect(),
-            module_calls: calls
-                .into_iter()
-                .map(|name| ModuleCall::synthetic(name, None, span))
-                .collect(),
-            ..ParsedFile::default()
+        let mut source = String::new();
+        for (alias, path) in uses {
+            source.push_str(&format!("let {alias} = use {{ source = '{path}' }}\n"));
         }
+        for name in calls {
+            source.push_str(&format!("{name} {{}}\n"));
+        }
+        carina_core::parser::parse(&source, &ProviderContext::default())
+            .expect("test fixture must parse")
     }
 
     #[test]

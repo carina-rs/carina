@@ -11,7 +11,7 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ModuleCallSourceSpan, ParsedExportParam, ParsedFile, TypeExpr,
+    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan, TypeExpr,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
@@ -30,30 +30,15 @@ pub(super) struct MergedParseResult {
     pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
 }
 
-fn source_span_position(span: ModuleCallSourceSpan) -> (u32, u32) {
+fn source_span_position(span: SourceSpan) -> (u32, u32) {
     (
-        span.start_line.saturating_sub(1) as u32,
-        span.start_column.saturating_sub(1) as u32,
+        span.start_line().saturating_sub(1) as u32,
+        span.start_column().saturating_sub(1) as u32,
     )
 }
 
 fn module_call_position(call: &ModuleCall) -> (u32, u32) {
     source_span_position(call.source_span())
-}
-
-fn deduplicate_identical_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    let mut unique = Vec::new();
-    for diagnostic in diagnostics {
-        let duplicate = unique.iter().any(|existing: &Diagnostic| {
-            existing.range == diagnostic.range
-                && existing.severity == diagnostic.severity
-                && existing.message == diagnostic.message
-        });
-        if !duplicate {
-            unique.push(diagnostic);
-        }
-    }
-    unique
 }
 
 fn value_depends_on_module_output(
@@ -974,11 +959,8 @@ impl DiagnosticEngine {
                 .attribute_spans
                 .get(error.attribute())
                 .map(|span| {
-                    (
-                        span.start_line.saturating_sub(1) as u32,
-                        span.start_column.saturating_sub(1) as u32,
-                        span.end_column.saturating_sub(1) as u32,
-                    )
+                    let (line, start) = source_span_position(*span);
+                    (line, start, span.end_column().saturating_sub(1) as u32)
                 })
                 .or(backend_anchor)?;
             Some(carina_diagnostic(
@@ -1948,8 +1930,10 @@ impl DiagnosticEngine {
             if let Some(signature) = imported_modules.get(&call.module_name) {
                 let module_args = &signature.arguments;
                 // Check for unknown parameters
-                for (arg_name, authored_argument, key_span, _) in call.arguments_with_source_spans()
-                {
+                for authored in call.arguments_with_source_spans() {
+                    let arg_name = authored.name();
+                    let authored_argument = authored.argument();
+                    let key_span = authored.key_span();
                     let (line, col) = source_span_position(key_span);
                     let matching_arg = module_args.iter().find(|arg| arg.name == arg_name);
 
@@ -2056,7 +2040,7 @@ impl DiagnosticEngine {
             }
         }
 
-        deduplicate_identical_diagnostics(diagnostics)
+        diagnostics
     }
 
     /// Map resolver-owned constraint outcomes onto their parser-authored
@@ -2092,8 +2076,8 @@ impl DiagnosticEngine {
                     }
                 };
                 let (line, col) = source_span_position(span);
-                let width = if span.start_line == span.end_line {
-                    span.end_column.saturating_sub(span.start_column) as u32
+                let width = if span.start_line() == span.end_line() {
+                    span.end_column().saturating_sub(span.start_column()) as u32
                 } else {
                     1
                 };
@@ -2152,7 +2136,7 @@ impl DiagnosticEngine {
                 ));
             }
         }
-        deduplicate_identical_diagnostics(diagnostics)
+        diagnostics
     }
 
     /// Surface BindingIndex-backed user-function argument/return reference
@@ -2253,7 +2237,6 @@ impl DiagnosticEngine {
                 let (line, col) = module_call_position(authored_call);
                 (line, col, authored_call.module_name.chars().count() as u32)
             };
-
             Some(carina_diagnostic(
                 line,
                 col,
