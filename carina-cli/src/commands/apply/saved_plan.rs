@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
@@ -268,7 +269,6 @@ pub(super) struct ReloadedPendingPlanFile {
 
 pub(super) struct ExpansionPriorStates {
     pub managed: HashMap<ResourceId, Current>,
-    pub data_sources: HashMap<ResourceId, State>,
     pub already_refreshed: HashSet<ResourceId>,
 }
 
@@ -346,43 +346,35 @@ impl SchemaCheckedPendingPlanFile {
     pub(super) fn expansion_prior_states(
         &self,
         required_managed: &[Resource],
-        required_data_sources: &[DataSource],
     ) -> ExpansionPriorStates {
         let required_managed: HashSet<&ResourceId> = required_managed
             .iter()
             .map(|resource| &resource.id)
             .collect();
-        let required_data_sources: HashSet<&ResourceId> = required_data_sources
-            .iter()
-            .map(|data_source| &data_source.id)
-            .collect();
         let mut managed = HashMap::new();
-        let mut data_sources = HashMap::new();
         let mut already_refreshed = HashSet::new();
         for entry in self.plan_file.current_states() {
-            match entry {
-                ReloadedCurrentStateEntry::Managed { id, current } => {
-                    if required_managed.contains(id) {
-                        managed.insert(id.clone(), current.as_ref().clone());
-                    } else if !matches!(current.as_ref(), Current::Absent(_)) {
-                        // Plan-time orphan refresh owns these addresses. Keep
-                        // only their ids: expansion needs the exclusion set,
-                        // not a deep clone of every unrelated saved state.
-                        already_refreshed.insert(id.clone());
-                    }
-                }
-                ReloadedCurrentStateEntry::DataSource { id, state } => {
-                    if required_data_sources.contains(id) {
-                        data_sources.insert(id.clone(), state.as_ref().clone());
-                    }
-                }
+            let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            if required_managed.contains(id) {
+                managed.insert(id.clone(), current.as_ref().clone());
+            } else if !matches!(current.as_ref(), Current::Absent(_)) {
+                // Plan-time orphan refresh owns these addresses. Keep only
+                // their ids: expansion needs the exclusion set, not a deep
+                // clone of every unrelated saved state.
+                already_refreshed.insert(id.clone());
             }
         }
         ExpansionPriorStates {
             managed,
-            data_sources,
             already_refreshed,
         }
+    }
+
+    pub(super) fn data_source_values(&self) -> Result<DataSourceValues, AppError> {
+        super::data_source_values_from_saved_plan(
+            self.plan_file.data_sources(),
+            self.plan_file.data_source_values(),
+        )
     }
     pub(super) fn verify_desired(
         self,
@@ -498,22 +490,23 @@ impl DesiredVerifiedPlanFile {
     ) -> Result<RehydratedPlanFile, AppError> {
         let mut redacted_states = HashMap::new();
         for entry in self.plan_file.current_states() {
-            match entry {
-                ReloadedCurrentStateEntry::Managed { id, current } => match current.as_ref() {
-                    carina_core::resource::Current::Absent(state) => {
-                        redacted_states.insert(id.clone(), state.state().clone());
-                    }
-                    carina_core::resource::Current::Present(present) => {
-                        redacted_states.insert(id.clone(), present.state().clone());
-                    }
-                    carina_core::resource::Current::CreateInFlight(_pending) => {}
-                    carina_core::resource::Current::MissingIdentifier(state) => {
-                        redacted_states.insert(id.clone(), state.state().clone());
-                    }
-                },
-                ReloadedCurrentStateEntry::DataSource { id, state } => {
-                    redacted_states.insert(id.clone(), state.as_ref().clone());
+            let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            match current.as_ref() {
+                carina_core::resource::Current::Absent(state) => {
+                    redacted_states.insert(id.clone(), state.state().clone());
                 }
+                carina_core::resource::Current::Present(present) => {
+                    redacted_states.insert(id.clone(), present.state().clone());
+                }
+                carina_core::resource::Current::CreateInFlight(_pending) => {}
+                carina_core::resource::Current::MissingIdentifier(state) => {
+                    redacted_states.insert(id.clone(), state.state().clone());
+                }
+            }
+        }
+        for saved in self.plan_file.data_source_values() {
+            if let DataSourceValue::Read(state) = &saved.value {
+                redacted_states.insert(saved.id.clone(), state.as_ref().clone());
             }
         }
         {
@@ -525,38 +518,38 @@ impl DesiredVerifiedPlanFile {
                 apply_target,
             };
             for entry in self.plan_file.current_states_mut() {
-                match entry {
-                    ReloadedCurrentStateEntry::Managed { id, current } => {
-                        let verified = match current.as_ref() {
-                            carina_core::resource::Current::Absent(state) => {
-                                verifier.verify(id, state.state(), None).await?
-                            }
-                            carina_core::resource::Current::Present(present) => {
-                                verifier
-                                    .verify(id, present.state(), Some(present.identifier()))
-                                    .await?
-                            }
-                            carina_core::resource::Current::CreateInFlight(_pending) => None,
-                            carina_core::resource::Current::MissingIdentifier(state) => {
-                                verifier.verify(id, state.state(), None).await?
-                            }
-                        };
-                        if let Some(verified) = verified
-                            && let Some(mut state) = current.state_bearing_mut()
-                        {
-                            *state.attributes_mut() = verified.attributes;
-                        }
+                let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                let verified = match current.as_ref() {
+                    carina_core::resource::Current::Absent(state) => {
+                        verifier.verify(id, state.state(), None).await?
                     }
-                    ReloadedCurrentStateEntry::DataSource { id, state } => {
-                        let identifier = state
-                            .identifier
-                            .as_deref()
-                            .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
-                        if let Some(verified) =
-                            verifier.verify(id, state, identifier.as_ref()).await?
-                        {
-                            **state = verified;
-                        }
+                    carina_core::resource::Current::Present(present) => {
+                        verifier
+                            .verify(id, present.state(), Some(present.identifier()))
+                            .await?
+                    }
+                    carina_core::resource::Current::CreateInFlight(_pending) => None,
+                    carina_core::resource::Current::MissingIdentifier(state) => {
+                        verifier.verify(id, state.state(), None).await?
+                    }
+                };
+                if let Some(verified) = verified
+                    && let Some(mut state) = current.state_bearing_mut()
+                {
+                    *state.attributes_mut() = verified.attributes;
+                }
+            }
+            for saved in self.plan_file.data_source_values_mut() {
+                if let DataSourceValue::Read(state) = &mut saved.value {
+                    let identifier = state
+                        .identifier
+                        .as_deref()
+                        .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
+                    if let Some(verified) = verifier
+                        .verify(&saved.id, state, identifier.as_ref())
+                        .await?
+                    {
+                        **state = verified;
                     }
                 }
             }
@@ -619,6 +612,10 @@ impl RehydratedPlanFile {
         self.plan_file.data_source_origins()
     }
 
+    fn data_source_values(&self) -> &[crate::commands::plan::SavedDataSourceValue] {
+        self.plan_file.data_source_values()
+    }
+
     fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
         self.plan_file.current_states()
     }
@@ -672,6 +669,10 @@ impl ExecutablePlanFile {
         self.plan.data_source_origins()
     }
 
+    pub(super) fn data_source_values(&self) -> &[crate::commands::plan::SavedDataSourceValue] {
+        self.plan.data_source_values()
+    }
+
     pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
         self.plan.current_states()
     }
@@ -686,5 +687,93 @@ impl ExecutablePlanFile {
 
     pub(super) fn wait_bindings(&self) -> &[PlanWaitBinding] {
         self.plan.wait_bindings()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use carina_core::data_source_value::DataSourceValue;
+    use carina_core::plan::Plan;
+    use carina_core::resource::{ConcreteValue, DataSource, DeferredValue, State, Value};
+
+    use super::{DesiredVerifiedPlanFile, HistoricalResourceAddresses};
+    use crate::commands::apply::ApplyTarget;
+    use crate::commands::plan::{PlanFile, SavedDataSourceValue};
+
+    #[tokio::test]
+    async fn historical_verification_rehydrates_read_outcome_without_current_state_row() {
+        let data_source =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+        let plaintext = Value::Concrete(ConcreteValue::String("provider-secret".into()));
+        let state_with_secret = State::existing(
+            data_source.id.clone(),
+            HashMap::from([(
+                "token".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()))),
+            )]),
+        );
+        let redacted = carina_core::value::redact_secrets_in_state(&state_with_secret)
+            .expect("redact data-source output");
+        let actual = State::existing(
+            data_source.id.clone(),
+            HashMap::from([("token".to_string(), plaintext.clone())]),
+        );
+        let plan = Plan::new();
+        let plan_file = PlanFile {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-28T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: serde_json::from_value(serde_json::json!([]))
+                .expect("empty saved provider configs"),
+            backend_config: None,
+            plan: plan.clone(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: vec![data_source.clone()],
+            data_source_origins: Vec::new(),
+            data_source_values: vec![SavedDataSourceValue {
+                id: data_source.id.clone(),
+                value: DataSourceValue::read(redacted),
+            }],
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+            schema_fingerprints: Default::default(),
+        }
+        .reload_in_flight_from_locked_state(None)
+        .expect("reload saved plan");
+        let pending = DesiredVerifiedPlanFile {
+            plan_file,
+            planned_secret_hashes: HashMap::new(),
+        };
+        let mut actual_states = HashMap::from([(data_source.id.clone(), actual)]);
+        let mut verified_planned_states = HashMap::new();
+
+        let rehydrated = pending
+            .verify_historical(
+                &carina_provider_mock::MockProvider::new(),
+                &mut actual_states,
+                &mut verified_planned_states,
+                &HistoricalResourceAddresses::from_plan(&plan),
+                ApplyTarget::SavedPlan {
+                    plan_file: Path::new("saved.plan"),
+                    source_dir: Path::new("."),
+                },
+            )
+            .await
+            .expect("verify data-source historical secret");
+
+        let DataSourceValue::Read(verified) = &rehydrated.data_source_values()[0].value else {
+            panic!("read outcome changed variants")
+        };
+        assert_eq!(verified.attributes.get("token"), Some(&plaintext));
     }
 }

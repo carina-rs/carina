@@ -341,9 +341,8 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
             managed_current: &HashMap::new(),
-            data_source_states: &HashMap::new(),
+            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },

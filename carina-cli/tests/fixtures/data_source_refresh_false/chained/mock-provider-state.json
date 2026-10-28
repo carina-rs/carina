@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "states": {
+    "iam.Roles.roles": {
+      "name_regex": "x",
+      "names": ["r1"]
+    },
+    "iam.Roles.roles_again": {
+      "name_regex": "r1",
+      "names": ["r2"]
+    }
+  }
+}

@@ -83,7 +83,7 @@ enum Commands {
         #[arg(long)]
         tui: bool,
 
-        /// Refresh state from provider before planning (default: true)
+        /// Refresh managed-resource state before planning; data sources are always read (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
 
@@ -139,7 +139,7 @@ enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
 
-        /// Refresh state from provider before destroying (default: true)
+        /// Refresh managed-resource state before destroying (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
 

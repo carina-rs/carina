@@ -7,6 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use carina_core::data_source_value::DataSourceValues;
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
@@ -86,7 +87,7 @@ pub(crate) fn queue_state_refresh(
 ///    consulting `state.resources` alone leaves any
 ///    `<data_source>.<attr>` reference in `exports {}` unresolved
 ///    (carina#3266, carina#3271).
-/// 2. `managed_current` and `data_source_states` together hold the live
+/// 2. `managed_current` and `data_source_values` together hold the live
 ///    execution view. For managed resources, `managed_current` may still
 ///    carry the **pre-apply** snapshot
 ///    (whatever the executor read at refresh time, before the apply
@@ -102,7 +103,7 @@ pub(crate) fn queue_state_refresh(
 #[derive(Debug, Clone)]
 pub(crate) struct PostApplyStates {
     managed_current: HashMap<ResourceId, Current>,
-    data_source_states: HashMap<ResourceId, State>,
+    data_source_values: DataSourceValues,
 }
 
 impl PostApplyStates {
@@ -114,7 +115,7 @@ impl PostApplyStates {
     /// type-level doc-comment for why).
     pub(crate) fn from_current_and_state(
         managed_current: &HashMap<ResourceId, Current>,
-        data_source_states: &HashMap<ResourceId, State>,
+        data_source_values: &DataSourceValues,
         state: &StateFile,
     ) -> Self {
         let mut managed_current = managed_current.clone();
@@ -131,7 +132,7 @@ impl PostApplyStates {
         }
         Self {
             managed_current,
-            data_source_states: data_source_states.clone(),
+            data_source_values: data_source_values.clone(),
         }
     }
 
@@ -139,8 +140,8 @@ impl PostApplyStates {
         &self.managed_current
     }
 
-    pub(crate) fn data_source_states(&self) -> &HashMap<ResourceId, State> {
-        &self.data_source_states
+    pub(crate) fn data_source_values(&self) -> &DataSourceValues {
+        &self.data_source_values
     }
 }
 
@@ -209,10 +210,9 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub result: &'a ExecutionResult,
     pub state_base: FinalStateBase,
     pub state_save_inputs: Arc<ApplyStateSaveInputs>,
-    /// Data sources (`read`-keyword resources). Layered into the
-    /// export-resolution binding view so `exports { x = some_read.attr }`
-    /// resolves (carina#3181).
-    pub data_sources: &'a [carina_core::resource::DataSource],
+    /// Total post-read outcomes. Apply-time reads replace their deferred
+    /// entries before this reaches export resolution.
+    pub data_source_values: &'a DataSourceValues,
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
     /// `Some(params)` rebuilds `state.exports` from the source
@@ -454,7 +454,6 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
         carina_core::parser::InferredExportParam,
     >,
     pub sorted_resources: &'a [Resource],
-    pub data_sources: &'a [carina_core::resource::DataSource],
     pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
@@ -502,9 +501,8 @@ pub(crate) fn resolve_export_values_post_apply(
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: input.sorted_resources,
         compositions: &[],
-        data_sources: input.data_sources,
         managed_current: &plan_input_current,
-        data_source_states: input.post_apply_states.data_source_states(),
+        data_source_values: input.post_apply_states.data_source_values(),
         remote_bindings: &HashMap::new(),
         wait_aliases: input.wait_aliases,
     });
@@ -1589,21 +1587,30 @@ mod post_apply_states_tests {
                 ConcreteValue::String("arn:aws:iam::1:role/x".into()),
             )])),
         );
-        let mut data_source_states = HashMap::new();
-        data_source_states.insert(
-            ds_id.clone(),
-            State::existing(ds_id.clone(), ds_attrs.clone()),
-        );
+        let data_sources = [carina_core::resource::DataSource::with_provider(
+            "aws",
+            "iam.Roles",
+            "admin_access_roles",
+            None,
+        )];
+        let data_source_values =
+            DataSourceValues::from_data_sources(&data_sources, |data_source| {
+                carina_core::data_source_value::DataSourceValue::read(State::existing(
+                    data_source.id.clone(),
+                    ds_attrs.clone(),
+                ))
+            });
 
         // state.resources has no entry for the data source — that is
         // the production reality the bug springs from.
         let state = StateFile::new();
 
         let post =
-            PostApplyStates::from_current_and_state(&HashMap::new(), &data_source_states, &state);
+            PostApplyStates::from_current_and_state(&HashMap::new(), &data_source_values, &state);
         let entry = post
-            .data_source_states()
-            .get(&ds_id)
+            .data_source_values()
+            .read_states()
+            .find_map(|(id, state)| (id == &ds_id).then_some(state))
             .expect("data-source entry must survive merge");
         assert_eq!(entry.attributes.get("arns"), ds_attrs.get("arns"));
     }
@@ -1642,8 +1649,11 @@ mod post_apply_states_tests {
             .into_state();
 
         let managed_current = crate::managed_current_from_states(managed_states);
-        let post =
-            PostApplyStates::from_current_and_state(&managed_current, &HashMap::new(), &state);
+        let post = PostApplyStates::from_current_and_state(
+            &managed_current,
+            &DataSourceValues::empty(),
+            &state,
+        );
         let current = post.managed_current().get(&id).expect("merged entry");
         let present = match current {
             Current::Absent(state) => {
@@ -1681,8 +1691,11 @@ mod post_apply_states_tests {
             .upsert_resource(row)
             .expect("deposed-only fixture must be valid");
 
-        let post =
-            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let post = PostApplyStates::from_current_and_state(
+            &HashMap::new(),
+            &DataSourceValues::empty(),
+            &state,
+        );
         let current = post
             .managed_current()
             .get(&id)
@@ -1715,8 +1728,11 @@ mod post_apply_states_tests {
             .upsert_resource(row)
             .expect("identifierless fixture must be valid");
 
-        let post =
-            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let post = PostApplyStates::from_current_and_state(
+            &HashMap::new(),
+            &DataSourceValues::empty(),
+            &state,
+        );
         let current = post
             .managed_current()
             .get(&id)
@@ -6442,8 +6458,11 @@ mod export_writeback_tests {
         export_params: &[InferredExportParam],
     ) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         let state = StateFile::new();
-        let post_apply_states =
-            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let post_apply_states = PostApplyStates::from_current_and_state(
+            &HashMap::new(),
+            &DataSourceValues::empty(),
+            &state,
+        );
         let checked = carina_core::validation::check_export_values_pre_apply(
             export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
@@ -6453,7 +6472,6 @@ mod export_writeback_tests {
         let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
             export_params: &checked,
             sorted_resources: &[],
-            data_sources: &[],
             pre_resolve_compositions: &[],
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -6497,8 +6515,11 @@ mod export_writeback_tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("test export must pass the secret boundary");
-        let post_apply_states =
-            PostApplyStates::from_current_and_state(&HashMap::new(), &HashMap::new(), &state);
+        let post_apply_states = PostApplyStates::from_current_and_state(
+            &HashMap::new(),
+            &DataSourceValues::empty(),
+            &state,
+        );
         let current = post_apply_states
             .managed_current()
             .get(&id)
@@ -6526,7 +6547,6 @@ mod export_writeback_tests {
         let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
             export_params: &checked,
             sorted_resources: std::slice::from_ref(&resource),
-            data_sources: &[],
             pre_resolve_compositions: &[],
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),

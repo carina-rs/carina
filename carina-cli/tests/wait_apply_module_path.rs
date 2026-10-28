@@ -30,11 +30,12 @@ use carina_cli::commands::validate_and_resolve_errors_with_factories;
 use carina_cli::wiring::{PlanPreprocessor, WiringContext};
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{Orphans, create_plan};
 use carina_core::executor::{
-    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource, execute_plan,
+    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, ProviderCheckInputs,
+    UnresolvedResource, execute_plan,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -505,13 +506,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         carina_core::binding_index::PreApplyInputs {
             managed: &resources_for_plan,
             compositions: &parsed.compositions,
-            data_sources: &[],
             managed_current: &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
                 ctx.schemas(),
                 &resources_for_plan,
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -538,13 +538,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
-                data_sources: &parsed.data_sources,
                 managed_current: &carina_core::resource::into_plan_input_current_map(
                     current_states.clone(),
                     ctx.schemas(),
                     &resource_origins,
                 ),
-                data_source_states: &HashMap::new(),
+                data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
                 remote_bindings: &remote_bindings,
                 wait_aliases: &wait_aliases,
             },
@@ -558,7 +557,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
     let mut data_sources = parsed.data_sources.clone();
-    let mut data_source_states = HashMap::new();
+    let mut data_source_values = carina_core::data_source_value::DataSourceValues::empty();
     let mut orphans = Orphans::new();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
@@ -567,7 +566,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             &resource_origins,
             &module_gate,
             &mut current_states,
-            &mut data_source_states,
+            &mut data_source_values,
             &mut orphans,
             &parsed.providers,
             &mut data_sources,
@@ -630,8 +629,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
         managed_current: current_states,
-        data_source_states: HashMap::new(),
-        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         // carina#3063 (#3069): the executor re-applies the full

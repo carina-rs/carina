@@ -1,0 +1,5 @@
+let kids = for role_name in roles.names {
+  mock.test.resource {
+    name = role_name
+  }
+}

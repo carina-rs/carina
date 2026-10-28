@@ -1,0 +1,3 @@
+let one = mock.test.resource {
+  name = roles.names[0]
+}

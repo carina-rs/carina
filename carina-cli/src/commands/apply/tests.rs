@@ -1,5 +1,6 @@
 use super::*;
 use carina_core::binding_index::PreApplyInputs;
+use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
@@ -337,6 +338,7 @@ async fn run_saved_plan_schema_fingerprint_case(
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             resource_id.clone(),
             State::not_found(resource_id),
@@ -502,6 +504,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             id.clone(),
             State::not_found(id),
@@ -688,6 +691,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         compositions: vec![saved],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -774,6 +778,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             id,
             planned_state,
@@ -2278,6 +2283,87 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
 }
 
+#[tokio::test]
+async fn live_apply_reports_phase2_module_constraint_as_structured_plan_error() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = format!(
+        r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let lookup = read mock.iam.Roles {{
+  name_regex = "^existing$"
+}}
+"#,
+        fixture.state_path().display()
+    );
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyTimeReadShared::default();
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("phase-2 module constraint fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        get_base_dir(fixture.config_path()),
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+        &loaded.inference_errors,
+        &loaded.duplicate_declarations,
+    );
+    assert!(validation_errors.is_empty(), "{validation_errors:?}");
+    let mut composition = saved_module_composition(string_value("bad"), "bad");
+    composition.signature.attributes.insert(
+        "value".to_string(),
+        carina_core::resource::CompositionAttribute::from_value(string_value("^existing$"), None),
+    );
+    parsed.compositions.push(composition);
+    parsed.data_sources[0].set_attr(
+        "name_regex",
+        Value::resource_ref("checked", "value", Vec::new()),
+    );
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &parsed.providers,
+    );
+    let observer_factory = fixture.observer_factory();
+
+    let error = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        fixture.config_path(),
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("the module constraint must abort direct apply");
+
+    assert!(
+        matches!(&error, AppError::Validation(message) if message == "plan failed with 1 error(s)"),
+        "phase-2 module constraints must use the structured plan-error path: {error:?}"
+    );
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        0,
+        "the rejected data source must not reach the provider"
+    );
+}
+
 #[test]
 fn total_apply_line_formats_duration() {
     assert_eq!(
@@ -2339,17 +2425,31 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
     });
     let mut target = Resource::with_provider("mock", "iam.Role", "target_role", None);
     target.binding = Some("target_role".to_string());
-    let deferred_reads =
-        deferred_data_source_reads_from_data_sources(&[data_source], &[target], &HashMap::new());
+    let data_sources = [data_source];
+    let mut classified = crate::wiring::classify_apply_time_data_source_read_inputs(
+        &data_sources,
+        &[target],
+        &HashMap::new(),
+    );
+    let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
+        DataSourceValue::deferred_to_apply(
+            classified
+                .remove(&data_source.id)
+                .expect("missing managed input must defer the read"),
+        )
+    });
+    let executable_values = values
+        .into_executable()
+        .expect("deferred fixture must be executable");
 
     assert!(
-        !can_use_export_only_fast_path(&plan, &deferred_reads),
+        !can_use_export_only_fast_path(&plan, &executable_values),
         "deferred reads are executable effects and must not be silently skipped"
     );
 }
 
 #[test]
-fn saved_plan_classifies_folded_data_source_input_from_preserved_dependency() {
+fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
     let mut data_source =
         DataSource::with_provider("mock", "iam.Roles", "registry_publish.roles", None);
     data_source.binding = Some("registry_publish.roles".to_string());
@@ -2364,13 +2464,56 @@ fn saved_plan_classifies_folded_data_source_input_from_preserved_dependency() {
         Resource::with_provider("mock", "iam.Role", "registry_publish.target_role", None);
     target.binding = Some("registry_publish.target_role".to_string());
 
-    let deferred_reads =
-        deferred_data_source_reads_from_data_sources(&[data_source], &[target], &HashMap::new());
+    let data_sources = [data_source];
+    let mut classified = crate::wiring::classify_apply_time_data_source_read_inputs(
+        &data_sources,
+        &[target],
+        &HashMap::new(),
+    );
+    let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
+        DataSourceValue::deferred_to_apply(
+            classified
+                .remove(&data_source.id)
+                .expect("preserved dependency must defer the read"),
+        )
+    });
+    let executable_values = values
+        .into_executable()
+        .expect("deferred fixture must be executable");
 
     assert!(
-        deferred_reads.contains(&id),
+        executable_values.deferred_inputs(&id).is_some(),
         "saved-plan apply must preserve a deferred read after parsing folded its input value"
     );
+}
+
+#[test]
+fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
+    let configured = DataSource::with_provider("mock", "iam.Roles", "configured", None);
+    let unexpected = DataSource::with_provider("mock", "iam.Roles", "unexpected", None);
+
+    let missing = data_source_values_from_saved_plan(std::slice::from_ref(&configured), &[])
+        .expect_err("a missing saved outcome must be rejected");
+    assert!(missing.to_string().contains("has no outcome"));
+
+    let unexpected_outcome = crate::commands::plan::SavedDataSourceValue {
+        id: unexpected.id.clone(),
+        value: DataSourceValue::deferred_to_apply(Vec::new()),
+    };
+    let extra = data_source_values_from_saved_plan(&[], &[unexpected_outcome])
+        .expect_err("an outcome outside the configured set must be rejected");
+    assert!(extra.to_string().contains("unknown data source"));
+
+    let configured_outcome = crate::commands::plan::SavedDataSourceValue {
+        id: configured.id.clone(),
+        value: DataSourceValue::deferred_to_apply(Vec::new()),
+    };
+    let duplicate = data_source_values_from_saved_plan(
+        std::slice::from_ref(&configured),
+        &[configured_outcome.clone(), configured_outcome],
+    )
+    .expect_err("duplicate saved outcomes must be rejected");
+    assert!(duplicate.to_string().contains("duplicate outcomes"));
 }
 
 #[tokio::test]
@@ -2469,7 +2612,11 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_resources: vec![target, consumer],
         compositions: Vec::new(),
         data_sources: vec![lookup.clone()],
-        data_source_origins: vec![lookup],
+        data_source_origins: vec![lookup.clone()],
+        data_source_values: vec![crate::commands::plan::SavedDataSourceValue {
+            id: lookup.id.clone(),
+            value: DataSourceValue::deferred_to_apply(Vec::new()),
+        }],
         current_states: vec![
             crate::commands::plan::CurrentStateEntry::managed(
                 target_id,
@@ -2609,6 +2756,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         compositions: vec![composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![
             crate::commands::plan::CurrentStateEntry::managed(
                 producer_id.clone(),
@@ -2687,6 +2835,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         compositions: vec![saved_module_composition(string_value("bad"), "bad")],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -2759,6 +2908,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -2859,6 +3009,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -3048,9 +3199,8 @@ fn apply_emits_legacy_override_warning_to_stderr() {
         PreApplyInputs {
             managed: &[],
             compositions: &[],
-            data_sources: &[],
             managed_current: &current_states,
-            data_source_states: &HashMap::new(),
+            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -3271,6 +3421,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             resource_id.clone(),
             State::not_found(resource_id),
@@ -6764,13 +6915,12 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
+            &DataSourceValues::empty(),
             &state,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
         sorted_resources: &sorted_resources,
-        data_sources: &[],
         pre_resolve_compositions: &[],
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -6872,13 +7022,12 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
+            &DataSourceValues::empty(),
             &state,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
         sorted_resources: &sorted_resources,
-        data_sources: &[],
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -7001,13 +7150,12 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
+            &DataSourceValues::empty(),
             &state,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
         sorted_resources: &sorted_resources,
-        data_sources: &[],
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -7174,13 +7322,12 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         carina_core::binding_index::PreApplyInputs {
             managed: &sorted_resources.clone(),
             compositions: &[],
-            data_sources: &[],
             managed_current: &crate::plan_input_current_from_states(
                 pre_apply_managed_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &sorted_resources,
             ),
-            data_source_states: &HashMap::new(),
+            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },
@@ -7198,13 +7345,12 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
+            &DataSourceValues::empty(),
             &post_apply_state_file,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
         sorted_resources: &sorted_resources,
-        data_sources: &[],
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -7310,16 +7456,18 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         })),
     }];
 
+    let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
+        DataSourceValue::read(data_source_states[&data_source.id].clone())
+    });
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &HashMap::new(),
-            &data_source_states,
+            &data_source_values,
             &post_apply_state_file,
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
         sorted_resources: &[],
-        data_sources: &data_sources,
         pre_resolve_compositions: &[],
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -7440,6 +7588,7 @@ async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
 // carina#3136) materializes + resolves identically on the apply side.
 mod apply_deferred_for_parity {
     use carina_core::binding_index::WaitAliasSpec;
+    use carina_core::data_source_value::DataSourceValues;
     use carina_core::parser::{ProviderContext, parse};
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
     use std::collections::HashMap;
@@ -7511,7 +7660,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -7576,7 +7725,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(empty),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -7633,7 +7782,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states.clone()),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -7664,7 +7813,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &crate::managed_current_from_states(states),
-            &HashMap::new(),
+            &DataSourceValues::empty(),
             &carina_core::schema::SchemaRegistry::new(),
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
@@ -7691,9 +7840,10 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 24 removes the wait
-    //! target schema kind (carina#3916); version 23 added the mandatory
-    //! provider-schema fingerprint snapshot (carina#3983).
+    //! `carina plan` is the supported migration. Version 25 persists total
+    //! data-source outcomes (carina#3993); version 24 removed the wait target
+    //! schema kind (carina#3916), and version 23 added the mandatory provider-
+    //! schema fingerprint snapshot (carina#3983).
 
     use std::path::Path;
 
@@ -7707,8 +7857,8 @@ mod saved_plan_version_tests {
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            24,
-            "making wait targets managed-only must bump the saved-plan format",
+            25,
+            "persisting total data-source outcomes must bump the saved-plan format",
         );
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
@@ -7755,7 +7905,7 @@ mod saved_plan_version_tests {
         else {
             panic!("expected typed version error, got {error:?}");
         };
-        assert_eq!((*found, *expected), (22, 24));
+        assert_eq!((*found, *expected), (22, 25));
         let expected_replan = format!("carina plan --out {} infra", plan_path.display());
         assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
         assert!(
@@ -8446,6 +8596,7 @@ mod saved_plan_version_tests {
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
             current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
                 id,
                 current_state,

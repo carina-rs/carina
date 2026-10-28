@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::FocusedPanel;
 use crate::module_info_app::{ModuleInfoApp, SectionKind};
+use crate::row::{Indent, Row};
 
 /// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
 pub fn draw(frame: &mut Frame, app: &mut ModuleInfoApp) {
@@ -57,19 +58,14 @@ fn draw_tree(frame: &mut Frame, app: &mut ModuleInfoApp, area: Rect) {
 
 /// Build a ListItem for a row
 fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> ListItem<'static> {
-    let indent = "  ".repeat(row.depth);
-
     let spans = match row.kind {
         SectionKind::Header => {
-            let mut s = vec![
-                Span::raw(indent),
-                Span::styled(
-                    format!("=== {} ===", row.label),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
+            let mut s = vec![Span::styled(
+                format!("=== {} ===", row.label),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )];
             if !row.detail.is_empty() {
                 s.push(Span::styled(
                     format!("  ({})", row.detail),
@@ -80,7 +76,6 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
         }
         SectionKind::Argument => {
             let mut s = vec![
-                Span::raw(indent),
                 Span::styled(row.label.clone(), Style::default().fg(Color::White)),
                 Span::raw(": "),
                 Span::styled(row.type_info.clone(), Style::default().fg(Color::Yellow)),
@@ -101,17 +96,16 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
         }
         SectionKind::Resource => {
             vec![
-                Span::raw(indent),
                 Span::styled(row.label.clone(), Style::default().fg(Color::White)),
                 Span::raw(": "),
                 Span::styled(row.type_info.clone(), Style::default().fg(Color::Yellow)),
             ]
         }
         SectionKind::Attribute => {
-            let mut s = vec![
-                Span::raw(indent),
-                Span::styled(row.label.clone(), Style::default().fg(Color::White)),
-            ];
+            let mut s = vec![Span::styled(
+                row.label.clone(),
+                Style::default().fg(Color::White),
+            )];
             if !row.type_info.is_empty() {
                 s.push(Span::raw(": "));
                 s.push(Span::styled(
@@ -123,7 +117,6 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
         }
         SectionKind::Import => {
             vec![
-                Span::raw(indent),
                 Span::styled(row.label.clone(), Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!("  {}", row.detail),
@@ -132,10 +125,10 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
             ]
         }
         SectionKind::ModuleCall => {
-            vec![
-                Span::raw(indent),
-                Span::styled(row.label.clone(), Style::default().fg(Color::Blue)),
-            ]
+            vec![Span::styled(
+                row.label.clone(),
+                Style::default().fg(Color::Blue),
+            )]
         }
     };
 
@@ -151,7 +144,8 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
             .collect();
     }
 
-    ListItem::new(Line::from(line_spans))
+    let row = Row::new(Indent::new(2 * row.depth), line_spans);
+    ListItem::new(row.into_line())
 }
 
 /// Draw the detail panel
@@ -191,4 +185,48 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Span::raw(" switch panel"),
     ]));
     frame.render_widget(help, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module_info_app::InfoRow;
+
+    #[test]
+    fn selected_nested_row_keeps_indent_unstyled_and_label_bold() {
+        let row = InfoRow {
+            label: "name".to_string(),
+            type_info: "String".to_string(),
+            detail: String::new(),
+            depth: 2,
+            kind: SectionKind::Argument,
+            required: false,
+            default_value: None,
+            description: None,
+        };
+
+        let item = build_list_item(&row, true);
+        let indent = Span::raw("    ");
+        assert_eq!(indent.style.fg, None);
+        assert_eq!(indent.style.add_modifier, Modifier::empty());
+        let label_style = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+        assert!(label_style.add_modifier.contains(Modifier::BOLD));
+
+        assert_eq!(
+            item,
+            ListItem::new(Line::from(vec![
+                indent,
+                Span::styled("name", label_style),
+                Span::styled(": ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "String",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        );
+    }
 }

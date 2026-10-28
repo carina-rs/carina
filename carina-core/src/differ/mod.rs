@@ -6,7 +6,7 @@
 mod comparison;
 mod plan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
@@ -183,6 +183,54 @@ impl Orphan {
 
     pub fn directives(&self) -> &Directives {
         &self.directives
+    }
+
+    /// Project this persisted-only resource into the minimal desired-resource
+    /// shape used by binding resolution. Provider state remains authoritative
+    /// for its values; the projection exists only so a data-source input can
+    /// resolve a binding that is no longer present in the configuration.
+    pub fn binding_resource(&self) -> Resource {
+        let (attributes, dependency_bindings) = match &self.current {
+            Current::Absent(state) => (
+                &state.state().attributes,
+                &state.state().dependency_bindings,
+            ),
+            Current::Present(present) => (
+                &present.state().attributes,
+                &present.state().dependency_bindings,
+            ),
+            Current::CreateInFlight(_pending) => {
+                return Resource {
+                    id: self.current.id().clone(),
+                    attributes: Default::default(),
+                    directives: self.directives.clone(),
+                    prefixes: Default::default(),
+                    binding: self.binding.clone(),
+                    dependency_bindings: Default::default(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    quoted_string_attrs: Default::default(),
+                };
+            }
+            Current::MissingIdentifier(state) => (
+                &state.state().attributes,
+                &state.state().dependency_bindings,
+            ),
+        };
+        Resource {
+            id: self.current.id().clone(),
+            attributes: attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            directives: self.directives.clone(),
+            prefixes: Default::default(),
+            binding: self.binding.clone(),
+            dependency_bindings: dependency_bindings.clone(),
+            module_source: None,
+            default_tag_keys: Default::default(),
+            quoted_string_attrs: Default::default(),
+        }
     }
 
     pub fn into_current(self) -> Current {
@@ -472,22 +520,10 @@ pub fn provider_states_for(
     current
 }
 
-/// Run an asynchronous provider-state transform over managed/orphan state and
-/// data-source state while retaining their distinct key spaces and owners.
-///
-/// Managed resources and orphans share one call because a desired managed
-/// resource can adopt a same-id orphan. Data sources use a second call because
-/// their `ResourceId` namespace can legitimately overlap the managed/orphan
-/// namespace during a managed-to-data-source configuration change. Each call
-/// must preserve its own key set; transformed values are installed only after
-/// both calls succeed.
-pub async fn transform_prior_provider_states(
-    current_states: &mut HashMap<ResourceId, Current>,
-    data_source_states: &mut HashMap<ResourceId, State>,
-    orphans: &mut Orphans,
-    mut transform_managed_orphans: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
-    mut transform_data_sources: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
-) -> Result<(), ProviderError> {
+fn prior_managed_transform_states(
+    current_states: &HashMap<ResourceId, Current>,
+    orphans: &Orphans,
+) -> StateTransformMap {
     let mut managed_states: HashMap<ResourceId, State> = current_states
         .iter()
         .filter_map(|(id, current)| {
@@ -513,15 +549,15 @@ pub async fn transform_prior_provider_states(
         })
         .collect();
     extend_disjoint_states(&mut managed_states, orphan_states);
-    let mut managed_states = StateTransformMap::from_states(managed_states);
-    let mut transformed_data_sources = StateTransformMap::from_states(data_source_states.clone());
+    StateTransformMap::from_states(managed_states)
+}
 
-    transform_managed_orphans(&mut managed_states).await?;
-    if !transformed_data_sources.is_empty() {
-        transform_data_sources(&mut transformed_data_sources).await?;
-    }
-
-    let mut managed_states = managed_states.into_states();
+fn install_prior_managed_transform_states(
+    current_states: &mut HashMap<ResourceId, Current>,
+    orphans: &mut Orphans,
+    transformed: StateTransformMap,
+) {
+    let mut managed_states = transformed.into_states();
     for (id, orphan) in orphans.iter_mut() {
         if let Some(state) = managed_states.remove(id)
             && let Some(target) = orphan.current.state_bearing_mut()
@@ -536,6 +572,98 @@ pub async fn transform_prior_provider_states(
             target.apply_transformed_state(state);
         }
     }
+}
+
+/// Run a provider-state transform over managed and orphan state only.
+///
+/// This is the managed-only counterpart of [`transform_prior_provider_states`]
+/// for call sites that have not read any data sources yet. It removes the need
+/// to manufacture an empty data-source map merely to cross the hydration
+/// boundary.
+pub async fn transform_prior_managed_provider_states(
+    current_states: &mut HashMap<ResourceId, Current>,
+    orphans: &mut Orphans,
+    transform: impl AsyncFnOnce(&mut StateTransformMap) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let mut transformed = prior_managed_transform_states(current_states, orphans);
+    let expected_ids = transformed
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    transform(&mut transformed).await?;
+    validate_state_transform_routes("managed/orphan", &expected_ids, &transformed)?;
+    install_prior_managed_transform_states(current_states, orphans, transformed);
+    Ok(())
+}
+
+fn validate_state_transform_routes(
+    label: &str,
+    expected: &HashSet<ResourceId>,
+    transformed: &StateTransformMap,
+) -> Result<(), ProviderError> {
+    let actual = transformed
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    if actual == *expected {
+        return Ok(());
+    }
+    let mut missing = expected
+        .difference(&actual)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut unexpected = actual
+        .difference(expected)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    missing.sort();
+    unexpected.sort();
+    Err(ProviderError::internal(format!(
+        "provider {label} state transform changed its address set (missing: [{}]; unexpected: [{}])",
+        missing.join(", "),
+        unexpected.join(", ")
+    )))
+}
+
+/// Run an asynchronous provider-state transform over managed/orphan state and
+/// data-source state while retaining their distinct key spaces and owners.
+///
+/// Managed resources and orphans share one call because a desired managed
+/// resource can adopt a same-id orphan. Data sources use a second call because
+/// their `ResourceId` namespace can legitimately overlap the managed/orphan
+/// namespace during a managed-to-data-source configuration change. Each call
+/// must preserve its own key set; transformed values are installed only after
+/// both calls succeed.
+pub async fn transform_prior_provider_states(
+    current_states: &mut HashMap<ResourceId, Current>,
+    data_source_states: &mut HashMap<ResourceId, State>,
+    orphans: &mut Orphans,
+    mut transform_managed_orphans: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
+    mut transform_data_sources: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let mut managed_states = prior_managed_transform_states(current_states, orphans);
+    let mut transformed_data_sources = StateTransformMap::from_states(data_source_states.clone());
+    let expected_managed_ids = managed_states
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let expected_data_source_ids = transformed_data_sources
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+
+    transform_managed_orphans(&mut managed_states).await?;
+    validate_state_transform_routes("managed/orphan", &expected_managed_ids, &managed_states)?;
+    if !transformed_data_sources.is_empty() {
+        transform_data_sources(&mut transformed_data_sources).await?;
+        validate_state_transform_routes(
+            "data-source",
+            &expected_data_source_ids,
+            &transformed_data_sources,
+        )?;
+    }
+
+    install_prior_managed_transform_states(current_states, orphans, managed_states);
     *data_source_states = transformed_data_sources.into_states();
     Ok(())
 }

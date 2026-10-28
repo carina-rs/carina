@@ -7380,6 +7380,33 @@ pub fn into_plan_input_current_map(
         .collect()
 }
 
+/// Borrowing counterpart used when a caller layers configured and orphan
+/// state. Each current value is cloned once into the canonicalized plan-input
+/// map; the source maps and resource graph are never deep-cloned first.
+pub fn plan_input_current_map_from_refs<'a>(
+    current: impl IntoIterator<Item = (&'a ResourceId, &'a Current)>,
+    schemas: &crate::schema::SchemaRegistry,
+    resources: impl IntoIterator<Item = &'a Resource>,
+) -> HashMap<ResourceId, PlanInputCurrent> {
+    let mut current = current
+        .into_iter()
+        .map(|(id, current)| (id.clone(), current.clone()))
+        .collect::<HashMap<_, _>>();
+    crate::value::canonicalize_states_with_schemas(&mut current, schemas);
+    for resource in resources {
+        if let Some(schema) = schemas.get_for(resource)
+            && let Some(state) = current.get_mut(&resource.id)
+            && let Some(attributes) = state.attributes_mut()
+        {
+            crate::utils::lift_state_enum_leaves(attributes, schema);
+        }
+    }
+    current
+        .into_iter()
+        .map(|(id, current)| (id, current.into_plan_input()))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn current_map_from_states(
     states: HashMap<ResourceId, State>,

@@ -32,8 +32,8 @@ use super::wait::{
     wait_failure_message,
 };
 use super::{
-    DeferredDataSourceReads, ExecutionAccumulator, ExecutionEvent, ExecutionInput,
-    ExecutionObserver, ExecutionResult, ProgressInfo, unresolved_data_source_inputs,
+    ExecutionAccumulator, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult,
+    ProgressInfo, unresolved_data_source_inputs,
 };
 
 pub(super) struct ExpandedEffects {
@@ -110,30 +110,39 @@ pub(super) fn apply_deferred_replace_delete_deps(
 
 pub(super) fn is_runtime_dispatchable(
     effect: &Effect,
-    deferred_reads: &DeferredDataSourceReads,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
 ) -> bool {
-    is_deferred_read(effect, deferred_reads)
+    is_deferred_read(effect, data_source_values)
         || (!matches!(effect, Effect::Read { .. })
             && (!effect.is_state_operation() || effect.is_scheduler_meta()))
 }
 
-pub(super) fn is_runtime_noop(effect: &Effect, deferred_reads: &DeferredDataSourceReads) -> bool {
+pub(super) fn is_runtime_noop(
+    effect: &Effect,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+) -> bool {
     match effect {
-        Effect::Read { .. } => !is_deferred_read(effect, deferred_reads),
+        Effect::Read { .. } => !is_deferred_read(effect, data_source_values),
         _ => effect.is_state_operation() && !effect.is_scheduler_meta(),
     }
 }
 
-fn count_runtime_effects(effects: &[Effect], deferred_reads: &DeferredDataSourceReads) -> usize {
+fn count_runtime_effects(
+    effects: &[Effect],
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+) -> usize {
     count_actionable_effects(effects)
         + effects
             .iter()
-            .filter(|effect| is_deferred_read(effect, deferred_reads))
+            .filter(|effect| is_deferred_read(effect, data_source_values))
             .count()
 }
 
-fn is_deferred_read(effect: &Effect, deferred_reads: &DeferredDataSourceReads) -> bool {
-    matches!(effect, Effect::Read { resource } if deferred_reads.contains(&resource.id))
+fn is_deferred_read(
+    effect: &Effect,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+) -> bool {
+    matches!(effect, Effect::Read { resource } if data_source_values.deferred_inputs(&resource.id).is_some())
 }
 
 fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]) -> String {
@@ -240,7 +249,7 @@ pub(super) async fn execute_effects_sequential(
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         managed_current: std::mem::take(&mut input.managed_current),
-        data_source_states: std::mem::take(&mut input.data_source_states),
+        data_source_states: input.data_source_values.read_states_map(),
         bindings: std::mem::take(&mut input.bindings),
         failed_refreshes: HashSet::new(),
     };
@@ -258,7 +267,7 @@ pub(super) async fn execute_effects_sequential(
         source_effect_indices: _,
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
-    let mut total = count_runtime_effects(&effects, &input.deferred_data_source_reads);
+    let mut total = count_runtime_effects(&effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
     let empty_resource_origins = HashMap::new();
@@ -311,7 +320,7 @@ pub(super) async fn execute_effects_sequential(
     accumulated.publish_if_dirty(&input.checkpoint_sink);
     // All actionable effect indices (excluding Read and state operations)
     let mut actionable_indices: Vec<usize> = (0..effects.len())
-        .filter(|&idx| is_runtime_dispatchable(&effects[idx], &input.deferred_data_source_reads))
+        .filter(|&idx| is_runtime_dispatchable(&effects[idx], &input.data_source_values))
         .collect();
 
     // Mark pre-apply Read and plain state operation effects as completed
@@ -319,7 +328,7 @@ pub(super) async fn execute_effects_sequential(
     // DeferredCreate is state-only for progress/provider purposes, but it is a scheduler
     // dispatch point that materializes dynamic Create effects.
     for (idx, effect) in effects.iter().enumerate() {
-        if is_runtime_noop(effect, &input.deferred_data_source_reads) {
+        if is_runtime_noop(effect, &input.data_source_values) {
             completed_indices.insert(idx);
             dispatched.insert(idx);
         }
@@ -1264,8 +1273,7 @@ mod tests {
             compositions: &[],
             bindings: Default::default(),
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
-            deferred_data_source_reads: DeferredDataSourceReads::none(),
+            data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],
             factories: &[],
@@ -1382,8 +1390,7 @@ mod tests {
             compositions: &[],
             bindings: Default::default(),
             managed_current: HashMap::new(),
-            data_source_states: HashMap::new(),
-            deferred_data_source_reads: DeferredDataSourceReads::none(),
+            data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],
             factories: &[],
