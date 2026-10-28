@@ -1,6 +1,14 @@
 use super::*;
 
 #[test]
+#[should_panic(expected = "document source path must match the analyzed path")]
+fn analyze_rejects_a_mismatched_document_source_path() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let doc = create_document("provider mock {}\n");
+    let _ = test_engine().analyze(&doc, Some(&fixture.path().join("main.crn")));
+}
+
+#[test]
 fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only() {
     for (provider_name, raw) in [
         ("awscc", "awscc.Region.ap_northeast_1"),

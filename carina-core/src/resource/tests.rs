@@ -2404,6 +2404,7 @@ fn resource_module_source_typed_field() {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
             scope: None,
+            call_path: None,
         });
 
     // Module source info should be in the typed field
@@ -2413,6 +2414,7 @@ fn resource_module_source_typed_field() {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
             scope: None,
+            call_path: None,
         })
     );
 

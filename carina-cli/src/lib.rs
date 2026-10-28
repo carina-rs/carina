@@ -40,9 +40,9 @@ pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 pub(crate) fn test_composition_call_path() -> carina_core::resource::CompositionCallPath {
-    test_composition_call_path_in(std::path::Path::new(
-        "/carina-tests/composition-fixture.crn",
-    ))
+    test_composition_call_path_in(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
 }
 
 #[cfg(test)]

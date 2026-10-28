@@ -708,25 +708,31 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
 #[tokio::test]
 async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut saved = saved_module_composition(string_value("public"), "rejected");
+    let saved_source = tmp.path().join("saved.crn");
+    let current_source = tmp.path().join("current.crn");
+    std::fs::write(&saved_source, "saved fixture").unwrap();
+    std::fs::write(&current_source, "current fixture").unwrap();
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("public"))));
+    let mut saved = saved_module_composition(secret.clone(), "rejected");
     saved.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
         "_virtual",
         "saved.anonymous",
     ));
     saved.binding = None;
-    let saved = saved.into_saved(tmp.path());
+    saved.call_path = crate::test_composition_call_path_in(&saved_source);
+    let saved = saved
+        .into_saved(tmp.path())
+        .expect("save anonymous composition");
     let saved = carina_core::value::redact_secrets_in_saved_composition(&saved)
         .expect("redact saved composition");
 
-    let mut current = saved_module_composition(string_value("public"), "rejected");
+    let mut current = saved_module_composition(secret, "rejected");
     current.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
         "_virtual",
         "current.anonymous",
     ));
     current.binding = None;
-    current.call_path = crate::test_composition_call_path_in(Path::new(
-        "/carina-tests/other-composition-fixture.crn",
-    ));
+    current.call_path = crate::test_composition_call_path_in(&current_source);
     let parsed = carina_core::parser::InferredFile {
         compositions: vec![current],
         ..Default::default()
@@ -2891,7 +2897,11 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         plan,
         sorted_resources: vec![producer.clone(), consumer.clone()],
         unresolved_resources: vec![producer, consumer],
-        compositions: vec![composition.into_saved(tmp.path())],
+        compositions: vec![
+            composition
+                .into_saved(tmp.path())
+                .expect("save composition"),
+        ],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
@@ -2970,7 +2980,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: vec![
-            saved_module_composition(string_value("bad"), "bad").into_saved(tmp.path()),
+            saved_module_composition(string_value("bad"), "bad")
+                .into_saved(tmp.path())
+                .expect("save composition"),
         ],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),

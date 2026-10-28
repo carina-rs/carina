@@ -2056,6 +2056,7 @@ pub(crate) struct ReloadedPlanFile {
 #[derive(Debug)]
 pub(crate) enum ReloadedCompositionRehydrationError {
     MissingCandidate(Box<SavedCompositionOriginId>),
+    SourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     Secret(carina_core::value::SecretRehydrationSiteError),
 }
 
@@ -2127,17 +2128,6 @@ impl ReloadedPlanFile {
             .compositions
             .iter()
             .map(|composition| {
-                let candidate = evaluated
-                    .iter()
-                    .find(|candidate| {
-                        candidate.call_path().saved_origin_id(canonical_source_root)
-                            == composition.origin_id
-                    })
-                    .ok_or_else(|| {
-                        ReloadedCompositionRehydrationError::MissingCandidate(Box::new(
-                            composition.origin_id.clone(),
-                        ))
-                    })?;
                 let has_placeholder =
                     composition.signature.arguments.values().any(|argument| {
                         carina_core::value::contains_redacted_secret(argument.value())
@@ -2147,6 +2137,22 @@ impl ReloadedPlanFile {
                 if !has_placeholder {
                     return Ok(composition.clone());
                 }
+                let mut candidate = None;
+                for live in evaluated {
+                    let origin = live
+                        .call_path()
+                        .saved_origin_id(canonical_source_root)
+                        .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
+                    if origin == composition.origin_id {
+                        candidate = Some(live);
+                        break;
+                    }
+                }
+                let candidate = candidate.ok_or_else(|| {
+                    ReloadedCompositionRehydrationError::MissingCandidate(Box::new(
+                        composition.origin_id.clone(),
+                    ))
+                })?;
                 carina_core::value::rehydrate_saved_composition_secrets(composition, candidate)
                     .map_err(ReloadedCompositionRehydrationError::Secret)
             })
@@ -2603,6 +2609,7 @@ impl CurrentStateEntry {
 #[derive(Debug)]
 enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
+    CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     ProviderEvidence(ProviderEvidenceError),
 }
 
@@ -2618,10 +2625,17 @@ impl From<ProviderEvidenceError> for PlanSaveError {
     }
 }
 
+impl From<carina_core::resource::CompositionSourceIdentityError> for PlanSaveError {
+    fn from(error: carina_core::resource::CompositionSourceIdentityError) -> Self {
+        Self::CompositionSourceIdentity(error)
+    }
+}
+
 impl std::fmt::Display for PlanSaveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Serialization(error) => error.fmt(formatter),
+            Self::CompositionSourceIdentity(error) => error.fmt(formatter),
             Self::ProviderEvidence(error) => error.fmt(formatter),
         }
     }
@@ -2879,10 +2893,11 @@ fn build_plan_file<E>(
             .compositions
             .iter()
             .map(|composition| {
-                let saved = composition.clone().into_saved(&canonical_source_root);
+                let saved = composition.clone().into_saved(&canonical_source_root)?;
                 carina_core::value::redact_secrets_in_saved_composition(&saved)
+                    .map_err(PlanSaveError::from)
             })
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Result<Vec<_>, PlanSaveError>>()?,
         data_sources: ctx
             .data_sources
             .iter()
@@ -2958,6 +2973,9 @@ fn format_plan_save_error(e: &PlanSaveError, flag: &str) -> String {
              or rerun without {flag}."
         ),
         PlanSaveError::Serialization(error) => error.to_string(),
+        PlanSaveError::CompositionSourceIdentity(error) => {
+            format!("Cannot save plan: {error}")
+        }
         PlanSaveError::ProviderEvidence(error) => format!("Cannot save plan: {error}"),
     }
 }

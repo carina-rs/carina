@@ -366,6 +366,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                                             &call.module_name,
                                             instance_prefix,
                                             call.binding_name.as_deref(),
+                                            Some(call.id()),
                                         )
                                         .expect("concrete outcome has a diagnostic"),
                                 ),
@@ -396,6 +397,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                             &call.module_name,
                             instance_prefix,
                             call.binding_name.as_deref(),
+                            Some(call.id()),
                         )
                         .expect("concrete constraint failure has a resolver error"));
                 }
@@ -434,6 +436,24 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // that exact binding must gain the new outer prefix as well.
             .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
             .collect();
+        let module_source = self.module_paths.get(&call.module_name).cloned();
+        let module_directory = module_source.as_deref().map(|source| {
+            let source = std::path::Path::new(source);
+            let path = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                self.base_dir.join(source)
+            };
+            path.canonicalize().unwrap_or(path)
+        });
+        let expanded_call = CompositionCall {
+            id: call.id().clone(),
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: instance_prefix.to_string(),
+            module_source: module_source.clone(),
+            module_directory,
+        };
         let module_instance_scope = ModuleInstanceScope::for_call(
             &call.module_name,
             call.binding_name.as_deref(),
@@ -452,6 +472,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance_prefix,
                 &call.module_name,
                 &module_instance_scope,
+                &expanded_call,
                 &intra_module_bindings,
                 argument_substitutions,
             )
@@ -476,6 +497,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance_prefix,
                 &call.module_name,
                 &module_instance_scope,
+                &expanded_call,
                 &intra_module_bindings,
                 argument_substitutions,
             )
@@ -488,25 +510,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             }
             data_sources.push(expanded);
         }
-
-        let module_source = self.module_paths.get(&call.module_name).cloned();
-        let module_directory = module_source.as_deref().map(|source| {
-            let source = std::path::Path::new(source);
-            let path = if source.is_absolute() {
-                source.to_path_buf()
-            } else {
-                self.base_dir.join(source)
-            };
-            path.canonicalize().unwrap_or(path)
-        });
-        let expanded_call = CompositionCall {
-            id: call.id().clone(),
-            module_name: call.module_name.clone(),
-            binding: call.binding_name.clone(),
-            instance: instance_prefix.to_string(),
-            module_source: module_source.clone(),
-            module_directory,
-        };
 
         // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
@@ -661,6 +664,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     instance_prefix,
                     &call.module_name,
                     &module_instance_scope,
+                    &expanded_call,
                     &intra_module_bindings,
                     argument_substitutions,
                 )
@@ -1414,6 +1418,7 @@ fn prefix_module_resource(
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
+    module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
 ) -> Result<Resource, ArgumentSubstitutionError> {
@@ -1450,10 +1455,18 @@ fn prefix_module_resource(
         .and_then(ModuleSource::identity_scope)
         .map(|child| module_instance_scope.with_child(&child))
         .unwrap_or_else(|| module_instance_scope.clone());
+    let call_path = new_resource
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::module_call_path)
+        .cloned()
+        .map(|path| path.prepend(module_call.clone()))
+        .unwrap_or_else(|| CompositionCallPath::direct(module_call.clone()));
     new_resource.module_source = Some(ModuleSource::expanded_module(
         module_name,
         instance_prefix,
         scope,
+        call_path,
     ));
 
     // `IndexMap` preserves authored attribute order across expansion
@@ -1480,6 +1493,7 @@ fn prefix_module_data_source(
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
+    module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
 ) -> Result<DataSource, ArgumentSubstitutionError> {
@@ -1512,10 +1526,18 @@ fn prefix_module_data_source(
         .and_then(ModuleSource::identity_scope)
         .map(|child| module_instance_scope.with_child(&child))
         .unwrap_or_else(|| module_instance_scope.clone());
+    let call_path = new_data_source
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::module_call_path)
+        .cloned()
+        .map(|path| path.prepend(module_call.clone()))
+        .unwrap_or_else(|| CompositionCallPath::direct(module_call.clone()));
     new_data_source.module_source = Some(ModuleSource::expanded_module(
         module_name,
         instance_prefix,
         scope,
+        call_path,
     ));
 
     let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
@@ -1676,6 +1698,7 @@ fn settle_prefixed_composition_constraints(
                         &composition.module_name,
                         &composition.instance,
                         composition.binding.as_deref(),
+                        Some(&composition.call_path.immediate().id),
                     )
                     .expect("concrete nested constraint outcome has a diagnostic"));
             }
@@ -1760,6 +1783,7 @@ fn prefix_deferred_for_expression(
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
+    module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
 ) -> Result<DeferredForExpression, ArgumentSubstitutionError> {
@@ -1816,6 +1840,7 @@ fn prefix_deferred_for_expression(
             instance_prefix,
             module_name,
             module_instance_scope,
+            module_call,
             intra_module_bindings,
             arguments,
         )?,
@@ -2568,14 +2593,30 @@ pub fn reconcile_anonymous_module_instances(
                 name,
                 instance: _,
                 scope,
+                call_path,
             }) = &r.module_source
             {
+                let mut remapped_call_path = call_path.clone();
+                if let Some(path) = remapped_call_path.as_deref_mut() {
+                    for call in path.calls_mut() {
+                        if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap)
+                        {
+                            call.instance = rewritten;
+                        }
+                        if let Some(binding) = call.binding.as_deref()
+                            && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+                        {
+                            call.binding = Some(rewritten);
+                        }
+                    }
+                }
                 r.module_source = Some(crate::resource::ModuleSource::Module {
                     name: name.clone(),
                     instance: new_prefix.clone(),
                     scope: scope
                         .as_ref()
                         .map(|scope| scope.remap_prefix(&old_prefix, &new_prefix)),
+                    call_path: remapped_call_path,
                 });
             }
         }
@@ -2760,6 +2801,24 @@ fn rewrite_ref_prefixes(
 mod tests {
     use super::*;
 
+    fn test_expanded_call() -> CompositionCall {
+        let parsed = crate::parser::parse_file(
+            "let registry = use { source = './registry' }\nlet registry_publish = registry {}\n",
+            std::path::Path::new("data-source-call.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("parse module owner call");
+        let call = &parsed.module_calls[0];
+        CompositionCall {
+            id: call.id().clone(),
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: "registry_publish".to_string(),
+            module_source: Some("./registry".to_string()),
+            module_directory: None,
+        }
+    }
+
     #[test]
     fn prefix_module_data_source_prefixes_non_empty_identity_and_binding() {
         let mut data_source =
@@ -2787,6 +2846,7 @@ mod tests {
                 Some("registry_publish"),
                 "registry_publish",
             ),
+            &test_expanded_call(),
             &HashSet::from(["caller".to_string(), "target".to_string()]),
             substitutions,
         )
@@ -2834,6 +2894,7 @@ mod tests {
                 Some("registry_publish"),
                 "registry_publish",
             ),
+            &test_expanded_call(),
             &HashSet::from(["consumer".to_string(), "target".to_string()]),
             substitutions,
         )
@@ -2855,6 +2916,8 @@ mod tests {
             DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
         roles.dependency_bindings.insert("target".to_string());
 
+        let expanded_call = test_expanded_call();
+
         let intra_module_bindings = HashSet::from(["target".to_string(), "roles".to_string()]);
         let arguments = HashMap::new();
         let config = crate::parser::ProviderContext::default();
@@ -2874,6 +2937,7 @@ mod tests {
                 Some("registry_publish"),
                 "registry_publish",
             ),
+            &expanded_call,
             &intra_module_bindings,
             substitutions,
         )
@@ -2882,6 +2946,13 @@ mod tests {
         assert_eq!(
             roles.dependency_bindings,
             BTreeSet::from(["registry_publish.target".to_string()]),
+        );
+        assert_eq!(
+            roles
+                .module_source
+                .as_ref()
+                .and_then(ModuleSource::module_call_path),
+            Some(&CompositionCallPath::direct(expanded_call)),
         );
     }
 }

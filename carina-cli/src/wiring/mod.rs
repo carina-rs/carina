@@ -5248,11 +5248,15 @@ fn relevant_compositions_for_data_source_reads(
     let mut relevant_indices = HashSet::new();
 
     for data_source in queries {
-        let Some(ModuleSource::Module { name, instance, .. }) = &data_source.module_source else {
+        let Some(query_call_path) = data_source
+            .module_source
+            .as_ref()
+            .and_then(ModuleSource::module_call_path)
+        else {
             continue;
         };
         for (index, composition) in compositions.iter().enumerate() {
-            if composition.module_name == *name && composition.instance == *instance {
+            if composition.call_path().is_prefix_of(query_call_path) {
                 relevant_indices.insert(index);
                 pending.extend(get_composition_dependencies(composition));
             }

@@ -322,6 +322,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
             name: "policy_module".to_string(),
             instance: "bootstrap".to_string(),
             scope: None,
+            call_path: None,
         }),
         "module_source must be set so compute_anonymous_identifiers can prepend \
          the instance prefix when the Pending name is bound"
@@ -409,6 +410,7 @@ fn test_expand_module_call() {
             name: "test_module".to_string(),
             instance: "my_instance".to_string(),
             scope: None,
+            call_path: None,
         })
     );
     // Module info should NOT be in attributes
@@ -559,6 +561,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             name: "thing".to_string(),
             instance: current_prefix.clone(),
             scope: None,
+            call_path: None,
         }),
         default_tag_keys: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),

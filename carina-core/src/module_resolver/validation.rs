@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
 use crate::parser::{
-    ArgumentParameter, CompareOp, RequireBlock, ValidateExpr, display_string_literal,
+    ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
 use crate::resource::{
     AccessMissPolicy, ConcreteValue, DeferredValue, LiveComposition, ModuleConstraintId,
@@ -52,6 +52,10 @@ pub struct ModuleConstraintDiagnostic {
     /// Internal call identity used to correlate diagnostics with expansion.
     /// Display must use `call` so anonymous content hashes never leak.
     pub instance: String,
+    /// Parser-minted identity for live resolver diagnostics. Saved-plan
+    /// diagnostics omit this live-only field.
+    #[serde(skip)]
+    pub call_id: Option<ModuleCallId>,
     pub call: ModuleConstraintCall,
     pub kind: ModuleConstraintKind,
     pub arguments: Vec<String>,
@@ -219,8 +223,9 @@ impl EvaluatedModuleConstraint {
         module: &str,
         instance: &str,
         binding: Option<&str>,
+        call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleError> {
-        self.module_diagnostic(module, instance, binding)
+        self.module_diagnostic(module, instance, binding, call_id)
             .map(|diagnostic| ModuleError::Constraint(Box::new(diagnostic)))
     }
 
@@ -231,6 +236,7 @@ impl EvaluatedModuleConstraint {
         module: &str,
         instance: &str,
         binding: Option<&str>,
+        call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleConstraintDiagnostic> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
@@ -246,6 +252,7 @@ impl EvaluatedModuleConstraint {
         Some(ModuleConstraintDiagnostic {
             module: module.to_string(),
             instance: instance.to_string(),
+            call_id: call_id.cloned(),
             call: ModuleConstraintCall::from_binding(binding),
             kind: self.kind.clone(),
             arguments: self.arguments.clone(),
@@ -569,6 +576,7 @@ fn evaluate_pending_constraint_views<'a>(
                         diagnostic: ModuleConstraintDiagnostic {
                             module: composition.module_name().to_string(),
                             instance: composition.instance().to_string(),
+                            call_id: composition.call_id().cloned(),
                             call: ModuleConstraintCall::from_binding(composition.binding()),
                             kind: evaluated.kind().clone(),
                             arguments: arguments.clone(),
@@ -1365,15 +1373,27 @@ mod tests {
         let detail = format!("error evaluating constraint: {detail}");
         let actuals = evaluated.actuals().to_vec();
         assert_eq!(actuals, [("name".to_string(), "'abc'".to_string())]);
+        let parsed = crate::parser::parse_file(
+            "let mod = use { source = './mod' }\nmod {}\n",
+            std::path::Path::new("constraint-test.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("parse module call identity");
+        let call_id = parsed.module_calls[0].id();
         let resolver_error = evaluated
-            .module_error("mod", "c", Some("c"))
+            .module_error("mod", "c", Some("c"), Some(call_id))
             .expect("evaluation error must render");
+        let ModuleError::Constraint(diagnostic) = &resolver_error else {
+            panic!("constraint evaluation must produce a constraint error");
+        };
+        assert_eq!(diagnostic.call_id.as_ref(), Some(call_id));
         let apply_failure = ModuleConstraintFailure {
             composition_id: ResourceId::with_identity("_virtual", "c"),
             constraint_id: ModuleConstraintId::argument_validation("name", 0),
             diagnostic: ModuleConstraintDiagnostic {
                 module: "mod".to_string(),
                 instance: "c".to_string(),
+                call_id: None,
                 call: ModuleConstraintCall::Named("c".to_string()),
                 kind: ModuleConstraintKind::ArgumentValidation {
                     argument: "name".to_string(),
@@ -1387,6 +1407,7 @@ mod tests {
         let plan_error = PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
+            call_id: None,
             call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),

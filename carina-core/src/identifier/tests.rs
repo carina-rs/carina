@@ -1841,6 +1841,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         name: "github_oidc".to_string(),
         instance: "bootstrap".to_string(),
         scope: None,
+        call_path: None,
     });
 
     let mut resources = vec![r];
@@ -2375,6 +2376,7 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
         name: "mymod".to_string(),
         instance: "inst".to_string(),
         scope: None,
+        call_path: None,
     });
     resource.set_attr(
         "route_table_id".to_string(),

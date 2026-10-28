@@ -5890,6 +5890,10 @@ pub enum ModuleSource {
         /// Full nested instance path plus its authored diagnostic form.
         #[serde(skip)]
         scope: Option<ModuleInstanceScope>,
+        /// Parser-minted call path that owns this expanded node.
+        /// Validation/runtime-only; saved resource forms re-expand it.
+        #[serde(skip)]
+        call_path: Option<Box<composition::CompositionCallPath>>,
     },
 }
 
@@ -5938,6 +5942,7 @@ impl ModuleSource {
             name: name.into(),
             instance: instance.into(),
             scope: None,
+            call_path: None,
         }
     }
 
@@ -5945,11 +5950,20 @@ impl ModuleSource {
         name: impl Into<String>,
         instance: impl Into<String>,
         scope: ModuleInstanceScope,
+        call_path: composition::CompositionCallPath,
     ) -> Self {
         Self::Module {
             name: name.into(),
             instance: instance.into(),
             scope: Some(scope),
+            call_path: Some(Box::new(call_path)),
+        }
+    }
+
+    pub fn module_call_path(&self) -> Option<&composition::CompositionCallPath> {
+        match self {
+            Self::Module { call_path, .. } => call_path.as_deref(),
+            Self::Root => None,
         }
     }
 
@@ -7533,10 +7547,11 @@ pub mod persistent_id;
 
 pub(crate) use composition::CompositionRuntimeRef;
 pub use composition::{
-    CompositionCall, CompositionCallPath, LiveComposition, LiveCompositionArgument,
-    LiveCompositionAttribute, LiveCompositionSignature, ModuleConstraintId,
-    PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
-    SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
+    CompositionCall, CompositionCallPath, CompositionSourceIdentityError, LiveComposition,
+    LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature,
+    ModuleConstraintId, PendingModuleConstraint, SavedComposition, SavedCompositionArgument,
+    SavedCompositionAttribute, SavedCompositionOriginId, SavedCompositionSignature,
+    SavedModuleCallId,
 };
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};

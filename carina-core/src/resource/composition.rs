@@ -12,8 +12,8 @@
 //! Unlike [`Resource`](super::Resource), this struct
 //! does not carry `directives` (no `prevent_destroy` applies to a
 //! synthetic node) or `prefixes` (no auto-generated names on a
-//! non-provider resource). `module_source` is flattened to
-//! `module_name` + `instance` — those are always set for compositions.
+//! non-provider resource). `module_source` display metadata is flattened to
+//! `module_name` + `instance`; parser-minted identity lives in `call_path`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -494,11 +494,8 @@ pub struct LiveCompositionSignature {
 /// Value-only function boundary persisted in a saved plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedCompositionSignature {
-    #[serde(default)]
     pub arguments: IndexMap<String, SavedCompositionArgument>,
-    #[serde(default)]
     pub attributes: IndexMap<String, SavedCompositionAttribute>,
-    #[serde(default)]
     pub pending_constraints: Vec<PendingModuleConstraint>,
 }
 
@@ -571,6 +568,16 @@ impl CompositionCallPath {
         std::iter::once(&self.root).chain(self.descendants.iter())
     }
 
+    /// Whether this call ancestry governs the node owned by `other`.
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
+        let mut other_calls = other.calls();
+        self.calls().all(|call| {
+            other_calls
+                .next()
+                .is_some_and(|other_call| call.id == other_call.id)
+        })
+    }
+
     pub(crate) fn calls_mut(&mut self) -> impl Iterator<Item = &mut CompositionCall> {
         std::iter::once(&mut self.root).chain(self.descendants.iter_mut())
     }
@@ -586,7 +593,10 @@ impl CompositionCallPath {
         Self { root, descendants }
     }
 
-    pub fn saved_origin_id(&self, canonical_source_root: &Path) -> SavedCompositionOriginId {
+    pub fn saved_origin_id(
+        &self,
+        canonical_source_root: &Path,
+    ) -> Result<SavedCompositionOriginId, CompositionSourceIdentityError> {
         SavedCompositionOriginId::from_live(self, canonical_source_root)
     }
 }
@@ -595,7 +605,9 @@ impl CompositionCallPath {
 impl Default for CompositionCallPath {
     fn default() -> Self {
         Self::direct(CompositionCall {
-            id: crate::parser::ModuleCallId::test_dummy(),
+            id: crate::parser::ModuleCallId::test_dummy_in(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+            ),
             module_name: "test_module".to_string(),
             binding: Some("test_call".to_string()),
             instance: "test_call".to_string(),
@@ -612,30 +624,40 @@ enum SavedSourceFileId {
     External(PathBuf),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("failed to canonicalize composition source path `{path}`: {source}")]
+pub struct CompositionSourceIdentityError {
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
+impl CompositionSourceIdentityError {
+    fn canonicalize(path: &Path) -> Result<PathBuf, Self> {
+        path.canonicalize().map_err(|source| Self {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+}
+
 impl SavedSourceFileId {
-    fn from_live(path: &Path, canonical_source_root: &Path) -> Self {
-        let root = canonical_source_root
-            .canonicalize()
-            .unwrap_or_else(|error| {
-                let _canonicalize_error = error;
-                canonical_source_root.to_path_buf()
-            });
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        };
-        let source = joined.canonicalize().unwrap_or_else(|error| {
-            let _canonicalize_error = error;
-            joined
-        });
-        match source.strip_prefix(&root) {
+    fn from_live(
+        path: &Path,
+        canonical_source_root: &Path,
+    ) -> Result<Self, CompositionSourceIdentityError> {
+        let root = CompositionSourceIdentityError::canonicalize(canonical_source_root)?;
+        // The loader preserves the path as supplied by the process. Relative
+        // source paths therefore resolve against the process CWD, not against
+        // the already-resolved source root.
+        let source = CompositionSourceIdentityError::canonicalize(path)?;
+        Ok(match source.strip_prefix(&root) {
             Ok(relative) => Self::SourceRootRelative(relative.to_path_buf()),
             Err(error) => {
                 let _outside_source_root = error;
                 Self::External(source)
             }
-        }
+        })
     }
 
     fn display_path(&self) -> &Path {
@@ -683,18 +705,21 @@ pub struct SavedModuleCallId {
 }
 
 impl SavedModuleCallId {
-    fn from_live(id: &crate::parser::ModuleCallId, canonical_source_root: &Path) -> Self {
+    fn from_live(
+        id: &crate::parser::ModuleCallId,
+        canonical_source_root: &Path,
+    ) -> Result<Self, CompositionSourceIdentityError> {
         let expansion = match id.expansion() {
             crate::parser::CallExpansion::Direct => SavedCallExpansion::Direct,
             crate::parser::CallExpansion::Expanded(key) => {
                 SavedCallExpansion::Expanded(key.as_str().to_string())
             }
         };
-        Self {
-            source_file: SavedSourceFileId::from_live(id.source_file(), canonical_source_root),
+        Ok(Self {
+            source_file: SavedSourceFileId::from_live(id.source_file(), canonical_source_root)?,
             call_span: id.call_span().into(),
             expansion,
-        }
+        })
     }
 
     pub fn source_file(&self) -> &Path {
@@ -719,14 +744,17 @@ pub struct SavedCompositionOriginId {
 }
 
 impl SavedCompositionOriginId {
-    fn from_live(path: &CompositionCallPath, canonical_source_root: &Path) -> Self {
+    fn from_live(
+        path: &CompositionCallPath,
+        canonical_source_root: &Path,
+    ) -> Result<Self, CompositionSourceIdentityError> {
         let CompositionCallPath { root, descendants } = path;
-        let root = SavedModuleCallId::from_live(&root.id, canonical_source_root);
+        let root = SavedModuleCallId::from_live(&root.id, canonical_source_root)?;
         let descendants = descendants
             .iter()
             .map(|call| SavedModuleCallId::from_live(&call.id, canonical_source_root))
-            .collect();
-        Self { root, descendants }
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { root, descendants })
     }
 
     pub fn root(&self) -> &SavedModuleCallId {
@@ -764,8 +792,8 @@ impl SavedCompositionOriginId {
 /// }
 /// ```
 ///
-/// `module_source` is dropped — module metadata is flattened into
-/// `module_name` + `instance`:
+/// `module_source` is dropped — display metadata is flattened into
+/// `module_name` + `instance`, while identity lives in `call_path`:
 ///
 /// ```compile_fail
 /// use carina_core::resource::LiveComposition;
@@ -850,6 +878,7 @@ impl PartialEq for LiveComposition {
             && self.dependency_bindings == other.dependency_bindings
             && self.module_name == other.module_name
             && self.instance == other.instance
+            && self.call_path == other.call_path
             && self.quoted_string_attrs == other.quoted_string_attrs
     }
 }
@@ -869,7 +898,10 @@ impl LiveComposition {
         &self.call_path
     }
 
-    pub fn into_saved(self, canonical_source_root: &Path) -> SavedComposition {
+    pub fn into_saved(
+        self,
+        canonical_source_root: &Path,
+    ) -> Result<SavedComposition, CompositionSourceIdentityError> {
         let Self {
             id,
             signature,
@@ -880,7 +912,7 @@ impl LiveComposition {
             call_path,
             quoted_string_attrs,
         } = self;
-        let origin_id = call_path.saved_origin_id(canonical_source_root);
+        let origin_id = call_path.saved_origin_id(canonical_source_root)?;
         let LiveCompositionSignature {
             arguments,
             attributes,
@@ -924,7 +956,7 @@ impl LiveComposition {
             })
             .collect();
         drop(quoted_string_attrs);
-        SavedComposition {
+        Ok(SavedComposition {
             id,
             signature: SavedCompositionSignature {
                 arguments,
@@ -936,7 +968,7 @@ impl LiveComposition {
             module_name,
             instance,
             origin_id,
-        }
+        })
     }
 }
 
@@ -946,13 +978,20 @@ pub struct SavedComposition {
     pub id: ResolvedResourceId,
     #[serde(flatten)]
     pub signature: SavedCompositionSignature,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub binding: Option<String>,
-    #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
     pub module_name: String,
     pub instance: String,
     pub origin_id: SavedCompositionOriginId,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl SavedComposition {
@@ -1002,6 +1041,13 @@ impl<'a> CompositionRuntimeRef<'a> {
         match self {
             Self::Live(composition) => &composition.instance,
             Self::Saved(composition) => &composition.instance,
+        }
+    }
+
+    pub(crate) fn call_id(self) -> Option<&'a crate::parser::ModuleCallId> {
+        match self {
+            Self::Live(composition) => Some(&composition.call_path.immediate().id),
+            Self::Saved(_) => None,
         }
     }
 
@@ -1082,10 +1128,10 @@ mod tests {
     use crate::resource::{ConcreteValue, ResourceId};
 
     #[test]
-    fn equality_ignores_call_path_display_but_compares_composition_fields() {
-        let call_path = |binding: &str| {
+    fn equality_compares_call_path_identity_but_ignores_call_display() {
+        let call_path = |source_file: &str, binding: &str| {
             CompositionCallPath::direct(CompositionCall {
-                id: crate::parser::ModuleCallId::test_dummy(),
+                id: crate::parser::ModuleCallId::test_dummy_in(source_file),
                 module_name: "module".to_string(),
                 binding: Some(binding.to_string()),
                 instance: binding.to_string(),
@@ -1104,17 +1150,20 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "module".to_string(),
             instance: "call".to_string(),
-            call_path: call_path("first"),
+            call_path: call_path("first.crn", "first"),
             quoted_string_attrs: HashSet::new(),
         };
         let mut right = left.clone();
-        right.call_path = call_path("second");
+        right.call_path = call_path("second.crn", "second");
 
-        assert_eq!(left, right);
+        assert_ne!(left, right);
         assert_eq!(
             left.call_path().immediate().binding.as_deref(),
             Some("first")
         );
+
+        right.call_path = call_path("first.crn", "different display");
+        assert_eq!(left, right);
 
         right.binding = Some("different".to_string());
         assert_ne!(left, right);
@@ -1256,6 +1305,7 @@ mod tests {
 
     #[test]
     fn pending_constraints_survive_serde_round_trip_and_secret_redaction() {
+        let source_root = tempfile::tempdir().expect("source root");
         let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("password", 0),
             expression: ValidateExpr::Compare {
@@ -1292,7 +1342,9 @@ mod tests {
             quoted_string_attrs: HashSet::new(),
         };
 
-        let saved = composition.into_saved(Path::new("/tmp/project"));
+        let saved = composition
+            .into_saved(source_root.path())
+            .expect("save composition identity");
         let redacted = crate::value::redact_secrets_in_saved_composition(&saved)
             .expect("composition redaction must succeed");
         let json = serde_json::to_string(&redacted).expect("serialize redacted composition");
@@ -1313,13 +1365,41 @@ mod tests {
         let error = serde_json::from_value::<SavedComposition>(missing_origin)
             .expect_err("saved composition origin must be mandatory");
         assert!(error.to_string().contains("origin_id"), "{error}");
+
+        let complete = serde_json::to_value(&redacted).expect("serialize composition");
+        for required in [
+            "binding",
+            "dependency_bindings",
+            "arguments",
+            "attributes",
+            "pending_constraints",
+        ] {
+            let mut malformed = complete.clone();
+            malformed
+                .as_object_mut()
+                .expect("composition object")
+                .remove(required);
+            let error = match serde_json::from_value::<SavedComposition>(malformed) {
+                Ok(_) => panic!("missing {required} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(required), "{required}: {error}");
+        }
     }
 
     #[test]
     fn saved_origin_uses_explicit_external_source_representation() {
+        let source_root = tempfile::tempdir().expect("source root");
+        let external_root = tempfile::tempdir().expect("external root");
+        let source_file = external_root.path().join("module.crn");
+        std::fs::write(
+            &source_file,
+            "let module = use { source = './module' }\nmodule {}\n",
+        )
+        .expect("write external source");
         let parsed = crate::parser::parse_file(
             "let module = use { source = './module' }\nmodule {}\n",
-            Path::new("/outside/module.crn"),
+            &source_file,
             &crate::parser::ProviderContext::default(),
         )
         .expect("parse external module call");
@@ -1332,10 +1412,44 @@ mod tests {
             module_source: Some("./module".to_string()),
             module_directory: None,
         })
-        .saved_origin_id(Path::new("/project"));
+        .saved_origin_id(source_root.path())
+        .expect("save external origin");
 
         let json = serde_json::to_value(origin).expect("serialize external origin");
         assert_eq!(json["root"]["source_file"]["location"], "external");
-        assert_eq!(json["root"]["source_file"]["path"], "/outside/module.crn");
+        assert_eq!(
+            json["root"]["source_file"]["path"],
+            source_file
+                .canonicalize()
+                .expect("canonical external source")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn saved_origin_rejects_a_source_path_that_cannot_be_canonicalized() {
+        let source_root = tempfile::tempdir().expect("source root");
+        let missing = source_root.path().join("missing.crn");
+        let parsed = crate::parser::parse_file(
+            "let module = use { source = './module' }\nmodule {}\n",
+            &missing,
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("parse call with a missing source identity");
+        let call = &parsed.module_calls[0];
+
+        let error = CompositionCallPath::direct(CompositionCall {
+            id: call.id().clone(),
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: "module".to_string(),
+            module_source: Some("./module".to_string()),
+            module_directory: None,
+        })
+        .saved_origin_id(source_root.path())
+        .expect_err("a missing source path must not mint a fallback identity");
+
+        assert!(error.to_string().contains("missing.crn"), "{error}");
     }
 }

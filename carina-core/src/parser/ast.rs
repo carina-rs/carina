@@ -1234,11 +1234,6 @@ impl ModuleCallId {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_dummy() -> Self {
-        Self::direct(PathBuf::from("test.crn"), SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
     pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
         Self::direct(source_file.into(), SourceSpan::dummy())
     }

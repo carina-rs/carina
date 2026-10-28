@@ -2944,6 +2944,9 @@ fn rehydrate_desired_plan_file(
             ReloadedCompositionRehydrationError::Secret(error) => {
                 saved_plan_secret_rehydration_error(error, apply_target)
             }
+            ReloadedCompositionRehydrationError::SourceIdentity(error) => {
+                AppError::Config(error.to_string())
+            }
         })?;
 
     rehydrate_saved_resource_like(

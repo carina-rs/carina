@@ -151,10 +151,7 @@ fn value_depends_on_module_output(
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
     Standalone(&'a ParsedFile),
-    Directory {
-        merged: &'a ParsedFile,
-        file: &'a std::path::Path,
-    },
+    Directory { merged: &'a ParsedFile },
     DirectoryUnavailable,
 }
 
@@ -162,15 +159,14 @@ impl<'a> SemanticView<'a> {
     pub(super) fn for_analysis(
         authored: &'a ParsedFile,
         merged: Option<&'a ParsedFile>,
-        file: Option<&'a std::path::Path>,
         directory_backed: bool,
     ) -> Self {
         if !directory_backed {
             return Self::Standalone(authored);
         }
-        match (merged, file) {
-            (Some(merged), Some(file)) => Self::Directory { merged, file },
-            _ => Self::DirectoryUnavailable,
+        match merged {
+            Some(merged) => Self::Directory { merged },
+            None => Self::DirectoryUnavailable,
         }
     }
 
@@ -180,7 +176,7 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) => Some(authored),
-            Self::Directory { merged, file } => authored.lookup_in(merged, file),
+            Self::Directory { merged } => authored.lookup_in(merged),
             Self::DirectoryUnavailable => None,
         }
     }
@@ -196,7 +192,7 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) | Self::DirectoryUnavailable => Some(authored),
-            Self::Directory { merged, file } => authored.lookup_in(merged, file),
+            Self::Directory { merged } => authored.lookup_in(merged),
         }
     }
 
@@ -215,8 +211,8 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) => authored.value_at(slot),
-            Self::Directory { merged, file } => authored
-                .lookup_in(merged, file)
+            Self::Directory { merged } => authored
+                .lookup_in(merged)
                 .and_then(|semantic| semantic.value_at(slot)),
             Self::DirectoryUnavailable => authored
                 .value_at(slot)
@@ -228,7 +224,7 @@ impl<'a> SemanticView<'a> {
     fn parsed(&self) -> Option<&ParsedFile> {
         match self {
             Self::Standalone(parsed) => Some(parsed),
-            Self::Directory { merged, .. } => Some(merged),
+            Self::Directory { merged } => Some(merged),
             Self::DirectoryUnavailable => None,
         }
     }
@@ -294,26 +290,13 @@ impl<'a> ContextFreeValue<'a> {
 }
 
 trait SemanticLookup: Sized {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self>;
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self>;
 
     fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value>;
 }
 
 impl SemanticLookup for ModuleCall {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
-        debug_assert_eq!(
-            self.source_file(),
-            current_file,
-            "authored module call must belong to the analyzed document"
-        );
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
         merged
             .module_calls
             .iter()
@@ -330,14 +313,11 @@ impl SemanticLookup for ModuleCall {
 }
 
 impl SemanticLookup for AttributeParameter {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
         let authored_span = self.source_span();
+        let authored_file = self.source_file();
         merged.attribute_params.iter().find(|candidate| {
-            candidate.source_file() == current_file && candidate.source_span() == authored_span
+            candidate.source_file() == authored_file && candidate.source_span() == authored_span
         })
     }
 
@@ -349,14 +329,11 @@ impl SemanticLookup for AttributeParameter {
 }
 
 impl SemanticLookup for ParsedExportParam {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
         let authored_span = self.source_span();
+        let authored_file = self.source_file();
         merged.export_params.iter().find(|candidate| {
-            candidate.source_file() == current_file && candidate.source_span() == authored_span
+            candidate.source_file() == authored_file && candidate.source_span() == authored_span
         })
     }
 
@@ -1271,9 +1248,9 @@ impl DiagnosticEngine {
         }
 
         let relative_message = error.display_relative_to(base_path);
-        let (constraint_instance, direct_error_location, severity, message) = match error {
+        let (constraint_call_id, direct_error_location, severity, message) = match error {
             carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
-                Some(diagnostic.instance.as_str()),
+                diagnostic.call_id.as_ref(),
                 None,
                 DiagnosticSeverity::ERROR,
                 relative_message,
@@ -1348,8 +1325,7 @@ impl DiagnosticEngine {
                 carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
             }
         })?;
-        let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
-        if constraint_instance.is_some_and(|instance| instance == root_instance) {
+        if constraint_call_id.is_some_and(|constraint_call_id| constraint_call_id == call.id()) {
             return None;
         }
 

@@ -18,6 +18,73 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[test]
+fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
+    let tmp = tempfile::tempdir().expect("temporary project");
+    let module_dir = tmp.path().join("modules/query");
+    let root_dir = tmp.path().join("root");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::create_dir_all(&root_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        r#"
+attributes {
+  marker = "fixed"
+}
+
+let matches = read mock.test.Matches {
+  pattern = "fixed"
+}
+"#,
+    )
+    .unwrap();
+    let root_body = r#"
+let query = use {
+  source = "$MODULE"
+}
+
+query {}
+query {}
+"#
+    .replace("$MODULE", &module_dir.display().to_string());
+    let root_file = root_dir.join("main.crn");
+    std::fs::write(&root_file, &root_body).unwrap();
+
+    let config = carina_core::parser::ProviderContext::default();
+    let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
+        .expect("root fixture must parse");
+    carina_core::module_resolver::resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &config,
+        &SchemaRegistry::new(),
+    )
+    .expect("anonymous calls must expand");
+
+    assert_eq!(
+        parsed.compositions.len(),
+        2,
+        "fixture must produce two calls"
+    );
+    assert_eq!(
+        parsed.data_sources.len(),
+        2,
+        "each anonymous call must produce its own query"
+    );
+    let relevant = relevant_compositions_for_data_source_reads(
+        &[],
+        &parsed.compositions,
+        std::slice::from_ref(&parsed.data_sources[0]),
+        &parsed.data_sources,
+    );
+
+    assert_eq!(
+        relevant,
+        vec![parsed.compositions[0].clone()],
+        "a query must be gated only by the parser-minted call path that owns it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let tmp = tempfile::tempdir().unwrap();

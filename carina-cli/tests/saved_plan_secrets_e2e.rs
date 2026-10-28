@@ -1529,6 +1529,62 @@ let alpha = tokens {{
 }
 
 #[test]
+fn unrelated_secret_does_not_join_a_moved_secret_free_composition() {
+    const SECRET: &str = "UNRELATED_RESOURCE_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let unrelated = mock.test.resource {{
+  name    = "unrelated-secret"
+  comment = secret("{SECRET}")
+}}
+
+let plain = use {{ source = "./plain" }}
+let instance = plain {{
+  value = "not-secret"
+}}
+"#,
+    ));
+    scenario.write_module(
+        "plain",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "plain-module"
+  comment = value
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[SECRET]);
+
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let unrelated = mock.test.resource {{
+  name    = "unrelated-secret"
+  comment = secret("{SECRET}")
+}}
+
+let plain = use {{ source = "./plain" }}
+// Moving this secret-free call must not require a saved-origin join.
+let instance = plain {{
+  value = "not-secret"
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert_success("saved-plan apply after moving secret-free call", &apply);
+    assert_output_has_no_plaintext("saved-plan moved secret-free call", &apply, &[SECRET]);
+}
+
+#[test]
 fn saved_plan_module_repeated_block_secret_is_canonical_masked_and_converges() {
     const ENV: &[(&str, &str)] = &[("MODULE_RULE_SECRET", "module-rule-plain-3973")];
     const PLAINTEXT: &str = "module-rule-plain-3973";

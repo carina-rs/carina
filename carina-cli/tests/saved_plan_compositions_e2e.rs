@@ -168,6 +168,84 @@ fn read_saved_plan(path: &Path) -> (Value, PlanFile) {
     (json, plan)
 }
 
+fn assert_relative_project_path_saved_plan_applies(project_arg: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("infra/foo");
+    let module = project.join("module");
+    fs::create_dir_all(&module).expect("create nested project");
+    fs::write(
+        project.join("main.crn"),
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./module" }
+let instance = component {
+  value = secret("RELATIVE_PROJECT_SECRET_4041")
+}
+"#,
+    )
+    .expect("write root configuration");
+    fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "relative-project"
+  comment = value
+}
+"#,
+    )
+    .expect("write module configuration");
+
+    let mock_state = temp.path().join("mock-provider-state.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(temp.path())
+            .env("NO_COLOR", "1")
+            .env("CARINA_MOCK_STATE_FILE", &mock_state)
+            .env_remove("CLICOLOR_FORCE")
+            .args(args)
+            .output()
+            .expect("run carina from project parent")
+    };
+
+    assert_success("carina init relative project", &run(&["init", project_arg]));
+    assert_success(
+        "carina plan relative project",
+        &run(&["plan", "--out", "plan.json", project_arg]),
+    );
+
+    let (_, saved_plan) = read_saved_plan(&temp.path().join("plan.json"));
+    let origin = saved_plan
+        .compositions
+        .first()
+        .expect("module call must produce a saved composition")
+        .origin_id
+        .root();
+    assert_eq!(
+        origin.source_file(),
+        Path::new("main.crn"),
+        "a relative project argument must not be duplicated inside its saved origin",
+    );
+
+    assert_success(
+        "carina apply relative-project saved plan",
+        &run(&["apply", "--auto-approve", "plan.json"]),
+    );
+}
+
+#[test]
+fn saved_plan_from_parent_non_dot_relative_project_path_applies() {
+    assert_relative_project_path_saved_plan_applies("infra/foo");
+}
+
+#[test]
+fn saved_plan_from_parent_dot_relative_project_path_applies() {
+    assert_relative_project_path_saved_plan_applies("./infra/foo");
+}
+
 #[test]
 fn saved_plan_round_trips_and_applies_every_composition_shape() {
     let scenario = Scenario::new();

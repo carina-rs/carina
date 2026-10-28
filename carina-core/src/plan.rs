@@ -1393,6 +1393,7 @@ mod tests {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
                 scope: None,
+                call_path: None,
             });
         plan.add(Effect::Create(resolved(module_resource)));
 
@@ -1405,6 +1406,7 @@ mod tests {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
                 scope: None,
+                call_path: None,
             }
         );
     }
@@ -1423,6 +1425,7 @@ mod tests {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
                 scope: None,
+                call_path: None,
             });
         plan.add(Effect::Create(resolved(module_resource)));
 
