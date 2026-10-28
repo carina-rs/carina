@@ -150,7 +150,7 @@ fn identifier(id: &str) -> Result<AppliedIdentifier, ProviderError> {
 }
 ```
 
-`ProviderError` carries a `kind` and a message, and optional cloud-API details: `operation`, `status`, `code` and `request_id`. Fill the details when they come from an API response; Carina shows them on separate lines. The kinds are `InvalidInput`, `ApiError`, `NotFound`, `Timeout` and `Internal`.
+`ProviderError` carries a `kind` and a message, and optional details: `cause` (the underlying error, flattened to text), and from a cloud API, `operation`, `status`, `code` and `request_id`. Fill the details when they come from an API response; Carina shows them on separate lines. The kinds are `InvalidInput`, `ApiError`, `NotFound`, `Timeout` and `Internal`.
 
 ## read
 
@@ -189,7 +189,7 @@ fn read(
 
 `read_found` is a separate method because `poll_create` and `resume_create` read the widget back the same way. Return `ReadOutcome::NotFound` when the resource is gone. Carina treats it as drift and plans to create the resource again. It treats a `NotFound` error from `read` the same way, but returning the outcome says what you mean.
 
-Return every attribute the API reports. Write-only values never come back from an API, and Carina does not expect them in `read`: it keeps the value it last sent.
+Return every attribute the API reports. Write-only values never come back from an API. Mark them `write_only` in the schema, and Carina does not expect them in `read`: it keeps the value it last sent. An attribute the API never returns that is not marked shows up as a change in every plan.
 
 ## create
 
@@ -459,7 +459,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Secrets
 
-Attribute values reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and tokens are written to state.
+Attribute values reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and create tokens are written to state.
 
 ## Data sources
 
@@ -467,7 +467,7 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 ## Other trait methods
 
-`required_permissions` feeds Carina's IAM preflight check, which reports missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
+`required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
 
 ## Next steps
 
