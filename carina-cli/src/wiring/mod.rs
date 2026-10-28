@@ -110,6 +110,11 @@ impl TrustedLocalGrantInputs {
     }
 }
 
+/// Error returned when process-local grant inputs were already installed.
+#[derive(Debug, thiserror::Error)]
+#[error("trusted local provider grant inputs were already installed")]
+pub struct TrustedLocalGrantInputsAlreadySetError;
+
 /// Install the raw process-local grant inputs captured by the CLI entry point.
 ///
 /// The grants live only for this process and are never written to project
@@ -117,10 +122,10 @@ impl TrustedLocalGrantInputs {
 pub fn set_trusted_local_grant_inputs(
     cli_values: Vec<String>,
     env_value: Option<std::ffi::OsString>,
-) -> Result<(), ()> {
+) -> Result<(), TrustedLocalGrantInputsAlreadySetError> {
     TRUSTED_LOCAL_GRANT_INPUTS
         .set(TrustedLocalGrantInputs::new(cli_values, env_value))
-        .map_err(|_| ())
+        .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
 }
 
 fn trusted_local_grants() -> Result<
@@ -360,9 +365,7 @@ pub fn build_factories_from_providers(
 ) -> Result<ProviderFactoryLoad, AppError> {
     carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
-    Ok(build_factories_from_providers_impl(
-        providers, base_dir, true,
-    )?)
+    build_factories_from_providers_impl(providers, base_dir, true)
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -400,7 +403,7 @@ fn build_factories_from_providers_impl(
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
-) -> Result<(Vec<Box<dyn ProviderFactory>>, HashMap<String, String>), AppError> {
+) -> Result<ProviderFactoryLoad, AppError> {
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     build_factories_from_providers_impl_using(
@@ -418,7 +421,7 @@ fn build_factories_from_providers_impl_using<L, Fut>(
     report_errors: bool,
     grant_inputs: &TrustedLocalGrantInputs,
     mut loader: L,
-) -> Result<(Vec<Box<dyn ProviderFactory>>, HashMap<String, String>), AppError>
+) -> Result<ProviderFactoryLoad, AppError>
 where
     L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
     Fut: std::future::Future<
@@ -448,8 +451,7 @@ where
 
         let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(installed.load_with(grants, |verified| loader(verified)))
+            tokio::runtime::Handle::current().block_on(installed.load_with(grants, &mut loader))
         });
 
         match factory_result {

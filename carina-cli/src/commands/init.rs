@@ -347,9 +347,17 @@ mod tests {
         assert_eq!(class, ProviderTrustClass::Aws);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
+    #[test]
+    fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
         let _env_guard = crate::test_env_guard();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(init_with_up_to_date_github_lock_case());
+    }
+
+    async fn init_with_up_to_date_github_lock_case() {
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -452,9 +460,17 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
+    #[test]
+    fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
         let _env_guard = crate::test_env_guard();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(init_with_up_to_date_registry_lock_case());
+    }
+
+    async fn init_with_up_to_date_registry_lock_case() {
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let first_trust = tempfile::tempdir().unwrap();

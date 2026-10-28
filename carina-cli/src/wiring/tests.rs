@@ -551,9 +551,17 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn unverified_official_factory_load_is_fatal_before_loader() {
+#[test]
+fn unverified_official_factory_load_is_fatal_before_loader() {
     let _env_guard = crate::test_env_guard();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(unverified_official_factory_load_case());
+}
+
+async fn unverified_official_factory_load_case() {
     let project = tempfile::tempdir().unwrap();
     let trust = tempfile::tempdir().unwrap();
     let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
@@ -600,7 +608,7 @@ async fn unverified_official_factory_load_is_fatal_before_loader() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
     let result = build_factories_from_providers_impl_using(
-        &[config.clone()],
+        std::slice::from_ref(&config),
         project.path(),
         false,
         &inputs,

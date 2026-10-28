@@ -642,14 +642,22 @@ mod tests {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
         let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = test_source();
         let locked_bytes = b"locked revision provider";
         let cached_bytes = b"tampered global revision provider";
         let expected_file = project.path().join("expected.wasm");
         std::fs::write(&expected_file, locked_bytes).unwrap();
         let expected_sha256 = sha256_file(&expected_file).unwrap();
+        crate::verified_artifact::record_test_github_origin_download(
+            &source.source_key(),
+            &expected_sha256,
+            None,
+        )
+        .unwrap();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
@@ -704,14 +712,22 @@ mod tests {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
         let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = test_source();
         let cached_bytes = b"lock-matching global revision provider";
         let global_wasm = global_cache_path_revision(&source, TEST_SHA).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         let sha256 = sha256_file(global_wasm.as_path()).unwrap();
+        crate::verified_artifact::record_test_github_origin_download(
+            &source.source_key(),
+            &sha256,
+            None,
+        )
+        .unwrap();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
@@ -754,7 +770,7 @@ mod tests {
     }
 
     const TEST_SOURCE: &str = "github.com/carina-rs/carina-provider-aws";
-    const TEST_SHA: &str = "abc123def456";
+    const TEST_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn test_source() -> GithubSource {
         github_source("carina-rs", "carina-provider-aws")
