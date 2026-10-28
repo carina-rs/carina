@@ -17,6 +17,7 @@ pub(crate) struct GithubRequest {
     url: String,
     accept: &'static str,
     authorization: Option<String>,
+    response_body_limit: Option<u64>,
 }
 
 impl GithubRequest {
@@ -105,23 +106,46 @@ impl GithubHttp for UreqGithubHttp {
                     .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
             })
             .collect();
-        let mut body = Vec::new();
-        response
-            .into_body()
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|error| {
-                format!(
-                    "Failed to read GitHub response body from {}: {error}",
-                    request.url()
-                )
-            })?;
+        let body = read_response_body(
+            response.into_body().into_reader(),
+            request.url(),
+            request.response_body_limit,
+        )?;
         Ok(GithubResponse {
             status,
             headers,
             body,
         })
     }
+}
+
+fn read_response_body(
+    mut reader: impl Read,
+    url: &str,
+    response_body_limit: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    match response_body_limit {
+        Some(limit) => reader.take(limit.saturating_add(1)).read_to_end(&mut body),
+        None => reader.read_to_end(&mut body),
+    }
+    .map_err(|error| format!("Failed to read GitHub response body from {url}: {error}"))?;
+    if let Some(limit) = response_body_limit
+        && body.len() as u64 > limit
+    {
+        return Err(response_body_limit_error(url, limit));
+    }
+    Ok(body)
+}
+
+fn response_body_limit_error(url: &str, limit: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let limit = if limit >= MIB && limit.is_multiple_of(MIB) {
+        format!("{} MiB", limit / MIB)
+    } else {
+        format!("{limit} byte{}", if limit == 1 { "" } else { "s" })
+    };
+    format!("GitHub response body from {url} exceeds the {limit} limit")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -146,6 +170,7 @@ pub(crate) struct GithubArtifactResponse {
     pub(crate) id: ArtifactId,
     pub(crate) name: String,
     pub(crate) expired: bool,
+    pub(crate) size_in_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +179,8 @@ struct GithubArtifactWireResponse {
     name: String,
     #[serde(default)]
     expired: bool,
+    #[serde(default)]
+    size_in_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -241,10 +268,7 @@ impl std::fmt::Display for GithubApiError {
                 )
             }
             Self::PaginationCycle { endpoint } => {
-                write!(
-                    formatter,
-                    "GitHub release pagination cycle revisited {endpoint}"
-                )
+                write!(formatter, "GitHub pagination cycle revisited {endpoint}")
             }
         }
     }
@@ -303,25 +327,12 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         &self,
         repo: &RepoSlug,
     ) -> Result<Vec<GithubReleaseResponse>, GithubApiError> {
-        let mut next = Some(repo.releases_url()?);
-        let mut releases = Vec::new();
-        let mut visited = BTreeSet::new();
-        while let Some(url) = next {
-            if !visited.insert(url.as_str().to_string()) {
-                return Err(GithubApiError::PaginationCycle {
-                    endpoint: endpoint_label(&url),
-                });
-            }
-            let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Optional)?;
-            let page: Vec<GithubReleaseResponse> = parse_json(&response.body, &url)?;
-            releases.extend(page);
-            next = response
-                .header("link")
-                .and_then(next_link)
-                .map(|next_url| repo.validate_url(next_url))
-                .transpose()?;
-        }
-        Ok(releases)
+        self.paginate(
+            repo,
+            repo.releases_url()?,
+            GithubAuthentication::Optional,
+            parse_json,
+        )
     }
 
     pub(crate) fn latest_release(
@@ -359,10 +370,15 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         repo: &RepoSlug,
         commit_sha: &CommitSha,
     ) -> Result<Vec<GithubWorkflowRunResponse>, GithubApiError> {
-        let url = repo.workflow_runs_url(commit_sha)?;
-        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
-        let runs: GithubWorkflowRunsResponse = parse_json(&response.body, &url)?;
-        Ok(runs.workflow_runs)
+        self.paginate(
+            repo,
+            repo.workflow_runs_url(commit_sha)?,
+            GithubAuthentication::Required,
+            |body, url| {
+                let page: GithubWorkflowRunsResponse = parse_json(body, url)?;
+                Ok(page.workflow_runs)
+            },
+        )
     }
 
     pub(crate) fn run_artifacts(
@@ -380,6 +396,7 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
                 id: ArtifactId::from_api(artifact.id),
                 name: artifact.name,
                 expired: artifact.expired,
+                size_in_bytes: artifact.size_in_bytes,
             })
             .collect())
     }
@@ -388,10 +405,43 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         &self,
         repo: &RepoSlug,
         artifact_id: ArtifactId,
+        response_body_limit: u64,
     ) -> Result<Vec<u8>, GithubApiError> {
         let url = repo.artifact_zip_url(artifact_id)?;
-        self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)
-            .map(|response| response.body)
+        self.get_with_body_limit(
+            &url,
+            GITHUB_JSON_ACCEPT,
+            GithubAuthentication::Required,
+            Some(response_body_limit),
+        )
+        .map(|response| response.body)
+    }
+
+    fn paginate<T>(
+        &self,
+        repo: &RepoSlug,
+        first_url: url::Url,
+        authentication: GithubAuthentication,
+        mut parse_page: impl FnMut(&[u8], &url::Url) -> Result<Vec<T>, GithubApiError>,
+    ) -> Result<Vec<T>, GithubApiError> {
+        let mut next = Some(first_url);
+        let mut items = Vec::new();
+        let mut visited = BTreeSet::new();
+        while let Some(url) = next {
+            if !visited.insert(url.as_str().to_string()) {
+                return Err(GithubApiError::PaginationCycle {
+                    endpoint: endpoint_label(&url),
+                });
+            }
+            let response = self.get(&url, GITHUB_JSON_ACCEPT, authentication)?;
+            items.extend(parse_page(&response.body, &url)?);
+            next = response
+                .header("link")
+                .and_then(next_link)
+                .map(|next_url| repo.validate_url(next_url))
+                .transpose()?;
+        }
+        Ok(items)
     }
 
     fn get(
@@ -399,6 +449,16 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         url: &url::Url,
         accept: &'static str,
         authentication: GithubAuthentication,
+    ) -> Result<GithubResponse, GithubApiError> {
+        self.get_with_body_limit(url, accept, authentication, None)
+    }
+
+    fn get_with_body_limit(
+        &self,
+        url: &url::Url,
+        accept: &'static str,
+        authentication: GithubAuthentication,
+        response_body_limit: Option<u64>,
     ) -> Result<GithubResponse, GithubApiError> {
         let authorization = self.authorization(authentication)?;
         let authenticated = authorization.is_some();
@@ -408,6 +468,7 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
                 url: url.to_string(),
                 accept,
                 authorization,
+                response_body_limit,
             })
             .map_err(GithubApiError::Http)?;
         let mut anonymous = !authenticated;
@@ -421,9 +482,18 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
                     url: url.to_string(),
                     accept,
                     authorization: None,
+                    response_body_limit,
                 })
                 .map_err(GithubApiError::Http)?;
             anonymous = true;
+        }
+        if let Some(limit) = response_body_limit
+            && response.body.len() as u64 > limit
+        {
+            return Err(GithubApiError::Http(response_body_limit_error(
+                url.as_str(),
+                limit,
+            )));
         }
         if !(200..300).contains(&response.status) {
             return Err(github_status_error(&response, url, anonymous));
@@ -600,7 +670,9 @@ impl GithubHttp for FixtureGithubHttp {
 mod tests {
     use super::*;
     use carina_core::provider_source::{GithubSource, ProviderSource, RemoteSource};
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -799,7 +871,7 @@ mod tests {
     #[test]
     fn workflow_runs_builds_query_from_typed_commit_sha() {
         let sha = CommitSha::new("abcdef0123456789abcdef0123456789abcdef01".into()).unwrap();
-        let url = "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abcdef0123456789abcdef0123456789abcdef01&status=success&per_page=10";
+        let url = "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abcdef0123456789abcdef0123456789abcdef01&status=success&event=push&per_page=100";
         let http = FixtureGithubHttp::default().json(
             url,
             r#"{"workflow_runs":[{"id":7,"event":"push","head_sha":"abcdef0123456789abcdef0123456789abcdef01","head_repository":{"full_name":"acme/widget"}}]}"#,
@@ -822,6 +894,35 @@ mod tests {
     }
 
     #[test]
+    fn workflow_runs_follows_next_link_until_exhausted() {
+        let sha = CommitSha::new("abcdef0123456789abcdef0123456789abcdef01".into()).unwrap();
+        let first = "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abcdef0123456789abcdef0123456789abcdef01&status=success&event=push&per_page=100";
+        let second = "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abcdef0123456789abcdef0123456789abcdef01&status=success&event=push&per_page=100&page=2";
+        let http = FixtureGithubHttp::default()
+            .json_with_headers(
+                first,
+                r#"{"workflow_runs":[{"id":8,"event":"push"}]}"#,
+                &[("Link", format!("<{second}>; rel=\"next\""))],
+            )
+            .json(second, r#"{"workflow_runs":[{"id":7,"event":"push"}]}"#);
+        let api = GithubApi::new(&http, Some("token"));
+
+        let runs = api.workflow_runs(&repo_slug(), &sha).unwrap();
+
+        assert_eq!(
+            runs.iter().map(|run| run.id.get()).collect::<Vec<_>>(),
+            [8, 7]
+        );
+        assert_eq!(
+            http.requests()
+                .iter()
+                .map(GithubRequest::url)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+    }
+
+    #[test]
     fn run_artifacts_takes_a_deserialized_workflow_run_id() {
         let run_id: WorkflowRunId = serde_json::from_str("7").unwrap();
         let url = "https://api.github.com/repos/acme/widget/actions/runs/7/artifacts";
@@ -835,7 +936,52 @@ mod tests {
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].id.get(), 42);
+        assert_eq!(artifacts[0].size_in_bytes, None);
         assert_eq!(http.requests()[0].url(), url);
+    }
+
+    #[test]
+    fn artifact_zip_download_rejects_body_over_limit() {
+        let url = "https://api.github.com/repos/acme/widget/actions/artifacts/42/zip";
+        let http = FixtureGithubHttp::default().bytes(url, b"12345");
+        let api = GithubApi::new(&http, Some("token"));
+
+        let error = api
+            .download_artifact_zip(&repo_slug(), ArtifactId::from_lock(42), 4)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(error.contains("4 byte"), "{error}");
+        assert_eq!(http.requests()[0].response_body_limit, Some(4));
+    }
+
+    #[test]
+    fn limited_response_reader_stops_after_limit_plus_one_bytes() {
+        struct CountingReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            bytes_read: Rc<Cell<usize>>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.bytes_read.set(self.bytes_read.get() + count);
+                Ok(count)
+            }
+        }
+
+        let bytes_read = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            inner: std::io::Cursor::new(vec![0; 32]),
+            bytes_read: Rc::clone(&bytes_read),
+        };
+
+        let error = read_response_body(reader, "https://api.github.com/artifact", Some(4))
+            .expect_err("the fifth byte must prove the body exceeds the limit");
+
+        assert!(error.contains("exceeds"), "{error}");
+        assert_eq!(bytes_read.get(), 5);
     }
 
     #[test]

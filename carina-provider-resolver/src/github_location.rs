@@ -118,7 +118,8 @@ impl RepoSlug {
         url.query_pairs_mut()
             .append_pair("head_sha", commit_sha.as_str())
             .append_pair("status", "success")
-            .append_pair("per_page", "10");
+            .append_pair("event", "push")
+            .append_pair("per_page", "100");
         self.validate_url(url.as_str())
     }
 

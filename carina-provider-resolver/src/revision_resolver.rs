@@ -32,6 +32,7 @@ struct Artifact {
     id: ArtifactId,
     name: String,
     expired: bool,
+    size_in_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -311,7 +312,19 @@ fn fetch_run_artifacts<H: GithubHttp + ?Sized>(
         .map(|artifacts| {
             artifacts
                 .into_iter()
-                .map(|GithubArtifactResponse { id, name, expired }| Artifact { id, name, expired })
+                .map(
+                    |GithubArtifactResponse {
+                         id,
+                         name,
+                         expired,
+                         size_in_bytes,
+                     }| Artifact {
+                        id,
+                        name,
+                        expired,
+                        size_in_bytes,
+                    },
+                )
                 .collect()
         })
         .map_err(|error| format!("Failed to fetch artifacts for run {run_id}: {error}"))
@@ -324,6 +337,7 @@ struct WasmZipEntry {
 }
 
 const MAX_WASM_ENTRY_DECOMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_ARTIFACT_ZIP_COMPRESSED_SIZE: u64 = 512 * 1024 * 1024;
 
 fn wasm_entry_limit_label(limit: u64) -> String {
     if limit == MAX_WASM_ENTRY_DECOMPRESSED_SIZE {
@@ -421,6 +435,56 @@ mod revision_artifact_selection {
         entry: WasmZipEntry,
     }
 
+    mod distinct_wasm_content {
+        use super::*;
+
+        pub(super) trait WasmContent {
+            fn content(&self) -> &[u8];
+        }
+
+        pub(super) struct UniqueWasm<T>(T);
+
+        impl<T> UniqueWasm<T> {
+            pub(super) fn into_inner(self) -> T {
+                self.0
+            }
+        }
+
+        pub(super) enum UniqueWasmError<T> {
+            Empty,
+            Multiple(Vec<T>),
+        }
+
+        pub(super) fn unique_wasm<T: WasmContent>(
+            mut entries: Vec<T>,
+        ) -> Result<UniqueWasm<T>, UniqueWasmError<T>> {
+            let distinct_hash_count = entries
+                .iter()
+                .map(|entry| <[u8; 32]>::from(Sha256::digest(entry.content())))
+                .collect::<HashSet<_>>()
+                .len();
+            match distinct_hash_count {
+                0 => Err(UniqueWasmError::Empty),
+                1 => Ok(UniqueWasm(entries.remove(0))),
+                _ => Err(UniqueWasmError::Multiple(entries)),
+            }
+        }
+    }
+
+    use distinct_wasm_content::{UniqueWasmError, WasmContent, unique_wasm};
+
+    impl WasmContent for WasmZipEntry {
+        fn content(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl WasmContent for CandidateWasm {
+        fn content(&self) -> &[u8] {
+            &self.entry.bytes
+        }
+    }
+
     pub(super) enum LockedReplayError {
         Download(ArtifactDownloadError),
         InvalidArtifact(String),
@@ -469,14 +533,23 @@ mod revision_artifact_selection {
                     expired_names.push(artifact.name);
                     continue;
                 }
+                if let Some(size_in_bytes) = artifact.size_in_bytes
+                    && size_in_bytes > MAX_ARTIFACT_ZIP_COMPRESSED_SIZE
+                {
+                    return Err(format!(
+                        "Candidate artifact '{}' (id {}) reports a compressed size of \
+                         {size_in_bytes} bytes, which exceeds the 512 MiB limit.",
+                        artifact.name, artifact.id
+                    ));
+                }
                 candidate_names.push(artifact.name.clone());
-                let zip_data = download(artifact.id).map_err(|error| {
+                let entries = wasm_entries(download(artifact.id).map_err(|error| {
                     format!(
                         "Failed to download candidate artifact '{}' (id {}): {error}",
                         artifact.name, artifact.id
                     )
-                })?;
-                let entries = wasm_entries(zip_data).map_err(|error| {
+                })?)
+                .map_err(|error| {
                     format!(
                         "Failed to inspect candidate artifact '{}' (id {}): {error}",
                         artifact.name, artifact.id
@@ -490,32 +563,27 @@ mod revision_artifact_selection {
             }
         }
 
-        let distinct_hash_count = match wasm_candidates.len() {
-            0 => 0,
-            1 => 1,
-            _ => wasm_candidates
-                .iter()
-                .map(|candidate| <[u8; 32]>::from(Sha256::digest(&candidate.entry.bytes)))
-                .collect::<HashSet<_>>()
-                .len(),
-        };
-        match distinct_hash_count {
-            1 => {
+        match unique_wasm(wasm_candidates) {
+            Ok(candidate) => {
                 // Runs are supplied newest-first, so the first occurrence of
                 // identical content carries the newest artifact ID.
-                let candidate = wasm_candidates.remove(0);
+                let candidate = candidate.into_inner();
                 Ok(SelectedRevisionArtifact::new(
                     candidate.artifact_id,
                     candidate.entry.bytes,
                 ))
             }
-            0 if candidate_names.is_empty() && !expired_names.is_empty() => Err(format!(
-                "All artifacts in successful workflow runs for {source}@{sha} have expired: {}. \
+            Err(UniqueWasmError::Empty)
+                if candidate_names.is_empty() && !expired_names.is_empty() =>
+            {
+                Err(format!(
+                    "All artifacts in successful workflow runs for {source}@{sha} have expired: {}. \
                  Re-run CI for this revision or run `{}`.",
-                expired_names.join(", "),
-                ProjectCommand::new("init", project_dir).with_argument("--upgrade")
-            )),
-            0 => {
+                    expired_names.join(", "),
+                    ProjectCommand::new("init", project_dir).with_argument("--upgrade")
+                ))
+            }
+            Err(UniqueWasmError::Empty) => {
                 let candidates = if candidate_names.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -534,7 +602,7 @@ mod revision_artifact_selection {
                      Candidate artifacts: {candidates}.{expired}"
                 ))
             }
-            _ => {
+            Err(UniqueWasmError::Multiple(wasm_candidates)) => {
                 let causes = wasm_candidates
                     .iter()
                     .map(|candidate| {
@@ -560,26 +628,31 @@ mod revision_artifact_selection {
         D: FnMut(ArtifactId) -> Result<Vec<u8>, ArtifactDownloadError>,
     {
         let zip_data = download(artifact_id).map_err(LockedReplayError::Download)?;
-        let mut entries = wasm_entries(zip_data).map_err(|error| {
+        let entries = wasm_entries(zip_data).map_err(|error| {
             LockedReplayError::InvalidArtifact(format!(
                 "Failed to inspect locked artifact {artifact_id} for {source}@{sha}: {error}"
             ))
         })?;
-        if entries.len() != 1 {
-            let names = entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let names = if names.is_empty() { "(none)" } else { &names };
-            return Err(LockedReplayError::InvalidArtifact(format!(
-                "Locked artifact {artifact_id} for {source}@{sha} must contain exactly one .wasm \
-                 entry, found {}: {names}. The pinned artifact itself is invalid; publishing \
-                 another CI run cannot change it.",
-                entries.len()
-            )));
-        }
-        let entry = entries.pop().expect("length checked");
+        let entry = match unique_wasm(entries) {
+            Ok(entry) => entry.into_inner(),
+            Err(error) => {
+                let (found, entries) = match error {
+                    UniqueWasmError::Empty => ("none", Vec::new()),
+                    UniqueWasmError::Multiple(entries) => ("multiple distinct contents", entries),
+                };
+                let names = entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let names = if names.is_empty() { "(none)" } else { &names };
+                return Err(LockedReplayError::InvalidArtifact(format!(
+                    "Locked artifact {artifact_id} for {source}@{sha} must contain exactly one \
+                     distinct .wasm content, found {found}: {names}. The pinned artifact itself \
+                     is invalid; publishing another CI run cannot change it."
+                )));
+            }
+        };
         Ok(SelectedRevisionArtifact::new(artifact_id, entry.bytes))
     }
 }
@@ -700,7 +773,7 @@ fn download_artifact_zip<H: GithubHttp + ?Sized>(
     artifact_id: ArtifactId,
     api: &GithubApi<'_, H>,
 ) -> Result<Vec<u8>, ArtifactDownloadError> {
-    api.download_artifact_zip(repo, artifact_id)
+    api.download_artifact_zip(repo, artifact_id, MAX_ARTIFACT_ZIP_COMPRESSED_SIZE)
         .map_err(|error| {
             let missing_or_gone = matches!(
                 &error,
@@ -1044,7 +1117,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::FixtureGithubHttp;
+    use crate::github::{FixtureGithubHttp, GithubRequest};
     use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
     use carina_core::provider_source::{ProviderSource, RemoteSource};
     use sha2::{Digest, Sha256};
@@ -1360,6 +1433,7 @@ mod tests {
             id: ArtifactId::from_lock(id),
             name: name.to_string(),
             expired,
+            size_in_bytes: None,
         }
     }
 
@@ -1867,29 +1941,108 @@ sha256 = "{}"
     }
 
     #[test]
+    fn revision_artifact_identical_wasm_entries_are_selectable_and_replayable() {
+        let wasm = b"same provider build";
+        let zip = artifact_zip(&[("dist/provider.wasm", wasm), ("pkg/provider.wasm", wasm)]);
+        let selected = select_artifact_from_runs(
+            &[workflow_run_id(100)],
+            &test_source(),
+            &test_sha(),
+            Path::new("."),
+            |_| Ok(vec![artifact("build-output", 42, false)]),
+            |_| Ok(zip.clone()),
+        )
+        .expect("byte-identical entries are one distinct WASM content");
+
+        let replayed =
+            replay_locked_artifact(&test_source(), &test_sha(), test_artifact_id(42), |_| {
+                Ok(zip.clone())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}",
+                    error.into_message(&test_source(), &test_sha(), test_artifact_id(42))
+                )
+            });
+
+        assert_eq!(selected.artifact_id().get(), 42);
+        assert_eq!(selected.wasm_bytes(), wasm);
+        assert_eq!(replayed.artifact_id().get(), 42);
+        assert_eq!(replayed.wasm_bytes(), wasm);
+    }
+
+    #[test]
     fn revision_artifact_selection_multiple_wasm_in_one_artifact_lists_each_entry() {
-        let error = select_artifact_from_runs(
+        let zip = artifact_zip(&[
+            ("dist/provider.wasm", b"one"),
+            ("fixtures/helper.wasm", b"two"),
+        ]);
+        let selection_error = select_artifact_from_runs(
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
             Path::new("."),
             |_| Ok(vec![artifact("build-output", 1, false)]),
-            |_| {
-                Ok(artifact_zip(&[
-                    ("dist/provider.wasm", b"one"),
-                    ("fixtures/helper.wasm", b"two"),
-                ]))
-            },
+            |_| Ok(zip.clone()),
         )
         .unwrap_err();
 
         assert!(
-            error.contains("build-output: dist/provider.wasm"),
-            "{error}"
+            selection_error.contains("build-output: dist/provider.wasm"),
+            "{selection_error}"
         );
         assert!(
-            error.contains("build-output: fixtures/helper.wasm"),
-            "{error}"
+            selection_error.contains("build-output: fixtures/helper.wasm"),
+            "{selection_error}"
+        );
+
+        let replay_error =
+            replay_locked_artifact(&test_source(), &test_sha(), test_artifact_id(1), |_| {
+                Ok(zip.clone())
+            })
+            .expect_err("different WASM contents must not replay")
+            .into_message(&test_source(), &test_sha(), test_artifact_id(1));
+
+        assert!(
+            replay_error.contains("dist/provider.wasm"),
+            "{replay_error}"
+        );
+        assert!(
+            replay_error.contains("fixtures/helper.wasm"),
+            "{replay_error}"
+        );
+    }
+
+    #[test]
+    fn revision_artifact_selection_rejects_oversized_listing_without_downloading() {
+        let repo = RepoSlug::try_from(&test_source()).unwrap();
+        let listing_url =
+            "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/runs/7/artifacts";
+        let http = FixtureGithubHttp::default().json(
+            listing_url,
+            r#"{"artifacts":[{"id":42,"name":"huge-build","expired":false,"size_in_bytes":536870913}]}"#,
+        );
+        let api = GithubApi::new(&http, Some("token"));
+
+        let error = select_artifact_from_runs(
+            &[workflow_run_id(7)],
+            &test_source(),
+            &test_sha(),
+            Path::new("."),
+            |run_id| fetch_run_artifacts(&repo, run_id, &api),
+            |artifact_id| download_artifact_zip(&repo, artifact_id, &api),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("huge-build"), "{error}");
+        assert!(error.contains("536870913"), "{error}");
+        assert!(error.contains("512 MiB"), "{error}");
+        assert_eq!(
+            http.requests()
+                .iter()
+                .map(GithubRequest::url)
+                .collect::<Vec<_>>(),
+            [listing_url]
         );
     }
 
@@ -2586,5 +2739,6 @@ sha256 = "{}"
         assert_eq!(parsed[0].id.get(), 12345);
         assert_eq!(parsed[0].name, "carina-provider-aws.wasm");
         assert!(!parsed[0].expired);
+        assert_eq!(parsed[0].size_in_bytes, Some(1024));
     }
 }
