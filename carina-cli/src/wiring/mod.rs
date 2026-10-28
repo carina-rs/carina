@@ -1498,7 +1498,12 @@ fn validate_resolved_value_constraints(
         "plan value checking requires paired data sources"
     );
 
-    let lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
+    let provider_lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
+    let lookup = |identity: &carina_core::schema::TypeIdentity, value: &Value| {
+        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
+            message: error.to_string(),
+        })
+    };
     let mut plan_errors = Vec::new();
     for (resource, origin) in resources.iter().zip(resource_origins) {
         let Some(schema) = ctx.schemas().get_for(resource) else {

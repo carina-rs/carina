@@ -825,7 +825,7 @@ impl ProviderFactory for TestProviderFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -1687,20 +1687,19 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         // Mirror awscc's `prefixed` validator family: VpcId must start
         // with "vpc-".
         if identity.kind == "VpcId" && !value.as_str().starts_with("vpc-") {
-            return Err(format!(
-                "Invalid vpc_id '{}': must start with 'vpc-'",
-                value
+            return Err(carina_core::provider::ProviderError::invalid_input(
+                format!("Invalid vpc_id '{}': must start with 'vpc-'", value),
             ));
         }
         Ok(())

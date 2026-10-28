@@ -103,6 +103,17 @@ pub struct ErrorDetail {
     pub request_id: Option<String>,
 }
 
+/// Stable classification of a [`ProviderError`] for callers that need policy
+/// decisions without parsing diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderErrorKind {
+    InvalidInput,
+    ApiError,
+    NotFound,
+    Timeout,
+    Internal,
+}
+
 /// Structured error returned by every provider operation.
 ///
 /// Variants mirror `provider-error` in `wit/types.wit`. Host-side code
@@ -290,6 +301,17 @@ impl ProviderError {
             ProviderError::NotFound(_) => "not_found",
             ProviderError::Timeout(_) => "timeout",
             ProviderError::Internal(_) => "internal",
+        }
+    }
+
+    /// Typed error classification for retry and diagnostic policy.
+    pub const fn kind(&self) -> ProviderErrorKind {
+        match self {
+            ProviderError::InvalidInput(_) => ProviderErrorKind::InvalidInput,
+            ProviderError::ApiError(_) => ProviderErrorKind::ApiError,
+            ProviderError::NotFound(_) => ProviderErrorKind::NotFound,
+            ProviderError::Timeout(_) => ProviderErrorKind::Timeout,
+            ProviderError::Internal(_) => ProviderErrorKind::Internal,
         }
     }
 
@@ -4404,11 +4426,12 @@ pub trait ProviderFactory: Send + Sync {
     /// }
     /// ```
     fn validate_config(&self, attributes: &CanonicalProviderConfigAttributes)
-    -> Result<(), String>;
+    -> ProviderResult<()>;
 
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
-    /// Returns `Err(message)` if the value is invalid for the given type.
+    /// Returns an invalid-input [`ProviderError`] if the value is invalid for
+    /// the given type.
     ///
     /// `identity` is the structured [`TypeIdentity`] of the type, so a
     /// provider resolves the exact provider-scoped type instead of
@@ -4429,7 +4452,7 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         _identity: &TypeIdentity,
         _value: &CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> ProviderResult<()> {
         Ok(())
     }
 
@@ -7271,7 +7294,7 @@ mod tests {
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
-            ) -> Result<(), String> {
+            ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
@@ -7360,7 +7383,7 @@ mod tests {
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
-            ) -> Result<(), String> {
+            ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {

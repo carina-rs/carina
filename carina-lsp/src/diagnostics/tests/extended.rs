@@ -1310,6 +1310,40 @@ security_group_ingress {
 }
 
 #[test]
+fn suspended_provider_validation_is_reported_once_per_provider_per_pass() {
+    let engine = test_engine_with_suspended_validation_provider();
+    let doc = create_document(
+        r#"let first = mock.test.resource {
+  probe = "same"
+}
+let second = mock.test.resource {
+  probe = "same"
+}
+let third = mock.test.resource {
+  probe = "same"
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let suspended = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(
+                "provider validation is suspended after repeated wall-clock timeouts for this input",
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(suspended.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert!(
+        suspended[0].message.contains("validate_custom_type"),
+        "diagnostic must retain the original validation operation: {:#?}",
+        suspended[0]
+    );
+}
+
+#[test]
 fn list_item_type_validation() {
     // Use a test engine with a List(Enum) schema to test list item validation
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};

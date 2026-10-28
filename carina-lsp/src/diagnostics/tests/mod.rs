@@ -51,7 +51,7 @@ impl ProviderFactory for RegionConfigFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -89,6 +89,100 @@ pub(super) fn test_engine_with_region_config_provider(name: &'static str) -> Dia
     DiagnosticEngine::new(
         Arc::new(provider_mod::collect_schemas(&factories)),
         vec![name.to_string()],
+        Arc::new(factories),
+    )
+}
+
+struct SuspendedValidationFactory;
+
+impl SuspendedValidationFactory {
+    const ERROR: &'static str = "provider validation is suspended after repeated wall-clock \
+        timeouts for this input in validate_custom_type; editing the configuration (or using a \
+        new provider version) resumes validation";
+}
+
+impl ProviderFactory for SuspendedValidationFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_config_attribute_types(
+        &self,
+    ) -> std::collections::HashMap<String, carina_core::schema::AttributeType> {
+        std::collections::HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &carina_core::schema::TypeIdentity,
+        _value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Err(carina_core::provider::ProviderError::timeout(Self::ERROR))
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!(
+            "SuspendedValidationFactory::create_provider is not used in diagnostics tests"
+        )
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        use carina_core::resource::Value;
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+        };
+
+        let probe = AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::new(
+                Some("mock"),
+                ["test", "resource"],
+                "Probe",
+            )),
+            None,
+            None,
+            legacy_validator(|_value: &Value| Ok(())),
+            None,
+        );
+        vec![ResourceSchema::new("test.resource").attribute(AttributeSchema::new("probe", probe))]
+    }
+}
+
+pub(super) fn test_engine_with_suspended_validation_provider() -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(SuspendedValidationFactory)];
+    DiagnosticEngine::new(
+        Arc::new(provider_mod::collect_schemas(&factories)),
+        vec!["mock".to_string()],
         Arc::new(factories),
     )
 }

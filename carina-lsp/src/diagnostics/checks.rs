@@ -17,7 +17,7 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
-use super::{DiagnosticEngine, carina_diagnostic};
+use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
 
 /// Directory parse plus the module-expansion error, if expansion stopped.
 ///
@@ -1085,6 +1085,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        deduplicator: &ProviderValidationDeduplicator,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1100,6 +1101,11 @@ impl DiagnosticEngine {
                     &provider.attributes,
                 );
             if let Err(error) = validation {
+                if error.provider_error().is_some_and(|provider_error| {
+                    !deduplicator.should_emit(&provider.name, provider_error)
+                }) {
+                    continue;
+                }
                 let position = error
                     .attribute()
                     .and_then(|attribute| {

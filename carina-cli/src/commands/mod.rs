@@ -256,7 +256,9 @@ fn enrich_provider_context(
             move |identity: &carina_core::schema::TypeIdentity,
                   value: &carina_core::provider::CanonicalCustomTypeValue| {
                 for factory in factories.iter() {
-                    factory.validate_custom_type(identity, value)?;
+                    factory
+                        .validate_custom_type(identity, value)
+                        .map_err(|error| error.to_string())?;
                 }
                 Ok(())
             },
@@ -1362,7 +1364,7 @@ exports {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 

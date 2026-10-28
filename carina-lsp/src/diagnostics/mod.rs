@@ -6,7 +6,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -15,9 +15,50 @@ use crate::position;
 use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
 };
-use carina_core::provider::ProviderFactory;
+use carina_core::provider::{ProviderError, ProviderErrorKind, ProviderFactory};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{SchemaRegistry, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeError, TypeIdentity, TypeInSchema};
+
+#[derive(Default)]
+pub(super) struct ProviderValidationDeduplicator {
+    seen: Mutex<HashSet<(String, ProviderErrorKind)>>,
+}
+
+impl ProviderValidationDeduplicator {
+    fn should_emit(&self, provider: &str, error: &ProviderError) -> bool {
+        error.kind() != ProviderErrorKind::Timeout
+            || self
+                .seen
+                .lock()
+                .expect("provider validation diagnostic lock must not be poisoned")
+                .insert((provider.to_string(), error.kind()))
+    }
+}
+
+fn provider_custom_type_lookup<'a>(
+    factories: &'a [Box<dyn ProviderFactory>],
+    deduplicator: &'a ProviderValidationDeduplicator,
+) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + 'a {
+    let validate = carina_core::executor::provider_ready::provider_custom_type_lookup(factories);
+    move |identity, value| match validate(identity, value) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let provider = error
+                .detail()
+                .provider_name
+                .as_deref()
+                .or(identity.provider.as_deref())
+                .unwrap_or("<unknown>");
+            if deduplicator.should_emit(provider, &error) {
+                Err(TypeError::ValidationFailed {
+                    message: error.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -133,7 +174,9 @@ impl DiagnosticEngine {
                 move |identity: &carina_core::schema::TypeIdentity,
                       value: &carina_core::provider::CanonicalCustomTypeValue| {
                     for factory in factories_clone.iter() {
-                        factory.validate_custom_type(identity, value)?;
+                        factory
+                            .validate_custom_type(identity, value)
+                            .map_err(|error| error.to_string())?;
                     }
                     Ok(())
                 },
@@ -168,6 +211,7 @@ impl DiagnosticEngine {
     /// are derived from it rather than inferred from buffer contents.
     pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let base_path = current_file_path.map(|path| {
             path.parent()
@@ -502,7 +546,11 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_arguments_in_root(doc, parsed, merged));
 
             // Check provider region
-            diagnostics.extend(self.check_provider_region(doc, parsed));
+            diagnostics.extend(self.check_provider_region(
+                doc,
+                parsed,
+                &provider_validation_deduplicator,
+            ));
 
             // Check for unloaded providers
             diagnostics.extend(self.check_unloaded_providers(doc, parsed));
@@ -1094,8 +1142,9 @@ impl DiagnosticEngine {
                                         // verbatim. Enum has its own arm below — the
                                         // pre-#3222 `namespace.is_some()` gate is now a
                                         // type-level split.
-                                        let lookup = carina_core::parser::provider_context_lookup(
-                                            &self.provider_context,
+                                        let lookup = provider_custom_type_lookup(
+                                            self.factories.as_ref(),
+                                            &provider_validation_deduplicator,
                                         );
                                         validate(value)
                                             .err()
@@ -1237,8 +1286,10 @@ impl DiagnosticEngine {
                             *value = evaluated;
                         }
                     }
-                    let lookup =
-                        carina_core::parser::provider_context_lookup(&self.provider_context);
+                    let lookup = provider_custom_type_lookup(
+                        self.factories.as_ref(),
+                        &provider_validation_deduplicator,
+                    );
                     let is_string_literal =
                         |attr: &str| resource_quoted_string_attrs.contains(attr);
                     if let Err(errors) = schema.validate_with_origins_and_lookup(

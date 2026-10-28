@@ -6135,7 +6135,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn validate_config(
         &self,
         attributes: &crate::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> crate::provider::ProviderResult<()> {
         self.seen
             .lock()
             .unwrap()
@@ -6261,7 +6261,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         fn validate_config(
             &self,
             attributes: &crate::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> crate::provider::ProviderResult<()> {
             self.seen
                 .lock()
                 .unwrap()

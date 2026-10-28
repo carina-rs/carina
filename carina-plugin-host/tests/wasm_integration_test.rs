@@ -9,9 +9,9 @@ use carina_core::executor::complete_create_for_writeback;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateOutcome,
     CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Observation, Provider,
-    ProviderError, ProviderFactory, ProviderReadyConfig, RawSavedAttrs, ReadRequest,
-    ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind,
-    SavedAttrs, Sent, SentRecord, UpdateRequest, hydrate_provider_states,
+    ProviderError, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
+    ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
+    ResumeOutcomeKind, SavedAttrs, Sent, SentRecord, UpdateRequest, hydrate_provider_states,
     normalize_provider_states,
 };
 use carina_core::resource::{
@@ -1570,7 +1570,7 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "test-utils")]
-async fn test_wasm_rebuilt_validation_instance_uses_updated_wall_budget() {
+async fn test_wasm_repeated_validation_timeout_suspends_same_input_until_context_changes() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let factory = factory.with_guest_call_budget(GuestCallBudget::new(
@@ -1600,6 +1600,45 @@ async fn test_wasm_rebuilt_validation_instance_uses_updated_wall_budget() {
     assert!(
         elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
         "rebuilt validate_config should time out after about 2s; elapsed {elapsed:?}"
+    );
+
+    let suspended_config = resolved_provider_config(factory.name(), slow_attributes());
+    let suspended_started = Instant::now();
+    let suspended =
+        carina_core::executor::prepare_provider_ready_config(&factory, &suspended_config)
+            .expect_err("a repeatedly timed-out validation input must be suspended");
+    let suspended_elapsed = suspended_started.elapsed();
+    let rendered = suspended.to_string();
+
+    assert_eq!(
+        suspended
+            .provider_error()
+            .map(carina_core::provider::ProviderError::kind),
+        Some(ProviderErrorKind::Timeout)
+    );
+    assert!(
+        rendered.contains(
+            "provider validation is suspended after repeated wall-clock timeouts for this input"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("validate_config"), "{rendered}");
+    assert!(
+        rendered.contains("editing the configuration") && rendered.contains("new provider version"),
+        "{rendered}"
+    );
+    assert!(
+        suspended_elapsed < Duration::from_secs(1),
+        "a suspended validation input must fail fast; elapsed {suspended_elapsed:?}"
+    );
+
+    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    let clean_started = Instant::now();
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect("a different validation input should rebuild and resume validation");
+    assert!(
+        clean_started.elapsed() < Duration::from_secs(1),
+        "a clean validation input should complete quickly"
     );
 }
 
