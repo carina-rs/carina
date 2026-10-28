@@ -1569,6 +1569,41 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_rebuilt_validation_instance_uses_updated_wall_budget() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    ));
+    let slow_attributes = || {
+        indexmap::IndexMap::from([(
+            "validate_delay_millis".to_string(),
+            Value::Concrete(ConcreteValue::Int(10_000)),
+        )])
+    };
+
+    let first_config = resolved_provider_config(factory.name(), slow_attributes());
+    carina_core::executor::prepare_provider_ready_config(&factory, &first_config)
+        .expect_err("the initial validation instance should time out and become poisoned");
+
+    let rebuilt_config = resolved_provider_config(factory.name(), slow_attributes());
+    let started = Instant::now();
+    let error = carina_core::executor::prepare_provider_ready_config(&factory, &rebuilt_config)
+        .expect_err("the rebuilt validation instance must retain the two-second wall budget");
+    let elapsed = started.elapsed();
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("validate_config"), "{rendered}");
+    assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
+        "rebuilt validate_config should time out after about 2s; elapsed {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_validate_config_trap_rebuilds_init_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -1587,6 +1622,43 @@ async fn test_wasm_validate_config_trap_rebuilds_init_instance() {
     let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
     carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
         .expect("validate_config should rebuild the trapped init instance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_validation_rebuild_preserves_http_world() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let original_world = factory
+        .validation_instance_world_for_test()
+        .await
+        .expect("the loaded validation instance should be live");
+    assert_eq!(original_world, "http-enabled");
+
+    let trap_config = resolved_provider_config(
+        factory.name(),
+        indexmap::IndexMap::from([(
+            "__mock_validate_config_trap__".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]),
+    );
+    carina_core::executor::prepare_provider_ready_config(&factory, &trap_config)
+        .expect_err("the mock validate_config hook must poison the validation instance");
+    assert_eq!(
+        factory.validation_instance_world_for_test().await,
+        None,
+        "a trapped validation call must leave no live instance before the rebuild"
+    );
+
+    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect("the next validation call should rebuild the poisoned instance");
+    let rebuilt_world = factory
+        .validation_instance_world_for_test()
+        .await
+        .expect("the rebuilt validation instance should be live");
+
+    assert_eq!(rebuilt_world, original_world);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2971,6 +3043,34 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect("a provider-returned error must not poison the shared instance")
+        .into_state();
+    assert!(!state.exists);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let error_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "__mock_read_error__", None);
+
+    let error = provider
+        .read(&error_id, &mock_identifier(), ReadRequest)
+        .await
+        .expect_err("the mock read hook must return a WIT provider-error");
+    assert_eq!(error.variant_name(), "internal");
+    assert_eq!(error.detail().context(), "intentional mock read error");
+
+    let followup_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "after-read-error", None);
+    let state = provider
+        .read(&followup_id, &mock_identifier(), ReadRequest)
+        .await
+        .expect("a provider-returned WIT error must not poison the FailFast instance")
         .into_state();
     assert!(!state.exists);
 }

@@ -349,6 +349,16 @@ enum InstantiationWorld {
     Basic,
 }
 
+impl InstantiationWorld {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn test_name(self) -> &'static str {
+        match self {
+            Self::HttpEnabled => "http-enabled",
+            Self::Basic => "basic",
+        }
+    }
+}
+
 /// The attempt shape is explicit: the load path carries its dual-attempt
 /// fallback disposition, while the runtime path carries exactly one selected
 /// world and cannot represent a fallback that never happened.
@@ -2342,15 +2352,16 @@ async fn create_instance_for_world(
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
-) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    match world {
+) -> Result<LiveInstance, WasmBindingCreationError> {
+    let (store, bindings) = match world {
         InstantiationWorld::HttpEnabled => {
             create_instance_with_http(engine, component, provider_kind, budget).await
         }
         InstantiationWorld::Basic => {
             create_instance(engine, component, provider_kind, budget).await
         }
-    }
+    }?;
+    Ok(LiveInstance::new(store, bindings, world))
 }
 
 async fn create_runtime_instance(
@@ -2359,7 +2370,7 @@ async fn create_runtime_instance(
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
-) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
+) -> Result<LiveInstance, WasmProviderInstanceError> {
     let result = create_instance_for_world(engine, component, provider_kind, world, budget).await;
     result.map_err(|failure| {
         map_binding_creation_error(
@@ -2406,8 +2417,9 @@ fn single_attempt_load_error(
     )
 }
 
-/// Output of `create_instance_auto`: the instantiated store and bindings.
-type CreateInstanceResult = Result<(GuestStore, WasmBindings), WasmProviderLoadError>;
+/// Output of `create_instance_auto`: one callable instance tagged with the
+/// world whose linker instantiated it.
+type CreateInstanceResult = Result<LiveInstance, WasmProviderLoadError>;
 
 /// Try HTTP instantiation first, then basic. On double failure, retain the
 /// complete HTTP-path error and component-derived compatibility context. The
@@ -2538,11 +2550,21 @@ impl fmt::Display for PoisonReason {
 struct LiveInstance {
     store: GuestStore,
     bindings: WasmBindings,
+    world: InstantiationWorld,
 }
 
 impl LiveInstance {
-    fn new(store: GuestStore, bindings: WasmBindings) -> Self {
-        Self { store, bindings }
+    fn new(store: GuestStore, bindings: WasmBindings, world: InstantiationWorld) -> Self {
+        Self {
+            store,
+            bindings,
+            world,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn instantiation_world(&self) -> InstantiationWorld {
+        self.world
     }
 }
 
@@ -2656,11 +2678,9 @@ struct FailFastInstance {
 }
 
 impl FailFastInstance {
-    fn new(store: GuestStore, bindings: WasmBindings) -> Self {
+    fn new(live: LiveInstance) -> Self {
         Self {
-            slot: Mutex::new(InstanceSlot::Live(Box::new(LiveInstance::new(
-                store, bindings,
-            )))),
+            slot: Mutex::new(InstanceSlot::Live(Box::new(live))),
         }
     }
 
@@ -2688,9 +2708,7 @@ impl RebuildContext {
         }
     }
 
-    async fn create_instance(
-        &self,
-    ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
+    async fn create_instance(&self) -> Result<LiveInstance, WasmBindingCreationError> {
         create_instance_for_world(
             &self.engine,
             &self.component,
@@ -2756,11 +2774,9 @@ struct RebuildableInstance {
 }
 
 impl RebuildableInstance {
-    fn new(store: GuestStore, bindings: WasmBindings, rebuild: RebuildContext) -> Self {
+    fn new(live: LiveInstance, rebuild: RebuildContext) -> Self {
         Self {
-            slot: Mutex::new(InstanceSlot::Live(Box::new(LiveInstance::new(
-                store, bindings,
-            )))),
+            slot: Mutex::new(InstanceSlot::Live(Box::new(live))),
             rebuild,
         }
     }
@@ -2772,7 +2788,7 @@ impl RebuildableInstance {
             InstanceSlot::Poisoned { reason } => Some(reason.clone()),
         };
         if let Some(reason) = poison_reason {
-            let (store, bindings) = self
+            let live = self
                 .rebuild
                 .create_instance()
                 .await
@@ -2785,13 +2801,21 @@ impl RebuildableInstance {
                     )
                 })
                 .map_err(|load_error| rebuild_provider_error(reason.clone(), load_error))?;
-            *slot = InstanceSlot::Live(Box::new(LiveInstance::new(store, bindings)));
+            *slot = InstanceSlot::Live(Box::new(live));
             log::warn!(
                 "rebuilt poisoned WASM provider validation instance; previous poison reason: \
                  {reason}"
             );
         }
         LiveInstanceGuard::from_slot(slot, operation)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn live_world(&self) -> Option<InstantiationWorld> {
+        match &*self.slot.lock().await {
+            InstanceSlot::Live(live) => Some(live.instantiation_world()),
+            InstanceSlot::Poisoned { reason: _ } => None,
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -3102,9 +3126,9 @@ impl WasmProviderFactory {
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
         let mut rebuild = RebuildContext::new(engine.clone(), component.clone(), budget);
-        let (mut store, bindings) = create_instance_auto(&mut rebuild).await?;
-        let enable_http = rebuild.world == InstantiationWorld::HttpEnabled;
-        let info_json = bindings.info_json().to_owned();
+        let mut live = create_instance_auto(&mut rebuild).await?;
+        let enable_http = live.world == InstantiationWorld::HttpEnabled;
+        let info_json = live.bindings.info_json().to_owned();
 
         let (reported_name, display_name, version) =
             wasm_convert::json_to_provider_info(&info_json).map_err(|source| {
@@ -3118,8 +3142,9 @@ impl WasmProviderFactory {
         }
         let name = configured.name.as_str();
 
-        let schemas_json = store
-            .call(|store| bindings.call_schemas(store))
+        let schemas_json = live
+            .store
+            .call(|store| live.bindings.call_schemas(store))
             .await
             .map_err(|source| wall_budget_load_error("schemas", source))?
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
@@ -3128,8 +3153,8 @@ impl WasmProviderFactory {
             .map_err(|e| provider_schema_decode_error(name, &version, e))?;
 
         let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
-            Self::load_metadata(&bindings, &mut store, name, &version).await?;
-        let init_instance = RebuildableInstance::new(store, bindings, rebuild);
+            Self::load_metadata(&live.bindings, &mut live.store, name, &version).await?;
+        let init_instance = RebuildableInstance::new(live, rebuild);
 
         Ok(Self {
             engine,
@@ -3326,7 +3351,7 @@ impl WasmProviderFactory {
     async fn create_initialized_instance(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
+    ) -> Result<LiveInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
@@ -3337,13 +3362,13 @@ impl WasmProviderFactory {
         } else {
             InstantiationWorld::Basic
         };
-        let (mut store, bindings) =
+        let mut live =
             create_runtime_instance(&self.engine, &self.component, kind, world, self.budget)
                 .await?;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
             .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
-        store
-            .call(|store| bindings.call_initialize(store, &wit_attrs))
+        live.store
+            .call(|store| live.bindings.call_initialize(store, &wit_attrs))
             .await
             .map_err(|source| WasmProviderInstanceError::WallBudgetExceeded {
                 operation: "initialize",
@@ -3358,7 +3383,7 @@ impl WasmProviderFactory {
                 )
             })?;
 
-        Ok((store, bindings))
+        Ok(live)
     }
 
     /// Get or create the shared WASM instance for the given binding's
@@ -3380,8 +3405,8 @@ impl WasmProviderFactory {
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let (store, bindings) = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(FailFastInstance::new(store, bindings));
+        let live = self.create_initialized_instance(attributes).await?;
+        let instance = Arc::new(FailFastInstance::new(live));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -3408,6 +3433,16 @@ impl WasmProviderFactory {
         self.budget = budget;
         self.init_instance.set_budget(budget);
         self
+    }
+
+    /// Exposes the validation instance's actual linker world to integration
+    /// tests that exercise rebuild behavior.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn validation_instance_world_for_test(&self) -> Option<&'static str> {
+        self.init_instance
+            .live_world()
+            .await
+            .map(InstantiationWorld::test_name)
     }
 
     pub fn version(&self) -> &str {
@@ -8572,6 +8607,72 @@ mod tests {
         assert!(
             !rendered.contains("prior operation timed out"),
             "component traps must not be mislabeled as timeouts: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_uses_the_recorded_basic_world() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+
+        let config = build_engine_config();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let component = Component::new(&engine, wasm_bytes)
+            .expect("mock WASM provider component should compile");
+        let initial = match create_instance_for_world(
+            &engine,
+            &component,
+            None,
+            InstantiationWorld::Basic,
+            GuestCallBudget::PRODUCTION,
+        )
+        .await
+        {
+            Ok(initial) => initial,
+            Err(_) => panic!("the mock provider must support the basic world"),
+        };
+        assert_eq!(initial.instantiation_world(), InstantiationWorld::Basic);
+        let instance = RebuildableInstance::new(
+            initial,
+            RebuildContext {
+                engine,
+                component,
+                provider_kind: None,
+                world: InstantiationWorld::Basic,
+                budget: GuestCallBudget::PRODUCTION,
+            },
+        );
+        *instance.slot.lock().await = InstanceSlot::Poisoned {
+            reason: PoisonReason::Cancelled,
+        };
+
+        let locked = instance
+            .acquire("validate_config")
+            .await
+            .expect("the poisoned basic-world instance should rebuild");
+        locked
+            .call("validate_config", async |bindings, store| {
+                bindings.call_validate_config(store, &[]).await
+            })
+            .await
+            .expect("the rebuilt basic-world guest call should not trap")
+            .expect("the mock provider should accept an empty config");
+
+        assert_eq!(
+            instance.live_world().await,
+            Some(InstantiationWorld::Basic),
+            "the rebuilt live instance must record the basic world actually instantiated"
         );
     }
 

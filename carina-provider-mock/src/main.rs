@@ -150,7 +150,7 @@ impl MockProcessProvider {
         }
     }
 
-    fn normalizer_error(operation: &str, id: &ResourceId) -> ProviderError {
+    fn operation_error(operation: &str, id: &ResourceId) -> ProviderError {
         ProviderError {
             kind: ProviderErrorKind::Internal,
             message: format!("intentional mock {operation} error"),
@@ -500,6 +500,9 @@ impl CarinaProvider for MockProcessProvider {
         identifier: &AppliedIdentifier,
         _request: ReadRequest,
     ) -> Result<ReadOutcome, ProviderError> {
+        if id.identity == "__mock_read_error__" {
+            return Err(Self::operation_error("read", id));
+        }
         if id.identity == "__mock_non_finite_read__" {
             return Ok(ReadOutcome::Found {
                 state: AppliedState {
@@ -1143,7 +1146,7 @@ impl CarinaProvider for MockProcessProvider {
             .iter()
             .find(|resource| resource.id.identity == "__mock_normalize_desired_error__")
         {
-            return Err(Self::normalizer_error("normalize_desired", &resource.id));
+            return Err(Self::operation_error("normalize_desired", &resource.id));
         }
         Ok(resources)
     }
@@ -1172,7 +1175,7 @@ impl CarinaProvider for MockProcessProvider {
             .as_ref()
             .filter(|id| id.identity == "__mock_normalize_state_error__")
         {
-            return Err(Self::normalizer_error("normalize_state", id));
+            return Err(Self::operation_error("normalize_state", id));
         }
 
         let mut normalized: HashMap<_, _> = states
@@ -1233,7 +1236,7 @@ impl CarinaProvider for MockProcessProvider {
             .as_ref()
             .filter(|id| id.identity == "__mock_hydrate_state_error__")
         {
-            return Err(Self::normalizer_error("hydrate_read_state", id));
+            return Err(Self::operation_error("hydrate_read_state", id));
         }
         *states = std::mem::take(states)
             .into_iter()
