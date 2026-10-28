@@ -598,13 +598,22 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     };
     let plan_file = record_with_test_schemas(contents, &schemas);
 
-    let reloaded = inspected_saved_plan(plan_file)
-        .reload_in_flight_from_locked_state(None)
-        .expect("current-state snapshot should reload");
-    let checked = reloaded.verify_provider_load(
+    let bound = ProviderBoundPlanFile::for_test(
+        inspected_saved_plan(plan_file),
         ProviderLoad::for_test(Vec::new(), &[])
             .into_complete()
             .expect("test provider load is complete"),
+        Path::new("."),
+    )
+    .expect("placeholder-free plan must bind its provider load");
+    let reloaded = bound
+        .reload_in_flight_from_locked_state(None)
+        .expect("current-state snapshot should reload");
+    let ReloadedProviderBoundPlanFile::Verified { plan, providers } = reloaded else {
+        panic!("placeholder-free plan changed typestate during reload")
+    };
+    let checked = plan.verify_provider_load(
+        providers,
         ApplyTarget::SavedPlan {
             plan_file: Path::new("reviewed-plan.json"),
             source_dir: Path::new("."),
@@ -612,7 +621,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     );
 
     assert!(
-        matches!(checked, Ok((SchemaCheckedPlanFile::Verified(_), _))),
+        checked.is_ok(),
         "the immutable pre-reload reference inventory must verify unchanged schemas"
     );
 }

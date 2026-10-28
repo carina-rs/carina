@@ -20,30 +20,54 @@ use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
 fn execution_minting_checks_load_completeness_after_skipped_validation_in_provider_name_order() {
+    let provider_configs = || {
+        ["zeta", "alpha"]
+            .into_iter()
+            .map(|name| ProviderConfig {
+                name: name.to_string(),
+                source: Some(
+                    format!("file:///definitely-missing/{name}.wasm")
+                        .parse()
+                        .unwrap(),
+                ),
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+            })
+            .collect::<Vec<_>>()
+    };
     let incomplete_load = || {
+        let provider_configs = provider_configs();
         ProviderLoad::for_test_with_load_errors(
             Vec::new(),
-            &[],
+            &provider_configs,
             HashMap::from([
                 ("zeta".to_string(), "zeta failed".to_string()),
                 ("alpha".to_string(), "alpha failed".to_string()),
             ]),
         )
     };
-    let inference_error = carina_core::validation::inference::ExportInferenceError {
-        index: 0,
-        name: "broken".to_string(),
-        error: carina_core::validation::inference::InferenceError::UnknownBinding {
-            binding: "missing".to_string(),
-        },
+    let invalid_config = || carina_core::parser::InferredFile {
+        providers: provider_configs(),
+        arguments: vec![carina_core::parser::ArgumentParameter {
+            name: "unrelated".to_string(),
+            type_expr: carina_core::parser::TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }],
+        ..Default::default()
     };
 
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = invalid_config();
     let evaluated_error = match incomplete_load().validate_evaluated_config(
         &mut parsed,
         Path::new("."),
         true,
-        std::slice::from_ref(&inference_error),
+        &[],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
@@ -51,19 +75,20 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
     let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
-        carina_core::parser::InferredFile::default(),
+        invalid_config(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         Path::new("."),
         true,
-        &[inference_error],
+        &[],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
     };
 
-    assert_eq!(evaluated_error.to_string(), "alpha failed\nzeta failed");
-    assert_eq!(pair_error.to_string(), "alpha failed\nzeta failed");
+    let expected = "arguments blocks are only valid inside module definitions, not in root configurations.\nalpha failed\nzeta failed";
+    assert_eq!(evaluated_error.to_string(), expected);
+    assert_eq!(pair_error.to_string(), expected);
 }
 
 #[test]

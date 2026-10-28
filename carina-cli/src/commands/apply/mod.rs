@@ -76,8 +76,7 @@ use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, CheckedSavedPlanInputs, CompleteProviderLoad,
-    LateAnonymousIdentityInputs, ProviderLoad, ValidatedWiring,
+    AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, ProviderLoad, ValidatedWiring,
     create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
     get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
     prepare_default_provider_ready_config, read_managed_state_with_retry,
@@ -90,7 +89,8 @@ use crate::wiring::{WiringContext, read_with_retry};
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
     DesiredPlanFile, ExecutablePlanFile, HistoricalResourceAddresses, InspectedPlanFile,
-    SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile, SchemaCheckedPlanFile,
+    ProviderBoundPlanFile, ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates,
+    SchemaCheckedPendingPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -105,11 +105,6 @@ struct PlanFileHeader {
     _timestamp: serde::de::IgnoredAny,
     #[serde(default)]
     source_path: Option<serde_json::Value>,
-}
-
-enum SavedPlanProviderLoad {
-    Complete(CompleteProviderLoad),
-    CurrentConfigChecked(CheckedSavedPlanInputs),
 }
 
 fn saved_plan_secret_rehydration_error(
@@ -3170,7 +3165,6 @@ async fn run_apply_from_plan_with_observer_factory(
         base_dir,
     )?
     .into_complete()?;
-    let needs_secret_verification = inspected_plan.needs_secret_verification();
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may
@@ -3181,40 +3175,40 @@ async fn run_apply_from_plan_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     );
-    let mut loaded_current_config = match loaded_current_config {
-        Ok(config) => Some(config),
-        Err(source) if needs_secret_verification => {
-            return Err(saved_plan_secret_evaluation_error(
-                AppError::Config(source),
-                apply_target,
-            ));
-        }
-        Err(_) => None,
-    };
-    let parsed_backend = loaded_current_config
-        .as_ref()
-        .map(|config| config.parsed.backend.clone());
-    let providers = if needs_secret_verification {
-        let current_config = loaded_current_config
-            .take()
-            .expect("secret verification requires a loaded current configuration");
-        let parsed = current_config.parsed;
-        let unresolved = current_config.unresolved_parsed;
-        let inference_errors = current_config.inference_errors;
-        let duplicate_declarations = current_config.duplicate_declarations;
-        let providers = providers
-            .check_saved_plan_config_pair(
-                parsed,
-                unresolved,
-                base_dir,
-                false,
-                &inference_errors,
-                &duplicate_declarations,
+    let (inspected_plan, parsed_backend) = match inspected_plan {
+        InspectedPlanFile::Verified(plan) => {
+            let parsed_backend = loaded_current_config
+                .ok()
+                .map(|config| config.parsed.backend);
+            (
+                ProviderBoundPlanFile::verified(plan, providers),
+                parsed_backend,
             )
-            .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-        SavedPlanProviderLoad::CurrentConfigChecked(providers)
-    } else {
-        SavedPlanProviderLoad::Complete(providers)
+        }
+        InspectedPlanFile::NeedsSecretVerification(plan) => {
+            let current_config = loaded_current_config.map_err(|source| {
+                saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
+            })?;
+            let parsed_backend = Some(current_config.parsed.backend.clone());
+            let parsed = current_config.parsed;
+            let unresolved = current_config.unresolved_parsed;
+            let inference_errors = current_config.inference_errors;
+            let duplicate_declarations = current_config.duplicate_declarations;
+            let providers = providers
+                .check_saved_plan_config_pair(
+                    parsed,
+                    unresolved,
+                    base_dir,
+                    false,
+                    &inference_errors,
+                    &duplicate_declarations,
+                )
+                .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+            (
+                ProviderBoundPlanFile::needs_secret_verification(plan, providers),
+                parsed_backend,
+            )
+        }
     };
     let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
@@ -3262,7 +3256,6 @@ async fn run_apply_from_plan_with_observer_factory(
 
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        providers,
         provider_context,
         auto_approve,
         Arc::clone(&backend),
@@ -3286,8 +3279,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
-    inspected_plan: InspectedPlanFile,
-    providers: SavedPlanProviderLoad,
+    inspected_plan: ProviderBoundPlanFile,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3399,41 +3391,25 @@ async fn run_apply_from_plan_locked_owned(
             // state and mints the wiring witness. The secret-bearing variant
             // returns its retained current-config pair alongside that witness,
             // so validation is not repeated under the lock.
-            let (schema_checked_plan, validated_wiring, canonical_resources) = match providers {
-                SavedPlanProviderLoad::Complete(providers) => {
-                    let (plan, wiring) =
-                        inspected_plan.verify_provider_load(providers, apply_target)?;
-                    (plan, wiring, None)
+            let (desired_plan, validated_wiring) = match inspected_plan {
+                ReloadedProviderBoundPlanFile::Verified { plan, providers } => {
+                    let (plan, wiring) = plan.verify_provider_load(providers, apply_target)?;
+                    (DesiredPlanFile::Verified(plan), wiring)
                 }
-                SavedPlanProviderLoad::CurrentConfigChecked(providers) => {
-                    let (plan, wiring, canonical_resources) = inspected_plan
-                        .verify_provider_load_with_current_config(providers, apply_target)?;
-                    (plan, wiring, Some(canonical_resources))
-                }
-            };
-
-            let desired_plan = match schema_checked_plan {
-                SchemaCheckedPlanFile::Verified(plan) => DesiredPlanFile::Verified(plan),
-                SchemaCheckedPlanFile::NeedsSecretVerification(pending) => {
-                    let canonical_resources = canonical_resources.ok_or_else(|| {
-                        saved_plan_secret_evaluation_error(
-                            AppError::Config(
-                                "the current configuration was unavailable".to_string(),
-                            ),
-                            apply_target,
-                        )
-                    })?;
+                ReloadedProviderBoundPlanFile::NeedsSecretVerification { plan, providers } => {
+                    let (pending, wiring, canonical_resources) =
+                        plan.verify_provider_load(providers, apply_target)?;
                     let candidates = prepare_saved_plan_secret_candidates(
                         canonical_resources,
                         &pending,
                         &state_file,
                         project_dir,
                         provider_context,
-                        &validated_wiring,
+                        &wiring,
                     )
                     .await
                     .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-                    pending.verify_desired(candidates, apply_target)?
+                    (pending.verify_desired(candidates, apply_target)?, wiring)
                 }
             };
             let wiring = validated_wiring.context();
@@ -3806,13 +3782,15 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    let providers = match ProviderLoad::load(
+    let inspected_plan = match ProviderLoad::load(
         inspected_plan.provider_configs().as_provider_configs(),
         apply_target.source_dir(),
     )
     .and_then(ProviderLoad::into_complete)
-    {
-        Ok(providers) => providers,
+    .and_then(|providers| {
+        ProviderBoundPlanFile::for_test(inspected_plan, providers, apply_target.source_dir())
+    }) {
+        Ok(inspected_plan) => inspected_plan,
         Err(error) => {
             return finish_lock_command(
                 backend.as_ref(),
@@ -3827,7 +3805,6 @@ async fn run_apply_from_plan_locked(
     };
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        SavedPlanProviderLoad::Complete(providers),
         provider_context,
         auto_approve,
         Arc::clone(&backend),
