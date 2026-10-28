@@ -75,6 +75,10 @@ The SDK is not on crates.io; depend on it from git and pin `rev`. `serde`, `serd
 `carina-provider-hello/src/main.rs`:
 
 ```rust
+// The provider only runs as a WebAssembly component; on the host target
+// nothing calls it.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 use std::collections::HashMap;
 
 use carina_plugin_sdk::types::*;
@@ -304,6 +308,7 @@ The parts to notice:
 - `read` rebuilds the attributes from the identifier. A provider for a real API would call the API here and return `ReadOutcome::NotFound` when the resource is gone.
 - The token types are `Never`, an empty type, because every operation finishes in one call. The poll and resume methods still have to exist, but they can never be called, and `match token {}` proves that to the compiler.
 - `export_provider!` builds the provider with `Default`, so the type must implement it. `main` is empty; the host calls the exported functions, not `main`.
+- The macro only expands for `wasm32`, so on the host target (`cargo check`, rust-analyzer) nothing uses the provider. The `cfg_attr` line at the top keeps that from producing dead-code warnings.
 
 ## Build
 
@@ -315,7 +320,7 @@ The component is at `target/wasm32-wasip2/release/carina-provider-hello.wasm`.
 
 ## Use it from a configuration
 
-In a separate directory, point a `provider` block at the component with a `file://` URL. The path must be absolute.
+In a separate directory, create `main.crn` and point a `provider` block at the component with a `file://` URL. The path must be absolute. With no `backend` block, state goes to `carina.state.json` in that directory.
 
 ```crn
 provider hello {
@@ -331,12 +336,6 @@ exports {
 }
 ```
 
-```crn
-backend local {
-  path = 'carina.state.json'
-}
-```
-
 Install the provider, then plan and apply:
 
 ```bash
@@ -347,7 +346,7 @@ carina apply
 
 `carina plan` shows the greeting to be created, with `message` as `(known after apply)`. After `apply`, another `plan` reports no changes, because `read` returns the same attributes. Change `name` to `'carina'` and `plan` shows the greeting must be replaced, because `name` is create-only. `carina destroy` deletes it.
 
-`carina init` copies the component into `.carina/providers/` and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build.
+`carina init` installs the component into `.carina/providers/` (as a hard link when it can, otherwise a copy) and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build and update the checksum.
 
 ## Use it from GitHub
 
@@ -360,7 +359,11 @@ provider hello {
 }
 ```
 
-With `version`, `carina init` picks the newest matching release tagged `v<version>` and downloads its asset named `<repo>-v<version>.wasm`, for example `carina-provider-hello-v0.1.0.wasm`. With `revision` instead of `version`, it installs the CI build for a branch, tag or commit, taken from the workflow artifact named `<repo>.wasm`; this calls the GitHub API, so it needs `GITHUB_TOKEN` or a logged-in `gh`. A GitHub source is not signature-checked, but `carina init` records the checksum of what it downloaded in the lock file.
+`version` is a semver constraint, as for any provider. `carina init` lists the repository's releases through the GitHub API, picks the newest version that matches, and downloads the release asset named `<repo>-v<version>.wasm` from the tag `v<version>`, for example `carina-provider-hello-v0.1.0.wasm` from `v0.1.0`. Tag releases with the `v` prefix. This lookup sends no token, so the repository must be public, and only the 100 most recent releases are considered.
+
+With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit: the workflow artifact named `<repo>.wasm`. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
+
+A GitHub source is not signature-checked, but `carina init` records the checksum of what it downloaded in the lock file.
 
 ## Next
 

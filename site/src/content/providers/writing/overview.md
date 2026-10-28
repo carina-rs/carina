@@ -18,6 +18,8 @@ A provider is a [WebAssembly component](https://component-model.bytecodealliance
 
 You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
+`export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, write `export_provider!(MyProvider, http)` and add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+
 ## How the host calls a provider
 
 When a command such as `carina plan` loads a provider, the host:
@@ -49,7 +51,9 @@ An update never receives the full desired resource. It receives a patch, a list 
 | `Remove` | The attribute was removed from the configuration. |
 | `Reassert` | A write-only attribute that has not changed, sent again because the API cannot read it back and the update would otherwise drop it. |
 
-The patch is the whole update. A provider must not change any attribute the patch does not mention. Carina sends `Reassert` only when another attribute already causes an update; a difference in a write-only value on its own never plans one.
+The patch is the whole update. A provider must not change any attribute the patch does not mention.
+
+A write-only attribute (one the API accepts but never returns, such as a password) still gets `Add`, `Replace` and `Remove` when its value changes: Carina records which write-only values it last sent and compares the configuration with that record. `Reassert` is different. It carries a write-only attribute whose value has not changed, and Carina adds it only to an update that something else already caused.
 
 ## Short calls; the host waits
 
@@ -67,7 +71,7 @@ A provider runs with no filesystem access. It sees only these environment variab
 - AWS credential and region variables, only for providers named `aws` or `awscc`.
 - `GITHUB_TOKEN`, only for a provider named `github`.
 
-A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead.
+The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead.
 
 ## Protocol version
 
