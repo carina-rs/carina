@@ -2008,7 +2008,10 @@ fn test_missing_required_argument() {
     );
 
     let result = resolver.expand_module_call(&call, "my_instance");
-    assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
+    assert!(matches!(
+        result.as_ref().map_err(|error| error.root_cause()),
+        Err(ModuleError::MissingArgument { .. })
+    ));
 }
 
 #[test]
@@ -2296,7 +2299,10 @@ fn test_unknown_argument_rejected() {
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
-        matches!(result, Err(ModuleError::UnknownArgument { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::UnknownArgument { .. })
+        ),
         "Expected UnknownArgument error, got {:?}",
         result
     );
@@ -3252,7 +3258,7 @@ fn test_argument_validation_fails_with_invalid_value() {
         "{rendered}"
     );
     assert!(rendered.contains("got 0"), "{rendered}");
-    match err {
+    match err.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.module, "web_server");
             assert_eq!(diagnostic.arguments, ["port"]);
@@ -3363,7 +3369,7 @@ fn test_argument_validation_no_message_uses_default() {
     let result = resolver.expand_module_call(&call, "c");
     assert!(result.is_err());
     let err = result.unwrap_err();
-    match err {
+    match err.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.message, "validation failed for argument 'count'");
         }
@@ -3444,7 +3450,8 @@ fn test_argument_validation_len_with_list() {
     });
     let result = resolver.expand_module_call(&call, "t");
     assert!(result.is_err());
-    match result.unwrap_err() {
+    let error = result.unwrap_err();
+    match error.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.message, "At least one tag is required");
         }
@@ -3605,7 +3612,8 @@ fn test_require_block_fails_with_not_expr() {
     });
     let result = resolver.expand_module_call(&call, "w");
     assert!(result.is_err());
-    match result.unwrap_err() {
+    let error = result.unwrap_err();
+    match error.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.message, "cert is required when HTTPS is enabled");
         }
@@ -3690,7 +3698,8 @@ fn test_require_block_len_function() {
     });
     let result = resolver.expand_module_call(&call, "lb");
     assert!(result.is_err());
-    match result.unwrap_err() {
+    let error = result.unwrap_err();
+    match error.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.message, "ALB requires at least two subnets");
         }
@@ -3796,7 +3805,7 @@ fn test_require_block_multiple_constraints() {
         rendered.contains("min_size must be <= max_size"),
         "{rendered}"
     );
-    match error {
+    match error.root_cause() {
         ModuleError::Constraint(diagnostic) => {
             assert_eq!(diagnostic.message, "min_size must be <= max_size");
         }
@@ -3829,7 +3838,10 @@ fn test_argument_type_mismatch_int_for_string() {
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
-        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::InvalidArgumentType { .. })
+        ),
         "Expected InvalidArgumentType error, got {:?}",
         result
     );
@@ -3864,7 +3876,10 @@ fn test_argument_type_mismatch_string_for_bool() {
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
-        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::InvalidArgumentType { .. })
+        ),
         "Expected InvalidArgumentType error, got {:?}",
         result
     );
@@ -3936,7 +3951,10 @@ fn test_argument_type_custom_validator() {
     });
     let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
-        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::InvalidArgumentType { .. })
+        ),
         "Expected InvalidArgumentType error for invalid ARN, got {:?}",
         result
     );
@@ -4009,7 +4027,10 @@ fn test_argument_type_list_of_custom_type() {
     });
     let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
-        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::InvalidArgumentType { .. })
+        ),
         "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
         result
     );
@@ -5572,7 +5593,10 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
 
     let result = resolver.expand_module_call(&call, "my_env");
     assert!(
-        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        matches!(
+            result.as_ref().map_err(|error| error.root_cause()),
+            Err(ModuleError::InvalidArgumentType { .. })
+        ),
         "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
          carina-rs/carina#2611. Got: {:?}",
         result
