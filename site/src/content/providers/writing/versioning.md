@@ -27,7 +27,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 12, for example, added a required `write_only` flag to nested struct fields in schemas. A provider built for the previous protocol would have sent no such flag, Carina would have treated every nested field as not write-only, and it would have planned updates that never converge. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
+Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 12, for example, added a required `write_only` flag to nested struct fields in schemas. An older Carina would have ignored that flag from a newer provider, treated every nested field as not write-only, and planned updates that never converge. The other direction would have been just as bad, so the flag is required: a provider built for an older protocol sends schemas without it, and a newer Carina could not even decode them. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
 
 ## When the protocol changes
 
