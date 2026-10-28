@@ -61,15 +61,151 @@ impl fmt::Display for ArtifactDownloadError {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct WorkflowRun {
     id: u64,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    head_repository: Option<WorkflowRunHeadRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunHeadRepository {
+    #[serde(default)]
+    full_name: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct WorkflowRunsResponse {
     #[serde(default)]
     workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkflowRunRejectionReason {
+    MissingEvent,
+    EventIsNotPush,
+    MissingHeadRepository,
+    HeadRepositoryMismatch,
+}
+
+impl fmt::Display for WorkflowRunRejectionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingEvent => "event is missing",
+            Self::EventIsNotPush => "event is not push",
+            Self::MissingHeadRepository => "head repository is missing",
+            Self::HeadRepositoryMismatch => "head repository does not match the source repository",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkflowRunRejection {
+    run_id: u64,
+    event: Option<String>,
+    head_repository: Option<String>,
+    reason: WorkflowRunRejectionReason,
+}
+
+impl fmt::Display for WorkflowRunRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let event = self.event.as_deref().unwrap_or("<missing>");
+        let head_repository = self.head_repository.as_deref().unwrap_or("<missing>");
+        write!(
+            formatter,
+            "run {} (event: {event}, head repository: {head_repository}) [{}]",
+            self.run_id, self.reason
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkflowRunSelection {
+    expected_repository: String,
+    eligible_run_ids: Vec<u64>,
+    rejected_runs: Vec<WorkflowRunRejection>,
+}
+
+impl WorkflowRunSelection {
+    fn into_eligible_run_ids(self) -> Result<Vec<u64>, NoEligibleWorkflowRuns> {
+        if self.eligible_run_ids.is_empty() {
+            Err(NoEligibleWorkflowRuns {
+                expected_repository: self.expected_repository,
+                rejected_runs: self.rejected_runs,
+            })
+        } else {
+            Ok(self.eligible_run_ids)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NoEligibleWorkflowRuns {
+    expected_repository: String,
+    rejected_runs: Vec<WorkflowRunRejection>,
+}
+
+impl fmt::Display for NoEligibleWorkflowRuns {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rejected_runs = if self.rejected_runs.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.rejected_runs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        write!(
+            formatter,
+            "Only push runs from {} are used. Rejected runs: {rejected_runs}.",
+            self.expected_repository
+        )
+    }
+}
+
+fn filter_workflow_runs(
+    source: &GithubSource,
+    workflow_runs: Vec<WorkflowRun>,
+) -> WorkflowRunSelection {
+    let expected_repository = format!("{}/{}", source.owner(), source.repo());
+    let mut eligible_run_ids = Vec::new();
+    let mut rejected_runs = Vec::new();
+
+    for run in workflow_runs {
+        let head_repository = run
+            .head_repository
+            .and_then(|repository| repository.full_name);
+        let reason = match run.event.as_deref() {
+            None => Some(WorkflowRunRejectionReason::MissingEvent),
+            Some(event) if event != "push" => Some(WorkflowRunRejectionReason::EventIsNotPush),
+            Some(_) => match head_repository.as_deref() {
+                None => Some(WorkflowRunRejectionReason::MissingHeadRepository),
+                Some(repository) if !repository.eq_ignore_ascii_case(&expected_repository) => {
+                    Some(WorkflowRunRejectionReason::HeadRepositoryMismatch)
+                }
+                Some(_) => None,
+            },
+        };
+
+        match reason {
+            Some(reason) => rejected_runs.push(WorkflowRunRejection {
+                run_id: run.id,
+                event: run.event,
+                head_repository,
+                reason,
+            }),
+            None => eligible_run_ids.push(run.id),
+        }
+    }
+
+    WorkflowRunSelection {
+        expected_repository,
+        eligible_run_ids,
+        rejected_runs,
+    }
 }
 
 /// Obtain a GitHub token for API authentication.
@@ -140,8 +276,8 @@ pub fn resolve_ref_to_sha(
         .ok_or_else(|| format!("No SHA found for revision '{revision}' in {source}"))
 }
 
-/// Find all successful workflow runs for a given commit SHA.
-/// Returns run IDs newest-first, matching GitHub's default ordering.
+/// Find eligible successful workflow runs for a given commit SHA.
+/// Returns same-repository push run IDs newest-first, matching GitHub's default ordering.
 ///
 /// Multiple workflows may run on the same commit (e.g. `ci.yml` and `docs.yml`
 /// both triggered on push to main). The caller inspects artifacts from every
@@ -179,7 +315,11 @@ fn find_workflow_run_ids(
     let data: WorkflowRunsResponse =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    Ok(data.workflow_runs.into_iter().map(|r| r.id).collect())
+    filter_workflow_runs(source, data.workflow_runs)
+        .into_eligible_run_ids()
+        .map_err(|error| {
+            format!("No eligible successful workflow runs found for {source}@{sha}. {error}")
+        })
 }
 
 /// Fetch the artifacts list for a single workflow run.
@@ -1214,6 +1354,188 @@ mod tests {
             name: name.to_string(),
             expired,
         }
+    }
+
+    fn workflow_run(id: u64, event: Option<&str>, head_repository: Option<&str>) -> WorkflowRun {
+        WorkflowRun {
+            id,
+            event: event.map(str::to_string),
+            head_repository: head_repository.map(|full_name| WorkflowRunHeadRepository {
+                full_name: Some(full_name.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_rejects_fork_pull_request_run() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            vec![workflow_run(
+                101,
+                Some("pull_request"),
+                Some("contributor/carina-provider-aws"),
+            )],
+        );
+
+        assert!(selection.eligible_run_ids.is_empty());
+        assert_eq!(selection.rejected_runs.len(), 1);
+        assert_eq!(selection.rejected_runs[0].run_id, 101);
+        assert_eq!(
+            selection.rejected_runs[0].reason,
+            WorkflowRunRejectionReason::EventIsNotPush
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_rejects_same_repo_pull_request_run() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            vec![workflow_run(
+                102,
+                Some("pull_request"),
+                Some("carina-rs/carina-provider-aws"),
+            )],
+        );
+
+        assert!(selection.eligible_run_ids.is_empty());
+        assert_eq!(selection.rejected_runs.len(), 1);
+        assert_eq!(
+            selection.rejected_runs[0].reason,
+            WorkflowRunRejectionReason::EventIsNotPush
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_accepts_repository_push_run_case_insensitively() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            vec![workflow_run(
+                103,
+                Some("push"),
+                Some("CARINA-RS/CARINA-PROVIDER-AWS"),
+            )],
+        );
+
+        assert_eq!(selection.eligible_run_ids, vec![103]);
+        assert!(selection.rejected_runs.is_empty());
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_rejects_other_repository_push_run() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            vec![workflow_run(
+                104,
+                Some("push"),
+                Some("carina-rs/carina-provider-aws-fork"),
+            )],
+        );
+
+        assert!(selection.eligible_run_ids.is_empty());
+        assert_eq!(selection.rejected_runs.len(), 1);
+        assert_eq!(
+            selection.rejected_runs[0].reason,
+            WorkflowRunRejectionReason::HeadRepositoryMismatch
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_mixed_runs_keeps_only_repository_push_run() {
+        let selection = filter_workflow_runs(
+            &test_source(),
+            vec![
+                workflow_run(
+                    105,
+                    Some("pull_request"),
+                    Some("contributor/carina-provider-aws"),
+                ),
+                workflow_run(
+                    106,
+                    Some("pull_request"),
+                    Some("carina-rs/carina-provider-aws"),
+                ),
+                workflow_run(107, Some("push"), Some("carina-rs/carina-provider-aws")),
+                workflow_run(108, Some("push"), Some("other/carina-provider-aws")),
+            ],
+        );
+
+        assert_eq!(selection.eligible_run_ids, vec![107]);
+        assert_eq!(
+            selection
+                .rejected_runs
+                .iter()
+                .map(|rejection| rejection.run_id)
+                .collect::<Vec<_>>(),
+            vec![105, 106, 108]
+        );
+    }
+
+    #[test]
+    fn revision_workflow_run_filter_no_eligible_run_error_lists_rejections() {
+        let source = test_source();
+        let response: WorkflowRunsResponse = serde_json::from_str(
+            r#"{
+                "workflow_runs": [
+                    {
+                        "id": 109,
+                        "event": "pull_request",
+                        "head_repository": {
+                            "full_name": "contributor/carina-provider-aws"
+                        }
+                    },
+                    {
+                        "id": 110,
+                        "event": "push",
+                        "head_repository": {
+                            "full_name": "other/carina-provider-aws"
+                        }
+                    },
+                    {
+                        "id": 111,
+                        "head_repository": {
+                            "full_name": "carina-rs/carina-provider-aws"
+                        }
+                    },
+                    {
+                        "id": 112,
+                        "event": "push",
+                        "head_repository": {}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let selection = filter_workflow_runs(&source, response.workflow_runs);
+
+        let error = selection
+            .into_eligible_run_ids()
+            .expect_err("all ineligible runs must produce an error")
+            .to_string();
+
+        assert!(
+            error.contains("Only push runs from carina-rs/carina-provider-aws are used"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "run 109 (event: pull_request, head repository: contributor/carina-provider-aws)"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("run 110 (event: push, head repository: other/carina-provider-aws)"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "run 111 (event: <missing>, head repository: carina-rs/carina-provider-aws)"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("run 112 (event: push, head repository: <missing>)"),
+            "{error}"
+        );
     }
 
     fn artifact_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
