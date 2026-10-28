@@ -71,6 +71,8 @@ use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
 use carina_state::{BackendError, LoadedOrphans, StateFile};
 
+#[cfg(test)]
+use crate::commands::shared::progress::RecordedProgressLines;
 use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
 use crate::commands::split_validation_message;
 use crate::error::AppError;
@@ -127,15 +129,6 @@ pub fn set_trusted_local_grant_inputs(
     TRUSTED_LOCAL_GRANT_INPUTS
         .set(TrustedLocalGrantInputs::new(cli_values, env_value))
         .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
-}
-
-fn trusted_local_grants() -> Result<
-    &'static carina_provider_resolver::TrustedLocalGrants,
-    carina_provider_resolver::GrantParseError,
-> {
-    TRUSTED_LOCAL_GRANT_INPUTS
-        .get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None))
-        .get()
 }
 
 /// Result of creating a plan, with context needed for saving
@@ -242,10 +235,61 @@ pub struct WiringContext {
     schemas: SchemaRegistry,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
+    provider_artifacts: BTreeMap<String, LoadedProviderArtifact>,
+}
+
+/// A WASM provider factory paired with the resolver-minted identity of the
+/// exact artifact bytes that produced it.
+pub struct LoadedProviderFactory {
+    factory: Box<dyn ProviderFactory>,
+    artifact: carina_provider_resolver::LoadedArtifactIdentity,
+}
+
+impl LoadedProviderFactory {
+    /// Attach resolver-minted test identities to in-process factories.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(factories: Vec<Box<dyn ProviderFactory>>) -> Vec<Self> {
+        factories
+            .into_iter()
+            .map(|factory| {
+                let bytes = format!("in-process test factory {}", factory.name());
+                Self::for_test_with_bytes(factory, bytes)
+            })
+            .collect()
+    }
+
+    /// Attach a resolver-minted test identity for explicit artifact bytes.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test_with_bytes(factory: Box<dyn ProviderFactory>, bytes: impl AsRef<[u8]>) -> Self {
+        let identity = carina_provider_resolver::ProviderLoadIdentity::for_test(
+            factory.name(),
+            carina_provider_resolver::ProviderTrustClass::Untrusted,
+        );
+        let verified = carina_provider_resolver::VerifiedLoad::for_test(bytes, identity);
+        Self::new(factory, verified.artifact().clone())
+    }
+
+    fn new(
+        factory: Box<dyn ProviderFactory>,
+        artifact: carina_provider_resolver::LoadedArtifactIdentity,
+    ) -> Self {
+        Self { factory, artifact }
+    }
+
+    fn into_factory(self) -> Box<dyn ProviderFactory> {
+        self.factory
+    }
+}
+
+/// Provider-kind artifacts that participate in one CLI wiring context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedProviderArtifact {
+    BuiltIn,
+    Wasm(carina_provider_resolver::LoadedArtifactIdentity),
 }
 
 /// Provider factories paired with provider-specific load diagnostics.
-pub type ProviderFactoryLoad = (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>);
+pub type ProviderFactoryLoad = (Vec<LoadedProviderFactory>, HashMap<String, String>);
 
 #[derive(Debug)]
 pub(crate) enum ProviderFactoryDiagnostic {
@@ -271,29 +315,45 @@ impl From<String> for ProviderFactoryDiagnostic {
 }
 
 pub(crate) type FormattingFactoryLoad = (
-    Vec<Box<dyn ProviderFactory>>,
+    Vec<LoadedProviderFactory>,
     HashMap<String, ProviderFactoryDiagnostic>,
 );
 
 impl WiringContext {
-    pub fn new(
-        factories: Vec<Box<dyn ProviderFactory>>,
-        provider_configs: &[ProviderConfig],
-    ) -> Self {
+    pub fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
         Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
     }
 
     pub(crate) fn new_with_additional_schemas(
-        factories: Vec<Box<dyn ProviderFactory>>,
+        loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         let uses_builtin_mock =
             carina_provider_mock::uses_builtin_provider(provider_configs, |provider_name| {
-                factories
+                loaded_factories
                     .iter()
-                    .any(|factory| factory.name() == provider_name)
+                    .any(|loaded| loaded.factory.name() == provider_name)
             });
+        let mut provider_artifacts = loaded_factories
+            .iter()
+            .map(|loaded| {
+                (
+                    loaded.factory.name().to_string(),
+                    LoadedProviderArtifact::Wasm(loaded.artifact.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if uses_builtin_mock {
+            provider_artifacts.insert(
+                BUILTIN_PROVIDER_NAME.to_string(),
+                LoadedProviderArtifact::BuiltIn,
+            );
+        }
+        let factories = loaded_factories
+            .into_iter()
+            .map(LoadedProviderFactory::into_factory)
+            .collect::<Vec<_>>();
         let mut schemas = SchemaRegistry::new();
         for (provider, schema) in additional_schemas {
             schemas.insert(provider, schema);
@@ -328,7 +388,29 @@ impl WiringContext {
             schemas,
             known_providers,
             uses_builtin_mock,
+            provider_artifacts,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_configs: &[ProviderConfig],
+    ) -> Self {
+        Self::new(LoadedProviderFactory::for_test(factories), provider_configs)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_additional_schemas(
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_configs: &[ProviderConfig],
+        additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+    ) -> Self {
+        Self::new_with_additional_schemas(
+            LoadedProviderFactory::for_test(factories),
+            provider_configs,
+            additional_schemas,
+        )
     }
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
@@ -347,6 +429,10 @@ impl WiringContext {
         &self.known_providers
     }
 
+    pub fn provider_artifacts(&self) -> &BTreeMap<String, LoadedProviderArtifact> {
+        &self.provider_artifacts
+    }
+
     fn uses_builtin_mock(&self) -> bool {
         self.uses_builtin_mock
     }
@@ -355,8 +441,7 @@ impl WiringContext {
 /// Build provider factories from provider configs that have a `source` attribute.
 ///
 /// For each provider with a `source`, resolves the WASM component path and creates a
-/// `WasmProviderFactory`. Providers without `source` are skipped (handled
-/// later in `get_provider_with_ctx`).
+/// `WasmProviderFactory`. Providers without `source` are skipped.
 ///
 /// Returns `(factories, load_errors)` where `load_errors` maps provider names
 /// to their failure reasons, so callers can show accurate diagnostics. A stale
@@ -433,11 +518,25 @@ where
             >,
         >,
 {
-    let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+    let mut factories = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
+    let mut attempted_default_sources = HashSet::new();
 
     for config in providers {
-        let Some(_) = &config.source else { continue };
+        let Some(source) = &config.source else {
+            continue;
+        };
+        if config.is_default() && !attempted_default_sources.insert(config.name.clone()) {
+            let reason = format!(
+                "Provider kind '{}' is declared more than once with a source; declare exactly one top-level `provider {}` block.",
+                config.name, config.name
+            );
+            if report_errors {
+                return Err(AppError::Validation(reason));
+            }
+            load_errors.insert(config.name.clone(), reason);
+            continue;
+        }
 
         let installed = match carina_provider_resolver::find_installed_provider(base_dir, config) {
             Ok(installed) => installed,
@@ -453,11 +552,15 @@ where
 
         let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(grants, &mut loader))
+            tokio::runtime::Handle::current().block_on(installed.load_with(grants, |verified| {
+                let artifact = verified.artifact().clone();
+                let loaded = loader(verified);
+                async move { loaded.await.map(|factory| (factory, artifact)) }
+            }))
         });
 
         match factory_result {
-            Ok(factory) => {
+            Ok((factory, artifact)) => {
                 if let Some(constraint) = &config.version
                     && let Err(message) = factory.verify_version(&constraint.raw)
                 {
@@ -470,13 +573,23 @@ where
                     load_errors.insert(config.name.clone(), reason);
                     continue;
                 }
-                factories.push(Box::new(factory));
+                let runtime_artifact = installed.clone();
+                let factory = factory.with_runtime_instantiation_error_mapper(move |error| {
+                    runtime_instantiation_error_with_provenance(&runtime_artifact, error)
+                });
+                factories.push(LoadedProviderFactory::new(Box::new(factory), artifact));
             }
             Err(error) => {
                 let error = match take_unverified_official_load_error(error) {
                     Ok(unverified) => return Err(AppError::from(unverified)),
                     Err(error) => error,
                 };
+                if report_errors
+                    && let Some(mismatch) =
+                        source_provider_kind_mismatch_from_load_error(source, &error)
+                {
+                    return Err(mismatch);
+                }
                 // Final UI boundary: `ProviderArtifactLoadError::Display`
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
@@ -490,46 +603,6 @@ where
     }
 
     Ok((factories, load_errors))
-}
-
-async fn load_installed_wasm_provider(
-    installed: &carina_provider_resolver::InstalledProvider,
-    grants: &carina_provider_resolver::TrustedLocalGrants,
-) -> Result<
-    carina_plugin_host::WasmProviderFactory,
-    carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
-> {
-    load_installed_wasm_provider_using(installed, grants, |verified| async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
-    })
-    .await
-}
-
-async fn load_installed_wasm_provider_using<F, Fut>(
-    installed: &carina_provider_resolver::InstalledProvider,
-    grants: &carina_provider_resolver::TrustedLocalGrants,
-    loader: F,
-) -> Result<
-    carina_plugin_host::WasmProviderFactory,
-    carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
->
-where
-    F: FnOnce(carina_provider_resolver::VerifiedLoad) -> Fut,
-    Fut: std::future::Future<
-            Output = Result<
-                carina_plugin_host::WasmProviderFactory,
-                carina_plugin_host::WasmProviderLoadError,
-            >,
-        >,
-{
-    // Injection keeps wiring regression tests out of the user's default precompile cache.
-    let factory = installed.load_with(grants, loader).await?;
-    let runtime_artifact = installed.clone();
-    Ok(
-        factory.with_runtime_instantiation_error_mapper(move |error| {
-            runtime_instantiation_error_with_provenance(&runtime_artifact, error)
-        }),
-    )
 }
 
 fn runtime_instantiation_error_with_provenance<E>(
@@ -1926,27 +1999,17 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
 pub(crate) async fn get_provider_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
-    base_dir: &Path,
     progress_sink: ProgressSink,
 ) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
     // Two-pass build so named instances can reuse the kind's factory.
     // Pass 1 handles every default instance (top-level `provider <kind>`
-    // blocks) — these are the entries that carry `source`/`version` and
-    // may need a WASM plugin to be loaded. Pass 2 handles each named
-    // instance (`let <name> = provider <kind> { ... }`), reusing the
-    // factory the default instance already brought in.
+    // blocks). Pass 2 handles each named instance (`let <name> = provider
+    // <kind> { ... }`), reusing the same context factory.
     for provider_config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(
-            ctx,
-            &mut router,
-            provider_config,
-            base_dir,
-            None,
-            progress_sink,
-        )
-        .await?;
+        instantiate_provider_into_router(ctx, &mut router, provider_config, None, progress_sink)
+            .await?;
     }
 
     for provider_config in configs.iter().filter(|config| !config.is_default()) {
@@ -1955,7 +2018,6 @@ pub(crate) async fn get_provider_with_ctx(
             ctx,
             &mut router,
             provider_config,
-            base_dir,
             inherited_source,
             progress_sink,
         )
@@ -2006,12 +2068,7 @@ pub(crate) fn prepare_default_provider_ready_config(
 /// default-instance and named-instance wiring paths (carina#3067).
 ///
 /// One helper, one shape — the rule is that there is no other place
-/// in the codebase that builds this line. Both code paths
-/// (`try_add_source_provider` for the kind's default, the
-/// `find_factory` branch of `instantiate_provider_into_router` for
-/// named instances) call this function, so a future "third caller"
-/// physically cannot emit a divergent shape without touching this
-/// function.
+/// in the codebase that builds this line.
 ///
 /// - `kind` is the kind name (`aws`, `awscc`) — what the user writes
 ///   in `provider <kind> {}` and routes to via `directives.provider`.
@@ -2019,12 +2076,9 @@ pub(crate) fn prepare_default_provider_ready_config(
 /// - `binding = None` is the kind's default instance and is rendered
 ///   as `instance=default`. Explicit, not omitted: the omission is
 ///   exactly what made the old shape ambiguous.
-/// - `source = None` is omitted from the rendered line. In practice
-///   both call paths feed a `Some(...)`: the source-loading path has
-///   it directly, and the find_factory path threads in the kind
-///   default's source. `None` is only reachable if a kind default
-///   never declared a `source`, which currently only happens in
-///   mock/test wiring that doesn't pass through this helper.
+/// - `source = None` is omitted from the rendered line. Default instances
+///   use their own configured source; named instances inherit the kind
+///   default's source.
 fn format_provider_using_line(
     kind: &str,
     region: &str,
@@ -2041,44 +2095,27 @@ fn format_provider_using_line(
 /// Register a single provider instance into `router`. The config's binding
 /// determines whether this is the kind's default or a named instance.
 ///
-/// Source-loading (`provider <kind> { source = ... }`) is only invoked
-/// when this is the kind's default instance — named instances reuse the
-/// factory the default instance already loaded.
+/// Every instance is constructed from the factory retained by `ctx`; provider
+/// artifacts are resolved exactly once before the context is built.
 async fn instantiate_provider_into_router(
     ctx: &WiringContext,
     router: &mut ProviderRouter,
     provider_config: &ResolvedProviderConfig,
-    base_dir: &Path,
     inherited_source: Option<&ProviderSource>,
     progress_sink: ProgressSink,
 ) -> Result<(), AppError> {
     let binding = provider_config.binding();
-    // Named instances inherit `source`/`version`/`revision` from the
-    // kind's default — these fields are rejected by the parser when set
-    // on `let <name> = provider <kind> { ... }`. Only the default
-    // instance can trigger the source-loading path.
-    if provider_config.is_default()
-        && let Some(source) = provider_config.source()
-    {
-        try_add_source_provider(router, source, provider_config, base_dir, progress_sink).await?;
-        return Ok(());
-    }
-
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
         let config = prepare_provider_ready_config(factory, provider_config)?;
         let region = factory.extract_region(config.attributes());
-        // Reaching this branch implies `provider_config.source` is None:
-        // the early-return above handles a default config with a source,
-        // and the parser rejects `source` on named instances. So the only
-        // candidate for the log line is the kind default's source, threaded
-        // in by the caller as `inherited_source`.
-        progress_sink.line(
-            format_provider_using_line(factory.name(), &region, binding, inherited_source).cyan(),
-        );
+        let displayed_source = provider_config.source().or(inherited_source);
         let provider = factory
             .create_provider(binding, &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
+        progress_sink.line(
+            format_provider_using_line(factory.name(), &region, binding, displayed_source).cyan(),
+        );
         router.add_normalizer(
             provider_config.name().to_string(),
             factory
@@ -2093,81 +2130,35 @@ async fn instantiate_provider_into_router(
             provider_config.as_provider_config(),
             Box::new(MockProvider::new()),
         );
-    } else if !provider_config.name().is_empty() {
-        let message = match binding {
-            // Named instance whose kind's default did not register a
-            // factory — usually the default instance failed to load
-            // (a separate error has already been printed for it).
-            Some(name) => format!(
-                "Named provider instance '{}' (kind '{}') cannot be loaded \
-                 because the kind's default instance is unavailable.",
-                name,
-                provider_config.name()
-            ),
-            None => format!(
-                "Provider '{}' requires 'source' and 'version' attributes.",
-                provider_config.name()
-            ),
-        };
+    } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red());
     }
     Ok(())
 }
 
-async fn try_add_source_provider(
-    router: &mut ProviderRouter,
-    source: &ProviderSource,
-    config: &ResolvedProviderConfig,
-    base_dir: &Path,
-    progress_sink: ProgressSink,
-) -> Result<(), AppError> {
-    match load_source_provider(source, config, base_dir).await {
-        Ok((factory, provider, name, ready_config)) => {
-            let region = factory.extract_region(ready_config.attributes());
-            progress_sink
-                .line(format_provider_using_line(&name, &region, None, Some(source)).cyan());
-            router.add_provider_config(config.as_provider_config(), provider);
-            router.add_normalizer(
-                config.name().to_string(),
-                factory
-                    .create_normalizer(None, &ready_config)
-                    .await
-                    .map_err(|e| AppError::Provider(e.for_provider(config.name().to_string())))?,
-            );
-            Ok(())
-        }
-        Err(LoadSourceError::KindMismatch(error)) => Err(error),
-        Err(LoadSourceError::Provider(e)) => {
-            // Provider init failure (e.g. allowed_account_ids mismatch).
-            // Propagate verbatim so the CLI boundary can render it
-            // structurally without leaking implementation-detail
-            // wrappers like "Failed to load provider '...': ...".
-            // Attach provider name so the renderer can label the
-            // structured block with the right provider.
-            Err(source_provider_initialization_error(config.name(), e))
-        }
-        Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
-        Err(LoadSourceError::TrustedLocalGrant(error)) => Err(AppError::from(error)),
-        Err(LoadSourceError::UnverifiedOfficial(error)) => Err(AppError::from(error)),
-        Err(LoadSourceError::Wasm(error)) => {
-            // Terminal display boundary for the structured host error plus
-            // resolver provenance. The underlying error remains typed until
-            // this colorized stderr rendering.
-            eprintln!("{}", error.to_string().red());
-            Ok(())
-        }
-        Err(LoadSourceError::Other(msg)) => {
-            eprintln!(
-                "{}",
-                format!("Failed to load provider '{}': {}", config.name(), msg).red()
-            );
-            Ok(())
-        }
+fn missing_provider_message(
+    provider_config: &ResolvedProviderConfig,
+    inherited_source: Option<&ProviderSource>,
+) -> Option<String> {
+    if provider_config.name().is_empty() {
+        return None;
     }
-}
 
-fn source_provider_initialization_error(provider_name: &str, error: ProviderError) -> AppError {
-    AppError::Provider(error.for_provider(provider_name.to_string()))
+    Some(match provider_config.binding() {
+        Some(name) => format!(
+            "Named provider instance '{}' (kind '{}') cannot be loaded \
+             because the kind's default instance is unavailable.",
+            name,
+            provider_config.name()
+        ),
+        // A source-backed default that failed to load was already reported at
+        // the single factory-load boundary, so do not replace that diagnostic.
+        None if provider_config.source().is_some() || inherited_source.is_some() => return None,
+        None => format!(
+            "Provider '{}' requires 'source' and 'version' attributes.",
+            provider_config.name()
+        ),
+    })
 }
 
 fn source_provider_kind_mismatch_from_load_error(
@@ -2225,106 +2216,18 @@ fn take_unverified_official_load_error<E>(
         .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
-/// Failure mode for `load_source_provider`. Distinguishing between a
-/// provider init rejection and other plumbing failures lets the caller
-/// surface the former as a structured error without the
-/// "Failed to load provider '...': ..." wrapper that obscures the
-/// real message (#2407).
-enum LoadSourceError {
-    /// The loaded artifact reported a provider kind other than the block
-    /// that selected it.
-    KindMismatch(AppError),
-    /// Resolved provider configuration failed the construction gate.
-    Config(carina_core::executor::ProviderConfigPreparationError),
-    /// The provider's `init` step rejected the configuration (e.g.,
-    /// `allowed_account_ids` mismatch). Message is user-facing.
-    Provider(ProviderError),
-    /// WASM loading failed after resolution. Kept structured until the
-    /// terminal-rendering boundary so both the anyhow chain and artifact
-    /// provenance remain attached.
-    Wasm(
-        carina_provider_resolver::ProviderArtifactLoadError<
-            carina_plugin_host::WasmProviderLoadError,
-        >,
-    ),
-    /// A process-local privilege grant was invalid when provider loading began.
-    TrustedLocalGrant(carina_provider_resolver::GrantParseError),
-    /// An allow-listed provider did not have usable user-owned verification.
-    UnverifiedOfficial(carina_provider_resolver::UnverifiedOfficialProviderError),
-    /// Plumbing failure such as an artifact lookup or configuration error.
-    /// Logged and skipped.
-    Other(String),
-}
-
-async fn load_source_provider(
-    source: &ProviderSource,
-    config: &ResolvedProviderConfig,
-    base_dir: &Path,
-) -> Result<
-    (
-        Box<dyn ProviderFactory>,
-        Box<dyn Provider>,
-        String,
-        ProviderReadyConfig,
-    ),
-    LoadSourceError,
-> {
-    let installed =
-        carina_provider_resolver::find_installed_provider(base_dir, config.as_provider_config())
-            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
-
-    let grants = trusted_local_grants().map_err(LoadSourceError::TrustedLocalGrant)?;
-    let factory = match load_installed_wasm_provider(&installed, grants).await {
-        Ok(factory) => factory,
-        Err(error) => {
-            let error = match take_unverified_official_load_error(error) {
-                Ok(unverified) => return Err(LoadSourceError::UnverifiedOfficial(unverified)),
-                Err(error) => error,
-            };
-            if let Some(mismatch) = source_provider_kind_mismatch_from_load_error(source, &error) {
-                return Err(LoadSourceError::KindMismatch(mismatch));
-            }
-            return Err(LoadSourceError::Wasm(error));
-        }
-    };
-    let factory: Box<dyn ProviderFactory> = Box::new(factory);
-    let name = factory.name().to_string();
-
-    let ready_config =
-        prepare_provider_ready_config(factory.as_ref(), config).map_err(LoadSourceError::Config)?;
-
-    let provider = factory
-        .create_provider(None, &ready_config)
-        .await
-        .map_err(LoadSourceError::Provider)?;
-    Ok((factory, provider, name, ready_config))
-}
-
-/// Returns the wired router **and** the `WiringContext` it was built
-/// from. The apply-from-saved-plan path needs the context's factories
-/// and schemas to re-apply the full normalization pipeline after
-/// apply-time reference re-resolution (carina#3063) — without it the
-/// from-plan path would silently undo enum-alias / canonicalize stages.
+/// Build a router exclusively from factories already retained by `ctx`.
 pub async fn create_providers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
-    base_dir: &Path,
 ) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
     // Same two-pass shape as `get_provider_with_ctx`: default instances
-    // first (they may load the WASM plugin), then named instances reuse
-    // the factory that was just loaded.
+    // first, then named instances reuse the same context factory.
     for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(
-            ctx,
-            &mut router,
-            config,
-            base_dir,
-            None,
-            ProgressSink::Human,
-        )
-        .await?;
+        instantiate_provider_into_router(ctx, &mut router, config, None, ProgressSink::Human)
+            .await?;
     }
     for config in configs.iter().filter(|config| !config.is_default()) {
         let inherited_source = kind_default_source(configs, config.name());
@@ -2332,7 +2235,6 @@ pub async fn create_providers_from_configs_with_ctx(
             ctx,
             &mut router,
             config,
-            base_dir,
             inherited_source,
             ProgressSink::Human,
         )
@@ -3594,7 +3496,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
-    base_dir: &Path,
 ) -> Result<ExpandedPlanContext<E>, AppError> {
     let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
@@ -3617,7 +3518,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, provider_configs, base_dir, progress_sink).await?;
+    let provider = get_provider_with_ctx(ctx, provider_configs, progress_sink).await?;
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
 
@@ -5917,7 +5818,7 @@ pub(crate) fn prepare_data_sources_for_plan(
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ParsedFile;
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile {
         resources: resources.to_vec(),
         ..ParsedFile::default()
@@ -5931,7 +5832,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     let mut parsed = carina_core::parser::ParsedFile {
         resources: resources.to_vec(),
         ..Default::default()
@@ -5943,7 +5844,7 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![], &[]);
+    let ctx = WiringContext::new_for_test(vec![], &[]);
     errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
 }
 
@@ -5952,7 +5853,7 @@ pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![], providers);
+    let ctx = WiringContext::new_for_test(vec![], providers);
     let canonical_resources =
         carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas())?;
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);

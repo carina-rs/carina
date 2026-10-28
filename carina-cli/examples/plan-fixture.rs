@@ -21,13 +21,14 @@ use std::process::ExitCode;
 use carina_cli::DetailLevel;
 use carina_cli::display::{format_destroy_plan_with_delete_instances, print_plan};
 use carina_cli::fixture_plan::{
-    build_fixture_plan_change_summary, build_plan_from_fixture_name,
+    build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
     delete_instance_attributes_from_plan,
 };
 use carina_cli::plan_image::{
     ImageTheme, PlanImageInput, PlanImageTarget, StateMetadata, parse_output_target,
     render_plan_outputs, resolve_plan_image_options, write_inline_image, write_plan_image,
 };
+use carina_cli::wiring::LoadedProviderFactory;
 
 fn print_usage() {
     eprintln!(
@@ -147,7 +148,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let fp = build_plan_from_fixture_name(&fixture);
+    let fp = build_plan_from_fixture_name_using(&fixture, LoadedProviderFactory::for_test);
     let historical_display =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);

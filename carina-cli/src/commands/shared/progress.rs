@@ -23,10 +23,37 @@ use crate::error::AppError;
 ///
 /// Callers must choose this at construction so machine-readable stdout can
 /// never accidentally inherit the human-output fallback.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct RecordedProgressLines(Mutex<Vec<String>>);
+
+#[cfg(test)]
+impl PartialEq for RecordedProgressLines {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+#[cfg(test)]
+impl Eq for RecordedProgressLines {}
+
+#[cfg(test)]
+impl RecordedProgressLines {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProgressSink {
     Human,
     MachineStdout,
+    #[cfg(test)]
+    Recorded(&'static RecordedProgressLines),
 }
 
 impl ProgressSink {
@@ -34,6 +61,8 @@ impl ProgressSink {
         match self {
             Self::Human => println!("{line}"),
             Self::MachineStdout => eprintln!("{line}"),
+            #[cfg(test)]
+            Self::Recorded(lines) => lines.0.lock().unwrap().push(line.to_string()),
         }
     }
 
@@ -236,6 +265,10 @@ where
                 ProgressSink::MachineStdout => {
                     Self::with_tty(MultiProgress::new(), io::stderr(), io::stderr())
                 }
+                #[cfg(test)]
+                ProgressSink::Recorded(_) => {
+                    Self::with_tty(MultiProgress::new(), io::sink(), io::sink())
+                }
             }
         } else {
             match sink {
@@ -243,6 +276,8 @@ where
                 ProgressSink::MachineStdout => {
                     Self::with_plain_writers(io::stderr(), None::<io::Stderr>)
                 }
+                #[cfg(test)]
+                ProgressSink::Recorded(_) => Self::with_plain_writers(io::sink(), None::<io::Sink>),
             }
         }
     }

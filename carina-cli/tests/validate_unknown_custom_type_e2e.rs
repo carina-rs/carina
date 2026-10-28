@@ -208,16 +208,16 @@ impl Provider for NoopProvider {
     }
 }
 
-fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory {
+fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: false,
-    }) as Box<dyn ProviderFactory>]
+    }) as Box<dyn ProviderFactory>])
 }
 
-fn factories_with_generic_arn() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory {
+fn factories_with_generic_arn() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: true,
-    }) as Box<dyn ProviderFactory>]
+    }) as Box<dyn ProviderFactory>])
 }
 
 /// Two-directory fixture: a module that *declares* an unknown

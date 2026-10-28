@@ -38,13 +38,14 @@ use crate::provider_trust::{ProviderLoadIdentity, ProviderLoadIdentityError, Pro
 use crate::signing;
 use crate::trusted_local::TrustedLocalGrants;
 use crate::user_trust::{load_user_verified_identity, user_trust_record_exists};
-#[cfg(test)]
-use crate::verified_artifact::record_test_github_origin_download;
 use crate::verified_artifact::{
-    DownloadedArtifact, GithubReleaseArtifactPin, LockArtifactSelection, ProviderArtifactBytes,
-    VerifiedArtifact, VerifiedArtifactError, VerifiedLoad, lock_artifact_selection,
-    lookup_github_release_artifact_pin, publish_download, record_verified_registry_origin_download,
+    DownloadedArtifact, GithubReleaseArtifactPin, LoadedArtifactIdentity, LockArtifactSelection,
+    ProviderArtifactBytes, VerifiedArtifact, VerifiedArtifactError, VerifiedLoad,
+    lock_artifact_selection, lookup_github_release_artifact_pin, publish_download,
+    record_verified_registry_origin_download,
 };
+#[cfg(test)]
+use crate::verified_artifact::{LoadedArtifactOrigin, record_test_github_origin_download};
 use crate::version_resolver::{
     GithubRelease, ReleaseAssetVerificationError, VerifiedReleaseAsset,
     fetch_latest_release_with_api, fetch_releases_with_api, resolve_from_releases,
@@ -4704,7 +4705,19 @@ impl InstalledProvider {
         let identity = self
             .load_identity(grants, &mut notice_sink)
             .map_err(|error| self.with_identity_error(error))?;
-        loader(VerifiedLoad::new(self.artifact_bytes(), identity))
+        let bytes = self.artifact_bytes();
+        let artifact = match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => {
+                LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
+            }
+            InstalledArtifact::File {
+                path: _path,
+                bytes: _installed_bytes,
+                source: _source,
+                project_dir: _project_dir,
+            } => LoadedArtifactIdentity::file(&bytes),
+        };
+        loader(VerifiedLoad::new(bytes, identity, artifact))
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -22779,6 +22792,30 @@ future_protection_field = "retain-me"
 
         assert_eq!(loaded, original_bytes);
         assert_ne!(loaded, swapped_bytes);
+    }
+
+    #[tokio::test]
+    async fn file_load_identity_hashes_the_retained_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let retained_bytes = b"local provider retained at lookup";
+        fs::write(&source_path, retained_bytes).unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        fs::write(&source_path, b"different bytes after lookup").unwrap();
+
+        let artifact = installed
+            .load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.artifact().clone())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            artifact.sha256(),
+            format!("{:x}", Sha256::digest(retained_bytes))
+        );
+        assert_eq!(artifact.origin(), &LoadedArtifactOrigin::File);
     }
 
     fn no_local_grants() -> TrustedLocalGrants {

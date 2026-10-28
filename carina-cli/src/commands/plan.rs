@@ -51,7 +51,8 @@ use crate::plan_image::{
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream_with_ctx,
+    LoadedProviderArtifact, WiringContext, build_factories_from_providers,
+    create_plan_from_parsed_with_upstream_with_ctx,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
 use carina_core::hint::ProjectCommand;
@@ -123,6 +124,133 @@ pub struct SavedDataSourceValue {
     pub value: carina_core::data_source_value::DataSourceValue,
 }
 
+pub type PlanProviderArtifacts = BTreeMap<String, RecordedProviderArtifact>;
+
+/// Provider artifact identity persisted in a saved plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedProviderArtifact {
+    BuiltIn,
+    Wasm {
+        sha256: String,
+        origin: RecordedArtifactOrigin,
+    },
+}
+
+/// Resolver origin persisted for one WASM provider artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedArtifactOrigin {
+    Locked {
+        source: String,
+        version: RecordedLockedArtifactVersion,
+    },
+    File,
+}
+
+/// Lock-resolved version facts persisted for one provider artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedLockedArtifactVersion {
+    Version { version: String },
+    Revision { resolved_sha: String },
+    RegistryRevision { revision: String, version: String },
+}
+
+impl From<&LoadedProviderArtifact> for RecordedProviderArtifact {
+    fn from(artifact: &LoadedProviderArtifact) -> Self {
+        match artifact {
+            LoadedProviderArtifact::BuiltIn => Self::BuiltIn,
+            LoadedProviderArtifact::Wasm(identity) => {
+                let origin = match identity.origin() {
+                    carina_provider_resolver::LoadedArtifactOrigin::Locked { source, version } => {
+                        let version = match version {
+                            carina_provider_resolver::LockedArtifactVersion::Version {
+                                version,
+                            } => RecordedLockedArtifactVersion::Version {
+                                version: version.clone(),
+                            },
+                            carina_provider_resolver::LockedArtifactVersion::Revision {
+                                resolved_sha,
+                            } => RecordedLockedArtifactVersion::Revision {
+                                resolved_sha: resolved_sha.clone(),
+                            },
+                            carina_provider_resolver::LockedArtifactVersion::RegistryRevision {
+                                revision,
+                                version,
+                            } => RecordedLockedArtifactVersion::RegistryRevision {
+                                revision: revision.clone(),
+                                version: version.clone(),
+                            },
+                        };
+                        RecordedArtifactOrigin::Locked {
+                            source: source.to_string(),
+                            version,
+                        }
+                    }
+                    carina_provider_resolver::LoadedArtifactOrigin::File => {
+                        RecordedArtifactOrigin::File
+                    }
+                };
+                Self::Wasm {
+                    sha256: identity.sha256().to_string(),
+                    origin,
+                }
+            }
+        }
+    }
+}
+
+impl RecordedProviderArtifact {
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::BuiltIn => "built-in".to_string(),
+            Self::Wasm { sha256, origin } => {
+                let suffix = match origin {
+                    RecordedArtifactOrigin::File => "file".to_string(),
+                    RecordedArtifactOrigin::Locked { source, version } => match version {
+                        RecordedLockedArtifactVersion::Version { version } => {
+                            format!("source {source}, version {version}")
+                        }
+                        RecordedLockedArtifactVersion::Revision { resolved_sha } => {
+                            format!("source {source}, resolved revision {resolved_sha}")
+                        }
+                        RecordedLockedArtifactVersion::RegistryRevision { revision, version } => {
+                            format!(
+                                "source {source}, registry revision {revision}, version {version}"
+                            )
+                        }
+                    },
+                };
+                format!("wasm sha256 {sha256} ({suffix})")
+            }
+        }
+    }
+}
+
+pub(crate) fn recorded_provider_artifacts(ctx: &WiringContext) -> PlanProviderArtifacts {
+    ctx.provider_artifacts()
+        .iter()
+        .map(|(provider, artifact)| (provider.clone(), RecordedProviderArtifact::from(artifact)))
+        .collect()
+}
+
+#[cfg(test)]
+mod recorded_provider_artifact_tests {
+    use super::{RecordedArtifactOrigin, RecordedProviderArtifact};
+
+    #[test]
+    fn wasm_summary_includes_the_full_sha256() {
+        let sha256 = "a".repeat(64);
+        let artifact = RecordedProviderArtifact::Wasm {
+            sha256: sha256.clone(),
+            origin: RecordedArtifactOrigin::File,
+        };
+
+        assert_eq!(artifact.summary(), format!("wasm sha256 {sha256} (file)"));
+    }
+}
+
 /// Saved plan file for `plan --out` / `apply <plan-file>`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFile {
@@ -132,8 +260,9 @@ pub struct PlanFile {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 25 adds the mandatory typed `data_source_values` outcomes
-    /// and removes duplicate data-source rows from `current_states`.
+    /// Plan format 26 adds mandatory identities for every loaded provider
+    /// artifact. Plan format 25 adds the mandatory typed `data_source_values`
+    /// outcomes and removes duplicate data-source rows from `current_states`.
     /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
     /// format 21 explicitly tags managed and data-source current-state entries,
     /// and explicitly tags each managed [`Current`] variant. A serialized
@@ -254,13 +383,26 @@ pub struct PlanFile {
     /// Canonical fingerprints of exactly the managed and data-source schemas
     /// this plan used. This field is mandatory since plan format 23.
     pub schema_fingerprints: PlanSchemaFingerprints,
+    /// Exact provider-kind artifacts loaded while this plan was computed.
+    /// This field is mandatory since plan format 26.
+    pub provider_artifacts: PlanProviderArtifacts,
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 25;
+    pub const CURRENT_VERSION: u32 = 26;
 
-    /// Capture the exact schema type inventory reached by this plan.
-    pub fn record_schema_fingerprints(&mut self, schemas: &carina_core::schema::SchemaRegistry) {
+    /// Capture provider artifacts and the exact schema inventory together.
+    pub fn record_loaded_providers(&mut self, ctx: &WiringContext) {
+        let references = self.referenced_schema_types();
+        self.schema_fingerprints = PlanSchemaFingerprints::capture(&references, ctx.schemas());
+        self.provider_artifacts = recorded_provider_artifacts(ctx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_schema_fingerprints_for_test(
+        &mut self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) {
         let references = self.referenced_schema_types();
         self.schema_fingerprints = PlanSchemaFingerprints::capture(&references, schemas);
     }
@@ -596,6 +738,7 @@ impl PlanFile {
             upstream_sources: _upstream_sources,
             wait_bindings: _wait_bindings,
             schema_fingerprints: _schema_fingerprints,
+            provider_artifacts: _provider_artifacts,
         } = self;
 
         provider_configs.contains_redacted_secret()
@@ -1403,6 +1546,10 @@ impl ReloadedPlanFile {
             .verify(references, schemas)
     }
 
+    pub(crate) fn provider_artifacts(&self) -> &PlanProviderArtifacts {
+        &self.plan_file.provider_artifacts
+    }
+
     pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
         &self.plan_file.provider_configs
     }
@@ -1686,6 +1833,7 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
             schema_fingerprints: Default::default(),
+            provider_artifacts: Default::default(),
         }
     }
 
@@ -1890,7 +2038,7 @@ fn build_plan_file<E>(
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-    schemas: &carina_core::schema::SchemaRegistry,
+    wiring: &WiringContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     assert_eq!(
         ctx.data_sources.len(),
@@ -2181,8 +2329,9 @@ fn build_plan_file<E>(
             })
             .collect(),
         schema_fingerprints: PlanSchemaFingerprints::default(),
+        provider_artifacts: PlanProviderArtifacts::default(),
     };
-    plan_file.record_schema_fingerprints(schemas);
+    plan_file.record_loaded_providers(wiring);
     Ok(plan_file)
 }
 
@@ -2529,7 +2678,6 @@ pub async fn run_plan(
         provider_inputs.remote_bindings(),
         &state_block_claims,
         &resolved_state_block_targets,
-        base_dir,
     )
     .await?;
     let parsed = ctx.parsed();
@@ -2638,7 +2786,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            wiring.schemas(),
+            &wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -2698,7 +2846,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            wiring.schemas(),
+            &wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -2801,6 +2949,12 @@ pub(crate) struct PreparedPlanIdentityInputs {
     pub(crate) provider_inputs: ResolvedProviderInputs,
 }
 
+/// Identity and provider inputs prepared with a caller-owned wiring context.
+pub(crate) struct PreparedPlanIdentityData {
+    pub(crate) state_blocks: crate::wiring::StateBlockResolution,
+    pub(crate) provider_inputs: ResolvedProviderInputs,
+}
+
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     state_file: &mut Option<StateFile>,
@@ -2813,28 +2967,35 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     let parsed = canonical_resources.parsed();
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let wiring = WiringContext::new(factories, &parsed.providers);
-    prepare_plan_identity_and_provider_inputs_with_wiring(
+    let PreparedPlanIdentityData {
+        state_blocks,
+        provider_inputs,
+    } = prepare_plan_identity_and_provider_inputs_with_wiring(
         canonical_resources,
         state_file,
         base_dir,
         provider_context,
         upstream_policy,
-        wiring,
+        &wiring,
     )
-    .await
+    .await?;
+    Ok(PreparedPlanIdentityInputs {
+        wiring,
+        state_blocks,
+        provider_inputs,
+    })
 }
 
-/// The saved-plan path supplies a schema context that it has already used to
-/// validate the plan fingerprint. Keeping that context avoids loading a
-/// second plugin or running any provider preparation before the check.
+/// Prepare identity and provider inputs while leaving the caller-owned wiring
+/// context in place. Saved-plan apply passes only its verified context here.
 pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
     canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     state_file: &mut Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
-    wiring: WiringContext,
-) -> Result<PreparedPlanIdentityInputs, AppError> {
+    wiring: &WiringContext,
+) -> Result<PreparedPlanIdentityData, AppError> {
     reconcile_canonical_prefixed_names(canonical_resources, state_file);
     let parsed = canonical_resources.parsed();
     let state_blocks = crate::wiring::resolve_state_blocks(
@@ -2857,7 +3018,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
     }
     if let Some(state) = state_file.as_mut() {
         reconcile_canonical_anonymous_identifiers_with_ctx(
-            &wiring,
+            wiring,
             canonical_resources,
             state,
             &state_blocks.claims,
@@ -2873,8 +3034,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
     )
     .await?;
 
-    Ok(PreparedPlanIdentityInputs {
-        wiring,
+    Ok(PreparedPlanIdentityData {
         state_blocks,
         provider_inputs,
     })
@@ -4413,7 +4573,7 @@ mod run_plan_out_tests {
             None,
             &Some(state_file),
             &ctx,
-            WiringContext::new(Vec::new(), &[]).schemas(),
+            &WiringContext::new_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
         let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
@@ -4778,7 +4938,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            WiringContext::new(Vec::new(), &[]).schemas(),
+            &WiringContext::new_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
 
@@ -4863,7 +5023,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            WiringContext::new(Vec::new(), &[]).schemas(),
+            &WiringContext::new_for_test(Vec::new(), &[]),
         )
         .expect("saved plan should serialize prepared compositions");
 
@@ -4919,7 +5079,7 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            WiringContext::new(Vec::new(), &[]).schemas(),
+            &WiringContext::new_for_test(Vec::new(), &[]),
         )
         .expect_err("a secret-bearing upstream snapshot must be rejected")
         .to_string();

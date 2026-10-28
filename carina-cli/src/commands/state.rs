@@ -1187,13 +1187,8 @@ async fn run_state_refresh_locked_with_ctx(
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
-    let provider = get_provider_with_ctx(
-        ctx,
-        provider_inputs.configs(),
-        base_dir,
-        ProgressSink::Human,
-    )
-    .await?;
+    let provider =
+        get_provider_with_ctx(ctx, provider_inputs.configs(), ProgressSink::Human).await?;
 
     println!();
     let progress = ProgressBackend::new(ProgressSink::Human);
@@ -2421,7 +2416,7 @@ mod tests {
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2466,7 +2461,7 @@ mod tests {
                 source: PathBuf::from("../unrelated"),
             });
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &parsed.providers,
         );
@@ -2496,7 +2491,7 @@ mod tests {
         )
         .unwrap();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &parsed.providers,
         );
@@ -2605,7 +2600,7 @@ mod tests {
         .await
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2666,7 +2661,7 @@ mod tests {
         .await
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2710,7 +2705,7 @@ mod tests {
         .await
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -3020,7 +3015,7 @@ mod tests {
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
                 trigger,
@@ -3109,7 +3104,7 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
             })],
@@ -3185,7 +3180,7 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &parsed.providers,
         );

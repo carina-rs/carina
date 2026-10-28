@@ -1051,6 +1051,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sts",
  "base64 0.22.1",
+ "carina-cli",
  "carina-core",
  "carina-lsp",
  "carina-plugin-host",

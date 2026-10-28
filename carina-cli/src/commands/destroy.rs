@@ -353,7 +353,6 @@ async fn run_destroy_locked_with_ctx_owned(
     let provider = get_provider_with_ctx(
         ctx,
         provider_inputs.configs(),
-        base_dir,
         ProgressSink::Human,
     )
     .await?;
@@ -2114,7 +2113,7 @@ mod tests {
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new(
+        let ctx = WiringContext::new_for_test(
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],

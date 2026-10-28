@@ -9876,6 +9876,40 @@ let bucket = awscc.s3.Bucket {
 // =====================================================================
 
 #[test]
+fn duplicate_provider_kind_across_buffer_and_sibling_is_one_anchored_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    std::fs::write(
+        base.join("providers.crn"),
+        "provider mock {\n  source = 'file:///mock.wasm'\n}\n",
+    )
+    .unwrap();
+    let source = "provider mock {}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("duplicate provider kind 'mock'")
+        })
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(duplicates[0].range.start.line, 0);
+    assert_eq!(duplicates[0].range.start.character, 9);
+    assert_eq!(duplicates[0].range.end.character, 13);
+    assert!(duplicates[0].message.contains("main.crn"));
+    assert!(duplicates[0].message.contains("providers.crn"));
+}
+
+#[test]
 fn duplicate_export_across_buffer_and_sibling_is_one_anchored_error() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();

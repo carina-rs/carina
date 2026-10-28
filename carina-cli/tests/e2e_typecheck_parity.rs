@@ -118,7 +118,10 @@ fn cli_diagnostics_at(
     factories: Vec<Box<dyn ProviderFactory>>,
     path: &std::path::Path,
 ) -> Vec<String> {
-    carina_cli::commands::validate::validate_with_factories(path, factories)
+    carina_cli::commands::validate::validate_with_factories(
+        path,
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories),
+    )
 }
 
 #[test]

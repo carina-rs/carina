@@ -67,7 +67,11 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
-    let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (provider_factories, provider_factory_error) =
+        match build_factories_from_providers(&parsed.providers, base_dir) {
+            Ok((factories, _)) => (factories, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
     let ctx = WiringContext::new(provider_factories, &parsed.providers);
     let schemas = ctx.schemas();
 
@@ -147,6 +151,13 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
             message: finding.to_string(),
         })
         .collect();
+    if let Some(message) = provider_factory_error {
+        warnings.push(LintWarning {
+            file: path.to_path_buf(),
+            line: 1,
+            message,
+        });
+    }
     for duplicate in &duplicate_declarations {
         let file = duplicate
             .first_file()
