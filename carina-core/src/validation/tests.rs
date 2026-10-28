@@ -1,6 +1,7 @@
 use super::*;
 use crate::parser::{
-    BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding,
+    ArgumentOrigin, BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst,
+    WaitBinding,
 };
 use crate::resource::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
@@ -683,12 +684,11 @@ fn binding_referenced_in_module_call() {
         "vpc_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
-    parsed.module_calls.push(ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments(args),
-    });
+    parsed.module_calls.push(ModuleCall::test(
+        "web_tier".to_string(),
+        None,
+        module_arguments(args),
+    ));
 
     assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
@@ -724,7 +724,7 @@ fn binding_referenced_in_attributes_not_warned() {
 
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "vpc_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::resource_ref(
@@ -746,7 +746,7 @@ fn binding_referenced_in_exports_not_warned() {
 
     parsed
         .export_params
-        .push(crate::parser::ExportParameter::new(
+        .push(crate::parser::ExportParameter::dummy(
             "vpc_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::resource_ref(
@@ -1978,7 +1978,7 @@ fn provider_in_module_with_attributes_errors() {
     });
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "vpc_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
@@ -2086,7 +2086,7 @@ fn state_block_in_module_with_attributes_errors() {
     );
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "resource_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
@@ -2154,7 +2154,7 @@ fn backend_in_module_with_attributes_errors() {
     let mut parsed = empty_parsed();
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "resource_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
@@ -2219,7 +2219,7 @@ fn upstream_state_in_module_with_attributes_errors() {
         parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "resource_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
@@ -2267,7 +2267,7 @@ fn exports_in_module_with_attributes_errors() {
     let mut parsed = parse_root_owned_declaration("exports {\n  module_value = 'module'\n}\n");
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter::new(
+        .push(crate::parser::AttributeParameter::dummy(
             "resource_id".to_string(),
             Some(TypeExpr::String),
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
@@ -3213,12 +3213,11 @@ fn validate_module_calls_rejects_custom_type() {
         )])),
     );
 
-    let module_calls = vec![ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments(args),
-    }];
+    let module_calls = vec![ModuleCall::test(
+        "github".to_string(),
+        None,
+        module_arguments(args),
+    )];
 
     let mut imported_modules = HashMap::new();
     imported_modules.insert(
@@ -3245,15 +3244,14 @@ fn validate_module_calls_rejects_custom_type() {
 fn validate_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let module_calls = vec![ModuleCall::test(
+        "web_tier".to_string(),
+        None,
+        module_arguments([(
             "environment".to_string(),
             Value::Concrete(ConcreteValue::String("production".into())),
         )]),
-    }];
+    )];
     let imported_modules = HashMap::from([(
         "web_tier".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3287,20 +3285,62 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
 }
 
 #[test]
+fn validate_module_calls_uses_original_line_after_heredoc() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let m = use { source = './m' }
+let document = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+let inst = m { n = 'abc' }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let imported_modules = HashMap::from([(
+        "m".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "n".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let error = validate_module_calls(
+        &parsed.module_calls,
+        &imported_modules,
+        &ProviderContext::default(),
+    )
+    .expect_err("the string argument must be rejected");
+
+    assert!(error.contains("at line 8"), "unexpected error: {error}");
+    assert!(!error.contains("at line 4"), "unexpected error: {error}");
+}
+
+#[test]
 fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall {
-        module_name: "inner".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let module_calls = vec![ModuleCall::test(
+        "inner".to_string(),
+        None,
+        module_arguments([(
             "name".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "count".to_string(),
             }),
         )]),
-    }];
+    )];
     let imported_modules = HashMap::from([(
         "inner".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3358,11 +3398,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..ProviderContext::default()
     };
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-
-    let module_calls = [ModuleCall::synthetic(
+    let module_calls = [ModuleCall::test(
         "child",
         None,
-        HashMap::from([("mode".to_string(), authored())]),
+        HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
     )];
     let imported_modules = HashMap::from([(
         "child".to_string(),
@@ -3382,7 +3421,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         .expect("module argument must validate");
 
     validate_attribute_params(
-        &[AttributeParameter::new(
+        &[AttributeParameter::dummy(
             "mode".to_string(),
             Some(schema_type.clone()),
             Some(authored()),
@@ -3465,7 +3504,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
-    let params_mismatch = vec![AttributeParameter::new(
+    let params_mismatch = vec![AttributeParameter::dummy(
         "role_arn".to_string(),
         Some(TypeExpr::Simple("iam_role_arn".to_string())),
         Some(Value::resource_ref(
@@ -3485,7 +3524,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     assert!(err.contains("IamRoleArn"), "Error: {err}");
 
     // Attribute param: role_arn: iam_role_arn = role.arn (MATCH: IamRoleArn matches iam_role_arn)
-    let params_match = vec![AttributeParameter::new(
+    let params_match = vec![AttributeParameter::dummy(
         "role_arn".to_string(),
         Some(TypeExpr::Simple("iam_role_arn".to_string())),
         Some(Value::resource_ref(
@@ -3524,7 +3563,7 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "value".to_string(),
         Some(TypeExpr::String),
         Some(Value::resource_ref(
@@ -3546,7 +3585,7 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
     use crate::parser::AttributeParameter;
 
     let params = vec![
-        AttributeParameter::new(
+        AttributeParameter::dummy(
             "valid".to_string(),
             None,
             Some(Value::resource_ref(
@@ -3555,7 +3594,7 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
                 vec!["runtime_field".to_string()],
             )),
         ),
-        AttributeParameter::new(
+        AttributeParameter::dummy(
             "invalid".to_string(),
             None,
             Some(Value::resource_ref(
@@ -3590,7 +3629,7 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     use crate::parser::AttributeParameter;
 
     let params = vec![
-        AttributeParameter::new(
+        AttributeParameter::dummy(
             "valid".to_string(),
             Some(TypeExpr::Simple("unrelated_type".to_string())),
             Some(Value::resource_ref(
@@ -3599,7 +3638,7 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
                 vec!["runtime_field".to_string()],
             )),
         ),
-        AttributeParameter::new(
+        AttributeParameter::dummy(
             "invalid".to_string(),
             Some(TypeExpr::Simple("unrelated_type".to_string())),
             Some(Value::resource_ref(
@@ -3650,6 +3689,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         CompositionArgument::from_value(
             Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
+            ArgumentOrigin::Defaulted,
         ),
     );
     let mut parsed = empty_parsed();
@@ -3844,6 +3884,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
         CompositionArgument::from_value(
             Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
             schema_type("ec2.Vpc"),
+            ArgumentOrigin::Defaulted,
         ),
     );
     let mut parsed = empty_parsed();
@@ -3906,18 +3947,17 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let call = ModuleCall {
-        module_name: "consumer".to_string(),
-        binding_name: Some("instance".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "consumer".to_string(),
+        Some("instance".to_string()),
+        module_arguments([(
             "subnet_ids".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
                 Value::resource_ref("web".to_string(), "group_id".to_string(), vec![]),
             ])),
         )]),
-    };
+    );
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3975,15 +4015,14 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         .resources
         .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let call = ModuleCall {
-        module_name: "consumer".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "consumer".to_string(),
+        None,
+        module_arguments([(
             "number".to_string(),
             Value::resource_ref("source", "count", Vec::new()),
         )]),
-    };
+    );
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -4035,7 +4074,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
         "id".to_string(),
         Value::resource_ref("vpc".to_string(), "bad_attr".to_string(), vec![]),
     );
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "network".to_string(),
         Some(TypeExpr::Simple("vpc_id".to_string())),
         Some(Value::Concrete(ConcreteValue::Map(nested))),
@@ -4073,7 +4112,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", cert_schema);
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "certificate_arn".to_string(),
         Some(TypeExpr::Simple("string".to_string())),
         Some(Value::resource_ref(
@@ -4130,7 +4169,7 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
         "id".to_string(),
         Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
     );
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "network".to_string(),
         Some(TypeExpr::Simple("vpc_id".to_string())),
         Some(Value::Concrete(ConcreteValue::Map(nested))),
@@ -4211,7 +4250,7 @@ fn validate_attribute_params_against_target_group_tags(
 fn attribute_param_nested_unknown_field_reports_suggestion() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "x".to_string(),
         None,
         Some(Value::resource_ref(
@@ -4241,7 +4280,7 @@ fn attribute_param_nested_unknown_field_reports_suggestion() {
 fn attribute_param_nested_known_field_is_valid() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "x".to_string(),
         None,
         Some(Value::resource_ref(
@@ -4263,7 +4302,7 @@ fn attribute_param_nested_known_field_is_valid() {
 fn attribute_param_nested_simple_annotation_uses_leaf_type() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "x".to_string(),
         Some(TypeExpr::Simple("environment_name".to_string())),
         Some(Value::resource_ref(
@@ -4285,7 +4324,7 @@ fn attribute_param_nested_simple_annotation_uses_leaf_type() {
 fn unannotated_attribute_param_flags_unknown_resource_attribute_with_suggestion() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "target_group_arn".to_string(),
         None,
         Some(Value::resource_ref(
@@ -4311,7 +4350,7 @@ fn unannotated_attribute_param_flags_unknown_resource_attribute_with_suggestion(
 fn primitive_annotated_attribute_param_flags_unknown_resource_attribute() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "target_group_arn".to_string(),
         Some(TypeExpr::String),
         Some(Value::resource_ref(
@@ -4330,7 +4369,7 @@ fn primitive_annotated_attribute_param_flags_unknown_resource_attribute() {
 fn unannotated_attribute_param_flags_unknown_resource_attribute_in_nested_value() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "target_group_arns".to_string(),
         None,
         Some(Value::Concrete(ConcreteValue::List(vec![
@@ -4347,7 +4386,7 @@ fn unannotated_attribute_param_flags_unknown_resource_attribute_in_nested_value(
 fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter::new(
+    let params = vec![AttributeParameter::dummy(
         "target_group_arn".to_string(),
         Some(TypeExpr::Simple("target_group_arn".to_string())),
         Some(Value::resource_ref(

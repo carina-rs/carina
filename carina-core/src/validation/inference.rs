@@ -1179,6 +1179,7 @@ pub fn format_inference_error(name: &str, err: &InferenceError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ModuleCall;
     use crate::resource::AccessPath;
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
@@ -1889,7 +1890,7 @@ mod tests {
         parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -1913,7 +1914,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "zone_id".to_string(),
                 None,
                 // `lookup` returns Any: inference fails, sentinel produced.
@@ -1944,7 +1945,7 @@ mod tests {
         parsed.resources.push(resource); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -1983,7 +1984,7 @@ mod tests {
         parsed.resources.push(resource); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2013,7 +2014,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 Some(TypeExpr::Simple("vpc_id".to_string())),
                 Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
@@ -2088,7 +2089,7 @@ mod tests {
         parsed.compositions.push(virt); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "role_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2124,15 +2125,14 @@ mod tests {
         // such as the LSP can run inference against the `Virtual` arm exercised
         // by the sibling test above; the CLI retry remains report-only.
         let mut parsed = crate::parser::ParsedFile::default();
-        parsed.module_calls.push(crate::parser::ModuleCall {
-            module_name: "github_module".to_string(),
-            binding_name: Some("github_actions_carina".to_string()),
-            source: Default::default(),
-            arguments: std::collections::HashMap::new(),
-        });
+        parsed.module_calls.push(ModuleCall::test(
+            "github_module".to_string(),
+            Some("github_actions_carina".to_string()),
+            std::collections::HashMap::new(),
+        ));
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "role_arn".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2159,7 +2159,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 None,

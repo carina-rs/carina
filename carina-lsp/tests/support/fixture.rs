@@ -1,5 +1,5 @@
 //! Multi-file `.crn` fixture helpers shared by integration tests that
-//! exercise `DiagnosticEngine::analyze_with_filename` against the
+//! exercise `DiagnosticEngine::analyze` against the
 //! directory-shaped layout the project's invariant requires
 //! (`main.crn` + sibling files like `providers.crn`, `exports.crn`).
 
@@ -28,11 +28,12 @@ pub fn write_fixture(files: &[(&str, &str)]) -> TempDir {
 pub fn analyze(engine: &DiagnosticEngine, fixture: &TempDir, file_name: &str) -> Vec<Diagnostic> {
     let path = fixture.path().join(file_name);
     let text = std::fs::read_to_string(&path).expect("read fixture file");
-    let doc = Document::new(
+    let doc = Document::new_with_path(
         text,
+        path,
         Arc::new(carina_core::parser::ProviderContext::default()),
     );
-    engine.analyze_with_filename(&doc, Some(file_name), Some(fixture.path()))
+    engine.analyze(&doc, Some(&fixture.path().join(file_name)))
 }
 
 /// Build a `DiagnosticEngine` from in-memory schemas. Provider names

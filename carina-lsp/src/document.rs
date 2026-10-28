@@ -1,25 +1,37 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
-use carina_core::parser::{ParseError, ParsedFile, ProviderContext, parse};
+use carina_core::parser::{ParseError, ParsedFile, ProviderContext, parse_file};
 
 pub struct Document {
     content: Rope,
     parsed: Option<ParsedFile>,
     parse_error: Option<ParseError>,
     provider_context: Arc<ProviderContext>,
+    source_file: PathBuf,
     version: i32,
 }
 
 impl Document {
+    #[cfg(test)]
     pub fn new(content: String, provider_context: Arc<ProviderContext>) -> Self {
+        Self::new_with_path(content, PathBuf::from("test.crn"), provider_context)
+    }
+
+    pub fn new_with_path(
+        content: String,
+        source_file: PathBuf,
+        provider_context: Arc<ProviderContext>,
+    ) -> Self {
         let mut doc = Self {
             content: Rope::from_str(&content),
             parsed: None,
             parse_error: None,
             provider_context,
+            source_file,
             version: 0,
         };
         doc.reparse();
@@ -51,7 +63,7 @@ impl Document {
 
     fn reparse(&mut self) {
         let text = self.content.to_string();
-        match parse(&text, &self.provider_context) {
+        match parse_file(&text, &self.source_file, &self.provider_context) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
@@ -86,6 +98,10 @@ impl Document {
     /// same configuration when they need to merge sibling `.crn` files.
     pub fn provider_context(&self) -> &ProviderContext {
         &self.provider_context
+    }
+
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source_file
     }
 
     pub fn parse_error(&self) -> Option<&ParseError> {

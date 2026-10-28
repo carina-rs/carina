@@ -2358,8 +2358,9 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
 /// provider is declared but no factory was loaded.
 #[test]
 fn wiring_context_constructs_factories_and_schemas_once() {
-    let parsed = carina_core::parser::parse(
+    let parsed = carina_core::parser::parse_file(
         "provider mock {}\n",
+        std::path::Path::new("providers.crn"),
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();

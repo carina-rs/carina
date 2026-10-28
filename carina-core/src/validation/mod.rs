@@ -13,7 +13,7 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType}
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
-    TypeExpr,
+    SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -602,10 +602,10 @@ pub fn suppress_coalesce_existence_error(
 /// never has to recover source identity by parsing that message.
 #[derive(Debug, Clone)]
 pub struct ModuleCallRefError {
-    /// Index into the `module_calls` slice passed to validation.
-    pub call_index: usize,
     call_label: String,
     pub argument: String,
+    /// Parser-authored key span for `argument`.
+    pub argument_span: SourceSpan,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
 }
@@ -679,19 +679,22 @@ fn validate_module_call_argument_ref_types_inner(
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
-    for (call_index, call) in module_calls.iter().enumerate() {
+    for call in module_calls {
         let call_name = call
             .binding_name
             .as_deref()
             .unwrap_or(call.module_name.as_str());
-        for (argument_name, value) in &call.arguments {
+        for authored in call.arguments_with_source_spans() {
+            let argument_name = authored.name();
+            let value = authored.argument();
+            let argument_span = authored.key_span();
             let declared_sink = imported_modules
                 .get(&call.module_name)
                 .and_then(|signature| {
                     signature
                         .arguments
                         .iter()
-                        .find(|argument| argument.name == *argument_name)
+                        .find(|argument| argument.name == argument_name)
                 })
                 .map(|argument| &argument.type_expr);
 
@@ -705,9 +708,9 @@ fn validate_module_call_argument_ref_types_inner(
                         return;
                     };
                     errors.push(ModuleCallRefError {
-                        call_index,
                         call_label: call_name.to_string(),
-                        argument: argument_name.clone(),
+                        argument: argument_name.to_string(),
+                        argument_span,
                         path: path.to_owned(),
                         kind,
                     });
@@ -766,6 +769,7 @@ pub enum CompositionRefError {
 #[derive(Debug, Clone)]
 pub struct CompositionModuleCallRefError {
     pub argument: String,
+    pub origin: Box<crate::parser::ArgumentOrigin>,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
     pub call: CompositionCall,
@@ -1233,7 +1237,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         }
     }
     for call in &parsed.module_calls {
-        for value in call.arguments.values() {
+        for (_, value) in call.arguments() {
             check_function_calls(
                 value.walker_value(),
                 None,
@@ -1386,10 +1390,17 @@ pub fn validate_composition_ref_types_with_bindings(
             continue;
         };
         for (argument_name, argument) in &composition.signature.arguments {
+            let Some((declared_type, origin)) = argument.validation_metadata() else {
+                // Value-only saved-plan arguments cannot occur on the normal
+                // live expansion path. If a caller manually combines one
+                // with live provenance, it still cannot provide a source
+                // origin for a diagnostic.
+                continue;
+            };
             let mut reference_position = 0;
             visit_refs_with_sink(
                 argument.value(),
-                argument.declared_type().map(RefSink::TypeExpr),
+                Some(RefSink::TypeExpr(declared_type)),
                 &mut |path, sink, usage| {
                     let current_position = reference_position;
                     reference_position += 1;
@@ -1405,6 +1416,7 @@ pub fn validate_composition_ref_types_with_bindings(
                     errors.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
+                            origin: Box::new(origin),
                             path: path.to_owned(),
                             kind,
                             call: call.clone(),
@@ -2907,26 +2919,19 @@ pub fn validate_module_calls(
     for call in module_calls {
         if let Some(signature) = imported_modules.get(&call.module_name) {
             let module_args = &signature.arguments;
-            for (arg_name, arg_value) in &call.arguments {
-                if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name) {
-                    let line = call
-                        .argument_value_source_span(arg_name)
-                        .or_else(|| call.source_span())
-                        .map(|span| span.start_line);
-                    let source_file = call.diagnostic_source().map(|source| source.file);
-                    let context = match (source_file.as_deref(), line) {
-                        (Some(file), Some(line)) => format!(
-                            "module {} argument '{}' in {} at line {line}",
-                            call.module_name,
-                            arg_name,
-                            file.display(),
-                        ),
-                        (None, Some(line)) => format!(
-                            "module {} argument '{}' at line {line}",
-                            call.module_name, arg_name,
-                        ),
-                        _ => format!("module {} argument '{}'", call.module_name, arg_name),
-                    };
+            let source_file = call.source_file();
+            for authored in call.arguments_with_source_spans() {
+                let arg_name = authored.name();
+                let arg_value = authored.argument();
+                let value_span = authored.value_span();
+                if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
+                    let line = value_span.start_line();
+                    let context = format!(
+                        "module {} argument '{}' in {} at line {line}",
+                        call.module_name,
+                        arg_name,
+                        source_file.display(),
+                    );
                     let resolved_parameter =
                         match resolve_parameter_type_for_check(&arg_param.type_expr, config) {
                             Ok(Some(resolved)) => resolved,
@@ -3220,7 +3225,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
         collect_dependencies(&deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {
-        for value in call.arguments.values() {
+        for (_, value) in call.arguments() {
             collect_dependencies(value.walker_value(), &mut referenced);
         }
     }

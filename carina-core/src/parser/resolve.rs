@@ -717,9 +717,9 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 return Err(ParseError::SecretDerivedBackendAttribute {
                     backend_type: backend.backend_type.clone(),
                     attribute: key.clone(),
-                    line: span.start_line,
-                    start_column: span.start_column,
-                    end_column: span.end_column,
+                    line: span.start_line(),
+                    start_column: span.start_column(),
+                    end_column: span.end_column(),
                 });
             }
             *value = evaluated;
@@ -819,7 +819,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // Type checking module arguments, attributes, or exports before this pass
     // would treat that deferred call as unknown and silently accept it.
     for call in &mut parsed.module_calls {
-        for argument in call.arguments.values_mut() {
+        for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
                 resolve_function_calls_only(
                     value,
@@ -1298,7 +1298,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for call in &parsed.module_calls {
-        for v in call.arguments.values() {
+        for (_, v) in call.arguments() {
             check(v.walker_value());
         }
     }

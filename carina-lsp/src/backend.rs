@@ -482,8 +482,18 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let doc = Document::new(
+        let Ok(source_file) = uri.to_file_path() else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Cannot analyze non-file document URI: {uri}"),
+                )
+                .await;
+            return;
+        };
+        let doc = Document::new_with_path(
             params.text_document.text,
+            source_file,
             Arc::clone(&self.provider_context),
         );
         self.documents.insert(uri.clone(), doc);
@@ -679,26 +689,19 @@ async fn publish_diagnostics_for(
     let Some(doc) = documents.get(&uri) else {
         return;
     };
-    let base_path = uri
-        .to_file_path()
-        .ok()
+    let current_file_path = uri.to_file_path().ok();
+    let base_path = current_file_path
+        .as_deref()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    let current_file_name: Option<String> = uri
-        .to_file_path()
-        .ok()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str().map(String::from)));
 
     let guard = providers.read().await;
     let state = base_path
         .as_ref()
         .map(|p| guard.state_for_path(p))
         .unwrap_or(&guard.empty);
-    let diagnostics = state.diagnostic_engine.analyze_with_filename(
-        &doc,
-        current_file_name.as_deref(),
-        base_path.as_deref(),
-    );
+    let diagnostics = state
+        .diagnostic_engine
+        .analyze(&doc, current_file_path.as_deref());
     drop(guard);
 
     client.publish_diagnostics(uri, diagnostics, None).await;
@@ -938,8 +941,9 @@ mod tests {
     }
 
     fn provider_state(block_name: &'static str) -> ProviderState {
-        let config = carina_core::parser::parse(
+        let config = carina_core::parser::parse_file(
             "provider mock {}\n",
+            std::path::Path::new("providers.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
@@ -1009,11 +1013,9 @@ mock.test.Thing {
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 
-        let diagnostics = state.diagnostic_engine.analyze_with_filename(
-            &document,
-            Some("main.crn"),
-            Some(temp.path()),
-        );
+        let diagnostics = state
+            .diagnostic_engine
+            .analyze(&document, Some(&temp.path().join("main.crn")));
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -1070,11 +1072,9 @@ mock.test.Thing {
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 
-        let diagnostics = state.diagnostic_engine.analyze_with_filename(
-            &document,
-            Some("main.crn"),
-            Some(temp.path()),
-        );
+        let diagnostics = state
+            .diagnostic_engine
+            .analyze(&document, Some(&temp.path().join("main.crn")));
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())

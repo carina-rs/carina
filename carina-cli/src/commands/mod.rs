@@ -731,6 +731,8 @@ fn validate_and_resolve_errors_with_context_inner<'a>(
         return Err(errors);
     }
 
+    let parsed: &mut carina_core::parser::InferredFile = &mut *parsed;
+
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
@@ -1128,12 +1130,13 @@ mod tests {
 
     #[test]
     fn backend_validation_keeps_the_typed_error() {
-        let raw = carina_core::parser::parse(
+        let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
                 key = "state.json"
                 region = true
             }"#,
+            std::path::Path::new("backend.crn"),
             &ProviderContext::default(),
         )
         .unwrap();

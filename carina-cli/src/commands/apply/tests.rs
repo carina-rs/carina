@@ -567,6 +567,12 @@ fn deserialize_saved_provider_configs(
     serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
 }
 
+fn saved_composition_argument(value: Value) -> CompositionArgument {
+    let saved_shape: CompositionArgument =
+        serde_json::from_value(serde_json::to_value(string_value("")).unwrap()).unwrap();
+    saved_shape.with_value(value)
+}
+
 fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
     let argument_name = "value";
     Composition {
@@ -577,7 +583,7 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
         signature: Signature {
             arguments: indexmap::IndexMap::from([(
                 argument_name.to_string(),
-                CompositionArgument::from_value(argument, carina_core::parser::TypeExpr::String),
+                saved_composition_argument(argument),
             )]),
             attributes: indexmap::IndexMap::new(),
             pending_constraints: vec![PendingModuleConstraint {
@@ -7589,7 +7595,7 @@ async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
 mod apply_deferred_for_parity {
     use carina_core::binding_index::WaitAliasSpec;
     use carina_core::data_source_value::DataSourceValues;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::{ProviderContext, parse_file};
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
     use std::collections::HashMap;
 
@@ -7649,7 +7655,12 @@ mod apply_deferred_for_parity {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_file(
+            src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
 
@@ -7717,7 +7728,12 @@ mod apply_deferred_for_parity {
                 aws.route53.RecordSet { name = opt.resource_record.name }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_file(
+            src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
 
@@ -7773,7 +7789,12 @@ mod apply_deferred_for_parity {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_file(
+            src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
 

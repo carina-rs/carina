@@ -718,13 +718,14 @@ mod tests {
 
     #[test]
     fn backend_config_error_conversion_preserves_each_terminal_attribute_diagnostic() {
-        let raw = carina_core::parser::parse(
+        let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
                 key = "state.json"
                 region = true
                 encrypt = "yes"
             }"#,
+            std::path::Path::new("backend.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap();

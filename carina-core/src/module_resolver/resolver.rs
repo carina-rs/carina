@@ -27,8 +27,30 @@ use super::validation::ModuleConstraintDiagnostic;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleCallSystemIdentity {
     source_file: PathBuf,
-    start_byte: usize,
+    call_span: crate::parser::SourceSpan,
     expansion_key: Option<String>,
+}
+
+impl ModuleCallSystemIdentity {
+    pub fn for_authored_call(source_file: PathBuf, call: &crate::parser::ModuleCall) -> Self {
+        Self {
+            source_file,
+            call_span: call.source_span(),
+            expansion_key: call.expansion_key().map(str::to_string),
+        }
+    }
+
+    pub fn source_file(&self) -> &Path {
+        &self.source_file
+    }
+
+    pub fn call_span(&self) -> crate::parser::SourceSpan {
+        self.call_span
+    }
+
+    pub fn expansion_key(&self) -> Option<&str> {
+        self.expansion_key.as_deref()
+    }
 }
 
 /// Resolver-owned result of evaluating one authored module constraint.
@@ -44,7 +66,16 @@ pub struct ResolvedModuleConstraintOutcome {
 pub enum ResolvedModuleConstraintStatus {
     Satisfied,
     Pending,
-    Failed(ModuleConstraintDiagnostic),
+    Failed {
+        diagnostic: Box<ModuleConstraintDiagnostic>,
+        origin: ResolvedModuleConstraintOrigin,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedModuleConstraintOrigin {
+    Argument(crate::parser::ArgumentOrigin),
+    Call,
 }
 
 /// Constraint outcomes and authored location for one expanded module call.
@@ -61,7 +92,7 @@ impl ModuleCallConstraintReport {
     ) -> (ModuleCallSystemIdentity, Self) {
         let identity = ModuleCallSystemIdentity {
             source_file: source.file.clone(),
-            start_byte: source.call_span.start_byte,
+            call_span: source.call_span,
             expansion_key: source.expansion_key.clone(),
         };
         (identity, Self { source, outcomes })
@@ -463,11 +494,25 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 
     /// Process imports and store imported modules
-    pub fn process_imports(&mut self, imports: &[UseStatement]) -> Result<(), ModuleError> {
+    pub fn process_imports(
+        &mut self,
+        imports: &[UseStatement],
+        module_calls: &[crate::parser::ModuleCall],
+    ) -> Result<(), ModuleError> {
         for import in imports {
-            let module = self
-                .load_module(&import.path)
-                .map_err(|error| error.with_owning_import(import.alias.clone()))?;
+            let module = self.load_module(&import.path).map_err(|error| {
+                let owning_calls = module_calls
+                    .iter()
+                    .filter(|call| call.module_name == import.alias)
+                    .map(|call| {
+                        ModuleCallSystemIdentity::for_authored_call(
+                            call.source_file().to_path_buf(),
+                            call,
+                        )
+                    })
+                    .collect();
+                error.with_owning_calls(owning_calls)
+            })?;
             self.imported_modules.insert(import.alias.clone(), module);
             self.module_paths
                 .insert(import.alias.clone(), import.path.clone());
@@ -492,7 +537,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
         // Process the module's own imports
         let imports = parsed.uses.clone();
-        let result = self.process_imports(&imports);
+        let result = self.process_imports(&imports, &parsed.module_calls);
 
         if let Err(e) = result {
             // Restore state on error
@@ -589,7 +634,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
-        resolver.process_imports(&parsed.uses)?;
+        resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
             parsed,
@@ -633,7 +678,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
         let mut resolver = ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(
             base_dir, config, schemas,
         );
-        resolver.process_imports(&parsed.uses)?;
+        resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
             parsed,
@@ -648,7 +693,10 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
 }
 
 /// Resolve all modules in a parsed file
-pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
+pub fn resolve_modules(
+    parsed: &mut crate::parser::ParsedFile,
+    base_dir: &Path,
+) -> Result<(), ModuleError> {
     resolve_modules_with_config(
         parsed,
         base_dir,
@@ -721,15 +769,13 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     for call in &module_calls {
         let instance_prefix = instance_prefix_for_call(call);
-        let expanded = resolver
-            .expand_module_call_checked(
-                call,
-                &instance_prefix,
-                ref_check,
-                Some(&binding_index),
-                Some(&resolved_bindings),
-            )
-            .map_err(|error| error.with_owning_import(call.module_name.clone()))?;
+        let expanded = resolver.expand_module_call_checked(
+            call,
+            &instance_prefix,
+            ref_check,
+            Some(&binding_index),
+            Some(&resolved_bindings),
+        )?;
         // `expand_module_call` returns a parser-phase `ParsedFile`;
         // this caller's `parsed` is a generic `File<E>` (the CLI
         // validate path passes an `InferredFile`). Relabel the
