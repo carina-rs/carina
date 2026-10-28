@@ -1,5 +1,7 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
+mod guest_store;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
@@ -16,15 +18,13 @@ use std::sync::{Arc, OnceLock};
 use sha2::{Digest, Sha256};
 
 use tokio::sync::Mutex;
-use wasmtime::component::ResourceTable;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView as _};
 use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView as _};
 use wasmtime_wasi::random::WasiRandom;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
@@ -52,6 +52,11 @@ use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, Verifie
 
 use crate::{secret_seal, wasm_convert};
 use carina_provider_protocol::types as proto;
+#[cfg(any(test, feature = "test-utils"))]
+pub use guest_store::GuestCallBudget;
+#[cfg(not(any(test, feature = "test-utils")))]
+use guest_store::GuestCallBudget;
+use guest_store::{EPOCH_TICK_INTERVAL, GuestStore, HostState, WallBudgetExceeded};
 
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
 /// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
@@ -128,13 +133,8 @@ struct WasmGuestCallError {
 
 #[derive(Clone, Copy, Debug)]
 enum WasmGuestCallContext {
-    Trap {
-        operation: &'static str,
-    },
-    Timeout {
-        operation: &'static str,
-        credential_hint: bool,
-    },
+    Trap { operation: &'static str },
+    ComputeBudgetExceeded { operation: &'static str },
 }
 
 impl fmt::Display for WasmGuestCallError {
@@ -144,18 +144,8 @@ impl fmt::Display for WasmGuestCallError {
             Some(WasmGuestCallContext::Trap { operation }) => {
                 write!(f, "{operation} call failed")
             }
-            Some(WasmGuestCallContext::Timeout {
-                operation,
-                credential_hint,
-            }) => {
-                write!(
-                    f,
-                    "{operation} did not complete within {WASM_OPERATION_TIMEOUT_SECS}s"
-                )?;
-                if credential_hint {
-                    f.write_str(" (check AWS credentials)")?;
-                }
-                Ok(())
+            Some(WasmGuestCallContext::ComputeBudgetExceeded { operation }) => {
+                write!(f, "{operation} exceeded the guest compute budget")
             }
         }?;
         f.write_str(": ")?;
@@ -165,26 +155,13 @@ impl fmt::Display for WasmGuestCallError {
 
 impl std::error::Error for WasmGuestCallError {}
 
-#[derive(Clone, Copy)]
-enum WasmTrapContext {
-    ProviderOperation,
-    Normalizer,
-}
-
-fn wasm_trap_provider_error(
-    operation: &'static str,
-    error: wasmtime::Error,
-    context: WasmTrapContext,
-) -> ProviderError {
+fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> ProviderError {
     let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
     if timed_out {
         ProviderError::timeout_caused_by(
             "WASM plugin timed out",
             WasmGuestCallError {
-                context: Some(WasmGuestCallContext::Timeout {
-                    operation,
-                    credential_hint: matches!(context, WasmTrapContext::ProviderOperation),
-                }),
+                context: Some(WasmGuestCallContext::ComputeBudgetExceeded { operation }),
                 source: error,
             },
         )
@@ -674,6 +651,10 @@ impl std::error::Error for PrecompiledComponentDeserializationError {}
 enum WasmProviderInstanceError {
     Instantiation(ProviderInstantiationError),
     InfoCall(wasmtime::Error),
+    WallBudgetExceeded {
+        operation: &'static str,
+        source: WallBudgetExceeded,
+    },
     InitializeValueEncode(SerializationError),
     InitializeCall(wasmtime::Error),
     Initialize(ProviderError),
@@ -694,14 +675,15 @@ impl WasmProviderInstanceError {
     fn into_provider_error_with(self, mapper: &ProviderInstantiationErrorMapper) -> ProviderError {
         match self {
             WasmProviderInstanceError::Instantiation(error) => mapper(error),
-            WasmProviderInstanceError::InfoCall(error) => {
-                wasm_trap_provider_error("info", error, WasmTrapContext::ProviderOperation)
+            WasmProviderInstanceError::InfoCall(error) => wasm_trap_provider_error("info", error),
+            WasmProviderInstanceError::WallBudgetExceeded { operation, source } => {
+                wall_budget_provider_error(operation, source)
             }
             WasmProviderInstanceError::InitializeValueEncode(error) => {
                 wasm_value_encode_provider_error("initialize", error)
             }
             WasmProviderInstanceError::InitializeCall(error) => {
-                wasm_trap_provider_error("initialize", error, WasmTrapContext::ProviderOperation)
+                wasm_trap_provider_error("initialize", error)
             }
             WasmProviderInstanceError::Initialize(error) => error,
             WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
@@ -821,18 +803,9 @@ const METADATA_ENDPOINTS: [IpAddr; 3] = [
 /// fail fast instead of hanging for the SDK's default timeout.
 const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Timeout for individual WASM plugin operations (in seconds).
-///
-/// Used for two layers of timeout enforcement:
-/// 1. Epoch interruption: traps WASM computation that exceeds this budget.
-/// 2. HTTP request cap: limits host-side HTTP calls that epochs cannot reach
-///    (epochs only fire during WASM execution, not during host I/O waits).
-const WASM_OPERATION_TIMEOUT_SECS: u64 = 30;
-
-/// [`WASM_OPERATION_TIMEOUT_SECS`] as a `Duration`, used to cap per-request
-/// HTTP timeouts in the [`AllowListHttpHooks`] layer.
-const HTTP_API_REQUEST_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(WASM_OPERATION_TIMEOUT_SECS);
+/// Maximum duration applied independently to each capped phase of an
+/// outbound guest HTTP request (connect, first byte, and between bytes).
+const HTTP_API_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build the standard wasmtime Config used for all WASM plugin engines.
 ///
@@ -861,7 +834,7 @@ impl EpochTicker {
         let flag = shutdown.clone();
         let handle = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(EPOCH_TICK_INTERVAL);
                 engine.increment_epoch();
             }
         });
@@ -881,37 +854,11 @@ impl Drop for EpochTicker {
     }
 }
 
-/// Wall-clock backstop for one WASM guest call.
-///
-/// Epoch interruption ([`WASM_OPERATION_TIMEOUT_SECS`] via
-/// `store.set_epoch_deadline`) can only trap WASM *computation* — it does
-/// not fire while the guest is parked in a host-side I/O wait such as a
-/// `wasi:http` request whose response never completes (see the
-/// [`WASM_OPERATION_TIMEOUT_SECS`] doc-comment). When that happens the
-/// future hangs forever, the per-provider store `Mutex` stays held, every
-/// other concurrent operation on the same provider blocks behind it, and
-/// `Ctrl+C` cannot unwind a future parked inside a `wasmtime` call
-/// (carina#3106).
-///
-/// This wraps only the guest call, after the shared store lock has been
-/// acquired. Time queued behind a sibling call is not execution time for this
-/// call and must not consume its backstop.
-///
-/// # Sizing — why this is 20 minutes, not the ~30s epoch budget
-///
-/// Provider operations may span many calls through the typed pending protocol;
-/// their total budget is independent and comes from the resource schema.
-/// Therefore this value only needs to exceed the longest legitimate *single
-/// step* (one API request or one status check), while remaining a finite
-/// backstop for carina#3106's unbounded host-side I/O hang. It stays at 20
-/// minutes for compatibility while providers migrate their former in-call
-/// waiters to pending steps.
-const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
-
 /// If `poisoned` is set, return the fail-fast error a poisoned instance
 /// must give for `operation`; otherwise `None` and the caller may proceed.
-/// Component traps retain their originating operation and top-level cause;
-/// cancellation/timeouts retain the legacy generic diagnostic.
+/// Component traps and observed wall timeouts retain their originating
+/// operation; cancellation before a timeout is observed retains the legacy
+/// generic diagnostic.
 fn poisoned_guard(
     poisoned: &AtomicBool,
     poisoned_reason: &OnceLock<String>,
@@ -958,37 +905,14 @@ fn poison_after_trap(
     poisoned.store(true, Ordering::Release);
 }
 
-/// Run one already-locked guest call under its wall-clock backstop.
-///
-/// `operation` names the call for the error message (e.g. `"create"`).
-///
-/// If the deadline elapses, `op` is dropped; the poisoning is done by
-/// [`LockedStore`]'s drop while it still holds the store lock (not here), so a
-/// waiter cannot acquire the freed-but-not-yet-flagged lock. Returns
-/// [`ProviderError::timeout`].
-async fn with_operation_timeout<T>(
-    operation: &str,
-    hard_timeout: std::time::Duration,
-    op: impl std::future::Future<Output = T>,
-) -> ProviderResult<T> {
-    match tokio::time::timeout(hard_timeout, op).await {
-        Ok(result) => Ok(result),
-        Err(_elapsed) => Err(ProviderError::timeout(format!(
-            "WASM plugin operation '{operation}' exceeded {}s (host-side I/O \
-             wait that epoch interruption cannot reach; check network/AWS \
-             connectivity)",
-            hard_timeout.as_secs_f64()
-        ))),
-    }
-}
-
 /// A held store lock that poisons its instance on drop **unless
 /// [`disarm`](Self::disarm)ed** after the guest call completed.
 ///
 /// Field order is load-bearing: Rust drops fields in declaration order,
 /// so `poison` (the [`PoisonOnDrop`] guard) drops *before* `store` (the
-/// `MutexGuard`). When `tokio::time::timeout` cancels the in-flight
-/// operation it drops this whole value; the flag is therefore set
+/// `MutexGuard`). When the wall timeout in `GuestStore::call` drops only the
+/// guest future, this whole value is dropped afterwards as the caller
+/// propagates the timeout error with the guard still armed, so the flag is set
 /// **while the store `Mutex` is still held**, closing the window where a
 /// sibling operation already queued on the lock could otherwise acquire the
 /// freed-but-not-yet-flagged store and call into the unusable wasmtime `Store`
@@ -999,13 +923,14 @@ async fn with_operation_timeout<T>(
 /// their origin preserved.
 struct LockedStore<'a> {
     poison: PoisonOnDrop<'a>,
-    store: tokio::sync::MutexGuard<'a, Store<HostState>>,
+    store: tokio::sync::MutexGuard<'a, GuestStore>,
 }
 
 /// Sets `poisoned` on drop unless disarmed. Separate from [`LockedStore`]
 /// only so the drop-order guarantee is expressed by field ordering.
 struct PoisonOnDrop<'a> {
     poisoned: &'a AtomicBool,
+    poisoned_reason: &'a OnceLock<String>,
     armed: bool,
 }
 
@@ -1021,7 +946,7 @@ impl<'a> LockedStore<'a> {
     /// Acquire the store lock for `operation`, re-checking the poison
     /// flag *after* the lock is held (an op queued on the `Mutex` when a
     /// sibling poisoned the instance passed an earlier pre-flight check while
-    /// the flag was still clear), then arm the epoch deadline.
+    /// the flag was still clear).
     async fn acquire(
         instance: &'a SharedWasmInstance,
         operation: &str,
@@ -1030,15 +955,15 @@ impl<'a> LockedStore<'a> {
         {
             return Err(err);
         }
-        let mut store = instance.store.lock().await;
+        let store = instance.store.lock().await;
         if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
         {
             return Err(err);
         }
-        store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
         Ok(LockedStore {
             poison: PoisonOnDrop {
                 poisoned: &instance.poisoned,
+                poisoned_reason: &instance.poisoned_reason,
                 armed: true,
             },
             store,
@@ -1052,8 +977,26 @@ impl<'a> LockedStore<'a> {
         self.poison.armed = false;
     }
 
-    fn store(&mut self) -> &mut Store<HostState> {
-        &mut self.store
+    /// Run one guest call under the wall-clock budget stored with this store.
+    ///
+    /// If the deadline elapses, the guest future is dropped while this guard
+    /// remains armed. Dropping the guard then poisons the instance before the
+    /// store lock is released.
+    async fn call<'s, T, F>(
+        &'s mut self,
+        operation: &'static str,
+        f: impl FnOnce(&'s mut Store<HostState>) -> F,
+    ) -> ProviderResult<T>
+    where
+        T: 'static,
+        F: Future<Output = T> + 's,
+    {
+        self.store.call(f).await.map_err(|error| {
+            let _ = self.poison.poisoned_reason.set(format!(
+                "WASM provider instance unusable after wall-clock timeout in {operation}"
+            ));
+            wall_budget_provider_error(operation, error)
+        })
     }
 }
 
@@ -1599,43 +1542,15 @@ async fn send_request_handler(
     })
 }
 
-// -- Host state for WASI --
-
-struct HostState {
-    wasi_ctx: WasiCtx,
-    http_ctx: Option<WasiHttpCtx>,
-    table: ResourceTable,
-    http_hooks: AllowListHttpHooks,
-    limits: StoreLimits,
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi_ctx,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl WasiHttpView for HostState {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: self
-                .http_ctx
-                .as_mut()
-                .expect("HTTP not enabled for this provider"),
-            table: &mut self.table,
-            hooks: &mut self.http_hooks,
-        }
-    }
-}
-
 // -- Helper: create a new Store + CarinaProvider instance --
 
 enum WasmBindingCreationError {
     Instantiation(wasmtime::Error),
     InfoCall(wasmtime::Error),
+    WallBudgetExceeded {
+        operation: &'static str,
+        source: WallBudgetExceeded,
+    },
     ProtocolVersion(String),
 }
 
@@ -1644,6 +1559,9 @@ impl WasmBindingCreationError {
         match self {
             Self::Instantiation(error) => Self::Instantiation(error.context(context)),
             Self::InfoCall(error) => Self::InfoCall(error),
+            Self::WallBudgetExceeded { operation, source } => {
+                Self::WallBudgetExceeded { operation, source }
+            }
             Self::ProtocolVersion(message) => Self::ProtocolVersion(message),
         }
     }
@@ -1724,22 +1642,36 @@ pub(crate) mod version_checked_bindings {
 
     impl ProtocolCheckedInstance {
         async fn instantiate(
-            store: &mut Store<HostState>,
+            store: &mut GuestStore,
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
             let pre = linker
                 .instantiate_pre(component)
                 .map_err(WasmBindingCreationError::Instantiation)?;
-            let instance = pre
-                .instantiate_async(&mut *store)
+            let instance = store
+                .call(|store| pre.instantiate_async(store))
                 .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "instantiate",
+                    source,
+                })?
                 .map_err(WasmBindingCreationError::Instantiation)?;
-            let info = untyped_info_func(store, &instance)
-                .map_err(WasmBindingCreationError::Instantiation)?;
-            let (info_json,) = info
-                .call_async(&mut *store, ())
+            let info = store
+                .call(|store| std::future::ready(untyped_info_func(store, &instance)))
                 .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let (info_json,) = store
+                .call(|store| info.call_async(store, ()))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
                 .map_err(WasmBindingCreationError::InfoCall)?;
             wasm_convert::check_protocol_version(&info_json)
                 .map_err(WasmBindingCreationError::ProtocolVersion)?;
@@ -1773,12 +1705,18 @@ pub(crate) mod version_checked_bindings {
 
     impl WasmBindings {
         pub(super) async fn instantiate_basic(
-            store: &mut Store<HostState>,
+            store: &mut GuestStore,
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
             let checked = ProtocolCheckedInstance::instantiate(store, component, linker).await?;
-            let bindings = CarinaProvider::new(&mut *store, &checked.instance)
+            let bindings = store
+                .call(|store| std::future::ready(CarinaProvider::new(store, &checked.instance)))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "instantiate",
+                    source,
+                })?
                 .map_err(WasmBindingCreationError::Instantiation)?;
             Ok(Self {
                 raw: RawWasmBindings::Basic(bindings),
@@ -1787,12 +1725,20 @@ pub(crate) mod version_checked_bindings {
         }
 
         pub(super) async fn instantiate_http(
-            store: &mut Store<HostState>,
+            store: &mut GuestStore,
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
             let checked = ProtocolCheckedInstance::instantiate(store, component, linker).await?;
-            let bindings = CarinaProviderWithHttp::new(&mut *store, &checked.instance)
+            let bindings = store
+                .call(|store| {
+                    std::future::ready(CarinaProviderWithHttp::new(store, &checked.instance))
+                })
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "instantiate",
+                    source,
+                })?
                 .map_err(WasmBindingCreationError::Instantiation)?;
             Ok(Self {
                 raw: RawWasmBindings::Http(bindings),
@@ -2308,18 +2254,17 @@ async fn create_instance(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<ProviderKind>,
-) -> Result<(Store<HostState>, WasmBindings), WasmBindingCreationError> {
+    budget: GuestCallBudget,
+) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
-    let host_state = HostState {
+    let mut store = GuestStore::new(
+        engine,
         wasi_ctx,
-        http_ctx: None,
-        table: ResourceTable::new(),
-        http_hooks: AllowListHttpHooks::new(provider_kind),
-        limits: build_store_limits(),
-    };
-    let mut store = Store::new(engine, host_state);
-    store.limiter(|state| &mut state.limits);
-    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+        None,
+        AllowListHttpHooks::new(provider_kind),
+        build_store_limits(),
+        budget,
+    );
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
@@ -2485,18 +2430,17 @@ async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<ProviderKind>,
-) -> Result<(Store<HostState>, WasmBindings), WasmBindingCreationError> {
+    budget: GuestCallBudget,
+) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
-    let host_state = HostState {
+    let mut store = GuestStore::new(
+        engine,
         wasi_ctx,
-        http_ctx: Some(WasiHttpCtx::new()),
-        table: ResourceTable::new(),
-        http_hooks: AllowListHttpHooks::new(provider_kind),
-        limits: build_store_limits(),
-    };
-    let mut store = Store::new(engine, host_state);
-    store.limiter(|state| &mut state.limits);
-    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+        Some(WasiHttpCtx::new()),
+        AllowListHttpHooks::new(provider_kind),
+        build_store_limits(),
+        budget,
+    );
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
@@ -2525,12 +2469,15 @@ async fn create_runtime_instance(
     component: &Component,
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
-) -> Result<(Store<HostState>, WasmBindings), WasmProviderInstanceError> {
+    budget: GuestCallBudget,
+) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
     let result = match world {
         InstantiationWorld::HttpEnabled => {
-            create_instance_with_http(engine, component, provider_kind).await
+            create_instance_with_http(engine, component, provider_kind, budget).await
         }
-        InstantiationWorld::Basic => create_instance(engine, component, provider_kind).await,
+        InstantiationWorld::Basic => {
+            create_instance(engine, component, provider_kind, budget).await
+        }
     };
     result.map_err(|failure| match failure {
         WasmBindingCreationError::Instantiation(failure) => {
@@ -2539,6 +2486,9 @@ async fn create_runtime_instance(
             )
         }
         WasmBindingCreationError::InfoCall(error) => WasmProviderInstanceError::InfoCall(error),
+        WasmBindingCreationError::WallBudgetExceeded { operation, source } => {
+            WasmProviderInstanceError::WallBudgetExceeded { operation, source }
+        }
         WasmBindingCreationError::ProtocolVersion(message) => {
             WasmProviderInstanceError::ProtocolVersion(message)
         }
@@ -2547,7 +2497,7 @@ async fn create_runtime_instance(
 
 /// Output of `create_instance_auto`: the instantiated store, the
 /// bindings, and whether the HTTP-enabled world was used.
-type CreateInstanceResult = Result<(Store<HostState>, WasmBindings, bool), WasmProviderLoadError>;
+type CreateInstanceResult = Result<(GuestStore, WasmBindings, bool), WasmProviderLoadError>;
 
 /// Try HTTP instantiation first, then basic. On double failure, retain the
 /// complete HTTP-path error and component-derived compatibility context. The
@@ -2568,9 +2518,10 @@ fn create_instance_auto<'a>(
     engine: &'a Engine,
     component: &'a Component,
     provider_kind: Option<ProviderKind>,
+    budget: GuestCallBudget,
 ) -> BoxFuture<'a, CreateInstanceResult> {
     Box::pin(async move {
-        match create_instance_with_http(engine, component, provider_kind).await {
+        match create_instance_with_http(engine, component, provider_kind, budget).await {
             Ok((store, bindings)) => Ok((store, bindings, true)),
             Err(WasmBindingCreationError::InfoCall(error)) => Err(WasmProviderLoadError::metadata(
                 "Failed to call info()",
@@ -2579,9 +2530,12 @@ fn create_instance_auto<'a>(
                     source: error,
                 },
             )),
+            Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
+                Err(wall_budget_load_error(operation, source))
+            }
             Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
             Err(WasmBindingCreationError::Instantiation(http_err)) => {
-                match create_instance(engine, component, provider_kind).await {
+                match create_instance(engine, component, provider_kind, budget).await {
                     Ok((store, bindings)) => Ok((store, bindings, false)),
                     Err(WasmBindingCreationError::InfoCall(error)) => {
                         Err(WasmProviderLoadError::metadata(
@@ -2591,6 +2545,9 @@ fn create_instance_auto<'a>(
                                 source: error,
                             },
                         ))
+                    }
+                    Err(WasmBindingCreationError::WallBudgetExceeded { operation, source }) => {
+                        Err(wall_budget_load_error(operation, source))
                     }
                     Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
                     Err(WasmBindingCreationError::Instantiation(basic_err)) => {
@@ -2609,9 +2566,9 @@ fn create_instance_auto<'a>(
 
 /// A single WASM instance (store + bindings) shared between `WasmProvider`
 /// and `WasmProviderNormalizer`. Both hold an `Arc` to this struct and
-/// serialize access through the `Mutex<Store<HostState>>`.
+/// serialize access through the `Mutex<GuestStore>`.
 struct SharedWasmInstance {
-    store: Mutex<Store<HostState>>,
+    store: Mutex<GuestStore>,
     bindings: WasmBindings,
     /// Set once a timeout/cancellation or a component trap leaves the shared
     /// component instance unusable. Once set, every subsequent operation fails
@@ -2619,14 +2576,26 @@ struct SharedWasmInstance {
     /// misleading trap or silent corruption across the remaining resources in
     /// the plan/apply (carina#3106).
     poisoned: AtomicBool,
-    /// Stable diagnostic for a trap that made the component instance
-    /// non-reentrant. Timeouts retain the legacy generic poisoned message;
-    /// component traps record their originating operation and cause so a
-    /// later CRUD call cannot misattribute the failure to itself.
+    /// Stable diagnostic for a trap or observed wall timeout that made the
+    /// component instance non-reentrant. Cancellation before the timeout is
+    /// observed retains the generic poisoned message; returned traps and wall
+    /// timeouts record their originating operation so a later call cannot
+    /// misattribute the failure to itself.
     poisoned_reason: OnceLock<String>,
 }
 
-// Safety: The Store is behind a Mutex, so concurrent access is serialized.
+impl SharedWasmInstance {
+    fn new(store: GuestStore, bindings: WasmBindings) -> Self {
+        Self {
+            store: Mutex::new(store),
+            bindings,
+            poisoned: AtomicBool::new(false),
+            poisoned_reason: OnceLock::new(),
+        }
+    }
+}
+
+// Safety: The GuestStore is behind a Mutex, so concurrent access is serialized.
 // The bindings are only used while the store mutex is held.
 unsafe impl Send for SharedWasmInstance {}
 unsafe impl Sync for SharedWasmInstance {}
@@ -2644,10 +2613,10 @@ pub struct WasmProviderFactory {
     engine: Engine,
     component: Component,
     configured: ConfiguredProvider,
+    budget: GuestCallBudget,
     display_name: String,
     version: String,
     schemas: Arc<Vec<ResourceSchema>>,
-    operation_hard_timeout: std::time::Duration,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
     /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
@@ -2658,7 +2627,7 @@ pub struct WasmProviderFactory {
     enable_http: bool,
     /// Reusable WASM instance from factory initialization.
     /// Used by `validate_config()` to avoid creating a throwaway instance.
-    init_instance: Mutex<(Store<HostState>, WasmBindings)>,
+    init_instance: SharedWasmInstance,
     /// Lazily created shared instances for provider + normalizer, keyed
     /// by binding name. `None` is the kind's default instance;
     /// `Some(name)` is a named instance (`let <name> = provider <kind>
@@ -2690,6 +2659,44 @@ impl fmt::Display for WasmMetadataCallError {
 }
 
 impl std::error::Error for WasmMetadataCallError {}
+
+#[derive(Debug)]
+struct WasmWallBudgetError {
+    operation: &'static str,
+    source: WallBudgetExceeded,
+}
+
+impl fmt::Display for WasmWallBudgetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WASM guest call '{}' timed out", self.operation)
+    }
+}
+
+impl std::error::Error for WasmWallBudgetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn wall_budget_provider_error(
+    operation: &'static str,
+    source: WallBudgetExceeded,
+) -> ProviderError {
+    ProviderError::timeout_caused_by(
+        "WASM plugin timed out",
+        WasmWallBudgetError { operation, source },
+    )
+}
+
+fn wall_budget_load_error(
+    operation: &'static str,
+    source: WallBudgetExceeded,
+) -> WasmProviderLoadError {
+    WasmProviderLoadError::metadata(
+        "WASM provider load timed out",
+        WasmWallBudgetError { operation, source },
+    )
+}
 
 fn metadata_call_error(
     provider_name: &str,
@@ -2733,7 +2740,7 @@ impl WasmProviderFactory {
     /// metadata here changes provider behavior, including resource identity.
     async fn load_metadata(
         bindings: &WasmBindings,
-        store: &mut Store<HostState>,
+        store: &mut GuestStore,
         provider_name: &str,
         provider_version: &str,
     ) -> Result<
@@ -2744,9 +2751,10 @@ impl WasmProviderFactory {
         ),
         WasmProviderLoadError,
     > {
-        let config_completions_json = bindings
-            .call_provider_config_completions(store)
+        let config_completions_json = store
+            .call(|store| bindings.call_provider_config_completions(store))
             .await
+            .map_err(|source| wall_budget_load_error("provider-config-completions", source))?
             .map_err(|source| {
                 metadata_call_error(
                     provider_name,
@@ -2761,22 +2769,23 @@ impl WasmProviderFactory {
             provider_version,
         )?;
 
-        let identity_attributes =
-            bindings
-                .call_identity_attributes(store)
-                .await
-                .map_err(|source| {
-                    metadata_call_error(
-                        provider_name,
-                        provider_version,
-                        "identity-attributes",
-                        source,
-                    )
-                })?;
-
-        let provider_config_types_json = bindings
-            .call_provider_config_attribute_types(store)
+        let identity_attributes = store
+            .call(|store| bindings.call_identity_attributes(store))
             .await
+            .map_err(|source| wall_budget_load_error("identity-attributes", source))?
+            .map_err(|source| {
+                metadata_call_error(
+                    provider_name,
+                    provider_version,
+                    "identity-attributes",
+                    source,
+                )
+            })?;
+
+        let provider_config_types_json = store
+            .call(|store| bindings.call_provider_config_attribute_types(store))
+            .await
+            .map_err(|source| wall_budget_load_error("provider-config-attribute-types", source))?
             .map_err(|source| {
                 metadata_call_error(
                     provider_name,
@@ -2886,8 +2895,9 @@ impl WasmProviderFactory {
         epoch_ticker: EpochTicker,
         configured: ConfiguredProvider,
     ) -> Result<Self, WasmProviderLoadError> {
+        let budget = GuestCallBudget::PRODUCTION;
         let (mut store, bindings, enable_http) =
-            create_instance_auto(&engine, &component, None).await?;
+            create_instance_auto(&engine, &component, None, budget).await?;
         let info_json = bindings.info_json().to_owned();
 
         let (reported_name, display_name, version) =
@@ -2902,9 +2912,10 @@ impl WasmProviderFactory {
         }
         let name = configured.name.as_str();
 
-        let schemas_json = bindings
-            .call_schemas(&mut store)
+        let schemas_json = store
+            .call(|store| bindings.call_schemas(store))
             .await
+            .map_err(|source| wall_budget_load_error("schemas", source))?
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
         let schemas = wasm_convert::json_to_schemas(&schemas_json)
@@ -2917,15 +2928,15 @@ impl WasmProviderFactory {
             engine,
             component,
             configured,
+            budget,
             display_name,
             version,
             schemas: Arc::new(schemas),
-            operation_hard_timeout: WASM_OPERATION_HARD_TIMEOUT,
             cached_config_completions,
             cached_identity_attributes,
             cached_provider_config_types,
             enable_http,
-            init_instance: Mutex::new((store, bindings)),
+            init_instance: SharedWasmInstance::new(store, bindings),
             shared_instances: Mutex::new(HashMap::new()),
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
@@ -2941,13 +2952,21 @@ impl WasmProviderFactory {
     /// If the cache directory cannot be created, falls back to compiling without caching.
     pub async fn from_bytes(load: VerifiedLoad) -> Result<Self, WasmProviderLoadError> {
         let configured = ConfiguredProvider::new(load.identity());
-        let wasm_bytes = load.bytes().as_bytes();
-        match Self::default_cache_dir() {
-            Some(cache_dir) => {
-                Self::from_bytes_with_cache_dir_configured(wasm_bytes, &cache_dir, configured).await
+        let wasm_bytes = load.bytes().clone();
+        let load: BoxFuture<'_, Result<Self, WasmProviderLoadError>> = Box::pin(async move {
+            match Self::default_cache_dir() {
+                Some(cache_dir) => {
+                    Self::from_bytes_with_cache_dir_configured(
+                        wasm_bytes.as_bytes(),
+                        &cache_dir,
+                        configured,
+                    )
+                    .await
+                }
+                None => Self::new_uncached_configured(wasm_bytes.as_bytes(), configured).await,
             }
-            None => Self::new_uncached_configured(wasm_bytes, configured).await,
-        }
+        });
+        load.await
     }
 
     /// Load provider bytes with an explicit precompile cache directory.
@@ -3100,7 +3119,7 @@ impl WasmProviderFactory {
     async fn create_initialized_instance(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<(Store<HostState>, WasmBindings), WasmProviderInstanceError> {
+    ) -> Result<(GuestStore, WasmBindings), WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
@@ -3112,12 +3131,17 @@ impl WasmProviderFactory {
             InstantiationWorld::Basic
         };
         let (mut store, bindings) =
-            create_runtime_instance(&self.engine, &self.component, kind, world).await?;
+            create_runtime_instance(&self.engine, &self.component, kind, world, self.budget)
+                .await?;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
             .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
-        bindings
-            .call_initialize(&mut store, &wit_attrs)
+        store
+            .call(|store| bindings.call_initialize(store, &wit_attrs))
             .await
+            .map_err(|source| WasmProviderInstanceError::WallBudgetExceeded {
+                operation: "initialize",
+                source,
+            })?
             .map_err(WasmProviderInstanceError::InitializeCall)?
             .map_err(|e| {
                 WasmProviderInstanceError::Initialize(
@@ -3150,12 +3174,7 @@ impl WasmProviderFactory {
             return Ok(Arc::clone(instance));
         }
         let (store, bindings) = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(SharedWasmInstance {
-            store: Mutex::new(store),
-            bindings,
-            poisoned: AtomicBool::new(false),
-            poisoned_reason: OnceLock::new(),
-        });
+        let instance = Arc::new(SharedWasmInstance::new(store, bindings));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -3173,13 +3192,14 @@ impl WasmProviderFactory {
         self
     }
 
-    /// Override the per-guest-call wall-clock backstop.
+    /// Override the per-guest-call compute and wall-clock budgets.
     ///
-    /// Production callers use the default. Integration tests inject a short
-    /// duration to prove that time queued for the store lock is excluded.
+    /// Production callers use the default. Integration tests inject short
+    /// budgets to prove the compute and wall-clock semantics.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn with_operation_hard_timeout(mut self, hard_timeout: std::time::Duration) -> Self {
-        self.operation_hard_timeout = hard_timeout;
+    pub fn with_guest_call_budget(mut self, budget: GuestCallBudget) -> Self {
+        self.budget = budget;
+        self.init_instance.store.get_mut().set_budget(budget);
         self
     }
 
@@ -3234,16 +3254,19 @@ impl ProviderFactory for WasmProviderFactory {
             .map_err(|e| e.to_string())?;
 
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.init_instance.lock().await;
-                let (ref mut store, ref bindings) = *guard;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                bindings
-                    .call_validate_config(store, &wit_attrs)
-                    .await
-                    .map_err(|e| format!("Failed to call validate_config(): {e}"))?
-                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async {
+                    let instance = &self.init_instance;
+                    let mut locked = LockedStore::acquire(instance, "validate_config").await?;
+                    let call = locked
+                        .call("validate_config", |store| {
+                            instance.bindings.call_validate_config(store, &wit_attrs)
+                        })
+                        .await?;
+                    finish_guest_call(instance, "validate_config", &mut locked, call)?
+                        .map_err(wasm_convert::wit_to_core_provider_error)
+                })
+                .map_err(|error: ProviderError| error.to_string())
         })
     }
 
@@ -3254,16 +3277,23 @@ impl ProviderFactory for WasmProviderFactory {
     ) -> Result<(), String> {
         let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.init_instance.lock().await;
-                let (ref mut store, ref bindings) = *guard;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                bindings
-                    .call_validate_custom_type(store, &wit_identity, value.as_str())
-                    .await
-                    .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
-                    .map_err(|e| wasm_convert::wit_to_core_provider_error(e).to_string())
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async {
+                    let instance = &self.init_instance;
+                    let mut locked = LockedStore::acquire(instance, "validate_custom_type").await?;
+                    let call = locked
+                        .call("validate_custom_type", |store| {
+                            instance.bindings.call_validate_custom_type(
+                                store,
+                                &wit_identity,
+                                value.as_str(),
+                            )
+                        })
+                        .await?;
+                    finish_guest_call(instance, "validate_custom_type", &mut locked, call)?
+                        .map_err(wasm_convert::wit_to_core_provider_error)
+                })
+                .map_err(|error: ProviderError| error.to_string())
         })
     }
 
@@ -3305,7 +3335,6 @@ impl ProviderFactory for WasmProviderFactory {
                 instance,
                 name: self.configured.name.clone(),
                 schemas: Arc::clone(&self.schemas),
-                operation_hard_timeout: self.operation_hard_timeout,
             }) as Box<dyn Provider>)
         })
     }
@@ -3339,7 +3368,6 @@ pub struct WasmProvider {
     instance: Arc<SharedWasmInstance>,
     name: String,
     schemas: Arc<Vec<ResourceSchema>>,
-    operation_hard_timeout: std::time::Duration,
 }
 
 // Safety: SharedWasmInstance.store is behind a Mutex, so concurrent access is
@@ -3572,24 +3600,14 @@ impl WasmProvider {
         decode: Decode,
     ) -> ProviderResult<Progress>
     where
+        WitOutcome: 'static,
         GuestCall: for<'a> FnOnce(&'a mut Store<HostState>) -> GuestOperationFuture<'a, WitOutcome>,
         Decode: FnOnce(WitOutcome, ResourceId) -> Result<Progress, DecodeError>,
         DecodeError: std::error::Error + Send + Sync + 'static,
     {
         let mut locked = LockedStore::acquire(&self.instance, operation).await?;
-        let call = with_operation_timeout(
-            operation,
-            self.operation_hard_timeout,
-            guest_call(locked.store()),
-        )
-        .await?;
-        let outcome = finish_guest_call(
-            &self.instance,
-            operation,
-            WasmTrapContext::ProviderOperation,
-            &mut locked,
-            call,
-        )?;
+        let call = locked.call(operation, guest_call).await?;
+        let outcome = finish_guest_call(&self.instance, operation, &mut locked, call)?;
         match outcome {
             Ok(outcome) => decode(outcome, id.clone()).map_err(|error| {
                 wasm_value_decode_provider_error(operation, error).for_resource(id)
@@ -4289,24 +4307,17 @@ impl WasmProvider {
         let call_request = wit_request.clone();
         let call_result = async {
             let mut locked = LockedStore::acquire(&self.instance, "resume_create").await?;
-            let call = with_operation_timeout(
-                "resume_create",
-                self.operation_hard_timeout,
-                call_instance.bindings.call_resume_create(
-                    locked.store(),
-                    &call_id,
-                    &call_request,
-                    &wit_pending,
-                ),
-            )
-            .await?;
-            finish_guest_call(
-                &self.instance,
-                "resume_create",
-                WasmTrapContext::ProviderOperation,
-                &mut locked,
-                call,
-            )
+            let call = locked
+                .call("resume_create", |store| {
+                    call_instance.bindings.call_resume_create(
+                        store,
+                        &call_id,
+                        &call_request,
+                        &wit_pending,
+                    )
+                })
+                .await?;
+            finish_guest_call(&self.instance, "resume_create", &mut locked, call)
         }
         .await;
         let result = match call_result {
@@ -4379,25 +4390,18 @@ impl WasmProvider {
             Ok(locked) => locked,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
-        let call = match with_operation_timeout(
-            "create",
-            self.operation_hard_timeout,
-            call_instance
-                .bindings
-                .call_create(locked.store(), &call_id, &call_request),
-        )
-        .await
+        let call = match locked
+            .call("create", |store| {
+                call_instance
+                    .bindings
+                    .call_create(store, &call_id, &call_request)
+            })
+            .await
         {
             Ok(call) => call,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
-        let result = match finish_guest_call(
-            &self.instance,
-            "create",
-            WasmTrapContext::ProviderOperation,
-            &mut locked,
-            call,
-        ) {
+        let result = match finish_guest_call(&self.instance, "create", &mut locked, call) {
             Ok(result) => result,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
@@ -4437,24 +4441,17 @@ impl WasmProvider {
         let call_request = starting.wit_request.clone();
         let call_result = async {
             let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
-            let call = with_operation_timeout(
-                "poll_create",
-                self.operation_hard_timeout,
-                call_instance.bindings.call_poll_create(
-                    locked.store(),
-                    &call_id,
-                    &call_request,
-                    &wit_pending,
-                ),
-            )
-            .await?;
-            finish_guest_call(
-                &self.instance,
-                "poll_create",
-                WasmTrapContext::ProviderOperation,
-                &mut locked,
-                call,
-            )
+            let call = locked
+                .call("poll_create", |store| {
+                    call_instance.bindings.call_poll_create(
+                        store,
+                        &call_id,
+                        &call_request,
+                        &wit_pending,
+                    )
+                })
+                .await?;
+            finish_guest_call(&self.instance, "poll_create", &mut locked, call)
         }
         .await;
         let result = match call_result {
@@ -4501,24 +4498,17 @@ impl WasmProvider {
         let call_request = starting.wit_request.clone();
         let call_result = async {
             let mut locked = LockedStore::acquire(&self.instance, "poll_create").await?;
-            let call = with_operation_timeout(
-                "poll_create",
-                self.operation_hard_timeout,
-                call_instance.bindings.call_poll_create(
-                    locked.store(),
-                    &call_id,
-                    &call_request,
-                    &wit_pending,
-                ),
-            )
-            .await?;
-            finish_guest_call(
-                &self.instance,
-                "poll_create",
-                WasmTrapContext::ProviderOperation,
-                &mut locked,
-                call,
-            )
+            let call = locked
+                .call("poll_create", |store| {
+                    call_instance.bindings.call_poll_create(
+                        store,
+                        &call_id,
+                        &call_request,
+                        &wit_pending,
+                    )
+                })
+                .await?;
+            finish_guest_call(&self.instance, "poll_create", &mut locked, call)
         }
         .await;
         let result = match call_result {
@@ -4828,21 +4818,14 @@ impl Provider for WasmProvider {
         let id = id.clone();
         Box::pin(async move {
             let mut locked = LockedStore::acquire(&self.instance, "read").await?;
-            let call = with_operation_timeout(
-                "read",
-                self.operation_hard_timeout,
-                self.instance
-                    .bindings
-                    .call_read(locked.store(), &wit_id, &identifier, wit_request),
-            )
-            .await?;
-            let result = finish_guest_call(
-                &self.instance,
-                "read",
-                WasmTrapContext::ProviderOperation,
-                &mut locked,
-                call,
-            )?;
+            let call = locked
+                .call("read", |store| {
+                    self.instance
+                        .bindings
+                        .call_read(store, &wit_id, &identifier, wit_request)
+                })
+                .await?;
+            let result = finish_guest_call(&self.instance, "read", &mut locked, call)?;
             match result {
                 Ok(wit_outcome) => wasm_convert::wit_to_core_read_outcome(wit_outcome, &id)
                     .map_err(|error| {
@@ -4864,21 +4847,14 @@ impl Provider for WasmProvider {
         let id = resource.id.clone();
         Box::pin(async move {
             let mut locked = LockedStore::acquire(&self.instance, "read_data_source").await?;
-            let call = with_operation_timeout(
-                "read_data_source",
-                self.operation_hard_timeout,
-                self.instance
-                    .bindings
-                    .call_read_data_source(locked.store(), &wit_resource),
-            )
-            .await?;
-            let result = finish_guest_call(
-                &self.instance,
-                "read_data_source",
-                WasmTrapContext::ProviderOperation,
-                &mut locked,
-                call,
-            )?;
+            let call = locked
+                .call("read_data_source", |store| {
+                    self.instance
+                        .bindings
+                        .call_read_data_source(store, &wit_resource)
+                })
+                .await?;
+            let result = finish_guest_call(&self.instance, "read_data_source", &mut locked, call)?;
             match result {
                 Ok(wit_state) => {
                     wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
@@ -4955,18 +4931,14 @@ impl Provider for WasmProvider {
             tokio::runtime::Handle::current().block_on(async {
                 let mut locked =
                     LockedStore::acquire(&self.instance, "required_permissions").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_required_permissions(locked.store(), &wit_id, op)
-                    .await;
-                finish_guest_call(
-                    &self.instance,
-                    "required_permissions",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )
+                let call = locked
+                    .call("required_permissions", |store| {
+                        self.instance
+                            .bindings
+                            .call_required_permissions(store, &wit_id, op)
+                    })
+                    .await?;
+                finish_guest_call(&self.instance, "required_permissions", &mut locked, call)
             })
         })
     }
@@ -4981,18 +4953,15 @@ impl Provider for WasmProvider {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut locked = LockedStore::acquire(&self.instance, "satisfier_hint").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_satisfier_hint(locked.store(), &wit_id, &wit_attr_path)
-                    .await;
-                let patterns = finish_guest_call(
-                    &self.instance,
-                    "satisfier_hint",
-                    WasmTrapContext::ProviderOperation,
-                    &mut locked,
-                    call,
-                )?;
+                let call = locked
+                    .call("satisfier_hint", |store| {
+                        self.instance
+                            .bindings
+                            .call_satisfier_hint(store, &wit_id, &wit_attr_path)
+                    })
+                    .await?;
+                let patterns =
+                    finish_guest_call(&self.instance, "satisfier_hint", &mut locked, call)?;
                 patterns
                     .into_iter()
                     .map(wasm_convert::wit_to_core_binding_pattern)
@@ -5206,7 +5175,6 @@ fn apply_wit_state_attribute_updates<M: StateValueAccess>(
 fn finish_guest_call<T>(
     instance: &SharedWasmInstance,
     operation: &'static str,
-    context: WasmTrapContext,
     locked: &mut LockedStore<'_>,
     call: wasmtime::Result<T>,
 ) -> ProviderResult<T> {
@@ -5225,7 +5193,7 @@ fn finish_guest_call<T>(
                 operation,
                 &error,
             );
-            Err(wasm_trap_provider_error(operation, error, context))
+            Err(wasm_trap_provider_error(operation, error))
         }
     }
 }
@@ -5236,14 +5204,8 @@ fn finish_normalizer_guest_call<T>(
     locked: &mut LockedStore<'_>,
     call: wasmtime::Result<Result<T, wit_types::ProviderError>>,
 ) -> ProviderResult<T> {
-    finish_guest_call(
-        instance,
-        operation,
-        WasmTrapContext::Normalizer,
-        locked,
-        call,
-    )?
-    .map_err(wasm_convert::wit_to_core_provider_error)
+    finish_guest_call(instance, operation, locked, call)?
+        .map_err(wasm_convert::wit_to_core_provider_error)
 }
 
 /// One stripped attribute retained so it can be reinserted at its original
@@ -5339,10 +5301,11 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     let result = {
                         let mut locked =
                             LockedStore::acquire(&instance, "normalize_desired").await?;
-                        let call = instance
-                            .bindings
-                            .call_normalize_desired(locked.store(), &sealed)
-                            .await;
+                        let call = locked
+                            .call("normalize_desired", |store| {
+                                instance.bindings.call_normalize_desired(store, &sealed)
+                            })
+                            .await?;
                         finish_normalizer_guest_call(
                             &instance,
                             "normalize_desired",
@@ -5412,11 +5375,13 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 let result = {
                     let mut locked =
                         LockedStore::acquire(&self.instance, "normalize_state").await?;
-                    let call = self
-                        .instance
-                        .bindings
-                        .call_normalize_state(locked.store(), &resolved_wit_states)
-                        .await;
+                    let call = locked
+                        .call("normalize_state", |store| {
+                            self.instance
+                                .bindings
+                                .call_normalize_state(store, &resolved_wit_states)
+                        })
+                        .await?;
                     finish_normalizer_guest_call(
                         &self.instance,
                         "normalize_state",
@@ -5438,14 +5403,17 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             // and ignore the guest's re-rendered key when correlating the
             // single result.
             for (id, key, wit_state) in single_wit_states {
+                let wit_states = [(key, wit_state)];
                 let result = {
                     let mut locked =
                         LockedStore::acquire(&self.instance, "normalize_state").await?;
-                    let call = self
-                        .instance
-                        .bindings
-                        .call_normalize_state(locked.store(), &[(key, wit_state)])
-                        .await;
+                    let call = locked
+                        .call("normalize_state", |store| {
+                            self.instance
+                                .bindings
+                                .call_normalize_state(store, &wit_states)
+                        })
+                        .await?;
                     finish_normalizer_guest_call(
                         &self.instance,
                         "normalize_state",
@@ -5528,15 +5496,15 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 let result = {
                     let mut locked =
                         LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
-                    let call = self
-                        .instance
-                        .bindings
-                        .call_hydrate_read_state(
-                            locked.store(),
-                            &resolved_wit_states,
-                            &resolved_wit_saved,
-                        )
-                        .await;
+                    let call = locked
+                        .call("hydrate_read_state", |store| {
+                            self.instance.bindings.call_hydrate_read_state(
+                                store,
+                                &resolved_wit_states,
+                                &resolved_wit_saved,
+                            )
+                        })
+                        .await?;
                     finish_normalizer_guest_call(
                         &self.instance,
                         "hydrate_read_state",
@@ -5556,17 +5524,22 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             // and provider-instance wire-key collisions. Correlate the single
             // result by position and ignore the guest's re-rendered key.
             for (id, key, wit_state, wit_saved) in single_batches {
+                let wit_states = [(key.clone(), wit_state)];
                 let wit_saved = wit_saved
-                    .map(|attrs| vec![(key.clone(), attrs)])
+                    .map(|attrs| vec![(key, attrs)])
                     .unwrap_or_default();
                 let result = {
                     let mut locked =
                         LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
-                    let call = self
-                        .instance
-                        .bindings
-                        .call_hydrate_read_state(locked.store(), &[(key, wit_state)], &wit_saved)
-                        .await;
+                    let call = locked
+                        .call("hydrate_read_state", |store| {
+                            self.instance.bindings.call_hydrate_read_state(
+                                store,
+                                &wit_states,
+                                &wit_saved,
+                            )
+                        })
+                        .await?;
                     finish_normalizer_guest_call(
                         &self.instance,
                         "hydrate_read_state",
@@ -5597,6 +5570,8 @@ mod tests {
     };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use wasmtime::component::ResourceTable;
+    use wasmtime_wasi::WasiCtxView;
 
     fn test_load_identity(name: &str) -> ProviderLoadIdentity {
         ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
@@ -6579,11 +6554,7 @@ mod tests {
 
     #[test]
     fn shared_trap_mapper_preserves_provider_operation_messages() {
-        let trap = wasm_trap_provider_error(
-            "read",
-            wasmtime::Error::msg("low-level trap"),
-            WasmTrapContext::ProviderOperation,
-        );
+        let trap = wasm_trap_provider_error("read", wasmtime::Error::msg("low-level trap"));
         assert_eq!(trap.detail().context(), "WASM guest trapped");
         assert_eq!(
             trap.to_string(),
@@ -6596,33 +6567,31 @@ mod tests {
             "read",
             wasmtime::Error::new(wasmtime::Trap::Interrupt)
                 .context("error while executing at wasm backtrace:\n    0: test-frame"),
-            WasmTrapContext::ProviderOperation,
         );
         assert_eq!(timeout.detail().context(), "WASM plugin timed out");
-        assert!(timeout.to_string().contains(&format!(
-            "read did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials)"
-        )));
+        let rendered = timeout.to_string();
+        assert!(rendered.contains("read exceeded the guest compute budget"));
+        assert!(!rendered.to_lowercase().contains("credential"));
 
         let normalizer_timeout = wasm_trap_provider_error(
             "normalize_state",
             wasmtime::Error::new(wasmtime::Trap::Interrupt)
                 .context("error while executing at wasm backtrace:\n    0: test-frame"),
-            WasmTrapContext::Normalizer,
         );
         assert_eq!(
             normalizer_timeout.detail().context(),
             "WASM plugin timed out"
         );
-        assert!(normalizer_timeout.to_string().contains(&format!(
-            "normalize_state did not complete within {WASM_OPERATION_TIMEOUT_SECS}s"
-        )));
+        let rendered = normalizer_timeout.to_string();
+        assert!(rendered.contains("normalize_state exceeded the guest compute budget"));
+        assert!(!rendered.to_lowercase().contains("credential"));
     }
 
     #[test]
     fn timeout_classification_uses_the_typed_trap_not_message_text() {
         let nested = wasmtime::Error::msg("epoch deadline reached").context("outer guest trap");
 
-        let error = wasm_trap_provider_error("read", nested, WasmTrapContext::ProviderOperation);
+        let error = wasm_trap_provider_error("read", nested);
 
         assert_eq!(error.variant_name(), "internal");
     }
@@ -6665,56 +6634,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_engine_epoch_interrupt_maps_to_provider_timeout() {
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
-            .into_iter()
-            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
-            .find(|path| path.exists());
-        let Some(wasm_path) = wasm_path else {
-            eprintln!(
-                "SKIP: WASM binary not found. Build with: cargo build -p \
-                 carina-provider-mock --target wasm32-wasip2"
-            );
-            return;
-        };
-
-        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-            .await
-            .expect("mock WASM provider should load");
-        let instance = factory
-            .get_or_create_shared_instance(None, &IndexMap::new())
-            .await
-            .expect("mock WASM provider should initialize");
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "epoch-timeout", None);
-        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let mut locked = LockedStore::acquire(&instance, "required_permissions")
-            .await
-            .expect("fresh instance should be usable");
-
-        locked.store().set_epoch_deadline(1);
-        factory.engine.increment_epoch();
-        let call = instance
-            .bindings
-            .call_required_permissions(locked.store(), &wit_id, PlanOp::Read)
-            .await;
-        let error = finish_guest_call(
-            &instance,
-            "required_permissions",
-            WasmTrapContext::ProviderOperation,
-            &mut locked,
-            call,
-        )
-        .expect_err("the elapsed real engine epoch deadline must trap");
-
-        assert!(
-            matches!(error, ProviderError::Timeout(_)),
-            "the real epoch interrupt must map to a timeout: {error}"
-        );
-    }
-
-    #[tokio::test]
     async fn normalizer_guest_boundary_decode_error_is_structured_and_reentrant() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -6751,10 +6670,15 @@ mod tests {
         let mut locked = LockedStore::acquire(&instance, "normalize_desired")
             .await
             .expect("fresh instance should be usable");
-        let call = instance
-            .bindings
-            .call_normalize_desired_raw(locked.store(), &[malformed])
-            .await;
+        let malformed = [malformed];
+        let call = locked
+            .call("normalize_desired", |store| {
+                instance
+                    .bindings
+                    .call_normalize_desired_raw(store, &malformed)
+            })
+            .await
+            .expect("the guest call should return its provider error");
         let error = finish_normalizer_guest_call(&instance, "normalize_desired", &mut locked, call)
             .expect_err("malformed guest input must return provider-error");
         drop(locked);
@@ -6793,10 +6717,14 @@ mod tests {
         let mut locked = LockedStore::acquire(&instance, "hydrate_read_state")
             .await
             .expect("the decode error must leave the instance usable");
-        let call = instance
-            .bindings
-            .call_hydrate_read_state(locked.store(), &[], &malformed_saved_attrs)
-            .await;
+        let call = locked
+            .call("hydrate_read_state", |store| {
+                instance
+                    .bindings
+                    .call_hydrate_read_state(store, &[], &malformed_saved_attrs)
+            })
+            .await
+            .expect("the guest call should return its provider error");
         let error =
             finish_normalizer_guest_call(&instance, "hydrate_read_state", &mut locked, call)
                 .expect_err("malformed saved attributes must return provider-error");
@@ -7724,16 +7652,16 @@ mod tests {
         let config = build_engine_config();
         let engine = Engine::new(&config).unwrap();
         let wasi_ctx = WasiCtxBuilder::new().build();
-        let host_state = HostState {
+        let mut store = GuestStore::new(
+            &engine,
             wasi_ctx,
-            http_ctx: None,
-            table: ResourceTable::new(),
-            http_hooks: AllowListHttpHooks::new(None),
-            limits: build_store_limits(),
-        };
-        let mut store = Store::new(&engine, host_state);
+            None,
+            AllowListHttpHooks::new(None),
+            build_store_limits(),
+            GuestCallBudget::PRODUCTION,
+        );
         // This will panic if epoch_interruption is not enabled on the engine.
-        store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+        store.set_epoch_deadline_for_test(1);
     }
 
     #[test]
@@ -7748,15 +7676,15 @@ mod tests {
         // Verify by setting a deadline of 1 on a store — if the epoch has
         // advanced past 1, this deadline is already expired.
         let wasi_ctx = WasiCtxBuilder::new().build();
-        let host_state = HostState {
+        let mut store = GuestStore::new(
+            &engine,
             wasi_ctx,
-            http_ctx: None,
-            table: ResourceTable::new(),
-            http_hooks: AllowListHttpHooks::new(None),
-            limits: build_store_limits(),
-        };
-        let mut store = Store::new(&engine, host_state);
-        store.set_epoch_deadline(1);
+            None,
+            AllowListHttpHooks::new(None),
+            build_store_limits(),
+            GuestCallBudget::PRODUCTION,
+        );
+        store.set_epoch_deadline_for_test(1);
 
         // The epoch should be at least 2 by now, so a deadline of 1 is expired.
         // We can't easily check the epoch value directly, but we can verify
@@ -7774,17 +7702,17 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_operation_timeout_is_reasonable() {
-        // The timeout should be long enough for normal operations but short
+    fn test_guest_compute_budget_is_reasonable() {
+        // The budget should be long enough for normal operations but short
         // enough to prevent indefinite hangs.
         const {
             assert!(
-                WASM_OPERATION_TIMEOUT_SECS >= 10,
-                "timeout too short for normal operations"
+                GuestCallBudget::PRODUCTION.compute().as_secs() >= 10,
+                "compute budget too short for normal operations"
             );
             assert!(
-                WASM_OPERATION_TIMEOUT_SECS <= 120,
-                "timeout too long to be useful"
+                GuestCallBudget::PRODUCTION.compute().as_secs() <= 120,
+                "compute budget too long to be useful"
             );
         }
     }
@@ -8056,6 +7984,7 @@ mod tests {
             &component,
             None,
             InstantiationWorld::HttpEnabled,
+            GuestCallBudget::PRODUCTION,
         )
         .await
         {
@@ -8090,13 +8019,18 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            match create_runtime_instance(&engine, &component, None, InstantiationWorld::Basic)
-                .await
-            {
-                Ok(_) => panic!("the basic linker must reject the wasi:http import"),
-                Err(error) => error,
-            };
+        let error = match create_runtime_instance(
+            &engine,
+            &component,
+            None,
+            InstantiationWorld::Basic,
+            GuestCallBudget::PRODUCTION,
+        )
+        .await
+        {
+            Ok(_) => panic!("the basic linker must reject the wasi:http import"),
+            Err(error) => error,
+        };
         let WasmProviderInstanceError::Instantiation(instantiation) = error else {
             panic!("expected instantiation error")
         };
@@ -8237,9 +8171,9 @@ mod tests {
 
         assert_eq!(provider_error.variant_name(), "timeout");
         assert_eq!(provider_error.detail().context(), "WASM plugin timed out");
-        assert!(provider_error.to_string().contains(&format!(
-            "info did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials)"
-        )));
+        let provider_rendered = provider_error.to_string();
+        assert!(provider_rendered.contains("info exceeded the guest compute budget"));
+        assert!(!provider_rendered.to_lowercase().contains("credential"));
         let cause = provider_error
             .detail()
             .cause()
@@ -8258,6 +8192,71 @@ mod tests {
             "{rendered}"
         );
         assert!(cause.source().is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_wall_timeout_keeps_typed_budget_source_without_duplicate_text() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let wasi_ctx = WasiCtxBuilder::new().build();
+        let mut store = GuestStore::new(
+            &engine,
+            wasi_ctx,
+            None,
+            AllowListHttpHooks::new(None),
+            build_store_limits(),
+            GuestCallBudget::new(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO,
+            ),
+        );
+        let source = store
+            .call(|_store| std::future::pending::<()>())
+            .await
+            .expect_err("a zero wall budget must time out");
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error = WasmProviderInstanceError::WallBudgetExceeded {
+            operation: "initialize",
+            source,
+        }
+        .into_provider_error_with(&mapper);
+
+        assert_eq!(provider_error.variant_name(), "timeout");
+        let operation_cause = provider_error
+            .detail()
+            .cause()
+            .expect("wall timeout must retain an operation-aware typed cause");
+        assert!(
+            operation_cause
+                .downcast_ref::<WasmWallBudgetError>()
+                .is_some(),
+            "unexpected cause type: {operation_cause:?}"
+        );
+        let budget_cause = operation_cause
+            .source()
+            .expect("operation-aware timeout must retain WallBudgetExceeded");
+        assert!(budget_cause.downcast_ref::<WallBudgetExceeded>().is_some());
+
+        let rendered = provider_error.to_string();
+        assert!(
+            rendered.contains("WASM guest call 'initialize' timed out"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("wall-clock budget"), "{rendered}");
+        assert_eq!(
+            rendered.matches("wall-clock budget").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("check network connectivity"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("credential"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -8296,9 +8295,13 @@ mod tests {
         assert_eq!(provider_error.detail().context(), "WASM plugin timed out");
         assert_eq!(
             provider_error.to_string(),
-            format!(
-                "WASM plugin timed out: initialize did not complete within {WASM_OPERATION_TIMEOUT_SECS}s (check AWS credentials): error while calling provider initialize: wasm trap: interrupt"
-            )
+            "WASM plugin timed out: initialize exceeded the guest compute budget: error while calling provider initialize: wasm trap: interrupt"
+        );
+        assert!(
+            !provider_error
+                .to_string()
+                .to_lowercase()
+                .contains("credential")
         );
     }
 
@@ -8418,6 +8421,7 @@ mod tests {
         {
             let _armed = PoisonOnDrop {
                 poisoned: &flag,
+                poisoned_reason: &reason,
                 armed: true,
             };
         }
@@ -8482,6 +8486,7 @@ mod tests {
         {
             let mut guard = PoisonOnDrop {
                 poisoned: &flag,
+                poisoned_reason: &reason,
                 armed: true,
             };
             guard.armed = false; // mirrors LockedStore::disarm()
@@ -8496,24 +8501,146 @@ mod tests {
         );
     }
 
-    /// The hard timeout bounds one guest call, not the complete operation.
-    /// It must outlast the epoch budget (so genuine WASM-computation overruns
-    /// surface as the more specific epoch trap) and leave margin for the
-    /// longest legitimate single-step API retry sequence. Multi-step waiters
-    /// use pending outcomes and the independent schema operation budget.
     #[test]
-    fn hard_timeout_outlasts_epoch_budget_and_longest_legitimate_guest_step() {
-        assert!(
-            WASM_OPERATION_HARD_TIMEOUT.as_secs() > WASM_OPERATION_TIMEOUT_SECS,
-            "hard timeout must outlast the epoch budget so epoch traps win the race"
+    fn production_wall_budget_exceeds_each_provider_single_call_worst_case() {
+        fn retry_backoff_total(
+            max_attempts: u32,
+            initial_delay: std::time::Duration,
+            max_delay: std::time::Duration,
+        ) -> std::time::Duration {
+            (1..max_attempts).fold(std::time::Duration::ZERO, |total, attempt| {
+                total
+                    + initial_delay
+                        .saturating_mul(2_u32.pow(attempt - 1))
+                        .min(max_delay)
+            })
+        }
+
+        // Mirrors carina-provider-aws/src/helpers.rs RetryPolicy::default()
+        // on origin/main.
+        // retry_aws_operation runs a complete SDK operation per outer attempt
+        // and treats the SDK's TimeoutError as retryable.
+        const AWS_RETRY_POLICY_MAX_ATTEMPTS: u32 = 8;
+        const AWS_RETRY_POLICY_INITIAL_DELAY: std::time::Duration =
+            std::time::Duration::from_secs(5);
+        const AWS_RETRY_POLICY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
+
+        // Mirrors the bounded policy in both carina-provider-aws/src/sdk_config.rs
+        // and carina-provider-awscc/src/sdk_config.rs on origin/main.
+        const AWS_SDK_CONNECT_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_millis(3_100);
+        const AWS_SDK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const AWS_SDK_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Mirrors carina-provider-aws/src/services/ec2/flow_log.rs on
+        // origin/main: up to 12 send() attempts with a 5s IAM-propagation
+        // sleep between attempts, followed by one read_ec2_flow_log SDK
+        // operation in the same create call.
+        const AWS_FLOW_LOG_SEND_ATTEMPTS: u32 = 12;
+        const AWS_FLOW_LOG_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // Mirrors carina-provider-aws/src/services/acm/certificate.rs on
+        // origin/main: one RequestCertificate send(), then six
+        // wait_for_dvo_populated send() attempts at a 5s interval.
+        const AWS_ACM_REQUEST_CERTIFICATE_SENDS: u32 = 1;
+        const AWS_ACM_DVO_WAIT_ATTEMPTS: u32 = 6;
+        const AWS_ACM_DVO_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let bounded_attempt_worst_case = AWS_SDK_CONNECT_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT)
+            + AWS_SDK_READ_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT);
+        assert_eq!(
+            bounded_attempt_worst_case,
+            std::time::Duration::from_millis(33_100)
         );
-        // In-call API retries remain deliberately bounded below the pending
-        // protocol; their current worst case is about 6.6 minutes.
-        const LONGEST_LEGITIMATE_GUEST_STEP_SECS: u64 = 7 * 60;
+        // In WASM, the operation-attempt and operation deadlines are observed
+        // only between attempts. The attempt deadline therefore does not
+        // tighten this bound, and one SDK operation can overrun its operation
+        // timeout by one bounded connect+read attempt.
+        let bounded_sdk_operation_worst_case =
+            AWS_SDK_OPERATION_TIMEOUT + bounded_attempt_worst_case;
+        assert_eq!(
+            bounded_sdk_operation_worst_case,
+            std::time::Duration::from_millis(93_100)
+        );
+
+        let aws_outer_backoff = retry_backoff_total(
+            AWS_RETRY_POLICY_MAX_ATTEMPTS,
+            AWS_RETRY_POLICY_INITIAL_DELAY,
+            AWS_RETRY_POLICY_MAX_DELAY,
+        );
+        assert_eq!(aws_outer_backoff, std::time::Duration::from_secs(395));
+        let aws_retry_operation_worst_case =
+            bounded_sdk_operation_worst_case * AWS_RETRY_POLICY_MAX_ATTEMPTS + aws_outer_backoff;
+
+        let aws_flow_log_worst_case = bounded_sdk_operation_worst_case
+            * (AWS_FLOW_LOG_SEND_ATTEMPTS + 1)
+            + AWS_FLOW_LOG_RETRY_INTERVAL * (AWS_FLOW_LOG_SEND_ATTEMPTS - 1);
+        assert_eq!(
+            aws_flow_log_worst_case,
+            std::time::Duration::from_millis(1_265_300)
+        );
+
+        let aws_acm_dns_validation_worst_case = bounded_sdk_operation_worst_case
+            * AWS_ACM_REQUEST_CERTIFICATE_SENDS
+            + bounded_sdk_operation_worst_case * AWS_ACM_DVO_WAIT_ATTEMPTS
+            + AWS_ACM_DVO_WAIT_INTERVAL * (AWS_ACM_DVO_WAIT_ATTEMPTS - 1);
+
+        // carina-provider-awscc/src/provider/cloudcontrol.rs `finish_issue`
+        // and `poll_phase` on origin/main return retries as `poll_after_secs`
+        // on a pending step, so one AWSCC guest call is one SDK operation.
+        let awscc_guest_call_worst_case = bounded_sdk_operation_worst_case;
+
+        // A host patch release must still run provider releases predating the
+        // bounded SDK configuration. Their standard SDK policy used three
+        // attempts with 1s + 2s backoff, while wasi:http could consume the
+        // host cap once for connect and once for first byte per attempt.
+        const LEGACY_AWS_SDK_MAX_ATTEMPTS: u32 = 3;
+        const LEGACY_AWS_SDK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+        const LEGACY_AWS_SDK_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+        let legacy_sdk_backoff = retry_backoff_total(
+            LEGACY_AWS_SDK_MAX_ATTEMPTS,
+            LEGACY_AWS_SDK_INITIAL_DELAY,
+            LEGACY_AWS_SDK_MAX_DELAY,
+        );
+        assert_eq!(legacy_sdk_backoff, std::time::Duration::from_secs(3));
+        let legacy_attempt_worst_case = HTTP_API_REQUEST_TIMEOUT + HTTP_API_REQUEST_TIMEOUT;
+        let legacy_sdk_operation_worst_case =
+            legacy_attempt_worst_case * LEGACY_AWS_SDK_MAX_ATTEMPTS + legacy_sdk_backoff;
+        assert_eq!(
+            legacy_sdk_operation_worst_case,
+            std::time::Duration::from_secs(183)
+        );
+        let legacy_aws_flow_log_worst_case = legacy_sdk_operation_worst_case
+            * (AWS_FLOW_LOG_SEND_ATTEMPTS + 1)
+            + AWS_FLOW_LOG_RETRY_INTERVAL * (AWS_FLOW_LOG_SEND_ATTEMPTS - 1);
+        assert_eq!(
+            legacy_aws_flow_log_worst_case,
+            std::time::Duration::from_secs(2_434)
+        );
+
         assert!(
-            WASM_OPERATION_HARD_TIMEOUT.as_secs() >= 2 * LONGEST_LEGITIMATE_GUEST_STEP_SECS,
-            "hard timeout must be >= 2x the longest legitimate single guest \
-             step; whole-operation waits belong to the pending-operation budget"
+            GuestCallBudget::PRODUCTION.wall() > aws_retry_operation_worst_case,
+            "the production wall budget must exceed retry_aws_operation's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > aws_flow_log_worst_case,
+            "the production wall budget must exceed the VPC flow-log loop's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > aws_acm_dns_validation_worst_case,
+            "the production wall budget must exceed the ACM DNS-validation wait's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > awscc_guest_call_worst_case,
+            "the production wall budget must exceed one AWSCC guest call's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > legacy_aws_flow_log_worst_case,
+            "the production wall budget must exceed the legacy VPC flow-log loop's worst case"
+        );
+        assert!(
+            GuestCallBudget::PRODUCTION.wall() > GuestCallBudget::PRODUCTION.compute(),
+            "the wall budget must outlast the compute budget so compute traps win"
         );
     }
 }
