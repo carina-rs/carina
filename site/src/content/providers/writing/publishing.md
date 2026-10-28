@@ -7,4 +7,4 @@ Publishing to the provider registry (`registry.carina-rs.dev`) is not open to th
 
 Opening it is tracked in [carina-rs/registry#16](https://github.com/carina-rs/registry/issues/16). This page will describe the process once that work is done.
 
-Until then, share a provider through its GitHub repository; a configuration can install it with a `github.com/<owner>/<repo>` source, as described in [Getting Started](/providers/writing/getting-started/#use-it-from-github).
+Until then, share a provider through its GitHub repository; a configuration can install it with a `github.com/<owner>/<repo>` source, as described in [Your First Provider](/providers/writing/getting-started/#use-it-from-github).

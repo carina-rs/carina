@@ -79,6 +79,6 @@ The provider protocol is versioned. The current version is 12, and the host also
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed.
 
-## Next
+## Next steps
 
-[Getting Started](/providers/writing/getting-started/) builds a small provider and uses it from a configuration.
+[Your First Provider](/providers/writing/getting-started/) builds a small provider and uses it from a configuration.

@@ -1,16 +1,16 @@
 ---
-title: "Getting Started"
+title: "Your First Provider"
 description: "Build a minimal Carina provider with carina-plugin-sdk, compile it to a WebAssembly component, and use it from a configuration through a file:// source."
 ---
 
 This page builds `hello`, a provider with one resource type, `hello.greeting`. It calls no API: a greeting's message is derived from its name. That keeps the example small enough to read in full while still going through every call the host makes, so you can run `plan`, `apply` and `destroy` against it.
 
-The code on this page was compiled and run against carina at commit `6726a1cc`, with `carina-plugin-wit` at `5ebd5ce6`.
+The code on this page was compiled and run against the carina repository at commit `6726a1cc`, with `carina-plugin-wit` at `5ebd5ce6`.
 
 ## Prerequisites
 
 - Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
-- The `carina` CLI, at a version that speaks the same protocol version as the SDK you build against (see [Protocol version](/providers/writing/overview/#protocol-version))
+- The [`carina` CLI](/getting-started/installation/), at a version that speaks the same protocol version as the SDK you build against (see [Protocol version](/providers/writing/overview/#protocol-version))
 
 ## Project layout
 
@@ -33,13 +33,13 @@ git init
 git submodule add https://github.com/carina-rs/carina-plugin-wit.git carina-plugin-wit
 ```
 
-The WIT files must match the SDK. Check out the `carina-plugin-wit` commit that carina pins at the revision you depend on:
+The WIT files must match the SDK. Check out the `carina-plugin-wit` commit that the carina repository pins at the revision you depend on. For `6726a1cc`, that is `5ebd5ce6`:
 
 ```bash
-rev=6726a1cc
-wit=$(gh api "repos/carina-rs/carina/contents/carina-plugin-wit?ref=$rev" --jq .sha)
-git -C carina-plugin-wit checkout "$wit"
+git -C carina-plugin-wit checkout 5ebd5ce6
 ```
+
+For another revision, look up the pinned commit with the GitHub CLI: `gh api "repos/carina-rs/carina/contents/carina-plugin-wit?ref=<rev>" --jq .sha`.
 
 ## Cargo manifests
 
@@ -330,10 +330,6 @@ provider hello {
 let greeting = hello.greeting {
   name = 'world'
 }
-
-exports {
-  message: String = greeting.message
-}
 ```
 
 Install the provider, then plan and apply:
@@ -359,12 +355,12 @@ provider hello {
 }
 ```
 
-`version` is a semver constraint, as for any provider. `carina init` lists the repository's releases through the GitHub API, picks the newest version that matches, and downloads the release asset named `<repo>-v<version>.wasm` from the tag `v<version>`, for example `carina-provider-hello-v0.1.0.wasm` from `v0.1.0`. Tag releases with the `v` prefix. This lookup sends no token, so the repository must be public, and only the 100 most recent releases are considered.
+`version` is a semver constraint, as for any provider. `carina init` lists the repository's releases through the GitHub API, picks the newest version that matches, and downloads the release asset named `<repo>-v<version>.wasm` from the tag `v<version>`, for example `carina-provider-hello-v0.1.0.wasm` from `v0.1.0`. Tag releases with the `v` prefix, and attach the built component to the release under that name: `target/wasm32-wasip2/release/carina-provider-hello.wasm` renamed to `carina-provider-hello-v0.1.0.wasm`. This lookup sends no token, so the repository must be public, and only the 100 most recent releases are considered.
 
-With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit: the workflow artifact named `<repo>.wasm`. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
+With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit. For that, a GitHub Actions workflow in the repository must upload the built component as an artifact named `<repo>.wasm`, for example `carina-provider-hello.wasm`. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
 
 A GitHub source is not signature-checked, but `carina init` records the checksum of what it downloaded in the lock file.
 
-## Next
+## Next steps
 
 The mock provider in the carina repository, [`carina-provider-mock`](https://github.com/carina-rs/carina/tree/main/carina-provider-mock), implements the same trait with pending operations, polling and resume. It is a test fixture rather than a template, but it shows each create outcome in use.
