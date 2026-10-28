@@ -81,10 +81,15 @@ pub fn send_phase(code: &ErrorCode) -> SendPhase {
         ErrorCode::ConnectionWriteTimeout => SendPhase::MaybeSent,
         // A connection limit can be reported after the implementation accepted work.
         ErrorCode::ConnectionLimitReached => SendPhase::MaybeSent,
-        // TLS setup precedes HTTP request transmission.
+        // This is NotSent only because the carina host emits TlsProtocolError
+        // exclusively from connector.connect during its TLS handshake. The
+        // host test `tls_handshake_failure_is_reported_as_pre_send` pins that
+        // side of the contract.
         ErrorCode::TlsProtocolError => SendPhase::NotSent,
+        // Certificate validation precedes HTTP request transmission.
         ErrorCode::TlsCertificateError => SendPhase::NotSent,
-        ErrorCode::TlsAlertReceived(..) => SendPhase::NotSent,
+        // An alert can arrive after a TLS stream has been established.
+        ErrorCode::TlsAlertReceived(..) => SendPhase::MaybeSent,
         // These request validation failures are defined before transmission.
         ErrorCode::HttpRequestDenied => SendPhase::NotSent,
         // Length/body failures can be discovered after a partial body write.
@@ -689,26 +694,142 @@ fn read_body(body: &IncomingBody) -> Result<Vec<u8>, TransportFailure> {
 mod tests {
     use std::error::Error as _;
 
+    use wasi::http::types::{DnsErrorPayload, FieldSizePayload, TlsAlertReceivedPayload};
+
     use super::*;
 
     #[test]
-    fn maybe_sent_read_timeout_is_not_a_retryable_connector_category() {
-        let error = connector_error(TransportFailure::from_code(
-            "response read timed out",
-            ErrorCode::ConnectionReadTimeout,
-        ));
+    fn every_error_code_maps_to_the_expected_connector_category_and_source() {
+        let field_size = || FieldSizePayload {
+            field_name: Some("x-test".to_string()),
+            field_size: Some(1),
+        };
+        let cases = vec![
+            (ErrorCode::DnsTimeout, SendPhase::NotSent),
+            (
+                ErrorCode::DnsError(DnsErrorPayload {
+                    rcode: Some("NXDOMAIN".to_string()),
+                    info_code: Some(3),
+                }),
+                SendPhase::NotSent,
+            ),
+            (ErrorCode::DestinationNotFound, SendPhase::NotSent),
+            (ErrorCode::DestinationUnavailable, SendPhase::NotSent),
+            (ErrorCode::DestinationIpProhibited, SendPhase::NotSent),
+            (ErrorCode::DestinationIpUnroutable, SendPhase::NotSent),
+            (ErrorCode::ConnectionRefused, SendPhase::NotSent),
+            (ErrorCode::ConnectionTerminated, SendPhase::MaybeSent),
+            (ErrorCode::ConnectionTimeout, SendPhase::NotSent),
+            (ErrorCode::ConnectionReadTimeout, SendPhase::MaybeSent),
+            (ErrorCode::ConnectionWriteTimeout, SendPhase::MaybeSent),
+            (ErrorCode::ConnectionLimitReached, SendPhase::MaybeSent),
+            (ErrorCode::TlsProtocolError, SendPhase::NotSent),
+            (ErrorCode::TlsCertificateError, SendPhase::NotSent),
+            (
+                ErrorCode::TlsAlertReceived(TlsAlertReceivedPayload {
+                    alert_id: Some(0),
+                    alert_message: Some("close notify".to_string()),
+                }),
+                SendPhase::MaybeSent,
+            ),
+            (ErrorCode::HttpRequestDenied, SendPhase::NotSent),
+            (ErrorCode::HttpRequestLengthRequired, SendPhase::MaybeSent),
+            (
+                ErrorCode::HttpRequestBodySize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (ErrorCode::HttpRequestMethodInvalid, SendPhase::NotSent),
+            (ErrorCode::HttpRequestUriInvalid, SendPhase::NotSent),
+            (ErrorCode::HttpRequestUriTooLong, SendPhase::NotSent),
+            (
+                ErrorCode::HttpRequestHeaderSectionSize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpRequestHeaderSize(Some(field_size())),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpRequestTrailerSectionSize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpRequestTrailerSize(field_size()),
+                SendPhase::MaybeSent,
+            ),
+            (ErrorCode::HttpResponseIncomplete, SendPhase::MaybeSent),
+            (
+                ErrorCode::HttpResponseHeaderSectionSize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseHeaderSize(field_size()),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseBodySize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseTrailerSectionSize(Some(1)),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseTrailerSize(field_size()),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseTransferCoding(Some("chunked".to_string())),
+                SendPhase::MaybeSent,
+            ),
+            (
+                ErrorCode::HttpResponseContentCoding(Some("gzip".to_string())),
+                SendPhase::MaybeSent,
+            ),
+            (ErrorCode::HttpResponseTimeout, SendPhase::MaybeSent),
+            (ErrorCode::HttpUpgradeFailed, SendPhase::MaybeSent),
+            (ErrorCode::HttpProtocolError, SendPhase::MaybeSent),
+            (ErrorCode::LoopDetected, SendPhase::MaybeSent),
+            (ErrorCode::ConfigurationError, SendPhase::MaybeSent),
+            (
+                ErrorCode::InternalError(Some("test".to_string())),
+                SendPhase::MaybeSent,
+            ),
+        ];
 
-        assert!(!error.is_timeout());
-        assert!(!error.is_io());
-        assert!(error.is_other());
-        let failure = error
-            .source()
-            .and_then(|source| source.downcast_ref::<TransportFailure>())
-            .expect("connector source must retain the transport failure");
-        assert_eq!(failure.phase(), SendPhase::MaybeSent);
-        assert!(matches!(
-            failure.code(),
-            Some(ErrorCode::ConnectionReadTimeout)
-        ));
+        for (code, expected_phase) in cases {
+            let expected_code = format!("{code:?}");
+            let error = connector_error(TransportFailure::from_code("transport failed", code));
+
+            match expected_phase {
+                SendPhase::NotSent => assert!(error.is_io(), "{expected_code}"),
+                SendPhase::MaybeSent => {
+                    assert!(error.is_other(), "{expected_code}");
+                    assert!(!error.is_timeout(), "{expected_code}");
+                    assert!(!error.is_io(), "{expected_code}");
+                }
+            }
+
+            let failure = error
+                .source()
+                .and_then(|source| source.downcast_ref::<TransportFailure>())
+                .expect("connector source must retain the transport failure");
+            assert_eq!(failure.phase(), expected_phase, "{expected_code}");
+            assert_eq!(
+                failure.code().map(|code| format!("{code:?}")),
+                Some(expected_code)
+            );
+        }
+    }
+
+    #[test]
+    fn send_request_exposes_transport_failure_with_phase() {
+        // Native tests cannot enter wasi:http imports, so pin the public
+        // function's error type and its public phase accessor at type level.
+        type SendRequestResult = Result<http::Response<Vec<u8>>, TransportFailure>;
+        type SendRequestFn = fn(http::Request<Vec<u8>>) -> SendRequestResult;
+
+        let _send_request: SendRequestFn = send_request;
+        let _phase: fn(&TransportFailure) -> SendPhase = TransportFailure::phase;
     }
 }

@@ -104,18 +104,32 @@ impl MockHttpProvider {
                         return format!("unexpected_transport_failure_source:{source}");
                     };
 
-                    match failure.phase() {
+                    let phase = match failure.phase() {
                         SendPhase::NotSent => {
                             assert!(connector_error.is_io());
-                            "not_sent".to_string()
+                            "not_sent"
                         }
                         SendPhase::MaybeSent => {
                             assert!(!connector_error.is_timeout());
                             assert!(!connector_error.is_io());
                             assert!(connector_error.is_other());
-                            "maybe_sent".to_string()
+                            "maybe_sent"
                         }
-                    }
+                    };
+                    let code = failure.code().map_or_else(
+                        || "none".to_string(),
+                        |code| {
+                            let debug = format!("{code:?}");
+                            debug
+                                .strip_prefix("ErrorCode::")
+                                .unwrap_or(&debug)
+                                .split('(')
+                                .next()
+                                .expect("an error-code debug name is non-empty")
+                                .to_string()
+                        },
+                    );
+                    format!("{phase}:{code}")
                 }
             };
         }

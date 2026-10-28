@@ -319,10 +319,19 @@ fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str)
 }
 
 fn http_probe_body() -> String {
-    // Exceed the two-chunk host body buffer so a connect failure can close the
-    // receiver while the guest is still writing, exercising the future-error
-    // recovery path rather than only the normal future-response path.
+    // Exceed the two-chunk host body buffer so the closed-port case can close
+    // the receiver while the guest is still writing, exercising the
+    // future-error recovery path. The denied-host case fails synchronously in
+    // outgoing_handler::handle instead.
     "x".repeat(16 * 1024)
+}
+
+fn http_probe_outcome(state: &State) -> &str {
+    let Some(Value::Concrete(ConcreteValue::String(outcome))) = state.attributes.get("send_phase")
+    else {
+        panic!("HTTP probe state must contain a string send_phase attribute");
+    };
+    outcome.expose_plaintext()
 }
 
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
@@ -460,12 +469,7 @@ async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
             .expect("the mock transport probe should report its phase"),
     );
 
-    assert_eq!(
-        state.attributes.get("send_phase"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "not_sent".to_string().into()
-        )))
-    );
+    assert_eq!(http_probe_outcome(&state), "not_sent:HttpRequestDenied");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -513,11 +517,13 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
     );
     drop(reserved_socket);
 
-    assert_eq!(
-        state.attributes.get("send_phase"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "not_sent".to_string().into()
-        )))
+    assert!(
+        matches!(
+            http_probe_outcome(&state),
+            "not_sent:ConnectionRefused" | "not_sent:ConnectionTimeout"
+        ),
+        "unexpected closed-port outcome: {}",
+        http_probe_outcome(&state)
     );
 }
 
@@ -593,12 +599,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let bytes_read = server.join().expect("loopback server should finish");
 
     assert!(bytes_read > 0, "the server must receive request bytes");
-    assert_eq!(
-        state.attributes.get("send_phase"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "maybe_sent".to_string().into()
-        )))
-    );
+    assert_eq!(http_probe_outcome(&state), "maybe_sent:HttpProtocolError");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1322,6 +1322,14 @@ fn http1_handshake_failure_code() -> wasmtime_wasi_http::p2::bindings::http::typ
     wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::ConnectionRefused
 }
 
+/// Map a carina-host TLS connector handshake failure to its wasi:http code.
+///
+/// The SDK classifies `TlsProtocolError` as NotSent on the invariant that this
+/// host emits it only before the HTTP/1 handshake and request transmission.
+fn tls_handshake_failure_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode {
+    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::TlsProtocolError
+}
+
 async fn send_request_handler(
     mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
     config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
@@ -1394,7 +1402,7 @@ async fn send_request_handler(
         let stream = connector
             .connect(domain, tcp_stream)
             .await
-            .map_err(|_| ErrorCode::TlsProtocolError)?;
+            .map_err(|_| tls_handshake_failure_code())?;
         let tls_handshake_ms = ms(phase_start);
 
         let stream = TokioIo::new(stream);
@@ -8142,6 +8150,16 @@ mod tests {
         assert!(matches!(
             http1_handshake_failure_code(),
             ErrorCode::ConnectionRefused
+        ));
+    }
+
+    #[test]
+    fn tls_handshake_failure_is_reported_as_pre_send() {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        assert!(matches!(
+            tls_handshake_failure_code(),
+            ErrorCode::TlsProtocolError
         ));
     }
 
