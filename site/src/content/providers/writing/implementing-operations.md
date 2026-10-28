@@ -12,6 +12,7 @@ The provider holds an API client behind a trait, so the same code runs against t
 ```rust
 //! Stand-in for the client of the API your provider manages.
 
+#[derive(Clone)]
 pub struct Widget {
     pub id: String,
     pub name: String,
@@ -34,17 +35,20 @@ pub enum CreateStatus {
 }
 
 pub trait Api {
-    /// Starts creating a widget and returns the API's operation ID.
-    fn start_create(&self, name: &str, size: i64) -> Result<String, ApiError>;
+    /// A fresh idempotency key, such as a UUID.
+    fn new_client_token(&self) -> String;
+    /// Starts creating a widget and returns the API's operation ID. Calling
+    /// it again with the same client token returns the same operation
+    /// instead of creating a second widget.
+    fn start_create(&self, client_token: &str, name: &str, size: i64) -> Result<String, ApiError>;
     fn create_status(&self, operation: &str) -> Result<CreateStatus, ApiError>;
-    fn find_by_name(&self, name: &str) -> Result<Option<Widget>, ApiError>;
     fn get(&self, id: &str) -> Result<Widget, ApiError>;
     fn set_size(&self, id: &str, size: i64) -> Result<(), ApiError>;
     fn delete(&self, id: &str) -> Result<(), ApiError>;
 }
 ```
 
-`ApiError` separates the two failures that matter to Carina: `Rejected`, where the API certainly did nothing, and `Unknown`, where it may have.
+`ApiError` separates the two failures that matter to Carina: `Rejected`, where the API certainly did nothing, and `Unknown`, where it may have. The client also issues idempotency keys: retrying `start_create` with the same client token returns the operation the first call started instead of creating a second widget. Most cloud APIs offer something like this (a client token or request ID), and a provider should use it.
 
 ## Helpers
 
@@ -156,25 +160,29 @@ fn create(
         Ok(values) => values,
         Err(err) => return Err(attempt.untracked(err)),
     };
-    match self.api.start_create(&name, size) {
+    let client_token = self.api.new_client_token();
+    match self.api.start_create(&client_token, &name, size) {
         Ok(operation) => Ok(attempt.pending(
             CreateToken::Operation(operation),
             Sent::AllRequestAttributes,
             5,
         )),
         // The API said no: nothing exists.
-        Err(ApiError::Rejected(message)) => Err(attempt.untracked(api_error(
-            "widget.Create",
-            ApiError::Rejected(message),
-        ))),
-        // The request may have been accepted. Keep the attempt and find
-        // out in poll_create.
-        Err(_) => Ok(attempt.pending(CreateToken::Unknown, Sent::AllRequestAttributes, 5)),
+        Err(err @ ApiError::Rejected(_)) => {
+            Err(attempt.untracked(api_error("widget.Create", err)))
+        }
+        // The request may have been accepted. Keep the attempt and
+        // retry it with the same client token in poll_create.
+        Err(_) => Ok(attempt.pending(
+            CreateToken::Starting { client_token },
+            Sent::AllRequestAttributes,
+            5,
+        )),
     }
 }
 ```
 
-The three outcomes follow the rules from the Overview. Bad input is found before anything is sent, so it is `untracked`, and so is an explicit rejection from the API. When the call fails in a way that does not say whether the API accepted it, the provider cannot know whether a widget exists. Reporting `untracked` there could leave a widget that Carina has forgotten, so the provider returns `pending` with a token that says "unknown" and settles it in `poll_create`.
+The three outcomes follow the rules from the Overview. Bad input is found before anything is sent, so it is `untracked`, and so is an explicit rejection from the API. When the call fails in a way that does not say whether the API accepted it, the provider cannot know whether a widget exists. Reporting `untracked` there could leave a widget that Carina has forgotten, so the provider returns `pending` with the client token and retries the call in `poll_create`.
 
 `Sent::AllRequestAttributes` says that the request carried every attribute in the create request. If your API takes some attributes in a later call, name only the ones the create call carried, with `Sent::only([...])`.
 
@@ -185,15 +193,16 @@ The token is stored in state while the create is unfinished:
 /// stores it in state, so it holds no request values or secrets.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CreateToken {
+    /// The create call has not been confirmed. Retrying it with the same
+    /// client token either starts the create or returns the operation the
+    /// first call started.
+    Starting { client_token: String },
     /// The API accepted the request and returned an operation to follow.
     Operation(String),
-    /// The create call failed in a way that does not say whether the API
-    /// accepted it; look the widget up by its unique name instead.
-    Unknown,
 }
 ```
 
-It holds an operation ID or nothing, never request values. On every poll the host passes the original request again, so the token does not need to repeat it.
+It holds a client token or an operation ID, never request values. On every poll the host passes the original request again, so the token does not need to repeat it.
 
 ## poll_create
 
@@ -206,30 +215,48 @@ fn poll_create(
 ) -> Result<CreateStep<CreateToken>, PollVerdict> {
     let (attempt, token) = match poll {
         Poll::Unissued(attempt, token) => (attempt, token),
-        // This provider only calls `issued` when it finishes, so an
-        // issued poll never happens. A provider that issues early would
-        // read the resource here.
-        Poll::Issued(issued, token) => return Ok(issued.pending(token, 5)),
+        // The widget's ID is known and the create has finished; only
+        // reading it back is left.
+        Poll::Issued(issued, token) => {
+            return match self.read_found(id, issued.identifier()) {
+                Ok(ReadOutcome::Found { state }) => Ok(issued.succeeded(state.attributes)),
+                Ok(outcome) => Err(issued
+                    .failed(
+                        Observation::Read(outcome),
+                        error(ProviderErrorKind::ApiError, "widget vanished after create"),
+                    )
+                    .into()),
+                // A transient read error: try again on the next poll.
+                Err(_) => Ok(issued.pending(token, 5)),
+            };
+        }
     };
     match token {
-        CreateToken::Operation(operation) => match self.api.create_status(&operation) {
-            Ok(CreateStatus::InProgress) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
-            Ok(CreateStatus::Done { id: widget_id }) => {
-                let issued = match identifier(&widget_id) {
-                    Ok(identifier) => attempt.issued(identifier),
-                    Err(err) => return Err(attempt.undetermined(err)),
-                };
-                match self.read_found(id, issued.identifier()) {
-                    Ok(ReadOutcome::Found { state }) => Ok(issued.succeeded(state.attributes)),
-                    Ok(outcome) => Err(issued
-                        .failed(
-                            Observation::Read(outcome),
-                            error(ProviderErrorKind::ApiError, "widget vanished after create"),
-                        )
-                        .into()),
-                    Err(err) => Err(issued.failed(Observation::ReadFailed(err.clone()), err).into()),
+        CreateToken::Starting { client_token } => {
+            let (name, size) = match desired(&request.resource) {
+                Ok(values) => values,
+                Err(err) => return Err(attempt.undetermined(err)),
+            };
+            match self.api.start_create(&client_token, &name, size) {
+                Ok(operation) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
+                Err(err @ ApiError::Rejected(_)) => {
+                    Err(attempt.untracked(api_error("widget.Create", err)))
                 }
+                Err(_) => Ok(attempt.pending(CreateToken::Starting { client_token }, 5)),
             }
+        }
+        CreateToken::Operation(operation) => match self.api.create_status(&operation) {
+            Ok(CreateStatus::InProgress) => {
+                Ok(attempt.pending(CreateToken::Operation(operation), 5))
+            }
+            Ok(CreateStatus::Done { id: widget_id }) => match identifier(&widget_id) {
+                // Record the identifier now and read the widget on the
+                // next poll, through the Poll::Issued arm above.
+                Ok(identifier) => Ok(attempt
+                    .issued(identifier)
+                    .pending(CreateToken::Operation(operation), 0)),
+                Err(err) => Err(attempt.undetermined(err)),
+            },
             // Created, then failed: the widget exists and Carina must
             // keep it so it can be deleted or retried.
             Ok(CreateStatus::Failed { id: Some(widget_id), reason }) => match identifier(&widget_id) {
@@ -239,40 +266,27 @@ fn poll_create(
                         Ok(outcome) => Observation::Read(outcome),
                         Err(err) => Observation::ReadFailed(err),
                     };
-                    Err(issued.failed(observation, error(ProviderErrorKind::ApiError, reason)).into())
+                    Err(issued
+                        .failed(observation, error(ProviderErrorKind::ApiError, reason))
+                        .into())
                 }
                 Err(err) => Err(attempt.undetermined(err)),
             },
             Ok(CreateStatus::Failed { id: None, reason }) => {
                 Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
             }
-            Err(err) => Err(attempt.undetermined(api_error("widget.CreateStatus", err))),
+            // The status call failed; the operation is still there.
+            Err(_) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
         },
-        CreateToken::Unknown => {
-            let name = match desired(&request.resource) {
-                Ok((name, _)) => name,
-                Err(err) => return Err(attempt.undetermined(err)),
-            };
-            match self.api.find_by_name(&name) {
-                Ok(Some(widget)) => match identifier(&widget.id) {
-                    Ok(identifier) => Ok(attempt.issued(identifier).succeeded(attributes(&widget))),
-                    Err(err) => Err(attempt.undetermined(err)),
-                },
-                // Names are unique, so the earlier call created nothing.
-                Ok(None) => Err(attempt.untracked(error(
-                    ProviderErrorKind::ApiError,
-                    "the create request did not reach the API",
-                ))),
-                Err(err) => Err(attempt.undetermined(api_error("widget.FindByName", err))),
-            }
-        }
     }
 }
 ```
 
-`attempt.issued(identifier)` is called only once the widget's ID is known, and from then on the code can only finish with `succeeded` or `failed`. A create that failed after the widget existed is `failed` with the identifier, so Carina records the widget and the next plan can retry or delete it. When the provider cannot tell what happened, such as when the status call itself fails, it returns `undetermined`. Carina then keeps the attempt rather than guessing.
+A `Starting` token retries the create with the same client token. Because the API treats the retry as the same request, it either starts the create now or returns the operation the first call started, and the provider never creates a second widget or claims one it did not create. Only a definite rejection makes the attempt `untracked`; any other failure keeps it pending.
 
-For the unknown case, the provider looks the widget up by its name. That works only because widget names are unique in this API; use whatever your API offers to find a request after the fact, such as an idempotency key.
+When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails with a transient error stays pending instead of turning a healthy widget into a failed create.
+
+A create that failed after the widget existed is `failed` with the identifier, so Carina records the widget and the next plan can retry or delete it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. `undetermined` is for the cases where the provider cannot tell what happened and has no way left to find out, such as an empty identifier from the API.
 
 ## resume_create
 
@@ -287,7 +301,7 @@ fn resume_create(
         // Carina was interrupted after the attempt started. Keep
         // polling where it left off.
         Resume::Unissued(attempt, token) => Ok(attempt.pending(token, 0)),
-        Resume::Issued(resumed, _token) => match self.read_found(id, resumed.identifier()) {
+        Resume::Issued(resumed, token) => match self.read_found(id, resumed.identifier()) {
             Ok(ReadOutcome::Found { state }) => Ok(resumed.completed(
                 carina_plugin_sdk::FoundRead::from_applied_state(state),
             )),
@@ -295,13 +309,14 @@ fn resume_create(
                 Observation::Read(outcome),
                 error(ProviderErrorKind::ApiError, "widget vanished during create"),
             )),
-            Err(err) => Err(resumed.failed(Observation::ReadFailed(err.clone()), err)),
+            // A transient read error: try again on the next poll.
+            Err(_) => Ok(resumed.pending(token, 5)),
         },
     }
 }
 ```
 
-`resume_create` runs when an earlier apply stopped while a create was pending. An attempt without an identifier goes back to polling with its saved token. An attempt that had an identifier is settled by reading the resource. `ResumeAttempt` also has `resend`, which returns a fresh `CreateAttempt` for a provider that knows the earlier request never reached the API.
+`resume_create` runs when an earlier apply stopped while a create was pending. An attempt without an identifier goes back to polling with its saved token. An attempt that had an identifier is settled by reading the resource, and stays pending if the read fails for a transient reason. `ResumeAttempt` also has `resend`, which returns a fresh `CreateAttempt` for a provider that knows the earlier request never reached the API.
 
 ## update
 
@@ -312,17 +327,20 @@ fn update(
     identifier: &AppliedIdentifier,
     request: UpdateRequest,
 ) -> Result<UpdateOutcome<Never>, ProviderError> {
+    // Check the whole patch before calling the API, so an op this
+    // provider cannot apply does not leave the others half done.
+    let mut new_size = None;
     for op in &request.patch.ops {
         match op {
-            PatchOp::Replace { key, value } | PatchOp::Add { key, value } | PatchOp::Reassert { key, value }
+            PatchOp::Add { key, value }
+            | PatchOp::Replace { key, value }
+            | PatchOp::Reassert { key, value }
                 if key == "size" =>
             {
                 let Value::Int(size) = value else {
                     return Err(error(ProviderErrorKind::InvalidInput, "size must be an int"));
                 };
-                self.api
-                    .set_size(identifier.as_str(), *size)
-                    .map_err(|err| api_error("widget.SetSize", err))?;
+                new_size = Some(*size);
             }
             // `name` is create-only, so Carina replaces the widget
             // instead of sending it here.
@@ -333,6 +351,11 @@ fn update(
                 ));
             }
         }
+    }
+    if let Some(size) = new_size {
+        self.api
+            .set_size(identifier.as_str(), size)
+            .map_err(|err| api_error("widget.SetSize", err))?;
     }
     let state = request.state_after_patch();
     Ok(UpdateOutcome::Done(carina_plugin_sdk::protocol::UpdateOutcome::Success {
@@ -345,7 +368,7 @@ fn update(
 }
 ```
 
-Apply exactly the operations in the patch and nothing else. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`.
+Apply exactly the operations in the patch and nothing else. Check every operation before the first API call, so an operation the provider cannot apply does not leave the others half done. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`.
 
 `from` holds a secret value as a hash, never the secret itself. If the update needs a secret, it is in the patch.
 

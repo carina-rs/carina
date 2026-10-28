@@ -24,36 +24,35 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         widgets: RefCell<Vec<Widget>>,
-        fail_create: Option<fn() -> ApiError>,
+        /// Client tokens already used, with the operation each started.
+        operations: RefCell<HashMap<String, String>>,
+        /// Errors to return from the next start_create calls, in order.
+        start_errors: RefCell<Vec<ApiError>>,
         size_calls: RefCell<Vec<(String, i64)>>,
     }
 
     impl Api for FakeApi {
-        fn start_create(&self, name: &str, size: i64) -> Result<String, ApiError> {
-            if let Some(fail) = self.fail_create {
-                return Err(fail());
+        fn new_client_token(&self) -> String {
+            "token-1".to_string()
+        }
+        fn start_create(&self, client_token: &str, name: &str, size: i64) -> Result<String, ApiError> {
+            if let Some(operation) = self.operations.borrow().get(client_token) {
+                return Ok(operation.clone());
+            }
+            if !self.start_errors.borrow().is_empty() {
+                return Err(self.start_errors.borrow_mut().remove(0));
             }
             self.widgets.borrow_mut().push(Widget { id: format!("w-{name}"), name: name.into(), size });
-            Ok(format!("op-{name}"))
+            let operation = format!("op-{name}");
+            self.operations.borrow_mut().insert(client_token.into(), operation.clone());
+            Ok(operation)
         }
         fn create_status(&self, operation: &str) -> Result<CreateStatus, ApiError> {
             let name = operation.trim_start_matches("op-");
             Ok(CreateStatus::Done { id: format!("w-{name}") })
         }
-        fn find_by_name(&self, name: &str) -> Result<Option<Widget>, ApiError> {
-            Ok(self.widgets.borrow().iter().find(|w| w.name == name).map(|w| Widget {
-                id: w.id.clone(),
-                name: w.name.clone(),
-                size: w.size,
-            }))
-        }
         fn get(&self, id: &str) -> Result<Widget, ApiError> {
-            self.widgets
-                .borrow()
-                .iter()
-                .find(|w| w.id == id)
-                .map(|w| Widget { id: w.id.clone(), name: w.name.clone(), size: w.size })
-                .ok_or(ApiError::NotFound)
+            self.widgets.borrow().iter().find(|w| w.id == id).cloned().ok_or(ApiError::NotFound)
         }
         fn set_size(&self, id: &str, size: i64) -> Result<(), ApiError> {
             self.size_calls.borrow_mut().push((id.to_string(), size));
@@ -62,6 +61,26 @@ mod tests {
         fn delete(&self, _id: &str) -> Result<(), ApiError> {
             Err(ApiError::NotFound)
         }
+    }
+
+    fn api_failing_with(errors: Vec<ApiError>) -> FakeApi {
+        FakeApi { start_errors: RefCell::new(errors), ..Default::default() }
+    }
+
+    /// Poll a pending create once, the way the host does.
+    fn poll(
+        provider: &WidgetProvider<FakeApi>,
+        pending: carina_plugin_sdk::protocol::types::PendingCreate<CreateToken>,
+    ) -> WireCreateStep<HashMap<String, Value>, PartialReadDiagnostic, CreateToken> {
+        carina_plugin_sdk::dispatch_poll_create(
+            provider,
+            &resource_id(),
+            create_request("a", 1),
+            pending.identifier,
+            pending.sent,
+            pending.token,
+        )
+        .expect("poll should not fail")
     }
 
     fn resource_id() -> ResourceId {
@@ -88,10 +107,7 @@ mod tests {
     #[test]
     fn rejected_create_is_untracked() {
         let provider = WidgetProvider {
-            api: FakeApi {
-                fail_create: Some(|| ApiError::Rejected("size too large".into())),
-                ..Default::default()
-            },
+            api: api_failing_with(vec![ApiError::Rejected("size too large".into())]),
         };
         // `CreateAttempt` can only be minted by the SDK; dispatch_create
         // goes through the same entry point the host uses.
@@ -101,35 +117,34 @@ mod tests {
     }
 
     #[test]
-    fn create_with_unknown_outcome_stays_pending() {
+    fn create_with_unknown_outcome_is_retried_with_the_same_client_token() {
         let provider = WidgetProvider {
-            api: FakeApi {
-                fail_create: Some(|| ApiError::Unknown("connection reset".into())),
-                ..Default::default()
-            },
+            api: api_failing_with(vec![ApiError::Unknown("connection reset".into())]),
         };
         let step = carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
             .expect("an unknown outcome must not be reported as a failure");
-        assert!(matches!(step, WireCreateStep::Pending(pending) if pending.identifier.is_none()));
+        let WireCreateStep::Pending(pending) = step else { panic!("expected pending") };
+        assert!(pending.identifier.is_none());
+
+        // The retry starts the create once; no second widget appears.
+        let WireCreateStep::Pending(pending) = poll(&provider, pending) else { panic!("expected pending") };
+        assert!(matches!(pending.token, CreateToken::Operation(_)));
+        assert_eq!(provider.api.widgets.borrow().len(), 1);
     }
 
     #[test]
-    fn poll_finishes_a_create_with_the_identifier() {
+    fn poll_records_the_identifier_then_reads_the_widget() {
         let provider = WidgetProvider { api: FakeApi::default() };
-        let id = resource_id();
-        let step = carina_plugin_sdk::dispatch_create(&provider, &id, create_request("a", 1))
+        let step = carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 1))
             .expect("create should start");
         let WireCreateStep::Pending(pending) = step else { panic!("expected pending") };
-        let step = carina_plugin_sdk::dispatch_poll_create(
-            &provider,
-            &id,
-            create_request("a", 1),
-            pending.identifier,
-            pending.sent,
-            pending.token,
-        )
-        .expect("poll should finish");
-        let WireCreateStep::Success { identifier, attributes } = step else { panic!("expected success") };
+
+        let WireCreateStep::Pending(pending) = poll(&provider, pending) else { panic!("expected pending") };
+        assert_eq!(pending.identifier.as_ref().map(|id| id.as_str()), Some("w-a"));
+
+        let WireCreateStep::Success { identifier, attributes } = poll(&provider, pending) else {
+            panic!("expected success")
+        };
         assert_eq!(identifier.as_str(), "w-a");
         assert!(matches!(attributes.get("size"), Some(Value::Int(1))));
     }
@@ -166,7 +181,7 @@ mod tests {
 }
 ```
 
-Test the classification as well as the happy path. A test like `create_with_unknown_outcome_stays_pending` is what keeps a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
+Test the classification as well as the happy path. A test like `create_with_unknown_outcome_is_retried_with_the_same_client_token` is what keeps a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
 
 ## Acceptance tests
 
@@ -178,7 +193,7 @@ The official providers keep acceptance tests in an `acceptance-tests/` directory
 2. `carina plan --detailed-exitcode` must exit with `0`. It exits with `2` when the plan has changes, which means the resource does not converge, usually because `read` returns a value in a different form than the configuration or leaves an attribute out.
 3. `carina destroy --auto-approve` removes everything.
 
-Updates, attribute removal and replacement need more than one configuration. Write the steps as separate files, such as `step1.crn` and `step2.crn`, copy each in turn into the same directory as `main.crn`, and apply them in order so the second apply updates what the first created. Check the plan between steps for the change you expect, and run the converge check after each apply.
+Updates, attribute removal and replacement need more than one configuration. Keep the steps outside the working directory, such as `step1.crn` and `step2.crn`, and copy each in turn over `main.crn` in one working directory, so the second apply updates what the first created. Do not put the step files in the working directory itself: Carina reads every `.crn` file in a directory, so it would declare the resources twice. Check the plan between steps for the change you expect, and run the converge check after each apply.
 
 Run acceptance tests in an account that holds nothing else, and make the script destroy what it created even when a step fails or the run is interrupted. A test that leaves resources behind costs money and can break the next run. Point `source` at the build under test with a `file://` URL, and use a release build of `carina`: loading a component in a debug build is slow.
 
