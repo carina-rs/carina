@@ -480,6 +480,14 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// An official provider artifact lacks usable user-owned verification.
+    #[error(transparent)]
+    UnverifiedOfficialProvider(#[from] carina_provider_resolver::UnverifiedOfficialProviderError),
+
+    /// A local provider privilege grant was malformed or unusable.
+    #[error(transparent)]
+    TrustedLocalGrant(#[from] carina_provider_resolver::GrantParseError),
+
     /// A runtime string was not a valid resource identity.
     #[error(transparent)]
     ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
@@ -568,6 +576,17 @@ pub enum AppError {
     SourceProviderKindMismatch {
         configured: String,
         loaded: String,
+        provider_source: String,
+    },
+
+    /// A source trusted for one provider identity was selected by an
+    /// incompatible provider block kind.
+    #[error(
+        "Provider block kind '{configured}' does not match trusted provider identity '{expected}' from source '{provider_source}'."
+    )]
+    SourceProviderTrustMismatch {
+        configured: String,
+        expected: String,
         provider_source: String,
     },
 
@@ -840,6 +859,28 @@ mod tests {
             AppError::Backend(BackendError::Configuration(_))
         ));
         assert!(app_err.to_string().contains("missing bucket"));
+    }
+
+    #[test]
+    fn trusted_local_grant_error_preserves_canonicalize_source_chain() {
+        let grant_error = carina_provider_resolver::GrantParseError::Canonicalize {
+            value: "/missing/provider.wasm=aws".to_string(),
+            path: PathBuf::from("/missing/provider.wasm"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing provider"),
+        };
+        let app_error = AppError::from(grant_error);
+
+        let mut current: &(dyn std::error::Error + 'static) = &app_error;
+        let mut found_io_error = false;
+        while let Some(source) = current.source() {
+            if source.downcast_ref::<std::io::Error>().is_some() {
+                found_io_error = true;
+                break;
+            }
+            current = source;
+        }
+
+        assert!(found_io_error, "AppError dropped the canonicalize cause");
     }
 
     #[test]

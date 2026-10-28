@@ -240,9 +240,13 @@ fn carina(base_dir: &Path, operation: &str, force: bool, input: &str) -> Output 
 }
 
 fn carina_init(base_dir: &Path) -> Output {
+    let cache = tempfile::tempdir().expect("create isolated plugin cache");
+    let trust = tempfile::tempdir().expect("create isolated trust-record directory");
     Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["init", base_dir.to_str().unwrap()])
         .env("NO_COLOR", "1")
+        .env("CARINA_PLUGIN_CACHE_DIR", cache.path())
+        .env("CARINA_TRUST_RECORD_DIR", trust.path())
         .output()
         .expect("failed to execute carina init")
 }

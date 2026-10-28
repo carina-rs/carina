@@ -42,7 +42,9 @@ fn resolve_install(
         .as_ref()
         .ok_or(InstallRejection::MissingSource)?;
     let installed = match source {
-        ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(config),
+        ProviderSource::File(_) => {
+            carina_provider_resolver::find_file_provider_source(source_dir, config)
+        }
         ProviderSource::Remote(_) => {
             carina_provider_resolver::find_installed_provider(source_dir, config)
                 .map_err(|error| error.to_string())
@@ -63,7 +65,10 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
 /// Build provider factories from discovered provider configs.
 /// Each entry is (source_directory, provider_config) so providers are installed
 /// in the directory containing the `.crn` file, not at the workspace root.
-fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResult {
+fn build_factories(
+    providers: &[(PathBuf, ProviderConfig)],
+    grants: &carina_provider_resolver::TrustedLocalGrants,
+) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut errors: HashMap<String, String> = HashMap::new();
     let mut fingerprint: Vec<(String, carina_lsp::backend::ProviderInstallFingerprint)> =
@@ -94,9 +99,12 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
         };
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(|bytes| async move {
-                carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes()).await
-            }))
+            tokio::runtime::Handle::current().block_on(installed.load_with(
+                grants,
+                |verified| async move {
+                    carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
+                },
+            ))
         }) {
             Ok(factory) => {
                 log::info!(
@@ -117,14 +125,35 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
     (factories, errors, fingerprint)
 }
 
+fn trusted_local_grants_from_env(
+    env_value: Option<&std::ffi::OsStr>,
+    report_error: impl FnOnce(&carina_provider_resolver::GrantParseError),
+) -> carina_provider_resolver::TrustedLocalGrants {
+    match carina_provider_resolver::TrustedLocalGrants::parse_os(&[], env_value) {
+        Ok(grants) => grants,
+        Err(error) => {
+            report_error(&error);
+            carina_provider_resolver::TrustedLocalGrants::parse_os(&[], None)
+                .expect("an empty trusted-local grant set is valid")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
+    let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
+    let trusted_local_grants =
+        trusted_local_grants_from_env(trusted_local_env.as_deref(), |error| {
+            log::error!("Ignoring invalid CARINA_TRUST_LOCAL_PROVIDER: {error}");
+        });
+    let trusted_local_grants = std::sync::Arc::new(trusted_local_grants);
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| {
+    let (service, socket) = LspService::new(move |client| {
         let provider_context = ProviderContext {
             decryptor: None,
             validators: HashMap::new(),
@@ -139,8 +168,9 @@ async fn main() {
 
         // Pass factory builder callback — actual WASM loading happens asynchronously
         // after initialize, not during server construction.
+        let trusted_local_grants = std::sync::Arc::clone(&trusted_local_grants);
         let factory_builder: carina_lsp::backend::FactoryBuilder =
-            std::sync::Arc::new(build_factories);
+            std::sync::Arc::new(move |providers| build_factories(providers, &trusted_local_grants));
 
         // Provider install prober: used by the drift poller to notice selected
         // artifact or lock-file metadata changes. Factory construction still
@@ -162,6 +192,61 @@ mod tests {
     use carina_provider_resolver::ProviderArtifactFingerprint;
     use indexmap::IndexMap;
     use std::path::PathBuf;
+
+    fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct ScopedTestEnvVar {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedTestEnvVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: callers hold test_env_guard while this process-wide override is active.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for ScopedTestEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: the test still holds test_env_guard while this guard is dropped.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
+        carina_provider_resolver::TrustedLocalGrants::parse(&[], None).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_trusted_local_env_is_reported_and_ignored() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+        let mut reported = None;
+        let grants = trusted_local_grants_from_env(Some(&value), |error| {
+            reported = Some(error.to_string());
+        });
+
+        assert_eq!(grants, no_local_grants());
+        assert!(
+            reported
+                .as_deref()
+                .is_some_and(|message| message.contains("must be valid UTF-8")),
+            "the non-UTF-8 parse error must reach the LSP log boundary: {reported:?}"
+        );
+    }
 
     fn cfg(name: &str, source: Option<&str>, binding: Option<&str>) -> (PathBuf, ProviderConfig) {
         (
@@ -194,7 +279,7 @@ mod tests {
             cfg("aws", Some("file:///nonexistent/fake.wasm"), None),
             cfg("aws", None, Some("us")),
         ];
-        let (_factories, errors, fingerprint) = build_factories(&providers);
+        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
         assert_eq!(
             fingerprint.len(),
             providers.len(),
@@ -220,7 +305,7 @@ mod tests {
         let (_, config) = cfg("mock", None, None);
         let providers = vec![(tmp.path().to_path_buf(), config)];
 
-        let (factories, errors, fingerprint) = build_factories(&providers);
+        let (factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
 
         assert!(factories.is_empty());
         assert!(
@@ -301,6 +386,60 @@ mod tests {
         assert_eq!(installed.path().as_path(), wasm);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unverified_official_provider_is_reported_before_wasm_loading() {
+        let _env_guard = test_env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.5.0";
+        let parsed_source: ProviderSource = source.parse().unwrap();
+        let ProviderSource::Remote(remote_source) = &parsed_source else {
+            panic!("GitHub source must parse as remote")
+        };
+        let wasm = carina_provider_resolver::cache_path_wasm(
+            tmp.path(),
+            &remote_source.source_key(),
+            version,
+        );
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, b"not a wasm component").unwrap();
+        let mut lock = carina_provider_resolver::LockFile::default();
+        lock.upsert(carina_provider_resolver::LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                version: version.parse().unwrap(),
+                tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
+                asset_id: serde_json::from_str("42").unwrap(),
+                constraint: None,
+            },
+            sha256: carina_provider_resolver::sha256_file(&wasm).unwrap(),
+            registry: None,
+        });
+        lock.save(&tmp.path().join("carina-providers.lock"))
+            .unwrap();
+        let (_, config) = cfg("aws", Some(source), None);
+
+        let (factories, errors, _) =
+            build_factories(&[(tmp.path().to_path_buf(), config)], &no_local_grants());
+
+        assert!(factories.is_empty());
+        let message = errors.get("aws").expect("LSP load diagnostic");
+        assert!(
+            message.starts_with(&format!(
+                "{source} is a carina-rs provider but this user hasn't verified it; run `carina init {}`",
+                tmp.path().display()
+            )),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Failed to load WASM component"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn mismatched_present_artifact_has_stable_fingerprint_and_diagnostic() {
         let tmp = tempfile::tempdir().unwrap();
@@ -336,7 +475,7 @@ mod tests {
 
         let (_, config) = cfg("aws", Some(source), None);
         let providers = vec![(tmp.path().to_path_buf(), config.clone())];
-        let (_factories, errors, fingerprint) = build_factories(&providers);
+        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(
