@@ -891,8 +891,9 @@ fn poison_after_trap(
 ///
 /// Field order is load-bearing: Rust drops fields in declaration order,
 /// so `poison` (the [`PoisonOnDrop`] guard) drops *before* `store` (the
-/// `MutexGuard`). When `tokio::time::timeout` cancels the in-flight
-/// operation it drops this whole value; the flag is therefore set
+/// `MutexGuard`). When the wall timeout in `GuestStore::call` drops only the
+/// guest future, this whole value is dropped afterwards as the caller
+/// propagates the timeout error with the guard still armed, so the flag is set
 /// **while the store `Mutex` is still held**, closing the window where a
 /// sibling operation already queued on the lock could otherwise acquire the
 /// freed-but-not-yet-flagged store and call into the unusable wasmtime `Store`
