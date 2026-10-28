@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use colored::Colorize;
@@ -74,6 +74,26 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
+
+static TRUSTED_LOCAL_GRANTS: OnceLock<carina_provider_resolver::TrustedLocalGrants> =
+    OnceLock::new();
+
+/// Install the process-local grants parsed by the CLI entry point.
+///
+/// The grants live only for this process and are never written to project
+/// locks, provider caches, saved plans, or state.
+pub fn set_trusted_local_grants(
+    grants: carina_provider_resolver::TrustedLocalGrants,
+) -> Result<(), carina_provider_resolver::TrustedLocalGrants> {
+    TRUSTED_LOCAL_GRANTS.set(grants)
+}
+
+fn trusted_local_grants() -> &'static carina_provider_resolver::TrustedLocalGrants {
+    TRUSTED_LOCAL_GRANTS.get_or_init(|| {
+        carina_provider_resolver::TrustedLocalGrants::parse(&[], None)
+            .expect("an empty trusted-local grant set is valid")
+    })
+}
 
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
@@ -363,7 +383,10 @@ fn build_factories_from_providers_impl(
         };
 
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(load_installed_wasm_provider(&installed))
+            tokio::runtime::Handle::current().block_on(load_installed_wasm_provider(
+                &installed,
+                trusted_local_grants(),
+            ))
         });
 
         match factory_result {
@@ -400,25 +423,30 @@ fn build_factories_from_providers_impl(
 
 async fn load_installed_wasm_provider(
     installed: &carina_provider_resolver::InstalledProvider,
+    grants: &carina_provider_resolver::TrustedLocalGrants,
 ) -> Result<
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 > {
-    load_installed_wasm_provider_using(installed, |bytes, configured_name| async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes(), configured_name).await
+    load_installed_wasm_provider_using(installed, grants, |bytes, identity| async move {
+        carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes(), identity).await
     })
     .await
 }
 
 async fn load_installed_wasm_provider_using<F, Fut>(
     installed: &carina_provider_resolver::InstalledProvider,
+    grants: &carina_provider_resolver::TrustedLocalGrants,
     loader: F,
 ) -> Result<
     carina_plugin_host::WasmProviderFactory,
     carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
 >
 where
-    F: FnOnce(carina_provider_resolver::ProviderArtifactBytes, String) -> Fut,
+    F: FnOnce(
+        carina_provider_resolver::ProviderArtifactBytes,
+        carina_provider_resolver::ProviderLoadIdentity,
+    ) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 carina_plugin_host::WasmProviderFactory,
@@ -427,7 +455,7 @@ where
         >,
 {
     // Injection keeps wiring regression tests out of the user's default precompile cache.
-    let factory = installed.load_with(loader).await?;
+    let factory = installed.load_with(grants, loader).await?;
     let runtime_artifact = installed.clone();
     Ok(
         factory.with_runtime_instantiation_error_mapper(move |error| {
@@ -2137,7 +2165,7 @@ async fn load_source_provider(
             .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?;
 
     let factory: Box<dyn ProviderFactory> = Box::new(
-        load_installed_wasm_provider(&installed)
+        load_installed_wasm_provider(&installed, trusted_local_grants())
             .await
             .map_err(LoadSourceError::Wasm)?,
     );

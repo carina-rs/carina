@@ -2,13 +2,19 @@
 
 mod install_lock;
 pub mod provider_resolver;
+mod provider_trust;
 pub mod revision_resolver;
 mod signing;
+mod trusted_local;
 mod verified_artifact;
 pub mod version_resolver;
 
 pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
+pub use provider_trust::{
+    ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust, ProviderTrustClass,
+};
+pub use trusted_local::{GrantParseError, TrustedLocalGrants};
 pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact};
 pub use version_resolver::{
     ResolvedVersion, fetch_latest_tag, fetch_release_tags, resolve_from_tags,

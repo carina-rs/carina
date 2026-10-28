@@ -48,6 +48,7 @@ use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
+use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass};
 
 use crate::{secret_seal, wasm_convert};
 use carina_provider_protocol::types as proto;
@@ -2364,37 +2365,26 @@ const AWS_ENV_ALLOWLIST: &[&str] = &[
 /// Environment variables exposed only to the GitHub provider.
 const GITHUB_ENV_ALLOWLIST: &[&str] = &["GITHUB_TOKEN"];
 
-/// A provider name supplied by the host configuration that selected the
-/// artifact, before any guest code is instantiated.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfiguredProviderName(String);
-
-impl ConfiguredProviderName {
-    fn new(name: String) -> Self {
-        Self(name)
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 struct ConfiguredProvider {
-    name: ConfiguredProviderName,
+    name: String,
     kind: ProviderKind,
 }
 
 impl ConfiguredProvider {
-    fn new(name: String) -> Self {
-        let name = ConfiguredProviderName::new(name);
-        let kind = ProviderKind::from_configured_name(&name);
+    fn new(identity: ProviderLoadIdentity) -> Self {
+        let kind = match identity.trust().class() {
+            ProviderTrustClass::Aws => ProviderKind::Aws,
+            ProviderTrustClass::GitHub => ProviderKind::GitHub,
+            ProviderTrustClass::Untrusted => ProviderKind::Untrusted,
+        };
+        let name = identity.configured_name().to_string();
         Self { name, kind }
     }
 }
 
 /// A provider kind whose credential and metadata partitions the host knows
-/// about. It is classified only from [`ConfiguredProviderName`], never from
-/// guest-reported metadata.
+/// about. It is classified only from the resolver-owned verified-source
+/// identity, never from configured or guest-reported names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
     /// AWS native-SDK and Cloud Control providers; both consume the AWS
@@ -2404,18 +2394,10 @@ enum ProviderKind {
     GitHub,
     /// Any provider the host has no credential partition for (e.g. the mock
     /// provider). Receives the shared group only.
-    Other,
+    Untrusted,
 }
 
 impl ProviderKind {
-    fn from_configured_name(name: &ConfiguredProviderName) -> Self {
-        match name.as_str() {
-            "aws" | "awscc" => ProviderKind::Aws,
-            "github" => ProviderKind::GitHub,
-            _ => ProviderKind::Other,
-        }
-    }
-
     /// The credential env-var partition for this kind. Exhaustive by
     /// construction — a new `ProviderKind` variant will not compile until
     /// its partition is decided here.
@@ -2423,7 +2405,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Aws => AWS_ENV_ALLOWLIST,
             ProviderKind::GitHub => GITHUB_ENV_ALLOWLIST,
-            ProviderKind::Other => &[],
+            ProviderKind::Untrusted => &[],
         }
     }
 
@@ -2434,7 +2416,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Aws => &METADATA_ENDPOINTS,
             ProviderKind::GitHub => &[],
-            ProviderKind::Other => &[],
+            ProviderKind::Untrusted => &[],
         }
     }
 }
@@ -2892,9 +2874,9 @@ impl WasmProviderFactory {
             wasm_convert::json_to_provider_info(&info_json).map_err(|source| {
                 WasmProviderLoadError::metadata("Failed to decode provider info", source)
             })?;
-        if reported_name != configured.name.as_str() {
+        if reported_name != configured.name {
             return Err(WasmProviderLoadError::ProviderNameMismatch {
-                configured: configured.name.as_str().to_string(),
+                configured: configured.name.clone(),
                 reported: reported_name,
             });
         }
@@ -2932,15 +2914,15 @@ impl WasmProviderFactory {
 
     /// Load provider bytes using the default precompile cache at `~/.carina/cache/`.
     ///
-    /// `configured_name` is the name of the host configuration that selected
-    /// the artifact. An artifact reporting a different name is rejected.
+    /// The load identity carries the configured name and resolver-owned trust
+    /// classification. An artifact reporting a different name is rejected.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
     pub async fn from_bytes(
         wasm_bytes: &[u8],
-        configured_name: String,
+        identity: ProviderLoadIdentity,
     ) -> Result<Self, WasmProviderLoadError> {
-        let configured = ConfiguredProvider::new(configured_name);
+        let configured = ConfiguredProvider::new(identity);
         match Self::default_cache_dir() {
             Some(cache_dir) => {
                 Self::from_bytes_with_cache_dir_configured(wasm_bytes, &cache_dir, configured).await
@@ -2952,13 +2934,13 @@ impl WasmProviderFactory {
     /// Load provider bytes with an explicit precompile cache directory.
     pub async fn from_bytes_with_cache_dir(
         wasm_bytes: &[u8],
-        configured_name: String,
+        identity: ProviderLoadIdentity,
         cache_dir: &Path,
     ) -> Result<Self, WasmProviderLoadError> {
         Self::from_bytes_with_cache_dir_configured(
             wasm_bytes,
             cache_dir,
-            ConfiguredProvider::new(configured_name),
+            ConfiguredProvider::new(identity),
         )
         .await
     }
@@ -3013,9 +2995,9 @@ impl WasmProviderFactory {
     #[cfg(test)]
     async fn new_uncached(
         wasm_bytes: &[u8],
-        configured_name: String,
+        identity: ProviderLoadIdentity,
     ) -> Result<Self, WasmProviderLoadError> {
-        Self::new_uncached_configured(wasm_bytes, ConfiguredProvider::new(configured_name)).await
+        Self::new_uncached_configured(wasm_bytes, ConfiguredProvider::new(identity)).await
     }
 
     async fn new_uncached_configured(
@@ -3083,7 +3065,7 @@ impl WasmProviderFactory {
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
     pub async fn from_precompiled(
         cwasm_path: &Path,
-        configured_name: String,
+        identity: ProviderLoadIdentity,
     ) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
         let component = Self::deserialize_precompiled_component(&engine, cwasm_path)
@@ -3094,7 +3076,7 @@ impl WasmProviderFactory {
             engine,
             component,
             epoch_ticker,
-            ConfiguredProvider::new(configured_name),
+            ConfiguredProvider::new(identity),
         )
         .await
     }
@@ -3104,9 +3086,9 @@ impl WasmProviderFactory {
         attributes: &IndexMap<String, Value>,
     ) -> Result<(Store<HostState>, WasmBindings), WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
-        // `initialize` and then read/create/update/delete). The provider
-        // kind was classified from the host-configured name before guest
-        // metadata was read, so the guest receives only that partition.
+        // `initialize` and then read/create/update/delete). The kind was
+        // classified from resolver-owned source identity before
+        // guest metadata was read, so the guest receives only that partition.
         let kind = Some(self.configured.kind);
         let world = if self.enable_http {
             InstantiationWorld::HttpEnabled
@@ -3305,7 +3287,7 @@ impl ProviderFactory for WasmProviderFactory {
                 })?;
             Ok(Box::new(WasmProvider {
                 instance,
-                name: self.configured.name.as_str().to_string(),
+                name: self.configured.name.clone(),
                 schemas: Arc::clone(&self.schemas),
                 operation_hard_timeout: self.operation_hard_timeout,
             }) as Box<dyn Provider>)
@@ -5600,6 +5582,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    fn test_load_identity(name: &str) -> ProviderLoadIdentity {
+        ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
+    }
+
     #[test]
     fn protocol_v12_wit_surface_compiles() {
         fn assert_type<T>() {}
@@ -6641,7 +6627,12 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let error = match WasmProviderFactory::new_uncached(&wasm_bytes, "aws".to_string()).await {
+        let error = match WasmProviderFactory::new_uncached(
+            &wasm_bytes,
+            ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Aws),
+        )
+        .await
+        {
             Ok(_) => panic!("a guest-reported name must not override the configured name"),
             Err(error) => error,
         };
@@ -6673,7 +6664,7 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, "mock".to_string())
+        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
             .await
             .expect("mock WASM provider should load");
         let instance = factory
@@ -6723,7 +6714,7 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, "mock".to_string())
+        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
             .await
             .expect("mock WASM provider should load");
         let instance = factory
@@ -7002,7 +6993,7 @@ mod tests {
         for kind in [
             Some(ProviderKind::Aws),
             Some(ProviderKind::GitHub),
-            Some(ProviderKind::Other),
+            Some(ProviderKind::Untrusted),
             None,
         ] {
             let keys = env_keys_for_kind(kind);
@@ -7042,7 +7033,7 @@ mod tests {
         for kind in [
             Some(ProviderKind::Aws),
             Some(ProviderKind::GitHub),
-            Some(ProviderKind::Other),
+            Some(ProviderKind::Untrusted),
             None,
         ] {
             let keys = env_keys_for_kind(kind);
@@ -7056,13 +7047,19 @@ mod tests {
     }
 
     #[test]
-    fn test_other_kind_gets_shared_only() {
-        // An unrecognized provider kind receives only the shared group —
-        // no credentials of any provider.
-        let keys = env_keys_for_kind(Some(ProviderKind::Other));
+    fn untrusted_identity_gets_no_credential_or_metadata_partition() {
+        // An untrusted source receives only the shared group and no metadata
+        // endpoint access, even when its configured name is "aws".
+        let configured = ConfiguredProvider::new(ProviderLoadIdentity::for_test(
+            "aws",
+            ProviderTrustClass::Untrusted,
+        ));
+        assert_eq!(configured.kind, ProviderKind::Untrusted);
+        let keys = env_keys_for_kind(Some(ProviderKind::Untrusted));
         assert!(keys.contains(&"HOME"));
         assert!(!keys.contains(&"AWS_ACCESS_KEY_ID"));
         assert!(!keys.contains(&"GITHUB_TOKEN"));
+        assert!(configured.kind.metadata_endpoints().is_empty());
     }
 
     #[test]
@@ -7090,25 +7087,28 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_kind_classification() {
-        let kind = |name: &str| ConfiguredProvider::new(name.to_string()).kind;
+    fn provider_kind_comes_from_resolver_trust_identity() {
+        let kind = |configured_name: &str, class| {
+            ConfiguredProvider::new(ProviderLoadIdentity::for_test(configured_name, class)).kind
+        };
 
-        assert_eq!(kind("aws"), ProviderKind::Aws);
-        assert_eq!(kind("awscc"), ProviderKind::Aws);
-        assert_eq!(kind("github"), ProviderKind::GitHub);
-        // Unknown and mock configured names fail closed to Other.
-        assert_eq!(kind("mock"), ProviderKind::Other);
-        // Casing/spelling drift fails closed (does NOT match Aws/GitHub).
-        assert_eq!(kind("AWS"), ProviderKind::Other);
-        assert_eq!(kind("GitHub"), ProviderKind::Other);
+        assert_eq!(kind("renamed", ProviderTrustClass::Aws), ProviderKind::Aws);
+        assert_eq!(
+            kind("aws", ProviderTrustClass::GitHub),
+            ProviderKind::GitHub
+        );
+        assert_eq!(
+            kind("aws", ProviderTrustClass::Untrusted),
+            ProviderKind::Untrusted
+        );
     }
 
     #[test]
     fn test_other_kind_has_empty_credential_partition() {
         // The fail-closed kind carries no credentials — only the shared
         // group reaches it (asserted via env_keys_for_kind above).
-        assert!(ProviderKind::Other.credential_partition().is_empty());
-        assert!(ProviderKind::Other.metadata_endpoints().is_empty());
+        assert!(ProviderKind::Untrusted.credential_partition().is_empty());
+        assert!(ProviderKind::Untrusted.metadata_endpoints().is_empty());
     }
 
     #[test]
@@ -7205,7 +7205,7 @@ mod tests {
         let kinds = [
             Some(ProviderKind::Aws),
             Some(ProviderKind::GitHub),
-            Some(ProviderKind::Other),
+            Some(ProviderKind::Untrusted),
             None,
         ];
         let destinations = [
@@ -7304,7 +7304,7 @@ mod tests {
         for kind in [
             Some(ProviderKind::Aws),
             Some(ProviderKind::GitHub),
-            Some(ProviderKind::Other),
+            Some(ProviderKind::Untrusted),
             None,
         ] {
             assert!(
@@ -7496,7 +7496,7 @@ mod tests {
             )]),
         };
         let mut hooks =
-            AllowListHttpHooks::with_resolver(Some(ProviderKind::Other), Arc::new(resolver));
+            AllowListHttpHooks::with_resolver(Some(ProviderKind::Untrusted), Arc::new(resolver));
         let request = hyper::Request::builder()
             .uri(format!(
                 "http://redirector.amazonaws.com:{}/start",
@@ -7542,7 +7542,11 @@ mod tests {
             "AWS must pass the metadata policy stage"
         );
         let resolver_calls = Arc::new(AtomicUsize::new(0));
-        for kind in [Some(ProviderKind::GitHub), Some(ProviderKind::Other), None] {
+        for kind in [
+            Some(ProviderKind::GitHub),
+            Some(ProviderKind::Untrusted),
+            None,
+        ] {
             let mut hooks = AllowListHttpHooks::with_resolver(
                 kind,
                 Arc::new(CountingResolver {

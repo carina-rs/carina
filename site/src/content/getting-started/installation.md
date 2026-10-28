@@ -123,6 +123,23 @@ provider aws {
 }
 ```
 
+Local components receive no AWS credentials and cannot reach the EC2 or ECS metadata service by default. To grant those capabilities to this exact build for one command, pass its absolute source path and the `aws` kind:
+
+```bash
+carina init
+carina plan --trust-local-provider /abs/path/carina-provider-aws.wasm=aws
+```
+
+The path is canonicalized, including symlink resolution, and the installed bytes must still match the source file. Re-run `carina init` after rebuilding the component.
+
+For a sequence of commands, set `CARINA_TRUST_LOCAL_PROVIDER` instead. It accepts the same `PATH=KIND` entries, separated by the platform path-list separator (`:` on Unix and `;` on Windows):
+
+```bash
+CARINA_TRUST_LOCAL_PROVIDER='/abs/path/carina-provider-aws.wasm=aws' carina plan
+```
+
+The other supported kind is `github`, for a local build of the GitHub provider. Grants last only for the current process; Carina never writes them to the provider lock, cache, saved plan, or state.
+
 ## Shell completions
 
 ```bash

@@ -480,6 +480,10 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// A local provider privilege grant was malformed or unusable.
+    #[error(transparent)]
+    TrustedLocalGrant(#[from] carina_provider_resolver::GrantParseError),
+
     /// A runtime string was not a valid resource identity.
     #[error(transparent)]
     ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),

@@ -61,7 +61,10 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
 /// Build provider factories from discovered provider configs.
 /// Each entry is (source_directory, provider_config) so providers are installed
 /// in the directory containing the `.crn` file, not at the workspace root.
-fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResult {
+fn build_factories(
+    providers: &[(PathBuf, ProviderConfig)],
+    grants: &carina_provider_resolver::TrustedLocalGrants,
+) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut errors: HashMap<String, String> = HashMap::new();
     let mut fingerprint: Vec<(String, ProviderArtifactFingerprint)> =
@@ -93,12 +96,10 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
 
         match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
-                |bytes, configured_name| async move {
-                    carina_plugin_host::WasmProviderFactory::from_bytes(
-                        bytes.as_bytes(),
-                        configured_name,
-                    )
-                    .await
+                grants,
+                |bytes, identity| async move {
+                    carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes(), identity)
+                        .await
                 },
             ))
         }) {
@@ -125,10 +126,24 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
 async fn main() {
     env_logger::init();
 
+    let trusted_local_env = std::env::var("CARINA_TRUST_LOCAL_PROVIDER").ok();
+    let trusted_local_grants = match carina_provider_resolver::TrustedLocalGrants::parse(
+        &[],
+        trusted_local_env.as_deref(),
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            log::error!("Ignoring invalid CARINA_TRUST_LOCAL_PROVIDER: {error}");
+            carina_provider_resolver::TrustedLocalGrants::parse(&[], None)
+                .expect("an empty trusted-local grant set is valid")
+        }
+    };
+    let trusted_local_grants = std::sync::Arc::new(trusted_local_grants);
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| {
+    let (service, socket) = LspService::new(move |client| {
         let provider_context = ProviderContext {
             decryptor: None,
             validators: HashMap::new(),
@@ -143,8 +158,9 @@ async fn main() {
 
         // Pass factory builder callback — actual WASM loading happens asynchronously
         // after initialize, not during server construction.
+        let trusted_local_grants = std::sync::Arc::clone(&trusted_local_grants);
         let factory_builder: carina_lsp::backend::FactoryBuilder =
-            std::sync::Arc::new(build_factories);
+            std::sync::Arc::new(move |providers| build_factories(providers, &trusted_local_grants));
 
         // Provider install prober: used by the drift poller to notice selected
         // artifact or lock-file metadata changes. Factory construction still
@@ -165,6 +181,10 @@ mod tests {
     use carina_core::parser::ProviderConfig;
     use indexmap::IndexMap;
     use std::path::PathBuf;
+
+    fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
+        carina_provider_resolver::TrustedLocalGrants::parse(&[], None).unwrap()
+    }
 
     fn cfg(name: &str, source: Option<&str>, binding: Option<&str>) -> (PathBuf, ProviderConfig) {
         (
@@ -197,7 +217,7 @@ mod tests {
             cfg("aws", Some("file:///nonexistent/fake.wasm"), None),
             cfg("aws", None, Some("us")),
         ];
-        let (_factories, errors, fingerprint) = build_factories(&providers);
+        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
         assert_eq!(
             fingerprint.len(),
             providers.len(),
@@ -223,7 +243,7 @@ mod tests {
         let (_, config) = cfg("mock", None, None);
         let providers = vec![(tmp.path().to_path_buf(), config)];
 
-        let (factories, errors, fingerprint) = build_factories(&providers);
+        let (factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
 
         assert!(factories.is_empty());
         assert!(
@@ -334,7 +354,7 @@ mod tests {
 
         let (_, config) = cfg("aws", Some(source), None);
         let providers = vec![(tmp.path().to_path_buf(), config.clone())];
-        let (_factories, errors, fingerprint) = build_factories(&providers);
+        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(

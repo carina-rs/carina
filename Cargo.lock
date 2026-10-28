@@ -1145,6 +1145,7 @@ dependencies = [
  "carina-core",
  "carina-plugin-host",
  "carina-provider-protocol",
+ "carina-provider-resolver",
  "carina-state",
  "dirs",
  "hex",

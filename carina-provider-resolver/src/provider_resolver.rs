@@ -18,7 +18,7 @@ use time::format_description::well_known::Rfc3339;
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider_source::{
-    GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
+    FileSource, GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
 };
 use carina_core::version_constraint::VersionConstraint;
 
@@ -27,7 +27,11 @@ use crate::install_lock::{
     global_cache_artifact_path, install_global_artifact_atomically,
     install_project_artifact_atomically, install_project_artifact_from_global_cache,
 };
+#[cfg(test)]
+use crate::provider_trust::ProviderTrustClass;
+use crate::provider_trust::{ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust};
 use crate::signing;
+use crate::trusted_local::TrustedLocalGrants;
 use crate::verified_artifact::{
     DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
     VerifiedArtifactError, VersionArtifactPin, lock_artifact_selection,
@@ -2043,6 +2047,10 @@ impl RegistryLock {
     pub fn yanked_versions(&self) -> &YankedRegistryVersions {
         &self.yanked_versions
     }
+
+    pub(crate) fn signature_protection(&self) -> &RegistrySignatureProtection {
+        &self.signature
+    }
 }
 
 /// The full carina-providers.lock file.
@@ -4041,7 +4049,7 @@ enum InstalledArtifact {
     File {
         path: WasmArtifactPath,
         bytes: ProviderArtifactBytes,
-        source: String,
+        source: FileSource,
     },
 }
 
@@ -4068,7 +4076,7 @@ impl InstalledProvider {
                 bytes: _,
                 source,
             } => ProviderArtifactProvenance::File {
-                source: source.clone(),
+                source: format!("file://{}", source.path()),
             },
         }
     }
@@ -4087,7 +4095,7 @@ impl InstalledProvider {
     pub(crate) fn file_source(
         path: WasmArtifactPath,
         provider_name: String,
-        source: String,
+        source: FileSource,
     ) -> Result<Self, String> {
         let bytes = ProviderArtifactBytes::read(path.as_path()).map_err(|error| {
             format!(
@@ -4116,11 +4124,46 @@ impl InstalledProvider {
         }
     }
 
+    fn load_identity(
+        &self,
+        grants: &TrustedLocalGrants,
+        notice_sink: &mut impl FnMut(&str),
+    ) -> Result<ProviderLoadIdentity, ProviderLoadIdentityError> {
+        let (trust, notice) = match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => (
+                ProviderTrust::from_verified_remote(artifact.source(), artifact.signature()),
+                None,
+            ),
+            InstalledArtifact::File {
+                path: _,
+                bytes,
+                source,
+            } => local_provider_trust(source, bytes, grants, notice_sink),
+        };
+        let identity = ProviderLoadIdentity::new(self.provider_name.clone(), trust)?;
+        if let Some(notice) = notice {
+            notice_sink(&notice);
+        }
+        Ok(identity)
+    }
+
     /// Attach this artifact's provenance to a load failure without flattening
     /// the underlying error. Display always renders the load error first.
     pub fn with_load_error<E>(&self, error: E) -> ProviderArtifactLoadError<E> {
         ProviderArtifactLoadError {
-            error,
+            error: ProviderArtifactLoadFailure::Loader(error),
+            provider_name: self.provider_name.clone(),
+            artifact_path: self.path().as_path().to_path_buf(),
+            provenance: Box::new(self.provenance()),
+        }
+    }
+
+    fn with_identity_error<E>(
+        &self,
+        error: ProviderLoadIdentityError,
+    ) -> ProviderArtifactLoadError<E> {
+        ProviderArtifactLoadError {
+            error: ProviderArtifactLoadFailure::Identity(error),
             provider_name: self.provider_name.clone(),
             artifact_path: self.path().as_path().to_path_buf(),
             provenance: Box::new(self.provenance()),
@@ -4128,20 +4171,63 @@ impl InstalledProvider {
     }
 
     /// Load through a caller-supplied async function, supplying both the
-    /// verified artifact bytes and the host-configured provider name while
+    /// verified artifact bytes and the resolver-owned load identity while
     /// making provenance attachment mandatory on the error path.
     pub async fn load_with<T, E, F, Fut>(
         &self,
+        grants: &TrustedLocalGrants,
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(ProviderArtifactBytes, String) -> Fut,
+        F: FnOnce(ProviderArtifactBytes, ProviderLoadIdentity) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        loader(self.artifact_bytes(), self.provider_name.clone())
+        self.load_with_notice_sink(grants, |line| eprintln!("{line}"), loader)
+            .await
+    }
+
+    async fn load_with_notice_sink<T, E, F, Fut, S>(
+        &self,
+        grants: &TrustedLocalGrants,
+        mut notice_sink: S,
+        loader: F,
+    ) -> Result<T, ProviderArtifactLoadError<E>>
+    where
+        F: FnOnce(ProviderArtifactBytes, ProviderLoadIdentity) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        S: FnMut(&str),
+    {
+        let identity = self
+            .load_identity(grants, &mut notice_sink)
+            .map_err(|error| self.with_identity_error(error))?;
+        loader(self.artifact_bytes(), identity)
             .await
             .map_err(|error| self.with_load_error(error))
     }
+}
+
+fn local_provider_trust(
+    source: &FileSource,
+    installed_bytes: &ProviderArtifactBytes,
+    grants: &TrustedLocalGrants,
+    notice_sink: &mut impl FnMut(&str),
+) -> (ProviderTrust, Option<String>) {
+    let Ok(canonical_path) = fs::canonicalize(source.path()) else {
+        return (ProviderTrust::untrusted(), None);
+    };
+    let Some(grant) = grants.matching(&canonical_path) else {
+        return (ProviderTrust::untrusted(), None);
+    };
+    let installed_sha256 = format!("{:x}", Sha256::digest(installed_bytes.as_bytes()));
+    let current_sha256 = sha256_file(&canonical_path).ok();
+    if current_sha256.as_deref() != Some(installed_sha256.as_str()) {
+        notice_sink(&format!(
+            "carina: local provider {} does not match the installed bytes; re-run `carina init` before trusting it",
+            canonical_path.display()
+        ));
+        return (ProviderTrust::untrusted(), None);
+    }
+    (grant.trust(), Some(grant.notice()))
 }
 
 /// Where an installed provider artifact came from. Locked variants cannot
@@ -4225,18 +4311,37 @@ impl fmt::Display for ProviderArtifactProvenance {
 /// the artifact provenance selected by the resolver.
 #[derive(Debug)]
 pub struct ProviderArtifactLoadError<E> {
-    error: E,
+    error: ProviderArtifactLoadFailure<E>,
     provider_name: String,
     artifact_path: PathBuf,
     provenance: Box<ProviderArtifactProvenance>,
 }
 
+#[derive(Debug)]
+enum ProviderArtifactLoadFailure<E> {
+    Identity(ProviderLoadIdentityError),
+    Loader(E),
+}
+
+impl<E> ProviderArtifactLoadError<E> {
+    pub fn identity_error(&self) -> Option<&ProviderLoadIdentityError> {
+        match &self.error {
+            ProviderArtifactLoadFailure::Identity(error) => Some(error),
+            ProviderArtifactLoadFailure::Loader(_) => None,
+        }
+    }
+}
+
 impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let error: &dyn fmt::Display = match &self.error {
+            ProviderArtifactLoadFailure::Identity(error) => error,
+            ProviderArtifactLoadFailure::Loader(error) => error,
+        };
         write!(
             f,
             "{}\nProvider: {}\nArtifact: {}\n{}",
-            self.error,
+            error,
             self.provider_name,
             self.artifact_path.display(),
             self.provenance
@@ -6548,8 +6653,8 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
         .source
         .as_ref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
-    let file_path = match source {
-        ProviderSource::File(file_source) => file_source.path(),
+    let file_source = match source {
+        ProviderSource::File(file_source) => file_source.clone(),
         ProviderSource::Remote(_) => {
             return Err(format!(
                 "Provider '{}' is not a file:// source",
@@ -6557,12 +6662,13 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
             ));
         }
     };
+    let file_path = file_source.path();
     let path = PathBuf::from(file_path);
     if !path.exists() {
         return Err(format!("file not found: {file_path}"));
     }
     let path = WasmArtifactPath::new(path, &config.name)?;
-    InstalledProvider::file_source(path, config.name.clone(), source.to_string())
+    InstalledProvider::file_source(path, config.name.clone(), file_source)
 }
 
 fn select_locked_artifact<'lock>(
@@ -6744,7 +6850,7 @@ pub fn find_installed_provider(
                 return InstalledProvider::file_source(
                     dest,
                     config.name.clone(),
-                    source.to_string(),
+                    file_source.clone(),
                 );
             }
             return Err(format!(
@@ -8957,6 +9063,16 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
+        }
+    }
+
+    fn local_file_source(path: &Path) -> FileSource {
+        match format!("file://{}", path.display())
+            .parse::<ProviderSource>()
+            .unwrap()
+        {
+            ProviderSource::File(source) => source,
+            ProviderSource::Remote(_) => panic!("expected file source"),
         }
     }
 
@@ -17549,7 +17665,7 @@ transparency_log_present = false
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(|bytes, _configured_name| async move {
+            .load_with(&no_local_grants(), |bytes, _identity| async move {
                 Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
             })
             .await
@@ -17573,7 +17689,7 @@ transparency_log_present = false
         fs::write(&source_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(|bytes, _configured_name| async move {
+            .load_with(&no_local_grants(), |bytes, _identity| async move {
                 Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
             })
             .await
@@ -17581,6 +17697,283 @@ transparency_log_present = false
 
         assert_eq!(loaded, original_bytes);
         assert_ne!(loaded, swapped_bytes);
+    }
+
+    fn no_local_grants() -> TrustedLocalGrants {
+        TrustedLocalGrants::parse(&[], None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_provider_without_grant_is_untrusted() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        fs::write(&source_path, b"local provider").unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let installed = find_file_provider_source(&config).unwrap();
+
+        let class = installed
+            .load_with(&no_local_grants(), |_bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn matching_local_grant_applies_aws_trust_and_emits_notice_once() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        fs::write(&source_path, b"local provider").unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let installed = find_file_provider_source(&config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+        let canonical = fs::canonicalize(&source_path).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &grants,
+                |line| emitted.push(line.to_string()),
+                |_bytes, identity| async move {
+                    Ok::<_, std::convert::Infallible>(identity.trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Aws);
+        assert_eq!(
+            emitted,
+            vec![format!(
+                "carina: trusting local provider {} as aws (--trust-local-provider)",
+                canonical.display()
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_file_source_matches_grant_for_canonical_target() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("target.wasm");
+        let link = project.path().join("provider.wasm");
+        fs::write(&target, b"local provider").unwrap();
+        symlink(&target, &link).unwrap();
+        let config = provider_config(&format!("file://{}", link.display()), None);
+        let installed = find_file_provider_source(&config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", target.display())], None).unwrap();
+
+        let class = installed
+            .load_with(&grants, |_bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[tokio::test]
+    async fn relative_file_source_does_not_match_grant_for_different_path() {
+        let relative_root = tempfile::tempdir_in(".").unwrap();
+        let source_path = relative_root.path().join("evil.wasm");
+        fs::write(&source_path, b"evil provider").unwrap();
+        let relative_source = source_path
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap_or(&source_path);
+        let granted_root = tempfile::tempdir().unwrap();
+        let granted_path = granted_root.path().join("aws.wasm");
+        fs::write(&granted_path, b"official local provider").unwrap();
+        let config = provider_config(&format!("file://./{}", relative_source.display()), None);
+        let installed = find_file_provider_source(&config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", granted_path.display())], None).unwrap();
+
+        let class = installed
+            .load_with(&grants, |_bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn matching_grant_with_different_cached_bytes_is_untrusted() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let cached_path = project.path().join("cached-provider.wasm");
+        fs::write(&source_path, b"current source bytes").unwrap();
+        fs::write(&cached_path, b"planted cached bytes").unwrap();
+        let installed = InstalledProvider::file_source(
+            WasmArtifactPath::new(cached_path, "awscc").unwrap(),
+            "awscc".into(),
+            local_file_source(&source_path),
+        )
+        .unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &grants,
+                |line| emitted.push(line.to_string()),
+                |_bytes, identity| async move {
+                    Ok::<_, std::convert::Infallible>(identity.trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].contains("does not match the installed bytes"));
+        assert!(emitted[0].contains("re-run `carina init`"));
+        assert!(!emitted[0].contains("trusting local provider"));
+    }
+
+    #[tokio::test]
+    async fn trusted_local_grant_rejects_incompatible_configured_name() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        fs::write(&source_path, b"local provider").unwrap();
+        let mut config = provider_config(&format!("file://{}", source_path.display()), None);
+        config.name = "foo".into();
+        let installed = find_file_provider_source(&config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+
+        let error = installed
+            .load_with(&grants, |_bytes, _identity| async move {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.identity_error().unwrap().configured_name(), "foo");
+    }
+
+    #[tokio::test]
+    async fn trusted_remote_source_rejects_disagreeing_configured_name_before_loader() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let bytes = b"verified provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let installed =
+            find_installed_provider(project.path(), &provider_config(source, None)).unwrap();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
+
+        let error = installed
+            .load_with(&no_local_grants(), move |_bytes, _identity| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
+        let identity_error = error.identity_error().unwrap();
+        assert_eq!(identity_error.configured_name(), "awscc");
+        assert_eq!(identity_error.expected(), "aws");
+    }
+
+    #[tokio::test]
+    async fn official_github_revision_load_identity_is_trusted_as_aws() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let revision = "main";
+        let resolved_sha = "deadbeefcafe1234567890";
+        let bytes = b"verified revision provider";
+        let wasm_path = crate::revision_resolver::cache_path_revision(
+            project.path(),
+            &github_source(source),
+            resolved_sha,
+        );
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Revision {
+                revision: revision.into(),
+                resolved_sha: resolved_sha.into(),
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, Some(revision));
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+
+        let class = installed
+            .load_with(&no_local_grants(), |_bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[tokio::test]
+    async fn verified_artifact_carries_non_carina_signer_pin_into_load_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "carina-rs/aws";
+        let version = "0.5.0";
+        let bytes = b"registry provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::Required(
+            SignerPinState::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+                    repository_owner_id: "999".into(),
+                    repository_id: "123".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
+            }),
+        ));
+        lock.provider[0].sha256 = sha256_bytes(bytes);
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+
+        let class = installed
+            .load_with(&no_local_grants(), |_bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>(identity.trust().class())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
     }
 
     #[test]
@@ -17832,17 +18225,19 @@ transparency_log_present = false
         let tmp = tempfile::tempdir().unwrap();
         let provider_path = tmp.path().join("provider.wasm");
         fs::write(&provider_path, b"fixture").unwrap();
-        let source = format!("file://{}", provider_path.display());
         let installed = InstalledProvider::file_source(
-            WasmArtifactPath::new(provider_path, "aws").unwrap(),
+            WasmArtifactPath::new(provider_path.clone(), "aws").unwrap(),
             "aws".to_string(),
-            source,
+            local_file_source(&provider_path),
         )
         .unwrap();
 
         let (loaded_bytes, configured_name) = installed
-            .load_with(|bytes, name| async move {
-                Ok::<_, std::convert::Infallible>((bytes.as_bytes().to_vec(), name))
+            .load_with(&no_local_grants(), |bytes, identity| async move {
+                Ok::<_, std::convert::Infallible>((
+                    bytes.as_bytes().to_vec(),
+                    identity.configured_name().to_string(),
+                ))
             })
             .await
             .unwrap();

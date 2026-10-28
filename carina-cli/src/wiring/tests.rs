@@ -7207,20 +7207,23 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let cache = tempfile::tempdir().unwrap();
     let cache_path = cache.path().to_path_buf();
 
-    let error =
-        match load_installed_wasm_provider_using(&installed, |bytes, configured_name| async move {
+    let error = match load_installed_wasm_provider_using(
+        &installed,
+        trusted_local_grants(),
+        |bytes, identity| async move {
             carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
                 bytes.as_bytes(),
-                configured_name,
+                identity,
                 &cache_path,
             )
             .await
-        })
-        .await
-        {
-            Ok(_) => panic!("fixture component must not instantiate as a provider"),
-            Err(error) => error,
-        };
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("fixture component must not instantiate as a provider"),
+        Err(error) => error,
+    };
     let rendered = error.to_string();
 
     assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));

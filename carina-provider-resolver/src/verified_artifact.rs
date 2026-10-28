@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
-    LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock, WasmArtifactPath,
-    cache_path_wasm, sha256_file,
+    LockEntry, LockEntryKind, LockFile, LockedProviderPin, NoRegistryLock, RegistryLock,
+    RegistrySignatureProtection, WasmArtifactPath, cache_path_wasm, sha256_file,
 };
 use crate::revision_resolver::cache_path_revision;
 
@@ -67,9 +67,26 @@ pub struct VerifiedArtifact {
     path: WasmArtifactPath,
     bytes: ProviderArtifactBytes,
     sha256: String,
-    source: String,
+    source: RemoteSourceKey,
+    signature: Option<RegistrySignatureProtection>,
     project_dir: PathBuf,
     pin: LockedProviderPin,
+}
+
+pub(crate) trait VerifiedArtifactRegistryLock {
+    fn signature(&self) -> RegistrySignatureProtection;
+}
+
+impl VerifiedArtifactRegistryLock for RegistryLock {
+    fn signature(&self) -> RegistrySignatureProtection {
+        self.signature_protection().clone()
+    }
+}
+
+impl VerifiedArtifactRegistryLock for NoRegistryLock {
+    fn signature(&self) -> RegistrySignatureProtection {
+        match *self {}
+    }
 }
 
 #[derive(Debug)]
@@ -210,6 +227,7 @@ impl ChecksumMismatch {
 pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
     pub(crate) path: WasmArtifactPath,
     pub(crate) lock_entry: &'lock LockEntry<R>,
+    source: RemoteSourceKey,
     locked_identity: String,
     pub(crate) pin: LockedProviderPin,
 }
@@ -227,8 +245,12 @@ impl VerifiedArtifact {
         &self.bytes
     }
 
-    pub(crate) fn source(&self) -> &str {
+    pub(crate) fn source(&self) -> &RemoteSourceKey {
         &self.source
+    }
+
+    pub(crate) fn signature(&self) -> Option<&RegistrySignatureProtection> {
+        self.signature.as_ref()
     }
 
     pub(crate) fn project_dir(&self) -> &Path {
@@ -239,7 +261,7 @@ impl VerifiedArtifact {
         &self.pin
     }
 
-    pub(crate) fn from_existing<R>(
+    pub(crate) fn from_existing<R: VerifiedArtifactRegistryLock>(
         lock_entry: &LockEntry<R>,
         provider_name: &str,
         project_dir: &Path,
@@ -249,7 +271,7 @@ impl VerifiedArtifact {
         Self::from_selection(selection, provider_name, project_dir)
     }
 
-    pub(crate) fn from_selection<R>(
+    pub(crate) fn from_selection<R: VerifiedArtifactRegistryLock>(
         selection: LockArtifactSelection<'_, R>,
         provider_name: &str,
         project_dir: &Path,
@@ -257,6 +279,7 @@ impl VerifiedArtifact {
         let LockArtifactSelection {
             path,
             lock_entry,
+            source,
             locked_identity,
             pin,
         } = selection;
@@ -264,6 +287,7 @@ impl VerifiedArtifact {
             path.as_path(),
             path.clone(),
             lock_entry,
+            source,
             &locked_identity,
             provider_name,
             project_dir,
@@ -271,10 +295,11 @@ impl VerifiedArtifact {
         )
     }
 
-    fn verify_bytes_at<R>(
+    fn verify_bytes_at<R: VerifiedArtifactRegistryLock>(
         bytes_path: &Path,
         published_path: WasmArtifactPath,
         lock_entry: &LockEntry<R>,
+        source: RemoteSourceKey,
         locked_identity: &str,
         provider_name: &str,
         project_dir: &Path,
@@ -302,7 +327,11 @@ impl VerifiedArtifact {
             path: published_path,
             bytes,
             sha256: actual_sha256,
-            source: lock_entry.source.clone(),
+            source,
+            signature: lock_entry
+                .registry
+                .as_ref()
+                .map(VerifiedArtifactRegistryLock::signature),
             project_dir: project_dir.to_path_buf(),
             pin,
         })
@@ -392,7 +421,7 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
     }
 }
 
-pub(crate) fn publish_cached<R>(
+pub(crate) fn publish_cached<R: VerifiedArtifactRegistryLock>(
     staged: StagedArtifact<'_>,
     lock_entry: &LockEntry<R>,
     provider_name: &str,
@@ -401,6 +430,7 @@ pub(crate) fn publish_cached<R>(
     let LockArtifactSelection {
         path,
         lock_entry: _,
+        source,
         locked_identity,
         pin,
     } = lock_artifact_selection(&project_dir, lock_entry, provider_name)
@@ -416,6 +446,7 @@ pub(crate) fn publish_cached<R>(
         staged.path(),
         path,
         lock_entry,
+        source,
         &locked_identity,
         provider_name,
         &project_dir,
@@ -431,7 +462,7 @@ pub(crate) fn publish_cached<R>(
     Ok(verified)
 }
 
-pub(crate) fn publish_download<R, P>(
+pub(crate) fn publish_download<R: VerifiedArtifactRegistryLock, P>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
 ) -> Result<DownloadedArtifact<P>, String> {
@@ -476,6 +507,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
             ));
         }
     };
+    let source_key = remote_source.source_key();
 
     let (path, locked_identity, pin) = match (&lock_entry.kind, remote_source) {
         (
@@ -540,6 +572,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
     Ok(LockArtifactSelection {
         path: WasmArtifactPath::new(path, provider_name)?,
         lock_entry,
+        source: source_key,
         locked_identity,
         pin,
     })

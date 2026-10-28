@@ -33,6 +33,15 @@ const VERSION: &str = env!("CARINA_VERSION_STRING");
 #[command(version = VERSION)]
 #[command(about = "A functional infrastructure management tool", long_about = None)]
 struct Cli {
+    /// Trust a local provider component as aws or github for this process
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH=KIND",
+        action = clap::ArgAction::Append
+    )]
+    trust_local_provider: Vec<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -372,6 +381,16 @@ async fn main() {
     carina_cli::cursor::install_panic_restore_hook();
 
     let cli = Cli::parse();
+    let trusted_local_env = std::env::var("CARINA_TRUST_LOCAL_PROVIDER").ok();
+    let trusted_local_grants = match carina_provider_resolver::TrustedLocalGrants::parse(
+        &cli.trust_local_provider,
+        trusted_local_env.as_deref(),
+    ) {
+        Ok(grants) => grants,
+        Err(error) => handle_app_error(error.into()),
+    };
+    carina_cli::wiring::set_trusted_local_grants(trusted_local_grants)
+        .expect("trusted local provider grants are installed once at process startup");
 
     let plan_images = match &cli.command {
         Commands::Plan {
@@ -999,6 +1018,24 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_flag_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn trust_local_provider_is_repeatable_and_global() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--trust-local-provider",
+            "/tmp/aws.wasm=aws",
+            "--trust-local-provider",
+            "/tmp/github.wasm=github",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.trust_local_provider,
+            ["/tmp/aws.wasm=aws", "/tmp/github.wasm=github"]
+        );
     }
 
     #[test]

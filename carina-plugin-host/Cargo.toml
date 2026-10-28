@@ -14,6 +14,7 @@ test-utils = []
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
+carina-provider-resolver = { path = "../carina-provider-resolver" }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,6 +41,7 @@ uuid = { version = "1", features = ["v4"] }
 argon2 = "0.5"
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 carina-plugin-host = { path = ".", features = ["test-utils"] }
+carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }
 carina-state = { path = "../carina-state" }
 hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

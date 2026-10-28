@@ -20,7 +20,7 @@ You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `
 
 `export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, write `export_provider!(MyProvider, http)` and add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
 
-The host checks every outgoing request against a fixed allow-list: hosts ending in `.amazonaws.com` or `.amazonaws.com.cn`, and the EC2 and ECS metadata addresses. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
+The host checks every outgoing request against a fixed allow-list. Hosts ending in `.amazonaws.com` or `.amazonaws.com.cn` are reachable, while the EC2 and ECS metadata addresses are reachable only by providers the host trusts as AWS. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
 
 ## How the host calls a provider
 
@@ -75,12 +75,12 @@ Create results go through a typestate in the SDK, so a provider must say what it
 A provider runs with no filesystem access. It sees only these environment variables:
 
 - `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
-- AWS credential and region variables, only for providers named `aws` or `awscc`.
-- `GITHUB_TOKEN`, only for a provider named `github`.
+- AWS credential and region variables, only for the verified `carina-rs/aws` and `carina-rs/awscc` providers (including their official GitHub sources), or for a matching local build explicitly granted the `aws` kind.
+- `GITHUB_TOKEN`, only for the verified `carina-rs/github` provider (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
-The host chooses these by the name the provider reports from `info`, so do not give a third-party provider one of those names: a user who installs it would hand it their AWS or GitHub credentials. A provider with any other name receives no credentials from the environment. Declare the settings it needs as attributes of its `provider` block instead, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
+The host chooses these capabilities from the provider's verified source identity, not from its configured or `info`-reported name. A third-party repository or registry namespace receives no credentials even if it calls itself `aws`, `awscc` or `github`. A local `file://` build also receives none unless its canonical source path is granted with `--trust-local-provider <PATH=KIND>` or `CARINA_TRUST_LOCAL_PROVIDER`; Carina checks that the bytes being loaded still match that source file. Declare other settings as attributes of the `provider` block, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
 
-Environment variables are not the only route to credentials. On EC2, the metadata address is open to every provider that uses the HTTP world, whatever its name, so such a provider can read the instance role's credentials. Install providers you trust only, especially on EC2. Restricting this is tracked in [carina#4022](https://github.com/carina-rs/carina/issues/4022).
+The same verified-source decision controls metadata access. Only a provider trusted as AWS can reach the EC2 or ECS metadata addresses and read role credentials from them.
 
 ## Protocol version
 

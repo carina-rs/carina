@@ -9,7 +9,9 @@ use crate::provider_resolver::{
     LockEntry, LockFile, LockFileError, LockFileMigration, WasmArtifactPath, provider_lock_path,
     resolve_lock_file_save_path, resolve_parent, sha256_file,
 };
-use crate::verified_artifact::{VerifiedArtifact, VerifiedArtifactError, publish_cached};
+use crate::verified_artifact::{
+    VerifiedArtifact, VerifiedArtifactError, VerifiedArtifactRegistryLock, publish_cached,
+};
 
 const PROVIDER_INSTALL_LOCK_FILE_NAME: &str = "provider-install.lock";
 
@@ -355,7 +357,7 @@ pub(crate) fn install_project_artifact_atomically(
     install_artifact_atomically(source, target)
 }
 
-pub(crate) fn install_project_artifact_from_global_cache<R>(
+pub(crate) fn install_project_artifact_from_global_cache<R: VerifiedArtifactRegistryLock>(
     install_lock: &ProviderInstallLock,
     source: &Path,
     destination: &WasmArtifactPath,
