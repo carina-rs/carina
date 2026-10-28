@@ -7,7 +7,7 @@ A provider has two version numbers. Its own release version is yours to choose. 
 
 ## The protocol version
 
-The host and the provider talk through a versioned protocol. `carina-provider-protocol` defines two numbers: `PROTOCOL_VERSION`, the version this build speaks, and `MIN_SUPPORTED_PROTOCOL_VERSION`, the oldest provider version the host still loads. The SDK writes the version it was built with into the provider's `info` response; you never set it yourself.
+The host and the provider talk through a versioned protocol. `carina-provider-protocol` defines two numbers: `PROTOCOL_VERSION`, the version this build speaks, and `MIN_SUPPORTED_PROTOCOL_VERSION`, the oldest protocol version the host still loads from a provider. The SDK writes the version it was built with into the provider's `info` response; you never set it yourself.
 
 Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
@@ -19,7 +19,7 @@ provider 'hello' was built against protocol version 10 but this host requires at
 provider 'hello' was built against protocol version 13 but this host supports up to version 12; upgrade carina to load this provider
 ```
 
-Since v0.5.0, the first release that checks the version, every release has set the minimum equal to its own version, so a provider has to be built for exactly the protocol version of the Carina that loads it:
+Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
@@ -27,7 +27,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 12, for example, added a required `write_only` flag to nested struct fields in schemas; a protocol 11 provider would have had every nested field read as readable, and Carina would have planned updates that never converge. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
+Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 12, for example, added a required `write_only` flag to nested struct fields in schemas. A provider built for the previous protocol would have sent no such flag, Carina would have treated every nested field as not write-only, and it would have planned updates that never converge. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
 
 ## When the protocol changes
 
@@ -48,4 +48,4 @@ Follow semver for your own version as usual. A protocol bump that forces users t
 
 ## Next steps
 
-[Publishing](/providers/writing/publishing/) covers releasing a provider through the registry, which is not open to third parties yet.
+[Docs Bundle](/providers/writing/docs-bundle/) describes how a provider will ship its documentation to the registry.

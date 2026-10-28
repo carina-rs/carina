@@ -5,7 +5,7 @@ description: "The archive format a Carina provider uses to ship its documentatio
 
 A provider registry shows each provider version's documentation: an overview page, and one page per resource type and data source. The official providers' pages at [registry.carina-rs.dev](https://registry.carina-rs.dev/providers/index.html) are built this way. The provider supplies them as a **docs bundle**, one archive built by the same release that builds the `.wasm`.
 
-Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write and check your docs now. The authoritative definition is the registry protocol's [Documentation source](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle) section; this page summarizes it.
+Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write your docs and build the bundle now; the registry checks it only at publish (see below). The authoritative definition is the registry protocol's [Documentation source](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle) section; this page summarizes it.
 
 ## Layout
 
@@ -18,7 +18,7 @@ carina-provider-hello-v0.1.0-docs.tar.gz
     lookup.md              # one page per data source
 ```
 
-`index.md` is the version's top page: what the provider manages, and how to configure its `provider` block. Each file under `resources/` and `data-sources/` becomes a page whose URL ends in its name without `.md`, the **slug**: `resources/greeting.md` is served at `/providers/<namespace>/<name>/<version>/resources/greeting`. You choose the slugs; the registry does not derive them from resource type names.
+`index.md` is the version's top page: what the provider manages, and how to configure its `provider` block. Each file under `resources/` and `data-sources/` becomes a page. A file's name without `.md` is its **slug**, and is the last part of its page URL: `resources/greeting.md` is served at `/providers/<namespace>/<name>/<version>/resources/greeting`. You choose the slugs; the registry does not derive them from resource type names.
 
 ## Rules
 
@@ -27,14 +27,16 @@ The registry checks every rule when a version is published and refuses a bundle 
 | What | Rule |
 |------|------|
 | Archive | One gzip member holding a POSIX tar archive (`ustar` or `pax`) |
-| Entries | Regular files and directories only: no symbolic or hard links. A directory entry declares size 0. Paths longer than `ustar` allows need `pax`, not GNU long names. No pax global headers; each pax extended header at most 64 KiB. Only zero bytes after the end-of-archive marker |
+| Entries | Regular files and directories only, no links; see below |
 | Paths | Relative, `/`-separated, no empty, `.` or `..` component; one leading `./` is ignored |
 | Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`; nothing else |
 | Slugs | `[a-z0-9][a-z0-9_]*`, at most 128 bytes |
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
 
-Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when one plus the largest number of `|` characters on any line, multiplied by its number of lines, exceeds 250,000. Each page's Markdown may render to at most 2 MiB of HTML, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
+The tar format has a few more rules: a directory entry declares size 0, paths longer than `ustar` allows need `pax` rather than GNU long names, pax global headers are not allowed, each pax extended header is at most 64 KiB, and only zero bytes may follow the end-of-archive marker. The script below produces compliant entries.
+
+Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when (largest number of `|` characters on any line + 1) × number of lines exceeds 250,000. Each page's Markdown may render to at most 2 MiB of HTML, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
 
 Docs are accepted only for stable versions. A pre-release publish that carries a docs bundle is refused as a whole, so attach docs only to stable releases. A version's docs are fixed when it is first published: corrected docs ship with the next version.
 
@@ -106,10 +108,12 @@ with open(out, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename
 python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 ```
 
-Attach the archive to the same GitHub release as the `.wasm`. The registry fetches it from that URL when the version is published. When the version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
+Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
+
+If you release with [provider-release](/providers/writing/publishing/#the-release-pipeline), its build workflow packs and checks the bundle with a `scripts/docs-bundle.py` copied from carina-provider-aws instead of this script. That copy allows files up to 1 MiB where the registry allows 256 KiB, so keep each page under 256 KiB yourself.
 
 There is no standalone checker for these rules yet; the registry runs them at publish. Making the registry's own validator available to providers is tracked in [carina-rs/registry#139](https://github.com/carina-rs/registry/issues/139).
 
 ## Next steps
 
-[Versioning and Compatibility](/providers/writing/versioning/) explains how protocol versions affect when you need to rebuild and release.
+[Publishing](/providers/writing/publishing/) tracks when third-party providers can publish to the registry.
