@@ -162,8 +162,10 @@ impl Error for UserTrustRecordDirError {}
 /// Get the user-owned provider trust-record directory.
 ///
 /// Checks `CARINA_TRUST_RECORD_DIR` first, then falls back to
-/// `~/.carina/trust/`. Returns an error when the environment value is relative,
-/// and `None` if the home directory cannot be determined.
+/// `~/.carina/trust/` in normal builds or isolated per-process temporary
+/// storage in test builds. Returns an error when the environment value is
+/// relative, and `None` in normal builds if the home directory cannot be
+/// determined.
 pub fn user_trust_record_dir() -> Result<Option<PathBuf>, UserTrustRecordDirError> {
     if let Some(value) = std::env::var_os(TRUST_RECORD_DIR_ENV) {
         let path = PathBuf::from(value);
@@ -172,7 +174,17 @@ pub fn user_trust_record_dir() -> Result<Option<PathBuf>, UserTrustRecordDirErro
         }
         return Ok(Some(path));
     }
-    Ok(dirs::home_dir().map(|home| home.join(".carina").join("trust")))
+    Ok(default_user_trust_record_dir())
+}
+
+#[cfg(not(test))]
+fn default_user_trust_record_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".carina").join("trust"))
+}
+
+#[cfg(test)]
+fn default_user_trust_record_dir() -> Option<PathBuf> {
+    Some(crate::isolated_test_storage_root().join("trust"))
 }
 
 impl UserTrustRecord {
@@ -449,6 +461,24 @@ mod tests {
         );
         assert!(error.to_string().contains("must be an absolute path"));
         assert!(error.to_string().contains("CARINA_TRUST_RECORD_DIR"));
+    }
+
+    #[test]
+    fn user_trust_record_dir_test_fallback_is_not_under_home_directory() {
+        let _env_guard = crate::test_env_guard();
+        let _trust_env = crate::ScopedEnvVar::remove(TRUST_RECORD_DIR_ENV);
+
+        let fallback = user_trust_record_dir().unwrap().unwrap();
+
+        assert_eq!(fallback, crate::isolated_test_storage_root().join("trust"));
+        if let Some(home) = dirs::home_dir() {
+            assert!(
+                !fallback.starts_with(&home),
+                "test trust-record fallback {} must not be under home {}",
+                fallback.display(),
+                home.display()
+            );
+        }
     }
 
     #[test]

@@ -518,6 +518,10 @@ mod tests {
 
     async fn assert_init_runs_real_verifier_inside_async_command() {
         let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         fs::write(
             project.path().join("providers.crn"),
             r#"provider aws {
@@ -567,13 +571,23 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn init_real_verifier_is_safe_on_current_thread_runtime() {
-        assert_init_runs_real_verifier_inside_async_command().await;
+    #[test]
+    fn init_real_verifier_is_safe_on_current_thread_runtime() {
+        let _env_guard = crate::test_env_guard();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_init_runs_real_verifier_inside_async_command());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn init_real_verifier_is_safe_on_multi_thread_runtime() {
-        assert_init_runs_real_verifier_inside_async_command().await;
+    #[test]
+    fn init_real_verifier_is_safe_on_multi_thread_runtime() {
+        let _env_guard = crate::test_env_guard();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_init_runs_real_verifier_inside_async_command());
     }
 }

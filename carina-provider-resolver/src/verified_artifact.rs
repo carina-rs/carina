@@ -11,7 +11,9 @@ use carina_core::provider_source::{
 use sha2::{Digest, Sha256};
 
 use crate::github::FetchedLocation;
-use crate::github_location::{ArtifactId, AssetId, GithubLocationError, ReleaseTag, RepoSlug};
+use crate::github_location::{
+    ArtifactId, AssetId, CommitSha, GithubLocationError, ReleaseTag, RepoSlug,
+};
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
@@ -178,6 +180,14 @@ pub(crate) struct GithubRevisionDownloadLocation {
 impl GithubRevisionDownloadLocation {
     pub(crate) fn new(repo: RepoSlug, artifact_id: ArtifactId) -> Self {
         Self { repo, artifact_id }
+    }
+
+    pub(crate) fn repo(&self) -> &RepoSlug {
+        &self.repo
+    }
+
+    pub(crate) fn artifact_id(&self) -> ArtifactId {
+        self.artifact_id
     }
 }
 
@@ -588,6 +598,15 @@ impl<P, R> ArtifactPin<'_, P, R> {
             Self::Unpinned { .. } => None,
         }
     }
+
+    fn source(&self) -> &RemoteSourceKey {
+        match self {
+            Self::Pinned { source, .. } => source,
+            Self::Unpinned {
+                first_use: FirstUse { source },
+            } => source,
+        }
+    }
 }
 
 impl OriginDownloadProof {
@@ -662,7 +681,8 @@ pub(crate) struct GithubReleaseArtifactPin {
 #[derive(Debug, Clone)]
 pub(crate) struct RevisionArtifactPin {
     pub(crate) revision: String,
-    pub(crate) resolved_sha: String,
+    pub(crate) resolved_sha: CommitSha,
+    pub(crate) artifact_id: ArtifactId,
 }
 
 pub(crate) trait OriginDownloadPin {
@@ -685,23 +705,22 @@ impl OriginDownloadPin for GithubReleaseArtifactPin {
     }
 }
 
-impl OriginDownloadPin for RevisionArtifactPin {
-    type Location = GithubRevisionDownloadLocation;
-
-    fn validated_origin(
-        source: &RemoteSourceKey,
-        location: Self::Location,
-    ) -> Result<OriginUrl, OriginUrlError> {
-        OriginUrl::github_revision(source, location)
-    }
-}
-
 fn record_verified_pin_origin<P: OriginDownloadPin>(
     source: &RemoteSourceKey,
     location: P::Location,
     sha256: &str,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let origin = P::validated_origin(source, location)
+        .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
+    record_verified_origin_download(origin, sha256, None)
+}
+
+pub(crate) fn record_verified_revision_origin_download(
+    source: &RemoteSourceKey,
+    location: GithubRevisionDownloadLocation,
+    sha256: &str,
+) -> Result<(), RecordVerifiedOriginDownloadError> {
+    let origin = OriginUrl::github_revision(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
     record_verified_origin_download(origin, sha256, None)
 }
@@ -715,7 +734,17 @@ pub(crate) enum DownloadedArtifact<P> {
     FirstUse {
         path: WasmArtifactPath,
         sha256: String,
+        source: RemoteSourceKey,
     },
+}
+
+impl<P> DownloadedArtifact<P> {
+    fn sha256(&self) -> &str {
+        match self {
+            Self::Verified { artifact, .. } => artifact.sha256(),
+            Self::FirstUse { sha256, .. } => sha256,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -807,6 +836,25 @@ impl ChecksumMismatch {
             ProjectCommand::new("init", &self.project_dir),
         )
     }
+
+    fn unchanged_revision_download_message(self) -> String {
+        let remedy = revision_artifact_replacement_remedy(&self.project_dir);
+        format!(
+            "Downloaded provider '{}' ({}@{}) does not match the sha256 pinned in carina-providers.lock. Expected: {}, got: {}. The artifact for an unchanged commit changed after it was pinned. {remedy}",
+            self.provider_name,
+            self.locked_source,
+            self.locked_identity,
+            self.expected_sha256,
+            self.actual_sha256,
+        )
+    }
+}
+
+pub(crate) fn revision_artifact_replacement_remedy(project_dir: &Path) -> String {
+    format!(
+        "Push a new commit (or point `revision` at one), or remove this provider's entry from carina-providers.lock and run `{}` to accept the current build.",
+        ProjectCommand::new("init", project_dir)
+    )
 }
 
 pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
@@ -961,6 +1009,7 @@ pub(crate) fn lookup_github_release_artifact_pin<'a>(
             | LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
+                artifact_id: _,
             }
             | LockEntryKind::RegistryRevision {
                 revision: _,
@@ -987,7 +1036,7 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
     lock_file: &'a LockFile,
     source: &RemoteSourceKey,
     revision: &str,
-    resolved_sha: &str,
+    resolved_sha: &CommitSha,
     provider_name: &'a str,
 ) -> ArtifactPin<'a, RevisionArtifactPin> {
     let pinned = lock_file
@@ -996,18 +1045,16 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
             LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: locked_sha,
-            } if locked_sha == resolved_sha => Some((
+                artifact_id,
+            } => Some((
                 entry,
                 RevisionArtifactPin {
                     revision: revision.to_string(),
                     resolved_sha: locked_sha.clone(),
+                    artifact_id: *artifact_id,
                 },
             )),
-            LockEntryKind::Revision {
-                revision: _,
-                resolved_sha: _,
-            }
-            | LockEntryKind::Version {
+            LockEntryKind::Version {
                 version: _,
                 constraint: _,
             }
@@ -1081,36 +1128,22 @@ pub(crate) fn publish_cached<R>(
     Ok(verified)
 }
 
-pub(crate) fn publish_download<R, P: OriginDownloadPin>(
+fn publish_download_verified<R, P>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
-    location: FetchedLocation<P::Location>,
-) -> Result<DownloadedArtifact<P>, String> {
-    publish_download_verified(staged, pin, location).map_err(String::from)
-}
-
-fn publish_download_verified<R, P: OriginDownloadPin>(
-    staged: StagedArtifact<'_>,
-    pin: ArtifactPin<'_, P, R>,
-    location: FetchedLocation<P::Location>,
 ) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
-    let location = location.into_inner();
     match pin {
         ArtifactPin::Pinned {
             lock_entry,
             provider_name,
             pin,
-            source,
-        } => {
-            let artifact = publish_cached(staged, lock_entry, provider_name)?;
-            record_verified_pin_origin::<P>(&source, location, artifact.sha256())
-                .map_err(String::from)
-                .map_err(VerifiedArtifactError::Other)?;
-            Ok(DownloadedArtifact::Verified {
+            source: _,
+        } => publish_cached(staged, lock_entry, provider_name).map(|artifact| {
+            DownloadedArtifact::Verified {
                 artifact: Box::new(artifact),
                 pin,
-            })
-        }
+            }
+        }),
         ArtifactPin::Unpinned {
             first_use: FirstUse { source },
         } => {
@@ -1125,12 +1158,45 @@ fn publish_download_verified<R, P: OriginDownloadPin>(
                     published_path.display()
                 ))
             })?;
-            record_verified_pin_origin::<P>(&source, location, &sha256)
-                .map_err(String::from)
-                .map_err(VerifiedArtifactError::Other)?;
-            Ok(DownloadedArtifact::FirstUse { path, sha256 })
+            Ok(DownloadedArtifact::FirstUse {
+                path,
+                sha256,
+                source,
+            })
         }
     }
+}
+
+pub(crate) fn publish_download<R, P: OriginDownloadPin>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+    location: FetchedLocation<P::Location>,
+) -> Result<DownloadedArtifact<P>, String> {
+    let source = pin.source().clone();
+    let downloaded = publish_download_verified(staged, pin)
+        .map_err(VerifiedArtifactError::into_download_message)?;
+    record_verified_pin_origin::<P>(&source, location.into_inner(), downloaded.sha256())
+        .map_err(String::from)?;
+    Ok(downloaded)
+}
+
+pub(crate) fn publish_revision_download<R, P>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+) -> Result<DownloadedArtifact<P>, String> {
+    publish_download_verified(staged, pin).map_err(VerifiedArtifactError::into_download_message)
+}
+
+pub(crate) fn publish_unchanged_revision_download<R, P>(
+    staged: StagedArtifact<'_>,
+    pin: ArtifactPin<'_, P, R>,
+) -> Result<DownloadedArtifact<P>, String> {
+    publish_download_verified(staged, pin).map_err(|error| match error {
+        VerifiedArtifactError::ChecksumMismatch(mismatch) => {
+            mismatch.unchanged_revision_download_message()
+        }
+        VerifiedArtifactError::Other(message) => message,
+    })
 }
 
 pub(crate) fn lock_artifact_selection<'lock, R>(
@@ -1210,20 +1276,23 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
             LockEntryKind::Revision {
                 revision,
                 resolved_sha,
+                artifact_id,
             },
             RemoteSource::GithubDirect(source),
         ) => (
             cache_path_revision(project_dir, &source, resolved_sha),
-            resolved_sha[..resolved_sha.len().min(12)].to_string(),
+            resolved_sha.short().to_string(),
             LockedProviderPin::Revision {
                 revision: revision.clone(),
                 resolved_sha: resolved_sha.clone(),
+                artifact_id: *artifact_id,
             },
         ),
         (
             LockEntryKind::Revision {
                 revision: _revision,
                 resolved_sha: _resolved_sha,
+                artifact_id: _artifact_id,
             },
             RemoteSource::Registry(_registry_source),
         ) => {
@@ -1313,48 +1382,6 @@ mod tests {
 
         assert_eq!(trust_record_files(trust.path()), first);
         assert_eq!(first.len(), 1);
-    }
-
-    #[test]
-    fn revision_pin_mints_trust_from_typed_github_origin() {
-        let _env_guard = crate::test_env_guard();
-        let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
-        let github = match "github.com/carina-rs/carina-provider-aws"
-            .parse::<ProviderSource>()
-            .unwrap()
-        {
-            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
-            source => panic!("expected GitHub source: {source}"),
-        };
-        let source = github.source_key();
-        let resolved_sha = "0123456789abcdef0123456789abcdef01234567";
-        let bytes = b"revision artifact bytes";
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &github, resolved_sha),
-            "aws",
-        )
-        .unwrap();
-        let install_lock = crate::ProviderInstallLock::acquire(project.path()).unwrap();
-        let mut staged = StagedArtifact::for_project(&install_lock, &destination).unwrap();
-        staged.write_all(bytes).unwrap();
-        let lock_file = LockFile::default();
-        let pin = lookup_revision_artifact_pin(&lock_file, &source, "main", resolved_sha, "aws");
-        let location = FetchedLocation::for_test(GithubRevisionDownloadLocation::new(
-            RepoSlug::try_from(&github).unwrap(),
-            ArtifactId::from_lock(42),
-        ));
-
-        let downloaded = publish_download(staged, pin, location).unwrap();
-
-        assert!(matches!(downloaded, DownloadedArtifact::FirstUse { .. }));
-        assert!(
-            crate::user_trust::load_user_verified_identity(&sha256, &source)
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]
@@ -1484,18 +1511,30 @@ mod tests {
             registry: None,
         });
         let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
-        let location = FetchedLocation::for_test(GithubReleaseDownloadLocation::for_test(
-            github_repo_from_key(&source).unwrap(),
-            tag,
-            asset_id,
-        ));
 
-        let error = publish_download_verified(staged, pin, location)
+        let error = publish_download_verified(staged, pin)
             .expect_err("origin bytes must match the existing lock pin");
 
         assert!(matches!(error, VerifiedArtifactError::ChecksumMismatch(_)));
         assert_eq!(std::fs::read(destination.as_path()).unwrap(), locked_bytes);
         assert!(trust_record_files(trust.path()).is_empty());
+    }
+
+    #[test]
+    fn unchanged_revision_download_error_has_actionable_remedy() {
+        let mismatch = ChecksumMismatch {
+            provider_name: "aws".into(),
+            locked_source: "github.com/carina-rs/carina-provider-aws".into(),
+            locked_identity: "abcdef012345".into(),
+            expected_sha256: "expected".into(),
+            actual_sha256: "actual".into(),
+            project_dir: PathBuf::from("infra/foo"),
+        };
+
+        assert_eq!(
+            mismatch.unchanged_revision_download_message(),
+            "Downloaded provider 'aws' (github.com/carina-rs/carina-provider-aws@abcdef012345) does not match the sha256 pinned in carina-providers.lock. Expected: expected, got: actual. The artifact for an unchanged commit changed after it was pinned. Push a new commit (or point `revision` at one), or remove this provider's entry from carina-providers.lock and run `carina init infra/foo` to accept the current build."
+        );
     }
 
     #[test]

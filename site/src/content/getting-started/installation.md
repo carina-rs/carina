@@ -89,7 +89,7 @@ provider awscc {
 }
 ```
 
-With a GitHub source, `revision` can also be a commit SHA and installs the CI build artifact for that commit. Resolving it calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`). A registry source needs no token.
+With a GitHub source, `revision` can also be a commit SHA and installs the CI build artifact for that commit. [Your First Provider](/providers/writing/getting-started/#use-it-from-github) describes which builds qualify. Resolving it calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`). A registry source needs no token.
 
 The two official providers are:
 

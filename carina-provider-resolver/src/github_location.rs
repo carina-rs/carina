@@ -125,13 +125,19 @@ impl RepoSlug {
         url.query_pairs_mut()
             .append_pair("head_sha", commit_sha.as_str())
             .append_pair("status", "success")
-            .append_pair("per_page", "10");
+            .append_pair("event", "push")
+            .append_pair("per_page", "100");
         self.validate_url(url.as_str())
     }
 
-    pub(crate) fn run_artifacts_url(&self, run_id: u64) -> Result<url::Url, GithubLocationError> {
-        let run_id = run_id.to_string();
-        self.url_with_segments(&["actions", "runs", &run_id, "artifacts"])
+    pub(crate) fn run_artifacts_url(
+        &self,
+        run_id: WorkflowRunId,
+    ) -> Result<url::Url, GithubLocationError> {
+        let run_id = run_id.get().to_string();
+        let mut url = self.url_with_segments(&["actions", "runs", &run_id, "artifacts"])?;
+        url.query_pairs_mut().append_pair("per_page", "100");
+        self.validate_url(url.as_str())
     }
 
     pub(crate) fn artifact_zip_url(
@@ -140,6 +146,14 @@ impl RepoSlug {
     ) -> Result<url::Url, GithubLocationError> {
         let artifact_id = artifact_id.to_string();
         self.url_with_segments(&["actions", "artifacts", &artifact_id, "zip"])
+    }
+
+    pub(crate) fn artifact_url(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<url::Url, GithubLocationError> {
+        let artifact_id = artifact_id.to_string();
+        self.url_with_segments(&["actions", "artifacts", &artifact_id])
     }
 
     pub(crate) fn validate_url(&self, raw: &str) -> Result<url::Url, GithubLocationError> {
@@ -289,6 +303,11 @@ impl CommitSha {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Return the canonical 12-character display and cache-key prefix.
+    pub fn short(&self) -> &str {
+        &self.0[..12]
+    }
 }
 
 impl<'de> Deserialize<'de> for CommitSha {
@@ -374,6 +393,23 @@ numeric_github_id!(
     ArtifactId,
     "A GitHub Actions artifact ID from the API or lock file."
 );
+
+/// A GitHub Actions workflow-run ID read from a GitHub API response.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub(crate) struct WorkflowRunId(u64);
+
+impl WorkflowRunId {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for WorkflowRunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 fn has_explicit_port(raw: &str) -> bool {
     let Some(rest) = raw.strip_prefix("https://") else {

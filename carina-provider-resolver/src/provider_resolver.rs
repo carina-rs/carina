@@ -26,7 +26,7 @@ use carina_core::version_constraint::VersionConstraint;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::github::FixtureGithubHttp;
 use crate::github::{EnvironmentGithubTokenProvider, GithubApi, GithubHttp, UreqGithubHttp};
-use crate::github_location::{AssetId, ReleaseTag, RepoSlug};
+use crate::github_location::{ArtifactId, AssetId, CommitSha, ReleaseTag, RepoSlug};
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
     global_cache_artifact_path, install_global_artifact_atomically,
@@ -94,7 +94,8 @@ pub enum LockEntryKind {
     /// Provider built from a git revision (branch/tag/SHA) via CI artifacts.
     Revision {
         revision: String,
-        resolved_sha: String,
+        resolved_sha: CommitSha,
+        artifact_id: ArtifactId,
     },
     /// Registry-hosted provider resolved by following a branch revision.
     RegistryRevision { revision: String, version: String },
@@ -123,6 +124,7 @@ impl LockEntryKind {
             LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
+                artifact_id: _,
             }
             | LockEntryKind::File => None,
         }
@@ -2110,7 +2112,15 @@ impl RegistryLock {
 /// Why a raw lock entry could not be represented by the current typed schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyReason {
-    GithubDirectVersionWithoutTag { version: String, sha256: String },
+    GithubDirectVersionWithoutTag {
+        version: String,
+        sha256: String,
+    },
+    RevisionWithoutArtifactId {
+        revision: String,
+        resolved_sha: CommitSha,
+        sha256: String,
+    },
 }
 
 impl fmt::Display for LegacyReason {
@@ -2119,6 +2129,14 @@ impl fmt::Display for LegacyReason {
             Self::GithubDirectVersionWithoutTag { version, sha256: _ } => write!(
                 formatter,
                 "GitHub direct version entry {version} without an exact release tag"
+            ),
+            Self::RevisionWithoutArtifactId {
+                revision,
+                resolved_sha,
+                sha256: _,
+            } => write!(
+                formatter,
+                "GitHub revision entry {revision} at {resolved_sha} without an artifact ID"
             ),
         }
     }
@@ -2149,6 +2167,8 @@ pub enum LegacyLockEntryParseError {
     MissingStringField { source: String, field: &'static str },
     /// The legacy version pin is not a semantic version.
     InvalidVersion { source: String, version: String },
+    /// The legacy revision pin does not contain a canonical Git commit SHA.
+    InvalidResolvedSha { source: String, value: String },
 }
 
 impl fmt::Display for LegacyLockEntryParseError {
@@ -2161,6 +2181,10 @@ impl fmt::Display for LegacyLockEntryParseError {
             Self::InvalidVersion { source, version } => write!(
                 formatter,
                 "legacy GitHub version entry for '{source}' has invalid semantic version '{version}'"
+            ),
+            Self::InvalidResolvedSha { source, value } => write!(
+                formatter,
+                "legacy GitHub revision entry for '{source}' has invalid resolved SHA '{value}'"
             ),
         }
     }
@@ -2228,6 +2252,61 @@ fn github_direct_version_without_tag(
     )))
 }
 
+fn revision_without_artifact_id(
+    entry: &toml::Table,
+) -> Result<Option<(String, LegacyReason)>, LegacyLockEntryParseError> {
+    const REQUIRED_KEYS: [&str; 6] = [
+        "name",
+        "source",
+        "mode",
+        "revision",
+        "resolved_sha",
+        "sha256",
+    ];
+
+    if entry.get("mode").and_then(toml::Value::as_str) != Some("revision") {
+        return Ok(None);
+    }
+    let Some(source) = entry.get("source").and_then(toml::Value::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(
+        source.parse::<ProviderSource>(),
+        Ok(ProviderSource::Remote(RemoteSource::GithubDirect(_)))
+    ) {
+        return Ok(None);
+    }
+    let expected_len = REQUIRED_KEYS.len() + usize::from(entry.contains_key("registry"));
+    if entry.len() != expected_len || !REQUIRED_KEYS.iter().all(|key| entry.contains_key(*key)) {
+        return Ok(None);
+    }
+    let required = |field: &'static str| {
+        entry
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| LegacyLockEntryParseError::MissingStringField {
+                source: source.to_string(),
+                field,
+            })
+    };
+    let resolved_sha = required("resolved_sha")?;
+    let resolved_sha = CommitSha::new(resolved_sha.clone()).map_err(|_| {
+        LegacyLockEntryParseError::InvalidResolvedSha {
+            source: source.to_string(),
+            value: resolved_sha,
+        }
+    })?;
+    Ok(Some((
+        source.to_string(),
+        LegacyReason::RevisionWithoutArtifactId {
+            revision: required("revision")?,
+            resolved_sha,
+            sha256: required("sha256")?,
+        },
+    )))
+}
+
 /// Split migratable legacy entries from tables accepted by the typed schema.
 pub(crate) fn split_legacy_entries(
     entries: Vec<toml::Table>,
@@ -2235,7 +2314,9 @@ pub(crate) fn split_legacy_entries(
     let mut retained = Vec::with_capacity(entries.len());
     let mut legacy = Vec::new();
     for entry in entries {
-        match github_direct_version_without_tag(&entry)? {
+        let classified =
+            github_direct_version_without_tag(&entry)?.or(revision_without_artifact_id(&entry)?);
+        match classified {
             Some((source, reason)) => {
                 legacy.push(LegacyLockEntry {
                     source,
@@ -2867,13 +2948,13 @@ impl LockFileMigration {
             provider_lock_path(&self.project_dir).display()
         )?;
         if !self.legacy_sources.is_empty() {
-            writeln!(f, "Legacy GitHub release entries retained for conversion:")?;
+            writeln!(f, "Legacy GitHub entries retained for conversion:")?;
             for source in &self.legacy_sources {
                 writeln!(f, "  {source}")?;
             }
             writeln!(
                 f,
-                "Each entry remains verbatim until a successful `{}` replaces it with an exact release tag and asset ID.",
+                "Each entry remains verbatim until a successful `{}` replaces it with an exact release tag and asset ID or a revision artifact ID.",
                 ProjectCommand::new("init", &self.project_dir)
             )?;
         }
@@ -3266,7 +3347,7 @@ impl std::error::Error for LockFileError {}
 #[derive(Debug)]
 pub enum LockConstraintError {
     LockFile(LockFileError),
-    LegacyEntry(LegacyLockEntryError),
+    LegacyEntry(Box<LegacyLockEntryError>),
     ConstraintMismatch {
         provider: String,
         locked_version: String,
@@ -3542,14 +3623,30 @@ impl LockFile {
     }
 
     fn legacy_github_version_pin(&self, source: &RemoteSourceKey) -> Option<(String, String)> {
-        self.legacy
-            .iter()
-            .find(|entry| Self::sources_match(&entry.source, source.as_str()))
-            .map(|entry| match &entry.reason {
-                LegacyReason::GithubDirectVersionWithoutTag { version, sha256 } => {
-                    (version.clone(), sha256.clone())
-                }
-            })
+        self.legacy.iter().find_map(|entry| match &entry.reason {
+            _ if !Self::sources_match(&entry.source, source.as_str()) => None,
+            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 } => {
+                Some((version.clone(), sha256.clone()))
+            }
+            LegacyReason::RevisionWithoutArtifactId { .. } => None,
+        })
+    }
+
+    pub(crate) fn legacy_revision_pin(
+        &self,
+        source: &RemoteSourceKey,
+        revision: &str,
+    ) -> Option<(CommitSha, String)> {
+        self.legacy.iter().find_map(|entry| match &entry.reason {
+            _ if !Self::sources_match(&entry.source, source.as_str()) => None,
+            LegacyReason::RevisionWithoutArtifactId {
+                revision: locked_revision,
+                resolved_sha,
+                sha256,
+            } if locked_revision == revision => Some((resolved_sha.clone(), sha256.clone())),
+            LegacyReason::GithubDirectVersionWithoutTag { .. }
+            | LegacyReason::RevisionWithoutArtifactId { .. } => None,
+        })
     }
 
     fn sources_match(existing: &str, requested: &str) -> bool {
@@ -3768,6 +3865,7 @@ impl LockFile {
                 | LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
                     revision: _,
@@ -4051,7 +4149,11 @@ impl LockFile {
 
     /// Find a revision-mode entry whose `resolved_sha` matches. Version and
     /// file entries can't have a resolved SHA, so they never match.
-    fn find_by_source_and_sha(&self, source: &str, sha: &str) -> Option<&LockEntry<RegistryLock>> {
+    fn find_by_source_and_sha(
+        &self,
+        source: &str,
+        sha: &CommitSha,
+    ) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|e| {
             Self::sources_match(&e.source, source)
                 && matches!(
@@ -4065,7 +4167,7 @@ impl LockFile {
     pub fn find_by_source_key_and_sha(
         &self,
         source: &RemoteSourceKey,
-        sha: &str,
+        sha: &CommitSha,
     ) -> Option<&LockEntry<RegistryLock>> {
         self.find_by_source_and_sha(source.as_str(), sha)
     }
@@ -4708,7 +4810,8 @@ pub enum LockedProviderPin {
     },
     Revision {
         revision: String,
-        resolved_sha: String,
+        resolved_sha: CommitSha,
+        artifact_id: ArtifactId,
     },
     RegistryRevision {
         revision: String,
@@ -4747,7 +4850,11 @@ impl fmt::Display for LockedProviderPin {
             LockedProviderPin::Revision {
                 revision,
                 resolved_sha,
-            } => write!(f, "revision {revision}, resolved_sha {resolved_sha}"),
+                artifact_id,
+            } => write!(
+                f,
+                "revision {revision}, resolved_sha {resolved_sha}, artifact_id {artifact_id}"
+            ),
             LockedProviderPin::RegistryRevision { revision, version } => {
                 write!(f, "registry revision {revision}, version {version}")
             }
@@ -6219,13 +6326,24 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
 /// Get the global plugin cache directory.
 ///
 /// Checks `CARINA_PLUGIN_CACHE_DIR` environment variable first,
-/// then falls back to `~/.carina/plugin-cache/`.
-/// Returns `None` if the home directory cannot be determined.
+/// then falls back to `~/.carina/plugin-cache/` in normal builds or isolated
+/// per-process temporary storage in test builds. Returns `None` in normal
+/// builds if the home directory cannot be determined.
 pub fn global_cache_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CARINA_PLUGIN_CACHE_DIR") {
         return Some(PathBuf::from(dir));
     }
+    default_global_cache_dir()
+}
+
+#[cfg(not(test))]
+fn default_global_cache_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".carina").join("plugin-cache"))
+}
+
+#[cfg(test)]
+fn default_global_cache_dir() -> Option<PathBuf> {
+    Some(crate::isolated_test_storage_root().join("plugin-cache"))
 }
 
 /// Resolve the global cache path for a WASM provider.
@@ -6522,6 +6640,7 @@ fn verify_registry_lock_pin(
         | LockEntryKind::Revision {
             revision: _,
             resolved_sha: _,
+            artifact_id: _,
         }
         | LockEntryKind::RegistryRevision {
             revision: _,
@@ -6708,6 +6827,7 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
                 | LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
                     revision: _,
@@ -7182,7 +7302,11 @@ where
             record_verified_github_release_pin(lock_file, &artifact, pin, resolved, name);
             artifact.path().clone()
         }
-        DownloadedArtifact::FirstUse { path, sha256 } => {
+        DownloadedArtifact::FirstUse {
+            path,
+            sha256,
+            source: _,
+        } => {
             lock_file.upsert(LockEntry {
                 name: name.to_string(),
                 source: source_key.to_string(),
@@ -7294,7 +7418,7 @@ where
                 github_source,
                 revision,
                 &config.name,
-                mode == LockMode::Upgrade,
+                mode,
                 github,
             )?;
             Ok(path)
@@ -7484,6 +7608,7 @@ fn select_locked_artifact<'lock>(
                 | LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 }
                 | LockEntryKind::File => None,
             }),
@@ -7492,6 +7617,7 @@ fn select_locked_artifact<'lock>(
                     LockEntryKind::Revision {
                         revision: _,
                         resolved_sha: _,
+                        artifact_id: _,
                     } => Some(lock_entry),
                     LockEntryKind::Version {
                         version: _,
@@ -7527,6 +7653,7 @@ fn select_locked_artifact<'lock>(
                 | LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
                     revision: _,
@@ -7555,6 +7682,7 @@ fn select_locked_artifact<'lock>(
                     LockEntryKind::Revision {
                         revision: _,
                         resolved_sha: _,
+                        artifact_id: _,
                     },
                     _,
                 ))
@@ -7758,6 +7886,7 @@ fn try_reuse_locked_registry_version(
         | LockEntryKind::Revision {
             revision: _,
             resolved_sha: _,
+            artifact_id: _,
         }
         | LockEntryKind::RegistryRevision {
             revision: _,
@@ -7801,6 +7930,7 @@ fn try_reuse_locked_github_release(
         | LockEntryKind::Revision {
             revision: _,
             resolved_sha: _,
+            artifact_id: _,
         }
         | LockEntryKind::RegistryRevision {
             revision: _,
@@ -8044,25 +8174,56 @@ pub fn check_lock_mismatch(
         let lock_entry = match lock_file.find_source_entry(&source_key) {
             Some(SourceLockEntry::Typed(entry)) => entry,
             Some(SourceLockEntry::Legacy(entry)) => {
-                let LegacyReason::GithubDirectVersionWithoutTag {
-                    version: legacy_version,
-                    sha256: _,
-                } = &entry.reason;
-                if let Some(crn_revision) = &config.revision {
-                    return Err(mismatch_error(
-                        &config.name,
-                        &format!("version = '{legacy_version}'"),
-                        &format!("revision = '{crn_revision}'"),
-                    ));
-                }
-                if let Some(constraint) = &config.version
-                    && !constraint.matches(legacy_version).unwrap_or(false)
-                {
-                    return Err(mismatch_error(
-                        &config.name,
-                        &format!("version = '{legacy_version}'"),
-                        &format!("constraint = '{}'", constraint.raw),
-                    ));
+                match &entry.reason {
+                    LegacyReason::GithubDirectVersionWithoutTag {
+                        version: legacy_version,
+                        sha256: _,
+                    } => {
+                        if let Some(crn_revision) = &config.revision {
+                            return Err(mismatch_error(
+                                &config.name,
+                                &format!("version = '{legacy_version}'"),
+                                &format!("revision = '{crn_revision}'"),
+                            ));
+                        }
+                        if let Some(constraint) = &config.version
+                            && !constraint.matches(legacy_version).unwrap_or(false)
+                        {
+                            return Err(mismatch_error(
+                                &config.name,
+                                &format!("version = '{legacy_version}'"),
+                                &format!("constraint = '{}'", constraint.raw),
+                            ));
+                        }
+                    }
+                    LegacyReason::RevisionWithoutArtifactId {
+                        revision: locked_revision,
+                        resolved_sha: _,
+                        sha256: _,
+                    } => match &config.revision {
+                        Some(crn_revision) if crn_revision == locked_revision => {}
+                        Some(crn_revision) => {
+                            return Err(mismatch_error(
+                                &config.name,
+                                &format!("revision = '{locked_revision}'"),
+                                &format!("revision = '{crn_revision}'"),
+                            ));
+                        }
+                        None => {
+                            let crn_shape = config.version.as_ref().map_or_else(
+                                || {
+                                    "(no revision, no version constraint — version mode)"
+                                        .to_string()
+                                },
+                                |constraint| format!("version constraint = '{}'", constraint.raw),
+                            );
+                            return Err(mismatch_error(
+                                &config.name,
+                                &format!("revision = '{locked_revision}'"),
+                                &crn_shape,
+                            ));
+                        }
+                    },
                 }
                 if mode == LockMode::Locked {
                     return Err(LockMismatchError::LegacyEntry(entry.error(project_dir)));
@@ -8110,6 +8271,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             )
             | (
@@ -8128,6 +8290,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 if crn_rev != locked_rev {
@@ -8228,6 +8391,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -8294,6 +8458,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -8440,7 +8605,9 @@ pub fn validate_lock_constraints(
         let lock_entry = match lock_file.find_source_entry(&source_key) {
             Some(SourceLockEntry::Typed(entry)) => Some(entry),
             Some(SourceLockEntry::Legacy(entry)) => {
-                return Err(LockConstraintError::LegacyEntry(entry.error(base_dir)));
+                return Err(LockConstraintError::LegacyEntry(Box::new(
+                    entry.error(base_dir),
+                )));
             }
             None => None,
         };
@@ -8471,6 +8638,7 @@ pub fn validate_lock_constraints(
                 LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
                     revision: _,
@@ -8559,6 +8727,16 @@ mod tests {
 
     fn source_key(source: &str) -> RemoteSourceKey {
         provider_source(source).source_key()
+    }
+
+    const TEST_COMMIT_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+    fn commit_sha(value: &str) -> CommitSha {
+        CommitSha::new(value.to_string()).expect("test commit SHA must be canonical")
+    }
+
+    fn artifact_id(value: u64) -> ArtifactId {
+        ArtifactId::from_lock(value)
     }
 
     #[test]
@@ -10697,10 +10875,275 @@ transparency_log_present = false
             source: source.into(),
             kind: LockEntryKind::Revision {
                 revision: revision.into(),
-                resolved_sha: sha.into(),
+                resolved_sha: commit_sha(sha),
+                artifact_id: artifact_id(42),
             },
             sha256: "abc".into(),
             registry: None,
+        }
+    }
+
+    #[test]
+    fn revision_lock_round_trip_preserves_artifact_id() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "main",
+            TEST_COMMIT_SHA,
+        ));
+
+        let serialized = lock.to_toml_string().unwrap();
+        assert!(serialized.contains("artifact_id = 42"), "{serialized}");
+
+        let parsed =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
+        assert_eq!(
+            parsed.provider[0].kind,
+            LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: commit_sha(TEST_COMMIT_SHA),
+                artifact_id: artifact_id(42),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_revision_lock_is_reselected_in_normal_mode_and_rejected_in_locked_mode() {
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "{source}"
+mode = "revision"
+revision = "main"
+resolved_sha = "{TEST_COMMIT_SHA}"
+sha256 = "legacy"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+        let lock =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
+        let config = provider_config(source, Some("main"));
+
+        assert!(lock.provider.is_empty());
+        check_lock_mismatch(std::slice::from_ref(&config), &lock, LockMode::Normal).unwrap();
+        let error = check_lock_mismatch(&[config], &lock, LockMode::Locked).unwrap_err();
+        assert!(matches!(
+            &error,
+            LockMismatchError::LegacyEntry(LegacyLockEntryError {
+                source: locked_source,
+                reason: LegacyReason::RevisionWithoutArtifactId {
+                    revision,
+                    resolved_sha,
+                    sha256,
+                },
+                project_dir: _,
+            }) if locked_source == source
+                && revision == "main"
+                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
+                && sha256 == "legacy"
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains(source), "{rendered}");
+        assert!(rendered.contains("carina init"), "{rendered}");
+        assert!(
+            lock.to_toml_string()
+                .unwrap()
+                .contains("mode = \"revision\"")
+        );
+
+        let project = tempfile::tempdir().unwrap();
+        fs::write(provider_lock_path(project.path()), &serialized).unwrap();
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let error = resolve_all(
+            &install_lock,
+            &[provider_config(source, Some("main"))],
+            LockMode::Locked,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            ResolveAllError::LockMismatch(LockMismatchError::LegacyEntry(
+                LegacyLockEntryError {
+                    source: locked_source,
+                    reason: LegacyReason::RevisionWithoutArtifactId {
+                        revision,
+                        resolved_sha,
+                        sha256,
+                    },
+                    project_dir: _,
+                }
+            )) if locked_source == source
+                && revision == "main"
+                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
+                && sha256 == "legacy"
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains(source), "{rendered}");
+        assert!(rendered.contains("carina init"), "{rendered}");
+    }
+
+    #[test]
+    fn legacy_revision_filter_requires_exact_keys_and_allows_registry() {
+        let mut entry = toml::Table::new();
+        for (key, value) in [
+            ("name", "awscc"),
+            ("source", "github.com/carina-rs/carina-provider-awscc"),
+            ("mode", "revision"),
+            ("revision", "main"),
+            ("resolved_sha", TEST_COMMIT_SHA),
+            ("sha256", "legacy"),
+        ] {
+            entry.insert(key.to_string(), toml::Value::String(value.to_string()));
+        }
+
+        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
+        assert!(retained.is_empty());
+        assert!(matches!(
+            legacy.as_slice(),
+            [LegacyLockEntry {
+                source,
+                reason: LegacyReason::RevisionWithoutArtifactId {
+                    revision,
+                    resolved_sha,
+                    sha256,
+                },
+                raw: _,
+            }] if source == "github.com/carina-rs/carina-provider-awscc"
+                && revision == "main"
+                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
+                && sha256 == "legacy"
+        ));
+        entry.insert("registry".into(), toml::Value::Table(toml::Table::new()));
+        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
+        assert!(retained.is_empty());
+        assert_eq!(legacy.len(), 1);
+        entry.insert("artifact_ld".into(), toml::Value::Integer(42));
+        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
+        assert_eq!(retained, vec![entry]);
+        assert!(legacy.is_empty());
+    }
+
+    #[test]
+    fn malformed_revision_artifact_id_is_a_parse_error() {
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "{TEST_COMMIT_SHA}"
+artifact_id = "not-a-number"
+sha256 = "malformed"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+
+        let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect_err("a present but malformed artifact ID must not be dropped");
+
+        assert!(matches!(&error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("expected u64"), "{rendered}");
+    }
+
+    #[test]
+    fn misspelled_revision_artifact_id_is_not_treated_as_legacy() {
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "{TEST_COMMIT_SHA}"
+artifact_ld = 42
+sha256 = "malformed"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+
+        let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect_err("a misspelled artifact ID must reach typed deserialization");
+
+        assert!(matches!(&error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("artifact_id"), "{rendered}");
+    }
+
+    #[test]
+    fn malformed_current_revision_shas_fail_lock_parsing_without_panicking() {
+        let invalid_values = [
+            "../..".to_string(),
+            "日本語".to_string(),
+            TEST_COMMIT_SHA.to_ascii_uppercase(),
+            format!("{TEST_COMMIT_SHA}&event=x"),
+        ];
+
+        for invalid in invalid_values {
+            let serialized = format!(
+                r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = {invalid:?}
+artifact_id = 42
+sha256 = "malformed"
+"#,
+                LockFile::CURRENT_VERSION
+            );
+
+            let result = std::panic::catch_unwind(|| {
+                LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+            });
+            let error = result
+                .expect("malformed resolved SHA must not panic")
+                .expect_err("malformed resolved SHA must fail lock parsing");
+            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_revision_shas_return_typed_parse_errors() {
+        for invalid in [
+            "../..",
+            "日本語",
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+        ] {
+            let serialized = format!(
+                r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = {invalid:?}
+sha256 = "malformed"
+"#,
+                LockFile::CURRENT_VERSION
+            );
+
+            let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+                .expect_err("malformed legacy resolved SHA must fail lock parsing");
+            assert!(matches!(
+                error,
+                LockFileError::LegacyEntryParse {
+                    source: LegacyLockEntryParseError::InvalidResolvedSha {
+                        source,
+                        value,
+                    },
+                    path: _,
+                } if source == "github.com/carina-rs/carina-provider-awscc" && value == invalid
+            ));
         }
     }
 
@@ -11655,7 +12098,7 @@ transparency_log_present = false
     }
 
     #[test]
-    fn v1_github_revision_lock_from_issue_migrates_and_saves_as_v4() {
+    fn v1_github_revision_without_artifact_id_is_retained_for_conversion() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(
@@ -11683,39 +12126,43 @@ sha256 = "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
         assert_eq!(migration.from, 1);
         assert_eq!(migration.to, 4);
         assert!(migration.discarded_discovery_pins.is_empty());
+        let report = migration.to_string();
+        assert!(
+            report.contains("Legacy GitHub entries retained for conversion"),
+            "{report}"
+        );
+        assert!(
+            report.contains("github.com/carina-rs/carina-provider-awscc"),
+            "{report}"
+        );
         assert_eq!(
-            migration
-                .to_string()
+            report
                 .lines()
                 .find(|line| line.starts_with("Migration found")),
             Some("Migration found no v1 discovery pins requiring operator authorization.")
         );
-        assert_eq!(lock_file.provider.len(), 1);
-        let entry = &lock_file.provider[0];
-        assert_eq!(entry.name, "awscc");
-        assert_eq!(entry.source, "github.com/carina-rs/carina-provider-awscc");
-        assert_eq!(
-            entry.kind,
-            LockEntryKind::Revision {
-                revision: "main".into(),
-                resolved_sha: "97c9fd97d9501443fd9b6ad7a12e883703e81add".into(),
-            }
-        );
-        assert_eq!(
-            entry.sha256,
-            "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
-        );
-        assert!(entry.registry.is_none());
+        assert!(lock_file.provider.is_empty());
+        assert!(matches!(
+            lock_file.legacy.as_slice(),
+            [LegacyLockEntry {
+                source,
+                reason: LegacyReason::RevisionWithoutArtifactId {
+                    revision,
+                    resolved_sha,
+                    sha256,
+                },
+                raw: _,
+            }] if source == "github.com/carina-rs/carina-provider-awscc"
+                && revision == "main"
+                && resolved_sha.as_str() == "97c9fd97d9501443fd9b6ad7a12e883703e81add"
+                && sha256 == "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
+        ));
 
         lock_file.save(&lock_path).unwrap();
         let saved = fs::read_to_string(&lock_path).unwrap();
         assert!(saved.starts_with("version = 4\n"), "{saved}");
         assert!(saved.contains("mode = \"revision\""), "{saved}");
-        assert!(saved.contains("revision = \"main\""), "{saved}");
-        assert!(
-            saved.contains("resolved_sha = \"97c9fd97d9501443fd9b6ad7a12e883703e81add\""),
-            "{saved}"
-        );
+        assert!(!saved.contains("artifact_id"), "{saved}");
     }
 
     #[test]
@@ -14670,20 +15117,20 @@ transparency_log_present = true
     #[test]
     fn find_queries_respect_entry_kind() {
         let source = "github.com/carina-rs/carina-provider-awscc";
-        let sha = "deadbeefcafe";
+        let sha = commit_sha(TEST_COMMIT_SHA);
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(source, "main", sha));
+        lock.upsert(revision_entry(source, "main", sha.as_str()));
 
         // Version-mode query does not match a revision entry.
         assert!(lock.find(source, "0.5.2").is_none());
         // Revision-by-sha query matches.
-        assert!(lock.find_by_source_and_sha(source, sha).is_some());
+        assert!(lock.find_by_source_and_sha(source, &sha).is_some());
 
         // Reverse: version-mode entry doesn't answer a revision query.
         let mut lock = LockFile::default();
         lock.upsert(github_release_entry(source, "0.5.2"));
         assert!(lock.find(source, "0.5.2").is_some());
-        assert!(lock.find_by_source_and_sha(source, sha).is_none());
+        assert!(lock.find_by_source_and_sha(source, &sha).is_none());
     }
 
     /// #2028 regression: revision-mode entries cannot cross the typed GitHub
@@ -14692,7 +15139,7 @@ transparency_log_present = true
     fn try_reuse_skips_revision_mode_entry() {
         let source = "github.com/carina-rs/carina-provider-awscc";
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(source, "main", "deadbeefcafe"));
+        lock.upsert(revision_entry(source, "main", TEST_COMMIT_SHA));
 
         assert!(
             try_reuse_locked_github_release(&source_key(source), None, &lock)
@@ -14768,6 +15215,27 @@ transparency_log_present = true
         let entry = lock.find_by_source(&source).unwrap();
         assert_eq!(entry.kind, LockEntryKind::File);
         assert!(!entry.sha256.is_empty());
+    }
+
+    #[test]
+    fn resolve_all_locked_saves_file_provider_lock_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_path = tmp.path().join("locked-file-provider.wasm");
+        let wasm = b"locked file provider";
+        fs::write(&wasm_path, wasm).unwrap();
+
+        let source = format!("file://{}", wasm_path.display());
+        let config = provider_config(&source, None);
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+
+        resolve_all(&install_lock, &[config], LockMode::Locked).unwrap();
+
+        let lock = load_lock_file_for_test(&provider_lock_path(tmp.path()))
+            .unwrap()
+            .expect("a Locked run must still save non-revision lock state");
+        let entry = lock.find_by_source(&source).unwrap();
+        assert_eq!(entry.kind, LockEntryKind::File);
+        assert_eq!(entry.sha256, sha256_bytes(wasm));
     }
 
     #[test]
@@ -20422,6 +20890,27 @@ future_protection_field = "retain-me"
     }
 
     #[test]
+    fn global_cache_dir_test_fallback_is_not_under_home_directory() {
+        let _guard = crate::test_env_guard();
+        let _cache_env = crate::ScopedEnvVar::remove("CARINA_PLUGIN_CACHE_DIR");
+
+        let fallback = global_cache_dir().unwrap();
+
+        assert_eq!(
+            fallback,
+            crate::isolated_test_storage_root().join("plugin-cache")
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert!(
+                !fallback.starts_with(&home),
+                "test plugin-cache fallback {} must not be under home {}",
+                fallback.display(),
+                home.display()
+            );
+        }
+    }
+
+    #[test]
     fn global_cache_path_wasm_preserves_github_and_registry_layouts() {
         let _guard = crate::test_env_guard();
         let root = tempfile::tempdir().unwrap();
@@ -20459,15 +20948,15 @@ future_protection_field = "retain-me"
         let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", &global);
 
         let source = "github.com/carina-rs/carina-provider-awscc";
-        let sha = "deadbeefcafe1234567890";
+        let sha = commit_sha(TEST_COMMIT_SHA);
 
         let lock_path = base.join("carina-providers.lock");
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(source, "main", sha));
+        lock.upsert(revision_entry(source, "main", sha.as_str()));
         lock.save(&lock_path).unwrap();
 
         let global_wasm =
-            crate::revision_resolver::global_cache_path_revision(&github_source(source), sha)
+            crate::revision_resolver::global_cache_path_revision(&github_source(source), &sha)
                 .unwrap();
         fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         fs::File::create(global_wasm.as_path())
@@ -21159,22 +21648,27 @@ future_protection_field = "retain-me"
         let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = "github.com/carina-rs/carina-provider-aws";
         let revision = "main";
-        let resolved_sha = "deadbeefcafe1234567890";
+        let resolved_sha =
+            CommitSha::new("deadbeefcafe1234567890abcdef1234567890ab".into()).unwrap();
         let bytes = b"verified revision provider";
         let wasm_path = crate::revision_resolver::cache_path_revision(
             project.path(),
             &github_source(source),
-            resolved_sha,
+            &resolved_sha,
         );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
+        let mut sidecar_path = wasm_path.as_os_str().to_os_string();
+        sidecar_path.push(".artifact-id");
+        fs::write(PathBuf::from(sidecar_path), b"42\n").unwrap();
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
             source: source.into(),
             kind: LockEntryKind::Revision {
                 revision: revision.into(),
-                resolved_sha: resolved_sha.into(),
+                resolved_sha,
+                artifact_id: ArtifactId::from_lock(42),
             },
             sha256: sha256_bytes(bytes),
             registry: None,
@@ -21432,14 +21926,18 @@ sha256 = "{}"
 
         assert!(matches!(
             &error,
-            LockConstraintError::LegacyEntry(LegacyLockEntryError {
-                source: locked_source,
-                reason: LegacyReason::GithubDirectVersionWithoutTag {
-                    version: _,
-                    sha256: _,
-                },
-                project_dir: _
-            }) if locked_source == source
+            LockConstraintError::LegacyEntry(error)
+                if matches!(
+                    error.as_ref(),
+                    LegacyLockEntryError {
+                        source: locked_source,
+                        reason: LegacyReason::GithubDirectVersionWithoutTag {
+                            version: _,
+                            sha256: _,
+                        },
+                        project_dir: _
+                    } if locked_source == source
+                )
         ));
         assert!(error.to_string().contains("carina init"));
     }
@@ -21450,7 +21948,7 @@ sha256 = "{}"
         let base = tmp.path();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let revision = "main";
-        let resolved_sha = "deadbeefcafe1234567890";
+        let resolved_sha = TEST_COMMIT_SHA;
         let lock_path = base.join("carina-providers.lock");
         let mut lock = LockFile::default();
         lock.upsert(revision_entry(source, revision, resolved_sha));
@@ -21470,7 +21968,7 @@ sha256 = "{}"
         );
         assert!(rendered.contains("revision main"), "{rendered}");
         assert!(
-            rendered.contains("resolved_sha deadbeefcafe1234567890"),
+            rendered.contains(&format!("resolved_sha {TEST_COMMIT_SHA}")),
             "{rendered}"
         );
         assert!(!rendered.contains("lock is stale"), "{rendered}");
@@ -21481,7 +21979,8 @@ sha256 = "{}"
     fn missing_locked_artifact_init_hint_uses_project_dir_and_omits_dot() {
         let pin = LockedProviderPin::Revision {
             revision: "main".into(),
-            resolved_sha: "deadbeefcafe".into(),
+            resolved_sha: commit_sha(TEST_COMMIT_SHA),
+            artifact_id: artifact_id(42),
         };
         let nested = missing_locked_artifact_error(Path::new("infra/foo"), &pin, Some("main"));
         assert!(
@@ -21627,17 +22126,17 @@ sha256 = "{}"
         let base = tmp.path();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let revision = "main";
-        let resolved_sha = "deadbeefcafe1234567890";
+        let resolved_sha = commit_sha(TEST_COMMIT_SHA);
         let wasm_path = crate::revision_resolver::cache_path_revision(
             base,
             &github_source(source),
-            resolved_sha,
+            &resolved_sha,
         );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, b"stale provider wasm").unwrap();
 
         let mut lock = LockFile::default();
-        let mut entry = revision_entry(source, revision, resolved_sha);
+        let mut entry = revision_entry(source, revision, resolved_sha.as_str());
         entry.sha256 = sha256_file(&wasm_path).unwrap();
         lock.upsert(entry);
         lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -21659,7 +22158,7 @@ sha256 = "{}"
         assert!(rendered.contains("provider resolved from"));
         assert!(rendered.contains("carina-providers.lock"));
         assert!(rendered.contains("revision main"));
-        assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+        assert!(rendered.contains(&format!("resolved_sha {TEST_COMMIT_SHA}")));
         assert!(rendered.contains("if this lock is stale"));
         assert!(rendered.contains("carina init --upgrade"));
     }
@@ -21897,7 +22396,7 @@ sha256 = "{sha256}"
     #[test]
     fn check_mismatch_detects_revision_to_version_switch() {
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        lock.upsert(revision_entry(SRC, "main", TEST_COMMIT_SHA));
         let cfg = versioned_config(SRC, "~0.5.0");
 
         let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
@@ -21909,7 +22408,7 @@ sha256 = "{sha256}"
     #[test]
     fn check_mismatch_detects_revision_change() {
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        lock.upsert(revision_entry(SRC, "main", TEST_COMMIT_SHA));
         let cfg = provider_config(SRC, Some("develop"));
 
         let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
@@ -21995,7 +22494,7 @@ sha256 = "{sha256}"
     #[test]
     fn check_mismatch_accepts_matching_revision() {
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(SRC, "main", "abc"));
+        lock.upsert(revision_entry(SRC, "main", TEST_COMMIT_SHA));
         let cfg = provider_config(SRC, Some("main"));
 
         assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
@@ -22018,7 +22517,7 @@ sha256 = "{sha256}"
     #[test]
     fn check_mismatch_detects_revision_dropped_from_crn() {
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        lock.upsert(revision_entry(SRC, "main", TEST_COMMIT_SHA));
         let cfg = provider_config(SRC, None); // no revision, no version
 
         let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
@@ -22039,7 +22538,7 @@ sha256 = "{sha256}"
 
         // Pre-existing lock: revision mode.
         let mut lock = LockFile::default();
-        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        lock.upsert(revision_entry(SRC, "main", TEST_COMMIT_SHA));
         lock.save(&lock_path).unwrap();
         let before = fs::read_to_string(&lock_path).unwrap();
 
