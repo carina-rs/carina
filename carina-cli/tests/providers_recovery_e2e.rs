@@ -435,6 +435,7 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         if operation != "repin-discovery" {
             let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
             let error = resolve_all(
+                &carina_core::UserDirs::under(&dir.path().join("test-user")),
                 &install_lock,
                 &[registry_provider_config()],
                 LockMode::Normal,
@@ -684,6 +685,7 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
 
     let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
     let error = resolve_all(
+        &carina_core::UserDirs::under(&dir.path().join("test-user")),
         &install_lock,
         &[registry_provider_config()],
         LockMode::Normal,

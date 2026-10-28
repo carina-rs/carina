@@ -196,7 +196,7 @@ macro_rules! skip_if_no_wasm {
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
 ///
 /// Tests in this binary run in parallel; if they all shared
-/// `WasmProviderFactory::from_bytes()`'s default `~/.carina/cache`, concurrent
+/// `WasmProviderFactory::from_bytes()`'s configured compiled-WASM cache, concurrent
 /// precompile runs race on the same `.cwasm` path and one test can observe
 /// a partially-written file (`"failed to load code for …"`). Each test gets
 /// its own cache dir via this helper to eliminate that race.

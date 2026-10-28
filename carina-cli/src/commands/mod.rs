@@ -324,6 +324,7 @@ pub(crate) fn duplicate_declaration_errors(
 /// `duplicate_declarations` here prevents production callers from silently
 /// bypassing directory-level uniqueness validation.
 pub fn validate_and_resolve_with_config(
+    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
@@ -331,6 +332,7 @@ pub fn validate_and_resolve_with_config(
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<(), AppError> {
     let errors = validate_and_resolve_errors(
+        user_dirs,
         parsed,
         base_dir,
         skip_resource_validation,
@@ -347,17 +349,18 @@ pub fn validate_and_resolve_with_config(
 /// Vec-returning twin of [`validate_and_resolve_with_config`]. Both loader
 /// diagnostic channels remain required at this lower-level entry point.
 pub fn validate_and_resolve_errors(
+    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
-    let (factories, load_errors) = match build_factories_from_providers(&parsed.providers, base_dir)
-    {
-        Ok(loaded) => loaded,
-        Err(error) => return vec![error],
-    };
+    let (factories, load_errors) =
+        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
+            Ok(loaded) => loaded,
+            Err(error) => return vec![error],
+        };
     validate_and_resolve_errors_with_factories(
         parsed,
         base_dir,
@@ -490,6 +493,7 @@ impl ResolvedConfig<'_> {
 /// Validate and canonicalize the evaluated and authored resource snapshots at
 /// the same schema-aware name-resolution boundary.
 pub(crate) fn validate_and_resolve_config_pair(
+    user_dirs: &carina_core::UserDirs,
     parsed: carina_core::parser::InferredFile,
     unresolved: UnresolvedConfigSnapshot,
     base_dir: &Path,
@@ -497,7 +501,8 @@ pub(crate) fn validate_and_resolve_config_pair(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, load_errors) =
+        build_factories_from_providers(user_dirs, &parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
     validate_and_resolve_config_pair_with_context(
         parsed,
@@ -1159,6 +1164,7 @@ mod tests {
 
     #[test]
     fn backend_validation_keeps_the_typed_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
@@ -1173,7 +1179,8 @@ mod tests {
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
 
-        let errors = validate_and_resolve_errors(&mut parsed, base.path(), false, &[], &[]);
+        let errors =
+            validate_and_resolve_errors(&user_dirs, &mut parsed, base.path(), false, &[], &[]);
 
         assert!(errors.iter().any(|error| {
             matches!(
@@ -1191,6 +1198,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provider_load_error_shows_actual_reason() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         let source_path = base.path().join("local-provider.wasm");
         let installed_path = base
@@ -1211,8 +1219,9 @@ mod tests {
             binding: None,
         });
 
-        let error = validate_and_resolve_with_config(&mut parsed, base.path(), false, &[], &[])
-            .unwrap_err();
+        let error =
+            validate_and_resolve_with_config(&user_dirs, &mut parsed, base.path(), false, &[], &[])
+                .unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -1232,6 +1241,7 @@ mod tests {
 
     #[test]
     fn test_provider_without_source_shows_source_hint() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // A provider without source should tell the user to add source config.
         let mut parsed = empty_parsed_file();
         parsed.providers.push(ProviderConfig {
@@ -1245,7 +1255,8 @@ mod tests {
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);
+        let result =
+            validate_and_resolve_with_config(&user_dirs, &mut parsed, base_dir, false, &[], &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -1258,6 +1269,7 @@ mod tests {
 
     #[test]
     fn upstream_field_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // `destroy` and `state` subcommands pass `skip_resource_validation =
         // true` so they can run on projects whose upstream has drifted.
         // The static upstream-exports check must respect that gate;
@@ -1296,6 +1308,7 @@ exports {
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
+            &user_dirs,
             &mut parsed.clone(),
             &base,
             false,
@@ -1308,6 +1321,7 @@ exports {
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
         let result = validate_and_resolve_with_config(
+            &user_dirs,
             &mut parsed,
             &base,
             true,
@@ -1323,6 +1337,7 @@ exports {
 
     #[test]
     fn duplicate_declaration_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         std::fs::write(
             base.path().join("a.crn"),
@@ -1346,6 +1361,7 @@ exports {
         let mut parsed = loaded.parsed;
 
         let err = validate_and_resolve_with_config(
+            &user_dirs,
             &mut parsed.clone(),
             base.path(),
             false,
@@ -1356,6 +1372,7 @@ exports {
         assert!(err.to_string().contains("duplicate export 'x'"));
 
         let result = validate_and_resolve_with_config(
+            &user_dirs,
             &mut parsed,
             base.path(),
             true,

@@ -22,7 +22,7 @@ pub use provider_trust::{
     UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
 };
 pub use trusted_local::{GrantParseError, TrustedLocalGrants};
-pub use user_trust::{UserTrustRecord, UserTrustRecordDirError, user_trust_record_dir};
+pub use user_trust::UserTrustRecord;
 pub use verified_artifact::{
     LoadedArtifactIdentity, LoadedArtifactOrigin, LockedArtifactVersion, ProviderArtifactBytes,
     VerifiedArtifact, VerifiedLoad,
@@ -37,15 +37,6 @@ pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(test)]
-pub(crate) fn isolated_test_storage_root() -> &'static std::path::Path {
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        tempfile::tempdir().expect("create isolated per-process provider storage for tests")
-    })
-    .path()
-}
-
-#[cfg(test)]
 pub(crate) struct ScopedEnvVar {
     name: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -57,13 +48,6 @@ impl ScopedEnvVar {
         let previous = std::env::var_os(name);
         // SAFETY: callers hold test_env_guard() while this process-wide override is active.
         unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-
-    pub(crate) fn remove(name: &'static str) -> Self {
-        let previous = std::env::var_os(name);
-        // SAFETY: callers hold test_env_guard() while this process-wide override is active.
-        unsafe { std::env::remove_var(name) };
         Self { name, previous }
     }
 }

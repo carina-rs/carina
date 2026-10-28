@@ -1836,6 +1836,7 @@ fn plan_exports_multifile_module_output_resolves() {
 
 #[test]
 fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture_path = PathBuf::from(format!(
         "{}/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected",
         env!("CARGO_MANIFEST_DIR")
@@ -1845,6 +1846,7 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let errors = crate::commands::validate_and_resolve_errors(
+        &user_dirs,
         &mut parsed,
         &fixture_path,
         true,

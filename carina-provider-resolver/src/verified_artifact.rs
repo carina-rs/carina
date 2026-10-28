@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use carina_core::UserDirs;
 use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::{
     GithubSource, ProviderSource, ProviderSourceParseError, RemoteSource, RemoteSourceKey,
@@ -684,7 +685,7 @@ impl<P, R> ArtifactPin<'_, P, R> {
     /// Return the lock pin when the cache is safe to reuse. Allow-listed
     /// sources additionally require a valid user-owned trust record for the
     /// same content/source pair; other sources cannot gain trust from a record.
-    pub(crate) fn pinned(&self) -> Option<(&LockEntry<R>, &P)> {
+    pub(crate) fn pinned(&self, user_dirs: &UserDirs) -> Option<(&LockEntry<R>, &P)> {
         match self {
             Self::Pinned {
                 lock_entry,
@@ -692,7 +693,7 @@ impl<P, R> ArtifactPin<'_, P, R> {
                 pin,
                 source,
             } if !ProviderTrust::remote_source_is_allowlisted(source)
-                || user_trust_record_exists(&lock_entry.sha256, source) =>
+                || user_trust_record_exists(user_dirs, &lock_entry.sha256, source) =>
             {
                 Some((lock_entry, pin))
             }
@@ -728,6 +729,7 @@ impl OriginDownloadProof {
 }
 
 fn record_verified_origin_download(
+    user_dirs: &UserDirs,
     origin: OriginUrl,
     sha256: &str,
     signer: Option<&RegistrySignatureProtection>,
@@ -741,11 +743,12 @@ fn record_verified_origin_download(
         sha256.to_string(),
         signer.cloned(),
     ))
-    .and_then(|record| record.write())
+    .and_then(|record| record.write(user_dirs))
     .map_err(|error| RecordVerifiedOriginDownloadError::new(&source, sha256, error))
 }
 
 pub(crate) fn record_verified_registry_origin_download(
+    user_dirs: &UserDirs,
     source: &RemoteSourceKey,
     requested_origin_url: &str,
     sha256: &str,
@@ -754,11 +757,12 @@ pub(crate) fn record_verified_registry_origin_download(
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let origin = OriginUrl::verified_registry(source, requested_origin_url, verified_signer)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    record_verified_origin_download(origin, sha256, Some(signer))
+    record_verified_origin_download(user_dirs, origin, sha256, Some(signer))
 }
 
 #[cfg(test)]
 pub(crate) fn record_test_github_origin_download(
+    user_dirs: &UserDirs,
     source: &RemoteSourceKey,
     sha256: &str,
     signer: Option<&RegistrySignatureProtection>,
@@ -772,7 +776,7 @@ pub(crate) fn record_test_github_origin_download(
     );
     let origin = OriginUrl::github_release(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    record_verified_origin_download(origin, sha256, signer)
+    record_verified_origin_download(user_dirs, origin, sha256, signer)
 }
 
 #[derive(Debug, Clone)]
@@ -808,23 +812,25 @@ impl OriginDownloadPin for GithubReleaseArtifactPin {
 }
 
 fn record_verified_pin_origin<P: OriginDownloadPin>(
+    user_dirs: &UserDirs,
     source: &RemoteSourceKey,
     location: P::Location,
     sha256: &str,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let origin = P::validated_origin(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    record_verified_origin_download(origin, sha256, None)
+    record_verified_origin_download(user_dirs, origin, sha256, None)
 }
 
 pub(crate) fn record_verified_revision_origin_download(
+    user_dirs: &UserDirs,
     source: &RemoteSourceKey,
     location: GithubRevisionDownloadLocation,
     sha256: &str,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let origin = OriginUrl::github_revision(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    record_verified_origin_download(origin, sha256, None)
+    record_verified_origin_download(user_dirs, origin, sha256, None)
 }
 
 #[derive(Debug)]
@@ -1270,6 +1276,7 @@ fn publish_download_verified<R, P>(
 }
 
 pub(crate) fn publish_download<R, P: OriginDownloadPin>(
+    user_dirs: &UserDirs,
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
     location: FetchedLocation<P::Location>,
@@ -1277,8 +1284,13 @@ pub(crate) fn publish_download<R, P: OriginDownloadPin>(
     let source = pin.source().clone();
     let downloaded = publish_download_verified(staged, pin)
         .map_err(VerifiedArtifactError::into_download_message)?;
-    record_verified_pin_origin::<P>(&source, location.into_inner(), downloaded.sha256())
-        .map_err(String::from)?;
+    record_verified_pin_origin::<P>(
+        user_dirs,
+        &source,
+        location.into_inner(),
+        downloaded.sha256(),
+    )
+    .map_err(String::from)?;
     Ok(downloaded)
 }
 
@@ -1486,9 +1498,8 @@ mod tests {
 
     #[test]
     fn user_trust_record_write_is_concurrent_and_idempotent() {
-        let _env_guard = crate::test_env_guard();
         let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_dirs = UserDirs::under(trust.path());
         let source = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
@@ -1498,17 +1509,18 @@ mod tests {
         };
         let sha256 = "01".repeat(32);
 
-        record_test_github_origin_download(&source, &sha256, None).unwrap();
-        let first = trust_record_files(trust.path());
-        record_test_github_origin_download(&source, &sha256, None).unwrap();
-        assert_eq!(trust_record_files(trust.path()), first);
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
+        let first = trust_record_files(user_dirs.trust_record_dir());
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
+        assert_eq!(trust_record_files(user_dirs.trust_record_dir()), first);
 
         let threads = (0..8)
             .map(|_| {
                 let source = source.clone();
                 let sha256 = sha256.clone();
+                let user_dirs = user_dirs.clone();
                 std::thread::spawn(move || {
-                    record_test_github_origin_download(&source, &sha256, None)
+                    record_test_github_origin_download(&user_dirs, &source, &sha256, None)
                 })
             })
             .collect::<Vec<_>>();
@@ -1516,17 +1528,17 @@ mod tests {
             thread.join().unwrap().unwrap();
         }
 
-        assert_eq!(trust_record_files(trust.path()), first);
+        assert_eq!(trust_record_files(user_dirs.trust_record_dir()), first);
         assert_eq!(first.len(), 1);
     }
 
     #[test]
     fn user_trust_record_error_keeps_io_cause_at_string_boundary() {
-        let _env_guard = crate::test_env_guard();
         let trust = tempfile::tempdir().unwrap();
-        let trust_file = trust.path().join("not-a-directory");
-        std::fs::write(&trust_file, b"occupied").unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", &trust_file);
+        let user_dirs = UserDirs::under(trust.path());
+        std::fs::create_dir_all(user_dirs.trust_record_dir().parent().unwrap()).unwrap();
+        let trust_file = user_dirs.trust_record_dir();
+        std::fs::write(trust_file, b"occupied").unwrap();
         let source = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
@@ -1536,7 +1548,8 @@ mod tests {
         };
         let sha256 = "01".repeat(32);
 
-        let error = record_test_github_origin_download(&source, &sha256, None).unwrap_err();
+        let error =
+            record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap_err();
 
         let error = String::from(error);
         assert!(error.contains("Failed to create provider trust-record directory"));
@@ -1605,18 +1618,19 @@ mod tests {
     }
 
     #[test]
-    fn origin_download_checksum_mismatch_is_typed_and_preserves_destination() {
-        let _env_guard = crate::test_env_guard();
+    fn origin_download_checksum_mismatch_preserves_destination_and_user_trust() {
         let project = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
-        let source = match "github.com/carina-rs/carina-provider-aws"
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
+        std::fs::create_dir_all(user_dirs.trust_record_dir()).unwrap();
+        let github = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
         {
-            ProviderSource::Remote(source) => source.source_key(),
-            ProviderSource::File(_) => unreachable!(),
+            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
+            source => panic!("expected GitHub source: {source}"),
         };
+        let source = github.source_key();
         let version = semver::Version::parse("1.0.0").unwrap();
         let tag = ReleaseTag::from_lock("v1.0.0".into());
         let asset_id = AssetId::from_lock(42);
@@ -1647,13 +1661,21 @@ mod tests {
             registry: None,
         });
         let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
+        let location = GithubReleaseDownloadLocation::for_test(
+            RepoSlug::try_from(&github).unwrap(),
+            tag,
+            asset_id,
+        );
 
-        let error = publish_download_verified(staged, pin)
+        let error = publish_download(&user_dirs, staged, pin, FetchedLocation::for_test(location))
             .expect_err("origin bytes must match the existing lock pin");
 
-        assert!(matches!(error, VerifiedArtifactError::ChecksumMismatch(_)));
+        assert!(
+            error.contains("does not match the sha256 pinned"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(destination.as_path()).unwrap(), locked_bytes);
-        assert!(trust_record_files(trust.path()).is_empty());
+        assert!(trust_record_files(user_dirs.trust_record_dir()).is_empty());
     }
 
     #[test]
