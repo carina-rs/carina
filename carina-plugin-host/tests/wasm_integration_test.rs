@@ -299,6 +299,32 @@ fn resource_with_provider_string_attribute(
     resource
 }
 
+fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str) -> Resource {
+    let mut resource = resource_with_provider_string_attribute(
+        "mock_http",
+        "test.send_phase",
+        identity,
+        "url",
+        url,
+    );
+    resource.attributes.insert(
+        "method".to_string(),
+        Value::Concrete(ConcreteValue::String(method.to_string().into())),
+    );
+    resource.attributes.insert(
+        "body".to_string(),
+        Value::Concrete(ConcreteValue::String(body.to_string().into())),
+    );
+    resource
+}
+
+fn http_probe_body() -> String {
+    // Exceed the two-chunk host body buffer so a connect failure can close the
+    // receiver while the guest is still writing, exercising the future-error
+    // recovery path rather than only the normal future-response path.
+    "x".repeat(16 * 1024)
+}
+
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
     match failure.into_kind() {
         CreateFailureKind::Untracked(error) => error,
@@ -410,8 +436,9 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_guest_classifies_denied_http_request_as_not_sent() {
+async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
     let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
         .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
@@ -423,13 +450,8 @@ async fn wasm_guest_classifies_denied_http_request_as_not_sent() {
         "wasi-http-denied",
         None,
     );
-    let resource = resource_with_provider_string_attribute(
-        "mock_http",
-        "test.send_phase",
-        "wasi-http-denied",
-        "url",
-        "http://example.invalid/",
-    );
+    let resource =
+        http_send_phase_resource("wasi-http-denied", "http://example.invalid/", "POST", &body);
 
     let state = create_state_for_writeback(
         provider
@@ -447,8 +469,62 @@ async fn wasm_guest_classifies_denied_http_request_as_not_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_guest_classifies_closed_after_request_as_maybe_sent() {
+async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
     let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let reserved_socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        Ok(socket)
+    }) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot reserve a closed loopback port: {error}");
+            return;
+        }
+    };
+    let closed_address = reserved_socket
+        .local_addr()
+        .expect("reserved socket has an address");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", closed_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-connect-failure",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-connect-failure",
+        &format!("http://phase-test.invalid:{}/", closed_address.port()),
+        "POST",
+        &body,
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+    drop(reserved_socket);
+
+    assert_eq!(
+        state.attributes.get("send_phase"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "not_sent".to_string().into()
+        )))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -475,12 +551,11 @@ async fn wasm_guest_classifies_closed_after_request_as_maybe_sent() {
         "wasi-http-closed",
         None,
     );
-    let resource = resource_with_provider_string_attribute(
-        "mock_http",
-        "test.send_phase",
+    let resource = http_send_phase_resource(
         "wasi-http-closed",
-        "url",
         &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
     );
 
     // Component compilation and provider initialization can be slow under
@@ -497,6 +572,9 @@ async fn wasm_guest_classifies_closed_after_request_as_maybe_sent() {
                 Err(error) => panic!("server accept failed: {error}"),
             }
         };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");

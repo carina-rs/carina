@@ -9,6 +9,8 @@ use carina_plugin_sdk::{
 };
 
 const URL_ATTRIBUTE: &str = "url";
+const METHOD_ATTRIBUTE: &str = "method";
+const BODY_ATTRIBUTE: &str = "body";
 const SEND_PHASE_ATTRIBUTE: &str = "send_phase";
 
 #[derive(Default)]
@@ -57,10 +59,11 @@ impl MockHttpProvider {
         }
     }
 
-    fn wasi_http_send_phase(url: &str) -> String {
+    fn wasi_http_send_phase(url: &str, method: &str, body: &str) -> String {
         #[cfg(target_arch = "wasm32")]
         {
             use std::error::Error as _;
+            use std::time::Duration;
 
             use aws_smithy_runtime_api::client::http::{
                 HttpClient, HttpConnector, HttpConnectorSettings,
@@ -73,9 +76,16 @@ impl MockHttpProvider {
             let components = RuntimeComponentsBuilder::for_tests()
                 .build()
                 .expect("HTTP probe runtime components must be valid");
-            let connector = WasiHttpClient::new()
-                .http_connector(&HttpConnectorSettings::default(), &components);
-            let request = HttpRequest::get(url).expect("HTTP probe URL must be valid");
+            let settings = HttpConnectorSettings::builder()
+                .connect_timeout(Duration::from_secs(1))
+                .read_timeout(Duration::from_secs(5))
+                .build();
+            let connector = WasiHttpClient::new().http_connector(&settings, &components);
+            let mut request = HttpRequest::get(url).expect("HTTP probe URL must be valid");
+            request
+                .set_method(method)
+                .expect("HTTP probe method must be valid");
+            *request.body_mut() = body.as_bytes().to_vec().into();
 
             return match futures::executor::block_on(connector.call(request)) {
                 Ok(_) => "success".to_string(),
@@ -87,10 +97,12 @@ impl MockHttpProvider {
                     let connector_error = dispatch
                         .as_connector_error()
                         .expect("dispatch failure must retain its connector error");
-                    let failure = connector_error
-                        .source()
-                        .and_then(|source| source.downcast_ref::<TransportFailure>())
-                        .expect("connector source must be a TransportFailure");
+                    let Some(source) = connector_error.source() else {
+                        return "missing_transport_failure_source".to_string();
+                    };
+                    let Some(failure) = source.downcast_ref::<TransportFailure>() else {
+                        return format!("unexpected_transport_failure_source:{source}");
+                    };
 
                     match failure.phase() {
                         SendPhase::NotSent => {
@@ -98,7 +110,9 @@ impl MockHttpProvider {
                             "not_sent".to_string()
                         }
                         SendPhase::MaybeSent => {
-                            assert!(connector_error.is_timeout() || connector_error.is_other());
+                            assert!(!connector_error.is_timeout());
+                            assert!(!connector_error.is_io());
+                            assert!(connector_error.is_other());
                             "maybe_sent".to_string()
                         }
                     }
@@ -108,7 +122,7 @@ impl MockHttpProvider {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = url;
+            let _ = (url, method, body);
             "unsupported".to_string()
         }
     }
@@ -135,6 +149,14 @@ impl CarinaProvider for MockHttpProvider {
                 (
                     URL_ATTRIBUTE.to_string(),
                     Self::string_attribute(URL_ATTRIBUTE, true, false),
+                ),
+                (
+                    METHOD_ATTRIBUTE.to_string(),
+                    Self::string_attribute(METHOD_ATTRIBUTE, true, false),
+                ),
+                (
+                    BODY_ATTRIBUTE.to_string(),
+                    Self::string_attribute(BODY_ATTRIBUTE, true, false),
                 ),
                 (
                     SEND_PHASE_ATTRIBUTE.to_string(),
@@ -189,7 +211,21 @@ impl CarinaProvider for MockHttpProvider {
                 "the HTTP probe requires a string url attribute",
             )));
         };
-        let phase = Self::wasi_http_send_phase(url);
+        let Some(Value::String(method)) = request.resource.attributes.get(METHOD_ATTRIBUTE) else {
+            return Err(attempt.untracked(Self::error(
+                id,
+                ProviderErrorKind::InvalidInput,
+                "the HTTP probe requires a string method attribute",
+            )));
+        };
+        let Some(Value::String(body)) = request.resource.attributes.get(BODY_ATTRIBUTE) else {
+            return Err(attempt.untracked(Self::error(
+                id,
+                ProviderErrorKind::InvalidInput,
+                "the HTTP probe requires a string body attribute",
+            )));
+        };
+        let phase = Self::wasi_http_send_phase(url, method, body);
         let mut attributes = request.resource.attributes;
         attributes.insert(SEND_PHASE_ATTRIBUTE.to_string(), Value::String(phase));
         let identifier =

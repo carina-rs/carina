@@ -1181,7 +1181,9 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             .test_route
             .as_ref()
             .filter(|route| {
-                route.host.eq_ignore_ascii_case(host) && route.destination.port() == port
+                !config.use_tls
+                    && route.host.eq_ignore_ascii_case(host)
+                    && route.destination.port() == port
             })
             .map(|route| route.destination);
         let allowed_host = match test_destination {
@@ -3085,6 +3087,7 @@ struct RebuildContext {
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
+    http_test_route: Option<HttpTestRoute>,
 }
 
 impl RebuildContext {
@@ -3095,6 +3098,7 @@ impl RebuildContext {
             provider_kind: None,
             world: InstantiationWorld::HttpEnabled,
             budget,
+            http_test_route: None,
         }
     }
 
@@ -3105,7 +3109,7 @@ impl RebuildContext {
             self.provider_kind,
             self.world,
             self.budget,
-            None,
+            self.http_test_route.clone(),
         )
         .await
     }
@@ -3865,10 +3869,12 @@ impl WasmProviderFactory {
         host: impl Into<String>,
         destination: SocketAddr,
     ) -> Self {
-        self.http_test_route = Some(HttpTestRoute {
+        let route = HttpTestRoute {
             host: host.into(),
             destination,
-        });
+        };
+        self.init_instance.rebuild.http_test_route = Some(route.clone());
+        self.http_test_route = Some(route);
         self
     }
 
@@ -6160,6 +6166,24 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn http_test_route_is_retained_for_validation_rebuilds() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 43210));
+        let factory = factory.with_http_test_route("phase-test.invalid", destination);
+
+        let route = factory
+            .init_instance
+            .rebuild
+            .http_test_route
+            .as_ref()
+            .expect("validation rebuild context must retain the test route");
+        assert_eq!(route.host, "phase-test.invalid");
+        assert_eq!(route.destination, destination);
+    }
+
     #[test]
     fn protocol_v12_wit_surface_compiles() {
         fn assert_type<T>() {}
@@ -8037,64 +8061,6 @@ mod tests {
             .boxed_unsync()
     }
 
-    fn sdk_classifies_not_sent(
-        code: &wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
-    ) -> bool {
-        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
-
-        matches!(
-            code,
-            ErrorCode::DnsTimeout
-                | ErrorCode::DnsError(..)
-                | ErrorCode::DestinationNotFound
-                | ErrorCode::DestinationUnavailable
-                | ErrorCode::DestinationIpProhibited
-                | ErrorCode::DestinationIpUnroutable
-                | ErrorCode::ConnectionRefused
-                | ErrorCode::ConnectionTimeout
-                | ErrorCode::TlsProtocolError
-                | ErrorCode::TlsCertificateError
-                | ErrorCode::TlsAlertReceived(..)
-                | ErrorCode::HttpRequestDenied
-                | ErrorCode::HttpRequestMethodInvalid
-                | ErrorCode::HttpRequestUriInvalid
-                | ErrorCode::HttpRequestUriTooLong
-        )
-    }
-
-    #[test]
-    fn host_error_codes_match_the_sdk_send_phase_contract() {
-        use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, ErrorCode};
-
-        let pre_send = [
-            ErrorCode::HttpRequestDenied,
-            ErrorCode::HttpRequestUriInvalid,
-            ErrorCode::ConnectionTimeout,
-            ErrorCode::DnsError(DnsErrorPayload {
-                rcode: Some("test".to_string()),
-                info_code: Some(0),
-            }),
-            ErrorCode::ConnectionRefused,
-            ErrorCode::TlsProtocolError,
-        ];
-        for code in &pre_send {
-            assert!(
-                sdk_classifies_not_sent(code),
-                "host pre-send code is not retry-safe in the SDK: {code:?}"
-            );
-        }
-
-        for code in [
-            ErrorCode::ConnectionReadTimeout,
-            ErrorCode::HttpProtocolError,
-        ] {
-            assert!(
-                !sdk_classifies_not_sent(&code),
-                "host post-send code was classified as retry-safe in the SDK: {code:?}"
-            );
-        }
-    }
-
     #[test]
     fn denied_and_invalid_requests_are_reported_as_pre_send() {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -8134,6 +8100,38 @@ mod tests {
         assert!(matches!(
             invalid.downcast_ref(),
             Some(ErrorCode::HttpRequestUriInvalid)
+        ));
+    }
+
+    #[test]
+    fn http_test_route_does_not_override_https_policy() {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 4443));
+        let mut hooks = AllowListHttpHooks::with_test_route(
+            Some(ProviderKind::Untrusted),
+            Some(HttpTestRoute {
+                host: "phase-test.invalid".to_string(),
+                destination,
+            }),
+        );
+        let request = hyper::Request::builder()
+            .uri("https://phase-test.invalid:4443/")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: true,
+            connect_timeout: std::time::Duration::from_secs(1),
+            first_byte_timeout: std::time::Duration::from_secs(1),
+            between_bytes_timeout: std::time::Duration::from_secs(1),
+        };
+
+        let error =
+            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                .expect_err("an HTTP-only test route must not bypass HTTPS host policy");
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ErrorCode::HttpRequestDenied)
         ));
     }
 
@@ -8269,10 +8267,6 @@ mod tests {
         };
 
         assert!(
-            sdk_classifies_not_sent(&code),
-            "a TCP-connect failure was not classified as pre-send: {code:?}"
-        );
-        assert!(
             matches!(
                 &code,
                 ErrorCode::ConnectionRefused | ErrorCode::ConnectionTimeout
@@ -8329,6 +8323,9 @@ mod tests {
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("set accepted socket blocking");
+            stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
             let mut request = [0_u8; 4096];
@@ -8370,6 +8367,9 @@ mod tests {
                     Err(error) => panic!("server accept failed: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted socket blocking");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
@@ -9622,6 +9622,7 @@ mod tests {
                 provider_kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
+                http_test_route: None,
             },
         );
         instance.state.lock().await.instance = ValidationInstanceState::Poisoned {
@@ -9669,6 +9670,7 @@ mod tests {
                 provider_kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
+                http_test_route: None,
             },
             fingerprint_key,
         };
