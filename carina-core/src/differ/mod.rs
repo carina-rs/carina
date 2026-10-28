@@ -44,11 +44,13 @@ pub fn managed_binding_stability(
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         };
-        let schema = registry.get(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            SchemaKind::Resource,
-        );
+        let schema = registry
+            .get(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                SchemaKind::Resource,
+            )
+            .map(|schema| schema.as_schema());
         let changed_attributes = match diff_present(
             resource,
             present,
@@ -680,6 +682,7 @@ pub fn lift_prior_state_enum_leaves(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let schema = schema.as_schema();
         let attributes = current_states
             .get_mut(&resource.id)
             .and_then(Current::attributes_mut)

@@ -200,10 +200,18 @@ mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, TypeError, enum_identity,
+        AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeError,
+        ValidatedConfigSchema, enum_identity,
     };
     use std::collections::HashMap;
     use tower_lsp::lsp_types::{Position, Range};
+
+    fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
+        ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+            .expect("test config type must be valid")
+            .rootless_type("value")
+            .expect("test config type must exist")
+    }
 
     /// Build a versioning-bucket fixture variant — keep the `aws.s3.Bucket
     /// .VersioningStatus` shape stable across these tests so `Display`
@@ -407,7 +415,7 @@ mod tests {
                 None,
             ),
         ]);
-        let error = carina_core::schema::Schema::flat(union)
+        let error = pathless_test_type(union)
             .validate(&Value::Concrete(ConcreteValue::String(
                 "z14grhdcwa56qt".into(),
             )))
@@ -438,7 +446,7 @@ mod tests {
             )),
             AttributeType::string(),
         ]);
-        let error = carina_core::schema::Schema::flat(union)
+        let error = pathless_test_type(union)
             .validate(&Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String("bogus".into())),
             ])))
@@ -465,7 +473,7 @@ mod tests {
                 None,
             ),
         ]);
-        let error = carina_core::schema::Schema::flat(union)
+        let error = pathless_test_type(union)
             .validate(&Value::Concrete(ConcreteValue::String("q".into())))
             .expect_err("both Enum arms must reject the string");
         let payload = enum_diagnostic_data_for_error(&error)
@@ -491,7 +499,7 @@ mod tests {
     #[test]
     fn version_quickfix_uses_dsl_spelling_from_core_candidates() {
         let schema = ResourceSchema::new("aws.iam.PolicyDocument").attribute(
-            AttributeSchema::new(
+            AttributeSchema::required(
                 "Version",
                 AttributeType::enum_(
                     enum_identity("Version", Some("aws.iam.PolicyDocument")),
@@ -504,14 +512,18 @@ mod tests {
                     None,
                 ),
             )
-            .required(),
+            .build(),
         );
         let mut attrs = HashMap::new();
         attrs.insert(
             "Version".to_string(),
             Value::Concrete(ConcreteValue::enum_identifier("bad_version")),
         );
-        let mut errs = schema.validate(&attrs).unwrap_err();
+        let mut errs = schema
+            .validate()
+            .expect("quick-fix test schema must be valid")
+            .validate(&attrs)
+            .unwrap_err();
         let err = errs.remove(0);
         let TypeError::InvalidEnumVariant { expected, .. } = err else {
             panic!("expected InvalidEnumVariant, got {err:?}");

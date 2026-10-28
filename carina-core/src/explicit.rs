@@ -1507,17 +1507,21 @@ mod tests {
         let prior_explicit = ExplicitFields::Struct {
             children: HashMap::from([("items".to_string(), whole_value(&[&["description"]]))]),
         };
-        let schema = ResourceSchema::new("example.Listener").attribute(AttributeSchema::new(
-            "items",
-            AttributeType::list(AttributeType::struct_(
-                "Rule",
-                vec![
-                    StructField::new("port", AttributeType::int()),
-                    StructField::new("description", AttributeType::string()),
-                    StructField::new("provider_status", AttributeType::string()).read_only(),
-                ],
-            )),
-        ));
+        let schema = ResourceSchema::new("example.Listener").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![
+                        StructField::optional("port", AttributeType::int()).build(),
+                        StructField::optional("description", AttributeType::string()).build(),
+                        StructField::provider_populated("provider_status", AttributeType::string())
+                            .build(),
+                    ],
+                )),
+            )
+            .build(),
+        );
         let desired = vec![rule(80, None), rule(80, None)];
         let with_provider_status = |mut value: Value| {
             let Value::Concrete(ConcreteValue::Map(fields)) = &mut value else {
@@ -1746,14 +1750,13 @@ mod tests {
         let item_type = AttributeType::struct_(
             "Statement",
             vec![
-                StructField::new("effect", effect_type),
-                StructField::new("description", AttributeType::string()),
+                StructField::optional("effect", effect_type).build(),
+                StructField::optional("description", AttributeType::string()).build(),
             ],
         );
-        let schema = ResourceSchema::new("example.Listener").attribute(AttributeSchema::new(
-            "items",
-            AttributeType::unordered_list(item_type),
-        ));
+        let schema = ResourceSchema::new("example.Listener").attribute(
+            AttributeSchema::optional("items", AttributeType::unordered_list(item_type)).build(),
+        );
         let desired_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "effect".to_string(),

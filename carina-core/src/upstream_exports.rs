@@ -1825,10 +1825,13 @@ mod tests {
         attr_type: crate::schema::AttributeType,
     ) -> SchemaRegistry {
         use crate::schema::{AttributeSchema, ResourceSchema};
-        let schema =
-            ResourceSchema::new("r.res").attribute(AttributeSchema::new(attr_name, attr_type));
+        let schema = ResourceSchema::new("r.res")
+            .attribute(AttributeSchema::optional(attr_name, attr_type).build());
         let mut registry = SchemaRegistry::new();
-        registry.insert("test", schema);
+        registry.insert(
+            "test",
+            schema.validate().expect("schema fixture must be valid"),
+        );
         registry
     }
 
@@ -2079,10 +2082,10 @@ mod tests {
             crate::schema::AttributeType::union(vec![
                 crate::schema::AttributeType::struct_(
                     "Count".to_string(),
-                    vec![StructField::new(
-                        "count",
-                        crate::schema::AttributeType::string(),
-                    )],
+                    vec![
+                        StructField::optional("count", crate::schema::AttributeType::string())
+                            .build(),
+                    ],
                 ),
                 crate::schema::AttributeType::string(),
             ]),
@@ -2117,10 +2120,10 @@ mod tests {
                 crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
                 crate::schema::AttributeType::struct_(
                     "Count".to_string(),
-                    vec![StructField::new(
-                        "count",
-                        crate::schema::AttributeType::string(),
-                    )],
+                    vec![
+                        StructField::optional("count", crate::schema::AttributeType::string())
+                            .build(),
+                    ],
                 ),
             ]),
         );
@@ -2196,7 +2199,7 @@ mod tests {
         let principal_union = AttributeType::union(vec![
             AttributeType::struct_(
                 "IamPolicyPrincipal".to_string(),
-                vec![StructField::new("federated", AttributeType::string())],
+                vec![StructField::optional("federated", AttributeType::string()).build()],
             ),
             AttributeType::string(),
         ]);
@@ -2230,7 +2233,7 @@ mod tests {
             &[("key_arn", TypeExpr::Simple("kms_key_arn".to_string()))],
         )]);
         let arn = AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("Arn")),
+            TypeIdentity::bare("Arn"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -2278,7 +2281,7 @@ mod tests {
         // compares against `String` and fails. With narrowing,
         // `AwsAccountId` (Custom over String) is accepted.
         let aws_account_id = AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("AwsAccountId")),
+            TypeIdentity::bare("AwsAccountId"),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -2322,7 +2325,7 @@ mod tests {
         )]);
         let policy_struct = AttributeType::struct_(
             "IamPolicyDocument".to_string(),
-            vec![StructField::new("statement", AttributeType::string()).required()],
+            vec![StructField::required("statement", AttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2426,9 +2429,9 @@ mod tests {
         let policy_struct = AttributeType::struct_(
             "PolicyDoc".to_string(),
             vec![
-                StructField::new("statements", AttributeType::string())
-                    .required()
-                    .with_block_name("statement"),
+                StructField::required("statements", AttributeType::string())
+                    .with_block_name("statement")
+                    .build(),
             ],
         );
         let schemas = schema_with_attr("policy", policy_struct);
@@ -2464,7 +2467,7 @@ mod tests {
             mk_typed_exports(&[("orgs", &[("ports", TypeExpr::Map(Box::new(TypeExpr::Int)))])]);
         let cfg_struct = AttributeType::struct_(
             "Cfg".to_string(),
-            vec![StructField::new("port", AttributeType::int()).required()],
+            vec![StructField::required("port", AttributeType::int()).build()],
         );
         let schemas = schema_with_attr("config", cfg_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2498,7 +2501,7 @@ mod tests {
         )]);
         let policy_struct = AttributeType::struct_(
             "PolicyDoc".to_string(),
-            vec![StructField::new("statement", AttributeType::string()).required()],
+            vec![StructField::required("statement", AttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2538,7 +2541,7 @@ mod tests {
         )]);
         let policy_struct = AttributeType::struct_(
             "IamPolicyDocument".to_string(),
-            vec![StructField::new("statement", AttributeType::string()).required()],
+            vec![StructField::required("statement", AttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);

@@ -41,8 +41,8 @@ impl ProviderFactory for AwsccTestFactory {
     fn display_name(&self) -> &str {
         "AWSCC (carina#3246 test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -74,21 +74,30 @@ impl ProviderFactory for AwsccTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![role_schema(), role_policy_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![role_schema(), role_policy_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn role_schema() -> ResourceSchema {
     ResourceSchema::new("iam.Role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("arn", AttributeType::string()))
+        .attribute(AttributeSchema::optional("role_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("arn", AttributeType::string()).build())
 }
 
 fn role_policy_schema() -> ResourceSchema {
     ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("policy_name", AttributeType::string()))
+        .attribute(AttributeSchema::optional("role_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build())
 }
 
 struct NoopProvider;

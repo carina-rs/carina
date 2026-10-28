@@ -289,29 +289,36 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
+        (ResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::new("name", AttributeType::string())
-                    .required()
-                    .create_only(),
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
             )
-            .attribute(AttributeSchema::new("label", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
+            .attribute(AttributeSchema::optional("label", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("items", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
             ))
-            .attribute(AttributeSchema::new(
-                "items",
-                AttributeType::list(AttributeType::string()),
-            ))
-            .attribute(AttributeSchema::new(
-                "config",
-                AttributeType::struct_(
-                    "Config",
-                    vec![StructField::new("label", AttributeType::string())],
-                ),
-            ))
-            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -615,8 +622,10 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -651,8 +660,13 @@ fn import_target_in_sibling_state_block_is_not_unused() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("test.resource").attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -685,8 +699,10 @@ fn single_unused_attribute_derived_binding_still_warns() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
@@ -705,8 +721,13 @@ fn unused_stable_binding_still_warns() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("test.resource").attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
@@ -725,8 +746,10 @@ fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored()
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -761,8 +784,10 @@ fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaratio
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -794,8 +819,10 @@ fn attribute_derived_identity_diagnostics_ignore_for_generated_resources_when_an
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -840,8 +867,10 @@ fn attribute_derived_identity_diagnostics_ignore_commented_resource_blocks() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let temp = tempfile::tempdir().unwrap();
@@ -1066,13 +1095,16 @@ fn read_only_shadowed_arn_diagnostics_land_on_top_level_and_nested_lines() {
 
     let config = AttributeType::struct_(
         "Config".to_string(),
-        vec![StructField::new("arn", AttributeType::string()).read_only()],
+        vec![StructField::provider_populated("arn", AttributeType::string()).build()],
     );
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only())
-        .attribute(AttributeSchema::new("config", config));
+        .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("config", config).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"mock.test.resource {
@@ -1117,16 +1149,19 @@ fn read_only_field_inside_map_struct_is_anchored_at_the_map_field() {
 
     let entry = AttributeType::struct_(
         "Entry".to_string(),
-        vec![StructField::new("arn", AttributeType::string()).read_only()],
+        vec![StructField::provider_populated("arn", AttributeType::string()).build()],
     );
     let config = AttributeType::struct_(
         "Config".to_string(),
-        vec![StructField::new("entries", AttributeType::map(entry))],
+        vec![StructField::optional("entries", AttributeType::map(entry)).build()],
     );
-    let schema =
-        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("config", config));
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::optional("config", config).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"mock.test.resource {
@@ -1323,10 +1358,13 @@ fn list_item_type_validation() {
     ));
 
     let schema = ResourceSchema::new("list.resource")
-        .attribute(AttributeSchema::new("protocols", list_enum));
+        .attribute(AttributeSchema::optional("protocols", list_enum).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let engine = DiagnosticEngine::new(
         Arc::new(schemas),
@@ -1397,23 +1435,29 @@ fn union_static_non_member_preserves_enum_diagnostic() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new(
-            "mode",
-            AttributeType::union(vec![
-                AttributeType::enum_(
-                    carina_core::schema::TypeIdentity::bare("Mode"),
-                    Some(vec!["active".to_string(), "passive".to_string()]),
-                    vec![],
-                    None,
-                    None,
-                ),
-                AttributeType::int(),
-            ]),
-        ));
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::union(vec![
+                    AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::bare("Mode"),
+                        Some(vec!["active".to_string(), "passive".to_string()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                    AttributeType::int(),
+                ]),
+            )
+            .build(),
+        );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -1471,8 +1515,10 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         ),
     ]);
     let schema = ResourceSchema::new("route53.Record")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("hosted_zone_id", hosted_zone_id));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("hosted_zone_id", hosted_zone_id).build())
+        .validate()
+        .expect("test schema must be valid");
     let attributes = std::collections::HashMap::from([
         (
             "name".to_string(),
@@ -1540,23 +1586,32 @@ fn union_attribute_with_deferred_resource_ref_emits_no_diagnostic() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
 
     let source = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new("value", AttributeType::string()));
-    let sink = ResourceSchema::new("sink.Item").attribute(AttributeSchema::new(
-        "target",
-        AttributeType::union(vec![
-            AttributeType::enum_(
-                enum_identity("TargetKind", None),
-                Some(vec!["known".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
-            AttributeType::refined_string(None, Some("^value-".to_string()), None, None),
-        ]),
-    ));
+        .attribute(AttributeSchema::optional("value", AttributeType::string()).build());
+    let sink = ResourceSchema::new("sink.Item").attribute(
+        AttributeSchema::optional(
+            "target",
+            AttributeType::union(vec![
+                AttributeType::enum_(
+                    enum_identity("TargetKind", None),
+                    Some(vec!["known".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+                AttributeType::refined_string(None, Some("^value-".to_string()), None, None),
+            ]),
+        )
+        .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source);
-    schemas.insert("test", sink);
+    schemas.insert(
+        "test",
+        source.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"let source = test.source.Item {
@@ -1581,11 +1636,14 @@ fn resource_scalar_string_mismatches_use_core_value_descriptions_once() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::bool()))
-        .attribute(AttributeSchema::new("count", AttributeType::int()))
-        .attribute(AttributeSchema::new("ratio", AttributeType::float()));
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
+        .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+        .attribute(AttributeSchema::optional("ratio", AttributeType::float()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"mock.test.resource {
@@ -1629,11 +1687,14 @@ fn resource_scalar_mismatches_never_display_environment_plaintext() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::bool()))
-        .attribute(AttributeSchema::new("count", AttributeType::int()))
-        .attribute(AttributeSchema::new("ratio", AttributeType::float()));
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
+        .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+        .attribute(AttributeSchema::optional("ratio", AttributeType::float()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let variable = "CARINA_LSP_ATTRIBUTE_SECRET";
     let plaintext = "hunter2SECRET";
@@ -1679,19 +1740,22 @@ fn union_of_structs_reports_alternatives_at_the_attribute() {
     let retention = AttributeType::union(vec![
         AttributeType::struct_(
             "RetentionDays".to_string(),
-            vec![StructField::new("days", AttributeType::int()).required()],
+            vec![StructField::required("days", AttributeType::int()).build()],
         ),
         AttributeType::struct_(
             "RetentionYears".to_string(),
-            vec![StructField::new("years", AttributeType::int()).required()],
+            vec![StructField::required("years", AttributeType::int()).build()],
         ),
     ]);
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("retention", retention));
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("retention", retention).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"provider test {
@@ -1732,23 +1796,29 @@ fn union_valid_static_value_no_warning() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new(
-            "mode",
-            AttributeType::union(vec![
-                AttributeType::enum_(
-                    carina_core::schema::TypeIdentity::bare("Mode"),
-                    Some(vec!["active".to_string(), "passive".to_string()]),
-                    vec![],
-                    None,
-                    None,
-                ),
-                AttributeType::int(),
-            ]),
-        ));
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::union(vec![
+                    AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::bare("Mode"),
+                        Some(vec!["active".to_string(), "passive".to_string()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                    AttributeType::int(),
+                ]),
+            )
+            .build(),
+        );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -1779,23 +1849,29 @@ fn union_valid_int_value_no_warning() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new(
-            "mode",
-            AttributeType::union(vec![
-                AttributeType::enum_(
-                    carina_core::schema::TypeIdentity::bare("Mode"),
-                    Some(vec!["active".to_string(), "passive".to_string()]),
-                    vec![],
-                    None,
-                    None,
-                ),
-                AttributeType::int(),
-            ]),
-        ));
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::union(vec![
+                    AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::bare("Mode"),
+                        Some(vec!["active".to_string(), "passive".to_string()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                    AttributeType::int(),
+                ]),
+            )
+            .build(),
+        );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -2966,48 +3042,70 @@ fn resource_ref_type_check_helper_regression() {
 
     // Source resource: has a String attribute "name" and a Custom "my_id"
     let source_schema = ResourceSchema::new("source")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "my_id",
-            AttributeType::enum_(
-                carina_core::schema::enum_identity("MyId", Some("test")),
-                None,
-                vec![],
-                Some(legacy_validator(dummy_validate)),
-                None,
-            ),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "my_id",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("MyId", Some("test")),
+                    None,
+                    vec![],
+                    Some(legacy_validator(dummy_validate)),
+                    None,
+                ),
+            )
+            .build(),
+        );
 
     // Target resource: has Union, Enum, and Custom attributes
     let target_schema = ResourceSchema::new("target")
-        .attribute(AttributeSchema::new(
-            "union_attr",
-            AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]),
-        ))
-        .attribute(AttributeSchema::new(
-            "enum_attr",
-            AttributeType::enum_(
-                carina_core::schema::TypeIdentity::bare("Status"),
-                Some(vec!["active".to_string(), "inactive".to_string()]),
-                vec![],
-                None,
-                None,
-            ),
-        ))
-        .attribute(AttributeSchema::new(
-            "custom_attr",
-            AttributeType::enum_(
-                carina_core::schema::enum_identity("MyId", Some("test")),
-                None,
-                vec![],
-                Some(legacy_validator(dummy_validate)),
-                None,
-            ),
-        ));
+        .attribute(
+            AttributeSchema::optional(
+                "union_attr",
+                AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "enum_attr",
+                AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::bare("Status"),
+                    Some(vec!["active".to_string(), "inactive".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "custom_attr",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("MyId", Some("test")),
+                    None,
+                    vec![],
+                    Some(legacy_validator(dummy_validate)),
+                    None,
+                ),
+            )
+            .build(),
+        );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", target_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        target_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     // Case 1: Union attr with incompatible ResourceRef (MyId != Int|Bool) -> mismatch
@@ -3118,33 +3216,20 @@ attributes {
 
 #[test]
 fn resource_validation_failed_with_attribute_points_to_attribute_line() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeError};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, ValidatorType};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        ))
-        .with_validator(|attrs| {
-            if let Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::Map(map),
-            )) = attrs.get("tags")
-            {
-                let has_key = map.keys().any(|k| k.eq_ignore_ascii_case("key"));
-                let has_value = map.keys().any(|k| k.eq_ignore_ascii_case("value"));
-                if has_key && has_value {
-                    return Err(vec![TypeError::ResourceValidationFailed {
-                        message: "tags key/value error".to_string(),
-                        attribute: Some("tags".to_string()),
-                    }]);
-                }
-            }
-            Ok(())
-        });
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck]);
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -3152,9 +3237,10 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
     );
 
     let diagnostics = engine.analyze(&doc, None);
-    let tags_diag = diagnostics
-        .iter()
-        .find(|d| d.message.contains("tags key/value error"));
+    let tags_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("tags map contains both 'key' and 'value'")
+    });
     assert!(
         tags_diag.is_some(),
         "Should have a tags validation error. Got: {:?}",
@@ -3173,7 +3259,10 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
 fn read_only_attribute_engine(attribute: carina_core::schema::AttributeSchema) -> DiagnosticEngine {
     let schema = carina_core::schema::ResourceSchema::new("test.resource").attribute(attribute);
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     custom_engine(schemas)
 }
 
@@ -3203,7 +3292,7 @@ fn read_only_wrong_typed_value_reports_only_writability() {
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     let engine = read_only_attribute_engine(
-        AttributeSchema::new("enabled", AttributeType::bool()).read_only(),
+        AttributeSchema::provider_populated("enabled", AttributeType::bool()).build(),
     );
     let doc = create_document("mock.test.resource {\n  enabled = 'not-a-bool'\n}\n");
 
@@ -3222,7 +3311,8 @@ fn read_only_invalid_enum_reports_no_enum_quick_fix() {
         None,
         None,
     );
-    let engine = read_only_attribute_engine(AttributeSchema::new("mode", mode).read_only());
+    let engine =
+        read_only_attribute_engine(AttributeSchema::provider_populated("mode", mode).build());
     let doc = create_document("mock.test.resource {\n  mode = 'bogus'\n}\n");
 
     let diagnostics = engine.analyze(&doc, None);
@@ -3244,10 +3334,10 @@ fn read_only_list_struct_reports_no_shape_or_nested_diagnostics() {
 
     let setting = AttributeType::struct_(
         "Setting".to_string(),
-        vec![StructField::new("enabled", AttributeType::bool()).required()],
+        vec![StructField::required("enabled", AttributeType::bool()).build()],
     );
     let engine = read_only_attribute_engine(
-        AttributeSchema::new("settings", AttributeType::list(setting)).read_only(),
+        AttributeSchema::provider_populated("settings", AttributeType::list(setting)).build(),
     );
     let doc = create_document(
         "mock.test.resource {\n  settings = [{\n    enabled = 'not-a-bool'\n    unexpected = true\n  }]\n}\n",
@@ -3258,14 +3348,54 @@ fn read_only_list_struct_reports_no_shape_or_nested_diagnostics() {
 }
 
 #[test]
+fn shared_definition_assignment_is_accepted_only_through_its_writable_path() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let schema = ResourceSchema::new("test.resource")
+        .with_def(
+            "Tag",
+            AttributeType::struct_(
+                "Tag",
+                vec![StructField::required("key", AttributeType::string()).build()],
+            ),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "effective_tags",
+                AttributeType::list(AttributeType::ref_("Tag")),
+            )
+            .build(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        schema.validate().expect("shared definition must be valid"),
+    );
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        "mock.test.resource {\n  tags { key = 'writable' }\n  effective_tags = [{ key = 'read-only' }]\n}\n",
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert_only_read_only_diagnostic(&diagnostics, "effective_tags");
+}
+
+#[test]
 fn read_only_assignment_points_to_attribute_line() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("region", AttributeType::string()).read_only());
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("region", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("mock", schema);
+    schemas.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let doc = create_document("mock.test.resource {\n  name = 'test'\n  region = 'us-west-2'\n}\n");
@@ -3479,23 +3609,28 @@ fn map_key_validation_warns_on_invalid_key() {
     let statement_type = AttributeType::struct_(
         "Statement".to_string(),
         vec![
-            StructField::new("effect", AttributeType::string()),
-            StructField::new("condition", condition_type),
+            StructField::optional("effect", AttributeType::string()).build(),
+            StructField::optional("condition", condition_type).build(),
         ],
     );
-    let schema = ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
-        "policy",
-        AttributeType::struct_(
-            "Policy".to_string(),
-            vec![StructField::new(
-                "statement",
-                AttributeType::list(statement_type),
-            )],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional(
+            "policy",
+            AttributeType::struct_(
+                "Policy".to_string(),
+                vec![
+                    StructField::optional("statement", AttributeType::list(statement_type)).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let engine = DiagnosticEngine::new(
         Arc::new(schemas),
@@ -3557,40 +3692,56 @@ fn distinct_semantic_customs_are_rejected() {
     // Source resource: data source with an AwsAccountId attribute
     let source_schema = ResourceSchema::new("sts.caller_identity")
         .as_data_source()
-        .attribute(AttributeSchema::new(
-            "account_id",
-            AttributeType::refined_string_with_validator(
-                Some(carina_core::schema::TypeIdentity::new(
-                    Some("aws"),
-                    Vec::<String>::new(),
-                    "AwsAccountId",
-                )),
-                None,
-                None,
-                legacy_validator(validate_account_id),
-                None,
-            ),
-        ));
+        .attribute(
+            AttributeSchema::optional(
+                "account_id",
+                AttributeType::refined_string_with_validator(
+                    carina_core::schema::TypeIdentity::new(
+                        Some("aws"),
+                        Vec::<String>::new(),
+                        "AwsAccountId",
+                    ),
+                    None,
+                    None,
+                    legacy_validator(validate_account_id),
+                    None,
+                ),
+            )
+            .build(),
+        );
 
     // Target resource: has a TargetId attribute (also String-based Custom)
-    let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
-        "target_id",
-        AttributeType::refined_string_with_validator(
-            Some(carina_core::schema::TypeIdentity::new(
-                Some("awscc"),
-                Vec::<String>::new(),
-                "TargetId",
-            )),
-            None,
-            None,
-            legacy_validator(validate_target_id),
-            None,
-        ),
-    ));
+    let target_schema = ResourceSchema::new("sso.Assignment").attribute(
+        AttributeSchema::optional(
+            "target_id",
+            AttributeType::refined_string_with_validator(
+                carina_core::schema::TypeIdentity::new(
+                    Some("awscc"),
+                    Vec::<String>::new(),
+                    "TargetId",
+                ),
+                None,
+                None,
+                legacy_validator(validate_target_id),
+                None,
+            ),
+        )
+        .build(),
+    );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", source_schema);
-    schemas.insert("awscc", target_schema);
+    schemas.insert(
+        "aws",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        target_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -3617,29 +3768,45 @@ fn resource_ref_type_mismatch_resolves_binding_from_sibling_file() {
         AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
     };
 
-    let source_schema = ResourceSchema::new("source.Item").attribute(AttributeSchema::new(
-        "source_id",
-        AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("SourceId")),
-            None,
-            None,
-            legacy_validator(|_| Ok(())),
-            None,
-        ),
-    ));
-    let sink_schema = ResourceSchema::new("sink.Item").attribute(AttributeSchema::new(
-        "target_id",
-        AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("TargetId")),
-            None,
-            None,
-            legacy_validator(|_| Ok(())),
-            None,
-        ),
-    ));
+    let source_schema = ResourceSchema::new("source.Item").attribute(
+        AttributeSchema::optional(
+            "source_id",
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("SourceId"),
+                None,
+                None,
+                legacy_validator(|_| Ok(())),
+                None,
+            ),
+        )
+        .build(),
+    );
+    let sink_schema = ResourceSchema::new("sink.Item").attribute(
+        AttributeSchema::optional(
+            "target_id",
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("TargetId"),
+                None,
+                None,
+                legacy_validator(|_| Ok(())),
+                None,
+            ),
+        )
+        .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3679,20 +3846,33 @@ fn resource_ref_string_matches_ref_membered_sink_union() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new("value", AttributeType::string()));
+        .attribute(AttributeSchema::optional("value", AttributeType::string()).build());
     let sink_schema = ResourceSchema::new("sink.Item")
-        .attribute(AttributeSchema::new(
-            "target",
-            AttributeType::union(vec![
-                AttributeType::ref_("S".to_string()),
-                AttributeType::ref_("L".to_string()),
-            ]),
-        ))
+        .attribute(
+            AttributeSchema::optional(
+                "target",
+                AttributeType::union(vec![
+                    AttributeType::ref_("S".to_string()),
+                    AttributeType::ref_("L".to_string()),
+                ]),
+            )
+            .build(),
+        )
         .with_def("S", AttributeType::string())
         .with_def("L", AttributeType::list(AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"let source = test.source.Item {}
@@ -3724,7 +3904,7 @@ fn resource_ref_mismatch_displays_resolved_ref_type_names() {
 
     let refined = |name: &str| {
         AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare(name)),
+            TypeIdentity::bare(name),
             None,
             None,
             legacy_validator(|_| Ok(())),
@@ -3732,20 +3912,28 @@ fn resource_ref_mismatch_displays_resolved_ref_type_names() {
         )
     };
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new(
-            "value",
-            AttributeType::ref_("Source".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("value", AttributeType::ref_("Source".to_string())).build(),
+        )
         .with_def("Source", refined("SourceId"));
     let sink_schema = ResourceSchema::new("sink.Item")
-        .attribute(AttributeSchema::new(
-            "target",
-            AttributeType::ref_("Target".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("target", AttributeType::ref_("Target".to_string())).build(),
+        )
         .with_def("Target", refined("TargetId"));
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"let source = test.source.Item {}
@@ -3778,20 +3966,33 @@ fn resource_ref_mismatch_displays_resolved_union_member_names() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new("value", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("value", AttributeType::bool()).build());
     let sink_schema = ResourceSchema::new("sink.Item")
-        .attribute(AttributeSchema::new(
-            "target",
-            AttributeType::union(vec![
-                AttributeType::ref_("S".to_string()),
-                AttributeType::ref_("L".to_string()),
-            ]),
-        ))
+        .attribute(
+            AttributeSchema::optional(
+                "target",
+                AttributeType::union(vec![
+                    AttributeType::ref_("S".to_string()),
+                    AttributeType::ref_("L".to_string()),
+                ]),
+            )
+            .build(),
+        )
         .with_def("S", AttributeType::string())
         .with_def("L", AttributeType::list(AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
-    schemas.insert("test", sink_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        sink_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(
         r#"let source = test.source.Item {}
@@ -3831,7 +4032,7 @@ fn exports_cross_file_ref_no_false_positive() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let aws_account_id_type = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         carina_core::schema::legacy_validator(|v| match v {
@@ -3850,9 +4051,12 @@ fn exports_cross_file_ref_no_false_positive() {
         None,
     );
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", aws_account_id_type));
+        .attribute(AttributeSchema::optional("account_id", aws_account_id_type).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -3880,9 +4084,12 @@ fn exports_dotted_string_literal_is_not_ref_type_checked() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", AttributeType::int()));
+        .attribute(AttributeSchema::optional("account_id", AttributeType::int()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3952,9 +4159,12 @@ fn exports_ref_type_warning_survives_formatter_round_trip() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("sample.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let original = r#"let item = test.sample.resource {
@@ -4001,9 +4211,12 @@ fn exports_ref_type_warning_survives_document_reparse_after_format_edit() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("sample.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let original = r#"let item = test.sample.resource {
@@ -4136,9 +4349,12 @@ fn exports_map_type_warning_for_cross_file_ref() {
 
     // Schema: registry_prod.account_id is String — incompatible with map(bool)
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", AttributeType::string()));
+        .attribute(AttributeSchema::optional("account_id", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -4176,12 +4392,14 @@ fn exports_subscripted_cross_file_ref_does_not_false_flag() {
     // behaviour of the core `check_ref_against_type` after #2447.
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let schema = ResourceSchema::new("organizations.account").attribute(AttributeSchema::new(
-        "accounts",
-        AttributeType::map(AttributeType::string()),
-    ));
+    let schema = ResourceSchema::new("organizations.account").attribute(
+        AttributeSchema::optional("accounts", AttributeType::map(AttributeType::string())).build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -4302,9 +4520,13 @@ fn postfix_access_type_errors_match_validate_across_sibling_files() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let directory = tempfile::tempdir().unwrap();
@@ -4425,13 +4647,15 @@ fn module_call_attribute_typo_in_resource_value_uses_expanded_binding_index() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let consumer_schema = ResourceSchema::new("test.Consumer")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "target_group_arn",
-            AttributeType::string(),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target_group_arn", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", consumer_schema);
+    schemas.insert(
+        "awscc",
+        consumer_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -4489,13 +4713,15 @@ fn schema_attribute_typo_in_module_call_argument_is_reported() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "target_group_arn",
-            AttributeType::string(),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target_group_arn", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", target_group_schema);
+    schemas.insert(
+        "awscc",
+        target_group_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -4563,13 +4789,15 @@ fn module_call_argument_attribute_typo_is_reported_without_a_base_path() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "target_group_arn",
-            AttributeType::string(),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target_group_arn", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", target_group_schema);
+    schemas.insert(
+        "awscc",
+        target_group_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let source = r#"let consumer = use { source = '../consumer_module' }
 
@@ -4621,30 +4849,42 @@ fn module_boundary_identity_engine() -> DiagnosticEngine {
         )
     };
     let vpc = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", identity("ec2.Vpc", "Id")).build());
     let security_group = ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")))
-        .attribute(AttributeSchema::new(
-            "group_id",
-            identity("ec2.SecurityGroup", "Id"),
-        ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", identity("ec2.Vpc", "Id")).build())
+        .attribute(
+            AttributeSchema::optional("group_id", identity("ec2.SecurityGroup", "Id")).build(),
+        );
     let log_group = ResourceSchema::new("logs.LogGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "arn",
-            identity("logs.LogGroup", "Arn"),
-        ));
-    let hosted_zone = ResourceSchema::new("route53.HostedZone").attribute(AttributeSchema::new(
-        "name",
-        AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
-    ));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("arn", identity("logs.LogGroup", "Arn")).build());
+    let hosted_zone = ResourceSchema::new("route53.HostedZone").attribute(
+        AttributeSchema::optional(
+            "name",
+            AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+        )
+        .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", vpc);
-    schemas.insert("aws", security_group);
-    schemas.insert("aws", log_group);
-    schemas.insert("aws", hosted_zone);
+    schemas.insert("aws", vpc.validate().expect("schema fixture must be valid"));
+    schemas.insert(
+        "aws",
+        security_group
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "aws",
+        log_group.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "aws",
+        hosted_zone
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     custom_engine(schemas)
 }
 
@@ -5213,14 +5453,18 @@ fn bare_structural_handle_is_a_real_engine_parse_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.network")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let source = r#"
@@ -5259,14 +5503,18 @@ fn sibling_bare_structural_handle_is_a_real_engine_parse_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.network")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let tmp = tempfile::tempdir().unwrap();
@@ -5310,14 +5558,18 @@ fn module_argument_substitution_error_is_anchored_to_the_authored_argument() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Thing")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string())),
+        (ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("identifier", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Consumer")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let tmp = tempfile::tempdir().unwrap();
@@ -5433,7 +5685,9 @@ fn nested_bare_handle_fixture() -> (DiagnosticEngine, tempfile::TempDir, String)
     schemas.insert(
         "mock",
         ResourceSchema::new("test.network")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let main = "let a = use { source = './a' }\na {}\n".to_string();
@@ -5527,8 +5781,10 @@ fn bare_structural_handle_for_string_module_argument_is_an_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.network")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let tmp = tempfile::tempdir().unwrap();
@@ -6670,10 +6926,14 @@ fn coalesce_resource_engine() -> DiagnosticEngine {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("comment", AttributeType::string()))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     custom_engine(schemas)
 }
@@ -6709,12 +6969,14 @@ fn for_iterable_coalesce_rejects_wrong_typed_default() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            )),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let source = r#"provider mock {}
 
@@ -7605,16 +7867,19 @@ fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
     let bucket_name = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("BucketName")),
+        carina_core::schema::TypeIdentity::bare("BucketName"),
         Some("^prod-[a-z0-9]+$".to_string()),
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let schema = ResourceSchema::new("s3.bucket")
-        .attribute(AttributeSchema::new("bucket_name", bucket_name));
+        .attribute(AttributeSchema::optional("bucket_name", bucket_name).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -7646,12 +7911,18 @@ fn lsp_secret_value_constraint_diagnostic_is_masked() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let plaintext = "lsp-secret-plaintext";
-    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
-        "password",
-        AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
-    ));
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(
+        AttributeSchema::optional(
+            "password",
+            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+        )
+        .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(&format!(
         "test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}\n"
@@ -7680,17 +7951,23 @@ fn lsp_nested_secret_value_constraint_diagnostic_is_masked() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let plaintext = "nested-lsp-secret-plaintext";
-    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
-        "passwords",
-        AttributeType::list(AttributeType::refined_string(
-            None,
-            None,
-            Some((Some(2), Some(4))),
-            None,
-        )),
-    ));
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(
+        AttributeSchema::optional(
+            "passwords",
+            AttributeType::list(AttributeType::refined_string(
+                None,
+                None,
+                Some((Some(2), Some(4))),
+                None,
+            )),
+        )
+        .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
     let doc = create_document(&format!(
         "test.test.SecretHolder {{\n  passwords = [secret('{plaintext}')]\n}}\n"
@@ -7870,14 +8147,25 @@ fn unreferenced_binding_is_still_flagged_unused() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "awscc",
-        ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+        (ResourceSchema::new("s3.Bucket").attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
@@ -7910,9 +8198,12 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
 
     // Schema: registry_prod.account_id is String.
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", AttributeType::string()));
+        .attribute(AttributeSchema::optional("account_id", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -7946,13 +8237,13 @@ fn exports_ref_type_mismatch_displays_resolved_schema_name() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new(
-            "value",
-            AttributeType::ref_("S".to_string()),
-        ))
+        .attribute(AttributeSchema::optional("value", AttributeType::ref_("S".to_string())).build())
         .with_def("S", AttributeType::string());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -7989,55 +8280,70 @@ fn attributes_sibling_resource_engine() -> DiagnosticEngine {
         AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity, legacy_validator,
     };
 
-    let target_group_schema = ResourceSchema::new("stub.TargetGroup").attribute(
-        AttributeSchema::new("target_group_arn", AttributeType::string()),
-    );
+    let target_group_schema = ResourceSchema::new("stub.TargetGroup")
+        .attribute(AttributeSchema::optional("target_group_arn", AttributeType::string()).build());
     let vpc_id_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("VpcId")),
+        TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let subnet_id_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("SubnetId")),
+        TypeIdentity::bare("SubnetId"),
         None,
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let vpc_schema = ResourceSchema::new("stub.Vpc")
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_type))
-        .attribute(AttributeSchema::new("subnet_id", subnet_id_type))
-        .attribute(AttributeSchema::new(
-            "config",
-            AttributeType::struct_(
-                "VpcConfig",
-                vec![StructField::new("name", AttributeType::string())],
-            ),
-        ));
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build())
+        .attribute(AttributeSchema::optional("subnet_id", subnet_id_type).build())
+        .attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "VpcConfig",
+                    vec![StructField::optional("name", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        );
     let arn_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("Arn")),
+        TypeIdentity::bare("Arn"),
         None,
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let policy_arn_type = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn"),
         None,
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let role_schema = ResourceSchema::new("stub.Role")
-        .attribute(AttributeSchema::new("arn", arn_type))
-        .attribute(AttributeSchema::new("policy_arn", policy_arn_type));
+        .attribute(AttributeSchema::optional("arn", arn_type).build())
+        .attribute(AttributeSchema::optional("policy_arn", policy_arn_type).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", target_group_schema);
-    schemas.insert("test", vpc_schema);
-    schemas.insert("test", role_schema);
+    schemas.insert(
+        "test",
+        target_group_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        vpc_schema.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        role_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     custom_engine(schemas)
 }
 
@@ -9876,10 +10182,14 @@ fn secret_exports_through_resource_and_module_attributes_are_rejected_across_fil
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("comment", AttributeType::string()))
-            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
 
@@ -9970,9 +10280,11 @@ fn secret_export_does_not_hide_sibling_export_type_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("comment", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let source = r#"let r = mock.test.resource {
@@ -10582,8 +10894,10 @@ fn broken_sibling_uses_source_local_module_reference_fallback() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let main = r#"provider mock {}
@@ -10618,8 +10932,10 @@ fn user_function_reference_arguments_and_returns_use_binding_index_types() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let source = r#"provider mock {}
@@ -10684,8 +11000,10 @@ fn sibling_function_bare_handle_error_is_owned_by_the_function_document() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let functions =
@@ -10719,8 +11037,10 @@ fn sibling_function_handle_field_access_is_valid_in_the_directory_engine() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let engine = custom_engine(schemas);
     let functions = "fn name_of(r: mock.test.resource): String { r.name }\n";
@@ -10749,15 +11069,19 @@ fn structural_ref_engine() -> DiagnosticEngine {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("compute.Instance")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("arn", AttributeType::string())),
+        (ResourceSchema::new("compute.Instance")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("arn", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("parent", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     custom_engine(schemas)
 }

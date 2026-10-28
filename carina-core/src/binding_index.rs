@@ -537,12 +537,12 @@ impl<'a> BindingIndex<'a> {
             // via `get_for`, data sources via `get_for_data_source`.
             // Compositions carry their own statically known attribute map.
             let target = match rref {
-                ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                    registry.get_for(m).map(BindingTarget::Schema)
-                }
-                ResourceRef::DataSource(d) => {
-                    registry.get_for_data_source(d).map(BindingTarget::Schema)
-                }
+                ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => registry
+                    .get_for(m)
+                    .map(|schema| BindingTarget::Schema(schema.as_schema())),
+                ResourceRef::DataSource(d) => registry
+                    .get_for_data_source(d)
+                    .map(|schema| BindingTarget::Schema(schema.as_schema())),
                 ResourceRef::Composition(c) => Some(BindingTarget::Composition(c)),
             };
             let Some(target) = target else {
@@ -2221,7 +2221,7 @@ pub fn managed_binding_stability_from_plan(
                 let changed_attributes = changed_attributes.iter().cloned().collect();
                 let refreshable_attributes = schemas
                     .get(&to.id.provider, &to.id.resource_type, SchemaKind::Resource)
-                    .map(|schema| schema.read_only_attributes())
+                    .map(|schema| schema.as_schema().read_only_attributes())
                     .unwrap_or_default()
                     .into_iter()
                     .map(str::to_string)
@@ -2356,13 +2356,18 @@ mod tests {
 
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
     }
 
     fn registry_with_vpc() -> SchemaRegistry {
         let mut r = SchemaRegistry::new();
-        r.insert("aws", vpc_schema());
+        r.insert(
+            "aws",
+            (vpc_schema())
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
         r
     }
 
@@ -2425,7 +2430,12 @@ let existing = read aws.ec2.Vpc {
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
         let mut registry = SchemaRegistry::new();
-        registry.insert("aws", vpc_schema().as_data_source());
+        registry.insert(
+            "aws",
+            (vpc_schema().as_data_source())
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
 
         let index = BindingIndex::from_parsed(&parsed, &registry);
         let entry = index
@@ -2830,8 +2840,11 @@ let vpc = aws.ec2.Vpc {
                 let mut registry = SchemaRegistry::new();
                 registry.insert(
                     "test",
-                    ResourceSchema::new("source.Node")
-                        .attribute(AttributeSchema::new("value", actual.attr.clone())),
+                    (ResourceSchema::new("source.Node").attribute(
+                        AttributeSchema::optional("value", actual.attr.clone()).build(),
+                    ))
+                    .validate()
+                    .expect("schema fixture must be valid"),
                 );
                 let index = BindingIndex::from_parsed(&parsed, &registry);
                 let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))

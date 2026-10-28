@@ -1,5 +1,5 @@
 //! LSP adapter that runs core's path-tagged validator
-//! ([`carina_core::schema::Schema::validate_collect`]) and anchors
+//! ([`carina_core::schema::EffectiveType::validate_collect`]) and anchors
 //! each error at its source position. The recursive
 //! struct/list-of-struct walk lives entirely in `carina-core` after
 //! #2214; this module just translates `(FieldPath, TypeError)` to LSP
@@ -12,32 +12,30 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use crate::document::Document;
 use crate::position;
 use carina_core::resource::Value;
-use carina_core::schema::{FieldPath, FieldPathStep, ResourceSchema, TypeError};
+use carina_core::schema::{
+    EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
+};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
 impl DiagnosticEngine {
-    /// Run [`carina_core::schema::Schema::validate_collect`] against
+    /// Run [`carina_core::schema::EffectiveType::validate_collect`] against
     /// the resource attribute's schema and translate each
     /// `(FieldPath, TypeError)` into an LSP `Diagnostic` anchored at
     /// the offending source position. The LSP no longer recurses into
     /// nested struct shapes — that responsibility belongs to the core
     /// validator (#2214).
     ///
-    /// `schema_view` carries `ResourceSchema::defs` so a cyclic
-    /// CFN-style `AttributeType::Ref` resolves correctly
-    /// (carina#3345). Construct it via
-    /// [`carina_core::schema::ResourceSchema::schema_view_for`] so
-    /// `defs` stays threaded through every per-keystroke diagnostic
-    /// pass.
+    /// `effective_type` carries both the resource definition map and the
+    /// selected attribute path's input ancestry.
     pub(super) fn validate_struct_value(
         &self,
         doc: &Document,
         attr_name: &str,
         value: &Value,
-        schema_view: &carina_core::schema::Schema,
+        effective_type: &EffectiveType<'_>,
     ) -> Vec<Diagnostic> {
-        let errors = schema_view.validate_collect(value);
+        let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
@@ -179,13 +177,14 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         resource_attrs: &HashMap<String, Value>,
-        schema: &ResourceSchema,
+        schema: &ValidatedResourceSchema,
     ) -> Vec<Diagnostic> {
         use carina_core::schema::Shape;
 
         let mut diagnostics = Vec::new();
 
-        for (attr_name, attr_schema) in schema.attributes() {
+        for attr_schema in schema.effective_attributes() {
+            let attr_name = attr_schema.name();
             // Resource-level validation reports read-only assignments; do not
             // offer authoring-style hints for attributes the user cannot set.
             if attr_schema.is_read_only() {
@@ -198,9 +197,9 @@ impl DiagnosticEngine {
             // `Ref("LifecycleConfiguration")` whose def carries a
             // `List<Ref<Rule>>` field (same bug class as carina#3349).
             let is_list_struct = matches!(
-                schema.shape_of(attr_schema.attr_type()),
+                schema.as_schema().shape_of(attr_schema.field_type()),
                 Shape::List { element_type: inner, .. } if matches!(
-                    schema.shape_of(inner),
+                    schema.as_schema().shape_of(inner),
                     Shape::Struct { .. }
                 )
             );
@@ -327,19 +326,28 @@ fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
 mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::schema::{AttributeType, Schema, validator};
+    use carina_core::schema::{
+        AttributeType, RootlessType, TypeIdentity, ValidatedConfigSchema, validator,
+    };
+
+    fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
+        ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+            .expect("test config type must be valid")
+            .rootless_type("value")
+            .expect("test config type must exist")
+    }
 
     fn tied_string_error(first: TypeError, second: TypeError) -> TypeError {
         let rejecting = |error: TypeError| {
             AttributeType::refined_string_with_validator(
-                None,
+                TypeIdentity::bare("TestValidator"),
                 None,
                 None,
                 validator(move |_| Err(error.clone())),
                 None,
             )
         };
-        Schema::flat(AttributeType::union(vec![
+        pathless_test_type(AttributeType::union(vec![
             rejecting(first),
             rejecting(second),
         ]))

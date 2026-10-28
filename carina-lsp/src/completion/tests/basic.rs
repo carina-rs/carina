@@ -566,6 +566,27 @@ outer {
 }
 
 #[test]
+fn shared_definition_fields_are_offered_only_on_the_writable_reference_path() {
+    let provider = test_provider_with_shared_definition_paths();
+
+    let writable = provider.struct_field_completions("test.shared.resource", &["tags".to_string()]);
+    assert_eq!(
+        writable
+            .iter()
+            .map(|completion| completion.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key"]
+    );
+
+    let read_only =
+        provider.struct_field_completions("test.shared.resource", &["effective_tags".to_string()]);
+    assert!(
+        read_only.is_empty(),
+        "a provider-populated path must not offer its declared-required field"
+    );
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn struct_field_value_completion_for_bool() {
     // Requires the real `awscc.ec2.flow_log` schema so the destination_options
@@ -1352,9 +1373,12 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
     use std::sync::Arc;
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("known_attr", AttributeType::string()));
+        .attribute(AttributeSchema::optional("known_attr", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let regions = vec![CompletionValue {
         value: "aws.Region.ap_northeast_1".to_string(),
         description: "Tokyo".to_string(),
@@ -1448,10 +1472,13 @@ for item in items {
 #[test]
 fn resource_attribute_completion_inside_let_for_expression() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("force_destroy", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("force_destroy", AttributeType::bool()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["aws".to_string()], vec![], vec![]);
     let text = "let xs = for v in vs {\n  aws.s3.Bucket {\n    ";

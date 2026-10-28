@@ -31,8 +31,8 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     fn display_name(&self) -> &str {
         "AWS (deferred-populate test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -64,8 +64,17 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![cert_schema(), rrset_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![cert_schema(), rrset_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -82,49 +91,71 @@ impl ProviderFactory for DeferredPopulateTestFactory {
 /// rule.
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "validation_method",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("status", AttributeType::string()).deferred_populate())
-        .attribute(AttributeSchema::new(
-            "domain_validation_options",
-            AttributeType::list(AttributeType::struct_(
-                "DomainValidation".to_string(),
-                vec![
-                    StructField::new("domain_name", AttributeType::string()),
-                    StructField::new(
-                        "resource_record",
-                        AttributeType::struct_(
-                            "ResourceRecord".to_string(),
-                            vec![
-                                StructField::new("name", AttributeType::string()),
-                                StructField::new("type", AttributeType::string()),
-                                StructField::new("value", AttributeType::string()),
-                            ],
-                        ),
-                    )
-                    .deferred_populate(),
-                    StructField::new("validation_status", AttributeType::string()),
-                ],
-            )),
-        ))
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("validation_method", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("status", AttributeType::string())
+                .deferred_populate()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "domain_validation_options",
+                AttributeType::list(AttributeType::struct_(
+                    "DomainValidation".to_string(),
+                    vec![
+                        StructField::provider_populated("domain_name", AttributeType::string())
+                            .build(),
+                        StructField::provider_populated(
+                            "resource_record",
+                            AttributeType::struct_(
+                                "ResourceRecord".to_string(),
+                                vec![
+                                    StructField::provider_populated(
+                                        "name",
+                                        AttributeType::string(),
+                                    )
+                                    .build(),
+                                    StructField::provider_populated(
+                                        "type",
+                                        AttributeType::string(),
+                                    )
+                                    .build(),
+                                    StructField::provider_populated(
+                                        "value",
+                                        AttributeType::string(),
+                                    )
+                                    .build(),
+                                ],
+                            ),
+                        )
+                        .deferred_populate()
+                        .build(),
+                        StructField::provider_populated(
+                            "validation_status",
+                            AttributeType::string(),
+                        )
+                        .build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
 }
 
 fn rrset_schema() -> ResourceSchema {
     ResourceSchema::new("route53.RecordSet")
-        .attribute(AttributeSchema::new(
-            "hosted_zone_id",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("type", AttributeType::string()))
-        .attribute(AttributeSchema::new("ttl", AttributeType::int()))
-        .attribute(AttributeSchema::new(
-            "resource_records",
-            AttributeType::list(AttributeType::string()),
-        ))
+        .attribute(AttributeSchema::optional("hosted_zone_id", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("ttl", AttributeType::int()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "resource_records",
+                AttributeType::list(AttributeType::string()),
+            )
+            .build(),
+        )
 }
 
 struct NoopProvider;

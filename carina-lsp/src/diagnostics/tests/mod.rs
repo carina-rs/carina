@@ -33,10 +33,8 @@ impl ProviderFactory for RegionConfigFactory {
         self.name
     }
 
-    fn provider_config_attribute_types(
-        &self,
-    ) -> std::collections::HashMap<String, carina_core::schema::AttributeType> {
-        std::collections::HashMap::from([(
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -45,7 +43,8 @@ impl ProviderFactory for RegionConfigFactory {
                 None,
                 None,
             ),
-        )])
+        )]))
+        .expect("test provider config schema must be valid")
     }
 
     fn validate_config(
@@ -79,7 +78,7 @@ impl ProviderFactory for RegionConfigFactory {
         unimplemented!("RegionConfigFactory::create_provider is not used in diagnostics tests")
     }
 
-    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         Vec::new()
     }
 }
@@ -106,25 +105,28 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     let inner_struct = AttributeType::list(AttributeType::struct_(
         "InnerStruct".to_string(),
         vec![
-            StructField::new("leaf_field", AttributeType::string()),
-            StructField::new("leaf_int", AttributeType::int()),
-            StructField::new("provider_leaf", AttributeType::string()).read_only(),
+            StructField::optional("leaf_field", AttributeType::string()).build(),
+            StructField::optional("leaf_int", AttributeType::int()).build(),
+            StructField::provider_populated("provider_leaf", AttributeType::string()).build(),
         ],
     ));
 
     let outer_struct = AttributeType::list(AttributeType::struct_(
         "OuterStruct".to_string(),
         vec![
-            StructField::new("inner", inner_struct),
-            StructField::new("outer_field", AttributeType::string()),
+            StructField::optional("inner", inner_struct).build(),
+            StructField::optional("outer_field", AttributeType::string()).build(),
         ],
     ));
 
     let schema = ResourceSchema::new("nested.resource")
-        .attribute(AttributeSchema::new("outer", outer_struct));
+        .attribute(AttributeSchema::optional("outer", outer_struct).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -145,16 +147,24 @@ pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
         None,
     );
     let schema = ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("status", AttributeType::string()))
-        .attribute(AttributeSchema::new("enum_status", status_enum));
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("enum_status", status_enum).build());
     let data_source_schema = ResourceSchema::new("acm.Certificate")
         .as_data_source()
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("status", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("status", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
-    schemas.insert("aws", data_source_schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "aws",
+        data_source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
 }
 
@@ -164,16 +174,19 @@ pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine 
     };
 
     let iam_policy_arn = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
+        TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn"),
         None,
         None,
         legacy_validator(|_| Ok(())),
         None,
     );
     let schema = ResourceSchema::new("iam.Role")
-        .attribute(AttributeSchema::new("policy_arn", iam_policy_arn));
+        .attribute(AttributeSchema::optional("policy_arn", iam_policy_arn).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
 }
@@ -189,11 +202,14 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
         None,
     );
 
-    let schema =
-        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
+    let schema = ResourceSchema::new("r.mode_holder")
+        .attribute(AttributeSchema::optional("mode", mode_enum).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -217,11 +233,14 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
         None,
     );
 
-    let schema =
-        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
+    let schema = ResourceSchema::new("r.mode_holder")
+        .attribute(AttributeSchema::optional("mode", mode_enum).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -258,11 +277,14 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         None,
     );
 
-    let schema =
-        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_custom));
+    let schema = ResourceSchema::new("r.mode_holder")
+        .attribute(AttributeSchema::optional("mode", mode_custom).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -277,25 +299,29 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     let transition_struct = AttributeType::struct_(
         "Transition".to_string(),
         vec![
-            StructField::new("days", AttributeType::int()),
-            StructField::new("storage_class", AttributeType::string()),
+            StructField::optional("days", AttributeType::int()).build(),
+            StructField::optional("storage_class", AttributeType::string()).build(),
         ],
     );
 
     let config_struct = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("transitions", AttributeType::list(transition_struct))
-                .with_block_name("transition"),
-            StructField::new("enabled", AttributeType::bool()),
+            StructField::optional("transitions", AttributeType::list(transition_struct))
+                .with_block_name("transition")
+                .build(),
+            StructField::optional("enabled", AttributeType::bool()).build(),
         ],
     );
 
     let schema = ResourceSchema::new("block.resource")
-        .attribute(AttributeSchema::new("config", config_struct));
+        .attribute(AttributeSchema::optional("config", config_struct).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -319,7 +345,7 @@ pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
     let lifecycle_def = AttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "rules",
                 AttributeType::list(AttributeType::struct_(
                     "Rule".to_string(),
@@ -330,22 +356,29 @@ pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
                     // struct-field validator never visits the
                     // Ref-typed attribute and the missing `id` slips
                     // through silently.
-                    vec![StructField::new("id", AttributeType::string()).required()],
+                    vec![StructField::required("id", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("rule"),
+            .with_block_name("rule")
+            .build(),
         ],
     );
 
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new(
-            "lifecycle_configuration",
-            AttributeType::ref_("LifecycleConfiguration".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional(
+                "lifecycle_configuration",
+                AttributeType::ref_("LifecycleConfiguration".to_string()),
+            )
+            .build(),
+        )
         .with_def("LifecycleConfiguration", lifecycle_def);
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     DiagnosticEngine::new(
         Arc::new(schemas),

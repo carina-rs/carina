@@ -1441,13 +1441,16 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        crate::schema::ResourceSchema::new("test.resource").attribute(
-            crate::schema::AttributeSchema::new(
+        (crate::schema::ResourceSchema::new("test.resource").attribute(
+            crate::schema::AttributeSchema::optional(
                 "replacement_key",
                 crate::schema::AttributeType::string(),
             )
-            .create_only(),
-        ),
+            .create_only()
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     crate::identifier::compute_anonymous_identifiers_for_test(
         &mut resources,

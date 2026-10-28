@@ -2,7 +2,8 @@ use super::*;
 use crate::parser::StateBlockAddress;
 use crate::resource::{AccessPath, Resource, Subscript, UnknownReason, ValueString};
 use crate::schema::{
-    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, enum_identity,
+    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry,
+    ValidatedConfigSchema, enum_identity,
 };
 use indexmap::IndexMap;
 
@@ -104,12 +105,17 @@ fn detect_anonymous_to_named_renames_for_test(
 
 fn make_s3_bucket_schema() -> ResourceSchema {
     ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()))
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
 }
 
 fn registry_with_s3_bucket() -> SchemaRegistry {
     let mut r = SchemaRegistry::new();
-    r.insert("awscc", make_s3_bucket_schema());
+    r.insert(
+        "awscc",
+        (make_s3_bucket_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     r
 }
 
@@ -158,14 +164,29 @@ fn canonical_eip_domain(provider: &str, raw: &str) -> crate::resource::Canonical
 
 fn route53_record_set_schema() -> ResourceSchema {
     ResourceSchema::new("route53.record_set")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("type", AttributeType::string()).identity())
-        .attribute(AttributeSchema::new("ttl", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "resource_records",
-            AttributeType::list(AttributeType::string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("hosted_zone_id", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("type", AttributeType::string())
+                .identity()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("ttl", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "resource_records",
+                AttributeType::list(AttributeType::string()),
+            )
+            .build(),
+        )
 }
 
 fn route53_record_set_resource(record_type: &str) -> Resource {
@@ -199,9 +220,9 @@ fn route53_state_entry(name: &str) -> AnonymousIdStateInfo {
 
 fn simhash_eip_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
 }
 
 fn simhash_eip_resource(tag_env: &str) -> Resource {
@@ -255,10 +276,17 @@ fn schema_less_anonymous_resources_do_not_create_attribute_derived_conflicts() {
 #[test]
 fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set() {
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("immutable_name", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "name".to_string(),
@@ -275,10 +303,16 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
 fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
     use crate::resource::AccessPath;
 
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name".to_string(),
@@ -295,10 +329,16 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 
 #[test]
 fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .identity()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource
         .prefixes
@@ -312,10 +352,16 @@ fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
 
 #[test]
 fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name_prefix".to_string(),
@@ -330,10 +376,16 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 
 #[test]
 fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .identity()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
     alpha
         .prefixes
@@ -352,10 +404,16 @@ fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
 
 #[test]
 fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .identity()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
     alpha.set_attr(
         "immutable_name_prefix".to_string(),
@@ -380,10 +438,16 @@ fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
 
 #[test]
 fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let resource = |name: ValueString| {
         let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
@@ -430,10 +494,16 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
 
 #[test]
 fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let resource = |name| {
         let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
@@ -455,10 +525,16 @@ fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities()
 
 #[test]
 fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("source", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("source", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let resource = |key: ValueString| {
         let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
@@ -495,10 +571,16 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
 
 #[test]
 fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .identity()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let mut unresolved = Resource::pending_with_provider("mock", "test.resource", None);
     unresolved.set_attr(
         "immutable_name_prefix".to_string(),
@@ -528,8 +610,10 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let resources = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
@@ -552,8 +636,10 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let resources = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
@@ -569,14 +655,22 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
 fn check_allows_stable_named_and_separate_module_instance_resources() {
     use crate::resource::ModuleSource;
 
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("mock", schema);
     registry.insert(
         "mock",
-        ResourceSchema::new("other.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    registry.insert(
+        "mock",
+        (ResourceSchema::new("other.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let mut stable_one = Resource::pending_with_provider("mock", "test.resource", None);
@@ -609,16 +703,15 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let schema = ResourceSchema::new("ec2.Route")
-        .attribute(AttributeSchema::new(
-            "route_table_id",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new(
-            "destination_cidr_block",
-            AttributeType::string(),
-        ));
+        .attribute(AttributeSchema::optional("route_table_id", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("destination_cidr_block", AttributeType::string()).build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let make_resource = || {
@@ -652,16 +745,23 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
             )),
         )],
     )];
-    let providers_awscc = crate::value::canonicalize_provider_configs_with_attribute_types(
-        &providers_awscc,
-        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("aws")),
-    )
-    .unwrap();
-    let providers_aws = crate::value::canonicalize_provider_configs_with_attribute_types(
-        &providers_aws,
-        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("aws")),
-    )
-    .unwrap();
+    let config_schema = || {
+        ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+            "region".to_string(),
+            region_type("aws"),
+        )]))
+        .unwrap()
+    };
+    let providers_awscc =
+        crate::value::canonicalize_provider_configs_with_schemas(&providers_awscc, &|provider| {
+            (provider == "awscc").then(config_schema)
+        })
+        .unwrap();
+    let providers_aws =
+        crate::value::canonicalize_provider_configs_with_schemas(&providers_aws, &|provider| {
+            (provider == "awscc").then(config_schema)
+        })
+        .unwrap();
 
     let mut resources_awscc = vec![make_resource()];
     let mut resources_aws = vec![make_resource()];
@@ -694,10 +794,16 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
 
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
-    let schema = ResourceSchema::new("ec2.Eip")
-        .attribute(AttributeSchema::new("domain", eip_domain_type("awscc")).create_only());
+    let schema = ResourceSchema::new("ec2.Eip").attribute(
+        AttributeSchema::optional("domain", eip_domain_type("awscc"))
+            .create_only()
+            .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -746,13 +852,20 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
     let domain = eip_domain_type("awscc");
     let schema = ResourceSchema::new("ec2.Eip")
         .attribute(
-            AttributeSchema::new("domains", AttributeType::list(domain.clone())).create_only(),
+            AttributeSchema::optional("domains", AttributeType::list(domain.clone()))
+                .create_only()
+                .build(),
         )
         .attribute(
-            AttributeSchema::new("domain_by_name", AttributeType::map(domain)).create_only(),
+            AttributeSchema::optional("domain_by_name", AttributeType::map(domain))
+                .create_only()
+                .build(),
         );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -801,10 +914,21 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
 #[test]
 fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let schema = ResourceSchema::new("ec2.Eip")
-        .attribute(AttributeSchema::new("domain", eip_domain_type("awscc")).create_only())
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("domain", eip_domain_type("awscc"))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -882,10 +1006,21 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
 fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
     let domain = eip_domain_type("awscc");
     let schema = ResourceSchema::new("ec2.Eip")
-        .attribute(AttributeSchema::new("domains", AttributeType::list(domain)).create_only())
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("domains", AttributeType::list(domain))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -981,10 +1116,21 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
 fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
     let domain = eip_domain_type("awscc");
     let schema = ResourceSchema::new("ec2.Eip")
-        .attribute(AttributeSchema::new("domains", AttributeType::list(domain)).create_only())
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("domains", AttributeType::list(domain))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1080,10 +1226,21 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
 fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
     let domain = eip_domain_type("awscc");
     let schema = ResourceSchema::new("ec2.Eip")
-        .attribute(AttributeSchema::new("domains", AttributeType::list(domain)).create_only())
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("domains", AttributeType::list(domain))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let attr_type = eip_domain_type("aws");
     let canonical = crate::resource::EnumValueResolver::new(&attr_type)
@@ -1144,10 +1301,21 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
 #[test]
 fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribute() {
     let schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(AttributeSchema::new("region", region_type("awscc")).create_only())
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("region", region_type("awscc"))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let state_name = "awscc_ec2_subnet_oldhash".to_string();
     let mut resource =
@@ -1374,10 +1542,21 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     // When one create-only property changes but another stays the same,
     // reconciliation should restore the state's identifier.
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("path", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1459,10 +1638,21 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     // When ALL create-only properties differ, no reconciliation (truly new resource)
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("path", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd", None);
     resource.set_attr(
@@ -1510,10 +1700,21 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
     // A unique full match covers no-edit upgrades where the anonymous hash input
     // changed across Carina versions but all create-only values are unchanged.
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("path", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd", None);
     resource.set_attr(
@@ -1554,10 +1755,16 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
 fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     // With only one create-only property, changing it means ALL changed,
     // so no reconciliation (matched=0 or mismatched=0)
-    let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("ec2.Vpc").attribute(
+        AttributeSchema::optional("cidr_block", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "ec2_vpc_aabbccdd", None);
     resource.set_attr(
@@ -1602,9 +1809,12 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     use crate::resource::ModuleSource;
 
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -1654,13 +1864,15 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
 fn test_anonymous_resource_no_create_only_properties() {
     // Resources with no create-only properties should still work as anonymous resources
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        ));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -1709,9 +1921,12 @@ fn test_anonymous_resource_no_create_only_properties() {
 fn test_anonymous_resource_no_create_only_deterministic() {
     // Same attributes should produce the same identifier
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -1755,9 +1970,12 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 fn test_anonymous_resource_no_create_only_collision() {
     // Two identical anonymous resources with no create-only properties should collide
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1797,16 +2015,34 @@ fn test_identity_attribute_prevents_collision() {
     // This simulates route53.record_set where `name` is create-only (same)
     // but `type` is identity (A vs AAAA).
     let schema = ResourceSchema::new("route53.record_set")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("type", AttributeType::string()).identity())
-        .attribute(AttributeSchema::new("ttl", AttributeType::string()))
-        .attribute(AttributeSchema::new(
-            "resource_records",
-            AttributeType::list(AttributeType::string()),
-        ));
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("hosted_zone_id", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("type", AttributeType::string())
+                .identity()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("ttl", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "resource_records",
+                AttributeType::list(AttributeType::string()),
+            )
+            .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1877,7 +2113,12 @@ fn test_identity_attribute_prevents_collision() {
 #[test]
 fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route53_record_set_schema());
+    schemas.insert(
+        "awscc",
+        (route53_record_set_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1924,7 +2165,12 @@ fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
 #[test]
 fn test_reconcile_anonymous_id_full_match_does_not_steal_live_entry() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route53_record_set_schema());
+    schemas.insert(
+        "awscc",
+        (route53_record_set_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2052,8 +2298,16 @@ fn anonymous_identity_discriminator_uses_canonical_hash_suffix_parser() {
 
 fn subnet_route_table_association_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.SubnetRouteTableAssociation")
-        .attribute(AttributeSchema::new("route_table_id", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).create_only())
+        .attribute(
+            AttributeSchema::optional("route_table_id", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("subnet_id", AttributeType::string())
+                .create_only()
+                .build(),
+        )
 }
 
 fn subnet_route_table_association_resource(
@@ -2132,8 +2386,11 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
 }
 
 fn route_schema_with_create_only_route_table() -> ResourceSchema {
-    ResourceSchema::new("ec2.Route")
-        .attribute(AttributeSchema::new("route_table_id", AttributeType::string()).create_only())
+    ResourceSchema::new("ec2.Route").attribute(
+        AttributeSchema::optional("route_table_id", AttributeType::string())
+            .create_only()
+            .build(),
+    )
 }
 
 fn route_state_entry(name: &str, route_table_id: &str) -> AnonymousIdStateInfo {
@@ -2148,7 +2405,12 @@ fn route_state_entry(name: &str, route_table_id: &str) -> AnonymousIdStateInfo {
 #[test]
 fn test_reconcile_does_not_hamming_match_standard_hash_names() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", subnet_route_table_association_schema());
+    schemas.insert(
+        "awscc",
+        (subnet_route_table_association_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let original_names = [
         "awscc_ec2_subnet_route_table_association_aaaaaaaa",
@@ -2199,7 +2461,12 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
 #[test]
 fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", subnet_route_table_association_schema());
+    schemas.insert(
+        "awscc",
+        (subnet_route_table_association_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_names = [
         "awscc_ec2_subnet_route_table_association_aaaaaaaa",
@@ -2260,7 +2527,12 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
 #[test]
 fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let mut simhash_schemas = SchemaRegistry::new();
-    simhash_schemas.insert("awscc", simhash_eip_schema());
+    simhash_schemas.insert(
+        "awscc",
+        simhash_eip_schema()
+            .validate()
+            .expect("simhash EIP schema must be valid"),
+    );
     let mut simhash_resources = vec![Resource::with_provider(
         "awscc",
         "ec2.eip",
@@ -2300,7 +2572,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     );
 
     let mut create_only_schemas = SchemaRegistry::new();
-    create_only_schemas.insert("awscc", route_schema_with_create_only_route_table());
+    create_only_schemas.insert(
+        "awscc",
+        route_schema_with_create_only_route_table()
+            .validate()
+            .expect("route schema must be valid"),
+    );
     let mut create_only_resources = vec![route_with_deferred_route_table(
         "awscc_ec2_route_aaaaaaaa",
         "private_rtb",
@@ -2357,7 +2634,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
 #[test]
 fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let desired_name = "awscc_ec2_route_aaaaaaaa";
     let mut resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
     let state_entries = vec![route_state_entry("awscc_ec2_route_11111111", "rtb-private")];
@@ -2402,7 +2684,12 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
 #[test]
 fn test_reconcile_deferred_create_only_ambiguous_refuses() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", subnet_route_table_association_schema());
+    schemas.insert(
+        "awscc",
+        (subnet_route_table_association_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let original_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
     let mut resources = vec![subnet_route_table_association_resource(
@@ -2454,7 +2741,12 @@ fn test_reconcile_deferred_create_only_ambiguous_refuses() {
 #[test]
 fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let original_name = "awscc_ec2_route_aaaaaaaa";
     let mut resource = Resource::with_provider("awscc", "ec2.Route", original_name, None);
@@ -2498,7 +2790,12 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
 #[test]
 fn test_reconcile_module_argument_passed_root_binding_resolves() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
@@ -2533,7 +2830,12 @@ fn test_reconcile_module_argument_passed_root_binding_resolves() {
 #[test]
 fn test_reconcile_module_intra_module_binding_resolves() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
@@ -2568,7 +2870,12 @@ fn test_reconcile_module_intra_module_binding_resolves() {
 #[test]
 fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
@@ -2603,9 +2910,12 @@ fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
 #[test]
 fn test_reconcile_simhash_tie_refused() {
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let original_name = "awscc_ec2_eip_0000000000000000";
     let mut resources = vec![Resource::with_provider(
         "awscc",
@@ -2736,11 +3046,14 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // When schema has no create-only properties and an attribute changes,
     // Hamming distance reconciliation should match with the closest state entry.
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -2835,7 +3148,12 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 #[test]
 fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", simhash_eip_schema());
+    schemas.insert(
+        "awscc",
+        (simhash_eip_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2884,7 +3202,12 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
 #[test]
 fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", simhash_eip_schema());
+    schemas.insert(
+        "awscc",
+        (simhash_eip_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2951,9 +3274,12 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
 fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     // Completely different resources should not reconcile
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Resource with a computed identifier
     let mut resource =
@@ -2994,10 +3320,17 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     // Case A: Schema has create-only properties, but user didn't set any.
     // Should use SimHash-based Hamming distance reconciliation.
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3201,12 +3534,15 @@ fn test_simhash_all_attributes_changed_large_distance() {
 fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // When multiple state entries exist, reconciliation should pick the closest one
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_team", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_team", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3341,9 +3677,12 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     // If state already has the same identifier, no reconciliation needed
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3393,9 +3732,12 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
 fn test_reconcile_no_create_only_empty_state() {
     // No state entries = no reconciliation
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut resource =
         Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344", None);
@@ -3427,11 +3769,14 @@ fn test_reconcile_no_create_only_empty_state() {
 fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     // Verify that changing one attribute produces a different but nearby identifier
     let schema = ResourceSchema::new("ec2.internet_gateway")
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_team", AttributeType::string()));
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_team", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3489,14 +3834,28 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     // Resources with create-only properties use standard hash,
     // resources without use SimHash. Verify both work side by side.
     let schema_with_co = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()));
+        .attribute(
+            AttributeSchema::optional("cidr_block", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build());
     let schema_without_co = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema_with_co);
-    schemas.insert("awscc", schema_without_co);
+    schemas.insert(
+        "awscc",
+        schema_with_co
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        schema_without_co
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3573,10 +3932,21 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     // Verify that resources WITH create-only properties still use the
     // existing partial-match reconciliation, not Hamming distance.
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("path", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Resource with both create-only props set
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd", None);
@@ -3630,10 +4000,16 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
     // When a create-only attribute has a prefix (e.g., bucket_name_prefix),
     // the anonymous identifier should be based on the prefix, not the
     // randomly generated name. This ensures the hash is stable across runs.
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("s3.Bucket").attribute(
+        AttributeSchema::optional("bucket_name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3674,10 +4050,16 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 #[test]
 fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     // Different prefixes should produce different anonymous identifiers
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("s3.Bucket").attribute(
+        AttributeSchema::optional("bucket_name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -3719,11 +4101,26 @@ fn test_reconcile_skips_let_bound_resources() {
     // Let-bound (named) resources should never be reconciled, even if their
     // name doesn't exist in state. The typed binding marks them as named.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("cidr_ip", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("ip_protocol", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("description", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // A let-bound resource whose name does NOT exist in state
     let mut ingress_new =
@@ -3778,11 +4175,26 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     // reconciliation should skip rather than picking the first match.
     // This prevents a new SG rule from hijacking an unrelated state entry.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("cidr_ip", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("ip_protocol", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("description", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Anonymous resource with a new hash-derived identifier
     let mut new_rule = Resource::with_provider(
@@ -3858,19 +4270,35 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // SimHash reconciliation should match the resource as an in-place update,
     // not a replace (delete+create).
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::string()))
-        .attribute(AttributeSchema::new("address", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("ipam_pool_id", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::new("network_border_group", AttributeType::string()).create_only(),
+            AttributeSchema::optional("address", AttributeType::string())
+                .create_only()
+                .build(),
         )
-        .attribute(AttributeSchema::new("transfer_address", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        ));
+        .attribute(
+            AttributeSchema::optional("ipam_pool_id", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("network_border_group", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("transfer_address", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -3986,11 +4414,26 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     // Both resources are named (let-bound) and already match state entries by name.
     // Reconciliation should leave them unchanged.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
+        .attribute(
+            AttributeSchema::optional("cidr_ip", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("ip_protocol", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("description", AttributeType::string())
+                .create_only()
+                .build(),
+        );
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     // Two named ingress resources with overlapping create-only attributes
     let mut ingress_http =
@@ -4070,10 +4513,16 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
 }
 
 fn make_sso_instance_registry() -> SchemaRegistry {
-    let schema = ResourceSchema::new("sso.Instance")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
+    let schema = ResourceSchema::new("sso.Instance").attribute(
+        AttributeSchema::optional("name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
     let mut r = SchemaRegistry::new();
-    r.insert("awscc", schema);
+    r.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     r
 }
 
@@ -4203,7 +4652,12 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
 #[test]
 fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    schemas.insert(
+        "awscc",
+        (route_schema_with_create_only_route_table())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let mut resources = vec![route_with_deferred_route_table(
         "awscc_ec2_route_aaaaaaaa",
         "private_rtb",
@@ -4251,7 +4705,12 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
 #[test]
 fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", subnet_route_table_association_schema());
+    schemas.insert(
+        "awscc",
+        (subnet_route_table_association_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
     let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
     let mut resource = Resource::with_provider(
@@ -4490,9 +4949,12 @@ fn test_detect_rename_ignores_non_hash_state_names() {
 /// Registry with NO create-only attributes — like `awscc.sso.Instance`.
 fn make_sso_instance_registry_no_create_only() -> SchemaRegistry {
     let schema = ResourceSchema::new("sso.Instance")
-        .attribute(AttributeSchema::new("name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
     let mut r = SchemaRegistry::new();
-    r.insert("awscc", schema);
+    r.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     r
 }
 
@@ -4806,9 +5268,12 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
 #[test]
 fn anonymous_identifier_includes_provider_prefix() {
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -4844,9 +5309,12 @@ fn anonymous_identifier_includes_provider_prefix() {
 #[test]
 fn anonymous_identifier_provider_prefix_for_aws_provider() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("aws", schema);
+    schemas.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
@@ -4882,9 +5350,12 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
 fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     // Schema with NO create-only attrs forces the SimHash-distance branch.
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),

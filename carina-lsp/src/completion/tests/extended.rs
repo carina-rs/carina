@@ -346,13 +346,19 @@ fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
 #[test]
 fn unresolvable_struct_path_preserves_enclosing_resource_binding() {
     let vpc = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build());
     let resource = ResourceSchema::new("review.Resource")
-        .attribute(AttributeSchema::new("policy", AttributeType::string()))
-        .attribute(AttributeSchema::new("a", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("policy", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("a", AttributeType::bool()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", vpc);
-    schemas.insert("test", resource);
+    schemas.insert(
+        "test",
+        vpc.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        resource.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
     let text = concat!(
@@ -440,10 +446,13 @@ fn list_enum_completions() {
     ));
 
     let schema = ResourceSchema::new("list.resource")
-        .attribute(AttributeSchema::new("protocols", list_enum));
+        .attribute(AttributeSchema::optional("protocols", list_enum).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
@@ -603,13 +612,19 @@ fn no_completions_for_unknown_resource_type_in_block() {
 
     // Create a provider with two schemas
     let schema_a = ResourceSchema::new("a.resource")
-        .attribute(AttributeSchema::new("attr_a", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr_a", AttributeType::string()).build());
     let schema_b = ResourceSchema::new("b.resource")
-        .attribute(AttributeSchema::new("attr_b", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr_b", AttributeType::string()).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema_a);
-    schemas.insert("test", schema_b);
+    schemas.insert(
+        "test",
+        schema_a.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        schema_b.validate().expect("schema fixture must be valid"),
+    );
 
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
@@ -764,13 +779,17 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let source_schema = ResourceSchema::new("source.Item")
-        .attribute(AttributeSchema::new(
-            "value",
-            AttributeType::ref_("Text".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("value", AttributeType::ref_("Text".to_string())).build(),
+        )
         .with_def("Text", AttributeType::string());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", source_schema);
+    schemas.insert(
+        "test",
+        source_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
     let target = AttributeType::string();
@@ -1396,11 +1415,14 @@ fn map_key_completions_from_enum_key_type() {
         ),
         AttributeType::map(AttributeType::string()),
     );
-    let schema =
-        ResourceSchema::new("resource").attribute(AttributeSchema::new("condition", map_type));
+    let schema = ResourceSchema::new("resource")
+        .attribute(AttributeSchema::optional("condition", map_type).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
 
@@ -1445,9 +1467,9 @@ fn union_struct_field_completions() {
         AttributeType::struct_(
             "Principal".to_string(),
             vec![
-                StructField::new("service", AttributeType::string()),
-                StructField::new("aws", AttributeType::string()),
-                StructField::new("federated", AttributeType::string()),
+                StructField::optional("service", AttributeType::string()).build(),
+                StructField::optional("aws", AttributeType::string()).build(),
+                StructField::optional("federated", AttributeType::string()).build(),
             ],
         ),
         AttributeType::string(),
@@ -1455,14 +1477,17 @@ fn union_struct_field_completions() {
 
     let statement_type = AttributeType::struct_(
         "Statement".to_string(),
-        vec![StructField::new("principal", principal_type)],
+        vec![StructField::optional("principal", principal_type).build()],
     );
 
     let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::new("statement", statement_type));
+        .attribute(AttributeSchema::optional("statement", statement_type).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
 
@@ -2730,9 +2755,12 @@ fn dynamic_enum_completion_offers_namespaced_prefix() {
         Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
     let schema = ResourceSchema::new("network.Subnet")
-        .attribute(AttributeSchema::new("availability_zone", zone_name));
+        .attribute(AttributeSchema::optional("availability_zone", zone_name).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
     let doc = create_document(
@@ -3046,16 +3074,19 @@ fn exports_map_value_offers_matching_resource_refs() {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", account_id));
+        .attribute(AttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3129,16 +3160,19 @@ fn exports_map_value_multiple_entries_returns_refs() {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", account_id));
+        .attribute(AttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3185,16 +3219,19 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", account_id));
+        .attribute(AttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3241,19 +3278,29 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
     let account_schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", account_id.clone()));
+        .attribute(AttributeSchema::optional("account_id", account_id.clone()).build());
     let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
-        .attribute(AttributeSchema::new("target_id", account_id));
+        .attribute(AttributeSchema::optional("target_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", account_schema);
-    schemas.insert("awscc", consumer_schema);
+    schemas.insert(
+        "awscc",
+        account_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        consumer_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3294,9 +3341,12 @@ fn argument_parameters_include_sibling_file_args() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::string()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3340,19 +3390,29 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
     let account_schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", account_id.clone()));
+        .attribute(AttributeSchema::optional("account_id", account_id.clone()).build());
     let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
-        .attribute(AttributeSchema::new("target_id", account_id));
+        .attribute(AttributeSchema::optional("target_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", account_schema);
-    schemas.insert("awscc", consumer_schema);
+    schemas.insert(
+        "awscc",
+        account_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        consumer_schema
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -3393,9 +3453,12 @@ fn upstream_state_export_suggested_in_value_position() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
@@ -3442,9 +3505,12 @@ fn upstream_state_export_filtered_by_attribute_type() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
@@ -3502,9 +3568,12 @@ fn upstream_state_export_multiple_bindings_and_sibling_exports_file() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
@@ -3574,16 +3643,19 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
         Ok(())
     }
     let vpc_id_type = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop),
         None,
     );
     let schema = ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_type));
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -4447,9 +4519,12 @@ fn value_position_filters_literal_union_by_lifted_string_type() {
     );
 
     let int_schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("count", AttributeType::int()));
+        .attribute(AttributeSchema::optional("count", AttributeType::int()).build());
     let mut int_schemas = SchemaRegistry::new();
-    int_schemas.insert("test", int_schema);
+    int_schemas.insert(
+        "test",
+        int_schema.validate().expect("test schema must be valid"),
+    );
     let int_provider = CompletionProvider::new(
         Arc::new(int_schemas),
         vec!["test".to_string()],

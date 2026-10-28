@@ -27,7 +27,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    ValidatedResourceSchema, legacy_validator,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
@@ -58,7 +59,10 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
 
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     schemas
 }
 
@@ -72,7 +76,7 @@ fn fixture_enum_segment_as_aws_value(s: &str) -> String {
 /// the schemas. The CLI pipeline keys schemas by provider, so each
 /// distinct prefix (`test`, `aws`, ...) needs its own factory entry.
 fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
-    let mut by_provider: HashMap<String, Vec<ResourceSchema>> = HashMap::new();
+    let mut by_provider: HashMap<String, Vec<ValidatedResourceSchema>> = HashMap::new();
     for (provider, _resource_type, _kind, schema) in schemas.iter() {
         let provider = provider.to_string();
         by_provider
@@ -360,8 +364,10 @@ inner { x = a }
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let expected = "cannot assign mock.test.resource to 'x': expected Int";
 
@@ -435,8 +441,10 @@ mock.test.resource { name = f(r.name) }
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     for (name, source) in [("fx1", fx1), ("fn14", fn14)] {
@@ -626,8 +634,8 @@ let instance = checked {
     .expect("write root configuration");
 
     let producer = ResourceSchema::new("r.producer")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build());
     (fixture, single_schema_map(producer))
 }
 
@@ -806,7 +814,7 @@ fn cli_messages_contain_ci(diags: &[String], substring: &str) -> bool {
 
 struct TestProviderFactory {
     name: String,
-    schemas: Vec<ResourceSchema>,
+    schemas: Vec<ValidatedResourceSchema>,
 }
 
 impl ProviderFactory for TestProviderFactory {
@@ -818,8 +826,8 @@ impl ProviderFactory for TestProviderFactory {
         "Test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -849,7 +857,7 @@ impl ProviderFactory for TestProviderFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         self.schemas.clone()
     }
 }
@@ -936,8 +944,8 @@ fn enum_schemas() -> SchemaRegistry {
     );
     single_schema_map(
         ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("mode", mode)),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("mode", mode).build()),
     )
 }
 
@@ -1055,8 +1063,8 @@ fn region_schemas() -> SchemaRegistry {
 
     single_schema_map(
         ResourceSchema::new("r.region_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("region", region_custom)),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("region", region_custom).build()),
     )
 }
 
@@ -1161,20 +1169,20 @@ test.r.region_holder {
 fn nested_struct_schemas() -> SchemaRegistry {
     let inner = AttributeType::struct_(
         "Inner".to_string(),
-        vec![StructField::new("leaf", AttributeType::int())],
+        vec![StructField::optional("leaf", AttributeType::int()).build()],
     );
     let outer = AttributeType::struct_(
         "Outer".to_string(),
         vec![
-            StructField::new("inner", inner),
-            StructField::new("label", AttributeType::string()),
+            StructField::optional("inner", inner).build(),
+            StructField::optional("label", AttributeType::string()).build(),
         ],
     );
 
     single_schema_map(
         ResourceSchema::new("r.nested")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("outer", outer)),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("outer", outer).build()),
     )
 }
 
@@ -1214,8 +1222,8 @@ fn union_schemas() -> SchemaRegistry {
     let union = AttributeType::union(vec![AttributeType::int(), AttributeType::string()]);
     single_schema_map(
         ResourceSchema::new("r.union")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("value", union)),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("value", union).build()),
     )
 }
 
@@ -1299,8 +1307,8 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
         ),
     ]);
     let schema = ResourceSchema::new("route53.Record")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("hosted_zone_id", hosted_zone_id));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("hosted_zone_id", hosted_zone_id).build());
     let attributes = HashMap::from([
         (
             "name".to_string(),
@@ -1312,6 +1320,9 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
         ),
     ]);
     let core_errors = schema
+        .clone()
+        .validate()
+        .expect("test schema must be valid")
         .validate_with_origins(&attributes, &|name| name == "hosted_zone_id")
         .expect_err("both union alternatives must reject the value");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
@@ -1362,14 +1373,20 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
 
 fn resource_ref_schemas() -> SchemaRegistry {
     let producer = ResourceSchema::new("r.producer")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build());
     let consumer = ResourceSchema::new("r.consumer")
-        .attribute(AttributeSchema::new("name", AttributeType::string()))
-        .attribute(AttributeSchema::new("target_id", AttributeType::string()));
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target_id", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", producer);
-    schemas.insert("test", consumer);
+    schemas.insert(
+        "test",
+        producer.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "test",
+        consumer.validate().expect("schema fixture must be valid"),
+    );
     schemas
 }
 
@@ -1422,8 +1439,10 @@ let upstream = test.r.producer {
 fn read_only_assignment_in_multi_file_directory_fails_validate() {
     let schemas = single_schema_map(
         ResourceSchema::new("r.bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("region", AttributeType::string()).read_only()),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("region", AttributeType::string()).build(),
+            ),
     );
     let fixture = write_fixture(&[
         (
@@ -1467,12 +1486,12 @@ test.r.bucket {
 fn nested_read_only_assignment_in_multi_file_directory_fails_validate() {
     let config = AttributeType::struct_(
         "Config".to_string(),
-        vec![StructField::new("arn", AttributeType::string()).read_only()],
+        vec![StructField::provider_populated("arn", AttributeType::string()).build()],
     );
     let schemas = single_schema_map(
         ResourceSchema::new("r.bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("config", config)),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("config", config).build()),
     );
     let fixture = write_fixture(&[
         (
@@ -1531,8 +1550,8 @@ test.r.bucket {
 fn unknown_attribute_emits_suggestion_parity() {
     let schemas = single_schema_map(
         ResourceSchema::new("r.suggester")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("description", AttributeType::string())),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
     );
     let fixture = write_fixture(&[(
         "main.crn",
@@ -1565,19 +1584,23 @@ test.r.suggester {
 fn list_struct_schemas() -> SchemaRegistry {
     let inner = AttributeType::struct_(
         "Inner".to_string(),
-        vec![StructField::new("leaf", AttributeType::int())],
+        vec![StructField::optional("leaf", AttributeType::int()).build()],
     );
     let outer = AttributeType::list(AttributeType::struct_(
         "Outer".to_string(),
         vec![
-            StructField::new("inner", inner),
-            StructField::new("label", AttributeType::string()),
+            StructField::optional("inner", inner).build(),
+            StructField::optional("label", AttributeType::string()).build(),
         ],
     ));
     single_schema_map(
         ResourceSchema::new("r.list_nested")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("outer", outer)
+                    .with_block_name("outer")
+                    .build(),
+            ),
     )
 }
 
@@ -1618,12 +1641,16 @@ test.r.list_nested {
 fn list_struct_renamed_block_schemas() -> SchemaRegistry {
     let rule = AttributeType::list(AttributeType::struct_(
         "Rule".to_string(),
-        vec![StructField::new("days", AttributeType::int())],
+        vec![StructField::optional("days", AttributeType::int()).build()],
     ));
     single_schema_map(
         ResourceSchema::new("r.renamed_block")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("rules", rule)
+                    .with_block_name("rule")
+                    .build(),
+            ),
     )
 }
 
@@ -1671,7 +1698,7 @@ test.r.renamed_block {
 
 struct WasmStyleProviderFactory {
     name: String,
-    schemas: Vec<ResourceSchema>,
+    schemas: Vec<ValidatedResourceSchema>,
 }
 
 impl ProviderFactory for WasmStyleProviderFactory {
@@ -1681,8 +1708,8 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn display_name(&self) -> &str {
         "WASM-style test provider"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -1722,37 +1749,43 @@ impl ProviderFactory for WasmStyleProviderFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         self.schemas.clone()
     }
 }
 
 fn wasm_style_vpc_schema() -> ResourceSchema {
     let vpc_id_type = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
     ResourceSchema::new("ec2.security_group")
-        .attribute(AttributeSchema::new(
-            "group_description",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_type))
+        .attribute(AttributeSchema::optional("group_description", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build())
 }
 
 fn wasm_style_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awsccmock", wasm_style_vpc_schema());
+    schemas.insert(
+        "awsccmock",
+        (wasm_style_vpc_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     schemas
 }
 
 fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
-        schemas: vec![wasm_style_vpc_schema()],
+        schemas: vec![
+            wasm_style_vpc_schema()
+                .validate()
+                .expect("factory test schema must be valid"),
+        ],
     }) as Box<dyn ProviderFactory>]
 }
 
@@ -1819,28 +1852,35 @@ awsccmock.ec2.security_group {
 
 fn wasm_style_subnet_schema() -> ResourceSchema {
     let vpc_id_type = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(
-        "vpc_ids",
-        AttributeType::list(vpc_id_type),
-    ))
+    ResourceSchema::new("ec2.subnet")
+        .attribute(AttributeSchema::optional("vpc_ids", AttributeType::list(vpc_id_type)).build())
 }
 
 fn wasm_style_subnet_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awsccmock", wasm_style_subnet_schema());
+    schemas.insert(
+        "awsccmock",
+        (wasm_style_subnet_schema())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     schemas
 }
 
 fn wasm_style_subnet_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
-        schemas: vec![wasm_style_subnet_schema()],
+        schemas: vec![
+            wasm_style_subnet_schema()
+                .validate()
+                .expect("factory test schema must be valid"),
+        ],
     }) as Box<dyn ProviderFactory>]
 }
 
@@ -1932,7 +1972,7 @@ fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
 
 fn vpc_id_custom_type_2358() -> AttributeType {
     AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(vpc_id_validate_2358),
@@ -1942,30 +1982,44 @@ fn vpc_id_custom_type_2358() -> AttributeType {
 
 fn vpc_resource_schema_2358() -> ResourceSchema {
     ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom_type_2358()).build())
 }
 
 fn security_group_schema_2358() -> ResourceSchema {
     ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new(
-            "group_description",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
+        .attribute(AttributeSchema::optional("group_description", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom_type_2358()).build())
 }
 
 fn schemas_2358() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc2358", vpc_resource_schema_2358());
-    schemas.insert("awscc2358", security_group_schema_2358());
+    schemas.insert(
+        "awscc2358",
+        (vpc_resource_schema_2358())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc2358",
+        (security_group_schema_2358())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     schemas
 }
 
 fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awscc2358".to_string(),
-        schemas: vec![vpc_resource_schema_2358(), security_group_schema_2358()],
+        schemas: vec![
+            vpc_resource_schema_2358()
+                .validate()
+                .expect("factory test schema must be valid"),
+            security_group_schema_2358()
+                .validate()
+                .expect("factory test schema must be valid"),
+        ],
     }) as Box<dyn ProviderFactory>]
 }
 

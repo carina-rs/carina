@@ -470,8 +470,8 @@ mod tests {
             "Example"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -493,14 +493,28 @@ mod tests {
             Box::pin(async { unreachable!("formatting does not instantiate providers") })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
-            let entries = AttributeType::list(AttributeType::struct_(
-                "Entry",
-                vec![StructField::new("value", AttributeType::string())],
-            ));
-            vec![ResourceSchema::new("example.resource").attribute(
-                AttributeSchema::new("entries", entries).with_block_name(self.block_name),
-            )]
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+                let entries = AttributeType::list(AttributeType::struct_(
+                    "Entry",
+                    vec![StructField::optional("value", AttributeType::string()).build()],
+                ));
+                vec![
+                    ResourceSchema::new("example.resource").attribute(
+                        AttributeSchema::optional("entries", entries)
+                            .with_block_name(self.block_name)
+                            .build(),
+                    ),
+                ]
+            };
+            schema_drafts
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("factory test schema must be valid")
+                })
+                .collect()
         }
     }
 
