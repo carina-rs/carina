@@ -1798,7 +1798,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
 }
 
 #[test]
-fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
+fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runtime() {
     struct BlockInPlaceValidationFactory {
         validated: Arc<AtomicBool>,
         received_region: Arc<Mutex<Option<Value>>>,
@@ -1821,7 +1821,10 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
             &self,
             attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> Result<(), String> {
-            let _handle = tokio::task::block_in_place(|| tokio::runtime::Handle::current());
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(tokio::time::sleep(std::time::Duration::ZERO));
+            });
             self.validated.store(true, Ordering::SeqCst);
             *self.received_region.lock().unwrap() = attributes.get("region").cloned();
             Ok(())
@@ -1869,7 +1872,7 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
     );
 
     normalize_state_with_ctx(&ctx, &provider_configs, &mut HashMap::new())
-        .expect("block-in-place provider validation should run inside a compatible runtime");
+        .expect("provider validation should run inside a time-enabled compatible runtime");
 
     assert!(validated.load(Ordering::SeqCst));
     assert_eq!(

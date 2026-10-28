@@ -461,6 +461,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         // and normalizer creation inside a compatible runtime.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
+            .enable_all()
             .build()
             .expect("failed to build tokio runtime for plan preprocessing");
         for factory in wiring.factories() {

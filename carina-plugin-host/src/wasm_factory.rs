@@ -50,7 +50,10 @@ use carina_core::wait::predicate::AttrPath;
 
 use crate::{secret_seal, wasm_convert};
 use carina_provider_protocol::types as proto;
+#[cfg(any(test, feature = "test-utils"))]
 pub use guest_store::GuestCallBudget;
+#[cfg(not(any(test, feature = "test-utils")))]
+use guest_store::GuestCallBudget;
 use guest_store::{EPOCH_TICK_INTERVAL, GuestStore, HostState, WallBudgetExceeded};
 
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
@@ -7690,10 +7693,7 @@ mod tests {
         const AWS_SDK_CONNECT_TIMEOUT: std::time::Duration =
             std::time::Duration::from_millis(3_100);
         const AWS_SDK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        const AWS_SDK_OPERATION_ATTEMPT_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30);
         const AWS_SDK_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-        const AWS_SDK_MAX_ATTEMPTS: u32 = 3;
 
         // Mirrors carina-provider-aws/src/services/ec2/flow_log.rs on
         // origin/main: up to 12 send() attempts with a 5s IAM-propagation
@@ -7709,20 +7709,16 @@ mod tests {
         const AWS_ACM_DVO_WAIT_ATTEMPTS: u32 = 6;
         const AWS_ACM_DVO_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-        assert_eq!(AWS_SDK_MAX_ATTEMPTS, 3);
-        assert_eq!(
-            AWS_SDK_OPERATION_ATTEMPT_TIMEOUT,
-            std::time::Duration::from_secs(30)
-        );
         let bounded_attempt_worst_case = AWS_SDK_CONNECT_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT)
             + AWS_SDK_READ_TIMEOUT.min(HTTP_API_REQUEST_TIMEOUT);
         assert_eq!(
             bounded_attempt_worst_case,
             std::time::Duration::from_millis(33_100)
         );
-        // In WASM, attempt/operation deadlines are observed only between
-        // attempts, so one SDK operation can overrun its operation timeout by
-        // one bounded connect+read attempt.
+        // In WASM, the operation-attempt and operation deadlines are observed
+        // only between attempts. The attempt deadline therefore does not
+        // tighten this bound, and one SDK operation can overrun its operation
+        // timeout by one bounded connect+read attempt.
         let bounded_sdk_operation_worst_case =
             AWS_SDK_OPERATION_TIMEOUT + bounded_attempt_worst_case;
         assert_eq!(
