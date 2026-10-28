@@ -280,4 +280,4 @@ Run acceptance tests in an account that holds nothing else, and make the script 
 
 ## Next steps
 
-The protocol-level details behind these pages are in [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md).
+[Versioning and Compatibility](/providers/writing/versioning/) explains which Carina releases can load your provider and what to do when the protocol changes. The protocol-level details behind these pages are in [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md).
