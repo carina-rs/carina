@@ -18,6 +18,7 @@ resolver = "2"
 version = "0.7.0"
 repository = "https://github.com/carina-rs/carina"
 homepage = "https://github.com/carina-rs/carina"
+publish = false
 
 # The CI Test job's nextest test-run phase is link-heavy across the
 # workspace's many test binaries. Default `debug = 2` emits full DWARF;
