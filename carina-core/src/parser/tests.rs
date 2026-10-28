@@ -2338,8 +2338,10 @@ fn forward_reference_unused_binding_detection() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let unused = crate::validation::check_unused_bindings(&parsed);
+    let authored =
+        crate::config_loader::AuthoredBindingView::parse_source(input, &ProviderContext::default())
+            .unwrap();
+    let unused = crate::validation::check_unused_bindings(&authored);
     // vpc is referenced by subnet, so should NOT be unused
     assert!(
         !unused.contains(&"vpc".to_string()),
@@ -9061,22 +9063,11 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
 
 #[test]
 fn exports_cross_file_binding_detection() {
-    // Simulate cross-file: exports.crn parsed WITHOUT the let binding
     let exports_input = r#"
 exports {
   vpc_id = vpc.vpc_id
 }
 "#;
-    let exports_parsed = parse(exports_input, &ProviderContext::default()).unwrap();
-    eprintln!("export_params: {:?}", exports_parsed.export_params);
-    assert_eq!(exports_parsed.export_params.len(), 1);
-    // Check if the value is a ResourceRef
-    let value = exports_parsed.export_params[0].value.as_ref().unwrap();
-    eprintln!("value: {:?}", value);
-    let is_ref = matches!(value, Value::Deferred(DeferredValue::ResourceRef { .. }));
-    eprintln!("is_ref: {}", is_ref);
-
-    // Now simulate merged ParsedFile with binding from main.crn
     let main_input = r#"
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -9086,13 +9077,12 @@ let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 "#;
-    let main_parsed = parse(main_input, &ProviderContext::default()).unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.crn"), main_input).unwrap();
+    std::fs::write(fixture.path().join("exports.crn"), exports_input).unwrap();
+    let loaded = crate::config_loader::load_configuration(fixture.path()).unwrap();
 
-    // Merge like config_loader does
-    let mut merged = main_parsed;
-    merged.export_params.extend(exports_parsed.export_params);
-
-    let unused = crate::validation::check_unused_bindings(&merged);
+    let unused = crate::validation::check_unused_bindings(&loaded.authored_bindings);
     assert!(
         unused.is_empty(),
         "vpc should not be unused when referenced from exports in a separate file, got: {:?}",
