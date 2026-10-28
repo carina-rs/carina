@@ -1324,7 +1324,7 @@ fn collect_unused_let_bindings_in_fixtures(
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
         let loaded = load_configuration(&fixture_dir).unwrap();
-        let unused = carina_core::validation::check_unused_bindings(&loaded.parsed);
+        let unused = carina_core::validation::check_unused_bindings(&loaded.authored_bindings);
         if unused.is_empty() {
             continue;
         }
