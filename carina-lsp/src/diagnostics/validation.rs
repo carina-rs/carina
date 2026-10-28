@@ -309,6 +309,75 @@ fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }
         | TypeError::StructFieldError { inner, .. } => severity_for_validation_error(inner),
+        TypeError::UnionAlternativesMismatch { failures } => {
+            if failures
+                .iter()
+                .all(|failure| severity_for_validation_error(failure) == DiagnosticSeverity::ERROR)
+            {
+                DiagnosticSeverity::ERROR
+            } else {
+                DiagnosticSeverity::WARNING
+            }
+        }
         _ => DiagnosticSeverity::WARNING,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::schema::{AttributeType, Schema, validator};
+
+    fn tied_string_error(first: TypeError, second: TypeError) -> TypeError {
+        let rejecting = |error: TypeError| {
+            AttributeType::refined_string_with_validator(
+                None,
+                None,
+                None,
+                validator(move |_| Err(error.clone())),
+                None,
+            )
+        };
+        Schema::flat(AttributeType::union(vec![
+            rejecting(first),
+            rejecting(second),
+        ]))
+        .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
+        .expect_err("both Union arms must reject the value")
+    }
+
+    #[test]
+    fn tied_union_is_warning_when_only_one_arm_is_an_error() {
+        let error = tied_string_error(
+            TypeError::ReadOnlyAttribute {
+                name: "provider_value".to_string(),
+            },
+            TypeError::ValidationFailed {
+                message: "not accepted".to_string(),
+            },
+        );
+
+        assert_eq!(
+            severity_for_validation_error(&error),
+            DiagnosticSeverity::WARNING
+        );
+    }
+
+    #[test]
+    fn tied_union_is_error_when_every_arm_is_an_error() {
+        let error = tied_string_error(
+            TypeError::ReadOnlyAttribute {
+                name: "first".to_string(),
+            },
+            TypeError::ReadOnlyAttribute {
+                name: "second".to_string(),
+            },
+        );
+
+        assert_eq!(
+            severity_for_validation_error(&error),
+            DiagnosticSeverity::ERROR
+        );
     }
 }

@@ -1276,6 +1276,88 @@ test.r.union {
     );
 }
 
+#[test]
+fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
+    let hosted_zone_id = AttributeType::union(vec![
+        AttributeType::enum_(
+            carina_core::schema::enum_identity(
+                "CloudFrontHostedZoneId",
+                Some("test.route53.Record.AliasTarget"),
+            ),
+            Some(vec!["global".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+        AttributeType::refined_string(
+            Some(carina_core::schema::TypeIdentity::new(
+                Some("test"),
+                ["route53", "Record", "AliasTarget"],
+                "Route53HostedZoneId",
+            )),
+            Some("^Z[A-Z0-9]+$".to_string()),
+            None,
+            None,
+        ),
+    ]);
+    let schema = ResourceSchema::new("route53.Record")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("hosted_zone_id", hosted_zone_id));
+    let attributes = HashMap::from([
+        (
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("record".into())),
+        ),
+        (
+            "hosted_zone_id".to_string(),
+            Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into())),
+        ),
+    ]);
+    let core_errors = schema
+        .validate_with_origins(&attributes, &|name| name == "hosted_zone_id")
+        .expect_err("both union alternatives must reject the value");
+    assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
+    let expected = core_errors[0].to_string();
+    assert!(
+        expected.contains("CloudFrontHostedZoneId.global") && expected.contains("/^Z[A-Z0-9]+$/"),
+        "core must retain both tied failures: {expected}"
+    );
+
+    let schemas = single_schema_map(schema);
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "main.crn",
+            r#"test.route53.Record {
+  name = "record"
+  hosted_zone_id = "z14grhdcwa56qt"
+}
+"#,
+        ),
+    ]);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp_matching = lsp
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    let cli_matching = cli
+        .iter()
+        .filter(|diagnostic| diagnostic.contains(&expected))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        lsp_matching.len(),
+        1,
+        "LSP must report the shared message once: {lsp:#?}"
+    );
+    assert_eq!(
+        cli_matching.len(),
+        1,
+        "CLI validate must report the shared message once: {cli:#?}"
+    );
+}
+
 // ============================================================================
 // Scenario 5: ResourceRef across sibling files
 // ============================================================================

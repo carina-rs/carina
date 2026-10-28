@@ -909,24 +909,21 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            // #2309: when the attribute schema is a Enum and
-                            // validation fails, emit a Diagnostic with the structured
-                            // candidate list on `Diagnostic.data` and a range that
-                            // covers the offending value text — both prerequisites
-                            // for the `textDocument/codeAction` quick-fix. Falls
-                            // through to the generic match below for everything
-                            // else (and when the Enum branch can't locate a
-                            // value range).
-                            if let carina_core::schema::Shape::Enum { .. } =
-                                schema.shape_of(attr_schema.attr_type())
-                                && let Some(diag) = build_enum_diagnostic(
-                                    attr_schema.attr_type(),
-                                    attr_value,
-                                    attr_name,
-                                    resource_quoted_string_attrs.contains(attr_name),
-                                    self.find_attribute_value_range(doc, attr_name, scope),
-                                )
-                            {
+                            // #2309: direct Enum attributes use the dedicated
+                            // structured diagnostic path. Union attributes stay in
+                            // the guarded match below so deferred values keep #2847's
+                            // behavior and static values are validated only once.
+                            if matches!(
+                                schema.shape_of(attr_schema.attr_type()),
+                                carina_core::schema::Shape::Enum { .. }
+                            ) && let Some(diag) = build_enum_diagnostic(
+                                &schema,
+                                attr_schema.attr_type(),
+                                attr_value,
+                                attr_name,
+                                resource_quoted_string_attrs.contains(attr_name),
+                                self.find_attribute_value_range(doc, attr_name, scope),
+                            ) {
                                 diagnostics.push(diag);
                                 // Continue past the generic match: this attribute
                                 // is already reported with the richer diagnostic.
@@ -1143,10 +1140,18 @@ impl DiagnosticEngine {
                                 {
                                     let schema_view =
                                         schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view
-                                        .validate(value)
-                                        .err()
-                                        .map(|e| e.with_attribute(attr_name).to_string())
+                                    schema_view.validate(value).err().and_then(|error| {
+                                        let tagged = error.with_attribute(attr_name);
+                                        if let Some(diagnostic) = build_enum_diagnostic_from_error(
+                                            &tagged,
+                                            self.find_attribute_value_range(doc, attr_name, scope),
+                                        ) {
+                                            diagnostics.push(diagnostic);
+                                            None
+                                        } else {
+                                            Some(tagged.to_string())
+                                        }
+                                    })
                                 }
                                 _ => None,
                             };
@@ -1256,6 +1261,7 @@ impl DiagnosticEngine {
                                         | carina_core::schema::TypeError::ValidationFailed { .. }
                                         | carina_core::schema::TypeError::UnknownStructField { .. }
                                         | carina_core::schema::TypeError::UnionStructMismatch { .. }
+                                        | carina_core::schema::TypeError::UnionAlternativesMismatch { .. }
                                         | carina_core::schema::TypeError::StructFieldError { .. }
                                         | carina_core::schema::TypeError::ListItemError { .. }
                                         | carina_core::schema::TypeError::MapValueError { .. }
@@ -1604,7 +1610,8 @@ impl DiagnosticEngine {
     /// whole line.
     ///
     /// Returns `None` for value shapes the LSP code action does not
-    /// support: block-syntax `attr = { ... }`, multi-line lists, or
+    /// support: block-syntax `attr = { ... }`, multi-line lists,
+    /// heredocs, interpolated strings, compound quoted expressions, or
     /// missing-value lines.
     fn find_attribute_value_range(
         &self,
@@ -1656,21 +1663,35 @@ impl DiagnosticEngine {
                 return None;
             }
             let value_start = col;
-            let value_end = if bytes[col] == b'"' {
+            let value_end = if bytes[col..].starts_with(b"<<") {
+                // A heredoc spans multiple lines. Replacing only its `<<MARKER`
+                // opener would leave the body and terminator behind.
+                return None;
+            } else if bytes[col] == b'"' || bytes[col] == b'\'' {
                 // Quoted string literal: include both quotes. Bail
                 // (return None) if the closing quote is missing rather
-                // than guess at a range.
+                // than guess at a range. Interpolated strings are also
+                // excluded because nested expression quotes make this
+                // line-oriented scan unable to prove the full token span.
+                // Single-quoted strings are literal-only in carina.pest.
+                let quote = bytes[col];
                 let mut i = col + 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    // Skip a backslash-escaped char so an inner `\"`
+                while i < bytes.len() && bytes[i] != quote {
+                    // Skip a backslash-escaped quote or backslash so it
                     // doesn't terminate the literal early.
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
                         i += 2;
                         continue;
                     }
+                    if quote == b'"' && bytes[i..].starts_with(b"${") {
+                        return None;
+                    }
                     i += 1;
                 }
                 if i >= bytes.len() {
+                    return None;
+                }
+                if !strip_line_comment(&line[i + 1..]).trim().is_empty() {
                     return None;
                 }
                 i + 1
@@ -1777,11 +1798,11 @@ fn resource_source_range(
     Some((start, lines.len() as u32))
 }
 
+/// Strip a `#` or `//` line comment outside quoted text.
+///
+/// This supports both resource-block brace balancing and checks that only
+/// whitespace or a comment follows a quoted attribute value.
 fn strip_line_comment(line: &str) -> &str {
-    // Conservative: only strip `#` or `//` outside of strings. For source
-    // ranges we only need brace-balance accuracy, so missing a comment
-    // inside a string is acceptable — strings in .crn don't normally
-    // contain unbalanced braces.
     let mut in_string = false;
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -1802,7 +1823,7 @@ fn strip_line_comment(line: &str) -> &str {
     line
 }
 
-/// Build a `Diagnostic` for a failed `Enum` attribute validation,
+/// Build a `Diagnostic` for a failed direct `Enum` attribute validation,
 /// carrying the structured candidate list on `Diagnostic.data` and a
 /// range over the offending value text. Returns `None` when validation
 /// passed, when the value range can't be located (block-syntax,
@@ -1812,16 +1833,15 @@ fn strip_line_comment(line: &str) -> &str {
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
 fn build_enum_diagnostic(
+    resource_schema: &carina_core::schema::ResourceSchema,
     attr_type: &carina_core::schema::AttributeType,
     attr_value: &Value,
     attr_name: &str,
     is_quoted_literal: bool,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
-    use crate::code_action::{EnumDiagnosticData, EnumDiagnosticKind};
-    // `Enum` carries no `AttributeType::Ref` by construction, so an
-    // empty `defs` is sound here.
-    let err = carina_core::schema::Schema::flat(attr_type.clone())
+    let err = resource_schema
+        .schema_view_for(attr_type.clone())
         .validate(attr_value)
         .err()?;
     let tagged = err.with_attribute(attr_name);
@@ -1832,26 +1852,20 @@ fn build_enum_diagnostic(
     } else {
         tagged
     };
-    let (kind, expected_variants) = match &reshaped {
-        carina_core::schema::TypeError::InvalidEnumVariant { expected, .. } => {
-            (EnumDiagnosticKind::BareInvalid, expected.clone())
-        }
-        carina_core::schema::TypeError::StringLiteralExpectedEnum { expected, .. } => {
-            (EnumDiagnosticKind::StringLiteral, expected.clone())
-        }
-        // The error wasn't an enum-variant mismatch (e.g. TypeMismatch
-        // when a non-string Value was passed to Enum). Skip the
-        // structured payload — the generic match below will surface a
-        // plain message instead.
-        _ => return None,
-    };
+    build_enum_diagnostic_from_error(&reshaped, value_range)
+}
+
+fn build_enum_diagnostic_from_error(
+    error: &carina_core::schema::TypeError,
+    value_range: Option<tower_lsp::lsp_types::Range>,
+) -> Option<Diagnostic> {
+    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
     let range = value_range?;
-    let data = EnumDiagnosticData::new(kind, expected_variants);
     Some(Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::WARNING),
         source: Some("carina".to_string()),
-        message: reshaped.to_string(),
+        message: error.to_string(),
         data: Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize")),
         ..Default::default()
     })
