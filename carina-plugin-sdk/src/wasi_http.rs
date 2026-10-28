@@ -37,7 +37,8 @@ use aws_smithy_types::body::SdkBody;
 
 use wasi::http::outgoing_handler;
 use wasi::http::types::{
-    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
+    ErrorCode, Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
+    http_error_code,
 };
 use wasi::io::streams::StreamError;
 
@@ -45,6 +46,104 @@ use crate::wasi_http_body::{
     BLOCKING_WRITE_AND_FLUSH_MAX_BYTES, RequestBody, chunks_for_blocking_write,
     inject_content_length_header,
 };
+
+/// Whether a failed transport operation could have sent request bytes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SendPhase {
+    /// The request did not leave the guest and is safe to resend.
+    NotSent,
+    /// Some request bytes may have been sent.
+    MaybeSent,
+}
+
+/// Classify a wasi:http error by whether the request could have been sent.
+///
+/// Keep this match exhaustive. A newly added wasi:http error must make an
+/// explicit resend-safety decision here rather than silently inheriting one.
+pub fn send_phase(code: &ErrorCode) -> SendPhase {
+    match code {
+        // DNS has not established a connection.
+        ErrorCode::DnsTimeout => SendPhase::NotSent,
+        ErrorCode::DnsError(..) => SendPhase::NotSent,
+        // Destination selection failures happen before connection setup.
+        ErrorCode::DestinationNotFound => SendPhase::NotSent,
+        ErrorCode::DestinationUnavailable => SendPhase::NotSent,
+        ErrorCode::DestinationIpProhibited => SendPhase::NotSent,
+        ErrorCode::DestinationIpUnroutable => SendPhase::NotSent,
+        // Connection establishment failed before HTTP request bytes existed.
+        ErrorCode::ConnectionRefused => SendPhase::NotSent,
+        // A terminated connection may already have carried request bytes.
+        ErrorCode::ConnectionTerminated => SendPhase::MaybeSent,
+        ErrorCode::ConnectionTimeout => SendPhase::NotSent,
+        // Read and write timeouts can happen after a partial request write.
+        ErrorCode::ConnectionReadTimeout => SendPhase::MaybeSent,
+        ErrorCode::ConnectionWriteTimeout => SendPhase::MaybeSent,
+        // A connection limit can be reported after the implementation accepted work.
+        ErrorCode::ConnectionLimitReached => SendPhase::MaybeSent,
+        // TLS setup precedes HTTP request transmission.
+        ErrorCode::TlsProtocolError => SendPhase::NotSent,
+        ErrorCode::TlsCertificateError => SendPhase::NotSent,
+        ErrorCode::TlsAlertReceived(..) => SendPhase::NotSent,
+        // These request validation failures are defined before transmission.
+        ErrorCode::HttpRequestDenied => SendPhase::NotSent,
+        // Length/body failures can be discovered after a partial body write.
+        ErrorCode::HttpRequestLengthRequired => SendPhase::MaybeSent,
+        ErrorCode::HttpRequestBodySize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpRequestMethodInvalid => SendPhase::NotSent,
+        ErrorCode::HttpRequestUriInvalid => SendPhase::NotSent,
+        ErrorCode::HttpRequestUriTooLong => SendPhase::NotSent,
+        // Header/trailer size failures are conservatively treated as possibly sent.
+        ErrorCode::HttpRequestHeaderSectionSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpRequestHeaderSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpRequestTrailerSectionSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpRequestTrailerSize(..) => SendPhase::MaybeSent,
+        // Every response-side failure necessarily follows request handoff.
+        ErrorCode::HttpResponseIncomplete => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseHeaderSectionSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseHeaderSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseBodySize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseTrailerSectionSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseTrailerSize(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseTransferCoding(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseContentCoding(..) => SendPhase::MaybeSent,
+        ErrorCode::HttpResponseTimeout => SendPhase::MaybeSent,
+        ErrorCode::HttpUpgradeFailed => SendPhase::MaybeSent,
+        // The host uses this for send/body failures; it is intentionally conservative.
+        ErrorCode::HttpProtocolError => SendPhase::MaybeSent,
+        // The specification does not define these as pre-connection failures.
+        ErrorCode::LoopDetected => SendPhase::MaybeSent,
+        ErrorCode::ConfigurationError => SendPhase::MaybeSent,
+        ErrorCode::InternalError(..) => SendPhase::MaybeSent,
+    }
+}
+
+/// A typed wasi:http transport failure retained as an AWS connector source.
+#[derive(Debug)]
+pub struct TransportFailure {
+    phase: SendPhase,
+    code: Option<ErrorCode>,
+    message: String,
+}
+
+impl TransportFailure {
+    /// Return whether request bytes could have been sent.
+    pub fn phase(&self) -> SendPhase {
+        self.phase
+    }
+
+    /// Return the wasi:http error code when the failing API supplied one.
+    pub fn code(&self) -> Option<&ErrorCode> {
+        self.code.as_ref()
+    }
+}
+
+impl fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransportFailure {}
 
 /// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
 /// per-phase wall-clock breakdown of each request to stderr.
@@ -177,11 +276,124 @@ struct WasiResponse {
     body: Vec<u8>,
 }
 
+/// Failure from the shared transport core, classified at its exact origin.
+#[derive(Debug)]
+enum ExecuteError {
+    NotSent {
+        message: String,
+        code: Option<ErrorCode>,
+    },
+    MaybeSent {
+        message: String,
+        code: Option<ErrorCode>,
+    },
+}
+
+impl ExecuteError {
+    fn not_sent(message: impl Into<String>) -> Self {
+        Self::NotSent {
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn maybe_sent(message: impl Into<String>) -> Self {
+        Self::MaybeSent {
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn maybe_sent_with_code(message: impl Into<String>, code: Option<ErrorCode>) -> Self {
+        Self::MaybeSent {
+            message: message.into(),
+            code,
+        }
+    }
+
+    fn from_code(message: impl Into<String>, code: ErrorCode) -> Self {
+        match send_phase(&code) {
+            SendPhase::NotSent => Self::NotSent {
+                message: message.into(),
+                code: Some(code),
+            },
+            SendPhase::MaybeSent => Self::MaybeSent {
+                message: message.into(),
+                code: Some(code),
+            },
+        }
+    }
+
+    fn phase(&self) -> SendPhase {
+        match self {
+            Self::NotSent { .. } => SendPhase::NotSent,
+            Self::MaybeSent { .. } => SendPhase::MaybeSent,
+        }
+    }
+
+    fn is_maybe_sent_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::MaybeSent {
+                code: Some(
+                    ErrorCode::DnsTimeout
+                        | ErrorCode::ConnectionTimeout
+                        | ErrorCode::ConnectionReadTimeout
+                        | ErrorCode::ConnectionWriteTimeout
+                        | ErrorCode::HttpResponseTimeout
+                ),
+                ..
+            }
+        )
+    }
+}
+
+impl fmt::Display for ExecuteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSent { message, .. } | Self::MaybeSent { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl From<ExecuteError> for TransportFailure {
+    fn from(error: ExecuteError) -> Self {
+        match error {
+            ExecuteError::NotSent { message, code } => Self {
+                phase: SendPhase::NotSent,
+                code,
+                message,
+            },
+            ExecuteError::MaybeSent { message, code } => Self {
+                phase: SendPhase::MaybeSent,
+                code,
+                message,
+            },
+        }
+    }
+}
+
+fn connector_error(error: ExecuteError) -> ConnectorError {
+    let phase = error.phase();
+    let is_timeout = error.is_maybe_sent_timeout();
+    let source = Box::new(TransportFailure::from(error));
+    if phase == SendPhase::NotSent {
+        ConnectorError::io(source)
+    } else if is_timeout {
+        ConnectorError::timeout(source)
+    } else {
+        ConnectorError::other(source, None)
+    }
+}
+
 /// The single wasi:http transport core. Both the generic
 /// [`send_request`] and the AWS SDK [`WasiHttpClient`] funnel through
 /// here, so the body-framing fixes (carina#3254 / #3320 / #3318) apply
 /// to every caller.
-fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<WasiResponse, String> {
+fn execute(
+    request: WasiRequest,
+    options: Option<RequestOptions>,
+) -> Result<WasiResponse, ExecuteError> {
     let trace = trace_enabled();
     let req_start = if trace { Some(Instant::now()) } else { None };
     let trace_method = if trace {
@@ -218,7 +430,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     let parsed = request
         .uri
         .parse::<http::Uri>()
-        .map_err(|e| format!("Invalid URI: {e}"))?;
+        .map_err(|e| ExecuteError::not_sent(format!("Invalid URI: {e}")))?;
 
     // Classify the body into Empty / Sized so the wire framing is
     // explicit. Without this, body-less requests lose their length
@@ -231,8 +443,8 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     // Build headers, injecting `content-length` if the caller omitted it.
     let mut headers_list = request.headers;
     inject_content_length_header(&mut headers_list, &body);
-    let fields =
-        Fields::from_list(&headers_list).map_err(|e| format!("Failed to create headers: {e:?}"))?;
+    let fields = Fields::from_list(&headers_list)
+        .map_err(|e| ExecuteError::not_sent(format!("Failed to create headers: {e:?}")))?;
 
     // Create outgoing request
     let outgoing_req = OutgoingRequest::new(fields);
@@ -252,7 +464,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     };
     outgoing_req
         .set_method(&method)
-        .map_err(|()| "Failed to set method".to_string())?;
+        .map_err(|()| ExecuteError::not_sent("Failed to set method"))?;
 
     // Set scheme
     let scheme = match parsed.scheme_str() {
@@ -263,13 +475,13 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     };
     outgoing_req
         .set_scheme(scheme.as_ref())
-        .map_err(|()| "Failed to set scheme".to_string())?;
+        .map_err(|()| ExecuteError::not_sent("Failed to set scheme"))?;
 
     // Set authority (host[:port])
     let authority = parsed.authority().map(|a| a.to_string());
     outgoing_req
         .set_authority(authority.as_deref())
-        .map_err(|()| "Failed to set authority".to_string())?;
+        .map_err(|()| ExecuteError::not_sent("Failed to set authority"))?;
 
     // Set path with query
     let path_and_query = parsed
@@ -278,7 +490,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
         .unwrap_or_else(|| "/".to_string());
     outgoing_req
         .set_path_with_query(Some(&path_and_query))
-        .map_err(|()| "Failed to set path".to_string())?;
+        .map_err(|()| ExecuteError::not_sent("Failed to set path"))?;
 
     let t_setup_done = req_start.map(|s| s.elapsed());
 
@@ -292,7 +504,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     let body_len = body.content_length();
     let outgoing_body = outgoing_req
         .body()
-        .map_err(|()| "Failed to get outgoing body".to_string())?;
+        .map_err(|()| ExecuteError::not_sent("Failed to get outgoing body"))?;
 
     // Hand the request off to the host *first* so the hyper task that
     // consumes the body channel is spawned before we start writing.
@@ -303,7 +515,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     // impl would block forever — the carina-rs/carina#3320 20-minute
     // host I/O hang.
     let future_response = outgoing_handler::handle(outgoing_req, options)
-        .map_err(|e| format!("outgoing-handler error: {e:?}"))?;
+        .map_err(|e| ExecuteError::from_code(format!("outgoing-handler error: {e:?}"), e))?;
     let t_handle_done = req_start.map(|s| s.elapsed());
 
     // Now ship the body. The hyper consumer is live, so each
@@ -312,7 +524,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     write_body(&outgoing_body, body.as_bytes())?;
     let t_write_body_done = req_start.map(|s| s.elapsed());
     OutgoingBody::finish(outgoing_body, None)
-        .map_err(|e| format!("Failed to finish body: {e:?}"))?;
+        .map_err(|e| ExecuteError::from_code(format!("Failed to finish body: {e:?}"), e))?;
     let t_body_finish_done = req_start.map(|s| s.elapsed());
 
     // Wait for the response by polling
@@ -322,9 +534,9 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
 
     let response = future_response
         .get()
-        .ok_or_else(|| "Response not ready after block".to_string())?
-        .map_err(|()| "Response already taken".to_string())?
-        .map_err(|e| format!("HTTP error: {e:?}"))?;
+        .ok_or_else(|| ExecuteError::maybe_sent("Response not ready after block"))?
+        .map_err(|()| ExecuteError::maybe_sent("Response already taken"))?
+        .map_err(|e| ExecuteError::from_code(format!("HTTP error: {e:?}"), e))?;
     let t_get_response_done = req_start.map(|s| s.elapsed());
 
     // Read response status
@@ -342,7 +554,7 @@ fn execute(request: WasiRequest, options: Option<RequestOptions>) -> Result<Wasi
     // Read response body
     let incoming_body = response
         .consume()
-        .map_err(|()| "Failed to consume response body".to_string())?;
+        .map_err(|()| ExecuteError::maybe_sent("Failed to consume response body"))?;
     let response_bytes = read_body(&incoming_body)?;
     let _trailers = IncomingBody::finish(incoming_body);
     let t_read_body_done = req_start.map(|s| s.elapsed());
@@ -405,7 +617,7 @@ pub fn send_request(request: http::Request<Vec<u8>>) -> Result<http::Response<Ve
         body,
     };
 
-    let wasi_resp = execute(wasi_req, None)?;
+    let wasi_resp = execute(wasi_req, None).map_err(|error| error.to_string())?;
 
     let mut builder = http::Response::builder().status(wasi_resp.status);
     for (key, value) in wasi_resp.headers {
@@ -435,8 +647,7 @@ fn make_request(
         body: request.body().bytes().unwrap_or(&[]).to_vec(),
     };
 
-    let wasi_resp =
-        execute(wasi_req, options).map_err(|e| ConnectorError::other(e.into(), None))?;
+    let wasi_resp = execute(wasi_req, options).map_err(connector_error)?;
 
     // Build the AWS SDK Response
     let mut sdk_response = Response::new(
@@ -466,32 +677,44 @@ fn make_request(
 /// entry fails with `cannot enter component instance`. Splitting via
 /// [`chunks_for_blocking_write`] keeps every call inside the
 /// contract, regardless of how large the SDK-buffered body is.
-fn write_body(body: &OutgoingBody, data: &[u8]) -> Result<(), String> {
+fn write_body(body: &OutgoingBody, data: &[u8]) -> Result<(), ExecuteError> {
     let stream = body
         .write()
-        .map_err(|()| "Failed to get output stream".to_string())?;
+        .map_err(|()| ExecuteError::maybe_sent("Failed to get output stream"))?;
     for chunk in chunks_for_blocking_write(data) {
         debug_assert!(chunk.len() <= BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
-        stream
-            .blocking_write_and_flush(chunk)
-            .map_err(|e| format!("Write error: {e:?}"))?;
+        stream.blocking_write_and_flush(chunk).map_err(|error| {
+            let message = format!("Write error: {error:?}");
+            match error {
+                StreamError::LastOperationFailed(io_error) => match http_error_code(&io_error) {
+                    Some(code) => ExecuteError::from_code(message, code),
+                    None => ExecuteError::maybe_sent(message),
+                },
+                StreamError::Closed => ExecuteError::maybe_sent(message),
+            }
+        })?;
     }
     drop(stream);
     Ok(())
 }
 
 /// Read all bytes from an incoming body.
-fn read_body(body: &IncomingBody) -> Result<Vec<u8>, String> {
+fn read_body(body: &IncomingBody) -> Result<Vec<u8>, ExecuteError> {
     let stream = body
         .stream()
-        .map_err(|()| "Failed to get input stream".to_string())?;
+        .map_err(|()| ExecuteError::maybe_sent("Failed to get input stream"))?;
     let mut buf = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
             Ok(chunk) => buf.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
-            Err(e) => {
-                return Err(format!("Read error: {e:?}"));
+            Err(error @ StreamError::LastOperationFailed(..)) => {
+                let message = format!("Read error: {error:?}");
+                let code = match error {
+                    StreamError::LastOperationFailed(io_error) => http_error_code(&io_error),
+                    StreamError::Closed => unreachable!("closed streams are handled above"),
+                };
+                return Err(ExecuteError::maybe_sent_with_code(message, code));
             }
         }
     }

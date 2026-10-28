@@ -374,6 +374,7 @@ carina/
 ├── carina-plugin-sdk/       # SDK for building WASM provider plugins
 ├── carina-plugin-wit/       # WIT interface definitions (git submodule)
 ├── carina-provider-mock/    # Mock provider for testing
+├── carina-provider-mock-http/ # Minimal wasi:http integration-test provider
 ├── carina-provider-protocol/ # Protocol definitions for provider communication
 ├── carina-provider-resolver/ # Resolves and loads provider plugins
 ├── carina-state/            # State management

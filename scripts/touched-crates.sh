@@ -81,6 +81,7 @@ crates=(
     carina-plugin-host
     carina-plugin-sdk
     carina-provider-mock
+    carina-provider-mock-http
     carina-provider-protocol
     carina-provider-resolver
     carina-state
