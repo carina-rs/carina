@@ -15,7 +15,7 @@ use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
     RegistrySignatureProtection, WasmArtifactPath, cache_path_wasm, sha256_file,
 };
-use crate::provider_trust::ProviderLoadIdentity;
+use crate::provider_trust::{ProviderLoadIdentity, ProviderTrust};
 use crate::revision_resolver::cache_path_revision;
 use crate::signing::VerifiedSignerIdentity;
 use crate::user_trust::{UserTrustRecord, user_trust_record_exists};
@@ -437,8 +437,9 @@ pub(crate) enum ArtifactPin<'a, P, R = RegistryLock> {
 }
 
 impl<P, R> ArtifactPin<'_, P, R> {
-    /// Return the lock pin only when the same content/source pair also has a
-    /// valid user-owned trust record, making a machine-local cache eligible.
+    /// Return the lock pin when the cache is safe to reuse. Allow-listed
+    /// sources additionally require a valid user-owned trust record for the
+    /// same content/source pair; other sources cannot gain trust from a record.
     pub(crate) fn pinned(&self) -> Option<(&LockEntry<R>, &P)> {
         match self {
             Self::Pinned {
@@ -447,7 +448,11 @@ impl<P, R> ArtifactPin<'_, P, R> {
                 pin,
                 source,
                 requested_origin_url: _,
-            } if user_trust_record_exists(&lock_entry.sha256, source) => Some((lock_entry, pin)),
+            } if !ProviderTrust::remote_source_is_allowlisted(source)
+                || user_trust_record_exists(&lock_entry.sha256, source) =>
+            {
+                Some((lock_entry, pin))
+            }
             Self::Pinned { .. } => None,
             Self::Unpinned { .. } => None,
         }
@@ -496,6 +501,9 @@ fn record_verified_origin_download(
     signer: Option<&RegistrySignatureProtection>,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
     let source = origin.source().clone();
+    if !ProviderTrust::remote_source_is_allowlisted(&source) {
+        return Ok(());
+    }
     UserTrustRecord::from_origin_download(OriginDownloadProof::new(
         origin,
         sha256.to_string(),

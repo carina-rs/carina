@@ -5908,45 +5908,47 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
     let project_dir = install_lock.project_dir();
     let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
         .map_err(RegistryArtifactError::Invalid)?;
-    let (state, digest) =
-        if path.as_path().exists() && user_trust_record_exists(expected_shasum, source) {
-            match hash_and_check(
-                path.as_path(),
-                expected_shasum,
-                &format!("cached {context}"),
-                project_dir,
-            ) {
-                Ok(digest) => (RegistryArtifactState::Cached { install_lock, path }, digest),
-                Err(error) => {
-                    let _ = install_lock.remove_project_artifact(&path);
-                    return Err(RegistryArtifactError::Invalid(error));
-                }
+    let (state, digest) = if path.as_path().exists()
+        && (!ProviderTrust::remote_source_is_allowlisted(source)
+            || user_trust_record_exists(expected_shasum, source))
+    {
+        match hash_and_check(
+            path.as_path(),
+            expected_shasum,
+            &format!("cached {context}"),
+            project_dir,
+        ) {
+            Ok(digest) => (RegistryArtifactState::Cached { install_lock, path }, digest),
+            Err(error) => {
+                let _ = install_lock.remove_project_artifact(&path);
+                return Err(RegistryArtifactError::Invalid(error));
             }
-        } else {
-            let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
-                RegistryArtifactError::Invalid(format!(
-                    "Failed to stage provider artifact {}: {error}",
-                    path.as_path().display()
-                ))
-            })?;
-            if let Err(error) = http.download_into(download_url, &mut staged) {
-                let message = error.to_string();
-                return Err(if error.is_unavailable() {
-                    RegistryArtifactError::Unavailable(message)
-                } else {
-                    RegistryArtifactError::Invalid(message)
-                });
-            }
-            let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
-                .map_err(RegistryArtifactError::Invalid)?;
-            (
-                RegistryArtifactState::Staged {
-                    artifact: staged,
-                    path,
-                },
-                digest,
-            )
-        };
+        }
+    } else {
+        let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
+            RegistryArtifactError::Invalid(format!(
+                "Failed to stage provider artifact {}: {error}",
+                path.as_path().display()
+            ))
+        })?;
+        if let Err(error) = http.download_into(download_url, &mut staged) {
+            let message = error.to_string();
+            return Err(if error.is_unavailable() {
+                RegistryArtifactError::Unavailable(message)
+            } else {
+                RegistryArtifactError::Invalid(message)
+            });
+        }
+        let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
+            .map_err(RegistryArtifactError::Invalid)?;
+        (
+            RegistryArtifactState::Staged {
+                artifact: staged,
+                path,
+            },
+            digest,
+        )
+    };
     Ok(VerifiedRegistryArtifact { state, digest })
 }
 
@@ -15009,6 +15011,70 @@ transparency_log_present = true
     }
 
     #[test]
+    fn third_party_registry_init_skips_user_trust_and_reuses_cache() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust_parent = tempfile::tempdir().unwrap();
+        let unavailable_trust_dir = trust_parent.path().join("not-a-directory");
+        fs::write(&unavailable_trust_dir, b"sentinel").unwrap();
+        let trust_before = snapshot_tree(trust_parent.path());
+        let _trust_env =
+            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", &unavailable_trust_dir);
+        let source = "example/widget";
+        let version = SIGNED_FIXTURE_VERSION;
+        let versions_url = "https://registry.carina-rs.dev/v1/providers/example/widget/versions";
+        let metadata_url =
+            "https://registry.carina-rs.dev/v1/providers/example/widget/0.0.0-main.1/download";
+        let artifact_url = "https://downloads.example.test/widget.wasm";
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                versions_url,
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
+            )
+            .json(
+                metadata_url,
+                &format!(
+                    r#"{{
+                        "protocols":["1"],
+                        "filename":"widget.wasm",
+                        "download_url":"{artifact_url}",
+                        "shasum":"{shasum}",
+                        "shasum_authored_by":"registry",
+                        "signature":{{
+                            "type":"sigstore-bundle",
+                            "certificate_identity":"{SIGNED_FIXTURE_IDENTITY}",
+                            "certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}",
+                            "bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"
+                        }}
+                    }}"#
+                ),
+            )
+            .response(SIGNED_FIXTURE_BUNDLE_URL, 200, SIGNED_FIXTURE_BUNDLE)
+            .downloadable_bytes(artifact_url, SIGNED_FIXTURE_ARTIFACT);
+        let mut lock = LockFile::default();
+
+        for _ in 0..2 {
+            resolve_provider_with_http(
+                project.path(),
+                &provider_source(source),
+                version,
+                "widget",
+                &mut lock,
+                &http,
+            )
+            .expect("third-party registry init must not require a user trust directory");
+        }
+
+        assert_eq!(http.request_count(artifact_url), 1);
+        assert_eq!(snapshot_tree(trust_parent.path()), trust_before);
+    }
+
+    #[test]
     fn registry_source_prints_first_use_pin_notice_once() {
         const CHILD_ENV: &str = "CARINA_TEST_FIRST_USE_PIN_NOTICE";
         const TEST_NAME: &str =
@@ -17449,6 +17515,69 @@ transparency_log_present = false
     }
 
     #[test]
+    fn third_party_github_init_skips_user_trust_and_reuses_cache() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust_parent = tempfile::tempdir().unwrap();
+        let unavailable_trust_dir = trust_parent.path().join("not-a-directory");
+        fs::write(&unavailable_trust_dir, b"sentinel").unwrap();
+        let trust_before = snapshot_tree(trust_parent.path());
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env =
+            crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", &unavailable_trust_dir);
+        let source = "github.com/carina-test-only/provider";
+        let version = "1.2.3";
+        let origin_bytes = b"third-party provider";
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http = FakeRegistryHttp::default().downloadable_bytes(&wasm_url, origin_bytes);
+        let mut lock = LockFile::default();
+
+        for _ in 0..2 {
+            resolve_provider_with_http(
+                project.path(),
+                &provider_source(source),
+                version,
+                "test",
+                &mut lock,
+                &http,
+            )
+            .expect("third-party GitHub init must not require a user trust directory");
+        }
+
+        assert_eq!(http.request_count(&wasm_url), 1);
+        assert_eq!(snapshot_tree(trust_parent.path()), trust_before);
+    }
+
+    #[test]
+    fn relative_user_trust_record_dir_fails_allowlisted_init() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", "relative/trust");
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let wasm_url = download_url_wasm(&github_source(source), version);
+        let http =
+            FakeRegistryHttp::default().downloadable_bytes(&wasm_url, b"origin-verified provider");
+        let mut lock = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            project.path(),
+            &provider_source(source),
+            version,
+            "aws",
+            &mut lock,
+            &http,
+        )
+        .expect_err("allow-listed init must reject a relative user trust directory");
+
+        assert!(error.contains("CARINA_TRUST_RECORD_DIR"), "{error}");
+        assert!(error.contains("must be an absolute path"), "{error}");
+    }
+
+    #[test]
     fn github_release_origin_escape_fails_without_writing_user_trust() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
@@ -18494,6 +18623,54 @@ transparency_log_present = false
                 line.contains("warning") && line.contains("Failed to parse provider trust record")
             }),
             "a broken record must be surfaced through the notice sink: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn relative_user_trust_record_dir_warns_and_loads_as_untrusted() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", "relative/trust");
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let bytes = b"repository-controlled provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "aws".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let mut emitted = Vec::new();
+
+        let class = block_on(installed.load_with_notice_sink(
+            &no_local_grants(),
+            |line| emitted.push(line.to_string()),
+            |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(
+            emitted.iter().any(|line| {
+                line.contains("warning")
+                    && line.contains("CARINA_TRUST_RECORD_DIR")
+                    && line.contains("must be an absolute path")
+            }),
+            "a relative trust directory must be surfaced through the notice sink: {emitted:?}"
         );
     }
 

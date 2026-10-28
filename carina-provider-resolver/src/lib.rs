@@ -16,7 +16,7 @@ pub use provider_trust::{
     ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust, ProviderTrustClass,
 };
 pub use trusted_local::{GrantParseError, TrustedLocalGrants};
-pub use user_trust::{UserTrustRecord, user_trust_record_dir};
+pub use user_trust::{UserTrustRecord, UserTrustRecordDirError, user_trust_record_dir};
 pub use verified_artifact::{ProviderArtifactBytes, VerifiedArtifact, VerifiedLoad};
 pub use version_resolver::{
     ResolvedVersion, fetch_latest_tag, fetch_release_tags, resolve_from_tags,

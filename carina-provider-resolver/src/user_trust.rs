@@ -140,15 +140,39 @@ impl Error for UserTrustRecordError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTrustRecordDirError {
+    RelativeEnvironmentPath { path: PathBuf },
+}
+
+impl fmt::Display for UserTrustRecordDirError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RelativeEnvironmentPath { path } => write!(
+                formatter,
+                "{TRUST_RECORD_DIR_ENV} must be an absolute path, got {:?}",
+                path
+            ),
+        }
+    }
+}
+
+impl Error for UserTrustRecordDirError {}
+
 /// Get the user-owned provider trust-record directory.
 ///
 /// Checks `CARINA_TRUST_RECORD_DIR` first, then falls back to
-/// `~/.carina/trust/`. Returns `None` if the home directory cannot be
-/// determined.
-pub fn user_trust_record_dir() -> Option<PathBuf> {
-    std::env::var_os(TRUST_RECORD_DIR_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".carina").join("trust")))
+/// `~/.carina/trust/`. Returns an error when the environment value is relative,
+/// and `None` if the home directory cannot be determined.
+pub fn user_trust_record_dir() -> Result<Option<PathBuf>, UserTrustRecordDirError> {
+    if let Some(value) = std::env::var_os(TRUST_RECORD_DIR_ENV) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(UserTrustRecordDirError::RelativeEnvironmentPath { path });
+        }
+        return Ok(Some(path));
+    }
+    Ok(dirs::home_dir().map(|home| home.join(".carina").join("trust")))
 }
 
 impl UserTrustRecord {
@@ -372,11 +396,15 @@ fn trust_record_path(sha256: &str, source: &str) -> Result<PathBuf, UserTrustRec
             "Invalid provider trust-record sha256 {sha256:?}"
         )));
     }
-    let root = user_trust_record_dir().ok_or_else(|| {
-        UserTrustRecordError::message(
-            "Cannot determine the provider trust-record directory; set CARINA_TRUST_RECORD_DIR",
-        )
-    })?;
+    let root = user_trust_record_dir()
+        .map_err(|error| {
+            UserTrustRecordError::with_source("Invalid provider trust-record directory", error)
+        })?
+        .ok_or_else(|| {
+            UserTrustRecordError::message(
+                "Cannot determine the provider trust-record directory; set CARINA_TRUST_RECORD_DIR",
+            )
+        })?;
     let encoded_source = URL_SAFE_NO_PAD.encode(source.as_bytes());
     Ok(root.join(sha256).join(format!("{encoded_source}.json")))
 }
@@ -403,6 +431,24 @@ mod tests {
             ProviderSource::Remote(source) => source.source_key(),
             ProviderSource::File(_) => unreachable!(),
         }
+    }
+
+    #[test]
+    fn user_trust_record_dir_rejects_relative_environment_path() {
+        let _env_guard = crate::test_env_guard();
+        let relative = PathBuf::from("relative/trust");
+        let _trust_env = crate::ScopedEnvVar::set(TRUST_RECORD_DIR_ENV, &relative);
+
+        let error = user_trust_record_dir().unwrap_err();
+
+        assert_eq!(
+            error,
+            UserTrustRecordDirError::RelativeEnvironmentPath {
+                path: relative.clone()
+            }
+        );
+        assert!(error.to_string().contains("must be an absolute path"));
+        assert!(error.to_string().contains("CARINA_TRUST_RECORD_DIR"));
     }
 
     #[test]
