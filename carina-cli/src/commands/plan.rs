@@ -2067,8 +2067,15 @@ impl ReloadedPlanFile {
         &self.contents.provider_configs
     }
 
-    pub(crate) fn provider_configs_mut(&mut self) -> &mut SavedProviderConfigs {
-        &mut self.contents.provider_configs
+    pub(crate) fn rehydrate_provider_config_secrets(
+        &mut self,
+        evaluated: &SavedProviderConfigs,
+    ) -> Result<(), carina_core::value::SecretRehydrationSiteError> {
+        self.contents.provider_configs = self
+            .contents
+            .provider_configs
+            .rehydrate_secrets(evaluated)?;
+        Ok(())
     }
 
     pub(crate) fn plan(&self) -> &Plan {
