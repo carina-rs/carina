@@ -940,24 +940,10 @@ impl ModularPlan {
 
         // Display module effects
         let mut module_sources: Vec<_> = groups.keys().filter(|s| !s.is_root()).cloned().collect();
-        module_sources.sort_by(|a, b| match (a, b) {
-            (
-                ModuleSource::Module {
-                    name: n1,
-                    instance: i1,
-                    ..
-                },
-                ModuleSource::Module {
-                    name: n2,
-                    instance: i2,
-                    ..
-                },
-            ) => (n1, i1).cmp(&(n2, i2)),
-            _ => std::cmp::Ordering::Equal,
-        });
+        module_sources.sort_by(|a, b| a.module_display().cmp(&b.module_display()));
 
         for source in module_sources {
-            if let ModuleSource::Module { name, instance, .. } = &source {
+            if let Some((name, instance)) = source.module_display() {
                 output.push_str(&format!("Module: {} (instance: {})\n", name, instance));
 
                 if let Some(indices) = groups.get(&source) {
@@ -1388,27 +1374,15 @@ mod tests {
         plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
 
         // Module resource
+        let module_source = ModuleSource::saved_module("web_tier", "web");
         let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-                call_path: None,
-            });
+            Resource::new("security_group", "web_sg").with_module_source(module_source.clone());
         plan.add(Effect::Create(resolved(module_resource)));
 
         let modular = ModularPlan::from_plan(plan);
 
         assert_eq!(modular.source_of(0), &ModuleSource::Root);
-        assert_eq!(
-            modular.source_of(1),
-            &ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-                call_path: None,
-            }
-        );
+        assert_eq!(modular.source_of(1), &module_source);
     }
 
     #[test]
@@ -1420,13 +1394,8 @@ mod tests {
         plan.add(Effect::Create(resolved(Resource::new("subnet", "public"))));
 
         // Module resource
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-                call_path: None,
-            });
+        let module_resource = Resource::new("security_group", "web_sg")
+            .with_module_source(ModuleSource::saved_module("web_tier", "web"));
         plan.add(Effect::Create(resolved(module_resource)));
 
         let modular = ModularPlan::from_plan(plan);
@@ -1435,7 +1404,7 @@ mod tests {
         assert_eq!(groups.get(&ModuleSource::Root).unwrap().len(), 2);
         assert_eq!(
             groups
-                .get(&ModuleSource::module("web_tier", "web"))
+                .get(&ModuleSource::saved_module("web_tier", "web"))
                 .unwrap()
                 .len(),
             1

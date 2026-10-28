@@ -1585,6 +1585,63 @@ let instance = plain {{
 }
 
 #[test]
+fn moved_secret_free_composition_skips_join_after_secret_composition_rehydrates() {
+    const SECRET: &str = "PER_COMPOSITION_SKIP_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let secure = tokens {{
+  value = secret("{SECRET}")
+}}
+
+let plain = tokens {{
+  value = "not-secret"
+}}
+"#,
+    ));
+    scenario.write_module(
+        "tokens",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "module-item"
+  comment = value
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[SECRET]);
+
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let secure = tokens {{
+  value = secret("{SECRET}")
+}}
+
+// Only this secret-free call moves; the secret-bearing call stays put.
+let plain = tokens {{
+  value = "not-secret"
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert_success(
+        "saved-plan apply after moving only the secret-free composition",
+        &apply,
+    );
+    assert_output_has_no_plaintext("per-composition saved-plan rehydration", &apply, &[SECRET]);
+}
+
+#[test]
 fn saved_plan_module_repeated_block_secret_is_canonical_masked_and_converges() {
     const ENV: &[(&str, &str)] = &[("MODULE_RULE_SECRET", "module-rule-plain-3973")];
     const PLAINTEXT: &str = "module-rule-plain-3973";

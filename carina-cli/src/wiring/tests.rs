@@ -76,12 +76,99 @@ query {}
         &parsed.compositions,
         std::slice::from_ref(&parsed.data_sources[0]),
         &parsed.data_sources,
-    );
+    )
+    .expect("live module source must have a call path");
 
+    assert_eq!(relevant.len(), 1);
     assert_eq!(
-        relevant,
-        vec![parsed.compositions[0].clone()],
+        relevant[0].call_path().immediate().id,
+        parsed.compositions[0].call_path().immediate().id,
         "a query must be gated only by the parser-minted call path that owns it"
+    );
+}
+
+#[test]
+fn data_source_reads_include_every_ancestor_module_gate() {
+    let tmp = tempfile::tempdir().expect("temporary project");
+    let inner_dir = tmp.path().join("modules/inner");
+    let outer_dir = tmp.path().join("modules/outer");
+    let root_dir = tmp.path().join("root");
+    for directory in [&inner_dir, &outer_dir, &root_dir] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+let matches = read mock.test.Matches {
+  pattern = "fixed"
+}
+
+attributes {
+  marker = "inner"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer_dir.join("main.crn"),
+        format!(
+            r#"
+let inner = use {{
+  source = "{}"
+}}
+
+inner {{}}
+
+attributes {{
+  marker = "outer"
+}}
+"#,
+            inner_dir.display(),
+        ),
+    )
+    .unwrap();
+    let root_body = format!(
+        r#"
+let outer = use {{
+  source = "{}"
+}}
+
+outer {{}}
+"#,
+        outer_dir.display(),
+    );
+    let root_file = root_dir.join("main.crn");
+    std::fs::write(&root_file, &root_body).unwrap();
+
+    let config = carina_core::parser::ProviderContext::default();
+    let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
+        .expect("root fixture must parse");
+    carina_core::module_resolver::resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &config,
+        &SchemaRegistry::new(),
+    )
+    .expect("nested calls must expand");
+
+    let outer = parsed
+        .compositions
+        .iter()
+        .find(|composition| composition.call_path().calls().count() == 1)
+        .expect("outer composition");
+    let relevant = relevant_compositions_for_data_source_reads(
+        &[],
+        &parsed.compositions,
+        &parsed.data_sources,
+        &parsed.data_sources,
+    )
+    .expect("live nested module sources must have call paths");
+
+    assert!(
+        relevant.iter().any(|composition| {
+            composition.call_path().immediate().id == outer.call_path().immediate().id
+        }),
+        "the query's outer ancestor must retain its module gate: {relevant:#?}",
     );
 }
 

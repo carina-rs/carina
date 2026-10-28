@@ -2597,17 +2597,14 @@ pub fn reconcile_anonymous_module_instances(
             }) = &r.module_source
             {
                 let mut remapped_call_path = call_path.clone();
-                if let Some(path) = remapped_call_path.as_deref_mut() {
-                    for call in path.calls_mut() {
-                        if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap)
-                        {
-                            call.instance = rewritten;
-                        }
-                        if let Some(binding) = call.binding.as_deref()
-                            && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
-                        {
-                            call.binding = Some(rewritten);
-                        }
+                for call in remapped_call_path.calls_mut() {
+                    if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                        call.instance = rewritten;
+                    }
+                    if let Some(binding) = call.binding.as_deref()
+                        && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+                    {
+                        call.binding = Some(rewritten);
                     }
                 }
                 r.module_source = Some(crate::resource::ModuleSource::Module {

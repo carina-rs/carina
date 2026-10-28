@@ -688,9 +688,9 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
     named.binding = Some("named".to_string());
 
     let module_one = Resource::pending_with_provider("mock", "other.resource", None)
-        .with_module_source(ModuleSource::module("fixture", "module_one"));
+        .with_module_source(ModuleSource::saved_module("fixture", "module_one"));
     let module_two = Resource::pending_with_provider("mock", "other.resource", None)
-        .with_module_source(ModuleSource::module("fixture", "module_two"));
+        .with_module_source(ModuleSource::saved_module("fixture", "module_two"));
 
     let conflicts = check_attribute_derived_anonymous_resource_conflicts(
         &[stable_one, stable_two, named, module_one, module_two],
@@ -1837,12 +1837,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         "policy_name".to_string(),
         Value::Concrete(ConcreteValue::String("inline".into())),
     );
-    r.module_source = Some(ModuleSource::Module {
-        name: "github_oidc".to_string(),
-        instance: "bootstrap".to_string(),
-        scope: None,
-        call_path: None,
-    });
+    r.module_source = Some(ModuleSource::saved_module("github_oidc", "bootstrap"));
 
     let mut resources = vec![r];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
@@ -2372,12 +2367,7 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
     use crate::resource::{AccessPath, ModuleSource};
 
     let mut resource = Resource::with_provider("awscc", "ec2.Route", name, None);
-    resource.module_source = Some(ModuleSource::Module {
-        name: "mymod".to_string(),
-        instance: "inst".to_string(),
-        scope: None,
-        call_path: None,
-    });
+    resource.module_source = Some(ModuleSource::saved_module("mymod", "inst"));
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {

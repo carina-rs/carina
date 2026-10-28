@@ -2399,28 +2399,78 @@ fn attrs_to_hashmap_clones_values() {
 fn resource_module_source_typed_field() {
     // Real resources that belong to modules should use the typed module_source field
     // instead of storing _module/_module_instance as hidden attributes
+    let module_source = ModuleSource::saved_module("web_tier", "web");
     let resource =
-        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
-            name: "web_tier".to_string(),
-            instance: "web".to_string(),
-            scope: None,
-            call_path: None,
-        });
+        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(module_source.clone());
 
     // Module source info should be in the typed field
-    assert_eq!(
-        resource.module_source,
-        Some(ModuleSource::Module {
-            name: "web_tier".to_string(),
-            instance: "web".to_string(),
-            scope: None,
-            call_path: None,
-        })
-    );
+    assert_eq!(resource.module_source, Some(module_source));
 
     // Module source info should NOT be in attributes
     assert!(!resource.attributes.contains_key("_module"));
     assert!(!resource.attributes.contains_key("_module_instance"));
+}
+
+#[test]
+fn live_module_source_equality_and_hash_use_call_path_identity() {
+    let source = |source_file: &str| {
+        let call = CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(source_file),
+            module_name: "fixture".to_string(),
+            binding: None,
+            instance: "fixture_0000000000000000".to_string(),
+            module_source: Some("./fixture".to_string()),
+            module_directory: None,
+        };
+        ModuleSource::expanded_module(
+            "fixture",
+            "fixture_0000000000000000",
+            ModuleInstanceScope::bound("fixture_0000000000000000"),
+            CompositionCallPath::direct(call),
+        )
+    };
+    let first = source("first.crn");
+    let second = source("second.crn");
+
+    assert_ne!(first, second);
+    assert_eq!(
+        std::collections::HashSet::from([first, second]).len(),
+        2,
+        "identical anonymous module display names must not collapse distinct calls",
+    );
+}
+
+#[test]
+fn module_source_serde_decodes_an_explicit_saved_variant() {
+    let call = CompositionCall {
+        id: crate::parser::ModuleCallId::test_dummy_in("live.crn"),
+        module_name: "fixture".to_string(),
+        binding: Some("instance".to_string()),
+        instance: "instance".to_string(),
+        module_source: Some("./fixture".to_string()),
+        module_directory: None,
+    };
+    let live = ModuleSource::expanded_module(
+        "fixture",
+        "instance",
+        ModuleInstanceScope::bound("instance"),
+        CompositionCallPath::direct(call),
+    );
+    let encoded = serde_json::to_value(&live).expect("serialize live module display metadata");
+    let decoded: ModuleSource =
+        serde_json::from_value(encoded.clone()).expect("deserialize saved module metadata");
+
+    assert!(matches!(
+        &decoded,
+        ModuleSource::SavedModule { name, instance }
+            if name == "fixture" && instance == "instance"
+    ));
+    assert!(decoded.module_call_path().is_none());
+    assert_ne!(live, decoded);
+    assert_eq!(
+        serde_json::to_value(decoded).expect("re-serialize saved module metadata"),
+        encoded,
+    );
 }
 
 #[test]

@@ -628,15 +628,14 @@ impl DiagnosticEngine {
                     && let Some(error) = merged_result
                         .as_ref()
                         .and_then(|result| result.module_error.as_ref())
-                    && let Some(diagnostic) = self.module_resolver_error_diagnostic(
+                {
+                    diagnostics.extend(self.module_resolver_error_diagnostics(
                         doc,
                         parsed,
                         error,
                         base_path,
                         current_file_path,
-                    )
-                {
-                    diagnostics.push(diagnostic);
+                    ));
                 }
             }
             let expansion_succeeded = merged_result

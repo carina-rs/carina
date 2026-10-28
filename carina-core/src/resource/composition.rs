@@ -621,6 +621,8 @@ struct SourceRootRelativePath(PathBuf);
 /// invariant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SavedCompositionSourcePathError {
+    #[error("saved composition source path must not be empty")]
+    Empty,
     #[error(
         "saved composition source path must be relative and contain only normal or parent-directory (`..`) components"
     )]
@@ -643,6 +645,9 @@ impl TryFrom<PathBuf> for SourceRootRelativePath {
     type Error = SavedCompositionSourcePathError;
 
     fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        if path.as_os_str().is_empty() {
+            return Err(SavedCompositionSourcePathError::Empty);
+        }
         let encoded = path.as_os_str().as_encoded_bytes();
         if encoded.contains(&0) {
             return Err(SavedCompositionSourcePathError::ContainsNul);
@@ -726,22 +731,32 @@ impl CompositionSourceIdentityError {
 impl std::fmt::Display for CompositionSourceIdentityError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Canonicalize { path, source: _ } => write!(
-                formatter,
-                "failed to canonicalize composition source path `{}`",
-                path.display(),
-            ),
-            Self::DifferentRoot { path, source_root } => write!(
-                formatter,
-                "composition source path `{}` cannot be expressed relative to source root `{}`",
-                path.display(),
-                source_root.display(),
-            ),
-            Self::InvalidRelativePath { path, source: _ } => write!(
-                formatter,
-                "composition source path `{}` cannot be saved as a source-root-relative path",
-                path.display(),
-            ),
+            Self::Canonicalize { path, source: _ } => {
+                let path = path.to_string_lossy();
+                write!(
+                    formatter,
+                    "failed to canonicalize composition source path `{}`",
+                    path.escape_debug(),
+                )
+            }
+            Self::DifferentRoot { path, source_root } => {
+                let path = path.to_string_lossy();
+                let source_root = source_root.to_string_lossy();
+                write!(
+                    formatter,
+                    "composition source path `{}` cannot be expressed relative to source root `{}`",
+                    path.escape_debug(),
+                    source_root.escape_debug(),
+                )
+            }
+            Self::InvalidRelativePath { path, source: _ } => {
+                let path = path.to_string_lossy();
+                write!(
+                    formatter,
+                    "composition source path `{}` cannot be saved as a source-root-relative path",
+                    path.escape_debug(),
+                )
+            }
         }
     }
 }
@@ -1379,6 +1394,30 @@ mod tests {
 
         right.binding = Some("different".to_string());
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn saved_source_path_rejects_empty_path() {
+        let error = SourceRootRelativePath::try_from(PathBuf::new())
+            .expect_err("an empty path cannot identify a source file");
+
+        assert_eq!(error, SavedCompositionSourcePathError::Empty);
+    }
+
+    #[test]
+    fn composition_source_identity_error_escapes_untrusted_paths() {
+        let escaped_path = PathBuf::from("source\u{1b}[31m.crn");
+        let escaped_root = PathBuf::from("root\nline");
+        let error = CompositionSourceIdentityError::DifferentRoot {
+            path: escaped_path,
+            source_root: escaped_root,
+        };
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(rendered.contains(r"source\u{1b}[31m.crn"), "{rendered:?}");
+        assert!(rendered.contains(r"root\nline"), "{rendered:?}");
     }
 
     #[test]

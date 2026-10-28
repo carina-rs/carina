@@ -5210,7 +5210,7 @@ fn relevant_compositions_for_data_source_reads(
     compositions: &[LiveComposition],
     queries: &[DataSource],
     binding_data_sources: &[DataSource],
-) -> Vec<LiveComposition> {
+) -> Result<Vec<LiveComposition>, AppError> {
     let managed_by_binding = managed
         .iter()
         .filter_map(|resource| {
@@ -5248,18 +5248,21 @@ fn relevant_compositions_for_data_source_reads(
     let mut relevant_indices = HashSet::new();
 
     for data_source in queries {
-        let Some(query_call_path) = data_source
-            .module_source
-            .as_ref()
-            .and_then(ModuleSource::module_call_path)
-        else {
-            continue;
-        };
-        for (index, composition) in compositions.iter().enumerate() {
-            if composition.call_path().is_prefix_of(query_call_path) {
-                relevant_indices.insert(index);
-                pending.extend(get_composition_dependencies(composition));
+        match data_source.module_source.as_ref() {
+            Some(ModuleSource::Module { call_path, .. }) => {
+                for (index, composition) in compositions.iter().enumerate() {
+                    if composition.call_path().is_prefix_of(call_path) {
+                        relevant_indices.insert(index);
+                        pending.extend(get_composition_dependencies(composition));
+                    }
+                }
             }
+            Some(ModuleSource::SavedModule { name, instance }) => {
+                return Err(AppError::Config(format!(
+                    "saved module source `{name}` (instance `{instance}`) cannot gate a live data-source read",
+                )));
+            }
+            Some(ModuleSource::Root) | None => {}
         }
     }
 
@@ -5279,12 +5282,12 @@ fn relevant_compositions_for_data_source_reads(
         }
     }
 
-    compositions
+    Ok(compositions
         .iter()
         .enumerate()
         .filter(|(index, _)| relevant_indices.contains(index))
         .map(|(_, composition)| composition.clone())
-        .collect()
+        .collect())
 }
 
 /// Drive phase-2 data-source reads to a fixpoint.
@@ -5396,7 +5399,7 @@ async fn read_data_sources_phase2_pass(
         inputs.compositions,
         data_sources,
         data_source_bindings.data_sources(),
-    );
+    )?;
     let module_gate =
         carina_core::executor::ModuleConstraintGate::from_live_compositions(&relevant_compositions);
     let resolutions = resolve_data_source_refs_for_refresh_from_refs(

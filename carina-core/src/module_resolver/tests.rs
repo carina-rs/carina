@@ -316,17 +316,18 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
          got {:?}",
         policy.id.identity_state(),
     );
-    assert_eq!(
-        policy.module_source,
-        Some(crate::resource::ModuleSource::Module {
-            name: "policy_module".to_string(),
-            instance: "bootstrap".to_string(),
-            scope: None,
-            call_path: None,
-        }),
-        "module_source must be set so compute_anonymous_identifiers can prepend \
-         the instance prefix when the Pending name is bound"
-    );
+    let Some(crate::resource::ModuleSource::Module {
+        name,
+        instance,
+        call_path,
+        ..
+    }) = &policy.module_source
+    else {
+        panic!("expanded resource must retain its live module source")
+    };
+    assert_eq!(name, "policy_module");
+    assert_eq!(instance, "bootstrap");
+    assert_eq!(&call_path.immediate().id, call.id());
 }
 
 #[test]
@@ -404,15 +405,18 @@ fn test_expand_module_call() {
         sg.get_attr("vpc_id"),
         Some(&Value::Concrete(ConcreteValue::String("vpc-456".into())))
     );
-    assert_eq!(
-        sg.module_source,
-        Some(crate::resource::ModuleSource::Module {
-            name: "test_module".to_string(),
-            instance: "my_instance".to_string(),
-            scope: None,
-            call_path: None,
-        })
-    );
+    let Some(crate::resource::ModuleSource::Module {
+        name,
+        instance,
+        call_path,
+        ..
+    }) = &sg.module_source
+    else {
+        panic!("expanded resource must retain its live module source")
+    };
+    assert_eq!(name, "test_module");
+    assert_eq!(instance, "my_instance");
+    assert_eq!(&call_path.immediate().id, call.id());
     // Module info should NOT be in attributes
     assert!(!sg.attributes.contains_key("_module"));
     assert!(!sg.attributes.contains_key("_module_instance"));
@@ -561,7 +565,16 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             name: "thing".to_string(),
             instance: current_prefix.clone(),
             scope: None,
-            call_path: None,
+            call_path: Box::new(crate::resource::CompositionCallPath::direct(
+                crate::resource::CompositionCall {
+                    id: crate::parser::ModuleCallId::test_dummy_in("reconcile.crn"),
+                    module_name: "thing".to_string(),
+                    binding: None,
+                    instance: current_prefix.clone(),
+                    module_source: None,
+                    module_directory: None,
+                },
+            )),
         }),
         default_tag_keys: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),

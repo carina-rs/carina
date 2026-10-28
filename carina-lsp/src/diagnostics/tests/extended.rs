@@ -6830,6 +6830,49 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 }
 
 #[test]
+fn annotated_nested_mismatches_anchor_each_anonymous_root_call_fallback() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+outer {
+  vpc_id = main_vpc.vpc_id
+}
+
+outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#;
+    std::fs::write(fixture.root.join("main.crn"), root_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", root_source);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatches
+            .iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>(),
+        vec![
+            Range::new(Position::new(6, 0), Position::new(6, 5)),
+            Range::new(Position::new(10, 0), Position::new(10, 5)),
+        ],
+    );
+}
+
+#[test]
 fn unannotated_nested_module_call_is_inferred_when_root_module_is_opened() {
     let engine = module_boundary_identity_engine();
     let fixture = nested_module_call_lsp_fixture("");

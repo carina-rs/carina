@@ -2970,7 +2970,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
     consumer.binding = Some("consumer".to_string());
-    consumer.module_source = Some(ModuleSource::module("checked_module", "root.checked"));
+    consumer.module_source = Some(ModuleSource::saved_module("checked_module", "root.checked"));
     consumer.set_attr("name", string_value("consumer"));
     consumer.set_attr(
         "comment",

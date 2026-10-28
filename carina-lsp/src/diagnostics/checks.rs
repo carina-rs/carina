@@ -1217,18 +1217,20 @@ impl DiagnosticEngine {
     /// Anchor a nested resolver failure at the authored root call that owns
     /// the imported module. Direct-call failures are emitted by the
     /// source-local checks; this fallback owns failures below that call.
-    pub(super) fn module_resolver_error_diagnostic(
+    pub(super) fn module_resolver_error_diagnostics(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
         error: &carina_core::module_resolver::ModuleError,
         base_path: &std::path::Path,
         current_source: Option<&std::path::Path>,
-    ) -> Option<Diagnostic> {
+    ) -> Vec<Diagnostic> {
         // Resolver identities are always file-backed. Without a current-file
         // identity there is no safe way to distinguish coincidentally equal
         // spans from different directory members.
-        let current_source = current_source?;
+        let Some(current_source) = current_source else {
+            return Vec::new();
+        };
         let call_source = error.call_source();
         let error = error.root_cause();
 
@@ -1244,7 +1246,7 @@ impl DiagnosticEngine {
         } {
             // `check_module_calls` runs the same shared handle-sink check and
             // can underline the exact argument expression in this document.
-            return None;
+            return Vec::new();
         }
 
         let relative_message = error.display_relative_to(base_path);
@@ -1264,7 +1266,7 @@ impl DiagnosticEngine {
                     .filter(|line| line.starts_with("module call '"))
                     .collect::<Vec<_>>();
                 if nested_calls.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 (
                     None,
@@ -1309,31 +1311,37 @@ impl DiagnosticEngine {
             | carina_core::module_resolver::ModuleError::BackendInModule
             | carina_core::module_resolver::ModuleError::UpstreamStateInModule
             | carina_core::module_resolver::ModuleError::ExportsInModule
-            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => return None,
+            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => {
+                return Vec::new();
+            }
         };
 
-        let call = parsed.module_calls.iter().find(|call| {
-            let matches_identity =
-                |identity: &carina_core::parser::ModuleCallId| identity == call.id();
-            match call_source {
-                carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
-                    matches_identity(failing)
+        let calls = parsed
+            .module_calls
+            .iter()
+            .filter(|call| {
+                let matches_identity =
+                    |identity: &carina_core::parser::ModuleCallId| identity == call.id();
+                match call_source {
+                    carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
+                        matches_identity(failing)
+                    }
+                    carina_core::module_resolver::ModuleErrorCallSource::Owners(owners) => {
+                        owners.iter().any(matches_identity)
+                    }
+                    carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
                 }
-                carina_core::module_resolver::ModuleErrorCallSource::Owners(owners) => {
-                    owners.iter().any(matches_identity)
-                }
-                carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
-            }
-        })?;
-        match constraint_origin {
-            Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(call_id))
-                if call_id == call.id() =>
-            {
-                return None;
-            }
-            Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(_))
-            | Some(carina_core::module_resolver::ConstraintOrigin::Saved)
-            | None => {}
+            })
+            .filter(|call| {
+                !matches!(
+                    constraint_origin,
+                    Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(call_id))
+                        if call_id == call.id()
+                )
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return Vec::new();
         }
 
         if let Some((line, error_source)) = direct_error_location.filter(|(line, _)| *line > 0) {
@@ -1351,13 +1359,18 @@ impl DiagnosticEngine {
                     .nth(line as usize)
                     .map_or(1, |source| source.chars().count().max(1))
                     as u32;
-                return Some(carina_diagnostic(line, 0, width, severity, message));
+                return vec![carina_diagnostic(line, 0, width, severity, message)];
             }
         }
 
-        let (line, col) = module_call_position(call);
-        let width = call.module_name.chars().count() as u32;
-        Some(carina_diagnostic(line, col, col + width, severity, message))
+        calls
+            .into_iter()
+            .map(|call| {
+                let (line, col) = module_call_position(call);
+                let width = call.module_name.chars().count() as u32;
+                carina_diagnostic(line, col, col + width, severity, message.clone())
+            })
+            .collect()
     }
 
     /// Check tag-key casing against the directory-wide CLI population while

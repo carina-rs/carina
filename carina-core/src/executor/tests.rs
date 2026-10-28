@@ -3581,7 +3581,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
 }
 
 fn mark_module_resource(resource: &mut Resource, instance: &str) {
-    resource.module_source = Some(crate::resource::ModuleSource::module(
+    resource.module_source = Some(crate::resource::ModuleSource::saved_module(
         "checked_module",
         instance,
     ));

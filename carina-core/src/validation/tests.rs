@@ -3798,6 +3798,72 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
 }
 
 #[test]
+fn composition_ref_error_dedup_uses_the_full_call_path() {
+    fn call(source: &str, label: &str) -> CompositionCall {
+        CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(source),
+            module_name: label.to_string(),
+            binding: Some(label.to_string()),
+            instance: label.to_string(),
+            module_source: None,
+            module_directory: None,
+        }
+    }
+
+    let schema_type = |path: &str| TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: path.to_string(),
+        type_name: "Id".to_string(),
+    };
+    let mut source = make_composition("source", &[]);
+    source.signature.attributes.insert(
+        "group_id".to_string(),
+        LiveCompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("sg-123".into())),
+            Some(schema_type("ec2.SecurityGroup")),
+        ),
+    );
+
+    let root = call("root.crn", "root");
+    let immediate = call("immediate.crn", "inner");
+    let make_consumer = |middle_source: &str| {
+        let mut consumer = make_composition("inner", &[]);
+        consumer.call_path = CompositionCallPath::direct(immediate.clone())
+            .prepend(call(middle_source, "middle"))
+            .prepend(root.clone());
+        consumer.signature.arguments.insert(
+            "vpc_id".to_string(),
+            LiveCompositionArgument::from_value(
+                Value::resource_ref("source", "group_id", vec![]),
+                schema_type("ec2.Vpc"),
+                ArgumentOrigin::Defaulted,
+            ),
+        );
+        consumer
+    };
+    let compositions = vec![
+        source,
+        make_consumer("middle-a.crn"),
+        make_consumer("middle-b.crn"),
+    ];
+    let mut parsed = empty_parsed();
+    parsed.compositions = compositions;
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| matches!(error, CompositionRefError::ModuleCall(_)))
+            .count(),
+        2,
+        "paths with the same root and immediate call but different intermediates are distinct: {errors:#?}",
+    );
+}
+
+#[test]
 fn post_expansion_composition_attribute_typo_is_reported_once() {
     let source = make_composition("inner", &["actual"]);
     let mut consumer = make_composition("consumer", &[]);

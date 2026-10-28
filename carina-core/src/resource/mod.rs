@@ -5872,12 +5872,13 @@ impl ModuleInstanceScope {
     }
 }
 
-/// Source of a resource (root or from a module).
+/// Source of a resource (root, a live module call, or saved display metadata).
 ///
-/// `scope` is validation-only expansion provenance. It is excluded from
-/// serialization and from this type's equality/hash semantics so adding the
-/// full nested path changes only anonymous-identity conflict grouping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Live module sources always retain their parser-minted call path. Saved
+/// resources intentionally decode into [`ModuleSource::SavedModule`] because
+/// the portable resource representation stores only display metadata; it must
+/// never masquerade as a live source with a missing identity.
+#[derive(Debug, Clone)]
 pub enum ModuleSource {
     /// Resource defined at the root level
     Root,
@@ -5888,13 +5889,51 @@ pub enum ModuleSource {
         /// Instance binding name (e.g., "web")
         instance: String,
         /// Full nested instance path plus its authored diagnostic form.
-        #[serde(skip)]
         scope: Option<ModuleInstanceScope>,
         /// Parser-minted call path that owns this expanded node.
-        /// Validation/runtime-only; saved resource forms re-expand it.
-        #[serde(skip)]
-        call_path: Option<Box<composition::CompositionCallPath>>,
+        call_path: Box<composition::CompositionCallPath>,
     },
+    /// Display metadata decoded from a persisted resource.
+    SavedModule {
+        /// Module name (e.g., "web_tier")
+        name: String,
+        /// Instance binding name (e.g., "web")
+        instance: String,
+    },
+}
+
+/// Stable persisted representation of [`ModuleSource`]. Live-only identity is
+/// deliberately projected away and decodes into the explicit saved variant.
+#[derive(Serialize, Deserialize)]
+enum SavedModuleSource {
+    Root,
+    Module { name: String, instance: String },
+}
+
+impl Serialize for ModuleSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let saved = match self {
+            Self::Root => SavedModuleSource::Root,
+            Self::Module { name, instance, .. } | Self::SavedModule { name, instance } => {
+                SavedModuleSource::Module {
+                    name: name.clone(),
+                    instance: instance.clone(),
+                }
+            }
+        };
+        saved.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModuleSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match SavedModuleSource::deserialize(deserializer)? {
+            SavedModuleSource::Root => Ok(Self::Root),
+            SavedModuleSource::Module { name, instance } => {
+                Ok(Self::SavedModule { name, instance })
+            }
+        }
+    }
 }
 
 impl PartialEq for ModuleSource {
@@ -5903,14 +5942,22 @@ impl PartialEq for ModuleSource {
             (Self::Root, Self::Root) => true,
             (
                 Self::Module {
-                    name: left_name,
-                    instance: left_instance,
+                    call_path: left_call_path,
                     ..
                 },
                 Self::Module {
+                    call_path: right_call_path,
+                    ..
+                },
+            ) => left_call_path == right_call_path,
+            (
+                Self::SavedModule {
+                    name: left_name,
+                    instance: left_instance,
+                },
+                Self::SavedModule {
                     name: right_name,
                     instance: right_instance,
-                    ..
                 },
             ) => left_name == right_name && left_instance == right_instance,
             _ => false,
@@ -5922,12 +5969,13 @@ impl Eq for ModuleSource {}
 
 impl Hash for ModuleSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Keep hashing aligned with `PartialEq`: module scope is display-only,
-        // while module name and instance define the grouping key.
+        // Keep hashing aligned with `PartialEq`: live identity is the complete
+        // call path; saved display metadata has its own, separate variant.
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Root => {}
-            Self::Module { name, instance, .. } => {
+            Self::Module { call_path, .. } => call_path.hash(state),
+            Self::SavedModule { name, instance } => {
                 name.hash(state);
                 instance.hash(state);
             }
@@ -5936,13 +5984,11 @@ impl Hash for ModuleSource {
 }
 
 impl ModuleSource {
-    /// Create a Module source
-    pub fn module(name: impl Into<String>, instance: impl Into<String>) -> Self {
-        Self::Module {
+    /// Create persisted/display-only module metadata with no live call ID.
+    pub fn saved_module(name: impl Into<String>, instance: impl Into<String>) -> Self {
+        Self::SavedModule {
             name: name.into(),
             instance: instance.into(),
-            scope: None,
-            call_path: None,
         }
     }
 
@@ -5956,14 +6002,14 @@ impl ModuleSource {
             name: name.into(),
             instance: instance.into(),
             scope: Some(scope),
-            call_path: Some(Box::new(call_path)),
+            call_path: Box::new(call_path),
         }
     }
 
     pub fn module_call_path(&self) -> Option<&composition::CompositionCallPath> {
         match self {
-            Self::Module { call_path, .. } => call_path.as_deref(),
-            Self::Root => None,
+            Self::Module { call_path, .. } => Some(call_path),
+            Self::Root | Self::SavedModule { .. } => None,
         }
     }
 
@@ -5977,6 +6023,17 @@ impl ModuleSource {
                     .clone()
                     .unwrap_or_else(|| ModuleInstanceScope::bound(instance)),
             ),
+            Self::SavedModule { instance, .. } => Some(ModuleInstanceScope::bound(instance)),
+        }
+    }
+
+    /// User-facing module name and instance for either live or saved sources.
+    pub fn module_display(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Root => None,
+            Self::Module { name, instance, .. } | Self::SavedModule { name, instance } => {
+                Some((name, instance))
+            }
         }
     }
 
@@ -5992,7 +6049,9 @@ impl ModuleSource {
     pub fn outer_instance_identity(&self) -> Option<ResourceIdentity> {
         match self {
             Self::Root => None,
-            Self::Module { instance, .. } => ResourceIdentity::try_from(instance.clone()).ok(),
+            Self::Module { instance, .. } | Self::SavedModule { instance, .. } => {
+                ResourceIdentity::try_from(instance.clone()).ok()
+            }
         }
     }
 }
