@@ -10,7 +10,7 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema, legacy_validator};
 
-use super::{CompletionProvider, DslSource};
+use super::{AttributeValueTarget, CompletionProvider, DslSource};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -135,14 +135,9 @@ impl CompletionProvider {
         completions
     }
 
-    // 8 args is over clippy's 7-default; bundling them into a context
-    // struct is a worthwhile cleanup but out of scope for #2643. Track
-    // it as a follow-up if the param list grows again.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn value_completions_for_attr(
         &self,
-        resource_type: &str,
-        attr_name: &str,
+        target: &AttributeValueTarget,
         text: &str,
         current_binding: Option<&str>,
         position: Position,
@@ -164,6 +159,18 @@ impl CompletionProvider {
         // across every helper below.
         let mut src_buf = String::new();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        let schema_target = match target {
+            AttributeValueTarget::SchemaAttribute {
+                resource_type,
+                attr_name,
+            } => self.lookup_schema(resource_type).and_then(|schema| {
+                schema
+                    .attributes()
+                    .get(attr_name)
+                    .map(|attribute| (resource_type.as_str(), schema, attribute))
+            }),
+            AttributeValueTarget::Unresolvable => None,
+        };
 
         // Check if the user has typed "binding." after "=" — if so, show only
         // that binding's resource attributes, not built-in functions or generic completions.
@@ -214,9 +221,7 @@ impl CompletionProvider {
         // block (the dispatcher routes those through
         // `InsideUpstreamStateBlock`), so the self-skip is unreachable
         // for upstream bindings and intentionally omitted.
-        if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(attr_schema) = schema.attributes().get(attr_name)
-        {
+        if let Some((_, schema, attr_schema)) = schema_target {
             if let Some(target_name) = Self::extract_custom_type_name(attr_schema.attr_type()) {
                 for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
                     if binding_resource_type.is_empty() {
@@ -298,11 +303,8 @@ impl CompletionProvider {
         // Both are used by the arguments filter just below and the
         // for-binding filter further down; `defs` stays paired with the
         // target while directional assignability resolves any schema `Ref`.
-        let target_schema = self.lookup_schema(resource_type);
-        let target_attr_type = target_schema
-            .and_then(|s| s.attributes().get(attr_name))
-            .map(|a| a.attr_type());
-        let target_defs = target_schema.map(|schema| schema.defs());
+        let target_attr_type = schema_target.map(|(_, _, attribute)| attribute.attr_type());
+        let target_defs = schema_target.map(|(_, schema, _)| schema.defs());
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -378,9 +380,7 @@ impl CompletionProvider {
         }
 
         // Look up the attribute type from schema
-        if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(attr_schema) = schema.attributes().get(attr_name)
-        {
+        if let Some((resource_type, schema, attr_schema)) = schema_target {
             // Struct types: offer `{ }` snippet only, no built-in functions.
             // Use `Shape` (Ref-peeled) so a Ref-typed struct attribute
             // (cyclic-CFN case) also gets the snippet (same bug class as

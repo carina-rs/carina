@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use crate::attribute_path::{ResolvedAttribute, resolve_attribute_path};
 use crate::document::Document;
-use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, enclosing_block};
+use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, StructPath, enclosing_block};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, display_string_literal};
 use carina_core::resource::{ConcreteValue, Value};
@@ -199,11 +199,14 @@ impl HoverProvider {
                 resource_type,
                 struct_path,
                 binding: _binding,
-            } => {
-                if let Some(hover) = self.attribute_hover(&word, resource_type, struct_path) {
-                    return Some(hover);
+            } => match struct_path {
+                StructPath::Known(struct_path) => {
+                    if let Some(hover) = self.attribute_hover(&word, resource_type, struct_path) {
+                        return Some(hover);
+                    }
                 }
-            }
+                StructPath::Unresolvable => {}
+            },
             EnclosingBlock::ModuleCall {
                 module_name,
                 arg_path,

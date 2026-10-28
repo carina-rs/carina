@@ -17,7 +17,7 @@ use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position
 use crate::attribute_path::{resolve_attribute_path, struct_fields_of};
 use crate::document::Document;
 use crate::enclosing_block::{
-    EnclosingBlock, ResourceTypePatterns, cursor_line_segment, enclosing_block,
+    EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
 };
 use carina_core::schema::{
     AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape,
@@ -122,12 +122,10 @@ impl CompletionProvider {
                 self.module_parameter_completions(&module_name, &text, base_path)
             }
             CompletionContext::AfterEquals {
-                resource_type,
-                attr_name,
+                target,
                 current_binding,
             } => self.value_completions_for_attr(
-                &resource_type,
-                &attr_name,
+                &target,
                 &text,
                 current_binding.as_deref(),
                 position,
@@ -336,20 +334,24 @@ impl CompletionProvider {
                 resource_type,
                 struct_path,
                 binding,
-            } => Some((
-                resource_type.as_str(),
-                struct_path.as_slice(),
-                binding.as_ref(),
-            )),
+            } => Some((resource_type.as_str(), struct_path, binding.as_ref())),
             EnclosingBlock::ModuleCall { .. } => None,
             EnclosingBlock::Other => None,
         };
 
         // `directives { ... }` is the meta-arg block, not a struct
         // attribute — short-circuit before the struct router runs (#2873).
-        if resource_block.is_some_and(|(_, struct_path, _)| {
-            struct_path.first().map(String::as_str) == Some("directives")
-        }) {
+        let directives_binding = match resource_block {
+            Some((_, StructPath::Known(struct_path), binding))
+                if struct_path.first().map(String::as_str) == Some("directives") =>
+            {
+                Some(binding)
+            }
+            Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {
+                None
+            }
+        };
+        if let Some(directives_binding) = directives_binding {
             // Cursor inside `depends_on = [...]` → list-element completion.
             if let Some(after_eq) = prefix.split('=').next_back()
                 && let Some(open) = after_eq.rfind('[')
@@ -358,8 +360,7 @@ impl CompletionProvider {
                 let attr_name = self.extract_attr_name(&prefix);
                 if attr_name == "depends_on" {
                     return CompletionContext::InsideDirectivesDependsOnList {
-                        current_binding: resource_block
-                            .and_then(|(_, _, binding)| binding.cloned()),
+                        current_binding: directives_binding.cloned(),
                     };
                 }
             }
@@ -378,26 +379,29 @@ impl CompletionProvider {
             }
         }
 
-        if let Some((enclosing_resource_type, struct_path, current_binding)) = resource_block
-            && !struct_path.is_empty()
-        {
-            let current_segment = cursor_line_segment(text, position);
-            if current_segment.contains('=') {
-                let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
-                if !after_eq.starts_with('"') || after_eq == "\"" {
-                    let field_name = self.extract_attr_name(&current_segment);
-                    return CompletionContext::AfterEqualsInStruct {
-                        resource_type: enclosing_resource_type.to_string(),
-                        attr_path: struct_path.to_vec(),
-                        field_name,
-                        current_binding: current_binding.cloned(),
-                    };
+        match resource_block {
+            Some((enclosing_resource_type, StructPath::Known(struct_path), current_binding))
+                if !struct_path.is_empty() =>
+            {
+                let current_segment = cursor_line_segment(text, position);
+                if current_segment.contains('=') {
+                    let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                    if !after_eq.starts_with('"') || after_eq == "\"" {
+                        let field_name = self.extract_attr_name(&current_segment);
+                        return CompletionContext::AfterEqualsInStruct {
+                            resource_type: enclosing_resource_type.to_string(),
+                            attr_path: struct_path.to_vec(),
+                            field_name,
+                            current_binding: current_binding.cloned(),
+                        };
+                    }
                 }
+                return CompletionContext::InsideStructBlock {
+                    resource_type: enclosing_resource_type.to_string(),
+                    attr_path: struct_path.to_vec(),
+                };
             }
-            return CompletionContext::InsideStructBlock {
-                resource_type: enclosing_resource_type.to_string(),
-                attr_path: struct_path.to_vec(),
-            };
+            Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {}
         }
 
         // Check if we're inside a provider block
@@ -475,23 +479,39 @@ impl CompletionProvider {
         match &block_context {
             EnclosingBlock::Resource {
                 resource_type,
-                struct_path: _struct_path,
+                struct_path,
                 binding,
-            } => {
-                if current_segment.contains('=') {
-                    let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
-                    if !after_eq.starts_with('"') || after_eq == "\"" {
-                        return CompletionContext::AfterEquals {
-                            resource_type: resource_type.clone(),
-                            attr_name: self.extract_attr_name(&current_segment),
-                            current_binding: binding.clone(),
-                        };
+            } => match struct_path {
+                StructPath::Known(_) => {
+                    if current_segment.contains('=') {
+                        let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                        if !after_eq.starts_with('"') || after_eq == "\"" {
+                            return CompletionContext::AfterEquals {
+                                target: AttributeValueTarget::SchemaAttribute {
+                                    resource_type: resource_type.clone(),
+                                    attr_name: self.extract_attr_name(&current_segment),
+                                },
+                                current_binding: binding.clone(),
+                            };
+                        }
                     }
+                    return CompletionContext::InsideResourceBlock {
+                        resource_type: resource_type.clone(),
+                    };
                 }
-                return CompletionContext::InsideResourceBlock {
-                    resource_type: resource_type.clone(),
-                };
-            }
+                StructPath::Unresolvable => {
+                    if current_segment.contains('=') {
+                        let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                        if !after_eq.starts_with('"') || after_eq == "\"" {
+                            return CompletionContext::AfterEquals {
+                                target: AttributeValueTarget::Unresolvable,
+                                current_binding: binding.clone(),
+                            };
+                        }
+                    }
+                    return CompletionContext::None;
+                }
+            },
             EnclosingBlock::ModuleCall {
                 module_name,
                 arg_path: _arg_path,
@@ -518,10 +538,8 @@ impl CompletionProvider {
         if brace_depth > 0 && prefix.contains('=') {
             let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
             if !after_eq.starts_with('"') || after_eq == "\"" {
-                let attr_name = self.extract_attr_name(&prefix);
                 return CompletionContext::AfterEquals {
-                    resource_type: String::new(),
-                    attr_name,
+                    target: AttributeValueTarget::Unresolvable,
                     current_binding: None,
                 };
             }
@@ -685,6 +703,15 @@ impl CompletionProvider {
 }
 
 #[derive(Debug)]
+enum AttributeValueTarget {
+    SchemaAttribute {
+        resource_type: String,
+        attr_name: String,
+    },
+    Unresolvable,
+}
+
+#[derive(Debug)]
 #[allow(dead_code)]
 enum CompletionContext {
     TopLevel,
@@ -697,8 +724,7 @@ enum CompletionContext {
         module_name: String,
     },
     AfterEquals {
-        resource_type: String,
-        attr_name: String,
+        target: AttributeValueTarget,
         current_binding: Option<String>,
     },
     /// Cursor is at a value position inside an `exports { ... }` block

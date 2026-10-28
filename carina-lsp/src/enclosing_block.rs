@@ -64,7 +64,7 @@ impl ResourceTypePatterns {
 pub(crate) enum EnclosingBlock {
     Resource {
         resource_type: String,
-        struct_path: Vec<String>,
+        struct_path: StructPath,
         binding: Option<String>,
     },
     ModuleCall {
@@ -72,6 +72,12 @@ pub(crate) enum EnclosingBlock {
         arg_path: Vec<String>,
     },
     Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StructPath {
+    Known(Vec<String>),
+    Unresolvable,
 }
 
 #[derive(Clone, Copy)]
@@ -225,10 +231,16 @@ pub(crate) fn enclosing_block(
                                 }
                                 BraceOpener::ControlFlow => continue,
                                 BraceOpener::Resource {
-                                    resource_type: _,
-                                    binding: _,
+                                    resource_type,
+                                    binding,
+                                } => {
+                                    return EnclosingBlock::Resource {
+                                        resource_type,
+                                        struct_path: StructPath::Unresolvable,
+                                        binding,
+                                    };
                                 }
-                                | BraceOpener::Path(PathSegment {
+                                BraceOpener::Path(PathSegment {
                                     name: _,
                                     syntax: SegmentSyntax::Bare,
                                 })
@@ -246,12 +258,9 @@ pub(crate) fn enclosing_block(
                             resource_type,
                             binding,
                         } => {
-                            let Some(struct_path) = resource_struct_path(reverse_path) else {
-                                return EnclosingBlock::Other;
-                            };
                             return EnclosingBlock::Resource {
                                 resource_type,
-                                struct_path,
+                                struct_path: resource_struct_path(reverse_path),
                                 binding,
                             };
                         }
@@ -580,16 +589,16 @@ fn is_module_identifier(candidate: &str) -> bool {
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-fn resource_struct_path(mut reverse_path: Vec<PathSegment>) -> Option<Vec<String>> {
+fn resource_struct_path(mut reverse_path: Vec<PathSegment>) -> StructPath {
     let mut struct_path = Vec::with_capacity(reverse_path.len());
     for segment in reverse_path.drain(..) {
         match segment.syntax {
             SegmentSyntax::Assignment | SegmentSyntax::Bare => struct_path.push(segment.name),
-            SegmentSyntax::NamedModule => return None,
+            SegmentSyntax::NamedModule => return StructPath::Unresolvable,
         }
     }
     struct_path.reverse();
-    Some(struct_path)
+    StructPath::Known(struct_path)
 }
 
 fn classify_non_resource(mut reverse_path: Vec<PathSegment>) -> EnclosingBlock {

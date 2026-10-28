@@ -344,6 +344,52 @@ fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
 }
 
 #[test]
+fn unresolvable_struct_path_preserves_enclosing_resource_binding() {
+    let vpc = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+    let resource = ResourceSchema::new("review.Resource")
+        .attribute(AttributeSchema::new("policy", AttributeType::string()))
+        .attribute(AttributeSchema::new("a", AttributeType::bool()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", vpc);
+    schemas.insert("test", resource);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+    let text = concat!(
+        "let a = test.ec2.Vpc {\n",
+        "  cidr_block = \"x\"\n",
+        "}\n",
+        "let v = test.review.Resource {\n",
+        "  policy = merge(\n",
+        "    {\n",
+        "      a = ",
+        "\n",
+        "    }\n",
+        "  )\n",
+        "}\n",
+    );
+    let position = Position::new(6, "      a = ".chars().count() as u32);
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(temp_dir.path().join("main.crn"), text).unwrap();
+    std::fs::write(
+        temp_dir.path().join("providers.crn"),
+        "provider test {\n}\n",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.path().join("exports.crn"), "exports {\n}\n").unwrap();
+
+    let completions = provider.complete(&create_document(text), position, Some(temp_dir.path()));
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"a"), "{labels:?}");
+    assert!(
+        !labels.contains(&"v"),
+        "the enclosing resource must not complete as a self-reference: {labels:?}"
+    );
+    assert!(!labels.contains(&"true"), "{labels:?}");
+    assert!(!labels.contains(&"false"), "{labels:?}");
+}
+
+#[test]
 fn nested_struct_after_equals_depth_2() {
     let provider = test_provider_with_nested_structs();
     let text = r#"let r = test.nested.resource {
