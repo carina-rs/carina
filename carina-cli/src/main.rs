@@ -381,6 +381,13 @@ async fn main() {
     carina_cli::cursor::install_panic_restore_hook();
 
     let cli = Cli::parse();
+    // User-owned paths are resolved once at the binary boundary, then passed
+    // explicitly through CLI library code.
+    #[allow(clippy::disallowed_methods)]
+    let user_dirs = match carina_core::UserDirs::from_real_home() {
+        Ok(user_dirs) => user_dirs,
+        Err(error) => handle_app_error(error.into()),
+    };
     let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
     carina_cli::wiring::set_trusted_local_grant_inputs(
         cli.trust_local_provider.clone(),
@@ -435,6 +442,7 @@ async fn main() {
         } = cli.command
         {
             match run_plan(
+                &user_dirs,
                 &path,
                 out.as_deref(),
                 plan_images.file(),
@@ -462,7 +470,9 @@ async fn main() {
         }
 
         let result = match cli.command {
-            Commands::Validate { path, json } => run_validate(&path, json, &provider_context),
+            Commands::Validate { path, json } => {
+                run_validate(&user_dirs, &path, json, &provider_context)
+            }
             Commands::Plan { .. } => unreachable!(),
             Commands::Apply {
                 path,
@@ -473,6 +483,7 @@ async fn main() {
             } => match classify_apply_input(&path) {
                 Ok(ApplyInput::SavedPlan(plan_path)) => {
                     run_apply_from_plan(
+                        &user_dirs,
                         plan_path,
                         auto_approve,
                         lock,
@@ -484,6 +495,7 @@ async fn main() {
                     .await
                 }
                 Ok(ApplyInput::Project(project_path)) => run_apply(
+                    &user_dirs,
                     project_path,
                     auto_approve,
                     lock,
@@ -504,6 +516,7 @@ async fn main() {
                 force,
                 parallelism,
             } => run_destroy(
+                &user_dirs,
                 &path,
                 auto_approve,
                 lock,
@@ -544,14 +557,21 @@ async fn main() {
                 check,
                 diff,
                 recursive,
-            } => run_fmt(&path, FmtMode::from_flags(check, diff), recursive),
+            } => run_fmt(
+                &user_dirs,
+                &path,
+                FmtMode::from_flags(check, diff),
+                recursive,
+            ),
             Commands::Module { command } => run_module_command(command, &provider_context),
             Commands::ForceUnlock { lock_id, path } => {
                 run_force_unlock(&lock_id, &path, &provider_context).await
             }
             Commands::State { command } => {
                 let project_dir = command.project_dir().map(Path::to_path_buf);
-                let result = run_state_command(command, &provider_context, shutdown.clone()).await;
+                let result =
+                    run_state_command(&user_dirs, command, &provider_context, shutdown.clone())
+                        .await;
                 match project_dir {
                     Some(project_dir) => {
                         result.map_err(|error| error.with_project_dir(&project_dir))
@@ -566,11 +586,11 @@ async fn main() {
                 locked,
                 migrate_state,
                 force,
-            } => commands::init::run_init(&path, upgrade, locked, migrate_state, force)
+            } => commands::init::run_init(&user_dirs, &path, upgrade, locked, migrate_state, force)
                 .await
                 .map_err(error::AppError::from)
                 .map_err(|error| error.with_project_dir(&path)),
-            Commands::Lint { path } => run_lint(&path, &provider_context),
+            Commands::Lint { path } => run_lint(&user_dirs, &path, &provider_context),
             Commands::Completions { shell } => {
                 generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
                 Ok(())
@@ -578,11 +598,11 @@ async fn main() {
             Commands::Skills { command } => {
                 let output = match command {
                     SkillsCommands::List => Ok(skills::run_skills_list()),
-                    SkillsCommands::Install => skills::run_skills_install(),
-                    SkillsCommands::Update => skills::run_skills_update(),
-                    SkillsCommands::Reinstall => skills::run_skills_reinstall(),
-                    SkillsCommands::Uninstall => skills::run_skills_uninstall(),
-                    SkillsCommands::Status => skills::run_skills_status(),
+                    SkillsCommands::Install => skills::run_skills_install(&user_dirs),
+                    SkillsCommands::Update => skills::run_skills_update(&user_dirs),
+                    SkillsCommands::Reinstall => skills::run_skills_reinstall(&user_dirs),
+                    SkillsCommands::Uninstall => skills::run_skills_uninstall(&user_dirs),
+                    SkillsCommands::Status => skills::run_skills_status(&user_dirs),
                 };
                 match output {
                     Ok(text) => {

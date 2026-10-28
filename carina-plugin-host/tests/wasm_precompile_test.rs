@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use carina_core::UserDirs;
 use carina_core::provider::ProviderFactory;
 use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
 use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
@@ -187,6 +188,27 @@ macro_rules! skip_if_no_wasm {
             }
         }
     };
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_precompile_cache_uses_the_supplied_user_dirs() {
+    let root = tempfile::tempdir().unwrap();
+    let user_dirs = UserDirs::under(root.path());
+    let component = wat::parse_str(NON_INSTANTIABLE_COMPONENT_WAT).unwrap();
+
+    let error = match WasmProviderFactory::from_bytes(
+        test_load(&component, "cache-test"),
+        &user_dirs,
+    )
+    .await
+    {
+        Ok(_) => panic!("the deliberately unsatisfied import must reject provider startup"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("bogus:cache-regression/iface"));
+    let cached = cached_component_path(user_dirs.compiled_wasm_cache_dir());
+    assert!(cached.starts_with(root.path()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

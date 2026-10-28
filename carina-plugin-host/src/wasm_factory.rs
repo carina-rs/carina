@@ -26,6 +26,7 @@ use wasmtime_wasi::random::WasiRandom;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 
+use carina_core::UserDirs;
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CanonicalCustomTypeValue,
@@ -2720,12 +2721,6 @@ fn decode_config_completions_json(
 }
 
 impl WasmProviderFactory {
-    /// Compute the default cache directory (`~/.carina/cache/`).
-    /// Returns `None` if the home directory cannot be determined.
-    fn default_cache_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".carina").join("cache"))
-    }
-
     /// Load provider metadata from WIT functions.
     ///
     /// Every export and decode is required to succeed. Substituting empty
@@ -2935,28 +2930,27 @@ impl WasmProviderFactory {
         })
     }
 
-    /// Load provider bytes using the default precompile cache at `~/.carina/cache/`.
+    /// Load provider bytes using the supplied per-user precompile cache.
     ///
     /// The verified load binds the resolver-retained bytes to their configured
     /// name and trust classification. An artifact reporting a different name
     /// is rejected.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn from_bytes(load: VerifiedLoad) -> Result<Self, WasmProviderLoadError> {
+    pub async fn from_bytes(
+        load: VerifiedLoad,
+        user_dirs: &UserDirs,
+    ) -> Result<Self, WasmProviderLoadError> {
         let configured = ConfiguredProvider::new(load.identity());
         let wasm_bytes = load.bytes().clone();
+        let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
         let load: BoxFuture<'_, Result<Self, WasmProviderLoadError>> = Box::pin(async move {
-            match Self::default_cache_dir() {
-                Some(cache_dir) => {
-                    Self::from_bytes_with_cache_dir_configured(
-                        wasm_bytes.as_bytes(),
-                        &cache_dir,
-                        configured,
-                    )
-                    .await
-                }
-                None => Self::new_uncached_configured(wasm_bytes.as_bytes(), configured).await,
-            }
+            Self::from_bytes_with_cache_dir_configured(
+                wasm_bytes.as_bytes(),
+                &cache_dir,
+                configured,
+            )
+            .await
         });
         load.await
     }

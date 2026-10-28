@@ -70,6 +70,7 @@ use crate::wiring::{
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destroy(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -90,6 +91,7 @@ pub async fn run_destroy(
 
     let base_dir = get_base_dir(path);
     crate::commands::validate_and_resolve_with_config(
+        user_dirs,
         &mut parsed,
         base_dir,
         true,
@@ -135,6 +137,7 @@ pub async fn run_destroy(
     };
 
     let outcome = run_destroy_locked_owned(
+        user_dirs,
         &mut parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -155,6 +158,7 @@ pub async fn run_destroy(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_owned(
+    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -169,15 +173,16 @@ async fn run_destroy_locked_owned(
 ) -> LockCommandOutcome<Result<(), AppError>> {
     // Provider declaration metadata is sufficient for schema/factory wiring;
     // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = match build_factories_from_providers(&parsed.providers, base_dir) {
-        Ok(factories) => factories,
-        Err(error) => {
-            return LockCommandOutcome::Kept {
-                result: Err(error),
-                lock,
-            };
-        }
-    };
+    let (factories, _) =
+        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
+            Ok(factories) => factories,
+            Err(error) => {
+                return LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                };
+            }
+        };
     let ctx = WiringContext::new(factories, &parsed.providers);
 
     run_destroy_locked_with_ctx_owned(
@@ -1328,6 +1333,7 @@ async fn run_destroy_locked(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let outcome = run_destroy_locked_owned(
+        crate::test_user_dirs(),
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -2348,6 +2354,7 @@ mod tests {
         let token = fixture.cancel_token();
 
         let err = run_destroy(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             true,
@@ -2404,6 +2411,7 @@ mod tests {
         let mut parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
         crate::commands::validate_and_resolve_with_config(
+            crate::test_user_dirs(),
             &mut parsed,
             base_dir,
             true,
@@ -2411,8 +2419,9 @@ mod tests {
             &loaded.duplicate_declarations,
         )
         .expect("fixture must validate");
-        let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
-            .expect("mock factory must load");
+        let (factories, _) =
+            build_factories_from_providers(crate::test_user_dirs(), &parsed.providers, base_dir)
+                .expect("mock factory must load");
         let ctx = WiringContext::new(factories, &parsed.providers);
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
@@ -2452,6 +2461,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             true,
@@ -2511,6 +2521,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             true,
@@ -2569,6 +2580,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             true,
@@ -2614,6 +2626,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             true,

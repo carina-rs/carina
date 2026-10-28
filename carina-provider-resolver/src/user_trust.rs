@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use carina_core::UserDirs;
 use carina_core::provider_source::RemoteSourceKey;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -15,7 +16,6 @@ use time::format_description::well_known::Rfc3339;
 use crate::provider_resolver::RegistrySignatureProtection;
 use crate::verified_artifact::OriginDownloadProof;
 
-const TRUST_RECORD_DIR_ENV: &str = "CARINA_TRUST_RECORD_DIR";
 const USER_TRUST_RECORD_VERSION: u32 = 1;
 
 /// A user-owned attestation that this exact provider content was downloaded
@@ -140,53 +140,6 @@ impl Error for UserTrustRecordError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserTrustRecordDirError {
-    RelativeEnvironmentPath { path: PathBuf },
-}
-
-impl fmt::Display for UserTrustRecordDirError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RelativeEnvironmentPath { path } => write!(
-                formatter,
-                "{TRUST_RECORD_DIR_ENV} must be an absolute path, got {:?}",
-                path
-            ),
-        }
-    }
-}
-
-impl Error for UserTrustRecordDirError {}
-
-/// Get the user-owned provider trust-record directory.
-///
-/// Checks `CARINA_TRUST_RECORD_DIR` first, then falls back to
-/// `~/.carina/trust/` in normal builds or isolated per-process temporary
-/// storage in test builds. Returns an error when the environment value is
-/// relative, and `None` in normal builds if the home directory cannot be
-/// determined.
-pub fn user_trust_record_dir() -> Result<Option<PathBuf>, UserTrustRecordDirError> {
-    if let Some(value) = std::env::var_os(TRUST_RECORD_DIR_ENV) {
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(UserTrustRecordDirError::RelativeEnvironmentPath { path });
-        }
-        return Ok(Some(path));
-    }
-    Ok(default_user_trust_record_dir())
-}
-
-#[cfg(not(test))]
-fn default_user_trust_record_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".carina").join("trust"))
-}
-
-#[cfg(test)]
-fn default_user_trust_record_dir() -> Option<PathBuf> {
-    Some(crate::isolated_test_storage_root().join("trust"))
-}
-
 impl UserTrustRecord {
     pub(crate) fn from_origin_download(
         proof: OriginDownloadProof,
@@ -208,8 +161,8 @@ impl UserTrustRecord {
         })
     }
 
-    pub(crate) fn write(&self) -> Result<(), UserTrustRecordError> {
-        let path = trust_record_path(&self.sha256, &self.source)?;
+    pub(crate) fn write(&self, user_dirs: &UserDirs) -> Result<(), UserTrustRecordError> {
+        let path = trust_record_path(user_dirs, &self.sha256, &self.source)?;
         let parent = path
             .parent()
             .expect("a trust-record path always has a digest directory");
@@ -371,10 +324,11 @@ impl UserTrustRecord {
 }
 
 pub(crate) fn load_user_verified_identity(
+    user_dirs: &UserDirs,
     sha256: &str,
     source: &RemoteSourceKey,
 ) -> Result<Option<UserVerifiedIdentity>, UserTrustRecordError> {
-    let path = trust_record_path(sha256, source.as_str())?;
+    let path = trust_record_path(user_dirs, sha256, source.as_str())?;
     let record = match UserTrustRecord::load_at(&path) {
         Ok(record) => record,
         Err(error)
@@ -394,11 +348,22 @@ pub(crate) fn load_user_verified_identity(
     }))
 }
 
-pub(crate) fn user_trust_record_exists(sha256: &str, source: &RemoteSourceKey) -> bool {
-    matches!(load_user_verified_identity(sha256, source), Ok(Some(_)))
+pub(crate) fn user_trust_record_exists(
+    user_dirs: &UserDirs,
+    sha256: &str,
+    source: &RemoteSourceKey,
+) -> bool {
+    matches!(
+        load_user_verified_identity(user_dirs, sha256, source),
+        Ok(Some(_))
+    )
 }
 
-fn trust_record_path(sha256: &str, source: &str) -> Result<PathBuf, UserTrustRecordError> {
+fn trust_record_path(
+    user_dirs: &UserDirs,
+    sha256: &str,
+    source: &str,
+) -> Result<PathBuf, UserTrustRecordError> {
     if sha256.len() != 64
         || !sha256
             .bytes()
@@ -408,17 +373,11 @@ fn trust_record_path(sha256: &str, source: &str) -> Result<PathBuf, UserTrustRec
             "Invalid provider trust-record sha256 {sha256:?}"
         )));
     }
-    let root = user_trust_record_dir()
-        .map_err(|error| {
-            UserTrustRecordError::with_source("Invalid provider trust-record directory", error)
-        })?
-        .ok_or_else(|| {
-            UserTrustRecordError::message(
-                "Cannot determine the provider trust-record directory; set CARINA_TRUST_RECORD_DIR",
-            )
-        })?;
     let encoded_source = URL_SAFE_NO_PAD.encode(source.as_bytes());
-    Ok(root.join(sha256).join(format!("{encoded_source}.json")))
+    Ok(user_dirs
+        .trust_record_dir()
+        .join(sha256)
+        .join(format!("{encoded_source}.json")))
 }
 
 fn sync_directory(path: &Path) {
@@ -429,6 +388,7 @@ fn sync_directory(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use carina_core::UserDirs;
     use carina_core::provider_source::ProviderSource;
 
     use super::*;
@@ -446,46 +406,24 @@ mod tests {
     }
 
     #[test]
-    fn user_trust_record_dir_rejects_relative_environment_path() {
-        let _env_guard = crate::test_env_guard();
-        let relative = PathBuf::from("relative/trust");
-        let _trust_env = crate::ScopedEnvVar::set(TRUST_RECORD_DIR_ENV, &relative);
+    fn user_trust_record_write_uses_the_supplied_user_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(root.path());
+        let source = github_source_key();
+        let sha256 = "04".repeat(32);
 
-        let error = user_trust_record_dir().unwrap_err();
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
 
-        assert_eq!(
-            error,
-            UserTrustRecordDirError::RelativeEnvironmentPath {
-                path: relative.clone()
-            }
-        );
-        assert!(error.to_string().contains("must be an absolute path"));
-        assert!(error.to_string().contains("CARINA_TRUST_RECORD_DIR"));
-    }
-
-    #[test]
-    fn user_trust_record_dir_test_fallback_is_not_under_home_directory() {
-        let _env_guard = crate::test_env_guard();
-        let _trust_env = crate::ScopedEnvVar::remove(TRUST_RECORD_DIR_ENV);
-
-        let fallback = user_trust_record_dir().unwrap().unwrap();
-
-        assert_eq!(fallback, crate::isolated_test_storage_root().join("trust"));
-        if let Some(home) = dirs::home_dir() {
-            assert!(
-                !fallback.starts_with(&home),
-                "test trust-record fallback {} must not be under home {}",
-                fallback.display(),
-                home.display()
-            );
-        }
+        let record = trust_record_path(&user_dirs, &sha256, source.as_str()).unwrap();
+        assert!(record.is_file());
+        assert!(record.starts_with(user_dirs.trust_record_dir()));
+        assert!(record.starts_with(root.path()));
     }
 
     #[test]
     fn user_trust_record_write_replaces_changed_attestation() {
-        let _env_guard = crate::test_env_guard();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
         let source = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
@@ -505,10 +443,12 @@ mod tests {
                 oidc_issuer: "https://token.actions.githubusercontent.com".into(),
             }));
 
-        record_test_github_origin_download(&source, &sha256, Some(&first_signer)).unwrap();
-        record_test_github_origin_download(&source, &sha256, Some(&new_signer)).unwrap();
+        record_test_github_origin_download(&user_dirs, &source, &sha256, Some(&first_signer))
+            .unwrap();
+        record_test_github_origin_download(&user_dirs, &source, &sha256, Some(&new_signer))
+            .unwrap();
 
-        let stored = load_user_verified_identity(&sha256, &source)
+        let stored = load_user_verified_identity(&user_dirs, &sha256, &source)
             .unwrap()
             .unwrap();
         assert_eq!(stored.signer(), Some(&new_signer));
@@ -516,15 +456,14 @@ mod tests {
 
     #[test]
     fn user_trust_record_serializes_version_one() {
-        let _env_guard = crate::test_env_guard();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
         let source = github_source_key();
         let sha256 = "02".repeat(32);
 
-        record_test_github_origin_download(&source, &sha256, None).unwrap();
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
 
-        let path = trust_record_path(&sha256, source.as_str()).unwrap();
+        let path = trust_record_path(&user_dirs, &sha256, source.as_str()).unwrap();
         let stored: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(stored["version"], 1);
@@ -532,13 +471,12 @@ mod tests {
 
     #[test]
     fn user_trust_record_write_replaces_unparsable_existing_record() {
-        let _env_guard = crate::test_env_guard();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_home.path());
         let source = github_source_key();
         let sha256 = "03".repeat(32);
-        record_test_github_origin_download(&source, &sha256, None).unwrap();
-        let path = trust_record_path(&sha256, source.as_str()).unwrap();
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
+        let path = trust_record_path(&user_dirs, &sha256, source.as_str()).unwrap();
 
         for broken in [
             b"{not json".to_vec(),
@@ -560,10 +498,10 @@ mod tests {
         ] {
             std::fs::write(&path, &broken).unwrap();
 
-            record_test_github_origin_download(&source, &sha256, None)
+            record_test_github_origin_download(&user_dirs, &source, &sha256, None)
                 .expect("a fresh origin proof must replace an unparsable record");
 
-            assert!(load_user_verified_identity(&sha256, &source)
+            assert!(load_user_verified_identity(&user_dirs, &sha256, &source)
                 .unwrap()
                 .is_some());
         }

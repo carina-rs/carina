@@ -447,12 +447,13 @@ impl WiringContext {
 /// to their failure reasons, so callers can show accurate diagnostics. A stale
 /// lock constraint is returned to the supervised command rather than exiting.
 pub fn build_factories_from_providers(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
     carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
-    build_factories_from_providers_impl(providers, base_dir, true)
+    build_factories_from_providers_impl(user_dirs, providers, base_dir, true)
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -463,6 +464,7 @@ pub fn build_factories_from_providers(
 /// Suppressed provider and lock-constraint failures are returned as load errors
 /// so `--check` can report degraded conversion without failing formatting.
 pub(crate) fn build_factories_from_providers_for_formatting(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<FormattingFactoryLoad, AppError> {
@@ -476,7 +478,8 @@ pub(crate) fn build_factories_from_providers_for_formatting(
         ));
     }
 
-    let (factories, load_errors) = build_factories_from_providers_impl(providers, base_dir, false)?;
+    let (factories, load_errors) =
+        build_factories_from_providers_impl(user_dirs, providers, base_dir, false)?;
     Ok((
         factories,
         load_errors
@@ -487,22 +490,31 @@ pub(crate) fn build_factories_from_providers_for_formatting(
 }
 
 fn build_factories_from_providers_impl(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
+    let loader_user_dirs = user_dirs.clone();
     build_factories_from_providers_impl_using(
+        user_dirs,
         providers,
         base_dir,
         report_errors,
         grant_inputs,
-        |verified| async move { carina_plugin_host::WasmProviderFactory::from_bytes(verified).await },
+        move |verified| {
+            let user_dirs = loader_user_dirs.clone();
+            async move {
+                carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs).await
+            }
+        },
     )
 }
 
 fn build_factories_from_providers_impl_using<L, Fut>(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
@@ -552,11 +564,15 @@ where
 
         let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(grants, |verified| {
-                let artifact = verified.artifact().clone();
-                let loaded = loader(verified);
-                async move { loaded.await.map(|factory| (factory, artifact)) }
-            }))
+            tokio::runtime::Handle::current().block_on(installed.load_with(
+                user_dirs,
+                grants,
+                |verified| {
+                    let artifact = verified.artifact().clone();
+                    let loaded = loader(verified);
+                    async move { loaded.await.map(|factory| (factory, artifact)) }
+                },
+            ))
         });
 
         match factory_result {

@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 
+use carina_core::UserDirs;
 use tempfile::NamedTempFile;
 
 use crate::provider_resolver::{
@@ -252,7 +253,10 @@ impl GlobalArtifactPath {
     }
 }
 
-pub(crate) fn global_cache_artifact_path(relative: PathBuf) -> Option<GlobalArtifactPath> {
+pub(crate) fn global_cache_artifact_path(
+    user_dirs: &UserDirs,
+    relative: PathBuf,
+) -> Option<GlobalArtifactPath> {
     if relative.components().any(|component| {
         matches!(
             component,
@@ -261,8 +265,9 @@ pub(crate) fn global_cache_artifact_path(relative: PathBuf) -> Option<GlobalArti
     }) {
         return None;
     }
-    crate::provider_resolver::global_cache_dir()
-        .map(|cache_dir| GlobalArtifactPath(cache_dir.join(relative)))
+    Some(GlobalArtifactPath(
+        user_dirs.plugin_cache_dir().join(relative),
+    ))
 }
 
 impl<'a> StagedArtifact<'a> {

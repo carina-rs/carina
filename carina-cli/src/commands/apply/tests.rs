@@ -380,6 +380,7 @@ async fn run_saved_plan_schema_fingerprint_case(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -851,6 +852,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -1016,6 +1018,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
     .unwrap();
 
     let error = run_apply_with_observer_factory(
+        crate::test_user_dirs(),
         &downstream,
         true,
         false,
@@ -1093,6 +1096,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     write_upstream("arn:aws:iam::222222222222:role/new");
     let reloaded = reload_apply_configuration_after_bootstrap(
+        crate::test_user_dirs(),
         &downstream,
         &downstream,
         &ProviderContext::default(),
@@ -1169,6 +1173,7 @@ inner { x = a }
     .unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
+        crate::test_user_dirs(),
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
@@ -1245,6 +1250,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         .expect("load unresolved bootstrap snapshot")
         .unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
+            crate::test_user_dirs(),
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
@@ -2781,6 +2787,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -2903,6 +2910,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -2974,6 +2982,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3059,6 +3068,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3162,6 +3172,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3407,6 +3418,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
+        crate::test_user_dirs(),
         fixture.config_path(),
         true,
         true,
@@ -3468,6 +3480,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     crate::commands::validate_and_resolve_with_config(
+        crate::test_user_dirs(),
         &mut parsed,
         base_dir,
         false,
@@ -3475,8 +3488,9 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         &loaded.duplicate_declarations,
     )
     .expect("fixture must validate");
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
-        .expect("mock factory must load");
+    let (factories, _) =
+        build_factories_from_providers(crate::test_user_dirs(), &parsed.providers, base_dir)
+            .expect("mock factory must load");
     let ctx = WiringContext::new(factories, &parsed.providers);
     let observer_factory = fixture.observer_factory();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
@@ -3571,6 +3585,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
 
     let error = run_apply_from_plan_locked(
+        crate::test_user_dirs(),
         inspected_saved_plan(plan_file),
         None,
         fixture.provider_context(),
@@ -3608,6 +3623,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
+        crate::test_user_dirs(),
         fixture.config_path(),
         true,
         true,
@@ -3653,6 +3669,7 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
     let observer_factory = fixture.observer_factory();
 
     let apply = run_apply_with_observer_factory(
+        crate::test_user_dirs(),
         fixture.config_path(),
         true,
         true,
@@ -8081,6 +8098,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8133,6 +8151,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8170,6 +8189,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8227,6 +8247,7 @@ mod saved_plan_version_tests {
         .expect("write malformed plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8287,6 +8308,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v3).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8375,6 +8397,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v10).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8445,6 +8468,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v13).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8501,6 +8525,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v15).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8556,6 +8581,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v18).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8611,6 +8637,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v19).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8680,6 +8707,7 @@ mod saved_plan_version_tests {
         .expect("write legacy plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8743,6 +8771,7 @@ mod saved_plan_version_tests {
         .expect("write malformed plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             &plan_path,
             true,
             false,
@@ -8892,6 +8921,7 @@ mod saved_plan_version_tests {
         std::fs::write(plan_path, serde_json::to_string(json).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            crate::test_user_dirs(),
             plan_path,
             true,
             false,

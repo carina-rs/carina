@@ -1845,6 +1845,7 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let errors = crate::commands::validate_and_resolve_errors(
+        crate::test_user_dirs(),
         &mut parsed,
         &fixture_path,
         true,

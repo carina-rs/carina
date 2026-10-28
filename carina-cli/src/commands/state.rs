@@ -293,6 +293,7 @@ impl StateCommands {
 
 /// Run state subcommands
 pub async fn run_state_command(
+    user_dirs: &carina_core::UserDirs,
     command: StateCommands,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -302,9 +303,9 @@ pub async fn run_state_command(
             bucket_name,
             force,
             path,
-        } => run_state_bucket_delete(&bucket_name, force, &path, provider_context).await,
+        } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
-            run_state_refresh(&path, lock, provider_context, cancel).await
+            run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
         }
         StateCommands::List { path, state_url } => {
             run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
@@ -876,6 +877,7 @@ async fn run_state_show(
 
 /// Run state bucket delete command
 async fn run_state_bucket_delete(
+    user_dirs: &carina_core::UserDirs,
     bucket_name: &str,
     force: bool,
     path: &Path,
@@ -935,8 +937,11 @@ async fn run_state_bucket_delete(
     let resource_type = selection.resource_type();
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
-    let (factories, _) =
-        build_factories_from_providers(provider_inputs.configs().as_provider_configs(), base_dir)?;
+    let (factories, _) = build_factories_from_providers(
+        user_dirs,
+        provider_inputs.configs().as_provider_configs(),
+        base_dir,
+    )?;
     let ctx = WiringContext::new(factories, provider_inputs.configs().as_provider_configs());
     let bucket_provider =
         create_state_bucket_delete_provider(&ctx, provider_inputs.configs(), provider_name).await?;
@@ -1014,6 +1019,7 @@ async fn create_state_bucket_delete_provider(
 
 /// Run state refresh command
 pub async fn run_state_refresh(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
@@ -1030,6 +1036,7 @@ pub async fn run_state_refresh(
 
     let base_dir = get_base_dir(path);
     crate::commands::validate_and_resolve_with_config(
+        user_dirs,
         &mut parsed,
         base_dir,
         true,
@@ -1066,6 +1073,7 @@ pub async fn run_state_refresh(
     };
 
     let op_result = run_state_refresh_locked(
+        user_dirs,
         &mut parsed,
         backend.as_ref(),
         state_lock.as_ref(),
@@ -1088,6 +1096,7 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
+    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
@@ -1097,7 +1106,7 @@ pub(crate) async fn run_state_refresh_locked(
 ) -> Result<(), AppError> {
     // Provider declaration metadata is sufficient for schema/factory wiring;
     // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, _) = build_factories_from_providers(user_dirs, &parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
 
     run_state_refresh_locked_with_ctx(
@@ -2544,6 +2553,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         run_state_refresh_locked(
+            crate::test_user_dirs(),
             &mut parsed,
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
@@ -2561,6 +2571,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
 
         run_state_refresh_locked(
+            crate::test_user_dirs(),
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2578,6 +2589,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
 
         run_state_refresh_locked(
+            crate::test_user_dirs(),
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3448,6 +3460,7 @@ mod tests {
 
         let provider_context = ProviderContext::default();
         let refresh = run_state_refresh(
+            crate::test_user_dirs(),
             fixture.config_path(),
             true,
             &provider_context,

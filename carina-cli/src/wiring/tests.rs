@@ -43,6 +43,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let loader_called = Arc::new(AtomicBool::new(false));
     let called = Arc::clone(&loader_called);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         &[],
         tmp.path(),
         false,
@@ -63,6 +64,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
 
     let called = Arc::clone(&loader_called);
     let result = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         std::slice::from_ref(&config),
         tmp.path(),
         false,
@@ -91,6 +93,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let saw_aws = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&saw_aws);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         &[config],
         tmp.path(),
         false,
@@ -146,6 +149,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let observed = Arc::clone(&hard_loads);
 
     let result = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         &configs,
         tmp.path(),
         true,
@@ -172,6 +176,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let formatting_loads = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&formatting_loads);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         &configs,
         tmp.path(),
         false,
@@ -627,7 +632,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     )
     .unwrap();
     let identity_mismatch = installed
-        .load_with(&grants, |_verified| async {
+        .load_with(crate::test_user_dirs(), &grants, |_verified| async {
             Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
         })
         .await
@@ -648,6 +653,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     std::fs::write(&installed_path, b"fixture").unwrap();
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
     let result = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         std::slice::from_ref(&config),
         tmp.path(),
         true,
@@ -669,6 +675,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let trusted_inputs =
         TrustedLocalGrantInputs::new(vec![format!("{}=aws", wasm_path.display())], None);
     let result = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         std::slice::from_ref(&config),
         tmp.path(),
         true,
@@ -684,6 +691,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     ));
 
     let (factories, errors) = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         std::slice::from_ref(&config),
         tmp.path(),
         false,
@@ -764,6 +772,7 @@ async fn unverified_official_factory_load_case() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
     let result = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         std::slice::from_ref(&config),
         project.path(),
         false,
@@ -831,8 +840,11 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    let (factories, _) =
-        build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
+    let (factories, _) = build_factories_from_providers(
+        crate::test_user_dirs(),
+        provider_configs.as_provider_configs(),
+        base_dir,
+    )?;
     let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
     let unresolved = carina_core::parser::ParsedFile {
         resources: unresolved_resources.to_vec(),
@@ -7895,6 +7907,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
     let (factories, errors) = build_factories_from_providers_impl_using(
+        crate::test_user_dirs(),
         &[config],
         base,
         false,
@@ -7962,7 +7975,8 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let (factories, errors) =
+        build_factories_from_providers(crate::test_user_dirs(), &[config], base).unwrap();
     let rendered = errors
         .get("awscc")
         .expect("missing locked artifact must reach the CLI diagnostic boundary");
@@ -8019,7 +8033,8 @@ async fn registry_source_reaches_cli_artifact_loader() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let (factories, errors) =
+        build_factories_from_providers(crate::test_user_dirs(), &[config], base).unwrap();
     let rendered = errors
         .get("awscc")
         .expect("the invalid fixture should fail only after registry resolution");
@@ -8067,8 +8082,12 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let (factories, errors) = build_factories_from_providers(std::slice::from_ref(&config), base)
-        .expect("registry source must reach the single factory-load boundary");
+    let (factories, errors) = build_factories_from_providers(
+        crate::test_user_dirs(),
+        std::slice::from_ref(&config),
+        base,
+    )
+    .expect("registry source must reach the single factory-load boundary");
     let load_error = errors
         .get("awscc")
         .expect("invalid WASM fixture must be reported during factory loading");
@@ -8158,7 +8177,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     };
 
     let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&[config], base).unwrap();
+        build_factories_from_providers_for_formatting(crate::test_user_dirs(), &[config], base)
+            .unwrap();
 
     assert!(factories.is_empty());
     assert!(!load_errors.is_empty());
@@ -8200,7 +8220,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         default_tags: IndexMap::new(),
     };
 
-    let runtime_error = match build_factories_from_providers(std::slice::from_ref(&config), base) {
+    let runtime_error = match build_factories_from_providers(
+        crate::test_user_dirs(),
+        std::slice::from_ref(&config),
+        base,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("unversioned provider lock must be returned as an error"),
     };
@@ -8232,7 +8256,8 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     assert!(std::error::Error::source(&runtime_error).is_none());
 
     let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&[config], base).unwrap();
+        build_factories_from_providers_for_formatting(crate::test_user_dirs(), &[config], base)
+            .unwrap();
     assert!(factories.is_empty());
     let formatting_error = load_errors
         .get("carina-providers.lock")
@@ -8298,7 +8323,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         default_tags: IndexMap::new(),
     };
 
-    let result = build_factories_from_providers(&[config], base);
+    let result = build_factories_from_providers(crate::test_user_dirs(), &[config], base);
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("mismatched provider lock must be returned as an error"),

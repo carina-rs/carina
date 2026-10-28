@@ -2058,6 +2058,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
     let result = run_state_refresh_locked(
+        crate::test_user_dirs(),
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),
@@ -2103,6 +2104,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
+        crate::test_user_dirs(),
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),
@@ -2166,6 +2168,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
+        crate::test_user_dirs(),
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),

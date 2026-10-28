@@ -1,3 +1,9 @@
 disallowed-types = [
   { path = "sigstore::bundle::verify::blocking::Verifier", reason = "owns a Tokio runtime and panics inside one (#3904); use the async Verifier with futures::executor::block_on" },
 ]
+
+disallowed-methods = [
+  { path = "dirs::home_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
+  { path = "std::env::home_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
+  { path = "carina_core::user_dirs::UserDirs::from_real_home", reason = "call UserDirs::from_real_home only at the carina and carina-lsp binary entry points" },
+]
