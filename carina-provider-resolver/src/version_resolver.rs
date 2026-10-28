@@ -287,7 +287,7 @@ fn verify_release_asset(
     if release.draft {
         return Err(ReleaseAssetVerificationError::Draft { tag: release.tag });
     }
-    if release.prerelease && release.version.pre.is_empty() {
+    if is_stable_version_marked_prerelease(&release) {
         return Err(ReleaseAssetVerificationError::PrereleaseForStableVersion {
             tag: release.tag,
             version: release.version,
@@ -320,6 +320,10 @@ fn verify_release_asset(
         tag: release.tag,
         asset_id: selected.id,
     })
+}
+
+fn is_stable_version_marked_prerelease(release: &GithubRelease) -> bool {
+    release.prerelease && release.version.pre.is_empty()
 }
 
 /// Select the release's only `.wasm` asset.
@@ -441,6 +445,7 @@ pub(crate) fn fetch_releases_with_api<H: GithubHttp + ?Sized>(
         .into_iter()
         .filter(|response| !response.draft)
         .filter_map(|response| GithubRelease::from_api(response).ok())
+        .filter(|release| !is_stable_version_marked_prerelease(release))
         .collect())
 }
 
@@ -595,6 +600,25 @@ mod tests {
         let resolved = resolve_from_releases(&releases, &req).unwrap().unwrap();
 
         assert_eq!(resolved.tag().as_str(), "v0.1.0");
+    }
+
+    #[test]
+    fn stable_version_marked_prerelease_with_higher_matching_version_is_not_selected() {
+        let url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
+        let http = FixtureGithubHttp::default().json(
+            url,
+            r#"[
+                {"tag_name":"v1.1.0","draft":false,"prerelease":true,"assets":[{"name":"prerelease.wasm","id":52}]},
+                {"tag_name":"v1.0.0","draft":false,"prerelease":false,"assets":[{"name":"stable.wasm","id":51}]}
+            ]"#,
+        );
+        let api = GithubApi::new(&http, None);
+        let req = VersionReq::parse("^1").unwrap();
+
+        let releases = fetch_releases_with_api(&github_source(), &api).unwrap();
+        let resolved = resolve_from_releases(&releases, &req).unwrap().unwrap();
+
+        assert_eq!(resolved.tag().as_str(), "v1.0.0");
     }
 
     #[test]

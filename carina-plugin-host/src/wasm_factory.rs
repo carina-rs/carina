@@ -2256,15 +2256,7 @@ async fn create_instance(
     provider_kind: Option<ProviderKind>,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
-    let mut store = GuestStore::new(
-        engine,
-        wasi_ctx,
-        None,
-        AllowListHttpHooks::new(provider_kind),
-        build_store_limits(),
-        budget,
-    );
+    let mut store = GuestStore::new(engine, provider_kind, None, build_store_limits(), budget);
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
@@ -2432,12 +2424,10 @@ async fn create_instance_with_http(
     provider_kind: Option<ProviderKind>,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let mut store = GuestStore::new(
         engine,
-        wasi_ctx,
+        provider_kind,
         Some(WasiHttpCtx::new()),
-        AllowListHttpHooks::new(provider_kind),
         build_store_limits(),
         budget,
     );
@@ -7651,12 +7641,10 @@ mod tests {
         // deadline on the Store would panic.
         let config = build_engine_config();
         let engine = Engine::new(&config).unwrap();
-        let wasi_ctx = WasiCtxBuilder::new().build();
         let mut store = GuestStore::new(
             &engine,
-            wasi_ctx,
             None,
-            AllowListHttpHooks::new(None),
+            None,
             build_store_limits(),
             GuestCallBudget::PRODUCTION,
         );
@@ -7675,12 +7663,10 @@ mod tests {
 
         // Verify by setting a deadline of 1 on a store — if the epoch has
         // advanced past 1, this deadline is already expired.
-        let wasi_ctx = WasiCtxBuilder::new().build();
         let mut store = GuestStore::new(
             &engine,
-            wasi_ctx,
             None,
-            AllowListHttpHooks::new(None),
+            None,
             build_store_limits(),
             GuestCallBudget::PRODUCTION,
         );
@@ -8198,12 +8184,10 @@ mod tests {
     async fn runtime_wall_timeout_keeps_typed_budget_source_without_duplicate_text() {
         let config = build_engine_config();
         let engine = Engine::new(&config).unwrap();
-        let wasi_ctx = WasiCtxBuilder::new().build();
         let mut store = GuestStore::new(
             &engine,
-            wasi_ctx,
             None,
-            AllowListHttpHooks::new(None),
+            None,
             build_store_limits(),
             GuestCallBudget::new(
                 std::time::Duration::from_secs(30),

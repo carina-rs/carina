@@ -281,19 +281,7 @@ impl std::fmt::Display for GithubApiError {
     }
 }
 
-impl std::error::Error for GithubApiError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Location(error) => Some(error),
-            Self::Decode { source, .. } => Some(source),
-            Self::ReleaseAssetVerification(error) => Some(error),
-            Self::Http(_)
-            | Self::Authentication(_)
-            | Self::Status { .. }
-            | Self::PaginationCycle { .. } => None,
-        }
-    }
-}
+impl std::error::Error for GithubApiError {}
 
 impl From<GithubLocationError> for GithubApiError {
     fn from(error: GithubLocationError) -> Self {
@@ -721,6 +709,16 @@ mod tests {
         })
         .unwrap();
         crate::version_resolver::verify_fresh_release_asset(repo_slug(), release).unwrap()
+    }
+
+    #[test]
+    fn github_api_error_does_not_expose_displayed_child_as_source() {
+        let error = GithubApiError::Decode {
+            endpoint: "https://api.github.com/repos/acme/widget/releases".into(),
+            source: serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+        };
+
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

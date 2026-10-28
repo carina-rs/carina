@@ -7073,11 +7073,7 @@ impl ResolvedGithubRelease {
                 asset_id,
             } => github
                 .verify_locked_release_asset(repo, version, tag, *asset_id)
-                .map_err(|error| {
-                    format!(
-                        "Failed to verify GitHub release asset id {asset_id} for tag '{tag}': {error}"
-                    )
-                }),
+                .map_err(|error| format!("Failed to verify locked GitHub release asset: {error}")),
         }
     }
 }
@@ -8972,6 +8968,11 @@ sha256 = "def"
         .expect_err("an unverified locked release asset must be rejected");
 
         assert!(error.contains(expected_error), "{error}");
+        assert_eq!(
+            error.matches(tag).count(),
+            1,
+            "release tag should not be repeated by nested error context: {error}"
+        );
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         assert!(!project_wasm.exists(), "project cache must stay untouched");
         assert!(
