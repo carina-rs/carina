@@ -1,10 +1,11 @@
 //! Resolve provider binaries from GitHub Actions CI artifacts by git revision.
 
 use serde::Deserialize;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use carina_core::provider_source::GithubSource;
+use sha2::{Digest, Sha256};
 
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
@@ -13,7 +14,7 @@ use crate::install_lock::{
 };
 use crate::provider_resolver::WasmArtifactPath;
 use crate::verified_artifact::{
-    DownloadedArtifact, RevisionArtifactPin, VerifiedArtifact, VerifiedArtifactError,
+    ArtifactPin, DownloadedArtifact, RevisionArtifactPin, VerifiedArtifact, VerifiedArtifactError,
     lookup_revision_artifact_pin, publish_download,
 };
 
@@ -115,8 +116,8 @@ pub fn resolve_ref_to_sha(
 /// Returns run IDs newest-first, matching GitHub's default ordering.
 ///
 /// Multiple workflows may run on the same commit (e.g. `ci.yml` and `docs.yml`
-/// both triggered on push to main). The caller is responsible for picking the
-/// run that actually contains the expected artifact — see
+/// both triggered on push to main). The caller inspects artifacts from every
+/// run to find the unique WASM entry — see
 /// [`select_artifact_from_runs`].
 fn find_workflow_run_ids(
     source: &GithubSource,
@@ -187,95 +188,240 @@ fn fetch_run_artifacts(
     Ok(data.artifacts)
 }
 
-/// Result of looking for a specific artifact inside a single run's artifact list.
-#[derive(Debug, PartialEq, Eq)]
-enum ArtifactMatch {
-    /// A non-expired artifact with the expected name was found.
-    Found(u64),
-    /// The expected artifact exists in this run but has expired.
-    Expired,
-    /// No artifact with the expected name is in this run.
-    NotFound,
+struct WasmZipEntry {
+    name: String,
+    bytes: Vec<u8>,
 }
 
-/// Pure: scan a run's artifacts list for one matching `expected_name`.
-/// Expired artifacts are reported separately so callers can surface a
-/// targeted error message when every candidate run is expired.
-fn pick_artifact_id(artifacts: &[Artifact], expected_name: &str) -> ArtifactMatch {
-    let mut saw_expired = false;
-    for artifact in artifacts {
-        if artifact.name != expected_name {
+fn wasm_entries(zip_data: Vec<u8>) -> Result<Vec<WasmZipEntry>, String> {
+    let cursor = io::Cursor::new(zip_data);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|error| format!("Failed to open artifact ZIP: {error}"))?;
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|error| format!("Failed to read ZIP entry: {error}"))?;
+        if file.is_dir() || !file.name().ends_with(".wasm") {
             continue;
         }
-        if artifact.expired {
-            saw_expired = true;
-            continue;
-        }
-        return ArtifactMatch::Found(artifact.id);
+        let name = file.name().to_string();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("Failed to read WASM entry '{name}': {error}"))?;
+        entries.push(WasmZipEntry { name, bytes });
     }
-    if saw_expired {
-        ArtifactMatch::Expired
-    } else {
-        ArtifactMatch::NotFound
+    Ok(entries)
+}
+
+mod revision_artifact_selection {
+    use super::*;
+
+    /// A GitHub artifact selected by inspecting its ZIP contents.
+    ///
+    /// Its fields and constructor stay private to this module, so an arbitrary
+    /// artifact ID cannot acquire selected-artifact provenance.
+    #[derive(Debug)]
+    pub(super) struct SelectedRevisionArtifact {
+        artifact_id: u64,
+        wasm_bytes: Vec<u8>,
+        sha256: String,
+    }
+
+    impl SelectedRevisionArtifact {
+        fn new(artifact_id: u64, wasm_bytes: Vec<u8>) -> Self {
+            let sha256 = format!("{:x}", Sha256::digest(&wasm_bytes));
+            Self {
+                artifact_id,
+                wasm_bytes,
+                sha256,
+            }
+        }
+
+        pub(super) fn artifact_id(&self) -> u64 {
+            self.artifact_id
+        }
+
+        pub(super) fn wasm_bytes(&self) -> &[u8] {
+            &self.wasm_bytes
+        }
+
+        pub(super) fn sha256(&self) -> &str {
+            &self.sha256
+        }
+    }
+
+    struct CandidateWasm {
+        artifact_id: u64,
+        artifact_name: String,
+        entry: WasmZipEntry,
+    }
+
+    pub(super) fn select_artifact_from_runs<F, D>(
+        run_ids: &[u64],
+        source: &GithubSource,
+        sha: &str,
+        mut fetch: F,
+        mut download: D,
+    ) -> Result<SelectedRevisionArtifact, String>
+    where
+        F: FnMut(u64) -> Result<Vec<Artifact>, String>,
+        D: FnMut(u64) -> Result<Vec<u8>, String>,
+    {
+        if run_ids.is_empty() {
+            return Err(format!(
+                "No successful workflow runs found for {source}@{sha}. Ensure CI has run successfully."
+            ));
+        }
+
+        let mut candidate_names = Vec::new();
+        let mut expired_names = Vec::new();
+        let mut wasm_candidates = Vec::new();
+        for &run_id in run_ids {
+            for artifact in fetch(run_id)? {
+                if artifact.expired {
+                    expired_names.push(artifact.name);
+                    continue;
+                }
+                candidate_names.push(artifact.name.clone());
+                let zip_data = download(artifact.id).map_err(|error| {
+                    format!(
+                        "Failed to download candidate artifact '{}' (id {}): {error}",
+                        artifact.name, artifact.id
+                    )
+                })?;
+                let entries = wasm_entries(zip_data).map_err(|error| {
+                    format!(
+                        "Failed to inspect candidate artifact '{}' (id {}): {error}",
+                        artifact.name, artifact.id
+                    )
+                })?;
+                wasm_candidates.extend(entries.into_iter().map(|entry| CandidateWasm {
+                    artifact_id: artifact.id,
+                    artifact_name: artifact.name.clone(),
+                    entry,
+                }));
+            }
+        }
+
+        match wasm_candidates.len() {
+            1 => {
+                let candidate = wasm_candidates.pop().expect("length checked");
+                Ok(SelectedRevisionArtifact::new(
+                    candidate.artifact_id,
+                    candidate.entry.bytes,
+                ))
+            }
+            0 if candidate_names.is_empty() && !expired_names.is_empty() => Err(format!(
+                "All artifacts in successful workflow runs for {source}@{sha} have expired: {}. \
+                 Re-run CI for this revision or run `carina init --upgrade`.",
+                expired_names.join(", ")
+            )),
+            0 => {
+                let candidates = if candidate_names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    candidate_names.join(", ")
+                };
+                Err(format!(
+                    "No .wasm entry found in any non-expired artifact for {source}@{sha}. \
+                     Candidate artifacts: {candidates}."
+                ))
+            }
+            _ => {
+                let causes = wasm_candidates
+                    .iter()
+                    .map(|candidate| {
+                        format!("{}: {}", candidate.artifact_name, candidate.entry.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "Multiple .wasm entries found across candidate artifacts for {source}@{sha}: \
+                     {causes}. Exactly one .wasm entry is required."
+                ))
+            }
+        }
+    }
+
+    pub(super) fn replay_locked_artifact<D>(
+        source: &GithubSource,
+        sha: &str,
+        artifact_id: u64,
+        expected_sha256: &str,
+        mut download: D,
+    ) -> Result<SelectedRevisionArtifact, String>
+    where
+        D: FnMut(u64) -> Result<Vec<u8>, String>,
+    {
+        let zip_data = download(artifact_id).map_err(|error| {
+            format!(
+                "Failed to download locked artifact {artifact_id} for {source}@{sha}: {error}. \
+                 The artifact may be missing or expired; re-run CI for this revision or run \
+                 `carina init --upgrade`."
+            )
+        })?;
+        let mut entries = wasm_entries(zip_data).map_err(|error| {
+            format!("Failed to inspect locked artifact {artifact_id} for {source}@{sha}: {error}")
+        })?;
+        if entries.len() != 1 {
+            let names = entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let names = if names.is_empty() { "(none)" } else { &names };
+            return Err(format!(
+                "Locked artifact {artifact_id} for {source}@{sha} must contain exactly one .wasm \
+                 entry, found {}: {names}. Re-run CI for this revision or run \
+                 `carina init --upgrade`.",
+                entries.len()
+            ));
+        }
+        let entry = entries.pop().expect("length checked");
+        let selected = SelectedRevisionArtifact::new(artifact_id, entry.bytes);
+        if selected.sha256() != expected_sha256 {
+            return Err(format!(
+                "SHA256 mismatch for locked artifact {artifact_id} ({source}@{sha}). \
+                 Expected: {expected_sha256}, got: {}. The pinned artifact contents changed; \
+                 if that change is intended, run `carina init --upgrade`.",
+                selected.sha256()
+            ));
+        }
+        Ok(selected)
     }
 }
 
-/// Iterate candidate workflow runs and return the first artifact ID that
-/// matches `expected_name` and is not expired.
-///
-/// When a repo has multiple workflows on push (e.g. `ci.yml` producing a WASM
-/// artifact and `docs.yml` producing nothing), GitHub returns all successful
-/// runs for the same SHA. Taking only `runs[0]` picks whichever finished last,
-/// which may not be the run that uploaded the artifact. Iterating the full
-/// list removes the dependency on workflow ordering.
-fn select_artifact_from_runs<F>(
-    run_ids: &[u64],
-    expected_name: &str,
+use revision_artifact_selection::{
+    SelectedRevisionArtifact, replay_locked_artifact, select_artifact_from_runs,
+};
+
+fn resolve_revision_artifact<F, A, D>(
+    artifact_pin: &ArtifactPin<'_, RevisionArtifactPin>,
     source: &GithubSource,
     sha: &str,
-    mut fetch: F,
-) -> Result<u64, String>
+    mut find_runs: F,
+    fetch: A,
+    download: D,
+) -> Result<SelectedRevisionArtifact, String>
 where
-    F: FnMut(u64) -> Result<Vec<Artifact>, String>,
+    F: FnMut() -> Result<Vec<u64>, String>,
+    A: FnMut(u64) -> Result<Vec<Artifact>, String>,
+    D: FnMut(u64) -> Result<Vec<u8>, String>,
 {
-    if run_ids.is_empty() {
-        return Err(format!(
-            "No successful workflow runs found for {source}@{sha}. \
-             Ensure CI has run successfully. Expected artifact: '{expected_name}'."
-        ));
+    if let Some((lock_entry, pin)) = artifact_pin.pinned() {
+        return replay_locked_artifact(source, sha, pin.artifact_id, &lock_entry.sha256, download);
     }
-
-    let mut saw_expired = false;
-    for &run_id in run_ids {
-        let artifacts = fetch(run_id)?;
-        match pick_artifact_id(&artifacts, expected_name) {
-            ArtifactMatch::Found(id) => return Ok(id),
-            ArtifactMatch::Expired => saw_expired = true,
-            ArtifactMatch::NotFound => {}
-        }
-    }
-
-    if saw_expired {
-        Err(format!(
-            "Artifact '{expected_name}' has expired in every successful workflow run for {source}@{sha}. \
-             Re-run CI for this revision or use `file://` for local builds."
-        ))
-    } else {
-        Err(format!(
-            "No artifact named '{expected_name}' found in any successful workflow run for {source}@{sha}. \
-             Ensure CI uploads an artifact named '{expected_name}'."
-        ))
-    }
+    let run_ids = find_runs()?;
+    select_artifact_from_runs(&run_ids, source, sha, fetch, download)
 }
 
-/// Download a GitHub Actions artifact (ZIP) and extract the WASM file.
-fn download_artifact<'lock>(
-    install_lock: &'lock ProviderInstallLock,
+/// Download a GitHub Actions artifact ZIP.
+fn download_artifact_zip(
     source: &GithubSource,
     artifact_id: u64,
-    destination: &WasmArtifactPath,
     token: &str,
-) -> Result<StagedArtifact<'lock>, String> {
+) -> Result<Vec<u8>, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url =
@@ -301,37 +447,24 @@ fn download_artifact<'lock>(
         .into_reader()
         .read_to_end(&mut zip_data)
         .map_err(|e| format!("Failed to read artifact data: {e}"))?;
+    Ok(zip_data)
+}
 
-    // Extract the .wasm file from the ZIP
-    let cursor = io::Cursor::new(zip_data);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| format!("Failed to open artifact ZIP: {e}"))?;
-
-    let expected_wasm = format!("{}.wasm", source.repo());
-
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Failed to read ZIP entry: {e}"))?;
-
-        let name = file.name().to_string();
-        if name.ends_with(".wasm") {
-            let mut staged =
-                StagedArtifact::for_project(install_lock, destination).map_err(|e| {
-                    format!(
-                        "Failed to stage provider artifact {}: {e}",
-                        destination.as_path().display()
-                    )
-                })?;
-            io::copy(&mut file, &mut staged)
-                .map_err(|e| format!("Failed to write WASM file: {e}"))?;
-            return Ok(staged);
-        }
-    }
-
-    Err(format!(
-        "No .wasm file found in artifact ZIP. Expected '{expected_wasm}'."
-    ))
+fn stage_selected_artifact<'lock>(
+    install_lock: &'lock ProviderInstallLock,
+    destination: &WasmArtifactPath,
+    selected: &SelectedRevisionArtifact,
+) -> Result<StagedArtifact<'lock>, String> {
+    let mut staged = StagedArtifact::for_project(install_lock, destination).map_err(|error| {
+        format!(
+            "Failed to stage provider artifact {}: {error}",
+            destination.as_path().display()
+        )
+    })?;
+    staged
+        .write_all(selected.wasm_bytes())
+        .map_err(|error| format!("Failed to write selected WASM file: {error}"))?;
+    Ok(staged)
 }
 
 /// Cache path for revision-based providers.
@@ -370,6 +503,7 @@ fn record_verified_revision_pin(
         kind: crate::provider_resolver::LockEntryKind::Revision {
             revision: pin.revision,
             resolved_sha: pin.resolved_sha,
+            artifact_id: pin.artifact_id,
         },
         sha256: artifact.sha256().to_string(),
         registry: None,
@@ -395,6 +529,7 @@ pub fn resolve_provider_by_revision(
         && let super::provider_resolver::LockEntryKind::Revision {
             revision: locked_revision,
             resolved_sha,
+            artifact_id: _,
         } = &lock_entry.kind
         && locked_revision == revision
     {
@@ -408,7 +543,8 @@ pub fn resolve_provider_by_revision(
         resolve_ref_to_sha(source, revision, &token)?
     };
 
-    let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
+    let artifact_pin =
+        lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name, !upgrade);
 
     // As in version mode, machine-local artifacts are never first-use trust
     // anchors. A project or global cache entry without this exact revision pin
@@ -466,27 +602,33 @@ pub fn resolve_provider_by_revision(
         &sha[..sha.len().min(12)]
     );
 
-    let run_ids = find_workflow_run_ids(source, &sha, &token)?;
-    let expected_name = format!("{}.wasm", source.repo());
-    let artifact_id =
-        select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
-            fetch_run_artifacts(source, run_id, &token)
-        })?;
-    let staged = download_artifact(install_lock, source, artifact_id, &wasm_path, &token)?;
+    let selected = resolve_revision_artifact(
+        &artifact_pin,
+        source,
+        &sha,
+        || find_workflow_run_ids(source, &sha, &token),
+        |run_id| fetch_run_artifacts(source, run_id, &token),
+        |artifact_id| download_artifact_zip(source, artifact_id, &token),
+    )?;
+    let artifact_id = selected.artifact_id();
+    let selected_sha256 = selected.sha256().to_string();
+    let staged = stage_selected_artifact(install_lock, &wasm_path, &selected)?;
     let installed_path = match publish_download(staged, artifact_pin)? {
         DownloadedArtifact::Verified { artifact, pin } => {
             record_verified_revision_pin(lock_file, &artifact, pin, name);
             artifact.path().clone()
         }
         DownloadedArtifact::FirstUse { path, sha256 } => {
+            debug_assert_eq!(&sha256, &selected_sha256);
             lock_file.upsert(super::provider_resolver::LockEntry {
                 name: name.to_string(),
                 source: source_key.to_string(),
                 kind: super::provider_resolver::LockEntryKind::Revision {
                     revision: revision.to_string(),
                     resolved_sha: sha.clone(),
+                    artifact_id,
                 },
-                sha256,
+                sha256: selected_sha256,
                 registry: None,
             });
             path
@@ -512,7 +654,8 @@ mod tests {
     use super::*;
     use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
     use carina_core::provider_source::{ProviderSource, RemoteSource};
-    use std::io::Write as _;
+    use sha2::{Digest, Sha256};
+    use std::cell::Cell;
 
     fn github_source(owner: &str, repo: &str) -> GithubSource {
         match format!("github.com/{owner}/{repo}")
@@ -566,6 +709,7 @@ mod tests {
             kind: crate::provider_resolver::LockEntryKind::Revision {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
             },
             sha256: "expected".into(),
             registry: None::<RegistryLock>,
@@ -599,6 +743,7 @@ mod tests {
             kind: crate::provider_resolver::LockEntryKind::Revision {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
             },
             sha256: "expected-sha256".into(),
             registry: None,
@@ -643,12 +788,19 @@ mod tests {
             kind: crate::provider_resolver::LockEntryKind::Revision {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
             },
             sha256: "locked-revision-sha256".into(),
             registry: None,
         });
-        let pin =
-            lookup_revision_artifact_pin(&lock_file, &source.source_key(), "main", TEST_SHA, "aws");
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &source.source_key(),
+            "main",
+            TEST_SHA,
+            "aws",
+            true,
+        );
 
         let error = publish_download(staged, pin)
             .expect_err("fresh revision bytes must match an existing lock pin");
@@ -678,6 +830,7 @@ mod tests {
             kind: crate::provider_resolver::LockEntryKind::Revision {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
             },
             sha256: expected_sha256.clone(),
             registry: None,
@@ -740,6 +893,7 @@ mod tests {
             kind: crate::provider_resolver::LockEntryKind::Revision {
                 revision: "main".into(),
                 resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
             },
             sha256: sha256.clone(),
             registry: None,
@@ -789,156 +943,289 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_pick_artifact_id_found() {
-        let artifacts = vec![
-            artifact("other.wasm", 1, false),
-            artifact("carina-provider-aws.wasm", 42, false),
-        ];
-        assert_eq!(
-            pick_artifact_id(&artifacts, "carina-provider-aws.wasm"),
-            ArtifactMatch::Found(42)
-        );
+    fn artifact_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     #[test]
-    fn test_pick_artifact_id_not_found() {
-        let artifacts = vec![artifact("other.wasm", 1, false)];
-        assert_eq!(
-            pick_artifact_id(&artifacts, "carina-provider-aws.wasm"),
-            ArtifactMatch::NotFound
-        );
-    }
-
-    #[test]
-    fn test_pick_artifact_id_expired() {
-        let artifacts = vec![artifact("carina-provider-aws.wasm", 42, true)];
-        assert_eq!(
-            pick_artifact_id(&artifacts, "carina-provider-aws.wasm"),
-            ArtifactMatch::Expired
-        );
-    }
-
-    #[test]
-    fn test_pick_artifact_id_prefers_non_expired_over_expired() {
-        // Same name, expired first then valid — must not short-circuit on expired.
-        let artifacts = vec![artifact("my.wasm", 1, true), artifact("my.wasm", 2, false)];
-        assert_eq!(
-            pick_artifact_id(&artifacts, "my.wasm"),
-            ArtifactMatch::Found(2)
-        );
-    }
-
-    #[test]
-    fn test_select_artifact_iterates_past_run_without_match() {
-        // Regression for the multi-workflow case:
-        // Run 200 is a docs workflow (no artifacts), run 100 is CI (has artifact).
-        // GitHub returns them newest-first, so 200 comes first. The resolver
-        // must iterate past 200 and find the artifact in 100.
-        let run_ids = vec![200u64, 100u64];
-        let fetch = |run_id: u64| -> Result<Vec<Artifact>, String> {
-            match run_id {
-                200 => Ok(vec![]),
-                100 => Ok(vec![artifact("carina-provider-aws.wasm", 999, false)]),
-                other => panic!("unexpected run_id {other}"),
-            }
-        };
-
-        let result = select_artifact_from_runs(
-            &run_ids,
-            "carina-provider-aws.wasm",
+    fn revision_artifact_selection_uses_zip_contents_not_artifact_name() {
+        let wasm = b"provider wasm";
+        let selected = select_artifact_from_runs(
+            &[100],
             &test_source(),
             TEST_SHA,
-            fetch,
-        );
-        assert_eq!(result.unwrap(), 999);
+            |_| Ok(vec![artifact("build-output", 42, false)]),
+            |artifact_id| {
+                assert_eq!(artifact_id, 42);
+                Ok(artifact_zip(&[("dist/provider.wasm", wasm)]))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(selected.artifact_id(), 42);
+        assert_eq!(selected.wasm_bytes(), wasm);
+        assert_eq!(selected.sha256(), sha256_bytes(wasm));
     }
 
     #[test]
-    fn test_select_artifact_found_in_first_run() {
-        let run_ids = vec![100u64];
-        let fetch = |_| Ok(vec![artifact("my.wasm", 7, false)]);
-        assert_eq!(
-            select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-                .unwrap(),
-            7
-        );
+    fn revision_artifact_selection_scans_all_runs_and_artifacts() {
+        let selected = select_artifact_from_runs(
+            &[200, 100],
+            &test_source(),
+            TEST_SHA,
+            |run_id| match run_id {
+                200 => Ok(vec![artifact("docs", 1, false)]),
+                100 => Ok(vec![
+                    artifact("metadata", 2, false),
+                    artifact("portable-build", 3, false),
+                ]),
+                other => panic!("unexpected run {other}"),
+            },
+            |artifact_id| match artifact_id {
+                1 => Ok(artifact_zip(&[("README.txt", b"docs")])),
+                2 => Ok(artifact_zip(&[("metadata.json", b"{}")])),
+                3 => Ok(artifact_zip(&[("out/provider.wasm", b"selected")])),
+                other => panic!("unexpected artifact {other}"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(selected.artifact_id(), 3);
+        assert_eq!(selected.wasm_bytes(), b"selected");
     }
 
     #[test]
-    fn test_select_artifact_prefers_later_run_when_earlier_is_expired() {
-        // First run's artifact has expired, second run has a valid one.
-        // The `saw_expired` flag must not suppress a later `Found`.
-        let run_ids = vec![200u64, 100u64];
-        let fetch = |run_id: u64| -> Result<Vec<Artifact>, String> {
-            match run_id {
-                200 => Ok(vec![artifact("my.wasm", 1, true)]),
-                100 => Ok(vec![artifact("my.wasm", 2, false)]),
-                other => panic!("unexpected run_id {other}"),
-            }
-        };
-        assert_eq!(
-            select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-                .unwrap(),
-            2
-        );
+    fn revision_artifact_selection_no_wasm_lists_all_artifact_names() {
+        let error = select_artifact_from_runs(
+            &[100],
+            &test_source(),
+            TEST_SHA,
+            |_| {
+                Ok(vec![
+                    artifact("docs", 1, false),
+                    artifact("metadata", 2, false),
+                ])
+            },
+            |artifact_id| match artifact_id {
+                1 => Ok(artifact_zip(&[("README.md", b"docs")])),
+                2 => Ok(artifact_zip(&[("metadata.json", b"{}")])),
+                other => panic!("unexpected artifact {other}"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("docs"), "{error}");
+        assert!(error.contains("metadata"), "{error}");
     }
 
     #[test]
-    fn test_select_artifact_not_found_anywhere() {
-        let run_ids = vec![200u64, 100u64];
-        let fetch = |_| Ok(vec![artifact("other.wasm", 1, false)]);
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-            .unwrap_err();
-        assert!(err.contains("No artifact named 'my.wasm'"), "err={err}");
+    fn revision_artifact_selection_multiple_artifacts_lists_each_wasm() {
+        let error = select_artifact_from_runs(
+            &[100],
+            &test_source(),
+            TEST_SHA,
+            |_| {
+                Ok(vec![
+                    artifact("linux-build", 1, false),
+                    artifact("macos-build", 2, false),
+                ])
+            },
+            |artifact_id| match artifact_id {
+                1 => Ok(artifact_zip(&[("dist/linux.wasm", b"linux")])),
+                2 => Ok(artifact_zip(&[("dist/macos.wasm", b"macos")])),
+                other => panic!("unexpected artifact {other}"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("linux-build: dist/linux.wasm"), "{error}");
+        assert!(error.contains("macos-build: dist/macos.wasm"), "{error}");
+    }
+
+    #[test]
+    fn revision_artifact_selection_multiple_wasm_in_one_artifact_lists_each_entry() {
+        let error = select_artifact_from_runs(
+            &[100],
+            &test_source(),
+            TEST_SHA,
+            |_| Ok(vec![artifact("build-output", 1, false)]),
+            |_| {
+                Ok(artifact_zip(&[
+                    ("dist/provider.wasm", b"one"),
+                    ("fixtures/helper.wasm", b"two"),
+                ]))
+            },
+        )
+        .unwrap_err();
+
         assert!(
-            err.contains(TEST_SOURCE),
-            "err should include source: {err}"
+            error.contains("build-output: dist/provider.wasm"),
+            "{error}"
         );
-        assert!(err.contains(TEST_SHA), "err should include sha: {err}");
-    }
-
-    #[test]
-    fn test_select_artifact_expired_in_all_runs() {
-        let run_ids = vec![200u64, 100u64];
-        let fetch = |_| Ok(vec![artifact("my.wasm", 1, true)]);
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-            .unwrap_err();
-        assert!(err.contains("expired"), "err={err}");
         assert!(
-            err.contains(TEST_SOURCE),
-            "err should include source: {err}"
+            error.contains("build-output: fixtures/helper.wasm"),
+            "{error}"
         );
-        assert!(err.contains(TEST_SHA), "err should include sha: {err}");
     }
 
     #[test]
-    fn test_select_artifact_propagates_fetch_error() {
-        // A transient fetch error on the first run must be surfaced, not
-        // silently swallowed so that later runs are tried.
-        let run_ids = vec![200u64, 100u64];
-        let fetch = |run_id: u64| -> Result<Vec<Artifact>, String> {
-            Err(format!("network error for run {run_id}"))
-        };
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-            .unwrap_err();
-        assert!(err.contains("network error for run 200"), "err={err}");
+    fn revision_artifact_selection_only_expired_artifacts_reports_expired() {
+        let error = select_artifact_from_runs(
+            &[100],
+            &test_source(),
+            TEST_SHA,
+            |_| {
+                Ok(vec![
+                    artifact("first-build", 1, true),
+                    artifact("second-build", 2, true),
+                ])
+            },
+            |_| -> Result<Vec<u8>, String> { panic!("expired artifacts must not be downloaded") },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("expired"), "{error}");
+        assert!(error.contains("first-build"), "{error}");
+        assert!(error.contains("second-build"), "{error}");
     }
 
     #[test]
-    fn test_select_artifact_no_runs() {
-        let run_ids: Vec<u64> = vec![];
-        let fetch = |_| -> Result<Vec<Artifact>, String> {
-            panic!("fetch should not be called when there are no runs")
-        };
-        let err = select_artifact_from_runs(&run_ids, "my.wasm", &test_source(), TEST_SHA, fetch)
-            .unwrap_err();
-        assert!(err.contains("No successful workflow runs"), "err={err}");
-        assert!(
-            err.contains(TEST_SOURCE),
-            "err should include source: {err}"
+    fn revision_artifact_locked_replay_skips_run_listing() {
+        let wasm = b"locked provider";
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
+            },
+            sha256: sha256_bytes(wasm),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            TEST_SHA,
+            "aws",
+            true,
         );
-        assert!(err.contains(TEST_SHA), "err should include sha: {err}");
+        let listed_runs = Cell::new(false);
+
+        let selected = resolve_revision_artifact(
+            &pin,
+            &test_source(),
+            TEST_SHA,
+            || {
+                listed_runs.set(true);
+                Ok(vec![100])
+            },
+            |_| panic!("locked replay must not fetch run artifacts"),
+            |artifact_id| {
+                assert_eq!(artifact_id, 42);
+                Ok(artifact_zip(&[("provider.wasm", wasm)]))
+            },
+        )
+        .unwrap();
+
+        assert!(!listed_runs.get());
+        assert_eq!(selected.artifact_id(), 42);
+        assert_eq!(selected.wasm_bytes(), wasm);
+    }
+
+    #[test]
+    fn revision_artifact_locked_replay_rejects_sha256_mismatch() {
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
+            },
+            sha256: sha256_bytes(b"locked provider"),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            TEST_SHA,
+            "aws",
+            true,
+        );
+
+        let error = resolve_revision_artifact(
+            &pin,
+            &test_source(),
+            TEST_SHA,
+            || -> Result<Vec<u64>, String> { panic!("locked replay must not list runs") },
+            |_| panic!("locked replay must not fetch run artifacts"),
+            |_| Ok(artifact_zip(&[("provider.wasm", b"changed provider")])),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("SHA256 mismatch"), "{error}");
+        assert!(error.contains("artifact 42"), "{error}");
+    }
+
+    #[test]
+    fn revision_artifact_upgrade_reselects_instead_of_replaying_pin() {
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+                artifact_id: 42,
+            },
+            sha256: sha256_bytes(b"old provider"),
+            registry: None,
+        });
+        let pin = lookup_revision_artifact_pin(
+            &lock_file,
+            &test_source().source_key(),
+            "main",
+            TEST_SHA,
+            "aws",
+            false,
+        );
+        let listed_runs = Cell::new(false);
+
+        let selected = resolve_revision_artifact(
+            &pin,
+            &test_source(),
+            TEST_SHA,
+            || {
+                listed_runs.set(true);
+                Ok(vec![100])
+            },
+            |_| Ok(vec![artifact("new-build", 99, false)]),
+            |artifact_id| {
+                assert_eq!(artifact_id, 99);
+                Ok(artifact_zip(&[("provider.wasm", b"new provider")]))
+            },
+        )
+        .unwrap();
+
+        assert!(listed_runs.get());
+        assert_eq!(selected.artifact_id(), 99);
+        assert_eq!(selected.wasm_bytes(), b"new provider");
     }
 
     #[test]

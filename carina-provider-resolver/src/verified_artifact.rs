@@ -108,6 +108,7 @@ pub(crate) struct VersionArtifactPin {
 pub(crate) struct RevisionArtifactPin {
     pub(crate) revision: String,
     pub(crate) resolved_sha: String,
+    pub(crate) artifact_id: u64,
 }
 
 #[derive(Debug)]
@@ -331,6 +332,7 @@ pub(crate) fn lookup_version_artifact_pin<'a>(
             LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
+                artifact_id: _,
             }
             | LockEntryKind::RegistryRevision {
                 revision: _,
@@ -354,23 +356,30 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
     revision: &str,
     resolved_sha: &str,
     provider_name: &'a str,
+    use_existing_pin: bool,
 ) -> ArtifactPin<'a, RevisionArtifactPin> {
+    if !use_existing_pin {
+        return ArtifactPin::Unpinned(FirstUse(()));
+    }
     let pinned = lock_file
         .find_by_source_key_and_sha(source, resolved_sha)
         .and_then(|entry| match &entry.kind {
             LockEntryKind::Revision {
-                revision: _,
+                revision: locked_revision,
                 resolved_sha: locked_sha,
-            } if locked_sha == resolved_sha => Some((
+                artifact_id,
+            } if locked_revision == revision && locked_sha == resolved_sha => Some((
                 entry,
                 RevisionArtifactPin {
-                    revision: revision.to_string(),
+                    revision: locked_revision.clone(),
                     resolved_sha: locked_sha.clone(),
+                    artifact_id: *artifact_id,
                 },
             )),
             LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
+                artifact_id: _,
             }
             | LockEntryKind::Version {
                 version: _,
@@ -504,6 +513,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
             LockEntryKind::Revision {
                 revision,
                 resolved_sha,
+                artifact_id,
             },
             RemoteSource::GithubDirect(source),
         ) => (
@@ -512,12 +522,14 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
             LockedProviderPin::Revision {
                 revision: revision.clone(),
                 resolved_sha: resolved_sha.clone(),
+                artifact_id: *artifact_id,
             },
         ),
         (
             LockEntryKind::Revision {
                 revision: _revision,
                 resolved_sha: _resolved_sha,
+                artifact_id: _artifact_id,
             },
             RemoteSource::Registry(_registry_source),
         ) => {

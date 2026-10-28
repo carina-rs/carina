@@ -7188,6 +7188,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         kind: carina_provider_resolver::LockEntryKind::Revision {
             revision: revision.into(),
             resolved_sha: resolved_sha.into(),
+            artifact_id: 42,
         },
         sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
         registry: None,
@@ -7250,6 +7251,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         kind: carina_provider_resolver::LockEntryKind::Revision {
             revision: revision.into(),
             resolved_sha: resolved_sha.into(),
+            artifact_id: 42,
         },
         sha256: "fixture".into(),
         registry: None,

@@ -69,6 +69,7 @@ pub enum LockEntryKind {
     Revision {
         revision: String,
         resolved_sha: String,
+        artifact_id: u64,
     },
     /// Registry-hosted provider resolved by following a branch revision.
     RegistryRevision { revision: String, version: String },
@@ -2175,6 +2176,28 @@ struct LockFileVersion {
     version: Option<u32>,
 }
 
+/// Discard the one pre-artifact-pin lock shape at the raw-value boundary, then
+/// let the canonical lock-entry types validate every retained table.
+fn deserialize_provider_entries<'de, D, R>(deserializer: D) -> Result<Vec<LockEntry<R>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    R: serde::de::DeserializeOwned,
+{
+    let entries = Vec::<toml::Table>::deserialize(deserializer)?;
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry.get("mode").and_then(toml::Value::as_str) != Some("revision")
+                || entry.contains_key("artifact_id")
+        })
+        .map(|entry| {
+            toml::Value::Table(entry)
+                .try_into()
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedLockFile {
@@ -2182,7 +2205,7 @@ struct UncheckedLockFile {
     _version: u32,
     #[serde(default)]
     registry_host: BTreeMap<String, RegistryHostLock>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_provider_entries")]
     provider: Vec<LockEntry<RegistryLock>>,
     #[serde(default)]
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
@@ -2195,7 +2218,7 @@ struct UncheckedLockFileV3 {
     _version: u32,
     #[serde(default)]
     registry_host: BTreeMap<String, RegistryHostLock>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_provider_entries")]
     provider: Vec<LockEntry<RegistryLockV3>>,
     #[serde(default)]
     unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
@@ -2208,7 +2231,7 @@ struct UncheckedLockFileV2 {
     _version: u32,
     #[serde(default)]
     registry_host: BTreeMap<String, LegacyRegistryHostLock>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_provider_entries")]
     provider: Vec<LockEntry<RegistryLockV3>>,
     #[serde(default)]
     unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
@@ -2219,7 +2242,7 @@ struct UncheckedLockFileV2 {
 struct UncheckedLockFileV1 {
     #[serde(rename = "version")]
     _version: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_provider_entries")]
     provider: Vec<LockEntry<RegistryLockV1>>,
     #[serde(default)]
     unpinned_registry_yanks: UnpinnedRegistryYanksV1,
@@ -4169,6 +4192,7 @@ pub enum LockedProviderPin {
     Revision {
         revision: String,
         resolved_sha: String,
+        artifact_id: u64,
     },
     RegistryRevision {
         revision: String,
@@ -4192,7 +4216,11 @@ impl fmt::Display for LockedProviderPin {
             LockedProviderPin::Revision {
                 revision,
                 resolved_sha,
-            } => write!(f, "revision {revision}, resolved_sha {resolved_sha}"),
+                artifact_id,
+            } => write!(
+                f,
+                "revision {revision}, resolved_sha {resolved_sha}, artifact_id {artifact_id}"
+            ),
             LockedProviderPin::RegistryRevision { revision, version } => {
                 write!(f, "registry revision {revision}, version {version}")
             }
@@ -6593,6 +6621,7 @@ fn select_locked_artifact<'lock>(
                             | LockEntryKind::Revision {
                                 revision: _,
                                 resolved_sha: _,
+                                artifact_id: _,
                             }
                             | LockEntryKind::File => None,
                         })
@@ -6603,6 +6632,7 @@ fn select_locked_artifact<'lock>(
                         LockEntryKind::Revision {
                             revision: _,
                             resolved_sha: _,
+                            artifact_id: _,
                         } => Some(lock_entry),
                         LockEntryKind::Version {
                             version: _,
@@ -6626,6 +6656,7 @@ fn select_locked_artifact<'lock>(
                     LockEntryKind::Revision {
                         revision: _,
                         resolved_sha: _,
+                        artifact_id: _,
                     }
                     | LockEntryKind::RegistryRevision {
                         revision: _,
@@ -6978,6 +7009,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: _,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             )
             | (
@@ -6996,6 +7028,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 if crn_rev != locked_rev {
@@ -7062,6 +7095,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -7118,6 +7152,7 @@ pub fn check_lock_mismatch(
                 LockEntryKind::Revision {
                     revision: locked_rev,
                     resolved_sha: _,
+                    artifact_id: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -8940,10 +8975,96 @@ transparency_log_present = false
             kind: LockEntryKind::Revision {
                 revision: revision.into(),
                 resolved_sha: sha.into(),
+                artifact_id: 42,
             },
             sha256: "abc".into(),
             registry: None,
         }
+    }
+
+    #[test]
+    fn revision_lock_round_trip_preserves_artifact_id() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "main",
+            "deadbeef",
+        ));
+
+        let serialized = lock.to_toml_string().unwrap();
+        assert!(serialized.contains("artifact_id = 42"), "{serialized}");
+
+        let parsed =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
+        assert_eq!(
+            parsed.provider[0].kind,
+            LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: "deadbeef".into(),
+                artifact_id: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_revision_lock_is_unpinned_in_normal_mode_and_missing_in_locked_mode() {
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "{source}"
+mode = "revision"
+revision = "main"
+resolved_sha = "deadbeef"
+sha256 = "legacy"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+        let lock =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
+        let config = provider_config(source, Some("main"));
+
+        assert!(lock.provider.is_empty());
+        check_lock_mismatch(std::slice::from_ref(&config), &lock, LockMode::Normal).unwrap();
+        let error = check_lock_mismatch(&[config], &lock, LockMode::Locked).unwrap_err();
+        assert!(
+            error.contains("missing from carina-providers.lock"),
+            "{error}"
+        );
+        assert!(error.contains("carina init"), "{error}");
+        assert!(
+            !lock
+                .to_toml_string()
+                .unwrap()
+                .contains("mode = \"revision\"")
+        );
+    }
+
+    #[test]
+    fn malformed_revision_artifact_id_is_a_parse_error() {
+        let serialized = format!(
+            r#"version = {}
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "deadbeef"
+artifact_id = "not-a-number"
+sha256 = "malformed"
+"#,
+            LockFile::CURRENT_VERSION
+        );
+
+        let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect_err("a present but malformed artifact ID must not be dropped");
+
+        assert!(matches!(&error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("expected u64"), "{rendered}");
     }
 
     fn provider_config(source: &str, revision: Option<&str>) -> ProviderConfig {
@@ -9864,7 +9985,7 @@ transparency_log_present = false
     }
 
     #[test]
-    fn v1_github_revision_lock_from_issue_migrates_and_saves_as_v4() {
+    fn v1_github_revision_without_artifact_id_migrates_as_unpinned() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(
@@ -9899,32 +10020,12 @@ sha256 = "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
                 .find(|line| line.starts_with("Migration found")),
             Some("Migration found no v1 discovery pins requiring operator authorization.")
         );
-        assert_eq!(lock_file.provider.len(), 1);
-        let entry = &lock_file.provider[0];
-        assert_eq!(entry.name, "awscc");
-        assert_eq!(entry.source, "github.com/carina-rs/carina-provider-awscc");
-        assert_eq!(
-            entry.kind,
-            LockEntryKind::Revision {
-                revision: "main".into(),
-                resolved_sha: "97c9fd97d9501443fd9b6ad7a12e883703e81add".into(),
-            }
-        );
-        assert_eq!(
-            entry.sha256,
-            "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
-        );
-        assert!(entry.registry.is_none());
+        assert!(lock_file.provider.is_empty());
 
         lock_file.save(&lock_path).unwrap();
         let saved = fs::read_to_string(&lock_path).unwrap();
         assert!(saved.starts_with("version = 4\n"), "{saved}");
-        assert!(saved.contains("mode = \"revision\""), "{saved}");
-        assert!(saved.contains("revision = \"main\""), "{saved}");
-        assert!(
-            saved.contains("resolved_sha = \"97c9fd97d9501443fd9b6ad7a12e883703e81add\""),
-            "{saved}"
-        );
+        assert!(!saved.contains("mode = \"revision\""), "{saved}");
     }
 
     #[test]
@@ -17647,6 +17748,7 @@ transparency_log_present = false
         let pin = LockedProviderPin::Revision {
             revision: "main".into(),
             resolved_sha: "deadbeefcafe".into(),
+            artifact_id: 42,
         };
         let nested = missing_locked_artifact_error(Path::new("infra/foo"), &pin, Some("main"));
         assert!(
