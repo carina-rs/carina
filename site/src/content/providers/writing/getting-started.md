@@ -359,7 +359,9 @@ provider hello {
 
 Lock files written by older Carina versions for `github.com/...` version sources do not record the release tag. Run `carina init` once to rewrite those entries; `carina init --locked`, plan, and apply report the legacy entry until it has been rewritten.
 
-With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit. For that, a GitHub Actions workflow in the repository must upload the built component as an artifact named `<repo>.wasm`, for example `carina-provider-hello.wasm`. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
+With `revision` instead of `version`, `carina init` installs the CI build for a branch, tag or commit. It resolves the revision to a commit and looks at the successful GitHub Actions runs for that commit. Only runs triggered by a `push` to the repository itself count; pull request runs, including those from forks, are ignored. Across the artifacts those runs uploaded, there must be exactly one `.wasm` file, so have one workflow upload the built component, under any artifact and file name. If several runs uploaded byte-identical builds, the newest is used. When no build or more than one is found, the error lists the candidates. This call does need a token, `GITHUB_TOKEN` or a logged-in `gh`.
+
+`carina-providers.lock` records the commit, the artifact ID and the checksum, and later installs download that artifact without choosing again. GitHub deletes artifacts after their retention period. When the recorded artifact is gone, `carina init` looks for a build at the same commit and accepts it only if its checksum matches the lock. In lock-writing modes it records the new artifact ID; with `--locked` it uses the build for that run only and suggests running `carina init` to update the lock. Lock entries written by older Carina versions for `revision` sources have no artifact ID; `carina init` selects the build again at the recorded commit and adds it, and `carina init --locked` reports the entry until then.
 
 A GitHub source is not signature-checked, but `carina init` records the checksum of what it downloaded in the lock file.
 
