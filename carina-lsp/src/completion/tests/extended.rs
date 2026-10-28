@@ -139,6 +139,257 @@ outer {
 }
 
 #[test]
+fn completion_inside_multiline_list_of_struct_uses_shared_path() {
+    let provider = test_provider_with_list_of_structs();
+    let text = r#"test.Policy {
+  rules = [
+    {
+
+    }
+  ]
+}
+"#;
+    let position = Position::new(3, 0);
+
+    let completions = provider.complete(&create_document(text), position, None);
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"name"), "{labels:?}");
+    assert!(labels.contains(&"enabled"), "{labels:?}");
+    assert!(!labels.contains(&"rules"), "{labels:?}");
+}
+
+#[test]
+fn completion_after_same_line_resource_and_struct_openers_uses_shared_path() {
+    let provider = test_provider_with_nested_structs();
+    let text = "test.nested.resource { outer = { ";
+    let position = Position::new(0, text.chars().count() as u32);
+
+    let completions = provider.complete(&create_document(text), position, None);
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"inner"), "{labels:?}");
+    assert!(labels.contains(&"outer_field"), "{labels:?}");
+    assert!(!labels.contains(&"outer"), "{labels:?}");
+}
+
+fn position_at_end(text: &str) -> Position {
+    let (line, tail) = text.rsplit_once('\n').map_or((0, text), |(before, tail)| {
+        (
+            before.bytes().filter(|byte| *byte == b'\n').count() + 1,
+            tail,
+        )
+    });
+    Position::new(line as u32, tail.chars().count() as u32)
+}
+
+#[test]
+fn scalar_list_values_keep_value_completion_context() {
+    let provider = test_provider_for_enclosing_block_regressions();
+    for text in [
+        "let role = 'admin'\ntest.review.Resource {\n  attr = [",
+        "let role = 'admin'\ntest.review.Resource {\n  attr = [role, ",
+        "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = [",
+        "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = [role, ",
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.contains(&"role"),
+            "list value position should retain `role`: {text:?} -> {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn function_argument_comma_stays_in_struct_value_context() {
+    let provider = test_provider_for_enclosing_block_regressions();
+    for text in [
+        "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = join(role, ",
+        "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = concat([role, ",
+        "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = lower('a,b')",
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.contains(&"role"),
+            "nested expression punctuation must not start a field-name segment: {text:?} -> {labels:?}"
+        );
+        assert!(!labels.contains(&"inner"), "{labels:?}");
+    }
+}
+
+#[test]
+fn map_comma_still_starts_a_new_field_segment() {
+    let provider = test_provider_for_enclosing_block_regressions();
+    let text = "test.review.Resource {\n  outer {\n    tags = { Name = 'a', Env = ";
+    let context = provider.get_completion_context(text, position_at_end(text));
+
+    assert!(
+        matches!(
+            context,
+            CompletionContext::AfterEqualsInStruct {
+                ref resource_type,
+                ref attr_path,
+                ref field_name,
+                ..
+            } if resource_type == "test.review.Resource"
+                && attr_path == &["outer".to_string(), "tags".to_string()]
+                && field_name == "Env"
+        ),
+        "map comma should make `Env` the current field: {context:?}"
+    );
+}
+
+#[test]
+fn assignment_expressions_and_control_blocks_keep_struct_context() {
+    let provider = test_provider_for_enclosing_block_regressions();
+    for (text, expected_path) in [
+        (
+            "test.review.Resource {\n  outer = if true {\n    ",
+            vec!["outer".to_string()],
+        ),
+        (
+            "test.review.Resource {\n  x = merge(y, {\n    ",
+            vec!["x".to_string()],
+        ),
+        (
+            "test.review.Resource {\n  policy = jsonencode({\n    ",
+            vec!["policy".to_string()],
+        ),
+    ] {
+        let context = provider.get_completion_context(text, position_at_end(text));
+        assert!(
+            matches!(
+                context,
+                CompletionContext::InsideStructBlock {
+                    ref resource_type,
+                    ref attr_path,
+                } if resource_type == "test.review.Resource" && attr_path == &expected_path
+            ),
+            "assignment expression should retain {expected_path:?}: {context:?}"
+        );
+    }
+
+    for control_text in [
+        "test.review.Resource {\n  if true {\n    ",
+        "test.review.Resource {\n  for item in items {\n    ",
+        "test.review.Resource {\n  if false {\n  } else {\n    ",
+    ] {
+        let completions = provider.complete(
+            &create_document(control_text),
+            position_at_end(control_text),
+            None,
+        );
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"outer"), "{control_text:?}: {labels:?}");
+        assert!(labels.contains(&"policy"), "{control_text:?}: {labels:?}");
+    }
+}
+
+#[test]
+fn else_branches_keep_assignment_struct_context() {
+    let provider = test_provider_with_nested_structs();
+    for text in [
+        r#"test.nested.resource {
+  outer = if true {
+    {
+      outer_field = 'a'
+    }
+  } else {
+    {
+      "#,
+        r#"test.nested.resource {
+  outer = if false {
+    {
+      outer_field = 'a'
+    }
+  } else if true {
+    {
+      "#,
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"inner"), "{text:?}: {labels:?}");
+        assert!(labels.contains(&"outer_field"), "{text:?}: {labels:?}");
+        assert!(!labels.contains(&"outer"), "{text:?}: {labels:?}");
+    }
+}
+
+#[test]
+fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
+    let provider = test_provider_with_nested_structs();
+    for text in [
+        r#"test.nested.resource {
+  outer = {
+    "k" = {
+      "#,
+        r#"test.nested.resource {
+  outer = {
+    'k' = {
+      "#,
+        r#"test.nested.resource {
+  outer = {
+    "k=v" = {
+      "#,
+    ] {
+        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        assert!(
+            completions.is_empty(),
+            "quoted map-key context must resolve to no schema fields: {:?}",
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn unresolvable_struct_path_preserves_enclosing_resource_binding() {
+    let vpc = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+    let resource = ResourceSchema::new("review.Resource")
+        .attribute(AttributeSchema::new("policy", AttributeType::string()))
+        .attribute(AttributeSchema::new("a", AttributeType::bool()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", vpc);
+    schemas.insert("test", resource);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+    let text = concat!(
+        "let a = test.ec2.Vpc {\n",
+        "  cidr_block = \"x\"\n",
+        "}\n",
+        "let v = test.review.Resource {\n",
+        "  policy = merge(\n",
+        "    {\n",
+        "      a = ",
+        "\n",
+        "    }\n",
+        "  )\n",
+        "}\n",
+    );
+    let position = Position::new(6, "      a = ".chars().count() as u32);
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(temp_dir.path().join("main.crn"), text).unwrap();
+    std::fs::write(
+        temp_dir.path().join("providers.crn"),
+        "provider test {\n}\n",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.path().join("exports.crn"), "exports {\n}\n").unwrap();
+
+    let completions = provider.complete(&create_document(text), position, Some(temp_dir.path()));
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(labels.contains(&"a"), "{labels:?}");
+    assert!(
+        !labels.contains(&"v"),
+        "the enclosing resource must not complete as a self-reference: {labels:?}"
+    );
+    assert!(!labels.contains(&"true"), "{labels:?}");
+    assert!(!labels.contains(&"false"), "{labels:?}");
+}
+
+#[test]
 fn nested_struct_after_equals_depth_2() {
     let provider = test_provider_with_nested_structs();
     let text = r#"let r = test.nested.resource {

@@ -1446,6 +1446,23 @@ for item in items {
 }
 
 #[test]
+fn resource_attribute_completion_inside_let_for_expression() {
+    let schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("force_destroy", AttributeType::bool()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["aws".to_string()], vec![], vec![]);
+    let text = "let xs = for v in vs {\n  aws.s3.Bucket {\n    ";
+    let completions = provider.complete(&create_document(text), Position::new(2, 4), None);
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+
+    assert!(labels.contains(&"name"), "{labels:?}");
+    assert!(labels.contains(&"force_destroy"), "{labels:?}");
+}
+
+#[test]
 fn enum_completion_inside_nested_for_loop_body() {
     // Two stacked `for` bodies still have to see through to the resource
     // type inside. Regression safety net for the for_body_depth tracker.
