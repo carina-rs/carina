@@ -7,6 +7,7 @@
 mod app;
 pub mod module_info_app;
 mod module_info_ui;
+mod row;
 mod ui;
 
 #[cfg(test)]

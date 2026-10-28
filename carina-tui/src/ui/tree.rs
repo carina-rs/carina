@@ -6,6 +6,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use crate::app::{App, FocusedPanel};
+use crate::row::{Indent, Row};
 
 use super::style::{build_plan_title, effect_style};
 
@@ -18,44 +19,7 @@ pub(super) fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(row_idx, &node_idx)| {
-            let node = &app.nodes[node_idx];
-            let connector = build_tree_connector_filtered(node_idx, app, &visible_set);
-            let is_ancestor_only = app.is_ancestor_only(node_idx);
-            let effect_color = if is_ancestor_only {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                effect_style(node.kind)
-            };
-            let type_style = if is_ancestor_only {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            };
-            let connector_style = if is_ancestor_only {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let mut spans = vec![
-                Span::styled(connector, connector_style),
-                Span::styled(format!("{} ", node.symbol), effect_color),
-                Span::styled(node.resource_type.clone(), type_style),
-                Span::raw(" "),
-                Span::styled(node.name_part.clone(), effect_color),
-            ];
-            if app.selected == row_idx {
-                spans = spans
-                    .into_iter()
-                    .map(|s| {
-                        let mut style = s.style;
-                        style = style.add_modifier(Modifier::BOLD);
-                        Span::styled(s.content, style)
-                    })
-                    .collect();
-            }
-            ListItem::new(Line::from(spans))
+            ListItem::new(build_tree_row(node_idx, row_idx, app, &visible_set))
         })
         .collect();
 
@@ -85,6 +49,53 @@ pub(super) fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     // Force our manually-tracked scroll offset to prevent ratatui's auto-scrolling
     *state.offset_mut() = app.tree_scroll_offset;
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn build_tree_row(
+    node_idx: usize,
+    row_idx: usize,
+    app: &App,
+    visible_set: &HashSet<usize>,
+) -> Line<'static> {
+    let node = &app.nodes[node_idx];
+    let connector = build_tree_connector_filtered(node_idx, app, visible_set);
+    let is_ancestor_only = app.is_ancestor_only(node_idx);
+    let effect_color = if is_ancestor_only {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        effect_style(node.kind)
+    };
+    let type_style = if is_ancestor_only {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    let connector_style = if is_ancestor_only {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![
+        Span::styled(connector, connector_style),
+        Span::styled(format!("{} ", node.symbol), effect_color),
+        Span::styled(node.resource_type.clone(), type_style),
+        Span::raw(" "),
+        Span::styled(node.name_part.clone(), effect_color),
+    ];
+    if app.selected == row_idx {
+        spans = spans
+            .into_iter()
+            .map(|s| {
+                let mut style = s.style;
+                style = style.add_modifier(Modifier::BOLD);
+                Span::styled(s.content, style)
+            })
+            .collect();
+    }
+
+    Row::new(Indent::new(0), spans).into_line()
 }
 
 /// Build the tree connector prefix for a node, considering filtered visibility.
@@ -159,6 +170,10 @@ mod tests {
     use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, Value};
     use carina_core::schema::SchemaRegistry;
 
+    use crate::ui::test_render::{
+        first_content_cell, leading_space_count, render_with_unstyled_indentation,
+    };
+
     fn create(resource: Resource) -> Effect {
         Effect::Create(ResolvedResource::new(resource))
     }
@@ -228,5 +243,69 @@ mod tests {
         let last_child = children[1];
         assert_eq!(build_tree_connector(first_child, &app), "    ├── ");
         assert_eq!(build_tree_connector(last_child, &app), "    └── ");
+    }
+
+    #[test]
+    fn selected_ancestor_row_keeps_connector_indent_unstyled() {
+        let mut plan = Plan::new();
+        plan.add(create(
+            Resource::new("test.Root", "root").with_binding("root"),
+        ));
+        plan.add(create(
+            Resource::new("test.Parent", "parent")
+                .with_binding("parent")
+                .with_attribute(
+                    "root_id",
+                    Value::resource_ref("root".to_string(), "id".to_string(), vec![]),
+                ),
+        ));
+        plan.add(create(
+            Resource::new("test.Ancestor", "ancestor")
+                .with_binding("ancestor")
+                .with_attribute(
+                    "parent_id",
+                    Value::resource_ref("parent".to_string(), "id".to_string(), vec![]),
+                ),
+        ));
+        plan.add(create(
+            Resource::new("test.Leaf", "matching-leaf").with_attribute(
+                "ancestor_id",
+                Value::resource_ref("ancestor".to_string(), "id".to_string(), vec![]),
+            ),
+        ));
+        let mut app = App::for_plan(&plan, &SchemaRegistry::new());
+        app.search_query = "matching-leaf".to_string();
+        app.update_search_matches();
+
+        let visible = app.visible_nodes();
+        let ancestor_idx = visible
+            .iter()
+            .copied()
+            .find(|&idx| app.nodes[idx].resource_type == "test.Ancestor")
+            .expect("ancestor node is visible");
+        let row_idx = visible
+            .iter()
+            .position(|&idx| idx == ancestor_idx)
+            .expect("ancestor has a visible row");
+        assert!(app.is_ancestor_only(ancestor_idx));
+        assert!(app.nodes[ancestor_idx].depth >= 2);
+        let parent_idx = app.nodes[ancestor_idx]
+            .parent
+            .expect("ancestor has a parent");
+        assert_eq!(app.nodes[parent_idx].children.last(), Some(&ancestor_idx));
+
+        app.selected = row_idx;
+        let visible_set = visible.iter().copied().collect();
+        let connector = build_tree_connector_filtered(ancestor_idx, &app, &visible_set);
+        assert!(connector.starts_with(' '));
+
+        let line = build_tree_row(ancestor_idx, row_idx, &app, &visible_set);
+        let buffer = render_with_unstyled_indentation(vec![line]);
+        assert!(leading_space_count(&buffer, 0) > 0);
+        let (_, connector_cell) =
+            first_content_cell(&buffer, 0).expect("connector glyph is rendered");
+        assert_eq!(connector_cell.symbol(), "└");
+        assert_eq!(connector_cell.fg, Color::DarkGray);
+        assert!(connector_cell.modifier.contains(Modifier::BOLD));
     }
 }

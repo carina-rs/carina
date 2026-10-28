@@ -8,6 +8,8 @@ mod diff;
 mod help;
 mod search;
 mod style;
+#[cfg(test)]
+mod test_render;
 mod tree;
 mod value_view;
 
