@@ -4127,17 +4127,18 @@ impl InstalledProvider {
         }
     }
 
-    /// Load through a caller-supplied async function while making provenance
-    /// attachment mandatory on the error path.
+    /// Load through a caller-supplied async function, supplying both the
+    /// verified artifact bytes and the host-configured provider name while
+    /// making provenance attachment mandatory on the error path.
     pub async fn load_with<T, E, F, Fut>(
         &self,
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(ProviderArtifactBytes) -> Fut,
+        F: FnOnce(ProviderArtifactBytes, String) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        loader(self.artifact_bytes())
+        loader(self.artifact_bytes(), self.provider_name.clone())
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -17548,7 +17549,7 @@ transparency_log_present = false
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(|bytes| async move {
+            .load_with(|bytes, _configured_name| async move {
                 Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
             })
             .await
@@ -17572,7 +17573,7 @@ transparency_log_present = false
         fs::write(&source_path, swapped_bytes).unwrap();
 
         let loaded = installed
-            .load_with(|bytes| async move {
+            .load_with(|bytes, _configured_name| async move {
                 Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
             })
             .await
@@ -17824,6 +17825,30 @@ transparency_log_present = false
         assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
         assert!(rendered.contains("if this lock is stale"));
         assert!(rendered.contains("carina init --upgrade"));
+    }
+
+    #[tokio::test]
+    async fn installed_provider_loader_receives_host_configured_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider_path = tmp.path().join("provider.wasm");
+        fs::write(&provider_path, b"fixture").unwrap();
+        let source = format!("file://{}", provider_path.display());
+        let installed = InstalledProvider::file_source(
+            WasmArtifactPath::new(provider_path, "aws").unwrap(),
+            "aws".to_string(),
+            source,
+        )
+        .unwrap();
+
+        let (loaded_bytes, configured_name) = installed
+            .load_with(|bytes, name| async move {
+                Ok::<_, std::convert::Infallible>((bytes.as_bytes().to_vec(), name))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded_bytes, b"fixture");
+        assert_eq!(configured_name, "aws");
     }
 
     #[test]

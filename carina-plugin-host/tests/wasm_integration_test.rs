@@ -189,9 +189,13 @@ macro_rules! skip_if_no_wasm {
 async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
-    let factory = WasmProviderFactory::from_bytes_with_cache_dir(&wasm_bytes, cache.path())
-        .await
-        .expect("Failed to load WASM provider");
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        &wasm_bytes,
+        "mock".to_string(),
+        cache.path(),
+    )
+    .await
+    .expect("Failed to load WASM provider");
     (factory, cache)
 }
 

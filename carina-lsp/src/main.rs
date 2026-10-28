@@ -92,9 +92,15 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
         };
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(|bytes| async move {
-                carina_plugin_host::WasmProviderFactory::from_bytes(bytes.as_bytes()).await
-            }))
+            tokio::runtime::Handle::current().block_on(installed.load_with(
+                |bytes, configured_name| async move {
+                    carina_plugin_host::WasmProviderFactory::from_bytes(
+                        bytes.as_bytes(),
+                        configured_name,
+                    )
+                    .await
+                },
+            ))
         }) {
             Ok(factory) => {
                 log::info!(

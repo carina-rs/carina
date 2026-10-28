@@ -28,8 +28,12 @@ const NON_WASI_BOGUS_COMPONENT_WAT: &str = r#"
 
 async fn render_instantiation_error(wat: &str) -> String {
     let cache_dir = tempfile::tempdir().expect("cache dir");
-    let err = match WasmProviderFactory::from_bytes_with_cache_dir(wat.as_bytes(), cache_dir.path())
-        .await
+    let err = match WasmProviderFactory::from_bytes_with_cache_dir(
+        wat.as_bytes(),
+        "fixture".to_string(),
+        cache_dir.path(),
+    )
+    .await
     {
         Ok(_) => panic!("fake component should have failed to instantiate"),
         Err(e) => e,
