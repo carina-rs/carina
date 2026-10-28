@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
-use carina_provider_resolver::{LockMode, resolve_all};
+use carina_provider_resolver::{LockMode, ProviderInstallLock, resolve_all};
 use indexmap::IndexMap;
 
 const PROVIDER: &str = "registry.carina-rs.dev/carina-rs/aws";
@@ -277,6 +277,47 @@ fn carina_target(
 }
 
 #[test]
+fn recovery_without_lock_reports_init_and_does_not_create_project() {
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("missing");
+
+    let output = carina(&project, "re-bootstrap", true, "");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "Provider lock file {} does not exist; run `{}` first",
+            project.join("carina-providers.lock").display(),
+            ProjectCommand::new("init", &project)
+        )),
+        "{stderr}"
+    );
+    assert!(!project.exists());
+}
+
+#[test]
+fn recovery_with_file_as_project_reports_missing_lock() {
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("not-a-directory");
+    fs::write(&project, b"unchanged").unwrap();
+
+    let output = carina(&project, "re-bootstrap", true, "");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "Provider lock file {} does not exist; run `{}` first",
+            project.join("carina-providers.lock").display(),
+            ProjectCommand::new("init", &project)
+        )),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(project).unwrap(), b"unchanged");
+}
+
+#[test]
 fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_discovery() {
     for (operation, target) in [
         ("repin-discovery", HOST),
@@ -388,8 +429,13 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         }
 
         if operation != "repin-discovery" {
-            let error = resolve_all(dir.path(), &[registry_provider_config()], LockMode::Normal)
-                .expect_err("provider-level recovery must not authorize discovery migration");
+            let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+            let error = resolve_all(
+                &install_lock,
+                &[registry_provider_config()],
+                LockMode::Normal,
+            )
+            .expect_err("provider-level recovery must not authorize discovery migration");
             assert!(
                 error.contains("lock-format migration requires operator authorization"),
                 "{operation}: {error}"
@@ -618,8 +664,13 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
         "declining must leave the v2 pin intact on disk"
     );
 
-    let error = resolve_all(dir.path(), &[registry_provider_config()], LockMode::Normal)
-        .expect_err("declining must leave migrated discovery resolution blocked");
+    let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+    let error = resolve_all(
+        &install_lock,
+        &[registry_provider_config()],
+        LockMode::Normal,
+    )
+    .expect_err("declining must leave migrated discovery resolution blocked");
     assert!(
         error.contains("lock-format migration requires operator authorization"),
         "{error}"
