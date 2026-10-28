@@ -4,7 +4,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -20,21 +20,14 @@ use carina_core::provider_source::{
 };
 use carina_core::version_constraint::VersionConstraint;
 
+use crate::install_lock::{
+    GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
+    global_cache_artifact_path, install_global_artifact_atomically,
+    install_project_artifact_atomically,
+};
 use crate::signing;
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
-
-fn link_or_copy_with(
-    link: impl Fn(&Path, &Path) -> io::Result<()>,
-    src: &Path,
-    dest: &Path,
-) -> io::Result<()> {
-    link(src, dest).or_else(|_| fs::copy(src, dest).map(|_| ()))
-}
-
-pub(crate) fn link_or_copy(src: &Path, dest: &Path) -> io::Result<()> {
-    link_or_copy_with(|src, dest| fs::hard_link(src, dest), src, dest)
-}
 
 /// Return the provider lock-file path for a project directory.
 pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
@@ -2048,7 +2041,7 @@ impl RegistryLock {
 /// The full carina-providers.lock file.
 ///
 /// `LockFile` deliberately implements neither `Serialize` nor `Deserialize`.
-/// Serialization stays behind the private seam used by [`Self::save`], while
+/// Serialization is performed by [`GuardedLockFile::save`], while
 /// deserialization is routed through [`Self::load`], which checks the format
 /// version before the current schema can consume or rewrite the file.
 #[derive(Debug, Clone)]
@@ -3112,7 +3105,7 @@ impl PreparedRegistryDiscoveryRepin<'_> {
     }
 }
 
-fn resolve_parent(path: &Path) -> &Path {
+pub(crate) fn resolve_parent(path: &Path) -> &Path {
     // Empty parents (bare relative filenames) and paths with no parent (such as
     // roots) both fall back to the current directory. For bare filenames, this
     // keeps the temporary file on the target's mount.
@@ -3140,7 +3133,7 @@ fn filesystem_loop_error() -> io::Error {
     io::Error::from_raw_os_error(ERROR_CANT_RESOLVE_FILENAME)
 }
 
-fn resolve_lock_file_save_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve_lock_file_save_path(path: &Path) -> io::Result<PathBuf> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -3191,7 +3184,7 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn rename_lock_file_for_test(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_lock_file_for_test(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(rename) = LOCK_FILE_RENAME_HOOK.with(|hook| hook.borrow_mut().take()) {
         return rename(from, to);
     }
@@ -3404,7 +3397,7 @@ impl LockFile {
         Ok(lock)
     }
 
-    fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+    pub(crate) fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(&SerializableLockFile {
             version: &self.version,
             registry_host: &self.registry_host,
@@ -3413,84 +3406,9 @@ impl LockFile {
         })
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        // rename replaces a symlink itself, unlike fs::write. Resolve the
-        // target first so every durability and replacement operation occurs
-        // in the target directory while the caller's symlink remains intact.
-        // It requires delete/replace permission for the target name, so a
-        // deny-delete ACL intentionally makes save fail: no atomic replacement
-        // can leave that name untouched.
-        let path = resolve_lock_file_save_path(path)?;
-        let parent = resolve_parent(&path);
-        let content = self
-            .to_toml_string()
-            .map_err(|e| io::Error::other(format!("Failed to serialize lock file: {e}")))?;
-
-        #[cfg(unix)]
-        let mut temp_file = {
-            use std::os::unix::fs::PermissionsExt;
-
-            let existing_permissions = match fs::metadata(&path) {
-                Ok(metadata) => Some(metadata.permissions()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            };
-
-            // Builder::tempfile_in is the configurable counterpart of
-            // NamedTempFile::new_in: the file remains in the target directory,
-            // while 0o666 is filtered by umask at creation just like fs::write.
-            let mut builder = tempfile::Builder::new();
-            builder.permissions(fs::Permissions::from_mode(0o666));
-            let temp_file = builder.tempfile_in(parent)?;
-
-            // Creation applies umask, so restore an existing target's exact
-            // mode afterwards. The still-open file remains writable even when
-            // the preserved mode is read-only.
-            // Only mode is preserved; ownership, ACLs, and extended attributes
-            // from the existing target are not retained by temp-file replacement.
-            if let Some(permissions) = existing_permissions {
-                temp_file.as_file().set_permissions(permissions)?;
-            }
-            temp_file
-        };
-
-        #[cfg(not(unix))]
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-        if let Err(error) = io::Write::write_all(&mut temp_file, content.as_bytes()) {
-            let _ = temp_file.close();
-            return Err(error);
-        }
-        if let Err(error) = temp_file.as_file().sync_all() {
-            let _ = temp_file.close();
-            return Err(error);
-        }
-
-        // Disarm automatic cleanup before the external rename so dropping the
-        // tempfile cannot unlink a pathname concurrently reused after rename.
-        let (temp_handle, temp_path) = match temp_file.keep() {
-            Ok(parts) => parts,
-            Err(error) => {
-                let source = error.error;
-                let _ = error.file.close();
-                return Err(source);
-            }
-        };
-        drop(temp_handle);
-        #[cfg(test)]
-        let rename_result = rename_lock_file_for_test(&temp_path, &path);
-        #[cfg(not(test))]
-        let rename_result = fs::rename(&temp_path, &path);
-        if let Err(error) = rename_result {
-            let _ = fs::remove_file(temp_path);
-            return Err(error);
-        }
-
-        if let Ok(parent_dir) = fs::File::open(parent) {
-            let _ = parent_dir.sync_all();
-        }
-
-        Ok(())
+        crate::install_lock::save_lock_file_fixture(self, path)
     }
 
     /// Find an entry matching `(source, version)` for modes with a published
@@ -3898,23 +3816,21 @@ struct RegistryProviderLockEntry {
 /// accepted observations durable. The live [`LockFile`] is replaced only
 /// after that write succeeds, so accepted registry security observations
 /// cannot exist only in memory.
-struct PersistentLockFile<'a> {
-    lock_file: &'a mut LockFile,
-    path: PathBuf,
-    project_dir: PathBuf,
+struct PersistentLockFile<'borrow, 'lock> {
+    lock_file: &'borrow mut GuardedLockFile<'lock>,
 }
 
-impl<'a> PersistentLockFile<'a> {
-    fn new(lock_file: &'a mut LockFile, project_dir: &Path) -> Self {
-        Self {
-            lock_file,
-            path: provider_lock_path(project_dir),
-            project_dir: project_dir.to_path_buf(),
-        }
+impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
+    fn new(lock_file: &'borrow mut GuardedLockFile<'lock>) -> Self {
+        Self { lock_file }
     }
 
     fn lock_file(&self) -> &LockFile {
         self.lock_file
+    }
+
+    fn install_lock(&self) -> &'lock ProviderInstallLock {
+        self.lock_file.install_lock()
     }
 
     fn persist_registry_ratchets(
@@ -3923,7 +3839,7 @@ impl<'a> PersistentLockFile<'a> {
         observation: &str,
         update: impl FnOnce(&mut RegistryRatchets) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut persisted = self.lock_file.clone();
+        let mut persisted = self.lock_file.clone_for_save();
         let mut ratchets = persisted
             .known_registry_ratchets_by_source_key(source)
             .map_err(|error| error.to_string())?;
@@ -3931,10 +3847,11 @@ impl<'a> PersistentLockFile<'a> {
         persisted
             .store_registry_ratchets(source.as_str(), ratchets)
             .map_err(|error| error.to_string())?;
-        persisted.save(&self.path).map_err(|error| {
+        persisted.save().map_err(|error| {
+            let path = provider_lock_path(self.lock_file.install_lock().project_dir());
             format!(
                 "Failed to persist registry {observation} observation to {}: {error}",
-                self.path.display()
+                path.display()
             )
         })?;
         *self.lock_file = persisted;
@@ -3959,7 +3876,7 @@ impl<'a> PersistentLockFile<'a> {
             versions,
             &locked,
             sequence_anchor,
-            &self.project_dir,
+            self.lock_file.install_lock().project_dir(),
         )?;
         let (observations, validated_sequence) = validated.into_parts();
 
@@ -4015,12 +3932,13 @@ impl<'a> PersistentLockFile<'a> {
     ) -> Result<(), String> {
         let SignerAcceptance { next, transition } = acceptance;
         if transition == SignerTransition::LegacyConverted {
-            let mut persisted = self.lock_file.clone();
+            let mut persisted = self.lock_file.clone_for_save();
             persisted.replace_legacy_signer_pin(source.as_str(), next)?;
-            persisted.save(&self.path).map_err(|error| {
+            persisted.save().map_err(|error| {
+                let path = provider_lock_path(self.lock_file.install_lock().project_dir());
                 format!(
                     "Failed to persist registry verified signature observation to {}: {error}",
-                    self.path.display()
+                    path.display()
                 )
             })?;
             *self.lock_file = persisted;
@@ -4421,10 +4339,10 @@ impl fmt::Display for RegistryDownloadError {
 trait RegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String>;
 
-    fn download_to_file(
+    fn download_into(
         &self,
         url: &RegistryResourceUrl,
-        dest: &Path,
+        out: &mut StagedArtifact<'_>,
     ) -> Result<(), RegistryDownloadError> {
         let raw_url = url.as_str();
         let body = match self
@@ -4439,19 +4357,8 @@ trait RegistryHttp {
                 });
             }
         };
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RegistryDownloadError::LocalIo(format!(
-                    "Failed to create directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        fs::write(dest, body).map_err(|error| {
-            RegistryDownloadError::LocalIo(format!(
-                "Failed to write file {}: {error}",
-                dest.display()
-            ))
+        out.write_all(&body).map_err(|error| {
+            RegistryDownloadError::LocalIo(format!("Failed to write downloaded file: {error}"))
         })?;
         Ok(())
     }
@@ -4537,10 +4444,10 @@ impl RegistryHttp for FixtureRegistryHttp {
         }
     }
 
-    fn download_to_file(
+    fn download_into(
         &self,
         url: &RegistryResourceUrl,
-        dest: &Path,
+        out: &mut StagedArtifact<'_>,
     ) -> Result<(), RegistryDownloadError> {
         let url = url.as_str();
         self.requested.lock().unwrap().push(url.to_string());
@@ -4568,16 +4475,8 @@ impl RegistryHttp for FixtureRegistryHttp {
                 }
             },
         };
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RegistryDownloadError::LocalIo(format!(
-                    "Failed to create {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        fs::write(dest, body).map_err(|error| {
-            RegistryDownloadError::LocalIo(format!("Failed to write {}: {error}", dest.display()))
+        out.write_all(body).map_err(|error| {
+            RegistryDownloadError::LocalIo(format!("Failed to write downloaded file: {error}"))
         })
     }
 }
@@ -4621,10 +4520,10 @@ impl RegistryHttp for UreqRegistryHttp {
         Ok(HttpResponse::Success { body })
     }
 
-    fn download_to_file(
+    fn download_into(
         &self,
         url: &RegistryResourceUrl,
-        dest: &Path,
+        out: &mut StagedArtifact<'_>,
     ) -> Result<(), RegistryDownloadError> {
         let request = RegistryHttpRequest::Resource(url);
         let url = url.as_str();
@@ -4651,22 +4550,7 @@ impl RegistryHttp for UreqRegistryHttp {
             });
         }
 
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RegistryDownloadError::LocalIo(format!(
-                    "Failed to create directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-
         let mut reader = response.into_body().into_reader();
-        let mut file = fs::File::create(dest).map_err(|error| {
-            RegistryDownloadError::LocalIo(format!(
-                "Failed to create file {}: {error}",
-                dest.display()
-            ))
-        })?;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = reader.read(&mut buffer).map_err(|error| {
@@ -4677,11 +4561,8 @@ impl RegistryHttp for UreqRegistryHttp {
             if read == 0 {
                 break;
             }
-            io::Write::write_all(&mut file, &buffer[..read]).map_err(|error| {
-                RegistryDownloadError::LocalIo(format!(
-                    "Failed to write file {}: {error}",
-                    dest.display()
-                ))
+            out.write_all(&buffer[..read]).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!("Failed to write downloaded file: {error}"))
             })?;
         }
 
@@ -5166,7 +5047,7 @@ fn fetch_registry_versions<H: RegistryHttp>(
     registry: &ResolvedRegistry,
     source: &RegistrySource,
     source_key: &RemoteSourceKey,
-    lock_file: &mut PersistentLockFile<'_>,
+    lock_file: &mut PersistentLockFile<'_, '_>,
     http: &H,
 ) -> Result<RecordedRegistryListing, String> {
     let url = join_registry_url(
@@ -5487,7 +5368,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
     source: &RegistrySource,
     source_key: &RemoteSourceKey,
     candidate_version: Option<&str>,
-    lock_file: &mut PersistentLockFile<'_>,
+    lock_file: &mut PersistentLockFile<'_, '_>,
     http: &H,
 ) -> Result<(), String> {
     let Some((locked_name, locked_version, locked_sha256, legacy_pin)) = lock_file
@@ -5544,7 +5425,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         format!("legacy-pinned registry provider '{locked_name}' ({source_key}@{locked_version})");
     let artifact = match obtain_registry_artifact(
         RegistryArtifactRequest {
-            base_dir: &lock_file.project_dir,
+            install_lock: lock_file.install_lock(),
             source: source_key,
             version: &locked_version,
             provider_name: &locked_name,
@@ -5569,23 +5450,31 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
     let version = ListedVersion::parse(&locked_version)?;
     let expected_signer = SignerPinState::Legacy(legacy_pin);
     let (_, acceptance) = match verify_and_decide_signer(
-        artifact.digest,
+        artifact.digest(),
         &bundle,
         &expected_signer,
         &version,
         source_key.as_str(),
-        &lock_file.project_dir,
+        lock_file.install_lock().project_dir(),
     ) {
         Ok(verified) => verified,
         Err(error) => {
-            let _ = fs::remove_file(artifact.path.as_path());
+            artifact.remove_if_cached();
             return Err(format!(
                 "legacy-pinned version {source_key}@{locked_version}: {error}"
             ));
         }
     };
     debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
-    lock_file.record_signer_acceptance(source_key, acceptance)
+    let artifact_path = artifact.path().as_path().to_path_buf();
+    artifact.publish().map_err(|error| {
+        format!(
+            "legacy-pinned version {source_key}@{locked_version}: Failed to publish provider artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    lock_file.record_signer_acceptance(source_key, acceptance)?;
+    Ok(())
 }
 
 /// Get the global plugin cache directory.
@@ -5601,12 +5490,12 @@ pub fn global_cache_dir() -> Option<PathBuf> {
 }
 
 /// Resolve the global cache path for a WASM provider.
-fn global_cache_path_wasm(source: &RemoteSourceKey, version: &str) -> Option<PathBuf> {
-    global_cache_dir().map(|dir| {
-        dir.join(source.as_str())
+fn global_cache_path_wasm(source: &RemoteSourceKey, version: &str) -> Option<GlobalArtifactPath> {
+    global_cache_artifact_path(
+        PathBuf::from(source.as_str())
             .join(version)
-            .join(format!("{}.wasm", source.artifact_name()))
-    })
+            .join(format!("{}.wasm", source.artifact_name())),
+    )
 }
 
 /// Resolve the cache path for a WASM provider component.
@@ -5652,7 +5541,6 @@ fn hash_and_check(
         .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
     let actual_hash = sha256_digest_hex(&artifact_digest);
     if actual_hash != expected_shasum {
-        let _ = fs::remove_file(wasm_path);
         return Err(format!(
             "SHA256 mismatch for {context}. Expected registry shasum {expected_shasum}, got {actual_hash}. Re-run `{}` to re-download.",
             ProjectCommand::new("init", project_dir)
@@ -5661,9 +5549,64 @@ fn hash_and_check(
     Ok(artifact_digest)
 }
 
-struct VerifiedRegistryArtifact {
-    path: WasmArtifactPath,
+enum RegistryArtifactState<'a> {
+    Cached {
+        install_lock: &'a ProviderInstallLock,
+        path: WasmArtifactPath,
+    },
+    Staged {
+        artifact: StagedArtifact<'a>,
+        path: WasmArtifactPath,
+    },
+}
+
+struct VerifiedRegistryArtifact<'a> {
+    state: RegistryArtifactState<'a>,
     digest: Sha256,
+}
+
+impl fmt::Debug for VerifiedRegistryArtifact<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (state, path) = match &self.state {
+            RegistryArtifactState::Cached { path, .. } => ("cached", path),
+            RegistryArtifactState::Staged { path, .. } => ("staged", path),
+        };
+        formatter
+            .debug_struct("VerifiedRegistryArtifact")
+            .field("state", &state)
+            .field("path", &path)
+            .field("digest", &sha256_digest_hex(&self.digest))
+            .finish()
+    }
+}
+
+impl VerifiedRegistryArtifact<'_> {
+    fn digest(&self) -> Sha256 {
+        self.digest.clone()
+    }
+
+    fn path(&self) -> &WasmArtifactPath {
+        match &self.state {
+            RegistryArtifactState::Cached { path, .. }
+            | RegistryArtifactState::Staged { path, .. } => path,
+        }
+    }
+
+    fn remove_if_cached(self) {
+        if let RegistryArtifactState::Cached { install_lock, path } = self.state {
+            let _ = install_lock.remove_project_artifact(&path);
+        }
+    }
+
+    fn publish(self) -> io::Result<WasmArtifactPath> {
+        match self.state {
+            RegistryArtifactState::Cached { path, .. } => Ok(path),
+            RegistryArtifactState::Staged { artifact, path } => {
+                artifact.publish()?;
+                Ok(path)
+            }
+        }
+    }
 }
 
 enum RegistryArtifactError {
@@ -5679,22 +5622,22 @@ impl fmt::Display for RegistryArtifactError {
     }
 }
 
-struct RegistryArtifactRequest<'a> {
-    base_dir: &'a Path,
-    source: &'a RemoteSourceKey,
-    version: &'a str,
-    provider_name: &'a str,
-    download_url: &'a RegistryResourceUrl,
-    expected_shasum: &'a str,
-    context: &'a str,
+struct RegistryArtifactRequest<'lock, 'request> {
+    install_lock: &'lock ProviderInstallLock,
+    source: &'request RemoteSourceKey,
+    version: &'request str,
+    provider_name: &'request str,
+    download_url: &'request RegistryResourceUrl,
+    expected_shasum: &'request str,
+    context: &'request str,
 }
 
-fn obtain_registry_artifact<H: RegistryHttp>(
-    request: RegistryArtifactRequest<'_>,
+fn obtain_registry_artifact<'lock, H: RegistryHttp>(
+    request: RegistryArtifactRequest<'lock, '_>,
     http: &H,
-) -> Result<VerifiedRegistryArtifact, RegistryArtifactError> {
+) -> Result<VerifiedRegistryArtifact<'lock>, RegistryArtifactError> {
     let RegistryArtifactRequest {
-        base_dir,
+        install_lock,
         source,
         version,
         provider_name,
@@ -5702,19 +5645,30 @@ fn obtain_registry_artifact<H: RegistryHttp>(
         expected_shasum,
         context,
     } = request;
-    let path = WasmArtifactPath::new(cache_path_wasm(base_dir, source, version), provider_name)
+    let project_dir = install_lock.project_dir();
+    let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
         .map_err(RegistryArtifactError::Invalid)?;
-    let digest = if path.as_path().exists() {
-        hash_and_check(
+    let (state, digest) = if path.as_path().exists() {
+        match hash_and_check(
             path.as_path(),
             expected_shasum,
             &format!("cached {context}"),
-            base_dir,
-        )
-        .map_err(RegistryArtifactError::Invalid)?
+            project_dir,
+        ) {
+            Ok(digest) => (RegistryArtifactState::Cached { install_lock, path }, digest),
+            Err(error) => {
+                let _ = install_lock.remove_project_artifact(&path);
+                return Err(RegistryArtifactError::Invalid(error));
+            }
+        }
     } else {
-        if let Err(error) = http.download_to_file(download_url, path.as_path()) {
-            let _ = fs::remove_file(path.as_path());
+        let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
+            RegistryArtifactError::Invalid(format!(
+                "Failed to stage provider artifact {}: {error}",
+                path.as_path().display()
+            ))
+        })?;
+        if let Err(error) = http.download_into(download_url, &mut staged) {
             let message = error.to_string();
             return Err(if error.is_unavailable() {
                 RegistryArtifactError::Unavailable(message)
@@ -5722,15 +5676,17 @@ fn obtain_registry_artifact<H: RegistryHttp>(
                 RegistryArtifactError::Invalid(message)
             });
         }
-        match hash_and_check(path.as_path(), expected_shasum, context, base_dir) {
-            Ok(digest) => digest,
-            Err(error) => {
-                let _ = fs::remove_file(path.as_path());
-                return Err(RegistryArtifactError::Invalid(error));
-            }
-        }
+        let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
+            .map_err(RegistryArtifactError::Invalid)?;
+        (
+            RegistryArtifactState::Staged {
+                artifact: staged,
+                path,
+            },
+            digest,
+        )
     };
-    Ok(VerifiedRegistryArtifact { path, digest })
+    Ok(VerifiedRegistryArtifact { state, digest })
 }
 
 fn verify_and_decide_signer(
@@ -5806,7 +5762,7 @@ struct VerifiedRegistryLockPin {
 }
 
 fn verify_registry_lock_pin(
-    lock_file: &mut PersistentLockFile<'_>,
+    lock_file: &mut PersistentLockFile<'_, '_>,
     source_key: &RemoteSourceKey,
     version: &str,
     expected_shasum: &str,
@@ -5844,7 +5800,8 @@ fn verify_registry_lock_pin(
         .known_registry_ratchets(source_key.as_str())
         .map_err(|error| error.to_string())?;
     if ratchets.signature.is_required() && signature.is_none() {
-        let remediation = identity_repin_remediation(source_key.as_str(), &lock_file.project_dir);
+        let remediation =
+            identity_repin_remediation(source_key.as_str(), lock_file.install_lock().project_dir());
         return Err(format!(
             "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
         ));
@@ -5907,17 +5864,18 @@ fn fetch_signature_bundle<H: RegistryHttp>(
 }
 
 fn resolve_registry_provider_with_http<H: RegistryHttp>(
-    base_dir: &Path,
     source: &RegistrySource,
     source_key: &RemoteSourceKey,
     version: &str,
     name: &str,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
+    let install_lock = lock_file.install_lock();
+    let project_dir = install_lock.project_dir();
     let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
-    let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
-    let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
+    let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
+    let mut persistent_lock = PersistentLockFile::new(lock_file);
     let RecordedRegistryListing {
         versions,
         validated_sequence,
@@ -5942,7 +5900,6 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     let download = fetch_registry_download(&registry, source, version, http)?;
     accept_registry_download_with_http(
         PendingRegistryDownload {
-            base_dir,
             source_key,
             version: listed_version,
             name,
@@ -5957,18 +5914,19 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
 }
 
 fn resolve_registry_revision_with_http<H: RegistryHttp>(
-    base_dir: &Path,
     source: &RegistrySource,
     revision: &str,
     name: &str,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     mode: LockMode,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
+    let install_lock = lock_file.install_lock();
+    let project_dir = install_lock.project_dir();
     let source_key = source.source_key();
     let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
-    let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
-    let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
+    let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
+    let mut persistent_lock = PersistentLockFile::new(lock_file);
     let RecordedRegistryListing {
         versions,
         validated_sequence,
@@ -6027,7 +5985,6 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
     };
     accept_registry_download_with_http(
         PendingRegistryDownload {
-            base_dir,
             source_key: &source_key,
             version: listed_version,
             name,
@@ -6081,7 +6038,6 @@ enum RegistryDownloadIntent<'a> {
 }
 
 struct PendingRegistryDownload<'a> {
-    base_dir: &'a Path,
     source_key: &'a RemoteSourceKey,
     version: ListedVersion,
     name: &'a str,
@@ -6093,11 +6049,10 @@ struct PendingRegistryDownload<'a> {
 
 fn accept_registry_download_with_http<H: RegistryHttp>(
     pending: PendingRegistryDownload<'_>,
-    persistent_lock: &mut PersistentLockFile<'_>,
+    persistent_lock: &mut PersistentLockFile<'_, '_>,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
     let PendingRegistryDownload {
-        base_dir,
         source_key,
         version,
         name,
@@ -6106,6 +6061,8 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         download,
         intent,
     } = pending;
+    let install_lock = persistent_lock.install_lock();
+    let project_dir = install_lock.project_dir();
     let version_string = version.raw.as_str();
     let download_url =
         parse_registry_resource_url(&download.download_url, "registry download URL")?;
@@ -6132,7 +6089,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 
     let artifact = obtain_registry_artifact(
         RegistryArtifactRequest {
-            base_dir,
+            install_lock,
             source: source_key,
             version: version_string,
             provider_name: name,
@@ -6149,16 +6106,16 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
             let bundle = fetch_signature_bundle(signature, http)
                 .map_err(|error| format!("{provider_context}: {error}"))?;
             match verify_and_decide_signer(
-                artifact.digest,
+                artifact.digest(),
                 &bundle,
                 &expected_signer,
                 &version,
                 source_key.as_str(),
-                base_dir,
+                project_dir,
             ) {
                 Ok(verified) => Some(verified),
                 Err(error) => {
-                    let _ = fs::remove_file(artifact.path.as_path());
+                    artifact.remove_if_cached();
                     return Err(format!("{provider_context}: {error}"));
                 }
             }
@@ -6183,7 +6140,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
                 verified_signature.as_ref().map(|(identity, _)| identity),
                 selection,
             ) {
-                let _ = fs::remove_file(artifact.path.as_path());
+                artifact.remove_if_cached();
                 return Err(error);
             }
             LockEntryKind::RegistryRevision {
@@ -6192,6 +6149,14 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
             }
         }
     };
+
+    let artifact_path = artifact.path().as_path().to_path_buf();
+    let artifact = artifact.publish().map_err(|error| {
+        format!(
+            "Failed to publish provider artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
 
     if let Some((_, acceptance)) = verified_signature {
         let transition = acceptance.transition.clone();
@@ -6209,7 +6174,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         registry,
         validated_sequence,
     })?;
-    Ok(artifact.path)
+    Ok(artifact)
 }
 
 fn annotate_version_lock_entry(
@@ -6237,35 +6202,27 @@ fn annotate_version_lock_entry(
 /// 2. Check the global plugin cache for a WASM component.
 /// 3. Download the WASM component.
 pub fn resolve_provider(
-    base_dir: &Path,
     source: &RemoteSource,
     version: &str,
     name: &str,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
 ) -> Result<WasmArtifactPath, String> {
-    resolve_provider_with_http(
-        base_dir,
-        source,
-        version,
-        name,
-        lock_file,
-        &UreqRegistryHttp,
-    )
+    resolve_provider_with_http(source, version, name, lock_file, &UreqRegistryHttp)
 }
 
 fn resolve_provider_with_http<H: RegistryHttp>(
-    base_dir: &Path,
     source: &RemoteSource,
     version: &str,
     name: &str,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
+    let install_lock = lock_file.install_lock();
+    let project_dir = install_lock.project_dir();
     let source_key = source.source_key();
     let github_source = match source {
         RemoteSource::Registry(registry_source) => {
             return resolve_registry_provider_with_http(
-                base_dir,
                 registry_source,
                 &source_key,
                 version,
@@ -6278,7 +6235,8 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     };
 
     // 1. Check local WASM cache first.
-    let wasm_path = WasmArtifactPath::new(cache_path_wasm(base_dir, &source_key, version), name)?;
+    let wasm_path =
+        WasmArtifactPath::new(cache_path_wasm(project_dir, &source_key, version), name)?;
     if wasm_path.as_path().exists() {
         verify_or_record_version_cache(
             wasm_path.as_path(),
@@ -6286,23 +6244,18 @@ fn resolve_provider_with_http<H: RegistryHttp>(
             version,
             name,
             lock_file,
-            base_dir,
+            project_dir,
         )?;
         return Ok(wasm_path);
     }
 
     // 2. Check global plugin cache for WASM.
     if let Some(global_wasm) = global_cache_path_wasm(&source_key, version)
-        && global_wasm.exists()
+        && global_wasm.as_path().exists()
     {
-        // Copy from global cache to local project
-        if let Some(parent) = wasm_path.as_path().parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        link_or_copy(&global_wasm, wasm_path.as_path())
-            .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        let hash = sha256_file(wasm_path.as_path())
-            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        let hash =
+            install_project_artifact_atomically(install_lock, global_wasm.as_path(), &wasm_path)
+                .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
         lock_file.upsert(LockEntry {
             name: name.to_string(),
             source: source_key.to_string(),
@@ -6324,10 +6277,22 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     let wasm_url = download_url_wasm(github_source, version);
     let wasm_download_url = parse_registry_resource_url(&wasm_url, "provider download URL")?;
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
-    match http.download_to_file(&wasm_download_url, wasm_path.as_path()) {
+    let mut staged = StagedArtifact::for_project(install_lock, &wasm_path).map_err(|error| {
+        format!(
+            "Failed to stage provider artifact {}: {error}",
+            wasm_path.as_path().display()
+        )
+    })?;
+    match http.download_into(&wasm_download_url, &mut staged) {
         Ok(()) => {
-            let hash = sha256_file(wasm_path.as_path())
+            let hash = sha256_file(staged.path())
                 .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+            staged.publish().map_err(|error| {
+                format!(
+                    "Failed to publish provider artifact {}: {error}",
+                    wasm_path.as_path().display()
+                )
+            })?;
             lock_file.upsert(LockEntry {
                 name: name.to_string(),
                 source: source_key.to_string(),
@@ -6340,10 +6305,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
             });
             // Save to global cache
             if let Some(global_wasm) = global_cache_path_wasm(&source_key, version) {
-                if let Some(parent) = global_wasm.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = link_or_copy(wasm_path.as_path(), &global_wasm);
+                let _ = install_global_artifact_atomically(wasm_path.as_path(), &global_wasm);
             }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
@@ -6351,11 +6313,7 @@ fn resolve_provider_with_http<H: RegistryHttp>(
             );
             Ok(wasm_path)
         }
-        Err(e) => {
-            // Clean up any partial download.
-            let _ = fs::remove_file(wasm_path.as_path());
-            Err(e.to_string())
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -6363,14 +6321,14 @@ fn resolve_provider_with_http<H: RegistryHttp>(
 ///
 /// Handles version validation, lock file load/save, and delegation to `resolve_provider`.
 pub fn resolve_single_config(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
 ) -> Result<WasmArtifactPath, String> {
-    resolve_single_config_with_http(base_dir, config, &UreqRegistryHttp)
+    resolve_single_config_with_http(install_lock, config, &UreqRegistryHttp)
 }
 
 fn resolve_single_config_with_http<H: RegistryHttp>(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
@@ -6379,38 +6337,32 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         .as_ref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    let lock_path = provider_lock_path(base_dir);
-    let mut lock_file = load_lock_file(base_dir)
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let mut lock_file = install_lock
+        .load_lock_file_or_default()
+        .map_err(|error| error.to_string())?;
+    lock_file.report_migration();
 
-    let artifact_path = resolve_config_with_http(
-        base_dir,
-        config,
-        source,
-        &mut lock_file,
-        LockMode::Normal,
-        http,
-    )?;
+    let artifact_path =
+        resolve_config_with_http(config, source, &mut lock_file, LockMode::Normal, http)?;
 
     lock_file
-        .save(&lock_path)
+        .save()
         .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
 
     Ok(artifact_path)
 }
 
 fn resolve_config_with_http<H: RegistryHttp>(
-    base_dir: &Path,
     config: &ProviderConfig,
     source: &ProviderSource,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     mode: LockMode,
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
+    let install_lock = lock_file.install_lock();
     match (source, config.revision.as_deref()) {
         (ProviderSource::File(file_source), _) => resolve_file_provider(
-            base_dir,
+            install_lock,
             &config.name,
             &source.to_string(),
             file_source.path(),
@@ -6418,7 +6370,6 @@ fn resolve_config_with_http<H: RegistryHttp>(
         ),
         (ProviderSource::Remote(RemoteSource::Registry(registry_source)), Some(revision)) => {
             resolve_registry_revision_with_http(
-                base_dir,
                 registry_source,
                 revision,
                 &config.name,
@@ -6429,11 +6380,10 @@ fn resolve_config_with_http<H: RegistryHttp>(
         }
         (ProviderSource::Remote(RemoteSource::GithubDirect(github_source)), Some(revision)) => {
             let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
-                base_dir,
+                lock_file,
                 github_source,
                 revision,
                 &config.name,
-                lock_file,
                 mode == LockMode::Upgrade,
             )?;
             Ok(path)
@@ -6441,7 +6391,6 @@ fn resolve_config_with_http<H: RegistryHttp>(
         (ProviderSource::Remote(remote_source), None) => {
             let source_key = remote_source.source_key();
             let version = resolve_version(
-                base_dir,
                 remote_source,
                 &config.name,
                 config.version.as_ref(),
@@ -6449,14 +6398,8 @@ fn resolve_config_with_http<H: RegistryHttp>(
                 mode == LockMode::Upgrade,
                 http,
             )?;
-            let path = resolve_provider_with_http(
-                base_dir,
-                remote_source,
-                &version,
-                &config.name,
-                lock_file,
-                http,
-            )?;
+            let path =
+                resolve_provider_with_http(remote_source, &version, &config.name, lock_file, http)?;
 
             annotate_version_lock_entry(&source_key, config.version.as_ref(), lock_file);
             Ok(path)
@@ -6465,7 +6408,7 @@ fn resolve_config_with_http<H: RegistryHttp>(
 }
 
 fn resolve_file_provider(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     provider_name: &str,
     source: &str,
     file_path: &str,
@@ -6478,16 +6421,9 @@ fn resolve_file_provider(
             provider_name, file_path
         ));
     }
-    let dest = file_provider_cache_path(base_dir, &src_path, provider_name)?;
-    if let Some(parent) = dest.as_path().parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create provider directory: {e}"))?;
-    }
-    let _ = fs::remove_file(dest.as_path());
-    link_or_copy(src_path.as_path(), dest.as_path())
+    let dest = file_provider_cache_path(install_lock.project_dir(), &src_path, provider_name)?;
+    let sha = install_project_artifact_atomically(install_lock, src_path.as_path(), &dest)
         .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
-    let sha = sha256_file(dest.as_path())
-        .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
 
     if let Some(entry) = lock_file
         .provider
@@ -6745,11 +6681,10 @@ fn try_reuse_locked_version(
 
 /// Resolve the exact version to use for a provider.
 fn resolve_version<H: RegistryHttp>(
-    project_dir: &Path,
     source: &RemoteSource,
     provider_name: &str,
     constraint: Option<&VersionConstraint>,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     upgrade: bool,
     http: &H,
 ) -> Result<String, String> {
@@ -6761,7 +6696,6 @@ fn resolve_version<H: RegistryHttp>(
 
     match source {
         RemoteSource::Registry(registry_source) => resolve_registry_version_with_http(
-            project_dir,
             registry_source,
             &source_key,
             provider_name,
@@ -6793,18 +6727,19 @@ fn resolve_version<H: RegistryHttp>(
 }
 
 fn resolve_registry_version_with_http<H: RegistryHttp>(
-    project_dir: &Path,
     source: &RegistrySource,
     source_key: &RemoteSourceKey,
     provider_name: &str,
     constraint: Option<&VersionConstraint>,
-    lock_file: &mut LockFile,
+    lock_file: &mut GuardedLockFile<'_>,
     http: &H,
 ) -> Result<String, String> {
+    let install_lock = lock_file.install_lock();
+    let project_dir = install_lock.project_dir();
     let existing_host = lock_file.registry_host_lock(source.hostname()).cloned();
     let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
     let RecordedRegistryListing { versions, .. } = {
-        let mut persistent_lock = PersistentLockFile::new(lock_file, project_dir);
+        let mut persistent_lock = PersistentLockFile::new(lock_file);
         let listing =
             fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?;
         convert_obtainable_legacy_signer_pin(
@@ -7077,35 +7012,37 @@ fn mismatch_error(name: &str, lock_shape: &str, crn_shape: &str, project_dir: &P
 
 /// Resolve all configured provider sources.
 pub fn resolve_all(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     providers: &[ProviderConfig],
     mode: LockMode,
 ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-    resolve_all_with_http(base_dir, providers, mode, &UreqRegistryHttp)
+    resolve_all_with_http(install_lock, providers, mode, &UreqRegistryHttp)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn resolve_all_with_fixture_registry(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     providers: &[ProviderConfig],
     mode: LockMode,
     http: &FixtureRegistryHttp,
 ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-    resolve_all_with_http(base_dir, providers, mode, http)
+    resolve_all_with_http(install_lock, providers, mode, http)
 }
 
 fn resolve_all_with_http<H: RegistryHttp>(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     providers: &[ProviderConfig],
     mode: LockMode,
     http: &H,
 ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-    let lock_path = provider_lock_path(base_dir);
-    let mut lock_file = load_lock_file(base_dir)
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let base_dir = install_lock.project_dir();
+    let mut lock_file = install_lock
+        .load_lock_file_or_default()
+        .map_err(|error| error.to_string())?;
+    lock_file.report_migration();
 
-    // Fail before touching the filesystem if the lock disagrees with .crn.
+    // Fail before installing any provider artifact or rewriting the lock if it
+    // disagrees with .crn.
     // Rewriting the lock requires `--upgrade`; `--locked` tightens this to
     // require every provider to be present in the lock too.
     check_lock_mismatch(providers, &lock_file, mode, base_dir)?;
@@ -7118,15 +7055,14 @@ fn resolve_all_with_http<H: RegistryHttp>(
             None => continue,
         };
 
-        let artifact_path =
-            resolve_config_with_http(base_dir, config, source, &mut lock_file, mode, http)?;
+        let artifact_path = resolve_config_with_http(config, source, &mut lock_file, mode, http)?;
 
         resolved.insert(config.name.clone(), artifact_path);
     }
 
     if !resolved.is_empty() {
         lock_file
-            .save(&lock_path)
+            .save()
             .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
     }
 
@@ -7244,6 +7180,102 @@ mod tests {
         }
     }
 
+    fn with_guarded_lock_file<T>(
+        install_lock: &ProviderInstallLock,
+        lock_file: &mut LockFile,
+        operation: impl FnOnce(&mut GuardedLockFile<'_>) -> T,
+    ) -> T {
+        let mut guarded = install_lock.guard_lock_file_for_test(std::mem::take(lock_file));
+        let result = operation(&mut guarded);
+        *lock_file = guarded.into_lock_file_for_test();
+        result
+    }
+
+    fn resolve_provider_with_http<H: RegistryHttp>(
+        base_dir: &Path,
+        source: &RemoteSource,
+        version: &str,
+        name: &str,
+        lock_file: &mut LockFile,
+        http: &H,
+    ) -> Result<WasmArtifactPath, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
+            super::resolve_provider_with_http(source, version, name, lock_file, http)
+        })
+    }
+
+    fn resolve_provider(
+        base_dir: &Path,
+        source: &RemoteSource,
+        version: &str,
+        name: &str,
+        lock_file: &mut LockFile,
+    ) -> Result<WasmArtifactPath, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
+            super::resolve_provider(source, version, name, lock_file)
+        })
+    }
+
+    fn resolve_single_config_with_http<H: RegistryHttp>(
+        base_dir: &Path,
+        config: &ProviderConfig,
+        http: &H,
+    ) -> Result<WasmArtifactPath, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        super::resolve_single_config_with_http(&install_lock, config, http)
+    }
+
+    fn resolve_all_with_http<H: RegistryHttp>(
+        base_dir: &Path,
+        providers: &[ProviderConfig],
+        mode: LockMode,
+        http: &H,
+    ) -> Result<HashMap<String, WasmArtifactPath>, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        super::resolve_all_with_http(&install_lock, providers, mode, http)
+    }
+
+    fn resolve_registry_revision_with_http<H: RegistryHttp>(
+        base_dir: &Path,
+        source: &RegistrySource,
+        revision: &str,
+        name: &str,
+        lock_file: &mut LockFile,
+        mode: LockMode,
+        http: &H,
+    ) -> Result<WasmArtifactPath, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
+            super::resolve_registry_revision_with_http(
+                source, revision, name, lock_file, mode, http,
+            )
+        })
+    }
+
+    fn resolve_registry_version_with_http<H: RegistryHttp>(
+        base_dir: &Path,
+        source: &RegistrySource,
+        source_key: &RemoteSourceKey,
+        provider_name: &str,
+        constraint: Option<&VersionConstraint>,
+        lock_file: &mut LockFile,
+        http: &H,
+    ) -> Result<String, String> {
+        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
+            super::resolve_registry_version_with_http(
+                source,
+                source_key,
+                provider_name,
+                constraint,
+                lock_file,
+                http,
+            )
+        })
+    }
+
     fn captured_listing(raw: &[u8]) -> Vec<u8> {
         let mut listing: serde_json::Value = serde_json::from_slice(raw).unwrap();
         listing["valid_until"] = serde_json::json!("2999-01-01T00:00:00Z");
@@ -7333,23 +7365,6 @@ mod tests {
             signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER);
         lock.save(&provider_lock_path(base_dir)).unwrap();
         lock
-    }
-
-    #[test]
-    fn link_or_copy_falls_back_to_copy_when_link_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("source.wasm");
-        let dest = dir.path().join("dest.wasm");
-        fs::write(&src, b"provider wasm").unwrap();
-
-        link_or_copy_with(
-            |_, _| Err(io::Error::other("injected hard-link failure")),
-            &src,
-            &dest,
-        )
-        .unwrap();
-
-        assert_eq!(fs::read(dest).unwrap(), b"provider wasm");
     }
 
     fn resolve_registry<H: RegistryHttp>(
@@ -10889,12 +10904,14 @@ discovery_pin_present = true
             .collect();
         let resolved = resolved_registry(hostname, "https://registry.carina-rs.dev/v1/providers/");
         let dir = tempfile::tempdir().unwrap();
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let mut lock = install_lock.guard_lock_file_for_test(lock);
 
         assert_eq!(lock.registry_host.len(), 1);
         for (_, source, version, shasum) in providers {
             let source = registry_source(source);
             let source_key = RemoteSource::Registry(source.clone()).source_key();
-            let mut persistent = PersistentLockFile::new(&mut lock, dir.path());
+            let mut persistent = PersistentLockFile::new(&mut lock);
             verify_registry_lock_pin(
                 &mut persistent,
                 &source_key,
@@ -10955,7 +10972,7 @@ discovery_pin_present = true
 
     #[test]
     fn hostname_mismatch_does_not_report_the_discovery_repin_operation() {
-        let mut lock = lock_with_registry_security_state_for_host(
+        let lock = lock_with_registry_security_state_for_host(
             "old.registry.example",
             RegistrySignatureProtection::NotRequired,
         );
@@ -10965,7 +10982,10 @@ discovery_pin_present = true
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
         );
-        let mut persistent = PersistentLockFile::new(&mut lock, Path::new("."));
+        let dir = tempfile::tempdir().unwrap();
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let mut lock = install_lock.guard_lock_file_for_test(lock);
+        let mut persistent = PersistentLockFile::new(&mut lock);
         let error = match verify_registry_lock_pin(
             &mut persistent,
             &source_key,
@@ -11099,8 +11119,9 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     fn resolve_all_string_boundary_preserves_lock_parse_source() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("carina-providers.lock"), "version = [\n").unwrap();
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
 
-        let rendered = resolve_all(dir.path(), &[], LockMode::Normal)
+        let rendered = resolve_all(&install_lock, &[], LockMode::Normal)
             .expect_err("a malformed lock must fail before provider resolution");
 
         assert!(rendered.contains("Failed to parse"), "{rendered}");
@@ -12021,7 +12042,9 @@ transparency_log_present = false
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
         );
-        let mut persistent = PersistentLockFile::new(&mut lock, dir.path());
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let mut lock = install_lock.guard_lock_file_for_test(lock);
+        let mut persistent = PersistentLockFile::new(&mut lock);
 
         let error = match verify_registry_lock_pin(
             &mut persistent,
@@ -12452,7 +12475,10 @@ transparency_log_present = true
 
     #[test]
     fn registry_provider_writes_always_create_referenced_host_records() {
-        let mut lock = LockFile::default();
+        let lock = LockFile::default();
+        let dir = tempfile::tempdir().unwrap();
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let mut lock = install_lock.guard_lock_file_for_test(lock);
 
         for (name, source, hostname) in [
             ("aws", "carina-rs/aws", "registry.carina-rs.dev"),
@@ -12472,11 +12498,11 @@ transparency_log_present = true
                 },
                 &RegistryRatchets::default(),
                 RegistrySequenceAnchor::Unestablished,
-                Path::new("."),
+                dir.path(),
             )
             .unwrap();
             let (_, validated_sequence) = validated.into_parts();
-            let mut persistent = PersistentLockFile::new(&mut lock, Path::new("."));
+            let mut persistent = PersistentLockFile::new(&mut lock);
 
             persistent
                 .upsert_registry_provider(RegistryProviderLockEntry {
@@ -12796,8 +12822,9 @@ transparency_log_present = true
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
 
-        let result = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap();
+        let result = resolve_all(&install_lock, &providers, LockMode::Normal).unwrap();
         let dest = result.get("test").expect("provider should be resolved");
         assert!(dest.as_path().exists());
         assert!(
@@ -12814,6 +12841,35 @@ transparency_log_present = true
     }
 
     #[test]
+    fn resolve_all_replaces_existing_file_provider_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("my-provider.wasm");
+        fs::write(&source_path, b"first artifact").unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+
+        let first = resolve_all(
+            &install_lock,
+            std::slice::from_ref(&config),
+            LockMode::Normal,
+        )
+        .unwrap();
+        let destination = first.get("awscc").unwrap().as_path().to_path_buf();
+
+        fs::remove_file(&source_path).unwrap();
+        fs::write(&source_path, b"second complete artifact").unwrap();
+        let second = resolve_all(&install_lock, &[config], LockMode::Normal).unwrap();
+
+        assert_eq!(second.get("awscc").unwrap().as_path(), destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"second complete artifact");
+        let entries = fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![destination]);
+    }
+
+    #[test]
     fn resolve_all_errors_on_missing_file_provider() {
         let tmp = tempfile::tempdir().unwrap();
         let providers = vec![ProviderConfig {
@@ -12826,7 +12882,8 @@ transparency_log_present = true
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
-        let err = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap_err();
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let err = resolve_all(&install_lock, &providers, LockMode::Normal).unwrap_err();
         assert!(err.contains("not found"));
     }
 
@@ -12846,8 +12903,13 @@ transparency_log_present = true
             .expect_err("an installed file lookup must reject native binaries");
         assert_eq!(installed_error, expected);
 
-        let error = resolve_all(tmp.path(), std::slice::from_ref(&config), LockMode::Normal)
-            .expect_err("file:// native binaries must be rejected by the resolver");
+        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let error = resolve_all(
+            &install_lock,
+            std::slice::from_ref(&config),
+            LockMode::Normal,
+        )
+        .expect_err("file:// native binaries must be rejected by the resolver");
 
         assert_eq!(error, expected);
         assert!(
@@ -12965,10 +13027,10 @@ transparency_log_present = true
             Err(format!("too many test redirects from {url}"))
         }
 
-        fn download_to_file(
+        fn download_into(
             &self,
             url: &RegistryResourceUrl,
-            dest: &Path,
+            out: &mut StagedArtifact<'_>,
         ) -> Result<(), RegistryDownloadError> {
             let url = url.as_str();
             self.requested.lock().unwrap().push(url.to_string());
@@ -12994,22 +13056,125 @@ transparency_log_present = true
                     }
                 },
             };
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    RegistryDownloadError::LocalIo(format!(
-                        "Failed to create directory {}: {error}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            fs::write(dest, body).map_err(|error| {
-                RegistryDownloadError::LocalIo(format!(
-                    "Failed to write file {}: {error}",
-                    dest.display()
-                ))
+            out.write_all(body).map_err(|error| {
+                RegistryDownloadError::LocalIo(format!("Failed to write downloaded file: {error}"))
             })?;
             Ok(())
         }
+    }
+
+    struct PartialFailingRegistryHttp {
+        final_path: PathBuf,
+    }
+
+    impl RegistryHttp for PartialFailingRegistryHttp {
+        fn get(&self, _request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
+            unreachable!("the artifact path uses the streaming download seam")
+        }
+
+        fn download_into(
+            &self,
+            _url: &RegistryResourceUrl,
+            out: &mut crate::install_lock::StagedArtifact<'_>,
+        ) -> Result<(), RegistryDownloadError> {
+            out.write_all(b"partial bytes").unwrap();
+            assert!(
+                !self.final_path.exists(),
+                "download implementations must not make partial bytes visible at the final path"
+            );
+            Err(RegistryDownloadError::Transport(
+                "injected interrupted download".into(),
+            ))
+        }
+    }
+
+    struct WrongHashRegistryHttp;
+
+    impl RegistryHttp for WrongHashRegistryHttp {
+        fn get(&self, _request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
+            unreachable!("the artifact path uses the streaming download seam")
+        }
+
+        fn download_into(
+            &self,
+            _url: &RegistryResourceUrl,
+            out: &mut crate::install_lock::StagedArtifact<'_>,
+        ) -> Result<(), RegistryDownloadError> {
+            out.write_all(b"wrong bytes").unwrap();
+            Ok(())
+        }
+    }
+
+    fn assert_empty_artifact_directory(path: &Path) {
+        let entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(
+            entries.is_empty(),
+            "temporary artifacts remain: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_registry_download_never_exposes_partial_final_artifact() {
+        let project = tempfile::tempdir().unwrap();
+        let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let source = source_key("carina-rs/aws");
+        let final_path = cache_path_wasm(project.path(), &source, "1.0.0");
+        let download_url =
+            parse_registry_resource_url("https://downloads.example.test/aws.wasm", "test URL")
+                .unwrap();
+        let http = PartialFailingRegistryHttp {
+            final_path: final_path.clone(),
+        };
+
+        let error = obtain_registry_artifact(
+            RegistryArtifactRequest {
+                install_lock: &guard,
+                source: &source,
+                version: "1.0.0",
+                provider_name: "aws",
+                download_url: &download_url,
+                expected_shasum: &sha256_bytes(b"complete bytes"),
+                context: "test registry artifact",
+            },
+            &http,
+        )
+        .expect_err("the injected transport failure must be returned");
+
+        assert!(matches!(error, RegistryArtifactError::Unavailable(_)));
+        assert!(!final_path.exists());
+        assert_empty_artifact_directory(final_path.parent().unwrap());
+    }
+
+    #[test]
+    fn registry_hash_mismatch_leaves_no_final_artifact_or_temp_residue() {
+        let project = tempfile::tempdir().unwrap();
+        let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let source = source_key("carina-rs/aws");
+        let final_path = cache_path_wasm(project.path(), &source, "1.0.0");
+        let download_url =
+            parse_registry_resource_url("https://downloads.example.test/aws.wasm", "test URL")
+                .unwrap();
+
+        let error = obtain_registry_artifact(
+            RegistryArtifactRequest {
+                install_lock: &guard,
+                source: &source,
+                version: "1.0.0",
+                provider_name: "aws",
+                download_url: &download_url,
+                expected_shasum: &sha256_bytes(b"expected bytes"),
+                context: "test registry artifact",
+            },
+            &WrongHashRegistryHttp,
+        )
+        .expect_err("the wrong hash must be rejected");
+
+        assert!(matches!(error, RegistryArtifactError::Invalid(_)));
+        assert!(!final_path.exists());
+        assert_empty_artifact_directory(final_path.parent().unwrap());
     }
 
     #[test]
@@ -14432,7 +14597,7 @@ transparency_log_present = true
     }
 
     #[test]
-    fn real_verifier_rejects_conformance_bundle_against_aws_source_pin() {
+    fn fresh_registry_artifact_stays_staged_when_real_verifier_rejects_signer() {
         let dir = tempfile::tempdir().unwrap();
         let aws = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
         let aws_source = SourcePin {
@@ -14476,14 +14641,46 @@ transparency_log_present = true
         let before = lock_file.to_toml_string().unwrap();
         lock_file.save(&provider_lock_path(dir.path())).unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
-        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
-            SIGNED_FIXTURE_DOWNLOAD_URL,
-            &format!(
-                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":{:?},"certificate_oidc_issuer":{:?},"bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#,
-                aws.certificate_san(),
-                aws.source().oidc_issuer,
-            ),
+        struct AssertArtifactUnpublishedOnBundleFetch {
+            inner: FakeRegistryHttp,
+            final_path: PathBuf,
+        }
+
+        impl RegistryHttp for AssertArtifactUnpublishedOnBundleFetch {
+            fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
+                if request.url() == SIGNED_FIXTURE_BUNDLE_URL {
+                    assert!(
+                        !self.final_path.exists(),
+                        "fresh artifact bytes must remain staged until signer acceptance"
+                    );
+                }
+                self.inner.get(request)
+            }
+
+            fn download_into(
+                &self,
+                url: &RegistryResourceUrl,
+                out: &mut StagedArtifact<'_>,
+            ) -> Result<(), RegistryDownloadError> {
+                self.inner.download_into(url, out)
+            }
+        }
+
+        let artifact_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
         );
+        let download_response = format!(
+            r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":{:?},"certificate_oidc_issuer":{:?},"bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#,
+            aws.certificate_san(),
+            aws.source().oidc_issuer,
+        );
+        let http = AssertArtifactUnpublishedOnBundleFetch {
+            inner: signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200)
+                .json(SIGNED_FIXTURE_DOWNLOAD_URL, &download_response),
+            final_path: artifact_path.clone(),
+        };
 
         let error = resolve_provider_with_http(
             dir.path(),
@@ -14499,22 +14696,21 @@ transparency_log_present = true
             error.contains("certificate source differs from the lock pin"),
             "{error}"
         );
-        assert!(http.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
-        assert!(http.was_requested("https://downloads.example.test/aws.wasm"));
+        assert!(http.inner.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
+        assert!(
+            http.inner
+                .was_requested("https://downloads.example.test/aws.wasm")
+        );
         assert_eq!(lock_file.to_toml_string().unwrap(), before);
         assert_eq!(
             fs::read_to_string(provider_lock_path(dir.path())).unwrap(),
             before
         );
         assert!(
-            !cache_path_wasm(
-                dir.path(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION
-            )
-            .exists(),
+            !artifact_path.exists(),
             "an artifact rejected with SourceMismatch must not remain cached"
         );
+        assert_empty_artifact_directory(artifact_path.parent().unwrap());
     }
 
     #[test]
@@ -14618,7 +14814,7 @@ transparency_log_present = true
     }
 
     #[test]
-    fn registry_source_rejects_oversized_signature_bundle_and_retains_download() {
+    fn registry_source_rejects_oversized_signature_bundle_and_drops_staged_download() {
         let dir = tempfile::tempdir().unwrap();
         let oversized = vec![b' '; MAX_SIGNATURE_BUNDLE_BYTES + 1];
         let http = signed_registry_http(&oversized, 200);
@@ -14636,15 +14832,13 @@ transparency_log_present = true
 
         assert!(error.contains("exceeding"), "{error}");
         assert!(error.contains("no override"), "{error}");
-        assert_eq!(
-            fs::read(cache_path_wasm(
-                dir.path(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION
-            ))
-            .unwrap(),
-            SIGNED_FIXTURE_ARTIFACT
+        let artifact_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
         );
+        assert!(!artifact_path.exists());
+        assert_empty_artifact_directory(artifact_path.parent().unwrap());
     }
 
     #[test]
@@ -14673,15 +14867,13 @@ transparency_log_present = true
         assert!(error.contains("HTTPS"), "{error}");
         assert!(error.contains("no override"), "{error}");
         assert_eq!(http.request_count(bundle_url), 0);
-        assert_eq!(
-            fs::read(cache_path_wasm(
-                dir.path(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION
-            ))
-            .unwrap(),
-            SIGNED_FIXTURE_ARTIFACT
+        let artifact_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
         );
+        assert!(!artifact_path.exists());
+        assert_empty_artifact_directory(artifact_path.parent().unwrap());
     }
 
     #[test]
@@ -15013,15 +15205,13 @@ transparency_log_present = false
             !error.contains("Sigstore signature verification failed"),
             "{error}"
         );
-        assert_eq!(
-            fs::read(cache_path_wasm(
-                dir.path(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION
-            ))
-            .unwrap(),
-            SIGNED_FIXTURE_ARTIFACT
+        let artifact_path = cache_path_wasm(
+            dir.path(),
+            &source_key("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
         );
+        assert!(!artifact_path.exists());
+        assert_empty_artifact_directory(artifact_path.parent().unwrap());
     }
 
     #[test]
@@ -16632,7 +16822,9 @@ transparency_log_present = false
             ),
         ] {
             assert_eq!(
-                global_cache_path_wasm(&source_key(source), "0.1.0").unwrap(),
+                global_cache_path_wasm(&source_key(source), "0.1.0")
+                    .unwrap()
+                    .as_path(),
                 root.path().join(relative)
             );
         }
@@ -16668,8 +16860,8 @@ transparency_log_present = false
         let global_wasm =
             crate::revision_resolver::global_cache_path_revision(&github_source(source), sha)
                 .unwrap();
-        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
-        fs::File::create(&global_wasm)
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::File::create(global_wasm.as_path())
             .unwrap()
             .write_all(b"fake wasm from a prior project")
             .unwrap();
@@ -16702,8 +16894,8 @@ transparency_log_present = false
         lock.save(&lock_path).unwrap();
 
         let global_wasm = global_cache_path_wasm(&source_key(source), version).unwrap();
-        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
-        fs::File::create(&global_wasm)
+        fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
+        fs::File::create(global_wasm.as_path())
             .unwrap()
             .write_all(b"fake wasm from a prior project")
             .unwrap();
@@ -17218,7 +17410,8 @@ transparency_log_present = false
         // .crn now wants a version — should error, not fall through to a
         // network fetch, and not rewrite the lock.
         let providers = vec![versioned_config(SRC, "~0.5.0")];
-        let err = resolve_all(base, &providers, LockMode::Normal)
+        let install_lock = ProviderInstallLock::acquire(base).unwrap();
+        let err = resolve_all(&install_lock, &providers, LockMode::Normal)
             .expect_err("mismatched lock must abort resolve_all");
         assert!(err.contains("--upgrade"), "{err}");
 

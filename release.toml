@@ -13,7 +13,7 @@ tag-message = "release: v{{version}}"
 # Commit message for version bump
 pre-release-commit-message = "release: v{{version}}"
 
-# Don't publish to crates.io from cargo-release (CI handles it)
+# Carina is not published to crates.io; releases ship via GitHub Releases and the Homebrew tap
 publish = false
 
 # Push tag and commit to trigger CI release workflow

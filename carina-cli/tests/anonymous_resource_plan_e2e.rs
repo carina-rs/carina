@@ -381,6 +381,92 @@ fn validate_still_warns_for_unused_stable_binding() {
 }
 
 #[test]
+fn validate_uses_authored_references_for_unused_binding_warnings() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let resource_bucket = mock.test.resource {
+  name = "resource-repro"
+}
+
+let export_bucket = mock.test.resource {
+  name = "export-repro"
+}
+
+let map_bucket = mock.test.resource {
+  name = "map-repro"
+}
+
+let interpolation_bucket = mock.test.resource {
+  name = "interpolation-repro"
+}
+
+let orphan = mock.test.resource {
+  name = "orphan"
+}
+"#,
+    );
+    fs::write(
+        scenario.project.join("consumer.crn"),
+        r#"mock.test.resource {
+  name = upper(resource_bucket.name)
+}
+"#,
+    )
+    .expect("write sibling resource function call");
+    fs::write(
+        scenario.project.join("exports.crn"),
+        r#"exports {
+  bucket_name: String = upper(export_bucket.name)
+}
+"#,
+    )
+    .expect("write sibling export function call");
+    fs::write(
+        scenario.project.join("map_consumer.crn"),
+        r#"mock.test.resource {
+  name = "map-consumer"
+  tags = { Source = map_bucket.name }
+}
+"#,
+    )
+    .expect("write sibling static map reference");
+    fs::write(
+        scenario.project.join("interpolation_consumer.crn"),
+        r#"mock.test.resource {
+  name = "${interpolation_bucket.name}.example.com"
+}
+"#,
+    )
+    .expect("write sibling top-level interpolation reference");
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    let validate = scenario.carina(&["validate", "."]);
+    assert_success("carina validate", &validate);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+
+    assert!(
+        !stdout.contains(&unused_binding_warning("resource_bucket")),
+        "a resource function-call reference folded during validation must still count as a use\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(&unused_binding_warning("export_bucket")),
+        "an export function-call reference folded during validation must still count as a use\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(&unused_binding_warning("map_bucket")),
+        "a static attribute reference inside a map must still count as a use\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(&unused_binding_warning("interpolation_bucket")),
+        "a top-level interpolation reference must still count as a use\n{stdout}",
+    );
+    assert!(
+        stdout.contains(&unused_binding_warning("orphan")),
+        "the never-used control must still warn\n{stdout}",
+    );
+}
+
+#[test]
 fn sibling_import_target_is_used_by_validate_and_plans_only_an_import() {
     let scenario = Scenario::new();
     scenario.write_main(

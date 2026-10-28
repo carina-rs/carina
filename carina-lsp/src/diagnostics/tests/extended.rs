@@ -271,16 +271,344 @@ fn render_value_type_error(
     .map(|error| error.to_string())
 }
 
-fn unused_binding_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+fn unused_binding_names(diagnostics: &[Diagnostic]) -> Vec<String> {
     diagnostics
         .iter()
         .filter_map(|diagnostic| {
             diagnostic
                 .message
-                .starts_with("Unused let binding")
-                .then_some(diagnostic.message.as_str())
+                .strip_prefix("Unused let binding '")
+                .and_then(|rest| rest.split_once('\''))
+                .map(|(binding, _)| binding.to_string())
         })
         .collect()
+}
+
+fn authored_binding_regression_schemas() -> SchemaRegistry {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::new("name", AttributeType::string())
+                    .required()
+                    .create_only(),
+            )
+            .attribute(AttributeSchema::new("label", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            ))
+            .attribute(AttributeSchema::new(
+                "items",
+                AttributeType::list(AttributeType::string()),
+            ))
+            .attribute(AttributeSchema::new(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::new("label", AttributeType::string())],
+                ),
+            ))
+            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+    );
+    schemas
+}
+
+#[test]
+fn unused_binding_analysis_matches_validate_for_authored_values() {
+    struct Case {
+        label: &'static str,
+        same_file: bool,
+        usage: &'static str,
+        function_source: Option<&'static str>,
+        expected: &'static [&'static str],
+    }
+
+    let cases = [
+        Case {
+            label: "static attribute in map",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  tags = { Source = bucket.name }
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "top-level interpolation",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "${bucket.name}.example.com"
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "interpolation inside list",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  items = ["${bucket.name}-list"]
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "interpolation inside map",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  tags = { Source = "${bucket.name}-map" }
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "interpolation inside struct",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  config = { label = "${bucket.name}-struct" }
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "provider-populated attribute",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  label = bucket.arn
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "export function call",
+            same_file: false,
+            usage: r#"exports {
+  x: String = upper(bucket.name)
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "attribute function call",
+            same_file: false,
+            usage: r#"attributes {
+  x: String = upper(bucket.name)
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "resource function call across files",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = upper(bucket.name)
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "sibling user function call on resource reference",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = ident(bucket.name)
+}
+"#,
+            function_source: Some("fn ident(v: String): String { v }\n"),
+            expected: &["orphan"],
+        },
+        Case {
+            label: "sibling user function ignoring resource reference",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = label(bucket.name)
+}
+"#,
+            function_source: Some("fn label(v: String): String { \"fixed\" }\n"),
+            expected: &["orphan"],
+        },
+        Case {
+            label: "resource function call in same file",
+            same_file: true,
+            usage: r#"mock.test.resource {
+  name = upper(bucket.name)
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "resource map function call",
+            same_file: false,
+            usage: r#"mock.test.resource {
+  name = "consumer"
+  tags = { A = upper(bucket.name) }
+}
+"#,
+            function_source: None,
+            expected: &["orphan"],
+        },
+        Case {
+            label: "never used",
+            same_file: false,
+            usage: "# bucket intentionally unused\n",
+            function_source: None,
+            expected: &["bucket", "orphan"],
+        },
+    ];
+
+    let schemas = authored_binding_regression_schemas();
+    let engine = custom_engine(schemas.clone());
+    let binding = r#"let bucket = mock.test.resource {
+  name = "repro"
+}
+
+let orphan = mock.test.resource {
+  name = "orphan"
+}
+"#;
+    let mut failures = Vec::new();
+
+    for case in cases {
+        let fixture = tempfile::tempdir().unwrap();
+        let main = if case.same_file {
+            format!("{binding}\n{}", case.usage)
+        } else {
+            binding.to_string()
+        };
+        let usage = if case.same_file {
+            "# usage is in main.crn\n"
+        } else {
+            case.usage
+        };
+        std::fs::write(fixture.path().join("main.crn"), &main).unwrap();
+        std::fs::write(fixture.path().join("usage.crn"), usage).unwrap();
+        if let Some(function_source) = case.function_source {
+            std::fs::write(fixture.path().join("functions.crn"), function_source).unwrap();
+        }
+
+        let diagnostics = engine.analyze_with_filename(
+            &create_document(&main),
+            Some("main.crn"),
+            Some(fixture.path()),
+        );
+        let lsp_unused = unused_binding_names(&diagnostics);
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            fixture.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &schemas,
+        )
+        .unwrap();
+        let validate_unused =
+            carina_core::validation::check_unused_bindings_with_identity_requirements(
+                &loaded.authored_bindings,
+                &schemas,
+            );
+        let expected = case
+            .expected
+            .iter()
+            .map(|binding| (*binding).to_string())
+            .collect::<Vec<_>>();
+
+        if lsp_unused != validate_unused || lsp_unused != expected {
+            failures.push(format!(
+                "{}: LSP={lsp_unused:?}, validate={validate_unused:?}, expected={expected:?}",
+                case.label
+            ));
+        }
+    }
+
+    for (label, source, expected) in [
+        (
+            "no-base-path resource function call",
+            format!("{binding}\nmock.test.resource {{\n  name = upper(bucket.name)\n}}\n"),
+            vec!["orphan".to_string()],
+        ),
+        (
+            "no-base-path unused control",
+            binding.to_string(),
+            vec!["bucket".to_string(), "orphan".to_string()],
+        ),
+    ] {
+        let diagnostics = engine.analyze(&create_document(&source), None);
+        let lsp_unused = unused_binding_names(&diagnostics);
+        if lsp_unused != expected {
+            failures.push(format!(
+                "{label}: LSP={lsp_unused:?}, expected={expected:?}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "unused-binding parity failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn failed_directory_parse_does_not_emit_buffer_only_unused_binding_warning() {
+    let schemas = authored_binding_regression_schemas();
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let main = r#"let bucket = mock.test.resource {
+  name = "bucket"
+}
+
+let orphan = mock.test.resource {
+  name = "orphan"
+}
+"#;
+    let consumer = r#"mock.test.resource {
+  name = bucket.name
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), main).unwrap();
+    std::fs::write(fixture.path().join("consumer.crn"), consumer).unwrap();
+    std::fs::write(fixture.path().join("broken.crn"), "let broken = {\n").unwrap();
+
+    let directory_parse =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            fixture.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &std::collections::HashMap::new(),
+        );
+    assert!(
+        directory_parse.is_err(),
+        "malformed directory fixture unexpectedly parsed",
+    );
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(main),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+    let unused = unused_binding_names(&diagnostics);
+
+    assert!(
+        unused.iter().all(|binding| binding != "bucket"),
+        "diagnostics: {diagnostics:#?}",
+    );
+    assert!(
+        unused.iter().all(|binding| binding != "orphan"),
+        "diagnostics: {diagnostics:#?}",
+    );
 }
 
 #[test]
@@ -309,11 +637,11 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
         engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(temp.path()));
 
     assert!(
-        unused_binding_messages(&alpha_diagnostics).is_empty(),
+        unused_binding_names(&alpha_diagnostics).is_empty(),
         "alpha diagnostics: {alpha_diagnostics:#?}",
     );
     assert!(
-        unused_binding_messages(&beta_diagnostics).is_empty(),
+        unused_binding_names(&beta_diagnostics).is_empty(),
         "beta diagnostics: {beta_diagnostics:#?}",
     );
 }
@@ -348,7 +676,7 @@ import {
     );
 
     assert!(
-        unused_binding_messages(&diagnostics).is_empty(),
+        unused_binding_names(&diagnostics).is_empty(),
         "import target diagnostics: {diagnostics:#?}",
     );
 }
@@ -368,8 +696,8 @@ fn single_unused_attribute_derived_binding_still_warns() {
     let diagnostics = engine.analyze(&create_document(source), None);
 
     assert_eq!(
-        unused_binding_messages(&diagnostics),
-        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+        unused_binding_names(&diagnostics),
+        vec!["alpha".to_string()],
     );
 }
 
@@ -388,8 +716,8 @@ fn unused_stable_binding_still_warns() {
     let diagnostics = engine.analyze(&create_document(source), None);
 
     assert_eq!(
-        unused_binding_messages(&diagnostics),
-        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+        unused_binding_names(&diagnostics),
+        vec!["alpha".to_string()],
     );
 }
 
@@ -10785,6 +11113,11 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         "tags = {\n    Name = \"application\"\n    Environment = \"production\"\n}";
     let merged_result = carina_core::config_loader::DirectoryParseResult {
         parsed: carina_core::parser::ParsedFile::default(),
+        authored_bindings: carina_core::config_loader::AuthoredBindingView::parse_source(
+            "",
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap(),
         duplicate_declarations: Vec::new(),
         source_files: vec![
             (current_file, current_source.to_string()),

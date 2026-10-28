@@ -14,9 +14,13 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position, Range};
 
+use crate::attribute_path::{resolve_attribute_path, struct_fields_of};
 use crate::document::Document;
+use crate::enclosing_block::{
+    EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
+};
 use carina_core::schema::{
-    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape, StructField,
+    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape,
 };
 
 pub struct CompletionProvider {
@@ -25,7 +29,7 @@ pub struct CompletionProvider {
     region_completions_data: Vec<CompletionValue>,
     /// Resource type patterns sorted longest-first for matching.
     /// Each pattern is `"<provider>.<resource_type>"` for both Managed and DataSource entries.
-    resource_type_patterns: Vec<String>,
+    resource_type_patterns: ResourceTypePatterns,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
 }
@@ -37,20 +41,7 @@ impl CompletionProvider {
         region_completions_data: Vec<CompletionValue>,
         custom_type_names: Vec<String>,
     ) -> Self {
-        // Build sorted resource type patterns from registry entries (longest first).
-        let mut resource_type_patterns: Vec<String> = schemas
-            .iter()
-            .map(|(provider, resource_type, _kind, _schema)| {
-                if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{}.{}", provider, resource_type)
-                }
-            })
-            .collect();
-        resource_type_patterns.sort();
-        resource_type_patterns.dedup();
-        resource_type_patterns.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        let resource_type_patterns = ResourceTypePatterns::from_schemas(&schemas);
 
         Self {
             schemas,
@@ -131,12 +122,10 @@ impl CompletionProvider {
                 self.module_parameter_completions(&module_name, &text, base_path)
             }
             CompletionContext::AfterEquals {
-                resource_type,
-                attr_name,
+                target,
                 current_binding,
             } => self.value_completions_for_attr(
-                &resource_type,
-                &attr_name,
+                &target,
                 &text,
                 current_binding.as_deref(),
                 position,
@@ -212,6 +201,7 @@ impl CompletionProvider {
         let current_line = lines[line_idx];
         let col = position.character as usize;
         let prefix: String = current_line.chars().take(col).collect();
+        let block_context = enclosing_block(text, position, &self.resource_type_patterns);
 
         // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
         // block-context walk because a `for` header sits at brace_depth 0 and
@@ -236,11 +226,9 @@ impl CompletionProvider {
         // but no equals sign, and we're inside arguments/attributes blocks.
         // This is checked later after determining block context.
 
-        // Check if we're inside a resource block or module call and find the type
+        // Track the block kinds that are outside the shared resource/module
+        // walker (provider, interface, state, and import blocks).
         let mut brace_depth: i32 = 0;
-        let mut resource_type = String::new();
-        let mut current_binding: Option<String> = None;
-        let mut module_name: Option<String> = None;
         let mut provider_block_name: Option<String> = None;
         let mut in_args_or_attrs_block = false;
         let mut in_exports_block = false;
@@ -252,40 +240,13 @@ impl CompletionProvider {
         // position (depth 1 for top-level, depth 2+ for nested map/list).
         // Cleared when the entry closes or a new one starts.
         let mut exports_entry_type: Option<String> = None;
-        // Track nested block names at each depth level (index 0 = depth 1, etc.)
-        let mut nested_block_names: Vec<String> = Vec::new();
-        // Depth-of-for-bodies currently open. A `for ... { <body> }` stacks a
-        // resource_block-free brace level that should be transparent when we
-        // look for enclosing resource types, so a resource declaration at
-        // `brace_depth == for_body_depth` is still a top-level declaration
-        // relative to any enclosing resource.
-        let mut for_body_depth: i32 = 0;
-
         for (i, line) in lines.iter().enumerate() {
             if i > line_idx {
                 break;
             }
             let trimmed = line.trim();
 
-            // A `for ... in ... {` header opens a pure control-flow brace level,
-            // not a resource block. Track it so resource-type detection below
-            // can see through it.
-            let is_for_header = trimmed.starts_with("for ") && trimmed.ends_with('{');
-
-            // Look for resource type declaration: "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
-            // Accept at depth == 0 (top level) or at depth == for_body_depth
-            // (directly inside a `for` body, which is semantically top-level
-            // for the purpose of resolving the enclosing resource type).
-            if let Some(rt) = self.extract_resource_type(line)
-                && brace_depth == for_body_depth
-            {
-                resource_type = rt;
-                module_name = None;
-                // Extract binding name from "let binding_name = resource_type {"
-                current_binding =
-                    crate::let_parse::parse_let_header(trimmed).map(|(name, _)| name.to_string());
-            } else if brace_depth == 0 && trimmed.starts_with("provider ") && trimmed.ends_with('{')
-            {
+            if brace_depth == 0 && trimmed.starts_with("provider ") && trimmed.ends_with('{') {
                 // Detect "provider <name> {"
                 let name = trimmed
                     .strip_prefix("provider ")
@@ -294,8 +255,6 @@ impl CompletionProvider {
                     .trim();
                 if !name.is_empty() {
                     provider_block_name = Some(name.to_string());
-                    resource_type.clear();
-                    module_name = None;
                 }
             } else if brace_depth == 0
                 && (trimmed.starts_with("arguments")
@@ -307,69 +266,10 @@ impl CompletionProvider {
                 if trimmed.starts_with("exports") {
                     in_exports_block = true;
                 }
-                resource_type.clear();
-                module_name = None;
             } else if brace_depth == 0 && is_let_upstream_state_line(trimmed) {
                 in_upstream_state_block = true;
-                resource_type.clear();
-                module_name = None;
             } else if brace_depth == 0 && is_let_use_line(trimmed) {
                 in_use_block = true;
-                resource_type.clear();
-                module_name = None;
-            } else if brace_depth == 0
-                && trimmed.ends_with('{')
-                && !trimmed.starts_with("let ")
-                && !self.starts_with_provider_prefix(trimmed)
-                && !trimmed.starts_with("provider ")
-                && !trimmed.starts_with("arguments ")
-                && !trimmed.starts_with("attributes ")
-                && !trimmed.starts_with("exports ")
-                && !trimmed.starts_with('#')
-            {
-                // This is a module call: "module_name {"
-                let name = trimmed.trim_end_matches('{').trim();
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    module_name = Some(name.to_string());
-                    resource_type.clear();
-                }
-            } else if brace_depth == 0
-                && trimmed.ends_with('{')
-                && let Some(name) = extract_let_module_call_name(trimmed)
-            {
-                // Named-binding module call: `let <binding> = <module-name> {`.
-                // The RHS is a bare identifier (not `use`, `upstream_state`, or
-                // a resource path), so this is a call into an imported module.
-                // Without this branch the line falls through both
-                // `extract_resource_type` (no schema match) and the anonymous
-                // module-call branch above (which excludes `let `), leaving
-                // `module_name` unset and the cursor classified as
-                // `InsideResourceBlock { resource_type: "" }` — which surfaces
-                // no candidates and lets VS Code fall back to word-based
-                // suggestions. See #2423.
-                module_name = Some(name);
-                resource_type.clear();
-                current_binding =
-                    crate::let_parse::parse_let_header(trimmed).map(|(n, _)| n.to_string());
-            }
-
-            // At brace_depth >= 1, detect nested block in two forms:
-            //   - block syntax: "identifier {"
-            //   - assignment syntax: "identifier = {"
-            if brace_depth >= 1 && trimmed.ends_with('{') && !resource_type.is_empty() {
-                let before_brace = trimmed.trim_end_matches('{').trim();
-                let name = if before_brace.contains('=') {
-                    // Assignment syntax: "name = {" → extract name before "="
-                    before_brace.split('=').next().unwrap_or("").trim()
-                } else {
-                    // Block syntax: "name {"
-                    before_brace
-                };
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    let depth_index = (brace_depth - 1) as usize;
-                    nested_block_names.truncate(depth_index);
-                    nested_block_names.push(name.to_string());
-                }
             }
 
             // Inside an `exports` block, capture the type annotation of
@@ -384,51 +284,22 @@ impl CompletionProvider {
                 exports_entry_type = Some(ty);
             }
 
-            // Track for-body opens so the opening `{` increments both
-            // brace_depth and for_body_depth. The matching `}` drops
-            // for_body_depth alongside brace_depth.
-            let mut for_brace_pending = is_for_header;
-
             for c in line.chars() {
                 if c == '{' {
                     brace_depth += 1;
-                    if for_brace_pending {
-                        for_body_depth += 1;
-                        for_brace_pending = false;
-                    }
                 } else if c == '}' {
-                    if brace_depth == for_body_depth && for_body_depth > 0 {
-                        for_body_depth -= 1;
-                    }
                     brace_depth -= 1;
                     if brace_depth == 0 {
-                        resource_type.clear();
-                        current_binding = None;
-                        module_name = None;
                         provider_block_name = None;
                         in_args_or_attrs_block = false;
                         in_exports_block = false;
                         in_upstream_state_block = false;
                         in_use_block = false;
                         exports_entry_type = None;
-                        nested_block_names.clear();
                     } else if brace_depth == 1 && in_exports_block {
                         // Closing a nested `{ ... }` inside an exports
                         // map/list value — the next entry starts fresh.
                         exports_entry_type = None;
-                    } else if brace_depth == for_body_depth {
-                        // Closed the resource/module block that was inside the
-                        // current for body — forget its type so the next
-                        // resource at this level is detected fresh.
-                        resource_type.clear();
-                        current_binding = None;
-                        module_name = None;
-                    } else {
-                        // Truncate to current depth
-                        let depth_index = (brace_depth - 1) as usize;
-                        if nested_block_names.len() > depth_index {
-                            nested_block_names.truncate(depth_index);
-                        }
                     }
                 }
             }
@@ -458,12 +329,29 @@ impl CompletionProvider {
             }
         }
 
+        let resource_block = match &block_context {
+            EnclosingBlock::Resource {
+                resource_type,
+                struct_path,
+                binding,
+            } => Some((resource_type.as_str(), struct_path, binding.as_ref())),
+            EnclosingBlock::ModuleCall { .. } => None,
+            EnclosingBlock::Other => None,
+        };
+
         // `directives { ... }` is the meta-arg block, not a struct
         // attribute — short-circuit before the struct router runs (#2873).
-        if !nested_block_names.is_empty()
-            && nested_block_names.last().map(String::as_str) == Some("directives")
-            && brace_depth >= 2
-        {
+        let directives_binding = match resource_block {
+            Some((_, StructPath::Known(struct_path), binding))
+                if struct_path.first().map(String::as_str) == Some("directives") =>
+            {
+                Some(binding)
+            }
+            Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {
+                None
+            }
+        };
+        if let Some(directives_binding) = directives_binding {
             // Cursor inside `depends_on = [...]` → list-element completion.
             if let Some(after_eq) = prefix.split('=').next_back()
                 && let Some(open) = after_eq.rfind('[')
@@ -472,7 +360,7 @@ impl CompletionProvider {
                 let attr_name = self.extract_attr_name(&prefix);
                 if attr_name == "depends_on" {
                     return CompletionContext::InsideDirectivesDependsOnList {
-                        current_binding: current_binding.clone(),
+                        current_binding: directives_binding.cloned(),
                     };
                 }
             }
@@ -491,24 +379,29 @@ impl CompletionProvider {
             }
         }
 
-        // Check if we're inside a nested struct block (brace_depth > 1)
-        if !nested_block_names.is_empty() && brace_depth > 1 && !resource_type.is_empty() {
-            if prefix.contains('=') {
-                let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
-                if !after_eq.starts_with('"') || after_eq == "\"" {
-                    let field_name = self.extract_attr_name(&prefix);
-                    return CompletionContext::AfterEqualsInStruct {
-                        resource_type: resource_type.clone(),
-                        attr_path: nested_block_names,
-                        field_name,
-                        current_binding: current_binding.clone(),
-                    };
+        match resource_block {
+            Some((enclosing_resource_type, StructPath::Known(struct_path), current_binding))
+                if !struct_path.is_empty() =>
+            {
+                let current_segment = cursor_line_segment(text, position);
+                if current_segment.contains('=') {
+                    let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                    if !after_eq.starts_with('"') || after_eq == "\"" {
+                        let field_name = self.extract_attr_name(&current_segment);
+                        return CompletionContext::AfterEqualsInStruct {
+                            resource_type: enclosing_resource_type.to_string(),
+                            attr_path: struct_path.to_vec(),
+                            field_name,
+                            current_binding: current_binding.cloned(),
+                        };
+                    }
                 }
+                return CompletionContext::InsideStructBlock {
+                    resource_type: enclosing_resource_type.to_string(),
+                    attr_path: struct_path.to_vec(),
+                };
             }
-            return CompletionContext::InsideStructBlock {
-                resource_type: resource_type.clone(),
-                attr_path: nested_block_names,
-            };
+            Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {}
         }
 
         // Check if we're inside a provider block
@@ -561,72 +454,105 @@ impl CompletionProvider {
             return CompletionContext::InsideUseBlock;
         }
 
-        // Check if we're after an equals sign (value position) inside a block
-        if brace_depth > 0 && prefix.contains('=') {
+        // Exports are not schema blocks, but their declared type still drives
+        // value-position completion.
+        if brace_depth > 0 && prefix.contains('=') && in_exports_block {
             let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
-            // Don't show completions if user is typing a string literal (except just starting)
             if !after_eq.starts_with('"') || after_eq == "\"" {
-                // Inside an `exports` block, filter value-position
-                // candidates by the entry's declared type. If the
-                // annotation can't be resolved the original empty
-                // fallback from #1993 still applies — it is preferable
-                // to silence than to dump every built-in.
-                if in_exports_block {
-                    if let Some(entry_type) = exports_entry_type.as_deref() {
-                        // `brace_depth == 1` means the value sits
-                        // directly after `= ` at the top of the exports
-                        // entry; `>= 2` means it's inside the entry's
-                        // `{ ... }` map or list body, so the relevant
-                        // type is unwrapped by one level.
-                        let in_nested = brace_depth >= 2;
-                        return CompletionContext::AfterEqualsInExports {
-                            type_expr_text: entry_type.to_string(),
-                            in_nested,
-                        };
+                if let Some(entry_type) = exports_entry_type.as_deref() {
+                    // `brace_depth == 1` means the value sits directly
+                    // after `= `; `>= 2` means it is inside the entry's
+                    // map/list body, so unwrap one level.
+                    let in_nested = brace_depth >= 2;
+                    return CompletionContext::AfterEqualsInExports {
+                        type_expr_text: entry_type.to_string(),
+                        in_nested,
+                    };
+                }
+                return CompletionContext::None;
+            }
+        }
+
+        // Resource and module identity comes exclusively from the shared,
+        // lexer-aware enclosing-block walk.
+        let current_segment = cursor_line_segment(text, position);
+        match &block_context {
+            EnclosingBlock::Resource {
+                resource_type,
+                struct_path,
+                binding,
+            } => match struct_path {
+                StructPath::Known(_) => {
+                    if current_segment.contains('=') {
+                        let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                        if !after_eq.starts_with('"') || after_eq == "\"" {
+                            return CompletionContext::AfterEquals {
+                                target: AttributeValueTarget::SchemaAttribute {
+                                    resource_type: resource_type.clone(),
+                                    attr_name: self.extract_attr_name(&current_segment),
+                                },
+                                current_binding: binding.clone(),
+                            };
+                        }
+                    }
+                    return CompletionContext::InsideResourceBlock {
+                        resource_type: resource_type.clone(),
+                    };
+                }
+                StructPath::Unresolvable => {
+                    if current_segment.contains('=') {
+                        let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                        if !after_eq.starts_with('"') || after_eq == "\"" {
+                            return CompletionContext::AfterEquals {
+                                target: AttributeValueTarget::Unresolvable,
+                                current_binding: binding.clone(),
+                            };
+                        }
                     }
                     return CompletionContext::None;
                 }
-                // Extract attribute name from current line
-                let attr_name = self.extract_attr_name(&prefix);
-                // Module call value position: route to a module-aware
-                // handler that loads the called module's `arguments {}`
-                // and emits type-driven candidates (#2621).
-                if let Some(module) = module_name.as_ref()
-                    && resource_type.is_empty()
-                    && !attr_name.is_empty()
-                {
-                    return CompletionContext::AfterEqualsInModuleCall {
-                        module_name: module.clone(),
-                        arg_name: attr_name,
-                    };
+            },
+            EnclosingBlock::ModuleCall {
+                module_name,
+                arg_path: _arg_path,
+            } => {
+                if current_segment.contains('=') {
+                    let after_eq = current_segment.split('=').next_back().unwrap_or("").trim();
+                    let arg_name = self.extract_attr_name(&current_segment);
+                    if (!after_eq.starts_with('"') || after_eq == "\"") && !arg_name.is_empty() {
+                        return CompletionContext::AfterEqualsInModuleCall {
+                            module_name: module_name.clone(),
+                            arg_name,
+                        };
+                    }
                 }
+                return CompletionContext::InsideModuleCall {
+                    module_name: module_name.clone(),
+                };
+            }
+            EnclosingBlock::Other => {}
+        }
+
+        // Preserve value completion in non-schema blocks and expression
+        // objects without inventing a resource or module identity.
+        if brace_depth > 0 && prefix.contains('=') {
+            let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
+            if !after_eq.starts_with('"') || after_eq == "\"" {
                 return CompletionContext::AfterEquals {
-                    resource_type: resource_type.clone(),
-                    attr_name,
-                    current_binding: current_binding.clone(),
+                    target: AttributeValueTarget::Unresolvable,
+                    current_binding: None,
                 };
             }
         }
 
-        // Inside module call block
         if brace_depth > 0 {
             if in_upstream_state_block {
                 return CompletionContext::InsideUpstreamStateBlock;
             }
-            if let Some(name) = module_name {
-                return CompletionContext::InsideModuleCall { module_name: name };
-            }
-            return CompletionContext::InsideResourceBlock { resource_type };
+            return CompletionContext::None;
         }
 
         CompletionContext::TopLevel
-    }
-
-    /// Check if a line starts with any provider prefix (e.g., "aws.", "awscc.")
-    fn starts_with_provider_prefix(&self, line: &str) -> bool {
-        self.provider_names
-            .iter()
-            .any(|name| line.starts_with(&format!("{}.", name)))
     }
 
     /// Extract resource type from a line like "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
@@ -634,113 +560,15 @@ impl CompletionProvider {
     pub(super) fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 
-        // Match against schema keys (sorted longest first for correct matching)
-        for pattern in &self.resource_type_patterns {
-            if trimmed.contains(pattern.as_str()) {
-                return Some(pattern.clone());
-            }
-        }
-        None
+        self.resource_type_patterns
+            .find_in(trimmed)
+            .map(str::to_string)
     }
 
     /// Extract attribute name from a line prefix like "    enable_dns_hostnames = "
     fn extract_attr_name(&self, prefix: &str) -> String {
         let before_eq = prefix.split('=').next().unwrap_or("").trim();
         before_eq.to_string()
-    }
-
-    fn extract_struct_fields<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_type: &'a AttributeType,
-    ) -> Option<&'a [StructField]> {
-        let mut budget = carina_core::schema::ShapeWalkBudget::new(64);
-        self.extract_struct_fields_with_budget(schema, attr_type, &mut budget)
-    }
-
-    fn extract_struct_fields_with_budget<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_type: &'a AttributeType,
-        budget: &mut carina_core::schema::ShapeWalkBudget,
-    ) -> Option<&'a [StructField]> {
-        use carina_core::schema::Shape;
-        // Project onto `Shape` so any `Ref` chain is peeled at the
-        // type level (carina#3349). The cyclic-CFN case
-        // (`Statement -> AndStatement -> List<Statement>`) descends
-        // because `shape_of` walks `Ref` against the schema's defs.
-        match schema.shape_of(attr_type) {
-            Shape::Struct { .. } => schema.struct_fields_with_budget(attr_type, budget),
-            Shape::List {
-                element_type: inner,
-                ..
-            } => match schema.shape_of(inner) {
-                Shape::Struct { .. } => schema.struct_fields_with_budget(inner, budget),
-                _ => None,
-            },
-            Shape::Union => schema
-                .union_members_with_budget(attr_type, budget)?
-                .iter()
-                .flatten()
-                .find_map(|member| {
-                    self.extract_struct_fields_with_budget(schema, member.as_attr(), budget)
-                }),
-            _ => None,
-        }
-    }
-
-    /// Look up attribute schema by name, falling back to block_name match.
-    fn find_attr_schema<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_name: &str,
-    ) -> Option<&'a carina_core::schema::AttributeSchema> {
-        if let Some(attr_schema) = schema.attributes().get(attr_name) {
-            return Some(attr_schema);
-        }
-        // Fallback: check if attr_name matches a block_name
-        schema
-            .attributes()
-            .values()
-            .find(|a| a.block_name().is_some_and(|bn| bn == attr_name))
-    }
-
-    /// Provide completions for struct fields inside a nested block
-    /// Resolve struct fields by walking down a path of nested block names.
-    /// For a single-element path like ["versioning_configuration"], looks up the attribute directly.
-    /// For multi-element paths like ["assume_role_policy_document", "statement"],
-    /// walks down the struct hierarchy.
-    /// Resolve the AttributeType at the given attr_path within a resource schema.
-    fn resolve_type_for_path<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_path: &[String],
-    ) -> Option<&'a AttributeType> {
-        if attr_path.is_empty() {
-            return None;
-        }
-
-        let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
-        let mut current_type = attr_schema.attr_type();
-
-        for name in &attr_path[1..] {
-            let fields = self.extract_struct_fields(schema, current_type)?;
-            let field = fields
-                .iter()
-                .find(|f| f.name() == *name || f.block_name() == Some(name))?;
-            current_type = field.field_type();
-        }
-
-        Some(current_type)
-    }
-
-    fn resolve_struct_fields_for_path<'a>(
-        &self,
-        schema: &'a ResourceSchema,
-        attr_path: &[String],
-    ) -> Option<&'a [StructField]> {
-        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        self.extract_struct_fields(schema, attr_type)
     }
 
     fn struct_field_completions(
@@ -756,7 +584,9 @@ impl CompletionProvider {
 
         if let Some(schema) = self.lookup_schema(resource_type) {
             // Try struct field completions first
-            if let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path) {
+            if let Some(resolved) = resolve_attribute_path(schema, attr_path)
+                && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
+            {
                 return fields
                     .iter()
                     .filter(|field| !field.is_read_only())
@@ -804,7 +634,8 @@ impl CompletionProvider {
         schema: &'a ResourceSchema,
         attr_path: &[String],
     ) -> Option<&'a AttributeType> {
-        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
+        let resolved = resolve_attribute_path(schema, attr_path)?;
+        let attr_type = resolved.attr_type();
         if let Shape::Map { key, .. } = schema.shape_of(attr_type) {
             Some(key)
         } else {
@@ -853,7 +684,8 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
+            && let Some(resolved) = resolve_attribute_path(schema, attr_path)
+            && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
             && let Some(field) = fields.iter().find(|f| f.name() == field_name)
         {
             if field.is_read_only() {
@@ -871,6 +703,15 @@ impl CompletionProvider {
 }
 
 #[derive(Debug)]
+enum AttributeValueTarget {
+    SchemaAttribute {
+        resource_type: String,
+        attr_name: String,
+    },
+    Unresolvable,
+}
+
+#[derive(Debug)]
 #[allow(dead_code)]
 enum CompletionContext {
     TopLevel,
@@ -883,8 +724,7 @@ enum CompletionContext {
         module_name: String,
     },
     AfterEquals {
-        resource_type: String,
-        attr_name: String,
+        target: AttributeValueTarget,
         current_binding: Option<String>,
     },
     /// Cursor is at a value position inside an `exports { ... }` block
@@ -986,42 +826,6 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     // longer identifier like `upstream_states`.
     let next = rest.trim_start();
     next.starts_with('{') || next.is_empty()
-}
-
-/// If `trimmed` is a `let <binding> = <module-name> {` header (named-binding
-/// module call), return `<module-name>`. Otherwise return `None`.
-///
-/// Distinguished from the other `let` shapes:
-///   - `let x = use { ... }`         → handled by `is_let_use_line`
-///   - `let x = upstream_state { ... }` → handled by `is_let_upstream_state_line`
-///   - `let x = aws.ec2.Vpc { ... }` → handled by `extract_resource_type`
-///
-/// The RHS must be a bare ASCII identifier followed by `{` (with optional
-/// whitespace). Anything else — provider-prefixed paths, `read`, dotted
-/// expressions, function calls — is rejected so callers can rely on this
-/// only matching the module-call shape.
-pub(super) fn extract_let_module_call_name(trimmed: &str) -> Option<String> {
-    let (_, rhs) = crate::let_parse::parse_let_header(trimmed)?;
-    let rhs = rhs.trim_end_matches('{').trim_end();
-    if rhs.is_empty() {
-        return None;
-    }
-    if !rhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    // Reject reserved RHS keywords that have their own shapes.
-    if rhs == "use" || rhs == "upstream_state" || rhs == "read" {
-        return None;
-    }
-    // First char must be an identifier-start (not a digit).
-    if !rhs
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-    {
-        return None;
-    }
-    Some(rhs.to_string())
 }
 
 fn is_let_use_line(trimmed: &str) -> bool {

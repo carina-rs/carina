@@ -72,6 +72,11 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+fn authored_binding_view(source: &str) -> crate::config_loader::AuthoredBindingView {
+    crate::config_loader::AuthoredBindingView::parse_source(source, &ProviderContext::default())
+        .expect("fixture must parse")
+}
+
 #[test]
 fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     let value = Value::Deferred(DeferredValue::FunctionCall {
@@ -381,7 +386,7 @@ fn literal_union_lifts_directionally_for_schema_assignment() {
 #[test]
 fn no_bindings_no_warnings() {
     let parsed = empty_parsed();
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -404,7 +409,7 @@ fn used_binding_no_warning() {
     );
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -419,14 +424,13 @@ fn unused_binding_warns() {
         );
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings_in_file(&parsed);
     assert_eq!(unused, vec!["vpc"]);
 }
 
 #[test]
 fn import_target_counts_as_binding_use_and_other_binding_still_warns() {
-    let parsed = crate::parser::parse(
-        r#"
+    let src = r#"
 import {
   to = mock.test.resource 'imported'
   id = 'existing-1'
@@ -434,12 +438,12 @@ import {
 
 let imported = mock.test.resource { name = "imported" }
 let orphan = mock.test.resource { name = "orphan" }
-"#,
-        &ProviderContext::default(),
-    )
-    .expect("fixture must parse");
+"#;
 
-    assert_eq!(check_unused_bindings(&parsed), vec!["orphan"]);
+    assert_eq!(
+        check_unused_bindings(&authored_binding_view(src)),
+        vec!["orphan"]
+    );
 }
 
 #[test]
@@ -461,13 +465,12 @@ fn state_block_targets_only_count_managed_resources_as_used() {
         id: Value::Concrete(ConcreteValue::String("existing-2".into())),
     });
 
-    assert_eq!(check_unused_bindings(&parsed), vec!["read_target"]);
+    assert_eq!(check_unused_bindings_in_file(&parsed), vec!["read_target"]);
 }
 
 #[test]
 fn moved_target_counts_as_binding_use_but_source_does_not() {
-    let parsed = crate::parser::parse(
-        r#"
+    let src = r#"
 moved {
   from = mock.test.resource 'old'
   to = mock.test.resource 'renamed'
@@ -481,21 +484,17 @@ let old = mock.test.resource { name = "old" }
 let renamed = mock.test.resource { name = "renamed" }
 let gone = mock.test.resource { name = "gone" }
 let orphan = mock.test.resource { name = "orphan" }
-"#,
-        &ProviderContext::default(),
-    )
-    .expect("fixture must parse");
+"#;
 
     assert_eq!(
-        check_unused_bindings(&parsed),
+        check_unused_bindings(&authored_binding_view(src)),
         vec!["old", "gone", "orphan"]
     );
 }
 
 #[test]
 fn binding_referenced_only_in_import_id_is_not_unused() {
-    let parsed = crate::parser::parse(
-        r#"
+    let src = r#"
 let imported = mock.test.resource { name = "imported" }
 let identifier_source = mock.test.resource { name = "identifier" }
 
@@ -505,12 +504,9 @@ import {
   to = mock.test.resource 'imported'
   id = "${identifier_source.id}|existing"
 }
-"#,
-        &ProviderContext::default(),
-    )
-    .expect("fixture must parse");
+"#;
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
 #[test]
@@ -527,7 +523,7 @@ fn dotted_string_literal_does_not_count_as_binding_use() {
     );
     parsed.resources.push(target); // allow: direct — fixture test inspection
 
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings_in_file(&parsed);
     assert_eq!(unused, vec!["publish"]);
 }
 
@@ -542,7 +538,7 @@ fn anonymous_resource_no_warning() {
     );
     parsed.resources.push(bucket); // allow: direct — fixture test inspection
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -566,7 +562,7 @@ fn binding_referenced_in_nested_value() {
     );
     parsed.resources.push(sg); // allow: direct — fixture test inspection
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -580,9 +576,7 @@ fn binding_referenced_in_interpolation_is_not_unused() {
             bucket_name = "acct-${role.arn}"
         }
     "#;
-    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
-
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
 #[test]
@@ -596,9 +590,7 @@ fn binding_referenced_in_function_call_arg_is_not_unused() {
             bucket_name = upper(role.arn)
         }
     "#;
-    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
-
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
 #[test]
@@ -614,9 +606,7 @@ fn binding_referenced_in_secret_builtin_function_call_is_not_unused() {
     "#;
     // `secret(role.arn)` stays deferred as a FunctionCall while its arg is
     // unresolved, so this source-level fixture pins function-call recursion.
-    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
-
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
 #[test]
@@ -644,7 +634,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
     let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
 
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
 #[test]
@@ -700,7 +690,7 @@ fn binding_referenced_in_module_call() {
         arguments: module_arguments(args),
     });
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -721,7 +711,7 @@ fn multiple_bindings_some_unused() {
     );
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
 
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings_in_file(&parsed);
     assert_eq!(unused, vec!["web_sg"]);
 }
 
@@ -744,7 +734,7 @@ fn binding_referenced_in_attributes_not_warned() {
             )),
         ));
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]
@@ -767,7 +757,7 @@ fn binding_referenced_in_exports_not_warned() {
         ));
 
     assert!(
-        check_unused_bindings(&parsed).is_empty(),
+        check_unused_bindings_in_file(&parsed).is_empty(),
         "binding referenced in exports should not be warned"
     );
 }
@@ -818,7 +808,7 @@ let route = awscc.ec2.route {
         other => panic!("Expected ResourceRef, got {:?}", other),
     }
 
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
     // igw_attachment is referenced by route, so should NOT be unused
     // route is the last resource and not referenced, so IS unused
     assert!(
@@ -848,7 +838,7 @@ cidr_block = "10.0.0.0/16"
         parsed.structural_bindings.contains("vpc"),
         "vpc should be in structural_bindings"
     );
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
     assert!(
         !unused.contains(&"vpc".to_string()),
         "if-expression binding should not be warned as unused"
@@ -873,7 +863,7 @@ cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
         parsed.structural_bindings.contains("vpcs"),
         "vpcs should be in structural_bindings"
     );
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
     assert!(
         unused.is_empty(),
         "for-expression bindings should not be warned as unused, got: {:?}",
@@ -891,8 +881,7 @@ for item in (primary.items ?? fallback.items) {
   test.r.child { name = item }
 }
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
 
     assert!(
         !unused.contains(&"primary".to_string()),
@@ -918,7 +907,7 @@ let caller = read aws.sts.caller_identity {}
         parsed.structural_bindings.contains("caller"),
         "caller should be in structural_bindings"
     );
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
     assert!(
         !unused.contains(&"caller".to_string()),
         "read-expression binding should not be warned as unused"
@@ -936,8 +925,7 @@ let vpc = awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
 }
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(input));
     assert_eq!(
         unused,
         vec!["vpc"],
@@ -952,19 +940,18 @@ provider foo {}
 
 let a = foo.x.Y {}
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
-
     assert!(
-        check_unused_bindings_with_identity_requirements(&parsed, &SchemaRegistry::new())
-            .is_empty(),
+        check_unused_bindings_with_identity_requirements(
+            &authored_binding_view(input),
+            &SchemaRegistry::new(),
+        )
+        .is_empty(),
         "a schema-less resource cannot safely discard its explicit identity binding",
     );
 }
 
 #[test]
 fn binding_used_inside_for_body_is_not_flagged_as_unused() {
-    use crate::parser::parse;
-
     let src = r#"
         provider test {
             source = 'x/y'
@@ -978,8 +965,7 @@ fn binding_used_inside_for_body_is_not_flagged_as_unused() {
             }
         }
     "#;
-    let parsed = parse(src, &crate::parser::ProviderContext::default()).unwrap();
-    let unused = check_unused_bindings(&parsed);
+    let unused = check_unused_bindings(&authored_binding_view(src));
     assert!(
         !unused.iter().any(|b| b == "vpc"),
         "`vpc` is referenced inside the for body, got: {unused:?}"
@@ -2752,7 +2738,7 @@ fn discard_binding_no_warning() {
         .with_binding("_");
     parsed.resources.push(caller); // allow: direct — fixture test inspection
 
-    assert!(check_unused_bindings(&parsed).is_empty());
+    assert!(check_unused_bindings_in_file(&parsed).is_empty());
 }
 
 #[test]

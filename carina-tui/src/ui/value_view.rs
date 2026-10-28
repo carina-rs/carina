@@ -79,7 +79,10 @@ pub(super) fn has_semantic_color(rendered: &RenderedValue) -> bool {
     })
 }
 
-pub(super) fn value_lines_styled<'a>(rendered: &RenderedValue, style: ValueStyle) -> Vec<Line<'a>> {
+pub(super) fn value_lines_styled<'a>(
+    rendered: &RenderedValue,
+    style: ValueStyle,
+) -> Vec<Vec<Span<'a>>> {
     let mut lines = vec![Vec::new()];
     for span in rendered.spans() {
         if span.kind() != ValueSpanKind::Whitespace || !span.text().contains('\n') {
@@ -106,7 +109,7 @@ pub(super) fn value_lines_styled<'a>(rendered: &RenderedValue, style: ValueStyle
             }
         }
     }
-    lines.into_iter().map(Line::from).collect()
+    lines
 }
 
 #[cfg(test)]
@@ -172,6 +175,26 @@ mod tests {
         assert!(
             spans
                 .iter()
+                .any(|span| { span.style.add_modifier.contains(Modifier::CROSSED_OUT) })
+        );
+    }
+
+    #[test]
+    fn styled_visual_lines_are_returned_as_span_vectors() {
+        let rendered =
+            carina_core::value::PrettyValue::new(Value::Concrete(ConcreteValue::StringList(vec![
+                "a".repeat(70).into(),
+                "b".repeat(70).into(),
+            ])))
+            .render(carina_core::value::PrettyLayout::for_attribute(4, "values"));
+
+        let lines = value_lines_styled(&rendered, ValueStyle::RedStrikethrough);
+
+        assert!(lines.len() > 1, "expected a wrapped value");
+        assert!(
+            lines
+                .iter()
+                .flatten()
                 .any(|span| { span.style.add_modifier.contains(Modifier::CROSSED_OUT) })
         );
     }

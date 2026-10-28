@@ -134,6 +134,55 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
+pub(super) fn test_provider_with_list_of_structs() -> CompletionProvider {
+    let rule = AttributeType::struct_(
+        "Rule",
+        vec![
+            StructField::new("name", AttributeType::string()),
+            StructField::new("enabled", AttributeType::bool()),
+        ],
+    );
+    let schema = ResourceSchema::new("Policy")
+        .attribute(AttributeSchema::new("rules", AttributeType::list(rule)));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
+}
+
+pub(super) fn test_provider_for_enclosing_block_regressions() -> CompletionProvider {
+    let tag_key = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("TagKey"),
+        Some(vec!["Name".to_string(), "Env".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let nested = AttributeType::struct_(
+        "Nested",
+        vec![
+            StructField::new("inner", AttributeType::string()),
+            StructField::new("outer_field", AttributeType::list(AttributeType::string())),
+            StructField::new(
+                "tags",
+                AttributeType::map_with_key(tag_key, AttributeType::string()),
+            ),
+        ],
+    );
+    let schema = ResourceSchema::new("review.Resource")
+        .attribute(AttributeSchema::new(
+            "attr",
+            AttributeType::list(AttributeType::string()),
+        ))
+        .attribute(AttributeSchema::new("outer", nested.clone()))
+        .attribute(AttributeSchema::new("x", nested))
+        .attribute(AttributeSchema::new("policy", AttributeType::string()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
+}
+
 /// Minimal provider with a single resource type `test.foo.bar` that has one
 /// `attr` string attribute. Enough to exercise value-position completions
 /// without needing real provider schemas.

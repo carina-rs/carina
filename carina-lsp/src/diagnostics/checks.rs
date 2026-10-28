@@ -2398,8 +2398,8 @@ impl DiagnosticEngine {
 
     /// Format a stream of unused-binding names into LSP diagnostics.
     /// The caller decides which bindings count as unused (derived from
-    /// `carina_core::validation::check_unused_bindings` on the merged
-    /// parse) and which to anchor the warning on — this helper only
+    /// `carina_core::validation::check_unused_bindings` on the directory's
+    /// authored view) and which to anchor the warning on — this helper only
     /// handles the final position lookup and diagnostic construction.
     pub(super) fn unused_binding_diagnostics<I>(
         &self,

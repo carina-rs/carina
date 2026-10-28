@@ -1,14 +1,18 @@
 //! Resolve provider binaries from GitHub Actions CI artifacts by git revision.
 
 use serde::Deserialize;
-use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::GithubSource;
 
-use crate::provider_resolver::WasmArtifactPath;
+use crate::install_lock::{
+    GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
+    global_cache_artifact_path, install_global_artifact_atomically,
+    install_project_artifact_atomically,
+};
+use crate::provider_resolver::{WasmArtifactPath, sha256_file};
 
 /// GitHub Actions artifact metadata (subset used by the resolver).
 #[derive(Deserialize)]
@@ -263,11 +267,12 @@ where
 
 /// Download a GitHub Actions artifact (ZIP) and extract the WASM file.
 fn download_artifact(
+    install_lock: &ProviderInstallLock,
     source: &GithubSource,
     artifact_id: u64,
-    dest: &Path,
+    destination: &WasmArtifactPath,
     token: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let owner = source.owner();
     let repo = source.repo();
     let url =
@@ -308,14 +313,24 @@ fn download_artifact(
 
         let name = file.name().to_string();
         if name.ends_with(".wasm") {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create cache dir: {e}"))?;
-            }
-            let mut out = fs::File::create(dest)
-                .map_err(|e| format!("Failed to create {}: {e}", dest.display()))?;
-            io::copy(&mut file, &mut out).map_err(|e| format!("Failed to write WASM file: {e}"))?;
-            return Ok(());
+            let mut staged =
+                StagedArtifact::for_project(install_lock, destination).map_err(|e| {
+                    format!(
+                        "Failed to stage provider artifact {}: {e}",
+                        destination.as_path().display()
+                    )
+                })?;
+            io::copy(&mut file, &mut staged)
+                .map_err(|e| format!("Failed to write WASM file: {e}"))?;
+            let hash = sha256_file(staged.path())
+                .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+            staged.publish().map_err(|e| {
+                format!(
+                    "Failed to publish provider artifact {}: {e}",
+                    destination.as_path().display()
+                )
+            })?;
+            return Ok(hash);
         }
     }
 
@@ -336,13 +351,16 @@ pub fn cache_path_revision(base_dir: &Path, source: &GithubSource, sha: &str) ->
         .join(format!("{}.wasm", source.repo()))
 }
 
-pub(crate) fn global_cache_path_revision(source: &GithubSource, sha: &str) -> Option<PathBuf> {
+pub(crate) fn global_cache_path_revision(
+    source: &GithubSource,
+    sha: &str,
+) -> Option<GlobalArtifactPath> {
     let sha_prefix = &sha[..sha.len().min(12)];
-    super::provider_resolver::global_cache_dir().map(|dir| {
-        dir.join(source.to_string())
+    global_cache_artifact_path(
+        PathBuf::from(source.to_string())
             .join(format!("rev-{sha_prefix}"))
-            .join(format!("{}.wasm", source.repo()))
-    })
+            .join(format!("{}.wasm", source.repo())),
+    )
 }
 
 fn checksum_mismatch_error(
@@ -366,13 +384,14 @@ fn checksum_mismatch_error(
 
 /// Resolve a provider by revision: download from CI artifacts if not cached.
 pub fn resolve_provider_by_revision(
-    base_dir: &Path,
+    lock_file: &mut GuardedLockFile<'_>,
     source: &GithubSource,
     revision: &str,
     name: &str,
-    lock_file: &mut super::provider_resolver::LockFile,
     upgrade: bool,
 ) -> Result<(WasmArtifactPath, String), String> {
+    let install_lock = lock_file.install_lock();
+    let base_dir = install_lock.project_dir();
     let token = get_github_token()?;
     let source_key = source.source_key();
 
@@ -429,15 +448,11 @@ pub fn resolve_provider_by_revision(
 
     // 2b. Check global plugin cache
     if let Some(global_wasm) = global_cache_path_revision(source, &sha)
-        && global_wasm.exists()
+        && global_wasm.as_path().exists()
     {
-        if let Some(parent) = wasm_path.as_path().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        super::provider_resolver::link_or_copy(&global_wasm, wasm_path.as_path())
-            .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
-        let hash = super::provider_resolver::sha256_file(wasm_path.as_path())
-            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        let hash =
+            install_project_artifact_atomically(install_lock, global_wasm.as_path(), &wasm_path)
+                .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
         lock_file.upsert(super::provider_resolver::LockEntry {
             name: name.to_string(),
             source: source_key.to_string(),
@@ -470,18 +485,12 @@ pub fn resolve_provider_by_revision(
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
             fetch_run_artifacts(source, run_id, &token)
         })?;
-    download_artifact(source, artifact_id, wasm_path.as_path(), &token)?;
+    let hash = download_artifact(install_lock, source, artifact_id, &wasm_path, &token)?;
 
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(source, &sha) {
-        if let Some(parent) = global_wasm.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = super::provider_resolver::link_or_copy(wasm_path.as_path(), &global_wasm);
+        let _ = install_global_artifact_atomically(wasm_path.as_path(), &global_wasm);
     }
-
-    let hash = super::provider_resolver::sha256_file(wasm_path.as_path())
-        .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
 
     lock_file.upsert(super::provider_resolver::LockEntry {
         name: name.to_string(),
@@ -601,8 +610,9 @@ mod tests {
             registry: None,
         });
 
-        let result =
-            resolve_provider_by_revision(dir.path(), &source, "main", "aws", &mut lock_file, false);
+        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let mut lock_file = install_lock.guard_lock_file_for_test(lock_file);
+        let result = resolve_provider_by_revision(&mut lock_file, &source, "main", "aws", false);
         match previous_token {
             Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },

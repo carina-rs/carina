@@ -1338,30 +1338,40 @@ impl DiagnosticEngine {
                 &export_value_bindings,
             ));
 
-            // Unused `let` detection. When a merged parse is available,
-            // run the core check against it (so references from sibling
-            // files count as usage) and filter the result to bindings
+            // Unused `let` detection. When a directory parse is available,
+            // run the core check against its authored view (so references
+            // from sibling files count as usage) and filter the result to bindings
             // declared in the current file — the LSP warning surface is
-            // per-document. Without a merged parse there are no sibling
-            // references to consider, so run the per-file check.
-            let unused_binding_names: Vec<String> = match merged {
-                Some(merged) => {
+            // per-document. With no base path, parse the current buffer through
+            // the same authored-view constructor. A failed directory parse must
+            // not fall back to that buffer-only view because it cannot see uses
+            // from sibling files.
+            let unused_binding_names: Vec<String> = match (merged_result.as_ref(), base_path) {
+                (Some(result), _) => {
                     let current_file_bindings: HashSet<String> = parsed
                         .iter_all_resources()
                         .filter_map(|rref| rref.binding().map(str::to_string))
                         .collect();
                     carina_core::validation::check_unused_bindings_with_identity_requirements(
-                        merged,
+                        &result.directory.authored_bindings,
                         &self.schemas,
                     )
                     .into_iter()
                     .filter(|b| current_file_bindings.contains(b))
                     .collect()
                 }
-                None => carina_core::validation::check_unused_bindings_with_identity_requirements(
-                    parsed,
-                    &self.schemas,
-                ),
+                (None, None) => carina_core::config_loader::AuthoredBindingView::parse_source(
+                    &text,
+                    &self.provider_context,
+                )
+                .map(|view| {
+                    carina_core::validation::check_unused_bindings_with_identity_requirements(
+                        &view,
+                        &self.schemas,
+                    )
+                })
+                .unwrap_or_default(),
+                (None, Some(_)) => Vec::new(),
             };
             diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
 

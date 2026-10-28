@@ -5,7 +5,7 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 
-use carina_provider_resolver::{self, LockMode};
+use carina_provider_resolver::{self, LockMode, ProviderInstallLock};
 
 use crate::commands::migrate_state::{MigrationOutcome, SourceDisposition, run_init_migrate_state};
 use crate::commands::{
@@ -26,8 +26,8 @@ pub async fn run_init(
         locked,
         migrate_state,
         force,
-        |base_dir, providers, mode| {
-            carina_provider_resolver::resolve_all(base_dir, providers, mode)
+        |install_lock, providers, mode| {
+            carina_provider_resolver::resolve_all(install_lock, providers, mode)
                 .map(|resolved| resolved.len())
         },
     )
@@ -41,7 +41,7 @@ async fn run_init_with_provider_resolver(
     migrate_state: bool,
     force: bool,
     resolve_providers: impl FnOnce(
-        &Path,
+        &ProviderInstallLock,
         &[carina_core::parser::ProviderConfig],
         LockMode,
     ) -> Result<usize, String>,
@@ -107,7 +107,13 @@ async fn run_init_with_provider_resolver(
             .cyan()
         );
 
-        let resolved_count = resolve_providers(base_dir, &loaded.parsed.providers, mode)?;
+        let install_lock = ProviderInstallLock::acquire(base_dir).map_err(|error| {
+            format!(
+                "Failed to acquire provider install lock for {}: {error}",
+                base_dir.display()
+            )
+        })?;
+        let resolved_count = resolve_providers(&install_lock, &loaded.parsed.providers, mode)?;
 
         println!(
             "{}",
@@ -256,9 +262,12 @@ mod tests {
             false,
             false,
             false,
-            |base_dir, providers, mode| {
+            |install_lock, providers, mode| {
                 carina_provider_resolver::resolve_all_with_fixture_registry(
-                    base_dir, providers, mode, &http,
+                    install_lock,
+                    providers,
+                    mode,
+                    &http,
                 )
                 .map(|resolved| resolved.len())
             },

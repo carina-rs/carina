@@ -2,6 +2,7 @@
 name = "carina-provider-protocol"
 version = "0.3.0"
 edition = "2024"
+publish.workspace = true
 license = "MIT"
 
 [dependencies]
