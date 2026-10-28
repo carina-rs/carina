@@ -1431,10 +1431,10 @@ exports {
             Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
         );
 
-    carina_core::parser::InferredFile {
-        resources: vec![resource],
-        ..carina_core::parser::InferredFile::default()
-    }
+        carina_core::parser::InferredFile {
+            resources: vec![resource],
+            ..carina_core::parser::InferredFile::default()
+        }
     }
 
     #[test]
