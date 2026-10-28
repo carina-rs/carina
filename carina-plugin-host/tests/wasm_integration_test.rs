@@ -1385,6 +1385,103 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let slow_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "queued-timeout", None);
+    let slow = create_request_for_test(resource_with_int_attribute(
+        "test.resource",
+        "queued-timeout",
+        "call_delay_millis",
+        10_000,
+    ))
+    .await;
+    let sibling_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "queued-sibling", None);
+
+    let timed_out = provider.create_for_test(&slow_id, slow);
+    let sibling = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        provider
+            .read(&sibling_id, &mock_identifier(), ReadRequest)
+            .await
+    };
+    let (timed_out, sibling) = tokio::join!(timed_out, sibling);
+
+    let timed_out = create_failure_error(timed_out.expect_err("the slow create must time out"));
+    assert!(matches!(timed_out, ProviderError::Timeout(_)));
+    let sibling = sibling.expect_err("the queued sibling must reject the poisoned instance");
+    let rendered = sibling.to_string();
+    assert!(
+        rendered.contains("unusable after wall-clock timeout in create"),
+        "the queued sibling must retain the original timeout reason: {rendered}"
+    );
+    assert!(
+        !rendered.contains("cannot enter component instance")
+            && !rendered.contains("WASM guest trapped: read call failed"),
+        "the queued sibling must never enter the dead store: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    ));
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let slow_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "cancelled-call", None);
+    let slow = create_request_for_test(resource_with_int_attribute(
+        "test.resource",
+        "cancelled-call",
+        "call_delay_millis",
+        10_000,
+    ))
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        provider.create_for_test(&slow_id, slow),
+    )
+    .await
+    .expect_err("the outer timeout must cancel the in-flight guest call");
+
+    let followup_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
+    let followup = provider
+        .read(&followup_id, &mock_identifier(), ReadRequest)
+        .await
+        .expect_err("cancelling an in-flight call must poison the configured instance");
+    let rendered = followup.to_string();
+    assert!(
+        rendered.contains("prior operation was cancelled"),
+        "the follow-up must retain the cancellation reason: {rendered}"
+    );
+    assert!(
+        !rendered.contains("cannot enter component instance")
+            && !rendered.contains("WASM guest trapped: read call failed"),
+        "the follow-up must not enter the cancelled instance: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -1452,23 +1549,61 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
 
     let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
     let retry_started = Instant::now();
-    let retry_error = carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
-        .expect_err("the timed-out init instance must remain poisoned");
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect("validate_config should rebuild the timed-out init instance");
     let retry_elapsed = retry_started.elapsed();
-    let retry_rendered = retry_error.to_string();
-
-    assert!(
-        retry_rendered.contains("unusable after wall-clock timeout in validate_config"),
-        "{retry_rendered}"
-    );
-    assert!(
-        !retry_rendered.contains("cannot enter component instance"),
-        "the follow-up must report the original poison reason: {retry_rendered}"
-    );
     assert!(
         retry_elapsed < Duration::from_secs(1),
-        "a poisoned init instance must fail fast; elapsed {retry_elapsed:?}"
+        "a clean call on the rebuilt init instance should finish quickly; elapsed {retry_elapsed:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_validate_config_trap_rebuilds_init_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let attributes = indexmap::IndexMap::from([(
+        "__mock_validate_config_trap__".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    )]);
+    let trap_config = resolved_provider_config(factory.name(), attributes);
+
+    let error = carina_core::executor::prepare_provider_ready_config(&factory, &trap_config)
+        .expect_err("the mock validate_config hook must trap");
+    let rendered = error.to_string();
+    assert!(rendered.contains("validate_config"), "{rendered}");
+    assert!(rendered.contains("WASM guest trapped"), "{rendered}");
+
+    let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
+        .expect("validate_config should rebuild the trapped init instance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-utils")]
+async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    ));
+    let attributes = indexmap::IndexMap::from([(
+        "validate_delay_millis".to_string(),
+        Value::Concrete(ConcreteValue::Int(10_000)),
+    )]);
+    let config = resolved_provider_config(factory.name(), attributes);
+
+    carina_core::executor::prepare_provider_ready_config(&factory, &config)
+        .expect_err("validate_config should time out before custom-type validation");
+
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
+    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
+    validate(
+        &TypeIdentity::new(Some("mock"), Vec::<String>::new(), "RecoveryProbe"),
+        &Value::Concrete(ConcreteValue::String("clean".into())),
+    )
+    .expect("validate_custom_type should rebuild the timed-out init instance");
 }
 
 #[tokio::test(flavor = "multi_thread")]

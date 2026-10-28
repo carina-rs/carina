@@ -476,6 +476,9 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+        if attrs.contains_key("__mock_validate_config_trap__") {
+            panic!("intentional mock validate_config trap");
+        }
         if let Some(Value::Int(delay_millis)) = attrs.get("validate_delay_millis")
             && let Ok(delay_millis) = u64::try_from(*delay_millis)
         {
