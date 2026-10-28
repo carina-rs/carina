@@ -245,12 +245,11 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
         );
         r
     };
-    let call = ModuleCall {
-        module_name: "policy_module".to_string(),
-        binding_name: Some("bootstrap".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "policy_module".to_string(),
+        Some("bootstrap".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver
         .expand_module_call(&call, "bootstrap")
@@ -290,12 +289,7 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
         );
         resolver
     };
-    let call = ModuleCall {
-        module_name: "policy_module".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test("policy_module".to_string(), None, HashMap::new());
 
     let first = resolver
         .expand_module_call(&call, "first")
@@ -332,11 +326,10 @@ fn test_expand_module_call() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: {
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
@@ -344,7 +337,7 @@ fn test_expand_module_call() {
             );
             module_arguments(args)
         },
-    };
+    );
 
     let expanded = resolver
         .expand_module_call(&call, "my_instance")
@@ -448,12 +441,11 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "registry".to_string(),
-        binding_name: Some("acme".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "registry".to_string(),
+        Some("acme".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver
         .expand_module_call(&call, "acme")
@@ -621,32 +613,22 @@ fn test_multiple_module_instances_no_collision() {
         r
     };
 
-    let call_a = ModuleCall {
-        module_name: "net".to_string(),
-        binding_name: Some("prod".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
-    let call_b = ModuleCall {
-        module_name: "net".to_string(),
-        binding_name: Some("staging".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call_a = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
+    let call_b = ModuleCall::test("net".to_string(), Some("staging".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded_a = resolver
         .expand_module_call(&call_a, "prod")
@@ -773,12 +755,11 @@ fn test_expand_module_call_creates_composition() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
     // carina#3181 PR C: `resources` is managed-only — 1 real resource.
@@ -827,12 +808,11 @@ fn test_expand_module_call_populates_compositions_slice() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
@@ -861,12 +841,11 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
@@ -912,12 +891,11 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
     let leaf = &expanded.resources[0];
@@ -949,12 +927,11 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
     let leaf = &expanded.resources[0];
@@ -1094,12 +1071,11 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         Value::Concrete(ConcreteValue::Int(3)),
     );
 
-    let call = ModuleCall {
-        module_name: "svc".to_string(),
-        binding_name: Some("api".to_string()),
-        source: Default::default(),
-        arguments: module_arguments(call_arguments),
-    };
+    let call = ModuleCall::test(
+        "svc".to_string(),
+        Some("api".to_string()),
+        module_arguments(call_arguments),
+    );
 
     let expanded = resolver.expand_module_call(&call, "api").unwrap();
     assert_eq!(expanded.compositions.len(), 1);
@@ -1165,12 +1141,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
     };
 
     // Module call without binding_name
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test("web_tier".to_string(), None, HashMap::new());
 
     let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
     assert_eq!(expanded.compositions.len(), 1);
@@ -1225,32 +1196,22 @@ fn role_names(parsed: &ParsedFile) -> HashSet<String> {
 
 #[test]
 fn test_anonymous_module_calls_get_distinct_prefixes() {
-    let call_a = ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "github_repo".to_string(),
-                Value::Concrete(ConcreteValue::String("carina-rs/infra".into())),
-            );
-            module_arguments(args)
-        },
-    };
-    let call_b = ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "github_repo".to_string(),
-                Value::Concrete(ConcreteValue::String("carina-rs/other".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call_a = ModuleCall::test("github".to_string(), None, {
+        let mut args = HashMap::new();
+        args.insert(
+            "github_repo".to_string(),
+            Value::Concrete(ConcreteValue::String("carina-rs/infra".into())),
+        );
+        module_arguments(args)
+    });
+    let call_b = ModuleCall::test("github".to_string(), None, {
+        let mut args = HashMap::new();
+        args.insert(
+            "github_repo".to_string(),
+            Value::Concrete(ConcreteValue::String("carina-rs/other".into())),
+        );
+        module_arguments(args)
+    });
 
     let a = instance_prefix_for_call(&call_a);
     let b = instance_prefix_for_call(&call_b);
@@ -1271,11 +1232,8 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
 // distance is below the reconciliation threshold.
 #[test]
 fn test_anonymous_module_call_prefix_is_locality_sensitive() {
-    let make = |repo: &str| ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: {
+    let make = |repo: &str| {
+        ModuleCall::test("github".to_string(), None, {
             let mut args = HashMap::new();
             args.insert(
                 "github_repo".to_string(),
@@ -1296,7 +1254,7 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
                 )])),
             );
             module_arguments(args)
-        },
+        })
     };
 
     let a = instance_prefix_for_call(&make("carina-rs/infra"));
@@ -1311,12 +1269,11 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
 
 #[test]
 fn test_named_module_call_uses_binding_name() {
-    let call = ModuleCall {
-        module_name: "github".to_string(),
-        binding_name: Some("prod".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "github".to_string(),
+        Some("prod".to_string()),
+        HashMap::new(),
+    );
     assert_eq!(instance_prefix_for_call(&call), "prod");
 }
 
@@ -1386,12 +1343,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
         resolver.imported_modules.insert("m".to_string(), module);
         resolver
     };
-    let call = ModuleCall {
-        module_name: "m".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test("m".to_string(), None, HashMap::new());
     let mut resources = Vec::new();
     for instance in ["first", "second"] {
         resources.extend(
@@ -1999,12 +1951,11 @@ fn test_missing_required_argument() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(), // Missing vpc_id
-    };
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        HashMap::new(), // Missing vpc_id
+    );
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
@@ -2019,11 +1970,10 @@ fn test_expand_module_call_uses_dot_path_addressing() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: {
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
@@ -2031,7 +1981,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
             );
             module_arguments(args)
         },
-    };
+    );
 
     let expanded = resolver
         .expand_module_call(&call, "my_instance")
@@ -2056,19 +2006,14 @@ fn test_module_dot_path_bindings_and_refs() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "net".to_string(),
-        binding_name: Some("prod".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver
         .expand_module_call(&call, "prod")
@@ -2155,19 +2100,14 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "net".to_string(),
-        binding_name: Some("prod".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
 
@@ -2217,12 +2157,11 @@ fn test_module_composition_dot_path_refs() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        HashMap::new(),
+    );
 
     let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
@@ -2287,11 +2226,10 @@ fn test_unknown_argument_rejected() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: {
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
@@ -2304,7 +2242,7 @@ fn test_unknown_argument_rejected() {
             );
             module_arguments(args)
         },
-    };
+    );
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
@@ -2478,23 +2416,18 @@ fn test_expand_module_call_with_interpolation() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "vpc_mod".to_string(),
-        binding_name: Some("dev_vpc".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            args.insert(
-                "env_name".to_string(),
-                Value::Concrete(ConcreteValue::String("dev".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr_block".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        args.insert(
+            "env_name".to_string(),
+            Value::Concrete(ConcreteValue::String("dev".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver
         .expand_module_call(&call, "dev_vpc")
@@ -2683,31 +2616,26 @@ fn test_expand_module_call_with_function_call_argument() {
     };
 
     // Pass a FunctionCall as an argument value
-    let call = ModuleCall {
-        module_name: "vpc_mod".to_string(),
-        binding_name: Some("dev_vpc".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr_block".to_string(),
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: crate::builtins::BuiltinFunction::cidr_subnet,
-                    args: vec![
-                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
-                        Value::Concrete(ConcreteValue::Int(8)).into(),
-                        Value::Concrete(ConcreteValue::Int(0)).into(),
-                    ],
-                    source_line: (0).into(),
-                }),
-            );
-            args.insert(
-                "env_name".to_string(),
-                Value::Concrete(ConcreteValue::String("dev".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr_block".to_string(),
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::cidr_subnet,
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                    Value::Concrete(ConcreteValue::Int(8)).into(),
+                    Value::Concrete(ConcreteValue::Int(0)).into(),
+                ],
+                source_line: (0).into(),
+            }),
+        );
+        args.insert(
+            "env_name".to_string(),
+            Value::Concrete(ConcreteValue::String("dev".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver
         .expand_module_call(&call, "dev_vpc")
@@ -3037,16 +2965,11 @@ fn test_argument_validation_passes_with_valid_value() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+        let mut args = HashMap::new();
+        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "web").unwrap();
     assert!(
@@ -3082,15 +3005,14 @@ fn test_argument_validation_with_resource_reference_is_pending() {
             .insert("web_server".to_string(), module);
         resolver
     };
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "web_server".to_string(),
+        Some("web".to_string()),
+        module_arguments([(
             "port".to_string(),
             Value::resource_ref("producer", "port", Vec::new()),
         )]),
-    };
+    );
 
     let expanded = resolver
         .expand_module_call(&call, "web")
@@ -3194,15 +3116,14 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         resolver.imported_modules.insert("outer".to_string(), outer);
         resolver
     };
-    let call = ModuleCall {
-        module_name: "outer".to_string(),
-        binding_name: Some("root".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "outer".to_string(),
+        Some("root".to_string()),
+        module_arguments([(
             "outer_port".to_string(),
             Value::resource_ref("producer", "port", Vec::new()),
         )]),
-    };
+    );
 
     let expanded = resolver.expand_module_call(&call, "root").unwrap();
     let nested = expanded
@@ -3241,12 +3162,11 @@ fn test_argument_validation_passes_with_default_value() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: HashMap::new(), // Uses default 8080
-    };
+    let call = ModuleCall::test(
+        "web_server".to_string(),
+        Some("web".to_string()),
+        HashMap::new(), // Uses default 8080
+    );
 
     let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_ok());
@@ -3263,16 +3183,11 @@ fn test_argument_validation_fails_with_invalid_value() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+        let mut args = HashMap::new();
+        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
@@ -3308,16 +3223,11 @@ fn test_argument_validation_fails_with_negative_value() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+        let mut args = HashMap::new();
+        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
@@ -3334,19 +3244,14 @@ fn test_argument_validation_fails_too_large() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "web_server".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "port".to_string(),
-                Value::Concrete(ConcreteValue::Int(70000)),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(70000)),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
@@ -3398,16 +3303,11 @@ fn test_argument_validation_no_message_uses_default() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "counter".to_string(),
-        binding_name: Some("c".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("counter".to_string(), Some("c".to_string()), {
+        let mut args = HashMap::new();
+        args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "c");
     assert!(result.is_err());
@@ -3470,37 +3370,27 @@ fn test_argument_validation_len_with_list() {
     };
 
     // Valid: non-empty list
-    let call = ModuleCall {
-        module_name: "tagged".to_string(),
-        binding_name: Some("t".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "tags".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("env:prod".into()),
-                )])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("env:prod".into()),
+            )])),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "t").is_ok());
 
     // Invalid: empty list
-    let call = ModuleCall {
-        module_name: "tagged".to_string(),
-        binding_name: Some("t".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "tags".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call, "t");
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -3575,25 +3465,20 @@ fn test_require_block_passes() {
     };
 
     // HTTPS enabled with cert_arn provided: should pass
-    let call = ModuleCall {
-        module_name: "web".to_string(),
-        binding_name: Some("w".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "enable_https".to_string(),
-                Value::Concrete(ConcreteValue::Bool(true)),
-            );
-            args.insert(
-                "cert_arn".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    "arn:aws:acm:us-east-1:123:cert/abc".into(),
-                )),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "enable_https".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        );
+        args.insert(
+            "cert_arn".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:acm:us-east-1:123:cert/abc".into(),
+            )),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "w").is_ok());
 }
 
@@ -3655,23 +3540,18 @@ fn test_require_block_fails_with_not_expr() {
     };
 
     // HTTPS enabled but has_cert is false: should fail
-    let call = ModuleCall {
-        module_name: "web".to_string(),
-        binding_name: Some("w".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "enable_https".to_string(),
-                Value::Concrete(ConcreteValue::Bool(true)),
-            );
-            args.insert(
-                "has_cert".to_string(),
-                Value::Concrete(ConcreteValue::Bool(false)),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "enable_https".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        );
+        args.insert(
+            "has_cert".to_string(),
+            Value::Concrete(ConcreteValue::Bool(false)),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call, "w");
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -3733,40 +3613,30 @@ fn test_require_block_len_function() {
     };
 
     // Two subnets: should pass
-    let call = ModuleCall {
-        module_name: "alb".to_string(),
-        binding_name: Some("lb".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "subnet_ids".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
-                    Value::Concrete(ConcreteValue::String("subnet-b".into())),
-                ])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "subnet_ids".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                Value::Concrete(ConcreteValue::String("subnet-b".into())),
+            ])),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "lb").is_ok());
 
     // One subnet: should fail
-    let call = ModuleCall {
-        module_name: "alb".to_string(),
-        binding_name: Some("lb".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "subnet_ids".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("subnet-a".into()),
-                )])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "subnet_ids".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("subnet-a".into()),
+            )])),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call, "lb");
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -3834,43 +3704,33 @@ fn test_require_block_multiple_constraints() {
     };
 
     // min_size < max_size: should pass
-    let call = ModuleCall {
-        module_name: "asg".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "min_size".to_string(),
-                Value::Concrete(ConcreteValue::Int(1)),
-            );
-            args.insert(
-                "max_size".to_string(),
-                Value::Concrete(ConcreteValue::Int(5)),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "min_size".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        );
+        args.insert(
+            "max_size".to_string(),
+            Value::Concrete(ConcreteValue::Int(5)),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // min_size > max_size: should fail
-    let call = ModuleCall {
-        module_name: "asg".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "min_size".to_string(),
-                Value::Concrete(ConcreteValue::Int(10)),
-            );
-            args.insert(
-                "max_size".to_string(),
-                Value::Concrete(ConcreteValue::Int(5)),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "min_size".to_string(),
+            Value::Concrete(ConcreteValue::Int(10)),
+        );
+        args.insert(
+            "max_size".to_string(),
+            Value::Concrete(ConcreteValue::Int(5)),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call, "a");
     assert!(result.is_err());
     let error = result.unwrap_err();
@@ -3902,11 +3762,10 @@ fn test_argument_type_mismatch_int_for_string() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: {
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        {
             let mut args = HashMap::new();
             // vpc_id expects string, pass int
             args.insert(
@@ -3915,7 +3774,7 @@ fn test_argument_type_mismatch_int_for_string() {
             );
             module_arguments(args)
         },
-    };
+    );
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
@@ -3934,11 +3793,10 @@ fn test_argument_type_mismatch_string_for_bool() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("my_instance".to_string()),
-        source: Default::default(),
-        arguments: {
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("my_instance".to_string()),
+        {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
@@ -3951,7 +3809,7 @@ fn test_argument_type_mismatch_string_for_bool() {
             );
             module_arguments(args)
         },
-    };
+    );
 
     let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
@@ -4002,39 +3860,29 @@ fn test_argument_type_custom_validator() {
     };
 
     // Valid ARN passes
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "policy_arn".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    "arn:aws:iam::123456789012:policy/MyPolicy"
-                        .to_string()
-                        .into(),
-                )),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "policy_arn".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:iam::123456789012:policy/MyPolicy"
+                    .to_string()
+                    .into(),
+            )),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // Invalid ARN fails
-    let call_bad = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("b".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "policy_arn".to_string(),
-                Value::Concrete(ConcreteValue::String("not-an-arn".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "policy_arn".to_string(),
+            Value::Concrete(ConcreteValue::String("not-an-arn".into())),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
@@ -4083,41 +3931,31 @@ fn test_argument_type_list_of_custom_type() {
     };
 
     // Valid list of ARNs
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "policy_arns".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
-                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
-                ])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "policy_arns".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
+            ])),
+        );
+        module_arguments(args)
+    });
     assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // List with invalid ARN fails
-    let call_bad = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("b".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "policy_arns".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
-                    Value::Concrete(ConcreteValue::String("not-an-arn".into())),
-                ])),
-            );
-            module_arguments(args)
-        },
-    };
+    let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "policy_arns".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                Value::Concrete(ConcreteValue::String("not-an-arn".into())),
+            ])),
+        );
+        module_arguments(args)
+    });
     let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
@@ -5671,20 +5509,15 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "env_module".to_string(),
-        binding_name: Some("my_env".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
-            args.insert(
-                "environment".to_string(),
-                Value::Concrete(ConcreteValue::String("dpv".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
+        let mut args = HashMap::new();
+        // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
+        args.insert(
+            "environment".to_string(),
+            Value::Concrete(ConcreteValue::String("dpv".into())),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "my_env");
     assert!(
@@ -5706,19 +5539,14 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "env_module".to_string(),
-        binding_name: Some("my_env".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "environment".to_string(),
-                Value::Concrete(ConcreteValue::String("prod".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "environment".to_string(),
+            Value::Concrete(ConcreteValue::String("prod".into())),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "my_env");
     assert!(
@@ -5753,11 +5581,12 @@ arguments {
             .expect("value binding should exist")
             .clone()
     };
-    let call = |value| ModuleCall {
-        module_name: "env_module".to_string(),
-        binding_name: Some("instance".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([("environment".to_string(), value)]),
+    let call = |value| {
+        ModuleCall::test(
+            "env_module".to_string(),
+            Some("instance".to_string()),
+            module_arguments([("environment".to_string(), value)]),
+        )
     };
 
     for literal in [r"'it\'s'", r#""it's""#] {
@@ -5974,19 +5803,14 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "registry".to_string(),
-        binding_name: Some("r".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("registry".to_string(), Some("r".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver.expand_module_call(&call, "r").unwrap();
 
@@ -6081,12 +5905,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
             .insert("assignments".to_string(), module);
         resolver
     };
-    let call = ModuleCall {
-        module_name: "assignments".to_string(),
-        binding_name: None,
-        source: Default::default(),
-        arguments: HashMap::new(),
-    };
+    let call = ModuleCall::test("assignments".to_string(), None, HashMap::new());
 
     let first = resolver
         .expand_module_call(&call, "first")
@@ -6158,19 +5977,14 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "net".to_string(),
-        binding_name: Some("prod".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        );
+        module_arguments(args)
+    });
 
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
     let d = &expanded.deferred_for_expressions[0];
@@ -6563,19 +6377,14 @@ fn argument_type_list_accepts_resource_ref() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "role_arns".to_string(),
-                Value::resource_ref("admin_access_roles", "arns", Vec::new()),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "role_arns".to_string(),
+            Value::resource_ref("admin_access_roles", "arns", Vec::new()),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "a");
     assert!(
@@ -6606,19 +6415,14 @@ fn argument_type_map_accepts_resource_ref() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "tags".to_string(),
-                Value::resource_ref("some_resource", "tags", Vec::new()),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "tags".to_string(),
+            Value::resource_ref("some_resource", "tags", Vec::new()),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "a");
     assert!(
@@ -6650,19 +6454,14 @@ fn argument_type_struct_accepts_resource_ref() {
         r
     };
 
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            args.insert(
-                "options".to_string(),
-                Value::resource_ref("some_resource", "options", Vec::new()),
-            );
-            module_arguments(args)
-        },
-    };
+    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+        let mut args = HashMap::new();
+        args.insert(
+            "options".to_string(),
+            Value::resource_ref("some_resource", "options", Vec::new()),
+        );
+        module_arguments(args)
+    });
 
     let result = resolver.expand_module_call(&call, "a");
     assert!(
@@ -6690,15 +6489,14 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
             .insert("test_module".to_string(), module);
         resolver
     };
-    let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "test_module".to_string(),
+        Some("a".to_string()),
+        module_arguments([(
             "count".to_string(),
             Value::resource_ref("source", "count", Vec::new()),
         )]),
-    };
+    );
 
     let result = resolver.expand_module_call(&call, "a");
     assert!(
@@ -6828,12 +6626,11 @@ fn module_argument_type_error_with_config(
         resolver
     };
 
-    let call = ModuleCall {
-        module_name: "web_tier".to_string(),
-        binding_name: Some("web".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(arg_name.to_string(), value)]),
-    };
+    let call = ModuleCall::test(
+        "web_tier".to_string(),
+        Some("web".to_string()),
+        module_arguments([(arg_name.to_string(), value)]),
+    );
 
     let result = resolver.expand_module_call(&call, "web");
     let Err(err) = result else {
@@ -6990,17 +6787,16 @@ fn binding_ref_argument_defers_to_binding_index() {
     resolver
         .imported_modules
         .insert("inner".to_string(), module);
-    let call = ModuleCall {
-        module_name: "inner".to_string(),
-        binding_name: Some("inner_instance".to_string()),
-        source: Default::default(),
-        arguments: module_arguments([(
+    let call = ModuleCall::test(
+        "inner".to_string(),
+        Some("inner_instance".to_string()),
+        module_arguments([(
             "environment".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
                 binding: "outer_environment".to_string(),
             }),
         )]),
-    };
+    );
     // Expansion only checks concrete value shapes. BindingIndex owns the
     // declared source-to-sink relation for binding references.
     assert!(resolver.expand_module_call(&call, "inner_instance").is_ok());
@@ -7023,12 +6819,12 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
         .diagnostic_source()
         .expect("attribute source");
     assert_eq!(attribute_source.file, attributes_path);
-    assert_eq!(attribute_source.call_span.start_line, 2);
+    assert_eq!(attribute_source.span.start_line, 2);
     let export_source = parsed.export_params[0]
         .diagnostic_source()
         .expect("export source");
     assert_eq!(export_source.file, exports_path);
-    assert_eq!(export_source.call_span.start_line, 2);
+    assert_eq!(export_source.span.start_line, 2);
 }
 
 #[test]

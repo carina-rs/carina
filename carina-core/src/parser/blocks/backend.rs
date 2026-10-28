@@ -28,24 +28,12 @@ pub(in crate::parser) fn parse_backend_block(
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
             let key_span = key_pair.as_span();
-            let (start_line, start_column) = key_span.start_pos().line_col();
-            let (end_line, end_column) = key_span.end_pos().line_col();
             let key = key_pair.as_str().to_string();
             let value = parse_expression(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
             )?;
-            attribute_spans.insert(
-                key.clone(),
-                crate::parser::ModuleCallSourceSpan {
-                    start_byte: key_span.start(),
-                    end_byte: key_span.end(),
-                    start_line,
-                    start_column,
-                    end_line,
-                    end_column,
-                },
-            );
+            attribute_spans.insert(key.clone(), ctx.source_span(key_span));
             attributes.insert(key, value);
         }
     }

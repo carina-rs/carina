@@ -603,7 +603,7 @@ fn parse_with_seeded_bindings_inner(
         Vec::new()
     };
 
-    let mut ctx = ParseContext::new(config);
+    let mut ctx = ParseContext::with_preprocessed_file(config, &preprocessed_file);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);

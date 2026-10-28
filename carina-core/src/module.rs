@@ -429,7 +429,7 @@ impl RootConfigSignature {
             .map(|call| ModuleCallInfo {
                 module_name: call.module_name.clone(),
                 binding_name: call.binding_name.clone(),
-                arguments: call.arguments.keys().cloned().collect(),
+                arguments: call.arguments().map(|(name, _)| name.to_string()).collect(),
             })
             .collect();
 

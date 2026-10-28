@@ -1288,6 +1288,7 @@ pub fn find_crn_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ModuleCall;
     use crate::resource::DeferredValue;
     use std::fs;
 
@@ -2292,13 +2293,13 @@ awscc.ec2.SecurityGroup {
             .diagnostic_source()
             .expect("attribute source");
         assert_eq!(attribute_source.file, attributes_path);
-        assert_eq!(attribute_source.call_span.start_line, 2);
+        assert_eq!(attribute_source.span.start_line, 2);
         let export_file = parsed[1].1.parsed();
         let export_source = export_file.export_params[0]
             .diagnostic_source()
             .expect("export source");
         assert_eq!(export_source.file, exports_path);
-        assert_eq!(export_source.call_span.start_line, 2);
+        assert_eq!(export_source.span.start_line, 2);
     }
 
     fn duplicate_messages(dir: &Path, sources: &[(&str, &str)]) -> Vec<String> {
@@ -2443,12 +2444,11 @@ awscc.ec2.SecurityGroup {
     #[test]
     fn duplicate_extraction_covers_module_call_bindings() {
         let parsed = ParsedFile {
-            module_calls: vec![crate::parser::ModuleCall {
-                module_name: "module".to_string(),
-                binding_name: Some("shared".to_string()),
-                source: Default::default(),
-                arguments: HashMap::new(),
-            }],
+            module_calls: vec![ModuleCall::test(
+                "module".to_string(),
+                Some("shared".to_string()),
+                HashMap::new(),
+            )],
             ..ParsedFile::default()
         };
 

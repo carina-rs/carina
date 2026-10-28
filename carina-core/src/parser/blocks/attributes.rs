@@ -64,7 +64,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                     default = Some(parse_expression(expr_pair, ctx)?);
                                 }
                                 Rule::arg_validation_block => {
-                                    let source_span = parameter_source_span(&inner_attr);
+                                    let source_span = parameter_source_span(&inner_attr, ctx);
                                     let mut condition_source_span = None;
                                     let mut rule = None;
                                     let mut error_msg = None;
@@ -82,8 +82,9 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validate_expr",
                                                         "validation_condition_attr",
                                                     )?;
-                                                    condition_source_span =
-                                                        Some(parameter_source_span(&validate_pair));
+                                                    condition_source_span = Some(
+                                                        parameter_source_span(&validate_pair, ctx),
+                                                    );
                                                     rule = Some(parse_validate_expr(
                                                         validate_pair,
                                                         ctx,
@@ -179,7 +180,7 @@ pub(in crate::parser) fn parse_attributes_block(
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::attributes_param {
-            let source_span = parameter_source_span(&param);
+            let source_span = parameter_source_span(&param, ctx);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
@@ -221,7 +222,7 @@ pub(in crate::parser) fn parse_exports_block(
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::exports_param {
-            let source_span = parameter_source_span(&param);
+            let source_span = parameter_source_span(&param, ctx);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "exports block")?
                 .as_str()
@@ -246,16 +247,9 @@ pub(in crate::parser) fn parse_exports_block(
     Ok(export_params)
 }
 
-fn parameter_source_span(param: &pest::iterators::Pair<'_, Rule>) -> ModuleCallSourceSpan {
-    let span = param.as_span();
-    let (start_line, start_column) = span.start_pos().line_col();
-    let (end_line, end_column) = span.end_pos().line_col();
-    ModuleCallSourceSpan {
-        start_byte: span.start(),
-        end_byte: span.end(),
-        start_line,
-        start_column,
-        end_line,
-        end_column,
-    }
+fn parameter_source_span(
+    param: &pest::iterators::Pair<'_, Rule>,
+    ctx: &ParseContext<'_>,
+) -> ModuleCallSourceSpan {
+    ctx.source_span(param.as_span())
 }
