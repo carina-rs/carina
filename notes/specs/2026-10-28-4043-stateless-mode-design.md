@@ -1,896 +1,699 @@
-# Stateless Mode by Provider-Declared Natural Key
+# Stateless Mode Rejection Record
 
 Tracking: carina-rs/carina#4043
 
-## Problem
+## Decision
 
-Carina currently joins desired resources to remote objects through persisted
-state. `Provider::read` requires a saved, non-empty `AppliedIdentifier`; when
-there is no state row, refresh treats the resource as absent instead of asking
-the provider to discover it (`carina-core/src/provider.rs:3540-3569`,
-`carina-cli/src/wiring/mod.rs:3518-3568`,
-`carina-cli/src/wiring/mod.rs:4895-4939`).
+Do not add stateless mode under the provider-wide capability rule.
 
-That is necessary for resources such as an EC2 VPC, whose useful identifier is
-assigned by AWS. It may be unnecessary for a resource addressed by a
-provider-enforced unique key, such as GitHub organization plus variable name.
+The rule for this issue is that a provider is wholly stateful or wholly
+stateless. A stateless provider must be able to discover, observe, reconcile,
+recover, and delete every resource type it ships without persisted state. A
+provider cannot mix stateless and stateful types, and a type cannot opt in by
+itself.
 
-The viable design is not "ignore state and match names." It is a separate
-execution model in which the provider schema proves that every managed type
-can be found, compared, recovered, and mutated from resolved desired input.
+The GitHub survey does not meet that bar. Of the 88 resource types documented
+by `integrations/terraform-provider-github`, 60 have a plausible natural or
+parent-singleton address and 28 require a server-assigned ID, an unsafe content
+match, or one-shot operation semantics. Ten of the 88 have at least one
+write-only or masked managed input; that count overlaps the address classes.
+The requested survey dimensions therefore count as:
 
-This document recommends a narrow GitHub-first implementation, but not around
-the planned types: `OrganizationSecret` is write-only and
-`OrganizationVariable` would stay additive under this design. They are the
-weakest showcase for stateless planning. A useful slice requires the provider
-to grow Repository, IssueLabel, Ruleset, and BranchProtection first.
+| Survey dimension | Count |
+| --- | ---: |
+| (a) Natural-keyed or parent singleton | 60 |
+| (b) Server-ID, unsafe-content-match, or action-only | 28 |
+| (c) At least one write-only or masked managed input | 10 |
 
-A provider-wide AWS stateless mode is not worth doing. Some types have durable
-keys, but useful stacks include server-assigned IDs and both providers rely on
-saved identifiers. Types may opt in later after type-specific API proof.
+Using the mutually exclusive reconciliation buckets in this document, the
+result is:
 
-## Decisions
+| Bucket | Meaning | Count |
+| --- | --- | ---: |
+| A | Safe stateless address and readable managed state | 51 |
+| B | Natural address, but only presence detection plus explicit forced resend can manage the secret value | 8 |
+| C | No safe total stateless reconciliation contract | 29 |
 
-1. `backend none {}` produces separate stateless types, not a fake backend.
-2. Every type needs a provider-declared, schema-extracted natural key.
-3. Parent-scoped types declare a key projection that produces typed ordering
-   edges; a new repository proves scoped children absent, while branch
-   protection is deferred until its branch exists.
-4. State-backed Carina turns a previously authored attribute that is later
-   dropped into a removal; stateless Carina stops managing it, while an
-   explicit empty value clears it (see [Field ownership, refresh, and
-   whole-object APIs](#field-ownership-refresh-and-whole-object-apis)).
-5. Collections are additive by default. Typed, opt-in authoritative scopes are
-   limited initially to labels, rulesets, and branch protection.
-6. `absent` explicitly deletes one keyed subresource. Repository deletion is
-   gated off; removing a repository block only stops management.
-7. Write-only fields, exports, state operations, saved/deposed operations,
-   managed output references, and unrecoverable creates are rejected.
-8. Shared validation serves CLI and LSP and constructs distinct typestates.
+The C bucket contains common resources, not obscure edge cases: organization
+and repository webhooks, deploy keys, runner groups, repository and
+organization rulesets, custom roles, milestones, issues, classic and v2
+project objects, environment deployment policies, user keys, and one-shot
+invitation acceptance. Matching those objects by a mutable content field would
+invent uniqueness that GitHub does not promise. Requiring users to write the
+server ID into configuration permits import-like management of an existing
+object, but cannot complete create because the desired configuration does not
+know the newly assigned ID.
 
-This applies `CLAUDE.md:11-80` (root cause, newtypes, typestate) and
-`CLAUDE.md:83-135`: user-supplied attributes never become identity keys for
-scheduler, state, dependency, or diff maps.
+The current GitHub provider is only a scaffold. It plans
+`github.actions.OrganizationSecret` and `OrganizationVariable`; repository,
+team, and branch-protection resources are explicit non-goals for its initial
+release (`carina-rs/carina-provider-github:docs/design.md:6-14`,
+`carina-rs/carina-provider-github:docs/design.md:26-46`). The secret is already
+the weaker B case: its plaintext is write-only and the planned state-backed
+design stores a hash (`carina-rs/carina-provider-github:docs/design.md:65-86`).
+Growing that provider into a useful, comprehensive GitHub provider necessarily
+introduces C types.
 
-## Current Boundaries
+AWS and AWSCC remain stateful providers. This decision removes the earlier
+idea that selected AWS types could opt in one at a time. A separate provider
+could be designed around a deliberately smaller all-stateless resource set,
+but that is a different provider and does not answer whether the GitHub
+provider can manage every GitHub resource type statelessly.
 
-### Carina identity is not remote identity
+## Problem and Acceptance Bar
 
-`ResourceIdentity` is opaque; `ResourceId` combines it with provider, type, and
-resource name, while `ResolvedResourceId` types resolution
-(`carina-core/src/resource/mod.rs:203-286`, `carina-core/src/resource/mod.rs:388-570`,
-`carina-core/src/resource/mod.rs:628-731`).
+Carina currently joins a managed resource to its remote object through the
+persisted `AppliedIdentifier`. `Provider::read` requires that identifier, while
+data-source reads receive resolved input (`carina-core/src/provider.rs:3540-3614`).
+The WIT interface likewise says that a resource without saved state does not
+cross the managed `read` boundary (`carina-plugin-wit/wit/provider.wit:52-73`).
 
-`AttributeSchema::identity()` contributes only to anonymous-resource identity;
-anonymous hashes combine those fields with create-only inputs
-(`carina-core/src/schema/mod.rs:6378-6384`,
-`carina-core/src/schema/mod.rs:6548-6551`,
-`carina-core/src/identifier/mod.rs:118-171`). It promises no API lookup.
+State carries substantially more than the identifier. `StateFile` persists
+lineage, serial, resource instances, and exports
+(`carina-state/src/state/mod.rs:484-502`). Its format records authored-field
+provenance, mutually exclusive applied versus in-flight current instances,
+top-level export compatibility, and nested write-only provenance
+(`carina-state/src/state/mod.rs:741-778`). Removing state therefore needs an
+answer for identity, partial ownership, secrets, interrupted creates, exports,
+saved-plan freshness, locking, and provider-populated outputs.
 
-`UniqueNameSpec` is also replacement behavior, not discovery
-(`carina-core/src/schema/mod.rs:6686-6695`). The existing axis is documented at
-`notes/specs/2026-06-28-carina3632-identity-axis.md:5-69`.
+This issue imposes a stronger first gate: those answers must work for every
+managed type in a provider. The following conditions are required before the
+other state responsibilities matter.
 
-### Providers cannot discover managed objects today
+1. Fully resolved desired input must produce a remote address that the GitHub
+   API itself treats as unique in a stated scope, or identify a singleton
+   setting under such a parent.
+2. Lookup must distinguish found, absent, and unreadable. An authorization
+   failure must never be treated as absence.
+3. Every managed field must either be observable or have a typed, explicit
+   compromise whose plan semantics are honest.
+4. Create must be recoverable after an interrupted response. Retrying must not
+   create a second object.
+5. Update and delete must be able to recover the remote mutation identifier
+   from desired input on every run.
+6. Renaming a key must either be addressable explicitly or be rejected; it
+   must not silently create a second object and abandon the first.
 
-Managed `read` accepts `AppliedIdentifier`; data-source `read` accepts resolved
-inputs (`carina-core/src/provider.rs:3540-3614`). Managed discovery additionally
-needs not-found, canonical-key, and mutation-identifier results.
+Import support is evidence about an address, not proof of these conditions. A
+Terraform importer may list all objects and match a field, or may require the
+operator to supply a server ID that only state can remember after create.
 
-WIT and SDK have no find/list/import operation (`carina-plugin-wit/wit/provider.wit:39-73`,
-`carina-plugin-sdk/src/lib.rs:699-759`), and `ResourceSchema` has no capability
-(`carina-core/src/schema/mod.rs:6698-6773`,
-`carina-provider-protocol/src/types.rs:1100-1129`).
+### Provider-wide capability and typed enforcement
 
-### State is more than an identifier map
+If this decision is reconsidered, capability belongs to the provider schema
+set, not `ResourceSchema`. Conceptually, the SDK would expose disjoint
+constructors:
 
-`StateFile` carries lineage, serial, resources, and exports; rows also carry
-current/deposed instances, explicit-input provenance, bindings, dependencies,
-directives, prefixes, and overrides (`carina-state/src/state/mod.rs:484-502`,
-`carina-state/src/state/mod.rs:2101-2166`).
+```text
+ProviderSchemaSet::stateful(Vec<StatefulResourceSchema>)
+ProviderSchemaSet::stateless(Vec<StatelessResourceSchema>)
 
-State v5 added exports; v15 made current instance a tagged union so an applied
-identifier and in-flight create cannot coexist; v17 added top-level
-`exports_version`; and v18 added nested write-only provenance
-(`carina-state/src/state/mod.rs:741-778`). Stateless mode needs an answer for
-each responsibility, not merely no file.
+StatelessResourceSchema::new(
+    ResourceSchema,
+    NaturalKeyExtractor,
+    ObservationContract,
+    MutationRecoveryContract,
+)
+```
+
+There is no per-type `Unsupported` case and no optional stateless field on an
+ordinary resource schema. Once a provider selects the stateless constructor,
+the only element type accepted by its resource collection requires a natural
+key extractor and the observation and recovery contracts. Rust providers
+using the SDK therefore cannot build an all-stateless schema set while
+registering a plain resource schema. At the plugin trust boundary, decoding
+must validate the whole tagged schema set and reject a malformed provider at
+load time.
+
+Validation then checks the provider used by the configuration against the
+backend mode. `backend none {}` may use only stateless provider schema sets;
+an ordinary backend may use only stateful sets. The shared validation path
+must feed both CLI diagnostics and LSP diagnostics. This is one provider-level
+error, not 88 runtime warnings.
+
+This shape follows the project's root-cause and typestate rules
+(`CLAUDE.md:11-81`). It also preserves the identity rule
+(`CLAUDE.md:83-135`): scheduler, dependency, plan, diff, and state maps remain
+keyed by `ResolvedResourceId`. A `NaturalKey` would be only the typed remote
+address. It could be constructed only by the provider-owned extractor from a
+fully resolved `ProviderReadyResource`, would own normalization, and would
+have no `From<ResourceName>`, `From<Value>`, or cross-type `PartialEq`.
+Pending, unknown, empty, and arbitrary user labels therefore cannot enter an
+equality-bearing internal key. The survey rejects content matching precisely
+because it would violate this boundary.
+
+## Survey Method
+
+The baseline is every Markdown resource document in the checked-out Terraform
+GitHub provider snapshot. Each row was checked against its corresponding
+`integrations/terraform-provider-github:docs/resources/<type>.md` and, where
+present, `integrations/terraform-provider-github:github/resource_github_<type>.go`.
+The import parser and CRUD calls show whether the implementation can use a
+natural address or retains a server ID.
+
+The API cross-check used
+`github/rest-api-description:descriptions/api.github.com/api.github.com.json`.
+The table names the relevant REST path or operation ID for the important
+distinctions. Path components such as `{hook_id}`, `{key_id}`, `{ruleset_id}`,
+`{milestone_number}`, and `{runner_group_id}` are materially different from
+`{label_name}`, `{environment_name}`, or `{team_slug}`.
+
+The corpus size was obtained with:
+
+```sh
+TF_PROVIDER=${TF_PROVIDER:?set this to an integrations/terraform-provider-github checkout}
+find "$TF_PROVIDER/docs/resources" -maxdepth 1 -type f -name '*.md' -print |
+  sed 's#.*/##; s/\.md$//' |
+  sort |
+  wc -l
+# 88
+```
+
+The OpenAPI paths were inspected with commands of this form:
+
+```sh
+GITHUB_OPENAPI=${GITHUB_OPENAPI:?set this to api.github.com.json}
+jq -r '
+  .paths
+  | to_entries[]
+  | select(.key | test("hooks|keys|rulesets|milestones|runner-groups"))
+  | .key as $path
+  | .value
+  | to_entries[]
+  | select(.key == "get" or .key == "post" or .key == "put" or
+           .key == "patch" or .key == "delete")
+  | [$path, .key, .value.operationId] | @tsv
+' "$GITHUB_OPENAPI"
+```
+
+Live responses were observed on `carina-rs` on 2026-10-28 with a read-only
+token. They are supporting observations, not a claim about all authentication
+modes:
+
+- repository Actions secrets returned only `name`, `created_at`, and
+  `updated_at`;
+- organization Actions secrets and variables returned HTTP 403 with an
+  explicit permission message;
+- listing organization webhooks without `admin:org_hook` returned HTTP 404
+  `Not Found`, not 403;
+- labels, branch protection, environments, Pages, and repository ruleset
+  summaries were readable; ruleset summaries contained the numeric `id` used
+  by their API URL.
+
+### Classification
+
+`NK` means an API-enforced scoped natural key or a singleton under a resolved
+parent. `ID` means that the mutation API addresses the object only by a
+server-assigned ID and the evidence did not establish a safe desired-input
+lookup. `Action` means the Terraform resource is an operation rather than
+durable declarative state. `R` means the managed state can be read; `W` means
+at least one managed input is masked, write-only, or unavailable on later
+reads.
+
+The final column is the reconciliation verdict:
+
+- A: safe enough for an all-stateless contract, subject to ordinary typed
+  permission and rename rules;
+- B: addressable, but secret equality is unknowable, so only presence plus an
+  explicit forced resend is honest;
+- C: content matching, manual IDs, or operation semantics cannot implement a
+  total stateless managed-resource contract.
+
+## GitHub Resource Survey
+
+The 88 `TF` rows are the counted baseline. `REST` rows are additional durable
+configuration families that are absent from that Terraform list but obvious
+from create/update/delete or singleton-setting endpoints in the OpenAPI
+snapshot. A REST row may represent multiple scopes when the identity and
+failure mode are identical. Transient workflow runs, artifacts, checks,
+deployments, comments, notifications, generated tokens, and audit records are
+outside the provider-resource boundary; including those one-shot APIs would
+only add more C cases.
+
+| Area | Type | API address | Readability | Rename or key change | Stateless treatment | Bucket | Source |
+| --- | --- | --- | --- | --- | --- | :---: | :---: |
+| Repository | `repository` | NK owner + repository | R | GitHub redirects an old repository name, but desired new name does not reveal the old name | Direct live lookup; rename needs an explicit old-key alias, otherwise new plus unmanaged old | A | TF |
+| Repository | `repository_collaborator` | NK owner + repository + login | R | Login or repository key change is a different association | Direct membership lookup; explicit old association removal | A | TF |
+| Repository | `repository_collaborators` | Singleton owner + repository | R | Parent rename changes the address | Read and reconcile the complete set only when explicitly authoritative | A | TF |
+| Repository | `repository_custom_property` | NK organization + repository + property name | R | Property rename changes the key | Direct scoped lookup; parent property must already resolve | A | TF |
+| Repository | `repository_dependabot_security_updates` | Singleton owner + repository | R | None | Read enablement from the parent endpoint | A | TF |
+| Repository | `repository_pages` | Singleton owner + repository | R | None | Parent-keyed settings; absence is the missing Pages site | A | TF |
+| Repository | `repository_topics` | Singleton owner + repository | R | None | Read and replace the explicit topic set | A | TF |
+| Repository | `repository_vulnerability_alerts` | Singleton owner + repository | R | None | Parent-keyed boolean capability | A | TF |
+| Repository | `repository_autolink_reference` | ID owner + repository + autolink_id | R | Prefix is immutable in REST | Listing and matching `key_prefix` is possible, but the API does not promise uniqueness; unsafe content match | C | TF |
+| Repository | `repository_file` | NK owner + repository + branch + path | R, but commit metadata is operation history | Path or branch change abandons the old path | File content can be compared, but commit author, email, and message are write instructions, not durable fields; not a total resource contract | C | TF |
+| Repository | REST-only `RepositoryImmutableReleasesSettings` | Singleton owner + repository | R | None | Direct `repos/enable-immutable-releases` and disable operation | A | REST |
+| Repository | REST-only `RepositoryCodeScanningDefaultSetup` | Singleton owner + repository | R | None | Direct `code-scanning/update-default-setup` | A | REST |
+| Repository | REST-only `RepositoryPrivateVulnerabilityReporting` | Singleton owner + repository | R | None | Direct enable/disable endpoint | A | REST |
+| Repository | REST-only `RepositoryInteractionLimits` | Singleton owner + repository | R | None | Direct set/remove endpoint | A | REST |
+| Branches and rules | `branch` | NK owner + repository + branch | R | Rename requires the old branch name | Direct ref lookup; a rename needs explicit old and new keys | A | TF |
+| Branches and rules | `branch_default` | Singleton owner + repository | R | May invoke a branch rename, which still needs the old name | Parent-keyed default setting | A | TF |
+| Branches and rules | `branch_protection` | NK repository + pattern through importer/list lookup | R | Pattern change changes the key | Resolve the rule by repository and pattern; preserve whole-object fields | A | TF |
+| Branches and rules | `branch_protection_v3` | NK owner + repository + branch | R | Branch rename changes the key | Direct `/branches/{branch}/protection` lookup | A | TF |
+| Branches and rules | `organization_ruleset` | ID organization + ruleset_id | R | Name is mutable under the retained ID | OpenAPI mutations use `{ruleset_id}`; matching name is a gh-infra convention, not an official REST uniqueness statement | C | TF |
+| Branches and rules | `repository_ruleset` | ID owner + repository + ruleset_id | R | Name is mutable under the retained ID | Same ID-only problem; list-by-name is unsafe without a tested provider guarantee | C | TF |
+| Actions | `actions_environment_secret` | NK owner + repository + environment + secret name | W plaintext/encrypted value | Rename is delete/create | Presence-only; explicit force resends all selected values | B | TF |
+| Actions | `actions_environment_variable` | NK owner + repository + environment + variable name | R | Name change changes the key | Direct scoped lookup; explicit old-key removal | A | TF |
+| Actions | `actions_hosted_runner` | ID hosted_runner_id | R | Display settings remain under ID | No provider-enforced desired key; manual ID cannot recover create | C | TF |
+| Actions | `actions_organization_oidc_subject_claim_customization_template` | Singleton organization | R | None | Direct parent setting | A | TF |
+| Actions | `actions_organization_permissions` | Singleton organization | R | None | Direct parent setting plus paged selected repositories | A | TF |
+| Actions | `actions_organization_secret` | NK organization + secret name | W plaintext/encrypted value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Actions | `actions_organization_secret_repositories` | Singleton organization + secret name | R | Secret rename changes the parent key | Read/set selected repository IDs after resolving repositories | A | TF |
+| Actions | `actions_organization_secret_repository` | NK organization + secret name + repository ID | R | Parent key change changes association | Resolve repository ID at run time; direct association lookup | A | TF |
+| Actions | `actions_organization_variable` | NK organization + variable name | R | Name change changes the key | Direct scoped lookup | A | TF |
+| Actions | `actions_organization_variable_repositories` | Singleton organization + variable name | R | Variable rename changes parent key | Read/set selected repositories | A | TF |
+| Actions | `actions_organization_variable_repository` | NK organization + variable name + repository ID | R | Parent key change changes association | Resolve repository ID at run time | A | TF |
+| Actions | `actions_organization_workflow_permissions` | Singleton organization | R | None | Direct parent setting | A | TF |
+| Actions | `actions_repository_access_level` | Singleton owner + repository | R | None | Direct parent setting | A | TF |
+| Actions | `actions_repository_oidc_subject_claim_customization_template` | Singleton owner + repository | R | None | Direct parent setting | A | TF |
+| Actions | `actions_repository_permissions` | Singleton owner + repository | R | None | Direct parent setting | A | TF |
+| Actions | `actions_runner_group` | ID organization + runner_group_id | R | Name is mutable under ID | Name matching is not documented unique; selected runners and repositories also use IDs | C | TF |
+| Actions | `actions_secret` | NK owner + repository + secret name | W plaintext/encrypted value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Actions | `actions_variable` | NK owner + repository + variable name | R | Name change changes key | Direct scoped lookup | A | TF |
+| Actions | `workflow_repository_permissions` | Singleton owner + repository | R | None | Direct parent setting | A | TF |
+| Actions | REST-only `OrganizationActionsPolicy` | ID organization + policy_id | R | Name/settings remain under ID | `actions/create-org-actions-policy` returns an ID; no natural-key endpoint | C | REST |
+| Actions | REST-only `RepositoryActionsPolicy` | ID owner + repository + policy_id | R | Name/settings remain under ID | `actions/create-repo-actions-policy` returns an ID | C | REST |
+| Actions | REST-only `ActionsCacheLimits` | Singleton enterprise, organization, or repository | R | None | Direct retention/storage-limit setting endpoints | A | REST |
+| Actions | REST-only `ActionsArtifactLogRetention` | Singleton organization or repository | R | None | Direct artifact-and-log-retention setting endpoints | A | REST |
+| Actions | REST-only `AgentsSecret` | NK organization or repository + secret name | W secret value | Rename is delete/create | Same presence-only and force-resend compromise as Actions secrets | B | REST |
+| Actions | REST-only `AgentsVariable` | NK organization or repository + variable name | R | Name change changes key | Direct scoped lookup | A | REST |
+| Actions | REST-only `SelfHostedRunnerLabels` | ID organization or repository + runner_id | R | Label names are set members; runner identity remains numeric | Cannot create or rediscover the runner from declared labels | C | REST |
+| Dependabot and Codespaces | `codespaces_organization_secret` | NK organization + secret name | W secret value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Dependabot and Codespaces | `codespaces_organization_secret_repositories` | Singleton organization + secret name | R | Secret rename changes parent key | Read/set selected repository list | A | TF |
+| Dependabot and Codespaces | `codespaces_secret` | NK owner + repository + secret name | W secret value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Dependabot and Codespaces | `codespaces_user_secret` | NK authenticated user + secret name | W secret value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Dependabot and Codespaces | `dependabot_organization_secret` | NK organization + secret name | W secret value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Dependabot and Codespaces | `dependabot_organization_secret_repositories` | Singleton organization + secret name | R | Secret rename changes parent key | Read/set selected repositories | A | TF |
+| Dependabot and Codespaces | `dependabot_organization_secret_repository` | NK organization + secret name + repository ID | R | Parent key change changes association | Resolve repository ID at run time | A | TF |
+| Dependabot and Codespaces | `dependabot_secret` | NK owner + repository + secret name | W secret value | Rename is delete/create | Presence-only plus explicit forced resend | B | TF |
+| Dependabot and Codespaces | REST-only `OrganizationCodespacesAccess` | Singleton organization | R | None | Direct `codespaces/set-codespaces-access` setting | A | REST |
+| Dependabot and Codespaces | REST-only `DependabotRepositoryAccess` | Singleton enterprise or organization | R | None | Direct repository-access setting | A | REST |
+| Environments | `repository_deployment_branch_policy` | ID owner + repository + environment + branch_policy_id | R | Pattern can change under ID | Pattern/type uniqueness is not promised; content matching is ambiguous | C | TF |
+| Environments | `repository_environment` | NK owner + repository + environment name | R | No rename endpoint; name change means new environment | Direct environment-name path; explicit old-key delete | A | TF |
+| Environments | `repository_environment_deployment_policy` | ID owner + repository + environment + policy_id | R | Pattern can change under ID | Same ID-only policy problem | C | TF |
+| Environments | REST-only `RepositoryDeploymentProtectionRule` | ID owner + repository + environment + protection_rule_id | R | App/rule remains under ID | Create/delete endpoints use assigned ID | C | REST |
+| Organization settings and roles | `organization_block` | NK organization + username | R | Login change changes association | Direct blocked-user membership endpoint | A | TF |
+| Organization settings and roles | `organization_custom_properties` | NK organization + property name | R | Property rename changes key | Direct property-name path | A | TF |
+| Organization settings and roles | `organization_custom_role` | ID organization + role_id | R | Name is mutable under ID | Deprecated and ID-only; name matching is not guaranteed unique | C | TF |
+| Organization settings and roles | `organization_repository_role` | ID organization + role_id | R | Name is mutable under ID | Custom repository-role CRUD uses the assigned ID | C | TF |
+| Organization settings and roles | `organization_role` | ID organization + role_id | R | Name is mutable under ID | Organization-role lookup uses role ID | C | TF |
+| Organization settings and roles | `organization_role_team` | ID role_id + team slug | R | Team slug or role changes association | Association has a tuple, but its role parent has no natural key | C | TF |
+| Organization settings and roles | `organization_role_team_assignment` | ID team slug + role_id | R | Same | Deprecated form of the same ID-parent association | C | TF |
+| Organization settings and roles | `organization_role_user` | ID role_id + login | R | Login or role change changes association | Role parent remains ID-only | C | TF |
+| Organization settings and roles | `organization_settings` | Singleton organization | R | Organization login rename changes parent key | Direct parent settings | A | TF |
+| Organization settings and roles | REST-only `CodeSecurityConfiguration` | ID enterprise or organization + configuration_id | R | Name is mutable under ID | Create/update/delete use the assigned configuration ID | C | REST |
+| Organization settings and roles | REST-only `OrganizationIssueField` | ID organization + issue_field_id | R | Name is mutable under ID | `orgs/create-issue-field` returns an ID | C | REST |
+| Organization settings and roles | REST-only `OrganizationIssueType` | ID organization + issue_type_id | R | Name is mutable under ID | `orgs/create-issue-type` returns an ID | C | REST |
+| Organization settings and roles | REST-only `OrganizationPrivateRegistry` | NK organization + secret_name | W credentials | Rename is delete/create | Addressable, but credentials require presence-only plus forced resend | B | REST |
+| Organization settings and roles | REST-only `SecretScanningCustomPattern` | ID organization or repository + pattern_id | R | Name/pattern can change under ID | Bulk create then update by assigned pattern ID | C | REST |
+| Organization settings and roles | REST-only `OrganizationImmutableReleasesSettings` | Singleton organization | R | None | Direct organization setting and selected-repository set | A | REST |
+| Organization settings and roles | REST-only `HostedComputeNetworkConfiguration` | ID organization + network_configuration_id | R | Name/settings remain under ID | Create returns assigned ID | C | REST |
+| Organization settings and roles | REST-only `CopilotCodingAgentPermissions` | Singleton enterprise or organization | R | None | Direct policy and selected-repository settings | A | REST |
+| Organization settings and roles | REST-only `OrganizationInteractionLimits` | Singleton organization | R | None | Direct set/remove endpoint | A | REST |
+| Organization settings and roles | REST-only `OrganizationSecurityProductEnablement` | Singleton organization + security product | R | Product is enum-like | Direct enable/disable endpoint | A | REST |
+| Teams and membership | `emu_group_mapping` | NK enterprise group ID + team slug | R | Team rename changes slug | Resolve mapping from the declared external group and team | A | TF |
+| Teams and membership | `membership` | NK organization + username | R | Login change changes association | Direct membership endpoint | A | TF |
+| Teams and membership | `organization_security_manager` | NK organization + team slug | R | Team rename changes slug | REST endpoint is `/security-managers/teams/{team_slug}` even though TF stores team ID | A | TF |
+| Teams and membership | `team` | NK organization + team slug | R | Name change derives a new slug | Direct lookup by slug; rename needs an explicit old slug or is new plus unmanaged old | A | TF |
+| Teams and membership | `team_members` | Singleton organization + team slug | R | Team rename changes parent key | Explicit authoritative member set | A | TF |
+| Teams and membership | `team_membership` | NK organization + team slug + username | R | Team or login rename changes association | Direct membership endpoint | A | TF |
+| Teams and membership | `team_repository` | NK organization + team slug + owner + repository | R | Parent key change changes association | Direct repository association | A | TF |
+| Teams and membership | `team_settings` | Singleton organization + team slug | R | Team rename changes parent key | Resolve slug to GraphQL node ID per run | A | TF |
+| Teams and membership | `team_sync_group_mapping` | Singleton organization + team slug | R | Team rename changes parent key | Read/set the team's IdP group mapping | A | TF |
+| Webhooks, keys, and apps | `app_installation_repositories` | Singleton installation_id | R | Installation is an externally assigned parent ID | Manage the complete repository selection for an explicitly supplied installation | A | TF |
+| Webhooks, keys, and apps | `app_installation_repository` | NK installation_id + repository | R | Repository key change changes association | Direct installation association | A | TF |
+| Webhooks, keys, and apps | `organization_webhook` | ID organization + hook_id | W configuration secret | URL and secret rotate under retained ID | URL has no organization-level uniqueness contract and duplicate matches are ambiguous; secret equality is also unknowable | C | TF |
+| Webhooks, keys, and apps | `repository_deploy_key` | ID owner + repository + key_id | R | Keys have no update endpoint; rotation is replacement | Match by key material only if uniqueness and canonicalization are proven; OpenAPI does not provide that guarantee | C | TF |
+| Webhooks, keys, and apps | `repository_webhook` | ID owner + repository + hook_id | W configuration secret | URL and secret rotate under retained ID | `repos/create-webhook` explicitly allows hooks to share a config when events do not overlap; the secret is also masked | C | TF |
+| Webhooks, keys, and apps | REST-only `AppWebhookConfig` | Singleton authenticated app | W configuration secret | URL or secret changes in place | Presence of app config is addressable; secret needs explicit forced resend | B | REST |
+| Projects, issues, and releases | `issue` | ID owner + repository + issue number | R | Title is mutable and non-unique | Content/operational object rather than infrastructure setting; title/body matching can select the wrong assigned number | C | TF |
+| Projects, issues, and releases | `issue_label` | NK owner + repository + label name | R | Case-only change is a display-name update under a folded key | Direct label-name endpoint; provider needs tested case normalization | A | TF |
+| Projects, issues, and releases | `issue_labels` | Singleton owner + repository | R | Label key changes are explicit set changes | Authoritative collection only when explicitly selected | A | TF |
+| Projects, issues, and releases | `organization_project` | ID project ID; classic API retired | R when API existed | Title was mutable | Resource no longer works against the retired classic Projects API | C | TF |
+| Projects, issues, and releases | `project_card` | ID card or node ID; classic API retired | R when API existed | Content/location mutable under ID | Retired and ID-only | C | TF |
+| Projects, issues, and releases | `project_column` | ID column ID; classic API retired | R when API existed | Name mutable under ID | Retired and ID-only | C | TF |
+| Projects, issues, and releases | `release` | NK owner + repository + tag through `repos/get-release-by-tag` | R | `tag_name` can change under retained release ID | Find by tag, then use ephemeral release ID; key rename needs explicit old tag | A | TF |
+| Projects, issues, and releases | `repository_milestone` | ID owner + repository + milestone number | R | Title is mutable and non-unique | Assigned number is required; title matching is unsafe | C | TF |
+| Projects, issues, and releases | `repository_project` | ID project ID; classic API retired | R when API existed | Title was mutable | Retired and ID-only | C | TF |
+| Projects, issues, and releases | `repository_pull_request` | ID owner + repository + pull number | R | Branches/title can change; multiple historical PRs exist | Base/head/title is not a durable unique key; this is an operational object | C | TF |
+| Projects, issues, and releases | REST-only `ProjectsV2FieldItemView` | ID project number plus field, item, or view ID | R | Names/content mutable under IDs | Create operations return assigned IDs; content matching is ambiguous | C | REST |
+| Projects, issues, and releases | REST-only `ReleaseAsset` | ID owner + repository + asset_id | R | Name is mutable under ID | Upload returns assigned ID; duplicate-name/error behavior is not a natural lookup contract | C | REST |
+| Enterprise | `enterprise_actions_permissions` | Singleton enterprise slug | R | None | Direct parent setting | A | TF |
+| Enterprise | `enterprise_actions_runner_group` | ID enterprise + runner_group_id | R | Name is mutable under ID | No documented unique lookup by desired fields | C | TF |
+| Enterprise | `enterprise_actions_workflow_permissions` | Singleton enterprise slug | R | None | Direct parent setting | A | TF |
+| Enterprise | `enterprise_ip_allow_list_entry` | ID GraphQL node ID | R | CIDR/name can change under ID | CIDR uniqueness is not promised; content matching can be ambiguous | C | TF |
+| Enterprise | `enterprise_organization` | NK enterprise slug + organization login | R | Organization rename changes key | Import already resolves slug to ephemeral node ID | A | TF |
+| Enterprise | `enterprise_security_analysis_settings` | Singleton enterprise slug | R | None | Direct parent setting | A | TF |
+| Enterprise | REST-only `EnterpriseCodeSecurityConfiguration` | ID enterprise + configuration_id | R | Name mutable under ID | Create/update/delete use assigned ID | C | REST |
+| Enterprise | REST-only `EnterpriseCopilotCodingAgentPolicy` | Singleton enterprise | R | None | Direct policy endpoint | A | REST |
+| User | `user_gpg_key` | ID gpg_key_id | R public key, but exact armored serialization is not stable identity | Key cannot be updated | Fingerprint matching would need a documented canonical-key guarantee; the TF importer is intentionally absent | C | TF |
+| User | `user_invitation_accepter` | Action invitation_id | R for pending invitation only | Accepted invitation disappears and later reads may be 404 | One-shot command with a random/provider ID, not convergent managed state | C | TF |
+| User | `user_ssh_key` | ID key_id | R | Title changes under ID; key rotation is replacement | Title is non-unique; public-key content matching and duplicate rejection are not a documented identity contract | C | TF |
+| User | REST-only `UserSshSigningKey` | ID ssh_signing_key_id | R | Title/key replacement remains under ID | Same unsafe content-match problem as SSH authentication keys | C | REST |
+| User | REST-only `UserEmail` | NK authenticated user + email | R | Email address change is remove/add | List membership gives a direct value key | A | REST |
+| User | REST-only `UserSocialAccount` | NK authenticated user + URL | R | URL change is remove/add | List membership gives a direct value key | A | REST |
+
+### Reproducible counts
+
+The following command checks that every TF document appears exactly once in
+the table, then derives both the address/readability counts and the mutually
+exclusive reconciliation buckets from the table itself:
+
+```sh
+TF_PROVIDER=${TF_PROVIDER:?set this to an integrations/terraform-provider-github checkout}
+python3 - "$TF_PROVIDER" notes/specs/2026-10-28-4043-stateless-mode-design.md <<'PY'
+import collections
+import pathlib
+import re
+import sys
+
+provider = pathlib.Path(sys.argv[1])
+document = pathlib.Path(sys.argv[2]).read_text()
+rows = []
+rest_rows = []
+for line in document.splitlines():
+    if not line.startswith("|"):
+        continue
+    columns = [column.strip() for column in line.strip().strip("|").split("|")]
+    if len(columns) != 8:
+        continue
+    if columns[7] == "REST":
+        rest_rows.append((columns[2], columns[3], columns[6]))
+        continue
+    if columns[7] != "TF":
+        continue
+    match = re.fullmatch(r"`([a-z0-9_]+)`", columns[1])
+    if match:
+        rows.append((match.group(1), columns[2], columns[3], columns[6]))
+
+documented = {path.stem for path in (provider / "docs/resources").glob("*.md")}
+surveyed = {name for name, _, _, _ in rows}
+assert len(rows) == len(surveyed) == 88
+assert surveyed == documented, (sorted(documented - surveyed), sorted(surveyed - documented))
+
+address = collections.Counter(
+    "natural_or_singleton" if value.startswith(("NK ", "Singleton ")) else "id_or_action"
+    for _, value, _, _ in rows
+)
+masked = sum(readability.startswith("W ") for _, _, readability, _ in rows)
+buckets = collections.Counter(bucket for _, _, _, bucket in rows)
+print(address)
+print("write_only_or_masked", masked)
+print(buckets)
+print("rest_candidate_families", len(rest_rows))
+print(collections.Counter(bucket for _, _, bucket in rest_rows))
+PY
+```
+
+Output:
+
+```text
+Counter({'natural_or_singleton': 60, 'id_or_action': 28})
+write_only_or_masked 10
+Counter({'A': 51, 'C': 29, 'B': 8})
+rest_candidate_families 32
+Counter({'A': 16, 'C': 13, 'B': 3})
+```
+
+The REST-only rows are not folded into the exact 88-type numbers because
+several rows are families spanning multiple scopes and Carina resource
+granularity has not been designed. As table families they add 16 A, three B,
+and 13 C rows; none can remove a C blocker from the 88-type baseline.
+
+## Why the C Types Block a Provider-Wide Capability
+
+### Server IDs cannot be reconstructed safely
+
+The Terraform implementation confirms that these are not merely cosmetic
+state IDs.
+
+- Repository webhooks save the ID returned by create and use it for every
+  later read, update, and delete
+  (`integrations/terraform-provider-github:github/resource_github_repository_webhook.go:106-184`,
+  `integrations/terraform-provider-github:github/resource_github_repository_webhook.go:191-225`).
+  Organization webhooks do the same
+  (`integrations/terraform-provider-github:github/resource_github_organization_webhook.go:86-180`,
+  `integrations/terraform-provider-github:github/resource_github_organization_webhook.go:183-228`).
+  The OpenAPI paths are `/repos/{owner}/{repo}/hooks/{hook_id}` and
+  `/orgs/{org}/hooks/{hook_id}`. The only obvious content candidate is
+  `config.url`, but OpenAPI `repos/create-webhook` explicitly permits multiple
+  repository hooks to share the same config when their events do not overlap;
+  organization-hook URL uniqueness is not promised either. Two hooks with the
+  same URL make update and delete ambiguous.
+- Deploy-key create returns an ID, and get/delete require that ID
+  (`integrations/terraform-provider-github:github/resource_github_repository_deploy_key.go:68-159`;
+  OpenAPI `repos/create-deploy-key` and
+  `/repos/{owner}/{repo}/keys/{key_id}`). GitHub may reject a duplicate key in
+  practice, but that behavior is not stated in the checked OpenAPI description
+  and was not acceptance-tested here. Matching normalized key material would
+  therefore be an assumption. There is no update endpoint, so rotation also
+  needs a correctly identified delete.
+- Runner groups retain the returned numeric ID
+  (`integrations/terraform-provider-github:github/resource_github_actions_runner_group.go:140-227`;
+  OpenAPI `/orgs/{org}/actions/runner-groups/{runner_group_id}`). Name is
+  readable and mutable, but the API description does not declare it a unique
+  lookup key.
+- Repository and organization ruleset create/read/update retain
+  `ruleset_id`
+  (`integrations/terraform-provider-github:github/resource_github_repository_ruleset.go:711-871`,
+  `integrations/terraform-provider-github:github/resource_github_organization_ruleset.go:771-918`;
+  OpenAPI `/repos/{owner}/{repo}/rulesets/{ruleset_id}` and
+  `/orgs/{org}/rulesets/{ruleset_id}`). gh-infra documents names as unique
+  within a repository, but the checked REST description only documents the
+  ID-addressed operation. Treating name as provider-enforced identity needs an
+  acceptance test and an upstream guarantee; third-party behavior alone is
+  not enough for Carina's provider-wide type contract.
+- Custom repository roles keep `role_id` across get, update, and delete
+  (`integrations/terraform-provider-github:github/resource_github_organization_repository_role.go:95-219`).
+  Organization roles and their team/user associations inherit the same
+  problem.
+- Milestones are read, updated, and deleted by their assigned number even
+  though title is mutable
+  (`integrations/terraform-provider-github:github/resource_github_repository_milestone.go:128-245`;
+  OpenAPI `/repos/{owner}/{repo}/milestones/{milestone_number}`). Issue titles
+  and milestone titles are not unique. Issues likewise store the assigned
+  issue number (`integrations/terraform-provider-github:github/resource_github_issue.go:144-171`).
+
+An explicit ID attribute does not solve create. Before create it is absent;
+after a successful remote create whose response is lost, retry still has no
+way to distinguish the created object from another matching object. A
+user-supplied ID mode can manage an already existing object, but it is an
+import handle, not an all-lifecycle stateless resource.
+
+### Content matching has concrete failure modes
+
+| Proposed fallback | Failure |
+| --- | --- |
+| Webhook by `config.url` | `repos/create-webhook` allows shared config for non-overlapping events; duplicate URLs can select more than one hook. URL change also looks like delete plus create. |
+| Deploy or user key by public key | Duplicate rejection and canonicalization were not verified. A changed key is replacement, and the old key must still be identified for deletion. |
+| Ruleset, runner group, custom role, or policy by name | Mutations use assigned IDs; names are mutable, and official uniqueness was not established for the surveyed endpoints. |
+| Milestone or issue by title | Titles are explicitly mutable and may be duplicated. |
+| Autolink by prefix or deployment policy by pattern | Import/list matching exists, but the REST description does not promise uniqueness. |
+| IP allow-list entry by CIDR | The GraphQL resource uses a node ID; duplicate/overlapping CIDR policy is not an identity guarantee. |
+| Project, column, card, field, item, or view by display text | Display text is mutable and non-unique; classic Projects endpoints are also retired. |
+
+These are the exact failure modes prohibited by `CLAUDE.md:83-135`: a mutable
+user field would occupy an equality-bearing remote-identity position. Wrapping
+it in a newtype does not create a provider uniqueness guarantee.
+
+### Write-only values are not drift-detectable
+
+The Actions secret API returns metadata, not the value. The Terraform provider
+writes `plaintext_value` or encrypted input but later reads only timestamps
+(`integrations/terraform-provider-github:github/resource_github_actions_secret.go:161-250`).
+Its Codespaces secret implementation explicitly compares the remote
+`updated_at` with a timestamp persisted in state and forces recreation when
+they differ (`integrations/terraform-provider-github:github/resource_github_codespaces_secret.go:110-165`).
+
+Without state, `updated_at` cannot replace the value hash. It can say that
+someone wrote the secret at a time, but not whether the current plaintext
+equals the desired plaintext, who wrote it, or whether a retry already sent
+the desired value. The honest stateless contract is B: detect missing only;
+show no value diff for an existing secret; and expose an explicit force action
+that resends selected secrets. This is the same compromise gh-infra documents
+in its [secrets and variables page](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/secrets-variables.md).
+
+Webhook configuration adds the same problem to a C type. GitHub returns the
+secret masked; the Terraform provider deliberately copies the previous state
+value over the masked response
+(`integrations/terraform-provider-github:github/resource_github_repository_webhook.go:119-126`,
+`integrations/terraform-provider-github:github/resource_github_repository_webhook.go:172-184`).
+Stateless matching by URL would therefore combine ambiguous identity with an
+undetectable secret rotation.
+
+The GPG-key resource is another C case. It creates and subsequently reads by
+the server ID, while the Terraform read restores only the derived key ID
+(`integrations/terraform-provider-github:github/resource_github_user_gpg_key.go:43-103`).
+Its Terraform documentation says import is unavailable because the API does
+not return the previously uploaded key
+(`integrations/terraform-provider-github:docs/resources/user_gpg_key.md:34-36`).
+The newer checked OpenAPI schema for
+`users/get-gpg-key-for-authenticated-user` does declare `public_key` and
+nullable `raw_key`, so this survey does not count the type as masked. That
+could support semantic value comparison after parsing, but it does not turn
+the assigned `{gpg_key_id}` into a provider-enforced desired-input key.
+
+### Absence and unreadable can be indistinguishable
+
+A stateless plan must decide whether to create when lookup says the object is
+missing. That decision is unsafe if lack of permission has the same response.
+The live observation on `carina-rs` is direct evidence: listing organization
+webhooks without `admin:org_hook` returned HTTP 404 with the ordinary `Not
+Found` body. By contrast, organization Actions secret and variable listing
+returned explicit HTTP 403 permission errors.
+
+The provider cannot globally interpret 404 as absent or globally interpret it
+as forbidden. Per-operation permission knowledge can fail closed, but for the
+organization webhook endpoint the response alone contains no proof of
+absence. gh-infra's correct rule is to leave unreadable settings out of the
+plan rather than compare them as absent, documented in its
+[principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md).
+That safety rule means the type cannot promise discovery for all valid GitHub
+authentication configurations.
+
+### Natural keys still do not infer renames
+
+GitHub documents the `owner` and `repo` REST parameters as case-insensitive in
+the OpenAPI parameter descriptions for `repos/get` and the label endpoints.
+The label-name parameter itself has no such statement. gh-infra documents and
+tests case-insensitive label matching: `Bug` against remote `bug` is an update
+of the display name, and duplicate manifest labels differing only by case are
+rejected ([labels](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md)).
+Carina would need an acceptance test before making that a provider contract.
+
+Other key changes have no such same-key interpretation. A repository rename
+may leave an old-name redirect, but desired input contains only the new name;
+it does not tell lookup which old name to try. A team name change derives a
+new slug. Environment, branch, variable, and secret names likewise change the
+address. Stateless semantics can safely treat those as a new object while
+leaving the old object unmanaged, or require an explicit old-key alias. They
+cannot infer rename from the new desired key.
 
 ## Prior Art: gh-infra
 
-[gh-infra's state-management design](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)
-is working prior art for stateless GitHub IaC. GitHub is its source of truth;
-every plan fetches live API state and diffs it against YAML. It has no state
-file or lock, and a repository removed from YAML is no longer managed rather
-than deleted (documented as "Deleted resources: Not detected").
+gh-infra demonstrates that a deliberately scoped GitHub tool can be useful
+without a state file. GitHub is its source of truth; each plan fetches live
+state and diffs it against YAML. It has no lock, documents last-write-wins,
+recommends CI concurrency groups or a merge queue, and cannot detect a
+repository removed from YAML
+([state management](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)).
 
-Its [design principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)
-make partial ownership central: an omitted field is neither compared nor sent,
-while an explicit empty value such as `topics: []` clears it. Collections are
-additive by default. `reconcile: authoritative` is opt-in, only applies to
-labels, rulesets, and branch protection, and only runs when that collection is
-present in the manifest. Secrets, variables, and milestones stay additive.
+Its ownership model is deliberately partial. Omitted fields are not compared
+or sent; explicit empty values clear fields. Collections are additive by
+default. Authoritative deletion is opt-in only for labels, rulesets, and
+branch protection, and only when that collection appears. Whole-object APIs
+are handled by reading current state, overlaying declared fields, and
+preserving settings that gh-infra does not model. Unreadable settings are
+excluded from the plan, and apply compares the returned object with what it
+sent
+([principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)).
 
-| Concern | gh-infra behavior | Consequence for Carina |
+gh-infra also makes the compromises visible:
+
+| Concern | gh-infra behavior | Relevance here |
 | --- | --- | --- |
-| Identity | Repository full name ([state management](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)); label names case-folded by gh-infra ([labels](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md)); ruleset name unique within its repository ([rulesets](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md)) | Confirms provider lookup may resolve a natural key to an ephemeral numeric ID |
-| Related IDs | Team/app slugs are resolved through the API at run time ([rulesets](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md)) | `Found` may return a run-local `AppliedIdentifier`; persistence is unnecessary when lookup is repeatable |
-| Whole-object APIs | GitHub replaces a whole ruleset, so gh-infra reads current and overlays declared fields ([rulesets](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md)); the same partial-ownership rule preserves unmodeled settings ([principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)) | Stateless mutation needs a typed field mask and an authorized whole-object overlay model |
-| Unreadable settings | Report the repository and leave it out of the plan; never compare unreadable as absent ([principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)) | Observation must type unreadable separately from missing |
-| Apply verification | Compare GitHub's returned object with what was sent; silently dropped settings fail ([principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)) | Carina must verify the managed projection after mutation |
-| Secrets | Detect only missing secrets; changed plaintext has no diff; `--force-secrets` resends all ([secrets and variables](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/secrets-variables.md)) | Carina v1 deliberately rejects them; a future always-reassert type may opt in |
-| Concurrency | No lock; last-write-wins, with CI concurrency groups or a merge queue ([state management](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)) | Carina may use the same model, but declares it in capability types and plan output |
-| Unsolved | Removed repositories are not detected and there are no exports ([state management](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)); label aliases are future work ([labels](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md)) | These remain explicitly unsupported in Carina stateless mode |
-
-Carina should copy the live-read, partial-field, additive-default, and
-post-apply-verification semantics. It should deliberately differ in how the
-contract is enforced: gh-infra documents resource-specific behavior, whereas
-Carina must reject unsupported types and features through provider schema
-capabilities, `ManagedFieldMask`, and stateless typestates.
-
-## 1. Identity Without State
-
-### Eligibility
-
-A type is eligible only when its provider declares a uniqueness scope, total
-extractor from resolved desired input, deterministic component normalization,
-direct or list-backed lookup with distinct not-found, usable mutation
-semantics, and interrupted-operation recovery.
-
-Carina must not infer eligibility from an attribute named `name`, a tag,
-`create_only`, `AttributeSchema::identity()`, `UniqueNameSpec`, or a successful
-import. A provider-enforced API tuple is different from a human label because
-the API guarantees at most one target and accepts the tuple for lookup.
-
-### Types and ownership
-
-`NaturalKey` privately owns provider instance, resource type, and non-empty
-normalized components. It has no public constructor, string conversion, or
-equality with `ResourceName`/raw `Value`. Only a schema-created extractor may
-produce it from `ProviderReadyResource`, whose type already proves resolved,
-validated provider input (`carina-core/src/executor/provider_ready.rs:1-66`).
-
-`StatelessResource` contains resolved ID, natural key, and provider-ready
-desired data. Internal maps remain keyed by resolved ID; natural key is only an
-API address/check. Duplicate keys are errors, never coalesced entries.
-
-### Why this is not name-as-identity
-
-The `CLAUDE.md` rule prevents four concrete failure modes; the proposed type
-boundary excludes each one.
-
-- A user label may be pending, `Unknown`, or empty and then collide in
-  scheduler/state/diff maps. Only a schema-owned extractor from a fully
-  resolved `ProviderReadyResource` can construct `NaturalKey`, whose
-  components are non-empty, so none of those states is representable.
-- Nobody guarantees that an arbitrary `name` is unique. `NaturalKey` exists
-  only when the provider declares that its API enforces uniqueness in an
-  explicit scope.
-- Carina's identity is unchanged: scheduler, plan, and diff maps stay keyed by
-  `ResolvedResourceId`. `NaturalKey` is only a remote address and the subject
-  of duplicate-key equality; that check mirrors the provider's own uniqueness
-  constraint instead of inventing an internal identity.
-- `NaturalKey` has no `From<ResourceName>`, `From<Value>`, or cross-type
-  `PartialEq`. A future consumer therefore cannot put a raw user label in the
-  remote-key position accidentally.
-
-### Resolution and composite keys
-
-`Value` can be concrete or deferred; deferred variants include references,
-secrets, redacted secrets, and `Unknown`
-(`carina-core/src/resource/mod.rs:1925-1944`,
-`carina-core/src/resource/mod.rs:2527-2595`).
-
-Before plan construction every component must be concrete. Unknown, secret,
-provider-populated, or not-yet-created managed references fail extraction
-before lookup; resolved data-source/upstream values are allowed.
-
-Ordered components support `(owner, repository, branch)` or
-`(zone, name, type, set_identifier)` and may include resolved provider scope.
-Changing scope selects another target, not an in-place rename.
-
-Version one rejects keys depending on another managed resource. A provider may
-still resolve a declared slug or natural-key component to a numeric API ID for
-this run, as [gh-infra does for teams/apps](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md);
-that ID is not Carina identity and is never persisted by Carina.
-
-Literal-only keys are extracted during shared validation, so their duplicates
-are CLI and LSP errors. Keys containing permitted data-source or upstream
-values are extracted after resolution and checked for duplicates before the
-first lookup; a collision is a plan-time error. Neither case is coalesced.
-
-### Parent scopes and creation ordering
-
-Rejecting managed-resource references in a key does not order a literal
-IssueLabel key after a Repository with the same owner/repository. The schema
-must express that relationship. `NaturalKeyCapability` therefore declares an
-optional `ParentScopeCapability`: parent resource type plus a schema-owned
-projection from the child key to `ParentKey<ParentType>`. IssueLabel, Ruleset,
-and BranchProtection declare Repository as parent, projected by owner and repo.
-
-Only that projection can construct `ParentKey`; it cannot be built from or
-compared with `ResourceName` or raw `Value`, and it preserves provider instance,
-parent type, and normalized scope components. Schema loading rejects an
-unsupported parent, incompatible normalization, or a parent cycle. During plan
-preparation the host compares `ParentKey<Repository>` only with declared
-`NaturalKey<Repository>` values. An exact match produces a typed
-`ParentKeyEdge` between the two `ResolvedResourceId` values; scheduler maps
-remain keyed by those IDs.
-
-The edge determines observation and creation:
-
-- If the declared parent is found, the host looks up each child normally.
-- If the declared parent is not found, its scoped children cannot exist. The
-  host skips child lookups and authoritative list calls, plans IssueLabel and
-  Ruleset declarations as `ProvenAbsentByParent` creates, treats child
-  `absent` declarations as no-ops, renders “not looked up; parent will be
-  created,” and orders creates after the parent.
-- If no matching parent is declared, it must already exist. The host first
-  looks up that parent; parent not-found is `MissingParent`, a typed plan error,
-  never a child `NotFound` result.
-
-BranchProtection also requires its branch to exist. Following gh-infra's
-[design principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md) ("After apply, plan shows no changes"),
-version one defers a desired branch-protection create when its repository will
-be created in the same apply; an `absent` declaration is already satisfied. The
-plan shows `Deferred: branch unavailable until repository creation`; the next
-plan can create it once the branch exists. One apply therefore may not converge
-for a brand-new repository. A missing branch under an already-existing
-repository is a typed prerequisite error, not a deferred create.
-
-### Normalization
-
-Normalization belongs to the key/schema, never scattered lowercase calls.
-Exact, documented case-folding, and DNS normalizers are deterministic and part
-of the provider schema fingerprint.
-
-GitHub's REST reference says only that the `owner` and `repo` parameters are
-not case sensitive on the [repository](https://docs.github.com/en/rest/repos/repos)
-and [label](https://docs.github.com/en/rest/issues/labels) endpoints; it makes
-no equivalent statement for the label-name parameter. [gh-infra's label
-documentation](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md)
-case-folds label names, rejects manifest duplicates that differ only by case,
-and treats a case-only difference as a rename. Carina may adopt that behavior
-only as a provider assumption backed by an acceptance test; the precise Unicode
-folding rule must be part of the schema fingerprint.
-
-With that tested case-folded key, desired `Bug` and observed `bug` produce the
-same `NaturalKey`; the plan updates the label's display name instead of creating
-a second label.
-
-Lookup returns a canonical observed key; aliases or redirects to another name
-are not equality. GitHub documents repository redirects, but old-name REST
-behavior was not fully verified, so providers compare returned `full_name`.
-
-## 2. Deletion
-
-State-backed Carina finds orphans because state retains resources removed from
-configuration. Stateless mode has no inventory. Three models were considered.
-
-### Field clearing is explicit
-
-Following [gh-infra's principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md),
-omission means "unmanaged": the field is neither compared nor sent. Clearing
-requires a schema-valid empty or typed clear value; `null` clears only where
-declared. This current-source ownership mask needs no authoring history and is
-independent of object deletion.
-
-### Explicit absence
-
-Removing a block only stops management. Remote deletion uses a typed `absent`
-declaration carrying the full IssueLabel key (repository plus name); plan looks
-up that key and shows an explicit delete.
-
-Today's `removed` means "remove from state without destroying"
-(`carina-core/src/parser/ast.rs:1021-1050`). It produces state removal, not a
-provider delete (`carina-core/src/effect.rs:560-572`,
-`carina-cli/src/commands/shared/effect_execution.rs:145-174`,
-`carina-cli/src/commands/shared/state_writeback.rs:1450-1471`). Overloading it
-would give one keyword opposite meanings. Stateless validation rejects it;
-`absent` expresses remote absence.
-
-### Authoritative scopes
-
-Opt-in authoritative scopes initially cover only labels, rulesets, and branch
-protection. The collection must be present; absence means unmanaged. Variables,
-secrets, and milestones stay additive. A typed scope requires complete paged
-list, cross-page normalization/deduplication, and every deletion in the plan.
-
-No delete is planned after a failed, forbidden, cyclic, or incomplete page.
-Scope is never inferred from several resources sharing a parent: a wrong scope
-can delete an entire collection.
-
-### Ownership markers
-
-Repository topics/descriptions and label/team descriptions are user data, not
-neutral markers; many GitHub types have no slot and AWS tags are not universal.
-Markers may filter deletion, never prove identity or ownership.
-
-### Decision
-
-The first useful slice combines additive default behavior, individual `absent`,
-and opt-in authoritative label/ruleset/branch-protection scopes. Repository
-removal only stops management; repository `absent` and `carina destroy` are
-gated off. Markers may strengthen a scope but never replace it.
-
-## 3. What State Carries and Stateless Mode Loses
-
-| Responsibility | Current evidence | Stateless answer |
-| --- | --- | --- |
-| Remote identifier | `Provider::read` consumes saved ID (`carina-core/src/provider.rs:3540-3569`) | Capable types use `NaturalKey` lookup |
-| Accepted desired values | `RowBasis` records accepted provenance (`carina-state/src/state/mod.rs:367-386`) | Current source produces `ManagedFieldMask` |
-| Authored shape | Differ uses prior explicit input (`carina-core/src/differ/comparison.rs:838-969`) | Omitted now means unmanaged; explicit empty clears |
-| Write-only values | v18 stores accepted hashes/provenance (`carina-state/src/state/mod.rs:741-778`) | Unsupported in v1 |
-| Provider outputs | Current instance retains outputs (`carina-state/src/state/mod.rs:2039-2072`) | Live observation only; managed refs rejected |
-| Exports | `StateFile.exports` persists upstream bindings (`carina-state/src/state/mod.rs:499-501`) | Cannot publish exports |
-| Renames | `moved` rewrites state binding (`carina-core/src/effect.rs:566-572`) | Unsupported; new key plus old `absent` |
-| In-flight create | Pending/in-flight types retain recovery (`carina-core/src/provider.rs:1743-1865`, `carina-core/src/provider.rs:2179-2350`) | Must recover by refinding key |
-| Saved-plan freshness | Plan stores lineage/serial (`carina-cli/src/commands/plan.rs:127-215`) | Saved plans unsupported in v1 |
-| Mutual exclusion | Backend owns lock (`carina-state/src/backend.rs:550-603`) | No Carina lock; explicit optimistic model |
-| Orphan inventory | Differ enumerates unmatched state IDs (`carina-core/src/differ/mod.rs:262-325`) | No implicit orphan detection |
-| Deposed instances | Resource state retains current/deposed (`carina-state/src/state/mod.rs:2101-2166`) | CBD/deposed recovery unsupported |
-
-### Write-only values
-
-Carina compares secrets through accepted-state hashes
-(`carina-core/src/differ/comparison.rs:494-521`) and overlays sent/retained
-write-only values during writeback (`carina-state/src/state/mod.rs:2980-3078`).
-
-GitHub Actions secret reads expose `updated_at`, not plaintext. This design
-assumes the timestamp records a write, not value equality; its exact update
-behavior requires an acceptance test. Regardless, an out-of-band plaintext
-change cannot be compared, so `updated_at` cannot replace the accepted-value
-hash.
-
-[gh-infra's secrets and variables documentation](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/secrets-variables.md)
-plans only missing secrets and offers `--force-secrets` to re-send all
-values. Carina deliberately starts stricter: version one rejects every
-top-level or nested write-only desired field through schema validation
-(`carina-core/src/schema/mod.rs:528-617`,
-`carina-core/src/schema/mod.rs:6293-6506`). A future typed
-`AlwaysReassertWriteOnly` capability could model "write every apply; equality
-unknown" rather than adding an untyped force flag.
-
-### Exports and upstream values
-
-`carina export` reads persisted exports (`carina-cli/src/main.rs:154-171`,
-`carina-cli/src/commands/export.rs:27-66`). Stateless projects cannot publish or
-serve as upstream state, though they may consume concretely resolved stateful
-upstream values. `--state-url` may inspect another file; [gh-infra also has no
-exports](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md).
-
-### Renames and state operations
-
-The grammar's `import`, `removed`, and `moved` state operations are rejected
-(`carina-core/src/parser/carina.pest:142-167`). A DSL-label change with the same
-key is harmless; a key change is new management plus optional old-key `absent`.
-Like [gh-infra](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md),
-version one has no rename history or aliases.
-
-### In-flight creates
-
-`CurrentInstance` persists #3909's applied/create-in-flight distinction
-(`carina-state/src/state/mod.rs:2039-2072`). Stateless cannot save an opaque
-poll token, so capability `RefindByKey` must recover interruption without
-duplicates; otherwise create is unsupported. GitHub types must test ambiguous
-responses.
-
-### Saved plans
-
-Saved-plan apply locks/reloads state and checks lineage/serial
-(`carina-cli/src/commands/apply/mod.rs:3200-3262`, `carina-cli/src/commands/apply/mod.rs:3298-3352`), represented by
-`ReloadedPlanFile` (`carina-cli/src/commands/plan.rs:1359-1378`). Stateless has
-no equivalent and rejects `plan --out`/saved apply; interactive apply re-reads.
-A future format requires revision tokens or conditional requests.
-
-### Lock and concurrency
-
-State-backed apply locks (`carina-cli/src/commands/apply/mod.rs:1554-1571`);
-`backend none` cannot. As in [gh-infra's state model](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md),
-use last-write-wins plus CI concurrency
-or a merge queue, with the next plan exposing divergence. Carina types remote
-uniqueness, fresh lookup, conflict recovery, and available revision conditions.
-Serializable users need state-backed mode; a lock-only backend is open.
-
-### Provider-populated values
-
-Provider-populated output is typed (`carina-core/src/schema/mod.rs:491-525`) and
-may be displayed, but managed references to it are rejected because they need
-live-output scheduling/cycle semantics. Shared validation enforces this;
-already-resolved data-source/upstream values remain allowed.
-
-### Field ownership, refresh, and whole-object APIs
-
-State-backed Carina projects away fields never authored, but omission of a
-previously authored top-level field emits a change
-(`carina-core/src/differ/comparison.rs:838-969`) and `PatchOp::Remove`
-(`carina-core/src/provider.rs:715-766`).
-
-Nested maps are more selective: saved keys never authored are merged back,
-while previously authored keys omitted now are removed
-(`carina-core/src/resource/mod.rs:4920-5045`). State's explicit tree is what
-lets state-backed Carina distinguish those cases.
-
-Stateless has no previous tree. `ManagedFieldMask` is derived from the current
-source authoring tree before schema defaults or provider normalization; defaults
-never silently become managed. Only masked paths are compared/sent, omission is
-unmanaged, and explicit clear values remain masked. Existing `ExplicitFields`
-is the relevant representation precedent (`carina-core/src/explicit.rs:1-160`).
-
-Existing `UpdateRequest` forbids writing unrepresented fields
-(`carina-core/src/provider.rs:585-710`), fitting patch APIs. A typed
-`WholeObjectOverlay` instead reads current, overlays masked paths, preserves
-unmasked/unmodeled settings, sends the whole object, and verifies the result.
-
-Every stateless plan is a live refresh, so `--refresh=false` is rejected.
-Readable drift on managed paths is detected. An unreadable managed path is a
-typed observation error and removes that resource from the plan, never a
-missing/default value. Current `ReadOutcome` lacks partial-read information,
-although mutation outcomes have `PartialReadDiagnostic`
-(`carina-core/src/provider.rs:1574-1679`); the new lookup must close that gap.
-
-## 4. Gating and Typestate
-
-### Schema capability
-
-Every resource schema carries exhaustive `StatelessCapability::Unsupported` or
-`NaturalKey(NaturalKeyCapability)`. The latter contains key, recovery,
-concurrency, optional parent scope/prerequisite, supported authoritative scopes,
-and a mutation model of either `FieldPatch` or `WholeObjectOverlay`.
-
-This is not inferred or optional. Core builders may initialize `Unsupported`,
-but the protocol field is mandatory so an old or malformed provider cannot opt
-in through a default. `ManagedFieldMask` also has private construction: only
-schema-aware extraction from the current source can produce valid field paths.
-
-Component paths are ordered and non-empty. Schema loading rejects paths into
-provider-populated, write-only, secret, collection, or unstable values, plus
-invalid parent projections, incompatible parent normalization, and parent
-cycles.
-
-### Validation
-
-The stateless validation pipeline rejects:
-
-- any managed type with `Unsupported` capability;
-- duplicate literal-only natural keys in one provider instance (the shared CLI
-  and LSP validation error);
-- duplicate keys containing permitted data-source/upstream values (after
-  resolution and before any provider lookup, as a plan-time error);
-- ambiguous or cyclic `ParentKeyEdge` construction;
-- top-level or nested write-only desired fields;
-- exports, `import`, `removed`, and `moved`;
-- saved-plan input/output and `--refresh=false`;
-- create-before-destroy or other deposed-instance lifecycles;
-- managed provider-populated references;
-- fields or clear values unsupported by the declared mutation model;
-- unrecoverable pending creates; and
-- authoritative scopes absent from the type's capability.
-
-Dynamic extraction rejects unresolved keys before observation. It resolves the
-permitted data-source/upstream case, performs the second duplicate check,
-derives `ParentKeyEdge` values, and observes parents before any child lookup.
-`MissingParent`, missing branch prerequisites, and unreadable managed paths fail
-before effect construction. Only those successes, plus explicitly typed
-deferred children, can construct `StatelessPlan`.
-
-CLI validation already loads schemas and calls shared checks
-(`carina-cli/src/commands/validate.rs:266-320`). The new checker belongs there,
-with LSP diagnostics calling the same implementation. That satisfies the
-CLI/LSP parity rule in `CLAUDE.md:433-437`.
-
-### Separate pipelines
-
-`ValidatedProject` is an exhaustive enum of `ValidatedStateBackedProject` and
-`ValidatedStatelessProject`. `StateBackedPlan` retains state snapshot, lineage,
-serial, and state effects. `StatelessPlan` contains live observations and
-`StatelessEffect`, but no state, exports, pending creates, or writeback; its
-apply function cannot accept `StateBackend`.
-
-The stateless builder consumes `ParentOrderedResource`, which always carries a
-typed scope disposition: `Root`, `ParentFound`, `ProvenAbsentByParent`, or
-deferred prerequisite. A child effect without that disposition is
-unrepresentable.
-
-The command layer performs one exhaustive dispatch on `ValidatedProject`.
-There are no pervasive `if stateless` branches. `StatelessEffect` cannot
-represent state removal/move, deposed replacement, or export publication, so
-those paths are unreachable rather than guarded by warnings.
-
-## 5. User Experience
-
-### Selection
-
-The grammar already accepts a backend identifier and body
-(`carina-core/src/parser/carina.pest:137-140`). `none` accepts no attributes and
-is exclusive with `local` or `s3`. Lifting produces
-`ExecutionMode::Stateless`, not `BackendConfig::None`; current
-`BackendConfig` variants are real storage (`carina-state/src/backend_config.rs:15-84`).
-
-A separate `stateless = true` could contradict a real backend and is rejected.
-An omitted backend keeps current resolution behavior. Switching an existing
-state-backed project is not automatic: the CLI rejects known state, in-flight,
-or deposed data until an explicit abandonment design exists.
-
-### Non-final configuration sketch
-
-This is design syntax, not accepted grammar. Only the general block shape and
-`backend none {}` follow today's parser; provider type names, `stateless_scope`,
-and `absent` remain to be specified. The `organization` provider attribute
-matches the GitHub provider design
-(`carina-rs/carina-provider-github:docs/design.md:61`).
-
-```carina
-backend none {}
-
-provider github { organization = 'carina-rs' }
-
-github.Repository {
-  name        = 'carina'
-  description = 'Strongly typed infrastructure management'
-}
-
-github.IssueLabel {
-  repository = 'carina'
-  name       = 'bug'
-  color      = 'd73a4a'
-}
-
-github.IssueLabel {
-  repository = 'carina'
-  name       = 'documentation'
-  color      = '0075ca'
-}
-
-stateless_scope github.IssueLabel {
-  repository = 'carina'
-  reconcile  = authoritative
-}
-
-absent github.IssueLabel {
-  repository = 'carina'
-  name       = 'obsolete'
-}
-```
-
-The two ordinary labels are the authoritative scope's declared set. `absent`
-is an explicit keyed deletion; omitting the repository block would only stop
-managing it.
-
-### Non-final plan sketch
-
-Illustrative output for that configuration is:
-
-```text
-$ carina plan
-Mode: stateless (backend none; no state file)
-Lock: none (last write wins; serialize applies externally)
-
-Live lookup
-  FOUND      github.Repository[carina-rs/carina]
-  FOUND      github.IssueLabel[carina-rs/carina#bug]
-  NOT FOUND  github.IssueLabel[carina-rs/carina#documentation]
-  FOUND      github.IssueLabel[carina-rs/carina#obsolete] (explicit absent)
-  LIST       github.IssueLabel[carina-rs/carina]
-             pages read=2, declared=2, remote=4
-
-Changes
-  ~ github.Repository[carina-rs/carina]
-      description: 'Infrastructure management' -> 'Strongly typed infrastructure management'
-      visibility: unmanaged (not compared or sent)
-  ~ github.IssueLabel[carina-rs/carina#bug]
-      color: 'b60205' -> 'd73a4a'
-  + github.IssueLabel[carina-rs/carina#documentation]
-  - github.IssueLabel[carina-rs/carina#obsolete] (explicit absent)
-  - github.IssueLabel[carina-rs/carina#needs-triage] (authoritative scope)
-  - github.IssueLabel[carina-rs/carina#stale] (authoritative scope)
-
-Plan: 1 to create, 2 to update, 3 to delete; no state will be written
-```
-
-Those child lookups are valid because the repository is `FOUND`. If it were
-`NOT FOUND`, label/ruleset rows would instead say `NOT LOOKED UP (parent will be
-created)` and plan creates after the repository; branch protection would say
-`DEFERRED (branch unavailable until repository creation)`.
-
-Lookup failure is distinct from not-found: 403, unreadable managed settings,
-rate limits, or transport errors never become create or false diffs. The
-affected resource is reported and contributes no effects.
-
-Apply resolves every key and capability before mutation, rechecks the relevant
-key, and uses the found result's ephemeral `AppliedIdentifier`. It neither
-opens state nor locks, exports, or saves pending work. It fails an effect when
-the returned managed projection differs from what was sent.
-
-### Non-final validation diagnostics
-
-Errors name mode, source, rejected capability, and repair. For an AWS VPC:
-
-```text
-$ carina validate
-error[stateless-unsupported-type]: aws.ec2.Vpc cannot be used with backend none
-  --> network.crn:8:16
-  = schema capability: StatelessCapability::Unsupported
-  = use backend local or backend s3 for this resource
-```
-
-For the GitHub provider's planned secret type:
-
-```text
-$ carina validate
-error[stateless-write-only]: github.actions.OrganizationSecret has a write-only desired value
-  --> secrets.crn:12:3
-  = attribute `plaintext_value` cannot be read back, so stateless equality is unavailable
-  = use a state-backed backend; OrganizationSecret is not supported in stateless v1
-```
-
-### Commands
-
-`carina state`, project export, import, saved-plan apply, and `destroy` return
-mode-specific errors. `destroy` directs users to explicit `absent` declarations.
-`carina export --state-url` may still inspect an unrelated state file.
-
-## Provider Assessment
-
-### GitHub: mostly future types
-
-The GitHub provider is only a scaffold.
-`carina-rs/carina-provider-github:README.md:10-24` describes bootstrapping,
-`carina-rs/carina-provider-github:docs/design.md:6-14` says implementation is
-future work, and
-`carina-rs/carina-provider-github:carina-provider-github/src/lib.rs:1-4` is
-scaffold only.
-
-The planned types are `OrganizationSecret` and `OrganizationVariable`
-(`carina-rs/carina-provider-github:docs/design.md:41-55`); repositories, teams,
-and branch protection are initial non-goals
-(`carina-rs/carina-provider-github:docs/design.md:16-39`). Secrets require state
-hashing (`carina-rs/carina-provider-github:docs/design.md:79-86`,
-`carina-rs/carina-provider-github:docs/design.md:178-182`). Thus the planned
-secret is gated off; the variable would stay additive under this design and is
-a weak proof. The provider resource set must expand before stateless mode is
-worth shipping.
-
-| Proposed type | Candidate key | Classification |
-| --- | --- | --- |
-| Organization variable | organization + name | Readable; additive-only under this design; supplementary, not the showcase |
-| Organization secret | organization + name | Direct key, but write-only; reject v1 |
-| Repository | owner + repository | Required slice; field overlay, but rename/redirect hazard |
-| Classic branch protection | owner + repository + branch | Required slice; whole-object overlay |
-| Repository ruleset | owner + repository + ruleset name | Required slice; gh-infra documents repository uniqueness, but the provider must test it |
-| Issue label | owner + repository + case-folded name | Required slice if the provider acceptance test proves gh-infra's case-folding behavior |
-| Team | organization + team slug | Conditional; slug-change-on-rename is an unverified assumption |
-| Team membership | organization + team slug + username | Candidate; IdP-synchronized write restrictions are an unverified assumption |
-| Repository collaborator | owner + repository + username | Poor first type; read may reflect indirect effective access |
-| Repository variable | owner + repository + name | Good later candidate; readable/direct |
-| Environment variable | owner + repository + environment + name | Good later if environment normalization is explicit |
-| Org/repo/environment secret | corresponding scope + name | Natural lookup but write-only; reject v1 |
-| Webhook | owner + repository + hook ID | ID is server-assigned; URL is not documented unique |
-| Deploy key | owner + repository + key ID | ID is server-assigned; title is not unique |
-
-REST verification for this design is narrow: the
-[repository](https://docs.github.com/en/rest/repos/repos) and
-[label](https://docs.github.com/en/rest/issues/labels) references explicitly
-say their `owner` and `repo` parameters are not case sensitive. They do not say
-that the label-name parameter is case insensitive.
-
-Provider assumptions requiring acceptance tests are: label-name case folding
-and exact Unicode behavior (documented by
-[gh-infra](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md),
-not the REST reference); team slugs changing on rename; write restrictions for
-IdP-synchronized teams; the meaning and update behavior of an Actions secret's
-`updated_at`; ruleset-name uniqueness within a repository (documented by
-[gh-infra](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md));
-404 versus 403 under every token type; and old-name repository redirects.
-
-The first useful stateless slice is concrete:
-
-| Type | Mutation | Deletion |
-| --- | --- | --- |
-| Repository | Create/update with current-manifest field mask | Removing block stops management; repository deletion gated off |
-| IssueLabel | Keyed update or parent-proven create | Additive default, individual `absent`, opt-in authoritative scope |
-| Ruleset | Name lookup to ephemeral ID, parent-proven create, whole-object overlay | Additive default, `absent`, opt-in authoritative scope |
-| BranchProtection | Branch-keyed whole-object overlay; deferred one plan for a new repository | Additive default, `absent`, opt-in authoritative scope |
-
-`OrganizationVariable` may join as additive-only support, but it does not make
-the slice useful by itself. Secrets, milestones, repository deletion, renames,
-exports, and provider-output references remain gated off.
-
-### Hand-written AWS provider
-
-AWS codegen metadata has an API identifier and anonymous identity overrides,
-not a stateless capability
-(`carina-rs/carina-provider-aws:carina-codegen-aws/src/resource_defs.rs:40-104`).
-`ReplacementClass::UniqueName` is only replacement policy
-(`carina-rs/carina-provider-aws:carina-codegen-aws/src/resource_defs.rs:30-38`).
-
-Commands used with `$AWS_PROVIDER` set to the provider checkout root:
-
-```sh
-rg -c '^\s*(vec!\[)?ResourceDef \{' \
-  "$AWS_PROVIDER/carina-codegen-aws/src/resource_defs.rs"
-# 40
-
-rg -c '^\s+replacement: ReplacementClass::UniqueName' \
-  "$AWS_PROVIDER/carina-codegen-aws/src/resource_defs.rs"
-# 3
-```
-
-Those three are not a stateless count. Candidate and counterexample types are:
-
-| Class | Examples | Evidence/caveat |
-| --- | --- | --- |
-| User-chosen service key | S3 Bucket | Required/create-only bucket name (`carina-rs/carina-provider-aws:carina-provider-aws/src/schemas/generated/s3/bucket.rs:23-86`) |
-| Account-scoped key | IAM Role, Logs LogGroup | Names plus outputs (`carina-rs/carina-provider-aws:carina-provider-aws/src/schemas/generated/iam/role.rs:16-78`, `carina-rs/carina-provider-aws:carina-provider-aws/src/schemas/generated/logs/log_group.rs:14-70`) |
-| Composite key | Route 53 RecordSet | Identifier/normalization (`carina-rs/carina-provider-aws:carina-provider-aws/src/services/route53/record_set.rs:1-47`); paged read (`carina-rs/carina-provider-aws:carina-provider-aws/src/services/route53/record_set.rs:298-345`) |
-| Derivable service handle | SQS Queue | Desired name, but current ID is Queue URL (`carina-rs/carina-provider-aws:carina-codegen-aws/src/resource_defs.rs:2723-2763`) |
-| Server-assigned ID | VPC, subnet, SG, instance | `VpcId` is provider-populated (`carina-rs/carina-provider-aws:carina-provider-aws/src/schemas/generated/ec2/vpc.rs:14-78`) |
-
-IAM users/policies and SSM parameters may be natural-key resources in AWS, but
-that is not evidence that the hand-written provider implements those types.
-No type should opt in without lookup, normalization, declared field-mutation,
-and interrupted-operation tests.
-
-### AWSCC measurement
-
-AWSCC reads CloudFormation `primaryIdentifier` metadata
-(`carina-rs/carina-provider-awscc:carina-provider-awscc/src/schemas/config.rs:16-53`,
-`carina-rs/carina-provider-awscc:carina-provider-awscc/src/bin/codegen.rs:67-95`,
-`carina-rs/carina-provider-awscc:carina-provider-awscc/src/bin/codegen.rs:3553-3579`).
-Runtime still passes a saved identifier to Cloud Control GetResource
-(`carina-rs/carina-provider-awscc:carina-provider-awscc/src/provider/operations.rs:572-625`,
-`carina-rs/carina-provider-awscc:carina-provider-awscc/src/provider/cloudcontrol.rs:285-324`).
-
-With `$AWSCC_PROVIDER` set to the provider checkout root, this command
-classified all 49 cached schemas:
-
-```sh
-schema_dir="$AWSCC_PROVIDER/cfn-schema-cache"
-for f in "$schema_dir"/*.json; do
-  jq -r '.typeName as $t
-    | (.primaryIdentifier // []) as $p
-    | (.createOnlyProperties // []) as $c
-    | (.readOnlyProperties // []) as $r
-    | if ($p | length) == 0 then [$t, "no_primary"]
-      elif ([$p[] as $id | select(($c | index($id)) == null)] | length) == 0
-        then [$t, "all_primary_create_only"]
-      elif ([$p[] as $id | select(($r | index($id)) != null)] | length) > 0
-        then [$t, "has_read_only_primary"]
-      else [$t, "other_or_mixed"] end
-    | @tsv' "$f"
-done | sort -k2,2 -k1,1 |
-  awk -F '\t' '{count[$2]++} END {for (k in count) print k, count[k]}'
-```
-
-Result:
-
-```text
-all_primary_create_only 11
-has_read_only_primary 38
-```
-
-The 11 were DynamoDB Table, ECR Repository, ECS Cluster, IAM Role, IAM
-RolePolicy, Logs LogGroup, S3 Bucket, S3 BucketPolicy, SSM Parameter, SSO
-Assignment, and WAFv2 WebACLAssociation.
-
-That is an upper bound, not 11 capable types. Create-only may be optional or
-service-defaulted and proves neither lookup nor recovery. AWSCC currently
-canonicalizes primary attributes only after read/create
-(`carina-rs/carina-provider-awscc:carina-provider-awscc/src/provider/operations.rs:2039-2093`).
-
-Both AWS providers must emit `Unsupported` initially. It is not worth promising
-broad AWS stateless operation for a small candidate subset while excluding the
-server-ID resources that make up real stacks. S3 Bucket, SSM Parameter, Logs
-LogGroup, or Route 53 RecordSet may be reviewed individually after GitHub.
-
-## Protocol and WIT Changes
-
-The current provider protocol is version 12
-(`carina-provider-protocol/src/lib.rs:6-11`). This design requires version 13
-and coordinated provider rebuilds.
-
-Add a mandatory `stateless-capability` variant to the WIT/protocol resource
-schema. Its natural-key case includes optional parent type/key projection and
-prerequisite, mutation model, and authoritative-scope support; there is no
-missing-field default. Existing WIT
-`identity-attributes` retain anonymous-identity meaning
-(`carina-plugin-wit/wit/provider.wit:211-213`).
-
-Add `find_by_natural_key(provider, resource_type, key)`; it must not require a
-desired resource because an implicit parent lookup has only `ParentKey`. Its
-typed outcome is either `NotFound` or `Found { canonical_key, identifier,
-current, observability, revision }`. `observability` distinguishes readable,
-truly missing, and unreadable fields; only the first two may enter comparison.
-
-Not-found is a successful outcome; permission/rate/transport failures are
-errors. The identifier feeds existing update/delete, the current object feeds
-diff, and canonical key catches redirect or normalization mismatch.
-
-The host uses the same operation to observe a declared or implicit parent
-before looking up its children. Add a typed prerequisite observation for cases
-not represented by a resource key, initially repository-branch existence. Its
-outcome is `Ready` or `Missing`; the host constructs `Deferred` without calling
-it when the parent repository itself is planned for creation.
-
-Add a paged `list_stateless_scope` for the initial authoritative collections.
-Items return canonical key, ephemeral identifier, current object,
-observability, and optional revision. The host enforces token progress,
-deduplication, normalization, and all-pages-success before delete diff.
-
-Add a stateless update request carrying `ManagedFieldMask`. `FieldPatch` sends
-only masked paths. `WholeObjectOverlay` authorizes the provider to read current,
-overlay masked paths, and preserve unmasked or unmodeled settings; this must not
-weaken the existing state-backed `UpdateRequest` rule. Both return the observed
-post-write object, and the host fails any managed path GitHub silently dropped.
-
-| Repository | Counterpart work |
-| --- | --- |
-| `carina-plugin-wit` | Capability, parent/prerequisite, field-mask, observability, find/list, and stateless-update types |
-| `carina` | Protocol, SDK/host conversion, parent-key graph, types, DSL, validation, LSP, plan/apply |
-| `carina-provider-github` | Repository/label/ruleset/branch-protection schemas, lookup/list, overlay, verification, recovery tests |
-| `carina-provider-aws` | Rebuild for v13 and explicitly emit `Unsupported` |
-| `carina-provider-awscc` | Rebuild for v13 and explicitly emit `Unsupported`; no inference |
-
-The main repository's pinned `carina-plugin-wit` commit and host bindings must
-move together; the sibling checkout is not a substitute for that update.
-
-## Phasing
-
-### Phase 0: contract
-
-- Agree on omission/clear semantics, `backend none`, `absent`, authoritative
-  scope syntax, and the rejection matrix.
-- Land protocol 13/WIT with all existing types `Unsupported`.
-- Add parent/prerequisite, field-mask/observability/find/list/overlay types and
-  schema failures.
-- Add shared CLI/LSP validation fixtures. Do not advertise the mode yet.
-
-### Phase 1: grow the GitHub provider
-
-- Implement Repository, IssueLabel, Ruleset, and BranchProtection with ordinary
-  state-backed behavior first; the current provider scaffold has none of them.
-- Prove key and parent lookup, not-found/forbidden/unreadable distinctions,
-  normalization, new-repository deferral, whole-object preservation,
-  post-write verification, and recovery.
-- Keep every capability `Unsupported` until those contracts pass provider tests.
-
-### Phase 2: useful stateless slice and later
-
-- Enable the four-type slice together with additive default, explicit `absent`,
-  authoritative label/ruleset/branch-protection scopes, typed parent ordering,
-  and explicit new-repository branch-protection deferral.
-- Add OrganizationVariable only as supplementary additive support; keep
-  OrganizationSecret rejected unless a typed always-reassert contract lands.
-- Evaluate AWS types one at a time only in response to demand; never infer from
-  `identity()`, `UniqueNameSpec`, `createOnly`, or `primaryIdentifier`.
-
-No implementation is part of this document.
-
-## Open Questions
-
-1. Is `absent` final, and should state-backed projects also accept it?
-2. What exact GitHub case folding is guaranteed for every proposed key?
-3. Can all token modes distinguish not-found from forbidden reliably?
-4. How do rename redirects behave for REST writes, and which field is canonical?
-5. Should organization/provider scope always be rendered as a key component?
-6. How are explicit clear values represented for every optional field shape?
-7. Can `ManagedFieldMask` represent nested lists safely without stable element keys?
-8. What provider-private data is needed to preserve unmodeled whole-object fields?
-9. Is a lock-only backend worth designing for serialized stateless applies?
-10. Is `AlwaysReassertWriteOnly` worth unknown equality and perpetual writes?
-11. How should users abandon old state, including in-flight/deposed instances?
-12. Is ruleset-name uniqueness strong enough for a Carina capability contract?
-13. Which AWS type, if any, justifies the first exception?
-
-## Recommendation
-
-Proceed only after the GitHub provider grows Repository, IssueLabel, Ruleset,
-and BranchProtection. Ship those as one useful slice with provider-declared
-keys, current-source field masks, live reads, additive default, explicit
-absence, typed parent ordering, typed authoritative scopes, post-write
-verification, shared validation, and separate stateless typestates. Document
-that branch protection for a newly created repository needs a second plan.
-
-OrganizationVariable may be supplementary; OrganizationSecret is gated off.
-Do not include repository deletion, renames, exports, saved plans, managed
-provider-output references, unrecoverable pending creates, or AWS types. Do not
-market this as broad AWS stateless mode; evaluate AWS only after GitHub proves value.
+| Labels | Case-insensitive name match; case-only change is a rename; aliases remain future work ([labels](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/labels.md)) | A provider can own normalization, but old-key aliases are still unsolved |
+| Rulesets | Name is required and documented by gh-infra as unique per repository; team/app slugs are resolved via API at run time; whole-object update overlays declared fields ([rulesets](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/rulesets.md)) | Useful implementation evidence, but not an official uniqueness guarantee for Carina's provider type |
+| Secrets | Missing-only detection; no changed-value diff; `--force-secrets` resends all selected secrets ([secrets and variables](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/resources/repository/secrets-variables.md)) | This is bucket B, not ordinary drift detection |
+| Deletion | Omission stops management; only selected collections have authoritative reconcile ([principles](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/introduction/principles.md)) | It intentionally avoids general ownership and delete discovery |
+| Locking | None; last write wins and the next plan exposes inconsistency ([state management](https://github.com/babarot/gh-infra/blob/main/docs/src/content/docs/internals/state-management.md)) | Operationally valid for that tool, but not equivalent to Carina's state lock |
+
+This prior art does not meet the provider-wide rule. gh-infra defines a narrow
+manifest model and assigns resource-specific behavior: some collections are
+authoritative, some are always additive, secrets are presence-only, deleted
+top-level resources are undetected, and unsupported GitHub objects simply are
+not part of its model. That is a coherent product choice. It is not proof that
+every type a comprehensive Carina GitHub provider might ship has a stateless
+identity and recovery contract.
+
+Carina should retain two ideas even though this proposal is rejected. First,
+unreadable must be typed separately from absent. Second, any future stateless
+field model must make omission mean “unmanaged now,” not silently copy
+state-backed behavior. State-backed Carina can tell that a field was authored
+previously: the differ projects never-authored fields away but marks a
+previously authored, now-omitted field as changed
+(`carina-core/src/differ/comparison.rs:838-861`), and the update patch emits
+`PatchOp::Remove` (`carina-core/src/provider.rs:710-765`). Stateless execution
+has no previous authored-field tree, so dropping a field would stop managing
+it; an explicit empty value would clear it.
+
+## Why Backend Omission Is Not the Opt-in
+
+If stateless mode is ever reconsidered, it must remain an explicit
+`backend none {}` selection. Omitting `backend` already means the implicit
+local state backend; it does not mean no state.
+
+Plan states this directly and reads the default backend when no configuration
+is selected (`carina-cli/src/commands/plan.rs:2363-2369`,
+`carina-cli/src/commands/plan.rs:2428-2436`). Backend construction turns
+`None` into a `LocalBackend` at `carina.state.json`
+(`carina-state/src/backends/mod.rs:29-37`). Apply and destroy both verify and
+resolve that default backend before proceeding
+(`carina-cli/src/commands/apply/mod.rs:1383-1390`,
+`carina-cli/src/commands/destroy.rs:100-123`).
+
+Reinterpreting omission would silently switch every existing project without
+an explicit backend block from local state to stateless operation. It would
+also make accidentally deleting `backend.crn` change the execution model
+instead of producing backend-drift protection. Explicit syntax is therefore a
+compatibility and safety boundary, not verbosity for its own sake.
+
+## What an Accepted Design Would Have Required
+
+No implementation work should begin under the current verdict. If the
+provider-wide constraint or GitHub APIs change, an accepted design would still
+need all of the following:
+
+- a provider-level tagged schema set as described above, validated identically
+  by CLI and LSP;
+- explicit `backend none {}` and separate `StatelessPlan` and
+  `StatelessApply` typestates with no state snapshot, lineage, serial, saved
+  identifier, or backend lock field;
+- a provider operation to find by typed natural key, with found, absent, and
+  unreadable outcomes, plus paginated list operations for explicitly
+  authoritative scopes;
+- typed managed-field masks and whole-object overlay operations so omitted and
+  unmodeled GitHub fields survive replacement-style APIs;
+- post-write observation, create-recovery contracts, parent-key ordering, and
+  explicit key-alias syntax for supported renames;
+- honest B-type secret operations: presence-only plans and an explicit forced
+  resend, never a fabricated equality result;
+- a protocol and WIT version bump. The current protocol is version 12
+  (`carina-provider-protocol/src/lib.rs:6-11`), current WIT exposes neither
+  find-by-key nor list (`carina-plugin-wit/wit/provider.wit:39-73`), and the
+  current resource schema has no provider execution-model tag
+  (`carina-core/src/schema/mod.rs:6698-6773`,
+  `carina-provider-protocol/src/types.rs:1100-1129`).
+
+Counterpart changes would be required in `carina-plugin-wit`, `carina`, and
+the stateless provider repository. Stateful `carina-provider-aws` and
+`carina-provider-awscc` would need only the coordinated protocol rebuild; they
+would remain provider-wide stateful, with no per-type stateless flags.
+
+## Future Reconsideration
+
+Reopen this decision only if at least one premise changes:
+
+1. The provider-wide rule is relaxed, or a separate deliberately limited
+   provider is acceptable. The existing `github` provider still must not mix
+   modes.
+2. GitHub adds documented, provider-enforced natural lookup keys or
+   client-supplied idempotency keys for the C families, including webhooks,
+   deploy keys, runner groups, rulesets, roles, milestones, projects, and
+   environment policies.
+3. Product requirements explicitly accept import-only resources whose remote
+   server ID must be written in configuration and which cannot support create.
+   Those must be a distinct type, not a weakened managed resource.
+4. The project accepts B semantics for secrets and masked webhook fields as a
+   typed capability: presence-only plus explicit resend, with no claim of
+   value drift detection.
+5. Provider acceptance tests prove normalization, uniqueness, permission
+   behavior, interrupted-create recovery, pagination, and rename behavior for
+   every shipped type.
+
+Until then, the honest answer to carina-rs/carina#4043 is that stateless GitHub
+management is useful for a selected subset, as gh-infra demonstrates, but is
+not realistic for every GitHub resource under a provider-wide all-or-nothing
+capability. The design is rejected rather than weakening Carina's identity and
+type-safety rules.
