@@ -85,7 +85,7 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
 
 `CreateToken` is defined below. Updates and deletes finish in one call, so their token types are `Never`.
 
-The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
+The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`; the `http` form also needs `wasi = "0.14"` in the `wasm32` dependencies, as the Overview explains. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, written in the same crate as `WidgetProvider` (Rust's orphan rule rejects it in a separate binary crate), and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
 
 ## Helpers
 
@@ -459,7 +459,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Secrets
 
-Attribute values reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. Error messages and causes are printed, and tokens are written to state.
+Attribute values reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and tokens are written to state.
 
 ## Data sources
 
