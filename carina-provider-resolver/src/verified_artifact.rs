@@ -379,32 +379,23 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
     revision: &str,
     resolved_sha: &CommitSha,
     provider_name: &'a str,
-    use_existing_pin: bool,
 ) -> ArtifactPin<'a, RevisionArtifactPin> {
-    if !use_existing_pin {
-        return ArtifactPin::Unpinned(FirstUse(()));
-    }
     let pinned = lock_file
         .find_by_source_key_and_sha(source, resolved_sha)
         .and_then(|entry| match &entry.kind {
             LockEntryKind::Revision {
-                revision: locked_revision,
+                revision: _,
                 resolved_sha: locked_sha,
                 artifact_id,
-            } if locked_revision == revision && locked_sha == resolved_sha => Some((
+            } => Some((
                 entry,
                 RevisionArtifactPin {
-                    revision: locked_revision.clone(),
+                    revision: revision.to_string(),
                     resolved_sha: locked_sha.clone(),
                     artifact_id: *artifact_id,
                 },
             )),
-            LockEntryKind::Revision {
-                revision: _,
-                resolved_sha: _,
-                artifact_id: _,
-            }
-            | LockEntryKind::Version {
+            LockEntryKind::Version {
                 version: _,
                 constraint: _,
             }

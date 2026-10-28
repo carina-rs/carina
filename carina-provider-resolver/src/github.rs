@@ -386,19 +386,24 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         repo: &RepoSlug,
         run_id: WorkflowRunId,
     ) -> Result<Vec<GithubArtifactResponse>, GithubApiError> {
-        let url = repo.run_artifacts_url(run_id)?;
-        let response = self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)?;
-        let artifacts: GithubArtifactsResponse = parse_json(&response.body, &url)?;
-        Ok(artifacts
-            .artifacts
-            .into_iter()
-            .map(|artifact| GithubArtifactResponse {
-                id: ArtifactId::from_api(artifact.id),
-                name: artifact.name,
-                expired: artifact.expired,
-                size_in_bytes: artifact.size_in_bytes,
-            })
-            .collect())
+        self.paginate(
+            repo,
+            repo.run_artifacts_url(run_id)?,
+            GithubAuthentication::Required,
+            |body, url| {
+                let artifacts: GithubArtifactsResponse = parse_json(body, url)?;
+                Ok(artifacts
+                    .artifacts
+                    .into_iter()
+                    .map(|artifact| GithubArtifactResponse {
+                        id: ArtifactId::from_api(artifact.id),
+                        name: artifact.name,
+                        expired: artifact.expired,
+                        size_in_bytes: artifact.size_in_bytes,
+                    })
+                    .collect())
+            },
+        )
     }
 
     pub(crate) fn download_artifact_zip(
@@ -925,7 +930,7 @@ mod tests {
     #[test]
     fn run_artifacts_takes_a_deserialized_workflow_run_id() {
         let run_id: WorkflowRunId = serde_json::from_str("7").unwrap();
-        let url = "https://api.github.com/repos/acme/widget/actions/runs/7/artifacts";
+        let url = "https://api.github.com/repos/acme/widget/actions/runs/7/artifacts?per_page=100";
         let http = FixtureGithubHttp::default().json(
             url,
             r#"{"artifacts":[{"id":42,"name":"provider","expired":false}]}"#,

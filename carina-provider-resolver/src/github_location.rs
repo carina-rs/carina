@@ -128,7 +128,9 @@ impl RepoSlug {
         run_id: WorkflowRunId,
     ) -> Result<url::Url, GithubLocationError> {
         let run_id = run_id.get().to_string();
-        self.url_with_segments(&["actions", "runs", &run_id, "artifacts"])
+        let mut url = self.url_with_segments(&["actions", "runs", &run_id, "artifacts"])?;
+        url.query_pairs_mut().append_pair("per_page", "100");
+        self.validate_url(url.as_str())
     }
 
     pub(crate) fn artifact_zip_url(
