@@ -76,13 +76,13 @@ use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, ProviderLoad, ValidatedWiring,
-    create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
-    get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
-    prepare_default_provider_ready_config, read_managed_state_with_retry,
-    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
-    reconcile_late_anonymous_identities, refresh_loaded_orphan_with_retry,
-    refresh_loaded_resource_with_retry,
+    AddressedDataSourceReadInputs, CompleteProviderLoad, LateAnonymousIdentityInputs, ProviderLoad,
+    ValidatedWiring, create_normalizers_from_configs_with_ctx,
+    create_providers_from_configs_with_ctx, get_provider_with_ctx, module_constraint_plan_errors,
+    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
+    read_managed_state_with_retry, reconcile_canonical_anonymous_identifiers_with_ctx,
+    reconcile_canonical_prefixed_names, reconcile_late_anonymous_identities,
+    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 #[cfg(test)]
 use crate::wiring::{WiringContext, read_with_retry};
@@ -104,6 +104,13 @@ struct PlanFileHeader {
     _timestamp: serde::de::IgnoredAny,
     #[serde(default)]
     source_path: Option<serde_json::Value>,
+}
+
+struct SavedPlanCurrentConfigInputs {
+    parsed: carina_core::parser::InferredFile,
+    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    inference_errors: Vec<carina_core::validation::inference::ExportInferenceError>,
+    duplicate_declarations: Vec<carina_core::config_loader::DuplicateDeclaration>,
 }
 
 fn saved_plan_secret_rehydration_error(
@@ -3187,7 +3194,7 @@ async fn run_apply_from_plan_with_observer_factory(
     let parsed_backend = loaded_current_config
         .as_ref()
         .map(|config| config.parsed.backend.clone());
-    let current_resources = if needs_secret_verification {
+    let current_config_inputs = if needs_secret_verification {
         let current_config = loaded_current_config
             .take()
             .expect("secret verification requires a loaded current configuration");
@@ -3202,25 +3209,27 @@ async fn run_apply_from_plan_with_observer_factory(
                 apply_target,
             ));
         }
-        let canonical = providers
+        providers
             .check_config_pair(
-                current_config.parsed,
-                current_config.unresolved_parsed,
+                current_config.parsed.clone(),
+                current_config.unresolved_parsed.clone(),
                 base_dir,
                 false,
                 &current_config.inference_errors,
                 &current_config.duplicate_declarations,
             )
             .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-        Some(canonical)
+        Some(SavedPlanCurrentConfigInputs {
+            parsed: current_config.parsed,
+            unresolved: current_config.unresolved_parsed,
+            inference_errors: current_config.inference_errors,
+            duplicate_declarations: current_config.duplicate_declarations,
+        })
     } else {
         None
     };
-    providers.ensure_complete()?;
-    let current_backend = current_resources
-        .as_ref()
-        .map(|resources| resources.parsed().backend.as_ref())
-        .or_else(|| parsed_backend.as_ref().map(Option::as_ref));
+    let providers = providers.into_complete()?;
+    let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
         Some(current_backend) => current_backend,
         None => inspected_plan.backend_config(),
@@ -3266,7 +3275,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        current_resources,
+        current_config_inputs,
         providers,
         provider_context,
         auto_approve,
@@ -3292,8 +3301,8 @@ async fn run_apply_from_plan_with_observer_factory(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
     inspected_plan: InspectedPlanFile,
-    current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
-    providers: ProviderLoad,
+    current_config_inputs: Option<SavedPlanCurrentConfigInputs>,
+    providers: CompleteProviderLoad,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3405,12 +3414,12 @@ async fn run_apply_from_plan_locked_owned(
             // load and mints the wiring witness before normalizer construction
             // or secret evaluation.
             let (schema_checked_plan, validated_wiring) =
-                providers.verify_saved_plan(inspected_plan, apply_target)?;
+                inspected_plan.verify_provider_load(providers, apply_target)?;
 
             let desired_plan = match schema_checked_plan {
                 SchemaCheckedPlanFile::Verified(plan) => DesiredPlanFile::Verified(plan),
                 SchemaCheckedPlanFile::NeedsSecretVerification(pending) => {
-                    let canonical_resources = current_resources.ok_or_else(|| {
+                    let current_config_inputs = current_config_inputs.ok_or_else(|| {
                         saved_plan_secret_evaluation_error(
                             AppError::Config(
                                 "the current configuration was unavailable".to_string(),
@@ -3418,6 +3427,24 @@ async fn run_apply_from_plan_locked_owned(
                             apply_target,
                         )
                     })?;
+                    let SavedPlanCurrentConfigInputs {
+                        parsed,
+                        unresolved,
+                        inference_errors,
+                        duplicate_declarations,
+                    } = current_config_inputs;
+                    let canonical_resources = validated_wiring
+                        .revalidate_config_pair(
+                            parsed,
+                            unresolved,
+                            project_dir,
+                            false,
+                            &inference_errors,
+                            &duplicate_declarations,
+                        )
+                        .map_err(|source| {
+                            saved_plan_secret_evaluation_error(source, apply_target)
+                        })?;
                     let candidates = prepare_saved_plan_secret_candidates(
                         canonical_resources,
                         &pending,
@@ -3791,7 +3818,7 @@ async fn run_apply_from_plan_locked_owned(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
     inspected_plan: InspectedPlanFile,
-    current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
+    current_config_inputs: Option<SavedPlanCurrentConfigInputs>,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3805,7 +3832,9 @@ async fn run_apply_from_plan_locked(
     let providers = match ProviderLoad::load(
         inspected_plan.provider_configs().as_provider_configs(),
         apply_target.source_dir(),
-    ) {
+    )
+    .and_then(ProviderLoad::into_complete)
+    {
         Ok(providers) => providers,
         Err(error) => {
             return finish_lock_command(
@@ -3819,20 +3848,9 @@ async fn run_apply_from_plan_locked(
             .await;
         }
     };
-    if let Err(error) = providers.ensure_complete() {
-        return finish_lock_command(
-            backend.as_ref(),
-            LockCommandOutcome::Kept {
-                result: Err(error),
-                lock,
-            },
-            &cancel,
-        )
-        .await;
-    }
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        current_resources,
+        current_config_inputs,
         providers,
         provider_context,
         auto_approve,

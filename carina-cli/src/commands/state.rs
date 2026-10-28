@@ -937,7 +937,7 @@ async fn run_state_bucket_delete(
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
     let providers = ProviderLoad::load(provider_inputs.configs().as_provider_configs(), base_dir)?;
-    let wiring = providers.validate_and_resolve_with_config(
+    let wiring = providers.validate_evaluated_config(
         &mut parsed,
         base_dir,
         true,
@@ -1038,7 +1038,7 @@ pub async fn run_state_refresh(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let wiring = providers.validate_and_resolve_with_config(
+    let wiring = providers.validate_evaluated_config(
         &mut parsed,
         base_dir,
         true,
@@ -2530,7 +2530,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
         let wiring = providers
-            .validate_and_resolve_with_config(&mut parsed, &downstream, true, &[], &[])
+            .validate_evaluated_config(&mut parsed, &downstream, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2552,7 +2552,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
         let wiring = providers
-            .validate_and_resolve_with_config(&mut parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(&mut parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2574,7 +2574,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
         let wiring = providers
-            .validate_and_resolve_with_config(&mut parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(&mut parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(

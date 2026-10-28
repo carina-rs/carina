@@ -16,7 +16,9 @@ use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
     SavedPlanSchemaMismatchError,
 };
-use crate::wiring::{ExpandedCanonicalResources, WiringContext};
+use crate::wiring::{
+    CompleteProviderLoad, ExpandedCanonicalResources, ValidatedWiring, WiringContext,
+};
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -219,14 +221,47 @@ pub(crate) struct ReloadedVerifiedPlanFile {
     schema_references: PlanSchemaReferences,
 }
 
+/// Proof that one saved plan's artifact identities and schemas were checked
+/// against the borrowed provider context.
+///
+/// Its constructor is private to this module. Wiring can consume the proof,
+/// but no other caller can manufacture a successful saved-plan transition.
+pub(crate) struct SavedPlanArtifactsChecked<'context> {
+    plan: SchemaCheckedPlanFile,
+    context: std::marker::PhantomData<&'context WiringContext>,
+}
+
+impl<'context> SavedPlanArtifactsChecked<'context> {
+    fn new(plan: SchemaCheckedPlanFile, _context: &'context WiringContext) -> Self {
+        Self {
+            plan,
+            context: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn into_plan(self) -> SchemaCheckedPlanFile {
+        self.plan
+    }
+}
+
 impl ReloadedInspectedPlanFile {
-    /// Check artifact identities and schemas immediately after provider loading.
-    /// Every later secret/normalizer/provider transition consumes this proof.
-    pub(crate) fn verify_loaded_providers(
+    /// Consume a complete provider load and return the checked plan together
+    /// with the only wiring value that can execute it.
+    pub(crate) fn verify_provider_load(
         self,
-        ctx: &WiringContext,
+        providers: CompleteProviderLoad,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<SchemaCheckedPlanFile, AppError> {
+    ) -> Result<(SchemaCheckedPlanFile, ValidatedWiring), AppError> {
+        providers.verify_saved_plan_artifacts(|ctx| self.check_loaded_providers(ctx, apply_target))
+    }
+
+    /// Check artifact identities and schemas against the context borrowed by
+    /// the consuming wiring transition.
+    fn check_loaded_providers<'context>(
+        self,
+        ctx: &'context WiringContext,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<SavedPlanArtifactsChecked<'context>, AppError> {
         let recorded_artifacts = match &self {
             Self::Verified(plan) => plan.plan_file.provider_artifacts(),
             Self::NeedsSecretVerification(plan) => plan.plan_file.provider_artifacts(),
@@ -289,7 +324,7 @@ impl ReloadedInspectedPlanFile {
                 })
             }
         };
-        Ok(checked_plan)
+        Ok(SavedPlanArtifactsChecked::new(checked_plan, ctx))
     }
 }
 
@@ -364,8 +399,9 @@ impl SavedPlanSecretCandidates {
     }
 }
 
-/// Reloaded saved plan proven to match the currently loaded schemas. The
-/// secret-verification transition accepts only this checked state.
+/// Reloaded saved plan proven to match the artifact identities and schemas of
+/// the [`ValidatedWiring`] returned alongside it. The secret-verification
+/// transition accepts only this checked state.
 pub(crate) enum SchemaCheckedPlanFile {
     Verified(RehydratedPlanFile),
     NeedsSecretVerification(SchemaCheckedPendingPlanFile),
@@ -751,7 +787,7 @@ mod tests {
         PlanFile, PlanFileContents, RecordedProviderArtifact, SavedDataSourceValue,
     };
     use crate::error::AppError;
-    use crate::wiring::{LoadedProviderFactory, ValidatedWiring};
+    use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedWiring};
 
     struct ArtifactFactory {
         name: &'static str,
@@ -826,8 +862,22 @@ mod tests {
         )
     }
 
+    fn wasm_load(name: &'static str, bytes: &[u8]) -> ProviderLoad {
+        ProviderLoad::for_test(
+            vec![LoadedProviderFactory::for_test_with_bytes(
+                Box::new(ArtifactFactory { name }),
+                bytes,
+            )],
+            &[provider_config(name)],
+        )
+    }
+
     fn builtin_context() -> ValidatedWiring {
         ValidatedWiring::from_factories_for_test(Vec::new(), &[])
+    }
+
+    fn builtin_load() -> ProviderLoad {
+        ProviderLoad::for_test(Vec::new(), &[])
     }
 
     fn saved_provider_configs(
@@ -895,10 +945,15 @@ mod tests {
     #[test]
     fn changed_artifact_with_identical_schemas_fails_before_schema_checked_state() {
         let planned = wasm_context("mock", b"artifact A");
-        let loaded = wasm_context("mock", b"artifact B");
+        let loaded = wasm_load("mock", b"artifact B");
 
         let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
-            .verify_loaded_providers(loaded.context(), apply_target());
+            .verify_provider_load(
+                loaded
+                    .into_complete()
+                    .expect("test provider load is complete"),
+                apply_target(),
+            );
 
         let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = result else {
             panic!("changed provider bytes must not produce SchemaCheckedPlanFile")
@@ -968,12 +1023,36 @@ mod tests {
     #[test]
     fn unchanged_artifact_and_schemas_produce_schema_checked_state() {
         let planned = wasm_context("mock", b"artifact A");
-        let loaded = wasm_context("mock", b"artifact A");
+        let loaded = wasm_load("mock", b"artifact A");
 
         let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
-            .verify_loaded_providers(loaded.context(), apply_target());
+            .verify_provider_load(
+                loaded
+                    .into_complete()
+                    .expect("test provider load is complete"),
+                apply_target(),
+            );
 
-        assert!(matches!(result, Ok(SchemaCheckedPlanFile::Verified(_))));
+        assert!(matches!(
+            result,
+            Ok((SchemaCheckedPlanFile::Verified(_), _))
+        ));
+    }
+
+    #[test]
+    fn saved_plan_verification_bundles_checked_plan_with_checked_wiring() {
+        let planned = wasm_context("mock", b"artifact A");
+        let loaded = wasm_load("mock", b"artifact A")
+            .into_complete()
+            .expect("test provider load is complete");
+
+        let (checked, wiring) =
+            reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
+                .verify_provider_load(loaded, apply_target())
+                .expect("matching artifacts and schemas must verify together");
+
+        assert!(matches!(checked, SchemaCheckedPlanFile::Verified(_)));
+        assert!(wiring.context().provider_artifacts().contains_key("mock"));
     }
 
     #[test]
@@ -985,26 +1064,39 @@ mod tests {
             Some(&RecordedProviderArtifact::BuiltIn)
         );
 
-        let loaded = builtin_context();
-        let result = reloaded(plan).verify_loaded_providers(loaded.context(), apply_target());
+        let loaded = builtin_load()
+            .into_complete()
+            .expect("test provider load is complete");
+        let result = reloaded(plan).verify_provider_load(loaded, apply_target());
 
-        assert!(matches!(result, Ok(SchemaCheckedPlanFile::Verified(_))));
+        assert!(matches!(
+            result,
+            Ok((SchemaCheckedPlanFile::Verified(_), _))
+        ));
     }
 
     #[test]
     fn builtin_vs_wasm_and_missing_or_extra_provider_keys_are_mismatches() {
         let builtin_plan = plan_recorded_with(&builtin_context(), Vec::new());
 
-        let same_name = reloaded(builtin_plan.clone())
-            .verify_loaded_providers(wasm_context("mock", b"artifact").context(), apply_target());
+        let same_name = reloaded(builtin_plan.clone()).verify_provider_load(
+            wasm_load("mock", b"artifact")
+                .into_complete()
+                .expect("test provider load is complete"),
+            apply_target(),
+        );
         assert!(matches!(
             same_name,
             Err(AppError::SavedPlanProviderArtifactMismatch(ref mismatch))
                 if mismatch.providers.contains_key("mock")
         ));
 
-        let changed_keys = reloaded(builtin_plan)
-            .verify_loaded_providers(wasm_context("other", b"artifact").context(), apply_target());
+        let changed_keys = reloaded(builtin_plan).verify_provider_load(
+            wasm_load("other", b"artifact")
+                .into_complete()
+                .expect("test provider load is complete"),
+            apply_target(),
+        );
         let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = changed_keys else {
             panic!("missing and extra provider keys must invalidate a saved plan")
         };

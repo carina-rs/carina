@@ -413,6 +413,24 @@ pub struct ProviderLoad {
     load_errors: HashMap<String, String>,
 }
 
+/// Provider wiring whose loader diagnostics have been checked exactly once.
+///
+/// This type still exposes no context or factories. Concrete config validation
+/// or saved-plan artifact verification must consume it before execution can
+/// borrow the context through [`ValidatedWiring`].
+pub(crate) struct CompleteProviderLoad {
+    context: WiringContext,
+}
+
+/// Schema-only provider state used by collect-all validation and lint.
+///
+/// A hard loader failure may produce this value with an empty context. It has
+/// no transition into [`CompleteProviderLoad`] or [`ValidatedWiring`].
+pub(crate) struct ReportingProviderLoad {
+    context: WiringContext,
+    load_errors: HashMap<String, String>,
+}
+
 /// Provider wiring that has passed the concrete validation or saved-plan
 /// artifact-verification transition required by its command.
 ///
@@ -420,7 +438,7 @@ pub struct ProviderLoad {
 /// it owns the original load, every downstream borrow refers to the exact
 /// context whose validation or artifact evidence was checked.
 pub struct ValidatedWiring {
-    load: ProviderLoad,
+    load: CompleteProviderLoad,
 }
 
 /// Collected validation diagnostics plus the read-only schemas used by
@@ -444,6 +462,68 @@ impl ValidationReport<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validation_report_from<'a>(
+    context: &'a WiringContext,
+    load_errors: &HashMap<String, String>,
+    parsed: &mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+    duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+) -> ValidationReport<'a> {
+    let errors = match crate::commands::validate_and_resolve_errors_inner(
+        parsed,
+        base_dir,
+        context,
+        load_errors,
+        skip_resource_validation,
+        prior_inference_errors,
+        duplicate_declarations,
+        crate::commands::ConfigNameResolution::EvaluatedOnly,
+    ) {
+        Ok(crate::commands::ResolvedConfig::Evaluated(_)) => Vec::new(),
+        Ok(crate::commands::ResolvedConfig::Paired(_)) => {
+            unreachable!("evaluated-only validation returned pair")
+        }
+        Err(errors) => errors,
+    };
+    ValidationReport {
+        errors,
+        schemas: context.schemas(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_config_pair_with_context(
+    context: &WiringContext,
+    load_errors: &HashMap<String, String>,
+    mut parsed: carina_core::parser::InferredFile,
+    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+    duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
+    match crate::commands::validate_and_resolve_errors_inner(
+        &mut parsed,
+        base_dir,
+        context,
+        load_errors,
+        skip_resource_validation,
+        prior_inference_errors,
+        duplicate_declarations,
+        crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
+    )
+    .map_err(crate::commands::collapse_errors)?
+    {
+        crate::commands::ResolvedConfig::Paired(pair) => Ok(*pair),
+        crate::commands::ResolvedConfig::Evaluated(_) => {
+            unreachable!("paired validation returned evaluated-only")
+        }
+    }
+}
+
 impl ProviderLoad {
     /// Load the providers declared by one command configuration.
     pub(crate) fn load(providers: &[ProviderConfig], base_dir: &Path) -> Result<Self, AppError> {
@@ -462,11 +542,20 @@ impl ProviderLoad {
     pub(crate) fn load_reporting(
         providers: &[ProviderConfig],
         base_dir: &Path,
-    ) -> (Self, Option<AppError>) {
+    ) -> (ReportingProviderLoad, Option<AppError>) {
         match Self::load(providers, base_dir) {
-            Ok(loaded) => (loaded, None),
+            Ok(Self {
+                context,
+                load_errors,
+            }) => (
+                ReportingProviderLoad {
+                    context,
+                    load_errors,
+                },
+                None,
+            ),
             Err(error) => (
-                Self {
+                ReportingProviderLoad {
                     context: WiringContext::new(Vec::new(), providers),
                     load_errors: HashMap::new(),
                 },
@@ -475,31 +564,25 @@ impl ProviderLoad {
         }
     }
 
-    fn completeness_error(&self) -> Option<AppError> {
-        if self.load_errors.is_empty() {
-            return None;
+    /// Consume the loader result after proving that every declared provider
+    /// loaded successfully.
+    pub(crate) fn into_complete(self) -> Result<CompleteProviderLoad, AppError> {
+        let Self {
+            context,
+            load_errors,
+        } = self;
+        if load_errors.is_empty() {
+            return Ok(CompleteProviderLoad { context });
         }
 
-        let mut load_errors = self.load_errors.iter().collect::<Vec<_>>();
-        load_errors.sort_unstable_by_key(|(provider, _)| *provider);
-        Some(crate::commands::collapse_errors(
+        let mut load_errors = load_errors.into_iter().collect::<Vec<_>>();
+        load_errors.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Err(crate::commands::collapse_errors(
             load_errors
                 .into_iter()
-                .map(|(_provider, reason)| AppError::Validation(reason.clone()))
+                .map(|(_provider, reason)| AppError::Validation(reason))
                 .collect(),
         ))
-    }
-
-    pub(crate) fn ensure_complete(&self) -> Result<(), AppError> {
-        match self.completeness_error() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    fn into_validated(self) -> Result<ValidatedWiring, AppError> {
-        self.ensure_complete()?;
-        Ok(ValidatedWiring { load: self })
     }
 
     /// Run evaluated-config validation without minting executable wiring.
@@ -514,31 +597,20 @@ impl ProviderLoad {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
-        let errors = match crate::commands::validate_and_resolve_errors_inner(
-            parsed,
-            base_dir,
+        validation_report_from(
             &self.context,
             &self.load_errors,
+            parsed,
+            base_dir,
             skip_resource_validation,
             prior_inference_errors,
             duplicate_declarations,
-            crate::commands::ConfigNameResolution::EvaluatedOnly,
-        ) {
-            Ok(crate::commands::ResolvedConfig::Evaluated(_)) => Vec::new(),
-            Ok(crate::commands::ResolvedConfig::Paired(_)) => {
-                unreachable!("evaluated-only validation returned pair")
-            }
-            Err(errors) => errors,
-        };
-        ValidationReport {
-            errors,
-            schemas: self.context.schemas(),
-        }
+        )
     }
 
     /// Validate an evaluated config and consume this exact load into the
     /// executable wiring witness.
-    pub fn validate_and_resolve_with_config(
+    pub fn validate_evaluated_config(
         self,
         parsed: &mut carina_core::parser::InferredFile,
         base_dir: &Path,
@@ -546,26 +618,13 @@ impl ProviderLoad {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedWiring, AppError> {
-        // Resource-skipping commands historically omitted per-provider load
-        // diagnostics. Executable wiring now requires a complete load, so
-        // destroy and state refresh fail fast instead of validating or
-        // executing with an incomplete context.
-        if skip_resource_validation {
-            self.ensure_complete()?;
-        }
-        let errors = self
-            .validation_report(
-                parsed,
-                base_dir,
-                skip_resource_validation,
-                prior_inference_errors,
-                duplicate_declarations,
-            )
-            .into_errors();
-        if !errors.is_empty() {
-            return Err(crate::commands::collapse_errors(errors));
-        }
-        self.into_validated()
+        self.into_complete()?.validate_evaluated_config(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
     }
 
     /// Validate and canonicalize both snapshots, then mint executable wiring
@@ -586,68 +645,38 @@ impl ProviderLoad {
         ),
         AppError,
     > {
-        let pair = self.check_config_pair(
+        self.into_complete()?.validate_config_pair(
             parsed,
             unresolved,
             base_dir,
             skip_resource_validation,
             prior_inference_errors,
             duplicate_declarations,
-        )?;
-        let wiring = self.into_validated()?;
-        Ok((wiring, pair))
+        )
     }
 
-    /// Validate both config snapshots without exposing or minting wiring.
+    /// Validate both config snapshots without exposing resources or minting wiring.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_config_pair(
         &self,
-        mut parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::parser::InferredFile,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-    ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-        match crate::commands::validate_and_resolve_errors_inner(
-            &mut parsed,
-            base_dir,
+    ) -> Result<(), AppError> {
+        resolve_config_pair_with_context(
             &self.context,
             &self.load_errors,
+            parsed,
+            unresolved,
+            base_dir,
             skip_resource_validation,
             prior_inference_errors,
             duplicate_declarations,
-            crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
         )
-        .map_err(crate::commands::collapse_errors)?
-        {
-            crate::commands::ResolvedConfig::Paired(pair) => Ok(*pair),
-            crate::commands::ResolvedConfig::Evaluated(_) => {
-                unreachable!("paired validation returned evaluated-only")
-            }
-        }
-    }
-
-    pub(crate) fn schemas(&self) -> &SchemaRegistry {
-        self.context.schemas()
-    }
-
-    /// Verify a reloaded saved plan against this complete load, consuming the
-    /// load into the same validated wiring type used by live commands.
-    pub(crate) fn verify_saved_plan(
-        self,
-        inspected_plan: crate::commands::apply::saved_plan::ReloadedInspectedPlanFile,
-        apply_target: crate::commands::apply::ApplyTarget<'_>,
-    ) -> Result<
-        (
-            crate::commands::apply::saved_plan::SchemaCheckedPlanFile,
-            ValidatedWiring,
-        ),
-        AppError,
-    > {
-        self.ensure_complete()?;
-        let checked = inspected_plan.verify_loaded_providers(&self.context, apply_target)?;
-        Ok((checked, ValidatedWiring { load: self }))
+        .map(|_| ())
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -690,14 +719,117 @@ impl ProviderLoad {
     }
 }
 
+impl CompleteProviderLoad {
+    /// Validate an evaluated config after loader completeness has been proven.
+    fn validate_evaluated_config(
+        self,
+        parsed: &mut carina_core::parser::InferredFile,
+        base_dir: &Path,
+        skip_resource_validation: bool,
+        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<ValidatedWiring, AppError> {
+        let errors = validation_report_from(
+            &self.context,
+            &HashMap::new(),
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+        .into_errors();
+        if !errors.is_empty() {
+            return Err(crate::commands::collapse_errors(errors));
+        }
+        Ok(ValidatedWiring { load: self })
+    }
+
+    /// Validate both snapshots after loader completeness has been proven.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_config_pair(
+        self,
+        parsed: carina_core::parser::InferredFile,
+        unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+        base_dir: &Path,
+        skip_resource_validation: bool,
+        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<
+        (
+            ValidatedWiring,
+            CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+        ),
+        AppError,
+    > {
+        let pair = resolve_config_pair_with_context(
+            &self.context,
+            &HashMap::new(),
+            parsed,
+            unresolved,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )?;
+        Ok((ValidatedWiring { load: self }, pair))
+    }
+
+    /// Bind a saved-plan artifact proof to this exact complete provider load.
+    pub(crate) fn verify_saved_plan_artifacts(
+        self,
+        check: impl for<'context> FnOnce(
+            &'context WiringContext,
+        ) -> Result<
+            crate::commands::apply::saved_plan::SavedPlanArtifactsChecked<'context>,
+            AppError,
+        >,
+    ) -> Result<
+        (
+            crate::commands::apply::saved_plan::SchemaCheckedPlanFile,
+            ValidatedWiring,
+        ),
+        AppError,
+    > {
+        let checked = check(&self.context)?;
+        let checked_plan = checked.into_plan();
+        Ok((checked_plan, ValidatedWiring { load: self }))
+    }
+}
+
+impl ReportingProviderLoad {
+    pub(crate) fn validation_report<'a>(
+        &'a self,
+        parsed: &mut carina_core::parser::InferredFile,
+        base_dir: &Path,
+        skip_resource_validation: bool,
+        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> ValidationReport<'a> {
+        validation_report_from(
+            &self.context,
+            &self.load_errors,
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+    }
+
+    pub(crate) fn schemas(&self) -> &SchemaRegistry {
+        self.context.schemas()
+    }
+}
+
 impl ValidatedWiring {
     /// Borrow the exact context that passed the minting transition.
     pub fn context(&self) -> &WiringContext {
         &self.load.context
     }
 
-    /// Revalidate a bootstrap-reloaded config against the already validated
-    /// provider load without minting or loading another context.
+    /// Revalidate a reloaded or saved-plan current config against the already
+    /// validated provider load without minting or loading another context.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn revalidate_config_pair(
         &self,
@@ -708,7 +840,9 @@ impl ValidatedWiring {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-        self.load.check_config_pair(
+        resolve_config_pair_with_context(
+            &self.load.context,
+            &HashMap::new(),
             parsed,
             unresolved,
             base_dir,
@@ -724,7 +858,9 @@ impl ValidatedWiring {
         provider_configs: &[ProviderConfig],
     ) -> Self {
         Self {
-            load: ProviderLoad::for_test(factories, provider_configs),
+            load: ProviderLoad::for_test(factories, provider_configs)
+                .into_complete()
+                .expect("test provider load must be complete"),
         }
     }
 
@@ -740,7 +876,11 @@ impl ValidatedWiring {
     /// loader and the bootstrap revalidation transition.
     #[cfg(test)]
     pub(crate) fn from_load_for_test(load: ProviderLoad) -> Self {
-        Self { load }
+        Self {
+            load: load
+                .into_complete()
+                .expect("test provider load must be complete"),
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -754,7 +894,9 @@ impl ValidatedWiring {
                 factories,
                 provider_configs,
                 additional_schemas,
-            ),
+            )
+            .into_complete()
+            .expect("fixture provider load must be complete"),
         }
     }
 

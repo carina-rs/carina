@@ -19,29 +19,80 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
-fn execution_validation_reports_every_load_error_in_provider_name_order() {
-    let providers = ProviderLoad::for_test_with_load_errors(
-        Vec::new(),
-        &[],
-        HashMap::from([
-            ("zeta".to_string(), "zeta failed".to_string()),
-            ("alpha".to_string(), "alpha failed".to_string()),
-        ]),
-    );
+fn execution_minting_checks_load_completeness_first_in_provider_name_order() {
+    let incomplete_load = || {
+        ProviderLoad::for_test_with_load_errors(
+            Vec::new(),
+            &[],
+            HashMap::from([
+                ("zeta".to_string(), "zeta failed".to_string()),
+                ("alpha".to_string(), "alpha failed".to_string()),
+            ]),
+        )
+    };
+    let inference_error = carina_core::validation::inference::ExportInferenceError {
+        index: 0,
+        name: "broken".to_string(),
+        error: carina_core::validation::inference::InferenceError::UnknownBinding {
+            binding: "missing".to_string(),
+        },
+    };
 
     let mut parsed = carina_core::parser::InferredFile::default();
-    let error = match providers.validate_and_resolve_with_config(
+    let evaluated_error = match incomplete_load().validate_evaluated_config(
         &mut parsed,
         Path::new("."),
         true,
+        std::slice::from_ref(&inference_error),
         &[],
+    ) {
+        Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
+        Err(error) => error,
+    };
+    let unresolved = carina_core::parser::ParsedFile::default();
+    let pair_error = match incomplete_load().validate_config_pair(
+        carina_core::parser::InferredFile::default(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        Path::new("."),
+        true,
+        &[inference_error],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
     };
 
-    assert_eq!(error.to_string(), "alpha failed\nzeta failed");
+    assert_eq!(evaluated_error.to_string(), "alpha failed\nzeta failed");
+    assert_eq!(pair_error.to_string(), "alpha failed\nzeta failed");
+}
+
+#[test]
+fn hard_reporting_load_returns_schema_only_diagnostics() {
+    let base = tempfile::tempdir().unwrap();
+    let provider = ProviderConfig {
+        name: "mock".to_string(),
+        source: Some("file:///definitely-missing/mock.wasm".parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let (providers, hard_error) =
+        ProviderLoad::load_reporting(&[provider.clone(), provider], base.path());
+    assert!(
+        hard_error
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("declared more than once")),
+        "fixture must exercise the hard loader failure"
+    );
+
+    let mut parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&mut parsed, base.path(), true, &[], &[]);
+
+    assert!(report.errors().is_empty());
+    assert!(report.schemas().iter().next().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

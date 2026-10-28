@@ -89,7 +89,7 @@ pub async fn run_destroy(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let wiring = providers.validate_and_resolve_with_config(
+    let wiring = providers.validate_evaluated_config(
         &mut parsed,
         base_dir,
         true,
@@ -1299,8 +1299,7 @@ async fn run_destroy_locked(
             .await;
         }
     };
-    let wiring = match providers.validate_and_resolve_with_config(parsed, base_dir, true, &[], &[])
-    {
+    let wiring = match providers.validate_evaluated_config(parsed, base_dir, true, &[], &[]) {
         Ok(wiring) => wiring,
         Err(error) => {
             return finish_lock_command(
@@ -2449,7 +2448,7 @@ mod tests {
         let providers =
             ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
         let wiring = providers
-            .validate_and_resolve_with_config(
+            .validate_evaluated_config(
                 &mut parsed,
                 base_dir,
                 true,

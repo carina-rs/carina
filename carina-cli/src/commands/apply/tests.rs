@@ -597,14 +597,15 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
-    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
     let plan_file = record_with_test_schemas(contents, &schemas);
 
     let reloaded = inspected_saved_plan(plan_file)
         .reload_in_flight_from_locked_state(None)
         .expect("current-state snapshot should reload");
-    let checked = reloaded.verify_loaded_providers(
-        &ctx,
+    let checked = reloaded.verify_provider_load(
+        ProviderLoad::for_test(Vec::new(), &[])
+            .into_complete()
+            .expect("test provider load is complete"),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("reviewed-plan.json"),
             source_dir: Path::new("."),
@@ -612,7 +613,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     );
 
     assert!(
-        matches!(checked, Ok(SchemaCheckedPlanFile::Verified(_))),
+        matches!(checked, Ok((SchemaCheckedPlanFile::Verified(_), _))),
         "the immutable pre-reload reference inventory must verify unchanged schemas"
     );
 }
@@ -3738,7 +3739,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let providers =
         ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
     let wiring = providers
-        .validate_and_resolve_with_config(
+        .validate_evaluated_config(
             &mut parsed,
             base_dir,
             false,

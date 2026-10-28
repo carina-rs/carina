@@ -7,7 +7,7 @@
 //!   carina-cli/src/commands/apply/mod.rs:477
 //!     load_configuration_with_config(path, ...)            (no expand)
 //!   carina-cli/src/commands/apply/mod.rs:488
-//!     validate_and_resolve_with_config(&mut parsed, ...)   (expands)
+//!     ProviderLoad::validate_evaluated_config(...)         (expands)
 //!       -> carina-cli/src/commands/mod.rs:285
 //!            module_resolver::resolve_modules_with_config(parsed, ...)
 //!   carina-cli/src/commands/apply/mod.rs:999
@@ -518,7 +518,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.providers,
     );
     let wiring = providers
-        .validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors, &[])
+        .validate_evaluated_config(&mut parsed, base_dir, true, &inference_errors, &[])
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();

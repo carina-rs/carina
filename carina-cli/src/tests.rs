@@ -2138,7 +2138,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
     let wiring = providers
-        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
         .unwrap();
     let result = run_state_refresh_locked(
         &mut parsed,
@@ -2187,7 +2187,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
     let wiring = providers
-        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2255,7 +2255,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
     let wiring = providers
-        .validate_and_resolve_with_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(&mut parsed, std::path::Path::new("."), true, &[], &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
