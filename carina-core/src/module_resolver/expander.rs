@@ -1449,19 +1449,19 @@ fn prefix_module_resource(
         arguments,
     )?;
 
-    let scope = new_resource
-        .module_source
-        .as_ref()
-        .and_then(ModuleSource::identity_scope)
-        .map(|child| module_instance_scope.with_child(&child))
-        .unwrap_or_else(|| module_instance_scope.clone());
-    let call_path = new_resource
-        .module_source
-        .as_ref()
-        .and_then(ModuleSource::module_call_path)
-        .cloned()
-        .map(|path| path.prepend(module_call.clone()))
-        .unwrap_or_else(|| CompositionCallPath::direct(module_call.clone()));
+    let (scope, call_path) = match new_resource.module_source.as_ref() {
+        Some(ModuleSource::Module(child)) => (
+            module_instance_scope.with_child(child.identity_scope()),
+            child
+                .module_call_path()
+                .clone()
+                .prepend(module_call.clone()),
+        ),
+        Some(ModuleSource::Root) | None => (
+            module_instance_scope.clone(),
+            CompositionCallPath::direct(module_call.clone()),
+        ),
+    };
     new_resource.module_source = Some(ModuleSource::expanded_module(
         module_name,
         instance_prefix,
@@ -1520,19 +1520,19 @@ fn prefix_module_data_source(
         arguments,
     )?;
 
-    let scope = new_data_source
-        .module_source
-        .as_ref()
-        .and_then(ModuleSource::identity_scope)
-        .map(|child| module_instance_scope.with_child(&child))
-        .unwrap_or_else(|| module_instance_scope.clone());
-    let call_path = new_data_source
-        .module_source
-        .as_ref()
-        .and_then(ModuleSource::module_call_path)
-        .cloned()
-        .map(|path| path.prepend(module_call.clone()))
-        .unwrap_or_else(|| CompositionCallPath::direct(module_call.clone()));
+    let (scope, call_path) = match new_data_source.module_source.as_ref() {
+        Some(ModuleSource::Module(child)) => (
+            module_instance_scope.with_child(child.identity_scope()),
+            child
+                .module_call_path()
+                .clone()
+                .prepend(module_call.clone()),
+        ),
+        Some(ModuleSource::Root) | None => (
+            module_instance_scope.clone(),
+            CompositionCallPath::direct(module_call.clone()),
+        ),
+    };
     new_data_source.module_source = Some(ModuleSource::expanded_module(
         module_name,
         instance_prefix,
@@ -2589,14 +2589,8 @@ pub fn reconcile_anonymous_module_instances(
             {
                 r.binding = Some(format!("{}.{}", new_prefix, binding_rest));
             }
-            if let Some(crate::resource::ModuleSource::Module {
-                name,
-                instance: _,
-                scope,
-                call_path,
-            }) = &r.module_source
-            {
-                let mut remapped_call_path = call_path.clone();
+            if let Some(crate::resource::ModuleSource::Module(module)) = &r.module_source {
+                let mut remapped_call_path = module.module_call_path().clone();
                 for call in remapped_call_path.calls_mut() {
                     if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
                         call.instance = rewritten;
@@ -2607,14 +2601,14 @@ pub fn reconcile_anonymous_module_instances(
                         call.binding = Some(rewritten);
                     }
                 }
-                r.module_source = Some(crate::resource::ModuleSource::Module {
-                    name: name.clone(),
-                    instance: new_prefix.clone(),
-                    scope: scope
-                        .as_ref()
-                        .map(|scope| scope.remap_prefix(&old_prefix, &new_prefix)),
-                    call_path: remapped_call_path,
-                });
+                r.module_source = Some(crate::resource::ModuleSource::expanded_module(
+                    module.name(),
+                    new_prefix.clone(),
+                    module
+                        .identity_scope()
+                        .remap_prefix(&old_prefix, &new_prefix),
+                    remapped_call_path,
+                ));
             }
         }
     }
@@ -2948,7 +2942,8 @@ mod tests {
             roles
                 .module_source
                 .as_ref()
-                .and_then(ModuleSource::module_call_path),
+                .and_then(ModuleSource::module_call)
+                .map(|source| source.module_call_path()),
             Some(&CompositionCallPath::direct(expanded_call)),
         );
     }

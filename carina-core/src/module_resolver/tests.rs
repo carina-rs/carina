@@ -316,18 +316,12 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
          got {:?}",
         policy.id.identity_state(),
     );
-    let Some(crate::resource::ModuleSource::Module {
-        name,
-        instance,
-        call_path,
-        ..
-    }) = &policy.module_source
-    else {
+    let Some(crate::resource::ModuleSource::Module(source)) = &policy.module_source else {
         panic!("expanded resource must retain its live module source")
     };
-    assert_eq!(name, "policy_module");
-    assert_eq!(instance, "bootstrap");
-    assert_eq!(&call_path.immediate().id, call.id());
+    assert_eq!(source.name(), "policy_module");
+    assert_eq!(source.instance(), "bootstrap");
+    assert_eq!(&source.module_call_path().immediate().id, call.id());
 }
 
 #[test]
@@ -405,18 +399,12 @@ fn test_expand_module_call() {
         sg.get_attr("vpc_id"),
         Some(&Value::Concrete(ConcreteValue::String("vpc-456".into())))
     );
-    let Some(crate::resource::ModuleSource::Module {
-        name,
-        instance,
-        call_path,
-        ..
-    }) = &sg.module_source
-    else {
+    let Some(crate::resource::ModuleSource::Module(source)) = &sg.module_source else {
         panic!("expanded resource must retain its live module source")
     };
-    assert_eq!(name, "test_module");
-    assert_eq!(instance, "my_instance");
-    assert_eq!(&call_path.immediate().id, call.id());
+    assert_eq!(source.name(), "test_module");
+    assert_eq!(source.instance(), "my_instance");
+    assert_eq!(&source.module_call_path().immediate().id, call.id());
     // Module info should NOT be in attributes
     assert!(!sg.attributes.contains_key("_module"));
     assert!(!sg.attributes.contains_key("_module_instance"));
@@ -561,21 +549,19 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix)),
         dependency_bindings: BTreeSet::new(),
-        module_source: Some(crate::resource::ModuleSource::Module {
-            name: "thing".to_string(),
-            instance: current_prefix.clone(),
-            scope: None,
-            call_path: Box::new(crate::resource::CompositionCallPath::direct(
-                crate::resource::CompositionCall {
-                    id: crate::parser::ModuleCallId::test_dummy_in("reconcile.crn"),
-                    module_name: "thing".to_string(),
-                    binding: None,
-                    instance: current_prefix.clone(),
-                    module_source: None,
-                    module_directory: None,
-                },
-            )),
-        }),
+        module_source: Some(crate::resource::ModuleSource::expanded_module(
+            "thing",
+            current_prefix.clone(),
+            crate::resource::ModuleInstanceScope::for_call("thing", None, &current_prefix),
+            crate::resource::CompositionCallPath::direct(crate::resource::CompositionCall {
+                id: crate::parser::ModuleCallId::test_dummy_in("reconcile.crn"),
+                module_name: "thing".to_string(),
+                binding: None,
+                instance: current_prefix.clone(),
+                module_source: None,
+                module_directory: None,
+            }),
+        )),
         default_tag_keys: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];
@@ -5979,7 +5965,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     assert!(
         matches!(
             d.template_resource.module_source,
-            Some(crate::resource::ModuleSource::Module { ref instance, .. }) if instance == "r"
+            Some(crate::resource::ModuleSource::Module(ref source)) if source.instance() == "r"
         ),
         "template_resource must carry the module instance source; got: {:?}",
         d.template_resource.module_source

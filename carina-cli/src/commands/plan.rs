@@ -17,12 +17,13 @@ use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, SavedPlan, SavedPlanModuleSources};
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     CompositionSourceIdentityResolver, ConcreteValue, Current, DataSource, LiveComposition,
-    Resource, ResourceId, SavedComposition, SavedCompositionOriginId, State, Value,
+    Resource, ResourceId, SavedComposition, SavedCompositionOriginId, SavedDataSource,
+    SavedModuleSource, SavedResource, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -460,6 +461,50 @@ struct ProviderEvidence {
 pub struct PlanFile {
     contents: PlanFileContents,
     evidence: ProviderEvidence,
+    saved_module_sources: PlanFileSavedModuleSources,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlanFileSavedModuleSources {
+    plan: SavedPlanModuleSources,
+    sorted_resources: Vec<Option<SavedModuleSource>>,
+    unresolved_resources: Vec<Option<SavedModuleSource>>,
+    data_sources: Vec<Option<SavedModuleSource>>,
+    data_source_origins: Vec<Option<SavedModuleSource>>,
+}
+
+fn into_saved_resources(
+    resources: Vec<Resource>,
+    retained: &[Option<SavedModuleSource>],
+) -> Vec<SavedResource> {
+    resources
+        .into_iter()
+        .enumerate()
+        .map(|(index, resource)| {
+            let mut saved = SavedResource::from(resource);
+            if saved.module_source.is_none() {
+                saved.module_source = retained.get(index).cloned().flatten();
+            }
+            saved
+        })
+        .collect()
+}
+
+fn into_saved_data_sources(
+    data_sources: Vec<DataSource>,
+    retained: &[Option<SavedModuleSource>],
+) -> Vec<SavedDataSource> {
+    data_sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, data_source)| {
+            let mut saved = SavedDataSource::from(data_source);
+            if saved.module_source.is_none() {
+                saved.module_source = retained.get(index).cloned().flatten();
+            }
+            saved
+        })
+        .collect()
 }
 
 /// Private format-27 wire representation.
@@ -476,14 +521,14 @@ struct PlanFileWire {
     state_serial: Option<u64>,
     provider_configs: SavedProviderConfigs,
     backend_config: Option<BackendConfig>,
-    plan: Plan,
-    sorted_resources: Vec<Resource>,
-    unresolved_resources: Vec<Resource>,
+    plan: SavedPlan,
+    sorted_resources: Vec<SavedResource>,
+    unresolved_resources: Vec<SavedResource>,
     compositions: Vec<SavedComposition>,
     #[serde(default)]
-    data_sources: Vec<DataSource>,
+    data_sources: Vec<SavedDataSource>,
     #[serde(default)]
-    data_source_origins: Vec<DataSource>,
+    data_source_origins: Vec<SavedDataSource>,
     data_source_values: Vec<SavedDataSourceValue>,
     current_states: Vec<CurrentStateEntry>,
     upstream_snapshot: HashMap<String, HashMap<String, Value>>,
@@ -716,7 +761,11 @@ impl ProviderEvidence {
 
 impl From<PlanFile> for PlanFileWire {
     fn from(plan_file: PlanFile) -> Self {
-        let PlanFile { contents, evidence } = plan_file;
+        let PlanFile {
+            contents,
+            evidence,
+            saved_module_sources,
+        } = plan_file;
         let PlanFileContents {
             version,
             carina_version,
@@ -751,12 +800,21 @@ impl From<PlanFile> for PlanFileWire {
             state_serial,
             provider_configs,
             backend_config,
-            plan,
-            sorted_resources,
-            unresolved_resources,
+            plan: plan.into_saved_with_module_sources(&saved_module_sources.plan),
+            sorted_resources: into_saved_resources(
+                sorted_resources,
+                &saved_module_sources.sorted_resources,
+            ),
+            unresolved_resources: into_saved_resources(
+                unresolved_resources,
+                &saved_module_sources.unresolved_resources,
+            ),
             compositions,
-            data_sources,
-            data_source_origins,
+            data_sources: into_saved_data_sources(data_sources, &saved_module_sources.data_sources),
+            data_source_origins: into_saved_data_sources(
+                data_source_origins,
+                &saved_module_sources.data_source_origins,
+            ),
             data_source_values,
             current_states,
             upstream_snapshot,
@@ -795,6 +853,30 @@ impl TryFrom<PlanFileWire> for PlanFile {
             schema_fingerprints,
             provider_artifacts,
         } = wire;
+        let sorted_resource_sources = sorted_resources
+            .iter()
+            .map(|resource| resource.module_source.clone())
+            .collect();
+        let unresolved_resource_sources = unresolved_resources
+            .iter()
+            .map(|resource| resource.module_source.clone())
+            .collect();
+        let data_source_sources = data_sources
+            .iter()
+            .map(|data_source| data_source.module_source.clone())
+            .collect();
+        let data_source_origin_sources = data_source_origins
+            .iter()
+            .map(|data_source| data_source.module_source.clone())
+            .collect();
+        let (plan, plan_sources) = plan.into_live_with_module_sources();
+        let saved_module_sources = PlanFileSavedModuleSources {
+            plan: plan_sources,
+            sorted_resources: sorted_resource_sources,
+            unresolved_resources: unresolved_resource_sources,
+            data_sources: data_source_sources,
+            data_source_origins: data_source_origin_sources,
+        };
         let contents = PlanFileContents {
             version,
             carina_version,
@@ -805,11 +887,23 @@ impl TryFrom<PlanFileWire> for PlanFile {
             provider_configs,
             backend_config,
             plan,
-            sorted_resources,
-            unresolved_resources,
+            sorted_resources: sorted_resources
+                .into_iter()
+                .map(SavedResource::into_live)
+                .collect(),
+            unresolved_resources: unresolved_resources
+                .into_iter()
+                .map(SavedResource::into_live)
+                .collect(),
             compositions,
-            data_sources,
-            data_source_origins,
+            data_sources: data_sources
+                .into_iter()
+                .map(SavedDataSource::into_live)
+                .collect(),
+            data_source_origins: data_source_origins
+                .into_iter()
+                .map(SavedDataSource::into_live)
+                .collect(),
             data_source_values,
             current_states,
             upstream_snapshot,
@@ -823,7 +917,11 @@ impl TryFrom<PlanFileWire> for PlanFile {
             &references,
             &contents.provider_configs,
         )?;
-        Ok(Self { contents, evidence })
+        Ok(Self {
+            contents,
+            evidence,
+            saved_module_sources,
+        })
     }
 }
 
@@ -844,6 +942,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
+            saved_module_sources: PlanFileSavedModuleSources::default(),
         })
     }
 
@@ -993,6 +1092,7 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
+            saved_module_sources: _,
         } = self;
         let moved_origins = MovedOrigins::from_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents

@@ -76,8 +76,7 @@ query {}
         &parsed.compositions,
         std::slice::from_ref(&parsed.data_sources[0]),
         &parsed.data_sources,
-    )
-    .expect("live module source must have a call path");
+    );
 
     assert_eq!(relevant.len(), 1);
     assert_eq!(
@@ -161,8 +160,7 @@ outer {{}}
         &parsed.compositions,
         &parsed.data_sources,
         &parsed.data_sources,
-    )
-    .expect("live nested module sources must have call paths");
+    );
 
     assert!(
         relevant.iter().any(|composition| {

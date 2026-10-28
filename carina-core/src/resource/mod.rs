@@ -802,8 +802,26 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 /// let _: ResolvedResource = resource.into();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "Resource", into = "Resource")]
-pub struct ResolvedResource(Resource);
+#[serde(bound(
+    serialize = "S: Serialize + Clone",
+    deserialize = "S: Deserialize<'de>"
+))]
+#[serde(try_from = "Resource<S>", into = "Resource<S>")]
+pub struct ResolvedResource<S = ModuleSource>(Resource<S>);
+
+pub type SavedResolvedResource = ResolvedResource<SavedModuleSource>;
+
+impl From<ResolvedResource> for SavedResolvedResource {
+    fn from(resource: ResolvedResource) -> Self {
+        Self::new(resource.into_inner().into())
+    }
+}
+
+impl ResolvedResource<SavedModuleSource> {
+    pub fn into_live(self) -> ResolvedResource {
+        ResolvedResource::new(self.into_inner().into_live())
+    }
+}
 
 /// A resource reached a resolved-only pipeline boundary before its identity
 /// was assigned.
@@ -818,9 +836,11 @@ impl ResolvedResource {
     pub fn from_id(id: ResolvedResourceId) -> Self {
         Self(Resource::from_id(id.into_inner()))
     }
+}
 
+impl<S> ResolvedResource<S> {
     /// Construct from a [`Resource`], panicking if identity is pending.
-    pub fn new(resource: Resource) -> Self {
+    pub fn new(resource: Resource<S>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
@@ -832,7 +852,7 @@ impl ResolvedResource {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(resource: Resource) -> Option<Self> {
+    pub fn try_new(resource: Resource<S>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self(resource)),
@@ -842,7 +862,7 @@ impl ResolvedResource {
     /// Convert a whole resource collection at the pipeline boundary where
     /// identity assignment is complete.
     pub fn collect_resolved(
-        resources: impl IntoIterator<Item = Resource>,
+        resources: impl IntoIterator<Item = Resource<S>>,
     ) -> Result<Vec<Self>, PendingResourceIdentityError> {
         resources
             .into_iter()
@@ -856,17 +876,21 @@ impl ResolvedResource {
     }
 
     /// Borrow the inner [`Resource`].
-    pub fn as_inner(&self) -> &Resource {
+    pub fn as_inner(&self) -> &Resource<S> {
         &self.0
     }
 
+    pub(crate) fn as_inner_mut(&mut self) -> &mut Resource<S> {
+        &mut self.0
+    }
+
     /// Borrow the underlying resource for provider-boundary consumers.
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &Resource<S> {
         self.as_inner()
     }
 
     /// Consume and return the inner [`Resource`].
-    pub fn into_inner(self) -> Resource {
+    pub fn into_inner(self) -> Resource<S> {
         self.0
     }
 
@@ -889,34 +913,34 @@ impl ResolvedResource {
 
     /// Set an attribute without weakening the resolved-identity invariant.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
-        self.0.set_attr(key, value);
+        self.0.attributes.insert(key.into(), value);
     }
 }
 
-impl Deref for ResolvedResource {
-    type Target = Resource;
+impl<S> Deref for ResolvedResource<S> {
+    type Target = Resource<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl From<ResolvedResource> for Resource {
-    fn from(resource: ResolvedResource) -> Self {
+impl<S> From<ResolvedResource<S>> for Resource<S> {
+    fn from(resource: ResolvedResource<S>) -> Self {
         resource.0
     }
 }
 
-impl TryFrom<Resource> for ResolvedResource {
+impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
     type Error = String;
 
-    fn try_from(resource: Resource) -> Result<Self, Self::Error> {
+    fn try_from(resource: Resource<S>) -> Result<Self, Self::Error> {
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
 }
 
-impl AsRef<Resource> for ResolvedResource {
-    fn as_ref(&self) -> &Resource {
+impl<S> AsRef<Resource<S>> for ResolvedResource<S> {
+    fn as_ref(&self) -> &Resource<S> {
         self.as_inner()
     }
 }
@@ -5823,13 +5847,6 @@ impl ModuleInstanceScope {
         }
     }
 
-    fn bound(instance: &str) -> Self {
-        Self {
-            key: instance.to_string(),
-            display: ModuleInstanceScopeDisplay::Bound(instance.to_string()),
-        }
-    }
-
     pub(crate) fn with_child(&self, child: &Self) -> Self {
         let display = match (&self.display, &child.display) {
             (
@@ -5872,67 +5889,93 @@ impl ModuleInstanceScope {
     }
 }
 
-/// Source of a resource (root, a live module call, or saved display metadata).
+/// Source of a live resource.
 ///
-/// Live module sources always retain their parser-minted call path. Saved
-/// resources intentionally decode into [`ModuleSource::SavedModule`] because
-/// the portable resource representation stores only display metadata; it must
-/// never masquerade as a live source with a missing identity.
+/// Persisted resources use [`SavedModuleSource`] instead. Keeping the two
+/// representations distinct prevents saved display metadata from entering
+/// live expansion, validation, or composition-gating paths.
 #[derive(Debug, Clone)]
 pub enum ModuleSource {
     /// Resource defined at the root level
     Root,
     /// Resource from a module instantiation
-    Module {
-        /// Module name (e.g., "web_tier")
-        name: String,
-        /// Instance binding name (e.g., "web")
-        instance: String,
-        /// Full nested instance path plus its authored diagnostic form.
-        scope: Option<ModuleInstanceScope>,
-        /// Parser-minted call path that owns this expanded node.
-        call_path: Box<composition::CompositionCallPath>,
-    },
-    /// Display metadata decoded from a persisted resource.
-    SavedModule {
-        /// Module name (e.g., "web_tier")
-        name: String,
-        /// Instance binding name (e.g., "web")
-        instance: String,
-    },
+    Module(ModuleCallSource),
 }
 
-/// Stable persisted representation of [`ModuleSource`]. Live-only identity is
-/// deliberately projected away and decodes into the explicit saved variant.
-#[derive(Serialize, Deserialize)]
-enum SavedModuleSource {
+/// A live module source with the complete parser-minted identity required by
+/// every live consumer.
+#[derive(Debug, Clone)]
+pub struct ModuleCallSource {
+    /// Module name (e.g., "web_tier").
+    pub(crate) name: String,
+    /// Instance binding name (e.g., "web").
+    pub(crate) instance: String,
+    /// Full nested instance path plus its authored diagnostic form.
+    pub(crate) scope: ModuleInstanceScope,
+    /// Parser-minted call path that owns this expanded node.
+    pub(crate) call_path: Box<composition::CompositionCallPath>,
+}
+
+impl ModuleCallSource {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    pub(crate) fn identity_scope(&self) -> &ModuleInstanceScope {
+        &self.scope
+    }
+
+    /// Return the complete call path for this live module source.
+    pub fn module_call_path(&self) -> &composition::CompositionCallPath {
+        &self.call_path
+    }
+}
+
+/// Stable persisted module-source metadata.
+///
+/// This deliberately omits live-only call identity while retaining the
+/// historical JSON shape used by saved plans.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SavedModuleSource {
     Root,
     Module { name: String, instance: String },
 }
 
-impl Serialize for ModuleSource {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let saved = match self {
-            Self::Root => SavedModuleSource::Root,
-            Self::Module { name, instance, .. } | Self::SavedModule { name, instance } => {
-                SavedModuleSource::Module {
-                    name: name.clone(),
-                    instance: instance.clone(),
-                }
-            }
-        };
-        saved.serialize(serializer)
+impl From<&ModuleSource> for SavedModuleSource {
+    fn from(source: &ModuleSource) -> Self {
+        match source {
+            ModuleSource::Root => Self::Root,
+            ModuleSource::Module(module) => Self::Module {
+                name: module.name.clone(),
+                instance: module.instance.clone(),
+            },
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for ModuleSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match SavedModuleSource::deserialize(deserializer)? {
-            SavedModuleSource::Root => Ok(Self::Root),
-            SavedModuleSource::Module { name, instance } => {
-                Ok(Self::SavedModule { name, instance })
-            }
+impl SavedModuleSource {
+    /// Recover the only saved source that is also complete live metadata.
+    /// A saved module deliberately has no call path and therefore cannot
+    /// cross this boundary.
+    pub(crate) fn into_live_root(self) -> Option<ModuleSource> {
+        match self {
+            Self::Root => Some(ModuleSource::Root),
+            Self::Module {
+                name: _name,
+                instance: _instance,
+            } => None,
         }
+    }
+}
+
+impl Serialize for ModuleSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let saved = SavedModuleSource::from(self);
+        saved.serialize(serializer)
     }
 }
 
@@ -5940,26 +5983,7 @@ impl PartialEq for ModuleSource {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Root, Self::Root) => true,
-            (
-                Self::Module {
-                    call_path: left_call_path,
-                    ..
-                },
-                Self::Module {
-                    call_path: right_call_path,
-                    ..
-                },
-            ) => left_call_path == right_call_path,
-            (
-                Self::SavedModule {
-                    name: left_name,
-                    instance: left_instance,
-                },
-                Self::SavedModule {
-                    name: right_name,
-                    instance: right_instance,
-                },
-            ) => left_name == right_name && left_instance == right_instance,
+            (Self::Module(left), Self::Module(right)) => left.call_path == right.call_path,
             _ => false,
         }
     }
@@ -5974,72 +5998,38 @@ impl Hash for ModuleSource {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Root => {}
-            Self::Module { call_path, .. } => call_path.hash(state),
-            Self::SavedModule { name, instance } => {
-                name.hash(state);
-                instance.hash(state);
-            }
+            Self::Module(module) => module.call_path.hash(state),
         }
     }
 }
 
 impl ModuleSource {
-    /// Create persisted/display-only module metadata with no live call ID.
-    pub fn saved_module(name: impl Into<String>, instance: impl Into<String>) -> Self {
-        Self::SavedModule {
-            name: name.into(),
-            instance: instance.into(),
-        }
-    }
-
     pub(crate) fn expanded_module(
         name: impl Into<String>,
         instance: impl Into<String>,
         scope: ModuleInstanceScope,
         call_path: composition::CompositionCallPath,
     ) -> Self {
-        Self::Module {
+        Self::Module(ModuleCallSource {
             name: name.into(),
             instance: instance.into(),
-            scope: Some(scope),
+            scope,
             call_path: Box::new(call_path),
-        }
+        })
     }
 
-    pub fn module_call_path(&self) -> Option<&composition::CompositionCallPath> {
+    pub fn module_call(&self) -> Option<&ModuleCallSource> {
         match self {
-            Self::Module { call_path, .. } => Some(call_path),
-            Self::Root | Self::SavedModule { .. } => None,
+            Self::Root => None,
+            Self::Module(module) => Some(module),
         }
     }
 
     pub(crate) fn identity_scope(&self) -> Option<ModuleInstanceScope> {
         match self {
             Self::Root => None,
-            Self::Module {
-                instance, scope, ..
-            } => Some(
-                scope
-                    .clone()
-                    .unwrap_or_else(|| ModuleInstanceScope::bound(instance)),
-            ),
-            Self::SavedModule { instance, .. } => Some(ModuleInstanceScope::bound(instance)),
+            Self::Module(module) => Some(module.scope.clone()),
         }
-    }
-
-    /// User-facing module name and instance for either live or saved sources.
-    pub fn module_display(&self) -> Option<(&str, &str)> {
-        match self {
-            Self::Root => None,
-            Self::Module { name, instance, .. } | Self::SavedModule { name, instance } => {
-                Some((name, instance))
-            }
-        }
-    }
-
-    /// Check if this is the root source
-    pub fn is_root(&self) -> bool {
-        matches!(self, Self::Root)
     }
 
     /// System identity of the outer module instance that owns this leaf.
@@ -6049,9 +6039,7 @@ impl ModuleSource {
     pub fn outer_instance_identity(&self) -> Option<ResourceIdentity> {
         match self {
             Self::Root => None,
-            Self::Module { instance, .. } | Self::SavedModule { instance, .. } => {
-                ResourceIdentity::try_from(instance.clone()).ok()
-            }
+            Self::Module(module) => ResourceIdentity::try_from(module.instance.clone()).ok(),
         }
     }
 }
@@ -6083,8 +6071,29 @@ impl DefaultTagKeys {
 }
 
 /// A managed infrastructure resource declared in DSL.
+///
+/// Saved module metadata cannot be placed on the live resource type:
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{Resource, SavedModuleSource};
+///
+/// let mut resource = Resource::new("mock.Widget", "example");
+/// resource.module_source = Some(SavedModuleSource::Module {
+///     name: "widget_module".to_string(),
+///     instance: "example".to_string(),
+/// });
+/// ```
+///
+/// A live resource cannot be deserialized from saved-plan JSON because the
+/// persisted module variant has no live call path:
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::Resource;
+/// let _: Resource = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Resource {
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+pub struct Resource<S = ModuleSource> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -6115,7 +6124,7 @@ pub struct Resource {
     pub dependency_bindings: BTreeSet<String>,
     /// Module source info for resources that belong to a module
     #[serde(default)]
-    pub module_source: Option<ModuleSource>,
+    pub module_source: Option<S>,
     /// Tag keys injected by the routed provider's `default_tags` during
     /// desired-side normalization.
     ///
@@ -6140,6 +6149,69 @@ pub struct Resource {
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+}
+
+/// Persisted resource representation used by saved plans.
+///
+/// It has the same wire fields as [`Resource`], but its module provenance is
+/// display-only [`SavedModuleSource`] metadata rather than a live call path.
+pub type SavedResource = Resource<SavedModuleSource>;
+
+impl From<Resource> for SavedResource {
+    fn from(resource: Resource) -> Self {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            quoted_string_attrs,
+        } = resource;
+        Self {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source: module_source.as_ref().map(SavedModuleSource::from),
+            default_tag_keys,
+            quoted_string_attrs,
+        }
+    }
+}
+
+impl Resource<SavedModuleSource> {
+    /// Enter the live runtime without manufacturing call identity that is not
+    /// present in the saved plan. Saved compositions retain the persisted
+    /// module-call information needed by apply.
+    pub fn into_live(self) -> Resource {
+        let Self {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            quoted_string_attrs,
+        } = self;
+        Resource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source: module_source.and_then(SavedModuleSource::into_live_root),
+            default_tag_keys,
+            quoted_string_attrs,
+        }
+    }
 }
 
 impl Resource {
@@ -7612,7 +7684,7 @@ pub use composition::{
     PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
     SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
 };
-pub use data_source::{DataSource, ResolvedDataSource};
+pub use data_source::{DataSource, ResolvedDataSource, SavedDataSource, SavedResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};

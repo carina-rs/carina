@@ -2253,7 +2253,7 @@ mod tests {
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
     use crate::explicit::{ExplicitFields, PendingPaths};
     use crate::parser::ProviderConfig;
-    use crate::plan::ReplaceDisplayMetadata;
+    use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
 
@@ -2725,7 +2725,9 @@ mod tests {
         // metadata. Round-trip here so the display path proves that desired
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
-        let plan: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let plan = serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap())
+            .unwrap()
+            .into_live();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

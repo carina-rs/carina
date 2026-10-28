@@ -1811,7 +1811,7 @@ mod apply_state_save_tests {
     }
 
     fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
-        serde_json::from_value(serde_json::json!({
+        serde_json::from_value::<carina_core::plan::SavedPlan>(serde_json::json!({
             "effects": [],
             "permanent_name_overrides": [
                 {
@@ -1822,7 +1822,8 @@ mod apply_state_save_tests {
                 }
             ]
         }))
-        .expect("plan with permanent name override should deserialize")
+        .expect("saved plan with permanent name override should deserialize")
+        .into_live()
     }
 
     fn applied_name_state(id: &ResourceId, name: &str) -> State {
@@ -4911,8 +4912,9 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize")
+            .into_live();
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(delete_id, "vpc-old")]);
 
@@ -5085,8 +5087,9 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize")
+            .into_live();
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5206,8 +5209,9 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize")
+            .into_live();
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
 

@@ -270,9 +270,7 @@ fn host_metadata_fields_are_not_rendered_as_attributes() {
                 Value::Concrete(ConcreteValue::String("test".into())),
             )
             .with_binding("my_bucket")
-            .with_module_source(carina_core::resource::ModuleSource::saved_module(
-                "web", "web",
-            )),
+            .with_module_source(carina_core::resource::ModuleSource::Root),
     ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());

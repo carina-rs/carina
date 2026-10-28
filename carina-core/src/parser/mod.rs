@@ -23,10 +23,10 @@ pub use ast::{
     ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile,
     ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses,
     ParsedExportParam, ParsedFile, ParserBindingMetadata, ProviderConfig, RequireBlock,
-    ResourceContext, ResourceRef, ResourceTypePath, ShapeMismatch, SourceFileId, SourceSpan,
-    StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement,
-    UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
-    expand_deferred_children,
+    ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
+    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
+    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub use entry::{

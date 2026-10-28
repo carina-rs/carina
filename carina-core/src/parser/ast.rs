@@ -12,8 +12,8 @@ use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode, LeafNode,
-    LiveComposition, PathSegment, Resource, ResourceId, ResourceIdentity, StructuralOperand,
-    StructuralOperandRef, UnknownReason, Value,
+    LiveComposition, ModuleSource, PathSegment, Resource, ResourceId, ResourceIdentity,
+    SavedModuleSource, StructuralOperand, StructuralOperandRef, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -26,7 +26,11 @@ use std::path::{Path, PathBuf};
 /// Also stores enough information to expand the loop later when the iterable
 /// is loaded from upstream_state.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DeferredForExpression {
+#[serde(bound(
+    serialize = "S: serde::Serialize",
+    deserialize = "S: serde::Deserialize<'de>"
+))]
+pub struct DeferredForExpression<S = ModuleSource> {
     /// Full source path of the file this deferred expression originated
     /// from (stamped by `config_loader` after parsing).
     #[serde(skip)]
@@ -51,10 +55,66 @@ pub struct DeferredForExpression {
     /// correct variable(s).
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
-    pub template_resource: Resource,
+    pub template_resource: Resource<S>,
 }
 
-impl DeferredForExpression {
+pub type SavedDeferredForExpression = DeferredForExpression<SavedModuleSource>;
+
+impl From<DeferredForExpression> for SavedDeferredForExpression {
+    fn from(expression: DeferredForExpression) -> Self {
+        let DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            binding_name,
+            iterable,
+            binding,
+            template_resource,
+        } = expression;
+        Self {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            binding_name,
+            iterable,
+            binding,
+            template_resource: template_resource.into(),
+        }
+    }
+}
+
+impl DeferredForExpression<SavedModuleSource> {
+    pub fn into_live(self) -> DeferredForExpression {
+        let Self {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            binding_name,
+            iterable,
+            binding,
+            template_resource,
+        } = self;
+        DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            binding_name,
+            iterable,
+            binding,
+            template_resource: template_resource.into_live(),
+        }
+    }
+}
+
+impl<S> DeferredForExpression<S> {
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
@@ -3105,8 +3165,9 @@ mod substitute_placeholder_tests {
             "saved-plan JSON must not contain machine-local source paths: {json}"
         );
 
-        let decoded: DeferredForExpression =
-            serde_json::from_str(&json).expect("deserialize deferred for expression");
+        let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
+            .expect("deserialize deferred for expression")
+            .into_live();
         assert_eq!(decoded.file, None);
         assert_eq!(decoded.line, 0);
         assert_eq!(decoded.iterable, deferred.iterable);

@@ -22,8 +22,8 @@ use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use crate::resource::{
-    DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
-    ResourceIdentity, State,
+    DeposedKey, Directives, ModuleSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
+    ResourceId, ResourceIdentity, SavedModuleSource, State,
 };
 use crate::wait::ManagedWaitTarget;
 use crate::wait::predicate::WaitPredicate;
@@ -270,13 +270,14 @@ impl From<NonEmptyDeletes> for Vec<DeferredReplaceDelete> {
 
 /// Payload for [`Effect::DeferredReplace`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeferredReplacePayload {
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+pub struct DeferredReplacePayload<S = ModuleSource> {
     /// Pre-apply iterations being destroyed.
     pub deletes: NonEmptyDeletes,
     /// Synthetic id used for plan-tree display and progress.
     pub id: ResolvedResourceId,
     /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression>,
+    pub template: Box<DeferredForExpression<S>>,
 }
 
 fn deferred_replace_delete_dependencies(deletes: &[DeferredReplaceDelete]) -> BTreeSet<String> {
@@ -484,18 +485,22 @@ impl ResolvedMove {
 
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Effect {
+#[serde(bound(
+    serialize = "S: Serialize + Clone",
+    deserialize = "S: Deserialize<'de>"
+))]
+pub enum EffectWithSource<S> {
     /// Read the current state of a resource (data source)
-    Read { resource: ResolvedDataSource },
+    Read { resource: ResolvedDataSource<S> },
 
     /// Create a new resource
-    Create(ResolvedResource),
+    Create(ResolvedResource<S>),
 
     /// Resume a create continuation loaded from locked state. The token is
     /// deliberately absent from the serializable plan and is joined from
     /// `Current::CreateInFlight` immediately before provider dispatch.
     ResumeCreate {
-        resource: ResolvedResource,
+        resource: ResolvedResource<S>,
         started_at: crate::provider::Timestamp,
     },
 
@@ -504,7 +509,7 @@ pub enum Effect {
         from: Box<State>,
         /// Non-empty provider identifier validated while constructing the plan.
         identifier: AppliedIdentifier,
-        to: ResolvedResource,
+        to: ResolvedResource<S>,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
     },
@@ -621,13 +626,184 @@ pub enum Effect {
         /// Synthetic id used for plan-tree display and progress.
         id: ResolvedResourceId,
         /// The for-expression body, replayed against the upstream state.
-        template: Box<DeferredForExpression>,
+        template: Box<DeferredForExpression<S>>,
     },
 
     /// A deferred-for replacement whose delete side is known at plan time
     /// and whose create side is materialized after the upstream binding is
     /// available at apply time.
-    DeferredReplace(Box<DeferredReplacePayload>),
+    DeferredReplace(Box<DeferredReplacePayload<S>>),
+}
+
+pub type Effect = EffectWithSource<ModuleSource>;
+pub type SavedEffect = EffectWithSource<SavedModuleSource>;
+
+impl From<Effect> for SavedEffect {
+    fn from(effect: Effect) -> Self {
+        match effect {
+            Effect::Read { resource } => Self::Read {
+                resource: resource.into(),
+            },
+            Effect::Create(resource) => Self::Create(resource.into()),
+            Effect::ResumeCreate {
+                resource,
+                started_at,
+            } => Self::ResumeCreate {
+                resource: resource.into(),
+                started_at,
+            },
+            Effect::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Self::Update {
+                from,
+                identifier,
+                to: to.into(),
+                changed_attributes,
+            },
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Effect::Import { id, identifier } => Self::Import { id, identifier },
+            Effect::Remove { id } => Self::Remove { id },
+            Effect::Move { from, to } => Self::Move { from, to },
+            Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Effect::DeferredCreate { id, template } => Self::DeferredCreate {
+                id,
+                template: Box::new((*template).into()),
+            },
+            Effect::DeferredReplace(payload) => {
+                let DeferredReplacePayload {
+                    deletes,
+                    id,
+                    template,
+                } = *payload;
+                Self::DeferredReplace(Box::new(DeferredReplacePayload {
+                    deletes,
+                    id,
+                    template: Box::new((*template).into()),
+                }))
+            }
+        }
+    }
+}
+
+impl EffectWithSource<SavedModuleSource> {
+    pub fn into_live(self) -> Effect {
+        match self {
+            Self::Read { resource } => Effect::Read {
+                resource: resource.into_live(),
+            },
+            Self::Create(resource) => Effect::Create(resource.into_live()),
+            Self::ResumeCreate {
+                resource,
+                started_at,
+            } => Effect::ResumeCreate {
+                resource: resource.into_live(),
+                started_at,
+            },
+            Self::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Effect::Update {
+                from,
+                identifier,
+                to: to.into_live(),
+                changed_attributes,
+            },
+            Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Self::Import { id, identifier } => Effect::Import { id, identifier },
+            Self::Remove { id } => Effect::Remove { id },
+            Self::Move { from, to } => Effect::Move { from, to },
+            Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Self::DeferredCreate { id, template } => Effect::DeferredCreate {
+                id,
+                template: Box::new((*template).into_live()),
+            },
+            Self::DeferredReplace(payload) => {
+                let DeferredReplacePayload {
+                    deletes,
+                    id,
+                    template,
+                } = *payload;
+                Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                    deletes,
+                    id,
+                    template: Box::new((*template).into_live()),
+                }))
+            }
+        }
+    }
 }
 
 impl AsRef<Effect> for Effect {
@@ -699,7 +875,7 @@ impl<'a> BasicEffect<'a> {
     }
 }
 
-impl Effect {
+impl EffectWithSource<ModuleSource> {
     /// Mint route-rebinding authority only from a resolved move effect.
     pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
         match self {
@@ -1499,6 +1675,18 @@ mod tests {
 
     const EFFECT_VARIANT_COUNT: usize = 10;
 
+    fn deserialize_effect(json: &str) -> Effect {
+        serde_json::from_str::<SavedEffect>(json)
+            .expect("deserialize saved effect")
+            .into_live()
+    }
+
+    fn deserialize_effect_value(value: serde_json::Value) -> Effect {
+        serde_json::from_value::<SavedEffect>(value)
+            .expect("deserialize saved effect")
+            .into_live()
+    }
+
     #[test]
     fn resolved_move_requires_routes_matching_the_moved_block() {
         let addresses = MovedAddresses::new("awscc", "s3.Bucket", "old", "new");
@@ -1862,7 +2050,7 @@ mod tests {
     fn deferred_create_serde_roundtrip() {
         let original = deferred_create_effect();
         let json = serde_json::to_string(&original).expect("serialize");
-        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        let decoded = deserialize_effect(&json);
         match decoded {
             Effect::DeferredCreate { template, .. } => {
                 assert_eq!(template.file, None);
@@ -1883,7 +2071,7 @@ mod tests {
     fn deferred_replace_serde_roundtrip() {
         let original = deferred_replace_effect();
         let json = serde_json::to_string(&original).expect("serialize");
-        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        let decoded = deserialize_effect(&json);
         assert_eq!(decoded, original);
     }
 
@@ -1905,7 +2093,7 @@ mod tests {
 
         let json = serde_json::to_string(&original).expect("serialize");
         assert!(json.contains("\"generation\""), "got: {json}");
-        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        let decoded = deserialize_effect(&json);
 
         assert_eq!(decoded, original);
     }
@@ -1924,7 +2112,7 @@ mod tests {
             }
         });
 
-        let effect: Effect = serde_json::from_value(legacy).expect("legacy delete");
+        let effect = deserialize_effect_value(legacy);
         match effect {
             Effect::Delete { generation, .. } => {
                 assert_eq!(generation, EffectGeneration::Current);
@@ -2068,7 +2256,7 @@ mod tests {
 
         for effect in effects {
             let json = serde_json::to_string(&effect).unwrap();
-            let deserialized: Effect = serde_json::from_str(&json).unwrap();
+            let deserialized = deserialize_effect(&json);
             assert_eq!(effect, deserialized, "Round-trip failed for {:?}", effect);
         }
     }
@@ -2176,7 +2364,7 @@ mod tests {
                 "dependencies": ["role"],
             }
         });
-        let effect: Effect = serde_json::from_value(legacy).unwrap();
+        let effect = deserialize_effect_value(legacy);
         if let Effect::Delete {
             explicit_dependencies,
             blocked_by_updates,
@@ -2303,7 +2491,7 @@ mod tests {
             serde_json::to_value(target.resolved_id()).expect("serialize resolved target id"),
             "ManagedWaitTarget must be transparent on the wire"
         );
-        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        let decoded = deserialize_effect(&json);
         assert_eq!(decoded, original);
     }
 

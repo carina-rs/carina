@@ -584,7 +584,14 @@ fn plan_file_serde_round_trip() {
     );
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
-    let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let mut wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let saved_module_source = serde_json::json!({
+        "Module": { "name": "web_tier", "instance": "web" }
+    });
+    wire["plan"]["effects"][0]["Create"]["module_source"] = saved_module_source.clone();
+    wire["sorted_resources"][0]["module_source"] = saved_module_source.clone();
+    wire["unresolved_resources"][0]["module_source"] = saved_module_source.clone();
+    wire["data_sources"][0]["module_source"] = saved_module_source.clone();
     assert_eq!(
         wire["version"],
         serde_json::json!(PlanFile::CURRENT_VERSION)
@@ -611,7 +618,7 @@ fn plan_file_serde_round_trip() {
             .contains("does not match classified state"),
         "{error}"
     );
-    let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
+    let deserialized: PlanFile = serde_json::from_value(wire).unwrap();
 
     assert_eq!(deserialized.version, PlanFile::CURRENT_VERSION);
     assert_eq!(deserialized.carina_version, "0.1.0");
@@ -627,6 +634,27 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
+    assert!(
+        deserialized.sorted_resources[0].module_source.is_none(),
+        "saved display metadata must not become a live module source"
+    );
+    let reserialized = serde_json::to_value(&deserialized).unwrap();
+    assert_eq!(
+        reserialized["plan"]["effects"][0]["Create"]["module_source"],
+        saved_module_source
+    );
+    assert_eq!(
+        reserialized["sorted_resources"][0]["module_source"],
+        saved_module_source
+    );
+    assert_eq!(
+        reserialized["unresolved_resources"][0]["module_source"],
+        saved_module_source
+    );
+    assert_eq!(
+        reserialized["data_sources"][0]["module_source"],
+        saved_module_source
+    );
     let reloaded = deserialized
         .reload_in_flight_from_locked_state(None)
         .expect("a plan without in-flight markers reloads");

@@ -34,7 +34,7 @@
 //!   compositions, or [`TryFrom<GraphNode>`](LeafNode#impl-TryFrom<GraphNode>-for-LeafNode)
 //!   for single-node conversion that surfaces the failure.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::{DataSource, GraphNode, LiveComposition, Resource, ResourceId};
 
@@ -47,7 +47,7 @@ use super::{DataSource, GraphNode, LiveComposition, Resource, ResourceId};
 /// [`TryFrom<GraphNode>`](#impl-TryFrom<GraphNode>-for-LeafNode) (for
 /// a single node where the caller wants to handle the composition
 /// case) or [`expand_to_leaves`] (to drop compositions in bulk).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum LeafNode {
     Resource(Resource),
     DataSource(DataSource),

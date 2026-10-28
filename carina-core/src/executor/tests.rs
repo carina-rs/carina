@@ -3581,9 +3581,18 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
 }
 
 fn mark_module_resource(resource: &mut Resource, instance: &str) {
-    resource.module_source = Some(crate::resource::ModuleSource::saved_module(
+    resource.module_source = Some(crate::resource::ModuleSource::expanded_module(
         "checked_module",
         instance,
+        crate::resource::ModuleInstanceScope::for_call("checked_module", Some(instance), instance),
+        crate::resource::CompositionCallPath::direct(crate::resource::CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
+            module_name: "checked_module".to_string(),
+            binding: Some(instance.to_string()),
+            instance: instance.to_string(),
+            module_source: Some("./checked_module".to_string()),
+            module_directory: None,
+        }),
     ));
 }
 

@@ -9,8 +9,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, ModuleSource, PendingModuleConstraint, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, ResourceIdentity,
+    ModuleConstraintId, PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource,
+    ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -2654,7 +2654,7 @@ fn legacy_override_state() -> StateFile {
 }
 
 fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
-    serde_json::from_value(serde_json::json!({
+    serde_json::from_value::<carina_core::plan::SavedPlan>(serde_json::json!({
         "effects": [],
         "permanent_name_overrides": [
             {
@@ -2665,7 +2665,8 @@ fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &s
             }
         ]
     }))
-    .expect("plan with permanent name override should deserialize")
+    .expect("saved plan with permanent name override should deserialize")
+    .into_live()
 }
 
 #[test]
@@ -2970,7 +2971,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
     consumer.binding = Some("consumer".to_string());
-    consumer.module_source = Some(ModuleSource::saved_module("checked_module", "root.checked"));
     consumer.set_attr("name", string_value("consumer"));
     consumer.set_attr(
         "comment",
