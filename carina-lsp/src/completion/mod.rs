@@ -14,13 +14,12 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position, Range};
 
-use crate::attribute_path::{resolve_attribute_path, struct_fields_of};
 use crate::document::Document;
 use crate::enclosing_block::{
     EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
 };
 use carina_core::schema::{
-    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape,
+    AttributeType, CompletionValue, SchemaKind, SchemaRegistry, Shape, ValidatedResourceSchema,
 };
 
 pub struct CompletionProvider {
@@ -53,10 +52,12 @@ impl CompletionProvider {
     }
 
     /// Look up a schema by `"<provider>.<resource_type>"` key, trying Managed first.
-    pub(super) fn lookup_schema(&self, key: &str) -> Option<&ResourceSchema> {
+    pub(super) fn lookup_schema(&self, key: &str) -> Option<&ValidatedResourceSchema> {
         let (provider, resource_type) = match key.split_once('.') {
             Some(parts) => parts,
-            None => return self.schemas.get("", key, SchemaKind::Resource),
+            None => {
+                return self.schemas.get("", key, SchemaKind::Resource);
+            }
         };
         self.schemas
             .get(provider, resource_type, SchemaKind::Resource)
@@ -584,37 +585,40 @@ impl CompletionProvider {
 
         if let Some(schema) = self.lookup_schema(resource_type) {
             // Try struct field completions first
-            if let Some(resolved) = resolve_attribute_path(schema, attr_path)
-                && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
+            if let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
+                && !resolved.is_read_only()
             {
-                return fields
-                    .iter()
-                    .filter(|field| !field.is_read_only())
-                    .map(|field| {
-                        let required_marker = if field.is_required() {
-                            " (required)"
-                        } else {
-                            ""
-                        };
-                        CompletionItem {
-                            label: field.name().to_string(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: field
-                                .description()
-                                .map(|d| format!("{}{}", d, required_marker))
-                                .or_else(|| {
-                                    if field.is_required() {
-                                        Some("(required)".to_string())
-                                    } else {
-                                        None
-                                    }
-                                }),
-                            insert_text: Some(format!("{} = ", field.name())),
-                            command: Some(trigger_suggest.clone()),
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
+                let fields = resolved.field_candidates();
+                if !fields.is_empty() {
+                    return fields
+                        .iter()
+                        .filter(|field| !field.is_read_only())
+                        .map(|field| {
+                            let required_marker = if field.is_required() {
+                                " (required)"
+                            } else {
+                                ""
+                            };
+                            CompletionItem {
+                                label: field.name().to_string(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: field
+                                    .description()
+                                    .map(|d| format!("{}{}", d, required_marker))
+                                    .or_else(|| {
+                                        if field.is_required() {
+                                            Some("(required)".to_string())
+                                        } else {
+                                            None
+                                        }
+                                    }),
+                                insert_text: Some(format!("{} = ", field.name())),
+                                command: Some(trigger_suggest.clone()),
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+                }
             }
 
             // Try map key completions: if the attribute type at attr_path is a Map
@@ -631,12 +635,15 @@ impl CompletionProvider {
     /// Returns the key AttributeType if the attribute at the path is a Map.
     fn resolve_map_key_type<'a>(
         &self,
-        schema: &'a ResourceSchema,
+        schema: &'a ValidatedResourceSchema,
         attr_path: &[String],
     ) -> Option<&'a AttributeType> {
-        let resolved = resolve_attribute_path(schema, attr_path)?;
-        let attr_type = resolved.attr_type();
-        if let Shape::Map { key, .. } = schema.shape_of(attr_type) {
+        let resolved = schema.effective_node_at_authored_path(attr_path)?;
+        if resolved.is_read_only() {
+            return None;
+        }
+        let attr_type = resolved.field_type();
+        if let Shape::Map { key, .. } = schema.as_schema().shape_of(attr_type) {
             Some(key)
         } else {
             None
@@ -684,14 +691,17 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(resource_type)
-            && let Some(resolved) = resolve_attribute_path(schema, attr_path)
-            && let Some(fields) = struct_fields_of(schema, resolved.attr_type())
-            && let Some(field) = fields.iter().find(|f| f.name() == field_name)
+            && let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
+            && !resolved.is_read_only()
         {
-            if field.is_read_only() {
-                return vec![];
+            let fields = resolved.field_candidates();
+            if let Some(field) = fields.iter().find(|field| field.name() == field_name) {
+                if field.is_read_only() {
+                    return vec![];
+                }
+                completions
+                    .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
             }
-            completions.extend(self.completions_for_type(field.field_type(), Some(resource_type)));
         }
         completions.extend(self.in_scope_binding_completions(
             text,

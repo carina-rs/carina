@@ -11,8 +11,8 @@
 //! 1. A `ResourceSchema` whose `attributes` reference a named def via
 //!    `AttributeType::Ref` and whose `defs` map carries the cyclic
 //!    struct can be constructed without panicking.
-//! 2. `Schema::validate_attr` accepts a well-formed nested value tree
-//!    that exercises the cycle at least one hop deep.
+//! 2. The validated schema's effective attribute view accepts a well-formed
+//!    nested value tree that exercises the cycle at least one hop deep.
 //! 3. The differ (`diff`) treats semantically equal cyclic values as
 //!    `NoChange`, and surfaces a real change as `Update` with the
 //!    correct `changed_attributes` — confirming `type_aware_equal`'s
@@ -26,7 +26,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use carina_core::differ::{Diff, diff};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Schema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
+};
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
 ///
@@ -36,25 +38,26 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Schema
 fn cyclic_webacl_like_schema() -> ResourceSchema {
     let statement_def = AttributeType::struct_(
         "Statement".to_string(),
-        vec![StructField::new(
-            "and_statement",
-            AttributeType::list(AttributeType::ref_("Statement".to_string())),
-        )],
+        vec![
+            StructField::optional(
+                "and_statement",
+                AttributeType::list(AttributeType::ref_("Statement".to_string())),
+            )
+            .build(),
+        ],
     );
 
     let rule_struct = AttributeType::struct_(
         "Rule".to_string(),
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new("statement", AttributeType::ref_("Statement".to_string())),
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional("statement", AttributeType::ref_("Statement".to_string()))
+                .build(),
         ],
     );
 
     ResourceSchema::new("wafv2.WebACL")
-        .attribute(AttributeSchema::new(
-            "rules",
-            AttributeType::list(rule_struct),
-        ))
+        .attribute(AttributeSchema::optional("rules", AttributeType::list(rule_struct)).build())
         .with_def("Statement", statement_def)
 }
 
@@ -89,23 +92,24 @@ fn rule_value(name: &str, child_count: usize) -> Value {
 
 #[test]
 fn cyclic_schema_validates_a_two_level_nested_value() {
-    let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = schema.attributes()["rules"].attr_type();
+    let schema = cyclic_webacl_like_schema()
+        .validate()
+        .expect("cyclic schema fixture must be valid");
 
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)]));
 
-    let s = Schema {
-        root: AttributeType::string(), // unused for this call
-        defs: schema.defs().clone(),
-    };
-    s.validate_attr(rule_attr_type, &rules_value)
+    schema
+        .effective_attribute("rules")
+        .expect("rules attribute must exist")
+        .validate(&rules_value)
         .expect("well-formed cyclic value must validate against schema.defs");
 }
 
 #[test]
 fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
-    let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = schema.attributes()["rules"].attr_type();
+    let schema = cyclic_webacl_like_schema()
+        .validate()
+        .expect("cyclic schema fixture must be valid");
 
     let mut bad_statement = indexmap::IndexMap::new();
     bad_statement.insert(
@@ -125,12 +129,10 @@ fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
         ConcreteValue::Map(bad_rule),
     )]));
 
-    let s = Schema {
-        root: AttributeType::string(),
-        defs: schema.defs().clone(),
-    };
-    let err = s
-        .validate_attr(rule_attr_type, &rules_value)
+    let err = schema
+        .effective_attribute("rules")
+        .expect("rules attribute must exist")
+        .validate(&rules_value)
         .expect_err("string-where-list under Ref must fail validation");
     let text = err.to_string();
     assert!(
@@ -218,22 +220,22 @@ fn resource_schema_defs_field_default_is_empty() {
     // accidentally requires `defs` would break every existing builder
     // call.
     let schema = ResourceSchema::new("aws.s3.Bucket")
-        .attribute(AttributeSchema::new("bucket", AttributeType::string()));
+        .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build());
     assert!(schema.defs().is_empty(), "defs default must be empty");
     let _: &BTreeMap<String, AttributeType> = schema.defs();
 }
 
 /// Regression for carina#3345: `ResourceSchema::validate` must route a
-/// `Ref`-containing attribute through `Schema::validate_attr` so the
-/// enclosing `defs` are in scope, not through the standalone
-/// `AttributeType::validate` which can only reject `Ref` with the
-/// "reached the standalone validator" sentinel.
+/// `Ref`-containing attribute through its ancestry-carrying effective view so
+/// the enclosing `defs` are in scope, not through a rootless type walker.
 ///
 /// The 7 awscc `s3.Bucket/*` apply failures from the 2026-05-29
 /// acceptance run all hit this site (`schema/mod.rs:3053`).
 #[test]
 fn resource_schema_validate_routes_ref_through_defs() {
-    let schema = cyclic_webacl_like_schema();
+    let schema = cyclic_webacl_like_schema()
+        .validate()
+        .expect("cyclic schema fixture must be valid");
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -250,7 +252,7 @@ fn resource_schema_validate_routes_ref_through_defs() {
     );
 }
 
-/// Regression for carina#3345 Symptom B: `Schema::canonicalize_state_attr`
+/// Regression for carina#3345 Symptom B: `EffectiveAttribute::canonicalize_state`
 /// must drive the `Ref` arm through the schema's `defs` map and
 /// canonicalize the resolved type's inner shape. This pins the
 /// public schema-aware entry point used by the host when reconciling
@@ -272,22 +274,23 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     // field. `selectors` attribute references it via Ref.
     let selectors_def = AttributeType::struct_(
         "Selectors".to_string(),
-        vec![StructField::new(
-            "tags",
-            AttributeType::union(vec![
-                AttributeType::string(),
-                AttributeType::list(AttributeType::string()),
-            ]),
-        )],
+        vec![
+            StructField::optional(
+                "tags",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            )
+            .build(),
+        ],
     );
     let schema = ResourceSchema::new("test.WithRef")
-        .attribute(AttributeSchema::new(
-            "selectors",
-            AttributeType::ref_("Selectors".to_string()),
-        ))
+        .attribute(
+            AttributeSchema::optional("selectors", AttributeType::ref_("Selectors".to_string()))
+                .build(),
+        )
         .with_def("Selectors", selectors_def);
-
-    let attr_type = schema.attributes()["selectors"].attr_type();
 
     // Construct the value with a bare `String` under `tags`, which
     // host state canonicalization must collapse to `StringList`
@@ -300,8 +303,10 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
+    let schema = schema.validate().expect("schema fixture must be valid");
     let canon = schema
-        .schema_view_for(attr_type.clone())
+        .effective_attribute("selectors")
+        .expect("selectors attribute must exist")
         .canonicalize_state(value);
 
     let Value::Concrete(ConcreteValue::Map(canon_map)) = canon else {
@@ -325,26 +330,15 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
 fn dangling_ref_surfaces_clean_validation_error() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let schema = ResourceSchema::new("test.WithDanglingRef").attribute(AttributeSchema::new(
-        "broken",
-        AttributeType::ref_("Nowhere".to_string()),
-    ));
+    let schema = ResourceSchema::new("test.WithDanglingRef").attribute(
+        AttributeSchema::optional("broken", AttributeType::ref_("Nowhere".to_string())).build(),
+    );
     // No `with_def` call — `defs` stays empty by design.
 
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "broken".to_string(),
-        Value::Concrete(ConcreteValue::String("anything".into())),
-    );
-
-    let errors = schema
-        .validate(&attrs)
-        .expect_err("dangling Ref must fail validation");
-    let combined: String = errors
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let combined = schema
+        .validate()
+        .expect_err("dangling Ref must fail admission")
+        .to_string();
     assert!(
         combined.contains("schema reference `Nowhere` is not defined"),
         "expected dangling-Ref message, got: {combined}"
@@ -354,26 +348,26 @@ fn dangling_ref_surfaces_clean_validation_error() {
 /// Regression for carina#3345: a true cyclic def (`Statement` →
 /// `List<Ref(Statement)>`) over a finite value must terminate, not
 /// blow the stack or hang.  This pins the load-bearing termination
-/// invariant for `Schema::validate_attr`'s recursion on Ref-cycles.
+/// invariant for the effective type validator's recursion on Ref-cycles.
 #[test]
 fn cyclic_ref_terminates_on_finite_value() {
-    let schema = cyclic_webacl_like_schema();
-    let rule_attr_type = schema.attributes()["rules"].attr_type();
+    let schema = cyclic_webacl_like_schema()
+        .validate()
+        .expect("cyclic schema fixture must be valid");
 
     // 3-level nesting: outer rule contains a statement whose
     // `and_statement` carries two statements, each of which has
     // its own `and_statement: []`. Exercises the cycle twice.
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("Top", 2)]));
 
-    let s = carina_core::schema::Schema {
-        root: AttributeType::string(),
-        defs: schema.defs().clone(),
-    };
-    s.validate_attr(rule_attr_type, &rules_value)
+    schema
+        .effective_attribute("rules")
+        .expect("rules attribute must exist")
+        .validate(&rules_value)
         .expect("finite cyclic value must validate (carina#3345)");
 }
 
-/// Regression for carina#3347: `Schema::validate_attr`'s `Map` arm
+/// Regression for carina#3347: the ancestry-carrying validator's `Map` arm
 /// must lift a `Map<Enum, ...>` key into `EnumIdentifier` shape
 /// before validating it, mirroring `validate_map`'s pre-existing
 /// `key_is_enum` special case (carina#2996). Without this lift, a
@@ -382,13 +376,13 @@ fn cyclic_ref_terminates_on_finite_value() {
 /// plain `String`.
 ///
 /// The carina#3346 migration routed every production validate call
-/// through `Schema::validate_attr`, exposing this latent divergence
+/// through the shared schema-aware walker, exposing this latent divergence
 /// as a `validate_iam_policy_document` regression in awscc#282 when
 /// pulling the new rev.
 #[test]
 fn schema_validate_attr_map_arm_lifts_enum_key() {
     use carina_core::resource::ConcreteValue;
-    use carina_core::schema::{AttributeType, Schema};
+    use carina_core::schema::AttributeType;
 
     let key_type = AttributeType::enum_(
         carina_core::schema::TypeIdentity::bare("Op"),
@@ -406,7 +400,10 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
-    let schema = Schema::flat(attr_type);
+    let schema = ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+        .expect("test config type must be valid")
+        .rootless_type("value")
+        .expect("test config type must exist");
     schema
         .validate(&value)
         .expect("a bare-identifier Map key for a Enum key type must validate");

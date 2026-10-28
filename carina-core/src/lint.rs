@@ -1423,21 +1423,30 @@ let ready = wait source {
     #[test]
     fn test_list_struct_attr_names() {
         let schema = ResourceSchema::new("ec2.SecurityGroup")
-            .attribute(crate::schema::AttributeSchema::new(
-                "security_group_ingress",
-                AttributeType::list(AttributeType::struct_(
-                    "Ingress".to_string(),
-                    vec![StructField::new("ip_protocol", AttributeType::string())],
-                )),
-            ))
-            .attribute(crate::schema::AttributeSchema::new(
-                "tags",
-                AttributeType::list(AttributeType::string()),
-            ))
-            .attribute(crate::schema::AttributeSchema::new(
-                "group_description",
-                AttributeType::string(),
-            ));
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "security_group_ingress",
+                    AttributeType::list(AttributeType::struct_(
+                        "Ingress".to_string(),
+                        vec![StructField::optional("ip_protocol", AttributeType::string()).build()],
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "tags",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "group_description",
+                    AttributeType::string(),
+                )
+                .build(),
+            );
 
         let names = list_struct_attr_names(&schema);
         assert!(names.contains("security_group_ingress"));

@@ -68,8 +68,8 @@ impl ProviderFactory for AwsStub {
     fn display_name(&self) -> &str {
         "AWS (carina#3061 apply-path stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -105,43 +105,66 @@ impl ProviderFactory for AwsStub {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "validation_method",
-                    AttributeType::string(),
-                ))
-                .attribute(AttributeSchema::new("status", AttributeType::string()))
-                .attribute(AttributeSchema::new(
-                    "certificate_arn",
-                    AttributeType::string(),
-                )),
-            // distribution_config's exact shape is irrelevant here —
-            // keep it precise enough that the full-validation guard below
-            // exercises the expanded wait target instead of stopping at an
-            // unrelated container-shape mismatch.
-            ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
-                "distribution_config",
-                AttributeType::struct_(
-                    "DistributionConfig",
-                    vec![
-                        carina_core::schema::StructField::new("enabled", AttributeType::bool()),
-                        carina_core::schema::StructField::new(
-                            "viewer_certificate",
-                            AttributeType::struct_(
-                                "ViewerCertificate",
-                                vec![carina_core::schema::StructField::new(
-                                    "acm_certificate_arn",
-                                    AttributeType::string(),
-                                )],
-                            ),
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("acm.Certificate")
+                    .attribute(
+                        AttributeSchema::optional("domain_name", AttributeType::string()).build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional("validation_method", AttributeType::string())
+                            .build(),
+                    )
+                    .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+                    .attribute(
+                        AttributeSchema::optional("certificate_arn", AttributeType::string())
+                            .build(),
+                    ),
+                // distribution_config's exact shape is irrelevant here —
+                // keep it precise enough that the full-validation guard below
+                // exercises the expanded wait target instead of stopping at an
+                // unrelated container-shape mismatch.
+                ResourceSchema::new("cloudfront.Distribution").attribute(
+                    AttributeSchema::optional(
+                        "distribution_config",
+                        AttributeType::struct_(
+                            "DistributionConfig",
+                            vec![
+                                carina_core::schema::StructField::optional(
+                                    "enabled",
+                                    AttributeType::bool(),
+                                )
+                                .build(),
+                                carina_core::schema::StructField::optional(
+                                    "viewer_certificate",
+                                    AttributeType::struct_(
+                                        "ViewerCertificate",
+                                        vec![
+                                            carina_core::schema::StructField::optional(
+                                                "acm_certificate_arn",
+                                                AttributeType::string(),
+                                            )
+                                            .build(),
+                                        ],
+                                    ),
+                                )
+                                .build(),
+                            ],
                         ),
-                    ],
+                    )
+                    .build(),
                 ),
-            )),
-        ]
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 

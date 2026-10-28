@@ -1474,9 +1474,15 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::string()))
-            .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let result = detect_drift(
@@ -2829,11 +2835,15 @@ fn build_state_after_apply_persists_write_only_attributes() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
-            ),
+                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(
@@ -2914,12 +2924,15 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        ResourceSchema::new("ec2.Eip")
-            .attribute(AttributeSchema::new(
-                "allocation_id",
-                AttributeType::string(),
+        (ResourceSchema::new("ec2.Eip")
+            .attribute(AttributeSchema::optional("allocation_id", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("domain", domain_type)
+                    .write_only()
+                    .build(),
             ))
-            .attribute(AttributeSchema::new("domain", domain_type).write_only()),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(
@@ -3025,11 +3038,15 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        (ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
-            ),
+                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                    .write_only()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let saved = build_state_after_apply(

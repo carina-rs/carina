@@ -205,6 +205,7 @@ impl<'a> UnionMembers<'a> {
             projected,
             expected,
             self.defs,
+            super::FieldAncestry::WRITABLE,
             visited_refs,
         ) else {
             visited_refs.truncate(restore_len);

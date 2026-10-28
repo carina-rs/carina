@@ -68,16 +68,19 @@ async fn normalized_resource_rejects_block_aliases_returned_by_provider_normaliz
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing").attribute(
-            AttributeSchema::new(
+        (ResourceSchema::new("thing").attribute(
+            AttributeSchema::optional(
                 "rules",
                 AttributeType::list(AttributeType::struct_(
                     "Rule",
-                    vec![StructField::new("action", AttributeType::string())],
+                    vec![StructField::optional("action", AttributeType::string()).build()],
                 )),
             )
-            .with_block_name("rule"),
-        ),
+            .with_block_name("rule")
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let normalizer = AttributeReturningNormalizer {
         name: "rule",
@@ -111,20 +114,23 @@ async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_n
 
     let condition = AttributeType::struct_(
         "Condition",
-        vec![StructField::new("value", AttributeType::string())],
+        vec![StructField::optional("value", AttributeType::string()).build()],
     );
     let rule = AttributeType::struct_(
         "Rule",
         vec![
-            StructField::new("conditions", AttributeType::list(condition))
-                .with_block_name("condition"),
+            StructField::optional("conditions", AttributeType::list(condition))
+                .with_block_name("condition")
+                .build(),
         ],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing")
-            .attribute(AttributeSchema::new("rules", AttributeType::list(rule))),
+        (ResourceSchema::new("thing")
+            .attribute(AttributeSchema::optional("rules", AttributeType::list(rule)).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let normalizer = AttributeReturningNormalizer {
         name: "rules",
@@ -202,10 +208,15 @@ async fn normalization_error_stops_later_stages() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        crate::schema::ResourceSchema::new("thing").attribute(crate::schema::AttributeSchema::new(
-            "tags",
-            crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-        )),
+        (crate::schema::ResourceSchema::new("thing").attribute(
+            crate::schema::AttributeSchema::optional(
+                "tags",
+                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let error = apply_desired_normalization_slice(
@@ -313,36 +324,47 @@ fn order_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing")
-            .attribute(AttributeSchema::new(
-                "subjects",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
+        (ResourceSchema::new("thing")
+            .attribute(
+                AttributeSchema::optional(
+                    "subjects",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "ref_subjects",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("mode", mode.clone()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("mode", mode).build(),
+                            StructField::optional("peer", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
             ))
-            .attribute(AttributeSchema::new(
-                "ref_subjects",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
-            ))
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::map(AttributeType::string()),
-            ))
-            .attribute(AttributeSchema::new("mode", mode.clone()))
-            .attribute(AttributeSchema::new(
-                "settings",
-                AttributeType::struct_(
-                    "Settings",
-                    vec![
-                        StructField::new("mode", mode),
-                        StructField::new("peer", AttributeType::string()),
-                    ],
-                ),
-            )),
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas
 }
@@ -477,16 +499,21 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        crate::schema::ResourceSchema::new("thing").attribute(crate::schema::AttributeSchema::new(
-            "mode",
-            crate::schema::AttributeType::enum_(
-                crate::schema::enum_identity("Mode", Some("test.thing")),
-                Some(vec!["Allow".to_string(), "Deny".to_string()]),
-                vec![("Allow".to_string(), "allow".to_string())],
-                None,
-                None,
-            ),
-        )),
+        (crate::schema::ResourceSchema::new("thing").attribute(
+            crate::schema::AttributeSchema::optional(
+                "mode",
+                crate::schema::AttributeType::enum_(
+                    crate::schema::enum_identity("Mode", Some("test.thing")),
+                    Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                    vec![("Allow".to_string(), "allow".to_string())],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let resource = Resource::with_provider("test", "thing", "example", None);
 
@@ -535,16 +562,21 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        crate::schema::ResourceSchema::new("thing").attribute(crate::schema::AttributeSchema::new(
-            "mode",
-            crate::schema::AttributeType::enum_(
-                crate::schema::enum_identity("Mode", Some("test.thing")),
-                Some(vec!["Allow".to_string(), "Deny".to_string()]),
-                vec![("Allow".to_string(), "allow".to_string())],
-                None,
-                None,
-            ),
-        )),
+        (crate::schema::ResourceSchema::new("thing").attribute(
+            crate::schema::AttributeSchema::optional(
+                "mode",
+                crate::schema::AttributeType::enum_(
+                    crate::schema::enum_identity("Mode", Some("test.thing")),
+                    Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                    vec![("Allow".to_string(), "allow".to_string())],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     let resource = Resource::with_provider("test", "thing", "example", None);
 
@@ -686,10 +718,11 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("thing").attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::string()),
-        )),
+        (ResourceSchema::new("thing").attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     apply_desired_normalization_slice(
@@ -734,27 +767,34 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        ResourceSchema::new("list_tags").attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::list(AttributeType::string()),
-        )),
+        (ResourceSchema::new("list_tags").attribute(
+            AttributeSchema::optional("tags", AttributeType::list(AttributeType::string())).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "test",
-        ResourceSchema::new("struct_tags").attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::struct_(
-                "Tags",
-                vec![StructField::new("owner", AttributeType::string())],
-            ),
-        )),
+        (ResourceSchema::new("struct_tags").attribute(
+            AttributeSchema::optional(
+                "tags",
+                AttributeType::struct_(
+                    "Tags",
+                    vec![StructField::optional("owner", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "test",
-        ResourceSchema::new("numeric_map_tags").attribute(AttributeSchema::new(
-            "tags",
-            AttributeType::map(AttributeType::int()),
-        )),
+        (ResourceSchema::new("numeric_map_tags").attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::int())).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     apply_desired_normalization_slice(

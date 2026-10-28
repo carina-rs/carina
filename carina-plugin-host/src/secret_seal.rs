@@ -745,12 +745,16 @@ mod tests {
         let mut registry = carina_core::schema::SchemaRegistry::new();
         registry.insert(
             "mock",
-            carina_core::schema::ResourceSchema::new("test.resource").attribute(
-                carina_core::schema::AttributeSchema::new(
-                    "settings",
-                    AttributeType::map(mode_enum_type()),
-                ),
-            ),
+            carina_core::schema::ResourceSchema::new("test.resource")
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "settings",
+                        AttributeType::map(mode_enum_type()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("test schema must be valid"),
         );
         carina_core::value::canonicalize_normalized_resources_with_schemas(
             &mut resources,

@@ -84,25 +84,29 @@ pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
     let transition_struct = AttributeType::struct_(
         "Transition".to_string(),
         vec![
-            StructField::new("days", AttributeType::int()),
-            StructField::new("storage_class", AttributeType::string()),
+            StructField::optional("days", AttributeType::int()).build(),
+            StructField::optional("storage_class", AttributeType::string()).build(),
         ],
     );
 
     let config_struct = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("transitions", AttributeType::list(transition_struct))
-                .with_block_name("transition"),
-            StructField::new("enabled", AttributeType::bool()),
+            StructField::optional("transitions", AttributeType::list(transition_struct))
+                .with_block_name("transition")
+                .build(),
+            StructField::optional("enabled", AttributeType::bool()).build(),
         ],
     );
 
     let schema = ResourceSchema::new("block.resource")
-        .attribute(AttributeSchema::new("config", config_struct));
+        .attribute(AttributeSchema::optional("config", config_struct).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -111,25 +115,58 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
     let inner_struct = AttributeType::struct_(
         "InnerStruct".to_string(),
         vec![
-            StructField::new("leaf_field", AttributeType::string()),
-            StructField::new("leaf_bool", AttributeType::bool()),
-            StructField::new("provider_leaf", AttributeType::bool()).read_only(),
+            StructField::optional("leaf_field", AttributeType::string()).build(),
+            StructField::optional("leaf_bool", AttributeType::bool()).build(),
+            StructField::provider_populated("provider_leaf", AttributeType::bool()).build(),
         ],
     );
 
     let outer_struct = AttributeType::struct_(
         "OuterStruct".to_string(),
         vec![
-            StructField::new("inner", inner_struct),
-            StructField::new("outer_field", AttributeType::string()),
+            StructField::optional("inner", inner_struct).build(),
+            StructField::optional("outer_field", AttributeType::string()).build(),
         ],
     );
 
     let schema = ResourceSchema::new("nested.resource")
-        .attribute(AttributeSchema::new("outer", outer_struct));
+        .attribute(AttributeSchema::optional("outer", outer_struct).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
+}
+
+pub(super) fn test_provider_with_shared_definition_paths() -> CompletionProvider {
+    let schema = ResourceSchema::new("shared.resource")
+        .with_def(
+            "Tag",
+            AttributeType::struct_(
+                "Tag",
+                vec![StructField::required("key", AttributeType::string()).build()],
+            ),
+        )
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "effective_tags",
+                AttributeType::list(AttributeType::ref_("Tag")),
+            )
+            .build(),
+        );
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -138,14 +175,17 @@ pub(super) fn test_provider_with_list_of_structs() -> CompletionProvider {
     let rule = AttributeType::struct_(
         "Rule",
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new("enabled", AttributeType::bool()),
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional("enabled", AttributeType::bool()).build(),
         ],
     );
     let schema = ResourceSchema::new("Policy")
-        .attribute(AttributeSchema::new("rules", AttributeType::list(rule)));
+        .attribute(AttributeSchema::optional("rules", AttributeType::list(rule)).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -161,24 +201,28 @@ pub(super) fn test_provider_for_enclosing_block_regressions() -> CompletionProvi
     let nested = AttributeType::struct_(
         "Nested",
         vec![
-            StructField::new("inner", AttributeType::string()),
-            StructField::new("outer_field", AttributeType::list(AttributeType::string())),
-            StructField::new(
+            StructField::optional("inner", AttributeType::string()).build(),
+            StructField::optional("outer_field", AttributeType::list(AttributeType::string()))
+                .build(),
+            StructField::optional(
                 "tags",
                 AttributeType::map_with_key(tag_key, AttributeType::string()),
-            ),
+            )
+            .build(),
         ],
     );
     let schema = ResourceSchema::new("review.Resource")
-        .attribute(AttributeSchema::new(
-            "attr",
-            AttributeType::list(AttributeType::string()),
-        ))
-        .attribute(AttributeSchema::new("outer", nested.clone()))
-        .attribute(AttributeSchema::new("x", nested))
-        .attribute(AttributeSchema::new("policy", AttributeType::string()));
+        .attribute(
+            AttributeSchema::optional("attr", AttributeType::list(AttributeType::string())).build(),
+        )
+        .attribute(AttributeSchema::optional("outer", nested.clone()).build())
+        .attribute(AttributeSchema::optional("x", nested).build())
+        .attribute(AttributeSchema::optional("policy", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -188,9 +232,12 @@ pub(super) fn test_provider_for_enclosing_block_regressions() -> CompletionProvi
 /// without needing real provider schemas.
 pub(super) fn test_provider_single_attr() -> CompletionProvider {
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::string()));
+        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
@@ -206,9 +253,12 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
         None,
     );
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("versioning_status", status_enum));
+        .attribute(AttributeSchema::optional("versioning_status", status_enum).build());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let region_completions: Vec<CompletionValue> = vec![
         CompletionValue {
@@ -243,18 +293,20 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     // Nested struct field with Enum (no namespace)
     let versioning_struct = AttributeType::struct_(
         "VersioningConfiguration".to_string(),
-        vec![StructField::new("status", status_enum.clone())],
+        vec![StructField::optional("status", status_enum.clone()).build()],
     );
 
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("versioning_status", status_enum))
-        .attribute(AttributeSchema::new(
-            "versioning_configuration",
-            versioning_struct,
-        ));
+        .attribute(AttributeSchema::optional("versioning_status", status_enum).build())
+        .attribute(
+            AttributeSchema::optional("versioning_configuration", versioning_struct).build(),
+        );
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
@@ -270,21 +322,29 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
         Ok(())
     }
     let vpc_id_custom = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop_validate),
         None,
     );
     let vpc = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom.clone()));
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom.clone()).build());
     let security_group = ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom));
+        .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", vpc);
-    schemas.insert("awscc", security_group);
+    schemas.insert(
+        "awscc",
+        vpc.validate().expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        security_group
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
 
@@ -297,7 +357,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(noop_validate),
@@ -311,10 +371,13 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         None,
     );
     let schema = ResourceSchema::new("sso.Assignment")
-        .attribute(AttributeSchema::new("principal_type", principal_type))
-        .attribute(AttributeSchema::new("target_id", account_id));
+        .attribute(AttributeSchema::optional("principal_type", principal_type).build())
+        .attribute(AttributeSchema::optional("target_id", account_id).build());
 
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", schema);
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }

@@ -56,6 +56,9 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
 #[allow(dead_code)]
 pub fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
-    registry.insert("test", schema);
+    registry.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
     registry
 }

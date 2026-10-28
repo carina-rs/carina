@@ -35,8 +35,8 @@ impl ProviderFactory for AwsccTestFactory {
     fn display_name(&self) -> &str {
         "AWSCC (carina#3243 test stub)"
     }
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
     fn validate_config(
         &self,
@@ -68,24 +68,30 @@ impl ProviderFactory for AwsccTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![vpc_schema(), security_group_schema()]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
+            vec![vpc_schema(), security_group_schema()];
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
 fn vpc_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()))
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build())
 }
 
 fn security_group_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new(
-            "group_description",
-            AttributeType::string(),
-        ))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()))
+        .attribute(AttributeSchema::optional("group_description", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build())
 }
 
 struct NoopProvider;

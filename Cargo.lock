@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "carina-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "carina-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "carina-provider-protocol",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "carina-lsp"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "carina-core",
  "carina-plugin-host",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-host"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "carina-core",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-sdk"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-mock"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "carina-core",
  "carina-plugin-sdk",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-resolver"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "carina-core",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "carina-sigstore-tlog"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "p256",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "carina-state"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "carina-tui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "carina-core",
  "crossterm",

@@ -182,6 +182,7 @@ pub fn classify_anonymous_identity_basis(
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
+    let schema = schema.as_schema();
 
     if stable_anonymous_hash_inputs(resource, schema).is_empty() {
         Some(AnonymousIdentityBasis::AttributeDerived)
@@ -384,7 +385,7 @@ pub fn resolve_attr_prefixes(
 
     for resource in resources.iter_mut() {
         let schema = match registry.get_for(resource) {
-            Some(s) => s,
+            Some(schema) => schema.as_schema(),
             None => continue, // Unknown resource type; validate_resources will catch this
         };
 
@@ -968,6 +969,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let schema = schema.as_schema();
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -1228,6 +1230,7 @@ pub fn reconcile_anonymous_identifiers(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let schema = schema.as_schema();
 
         let create_only_attrs = schema.create_only_attributes();
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
@@ -1431,6 +1434,7 @@ pub fn detect_anonymous_to_named_renames(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let schema = schema.as_schema();
 
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 

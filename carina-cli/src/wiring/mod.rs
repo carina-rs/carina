@@ -62,8 +62,9 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    BlockNameConflict, CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError,
-    resolve_config_block_names_with_schemas, resolve_file_block_names_with_schemas,
+    BlockNameConflict, CustomTypeLookup, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
+    ValidatedResourceSchema, resolve_config_block_names_with_schemas,
+    resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -326,7 +327,7 @@ impl WiringContext {
     pub(crate) fn new_with_additional_schemas(
         loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
-        additional_schemas: impl IntoIterator<Item = (String, ResourceSchema)>,
+        additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         let uses_builtin_mock =
             carina_provider_mock::uses_builtin_provider(provider_configs, |provider_name| {
@@ -364,10 +365,11 @@ impl WiringContext {
         }
         if uses_builtin_mock {
             for schema in carina_provider_mock::builtin_schemas() {
-                let already_registered = if schema.is_data_source() {
-                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, schema.resource_type())
+                let parts = schema.parts();
+                let already_registered = if matches!(parts.kind, SchemaKind::DataSource) {
+                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, parts.resource_type)
                 } else {
-                    schemas.has_managed(BUILTIN_PROVIDER_NAME, schema.resource_type())
+                    schemas.has_managed(BUILTIN_PROVIDER_NAME, parts.resource_type)
                 };
                 if !already_registered {
                     schemas.insert(BUILTIN_PROVIDER_NAME, schema);
@@ -402,7 +404,7 @@ impl WiringContext {
     pub(crate) fn new_for_test_with_additional_schemas(
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig],
-        additional_schemas: impl IntoIterator<Item = (String, ResourceSchema)>,
+        additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         Self::new_with_additional_schemas(
             LoadedProviderFactory::for_test(factories),
@@ -953,13 +955,12 @@ fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<Stri
         .unwrap_or_default()
 }
 
-fn provider_config_attribute_type_for(
+fn provider_config_schema_for(
     ctx: &WiringContext,
     provider_name: &str,
-    attr_name: &str,
-) -> Option<carina_core::schema::AttributeType> {
+) -> Option<carina_core::schema::ValidatedConfigSchema> {
     provider_mod::find_factory(ctx.factories(), provider_name)
-        .and_then(|factory| factory.provider_config_attribute_types().remove(attr_name))
+        .map(|factory| factory.provider_config_attribute_types())
 }
 
 /// Detect and apply anonymous → let-bound resource renames.
@@ -984,13 +985,10 @@ pub fn apply_anonymous_to_named_renames(
         return Ok(Vec::new());
     };
 
-    let canonical_providers =
-        carina_core::value::canonicalize_provider_configs_with_attribute_types(
-            providers,
-            &|provider_name, attr_name| {
-                provider_config_attribute_type_for(ctx, provider_name, attr_name)
-            },
-        )?;
+    let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
+        providers,
+        &|provider_name| provider_config_schema_for(ctx, provider_name),
+    )?;
 
     let renames = identifier::detect_anonymous_to_named_renames(
         resources,
@@ -1003,7 +1001,7 @@ pub fn apply_anonymous_to_named_renames(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|s| s.create_only_attributes())
+                .map(|schema| schema.as_schema().create_only_attributes())
                 .unwrap_or_default();
             let state_entries = sf
                 .resources_by_type(provider, resource_type)
@@ -1092,7 +1090,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|s| s.create_only_attributes())
+                .map(|schema| schema.as_schema().create_only_attributes())
                 .unwrap_or_default();
 
             let state_entries = state_file
@@ -1167,7 +1165,7 @@ pub fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|s| s.create_only_attributes())
+                .map(|schema| schema.as_schema().create_only_attributes())
                 .unwrap_or_default();
 
             let state_entries = state_file
@@ -1322,11 +1320,9 @@ fn canonicalized_provider_configs_for_identifiers(
     providers: &[ProviderConfig],
 ) -> Result<carina_core::value::CanonicalizedProviderConfigs, AppError> {
     Ok(
-        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+        carina_core::value::canonicalize_provider_configs_with_schemas(
             providers,
-            &|provider_name, attr_name| {
-                provider_config_attribute_type_for(ctx, provider_name, attr_name)
-            },
+            &|provider_name| provider_config_schema_for(ctx, provider_name),
         )?,
     )
 }
@@ -1412,7 +1408,7 @@ pub(crate) fn lift_data_source_value_enum_leaves(
         .filter_map(|data_source| {
             schemas
                 .get_for_data_source(data_source)
-                .map(|schema| (&data_source.id, schema))
+                .map(|schema| (&data_source.id, schema.as_schema()))
         })
         .collect::<HashMap<_, _>>();
     for (id, state) in data_source_values.iter_read_states_mut() {
@@ -1609,7 +1605,7 @@ fn validate_resolved_value_constraints(
 fn append_resolved_value_constraint_errors(
     plan_errors: &mut Vec<PlanError>,
     id: &ResourceId,
-    schema: &ResourceSchema,
+    schema: &carina_core::schema::ValidatedResourceSchema,
     attributes: &HashMap<String, Value>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
@@ -1625,7 +1621,8 @@ fn append_resolved_value_constraint_errors(
     };
 
     for error in errors {
-        let (attributes, origins) = resolved_constraint_context(&error, origin_attributes, schema);
+        let (attributes, origins) =
+            resolved_constraint_context(&error, origin_attributes, schema.as_schema());
         plan_errors.push(PlanError::new(
             id.clone(),
             PlanErrorKind::ResolvedValueConstraint {

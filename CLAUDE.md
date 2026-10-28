@@ -473,7 +473,10 @@ Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningS
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 
-4. **LSP diagnostics must validate Custom types** - When adding a custom type (built via `AttributeType::custom(...)`; internally the `AttrTypeKind::Custom` variant) with a validate function, ensure `carina-lsp/src/diagnostics/mod.rs` calls the validate function for editor warnings
+4. **LSP diagnostics must validate refined types** - When adding a refined
+   string/int/float type with a validator binding, provide its mandatory
+   `TypeIdentity` and ensure `carina-lsp/src/diagnostics/mod.rs` invokes the
+   provider lookup for editor warnings.
 
 5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
 
@@ -486,36 +489,65 @@ A struct type represents a nested object with typed fields.
   variant enum `AttrTypeKind` is `pub(crate)`, so downstream crates cannot
   pattern-match a raw `&AttributeType` — they construct one via the
   constructor methods (`AttributeType::struct_(name, fields)`,
-  `AttributeType::custom(...)`, etc.) and read it through the `Ref`-peeled
+  `AttributeType::refined_string(Some(identity), ...)`, etc.) and read it
+  through the `Ref`-peeled
   `Shape` view. The struct case is the `AttrTypeKind::Struct { name, fields:
   Vec<StructField> }` variant (carina#3349 made this unrepresentable from
   outside `carina-core`).
 - Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
-  `field_type` (recursive `AttributeType`), `input_mode: InputMode`,
+  `field_type` (recursive `AttributeType`), a private declared input mode,
   `description`, `provider_name`, `block_name`, `deferred_populate`, and
-  `write_only`. `InputMode` is the shared optional/required/provider-populated
-  axis used by both `StructField` and `AttributeSchema`; required user input
-  and provider-populated output are mutually exclusive, and conflicting
-  builder calls panic instead of silently choosing the last one. Assigning a
-  provider-populated nested field is rejected the same as a top-level
-  read-only attribute (carina#3772).
+  `write_only`. Input mode is selected once by the `optional`, `required`, or
+  `provider_populated` constructor, and each mode-specific builder exposes
+  only valid modifiers; mode conflicts therefore cannot be expressed and are
+  not builder panics. A nested declaration is not itself an effective mode:
+  provider-populated ancestry belongs to the reference path. Consumers must
+  start from a validated schema and use `EffectiveAttribute`, `EffectiveType`,
+  and `EffectiveField` traversal views; below provider-populated output these
+  report `ProviderPopulated` even when a shared definition declares the field
+  optional or required. Assignments are checked against that effective mode
+  (carina#3772). Resource-path value validation and state canonicalization
+  enter through `EffectiveAttribute` / `EffectiveType`
+  (`validate`, `validate_collect`, `canonicalize_state`); genuinely rootless
+  types use an owned `RootlessType` obtained from a pathless owner such as
+  `ValidatedConfigSchema`—there is no public constructor from an arbitrary
+  `AttributeType`. The raw writable-rooted walker is crate-private, so a
+  path-derived cursor cannot enter it through public API. Canonical
+  provider/state/differ lookup uses `effective_attribute`; authored DSL lookup
+  that may accept a block alias uses the explicitly named
+  `effective_attribute_by_authored_name` /
+  `effective_node_at_authored_path` traversal.
 - **Schema types are builder-only.** `StructField`, `AttributeSchema`, and
   `ResourceSchema` keep their fields `pub(crate)` (carina#3984 / PR #3999).
   Code outside `carina-core` builds them only through the builders
-  (`StructField::new(..).write_only()`, `AttributeSchema::new(..)`,
-  `ResourceSchema::new(..).attribute(..)`), so a field set can't be mutated
-  after construction into a state the builders reject. To destructure
-  exhaustively (provider conversions, the WASM seam), use the read-only views
+  (`StructField::{optional,required,provider_populated}(..)`, the corresponding
+  `AttributeSchema` constructors, and
+  `ResourceSchema::new(..).attribute(..)`). A complete draft must pass
+  `ResourceSchema::validate()` before it becomes a
+  `ValidatedResourceSchema`; registries and provider factories accept only
+  that witness. Provider-config types likewise cross factory boundaries as a
+  `ValidatedConfigSchema`. To destructure exhaustively (provider conversions,
+  the WASM seam), use the read-only views
   `parts()` → `StructFieldParts` / `AttributeSchemaParts` /
   `ResourceSchemaParts`. Their fields are all `pub` and they are not
   `#[non_exhaustive]`, so adding a field still breaks every destructuring
-  site until it is carried across. Don't add `pub` back to the schema
-  structs' fields to "make a conversion easier".
+  site until it is carried across. The parts views call the raw mode
+  `declared_input_mode` because it is conversion data, not a consumer-facing
+  effective mode. Refined validators require a `TypeIdentity`; there is no
+  identity-less validator constructor. Resource validation is portable
+  declaration data only—native/in-process resource validators are not part of
+  the schema API. Don't add `pub` back to the schema structs' fields to "make
+  a conversion easier".
 - **Write-only, top-level and nested.** `write_only` marks a value that is
   sent on create/update but never returned by reads (CloudFormation
   `writeOnlyProperties`). It is set by `.write_only()` on `AttributeSchema`
-  or on a nested `StructField`. Combining write-only with provider-populated
-  panics in the builder. Whether a top-level attribute contains a nested
+  or on a nested user-input `StructField`. Provider-populated builders do not
+  expose `.write_only()`, and whole-schema validation also rejects write-only
+  on every path below provider-populated output (including through refs,
+  unions, maps, and recursive definitions). Declared requiredness, defaults,
+  and block aliases below such an ancestor are inert on that path; walkers
+  must obtain their effective mode and active alias from an `Effective*` view.
+  Whether a top-level attribute contains a nested
   write-only field is **derived** from the type
   (`ResourceSchema::write_only_bearing`), never stored, so the flag can't
   disagree with the type. `first_write_only_conflict` rejects shapes that

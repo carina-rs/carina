@@ -4,8 +4,6 @@
 //! directory. Multi-file cases deliberately split declarations across sibling
 //! `.crn` files so the loader merge seam is exercised directly.
 
-use std::collections::HashMap;
-
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -23,8 +21,8 @@ impl ProviderFactory for DuplicateTestFactory {
         "Duplicate declaration test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -46,12 +44,22 @@ impl ProviderFactory for DuplicateTestFactory {
         Box::pin(async { panic!("validation tests never instantiate providers") })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            ResourceSchema::new("test.Thing")
-                .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-                .with_unique_name_attribute("name"),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                ResourceSchema::new("test.Thing")
+                    .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                    .with_unique_name_attribute("name"),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 

@@ -541,7 +541,9 @@ pub fn build_detail_rows_by_instance(
     // `get_for` / `get_for_data_source` registry method.
     match effect {
         Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
-            let schema = registry.and_then(|reg| reg.get_for(r));
+            let schema = registry
+                .and_then(|reg| reg.get_for(r))
+                .map(|schema| schema.as_schema());
             build_create_rows(&r.attributes, &r.default_tag_keys, schema, detail)
         }
         Effect::Update {
@@ -551,7 +553,9 @@ pub fn build_detail_rows_by_instance(
             ..
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let schema = registry.and_then(|r| r.get_for(to));
+            let schema = registry
+                .and_then(|registry| registry.get_for(to))
+                .map(|schema| schema.as_schema());
             let Some(masked_from) = historical_attributes.update(&from.id) else {
                 return Vec::new();
             };
@@ -571,7 +575,9 @@ pub fn build_detail_rows_by_instance(
             ..
         } => build_delete_rows(id, identifier.as_str(), generation, historical_attributes),
         Effect::Read { resource } => {
-            let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
+            let schema = registry
+                .and_then(|reg| reg.get_for_data_source(resource))
+                .map(|schema| schema.as_schema());
             build_create_rows(
                 &resource.attributes,
                 &DefaultTagKeys::default(),
@@ -1246,7 +1252,9 @@ pub fn build_replace_detail_rows_from_display(
     let Some(historical_attributes) = historical_display.delete(&key) else {
         return Vec::new();
     };
-    let schema = registry.and_then(|reg| reg.get_for(to));
+    let schema = registry
+        .and_then(|reg| reg.get_for(to))
+        .map(|schema| schema.as_schema());
     build_replace_rows_from_attributes(
         &historical_attributes.attributes,
         &historical_attributes.nested_write_only,
@@ -2338,10 +2346,15 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            ResourceSchema::new("test.Widget").attribute(crate::schema::AttributeSchema::new(
-                "tags",
-                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-            )),
+            (ResourceSchema::new("test.Widget").attribute(
+                crate::schema::AttributeSchema::optional(
+                    "tags",
+                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         crate::provider::merge_default_tags(
             &config,
@@ -2425,10 +2438,15 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            ResourceSchema::new("s3.Bucket").attribute(crate::schema::AttributeSchema::new(
-                "tags",
-                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-            )),
+            (ResourceSchema::new("s3.Bucket").attribute(
+                crate::schema::AttributeSchema::optional(
+                    "tags",
+                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
         );
         crate::provider::merge_default_tags(
             &config,
@@ -4413,23 +4431,23 @@ mod tests {
         let statement = AttributeType::unordered_list(AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                StructField::new("effect", effect),
-                StructField::new("action", AttributeType::string()),
+                StructField::optional("effect", effect).build(),
+                StructField::optional("action", AttributeType::string()).build(),
             ],
         ));
         let policy = AttributeType::struct_(
             "PolicyDocument".to_string(),
             vec![
-                StructField::new("version", version),
-                StructField::new("statement", statement),
+                StructField::optional("version", version).build(),
+                StructField::optional("statement", statement).build(),
             ],
         );
         let schema = ResourceSchema::new("iam.Role")
-            .attribute(AttributeSchema::new("policy", policy))
-            .attribute(AttributeSchema::new("description", AttributeType::string()))
-            .attribute(AttributeSchema::new("region", AttributeType::string()));
+            .attribute(AttributeSchema::optional("policy", policy).build())
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("region", AttributeType::string()).build());
         let mut registry = SchemaRegistry::new();
-        registry.insert("", schema);
+        registry.insert("", schema.validate().expect("schema fixture must be valid"));
         registry
     }
 
@@ -4662,9 +4680,10 @@ mod tests {
             None,
         );
         let map_t = AttributeType::map_with_key(AttributeType::string(), enum_t);
-        let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new("modes", map_t));
+        let schema = ResourceSchema::new("x.Thing")
+            .attribute(AttributeSchema::optional("modes", map_t).build());
         let mut registry = SchemaRegistry::new();
-        registry.insert("", schema);
+        registry.insert("", schema.validate().expect("schema fixture must be valid"));
 
         let mk = |v: ConcreteValue| {
             let mut m = indexmap::IndexMap::new();
@@ -4835,12 +4854,11 @@ mod tests {
             None,
             None,
         );
-        let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new(
-            "modes",
-            AttributeType::unordered_list(mode),
-        ));
+        let schema = ResourceSchema::new("x.Thing").attribute(
+            AttributeSchema::optional("modes", AttributeType::unordered_list(mode)).build(),
+        );
         let mut registry = SchemaRegistry::new();
-        registry.insert("", schema);
+        registry.insert("", schema.validate().expect("schema fixture must be valid"));
         registry
     }
 
@@ -5070,10 +5088,13 @@ mod tests {
         );
         let settings = AttributeType::struct_(
             "Settings",
-            vec![crate::schema::StructField::new(
-                "modes",
-                AttributeType::union(vec![AttributeType::ref_("L")]),
-            )],
+            vec![
+                crate::schema::StructField::optional(
+                    "modes",
+                    AttributeType::union(vec![AttributeType::ref_("L")]),
+                )
+                .build(),
+            ],
         );
         let defs = std::collections::BTreeMap::from([("L".to_string(), AttributeType::list(mode))]);
         let old_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -5722,10 +5743,10 @@ mod tests {
         let element_type = AttributeType::struct_(
             "Statement",
             vec![
-                StructField::new("effect", enum_type("Effect", "Allow", "allow")),
-                StructField::new("mode", enum_type("Mode", "Enabled", "enabled")),
-                StructField::new("scope", enum_type("Scope", "Regional", "regional")),
-                StructField::new("description", AttributeType::string()),
+                StructField::optional("effect", enum_type("Effect", "Allow", "allow")).build(),
+                StructField::optional("mode", enum_type("Mode", "Enabled", "enabled")).build(),
+                StructField::optional("scope", enum_type("Scope", "Regional", "regional")).build(),
+                StructField::optional("description", AttributeType::string()).build(),
             ],
         );
         let list_type = AttributeType::unordered_list(element_type);

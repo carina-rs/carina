@@ -144,26 +144,28 @@ fn plan_for_reordered_iam_policy_value_lists(
         };
         AttributeType::union(vec![AttributeType::string(), list])
     };
-    let principal =
-        AttributeType::struct_("Principal", vec![StructField::new("aws", string_or_list())]);
+    let principal = AttributeType::struct_(
+        "Principal",
+        vec![StructField::optional("aws", string_or_list()).build()],
+    );
     let statement = AttributeType::struct_(
         "Statement",
         vec![
-            StructField::new("action", string_or_list()),
-            StructField::new("principal", principal),
+            StructField::optional("action", string_or_list()).build(),
+            StructField::optional("principal", principal).build(),
         ],
     );
     let policy_document = AttributeType::struct_(
         "PolicyDocument",
-        vec![StructField::new(
-            "statement",
-            AttributeType::list(statement),
-        )],
+        vec![StructField::optional("statement", AttributeType::list(statement)).build()],
     );
     let schema = ResourceSchema::new("iam.Policy")
-        .attribute(AttributeSchema::new("policy_document", policy_document));
+        .attribute(AttributeSchema::optional("policy_document", policy_document).build());
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", schema);
+    registry.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let string_list = |items: &[&str]| {
         Value::Concrete(ConcreteValue::List(
@@ -595,8 +597,13 @@ fn replace_when_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
+            AttributeSchema::optional("cidr_block", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -631,17 +638,20 @@ fn create_only_nested_write_only_fixture(
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 
     let schema = crate::schema::ResourceSchema::new("test.Credential").attribute(
-        AttributeSchema::new(
+        AttributeSchema::optional(
             "creds",
             AttributeType::struct_(
                 "Credentials",
                 vec![
-                    StructField::new("username", AttributeType::string()),
-                    StructField::new("password", AttributeType::string()).write_only(),
+                    StructField::optional("username", AttributeType::string()).build(),
+                    StructField::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
                 ],
             ),
         )
-        .create_only(),
+        .create_only()
+        .build(),
     );
     let desired_creds = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
@@ -675,7 +685,7 @@ fn create_only_nested_write_only_without_record_plans_no_change() {
     let (desired, current, schema) = create_only_nested_write_only_fixture("accepted-secret");
     let id = desired.id.clone();
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("", schema);
+    schemas.insert("", schema.validate().expect("schema fixture must be valid"));
     let saved = crate::provider::RawSavedAttrs::from_persisted(
         HashMap::new(),
         HashMap::from([(
@@ -722,7 +732,7 @@ fn create_only_nested_write_only_changed_record_plans_replace() {
         .record_sent(&schema, ["creds"], &previous_desired.attributes, None)
         .expect("fixture credentials are persistable");
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("", schema);
+    schemas.insert("", schema.validate().expect("schema fixture must be valid"));
     let saved = crate::provider::RawSavedAttrs::from_persisted(
         HashMap::new(),
         HashMap::from([(id.clone(), record)]),
@@ -775,12 +785,17 @@ fn normal_update_when_non_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new(
-                "enable_dns_support",
-                AttributeType::bool(),
-            )),
+        (crate::schema::ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -842,12 +857,17 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new(
-                "enable_dns_support",
-                AttributeType::bool(),
-            )),
+        (crate::schema::ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -910,10 +930,20 @@ fn replace_carries_create_before_destroy_directives() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
-            .with_unique_name_attribute("name"),
+        (crate::schema::ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -1034,8 +1064,13 @@ fn replace_with_provider_prefixed_schema_key() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
+            AttributeSchema::optional("cidr_block", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -1379,10 +1414,10 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     let egress_struct = AttributeType::struct_(
         "Egress".to_string(),
         vec![
-            StructField::new("cidr_ip", AttributeType::string()),
-            StructField::new("description", AttributeType::string()),
-            StructField::new("from_port", AttributeType::int()),
-            StructField::new(
+            StructField::optional("cidr_ip", AttributeType::string()).build(),
+            StructField::optional("description", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional(
                 "ip_protocol",
                 AttributeType::enum_(
                     crate::schema::enum_identity("IpProtocol", Some("awscc.ec2.SecurityGroup")),
@@ -1397,15 +1432,17 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                     None,
                     None,
                 ),
-            ),
-            StructField::new("to_port", AttributeType::int()),
+            )
+            .build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
         ],
     );
     let schema = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::new(
+        crate::schema::AttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
-        ),
+        )
+        .build(),
     );
 
     // Desired state (post-normalization, post-alias-resolution)
@@ -1591,20 +1628,21 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     let egress_struct = AttributeType::struct_(
         "Egress".to_string(),
         vec![
-            StructField::new("cidr_ip", AttributeType::string()),
-            StructField::new("description", AttributeType::string()),
-            StructField::new("from_port", AttributeType::int()),
-            StructField::new("ip_protocol", AttributeType::string()),
-            StructField::new("to_port", AttributeType::int()),
+            StructField::optional("cidr_ip", AttributeType::string()).build(),
+            StructField::optional("description", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional("ip_protocol", AttributeType::string()).build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
         ],
     );
 
     // Bug: ordered: true causes positional comparison of struct list items
     let schema_ordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::new(
+        crate::schema::AttributeSchema::optional(
             "security_group_egress",
             AttributeType::list(egress_struct.clone()),
-        ),
+        )
+        .build(),
     );
 
     // Same items in different order
@@ -1677,10 +1715,11 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 
     // With ordered: false (unordered_list), differ correctly sees no change
     let schema_unordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::new(
+        crate::schema::AttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
-        ),
+        )
+        .build(),
     );
     let result = diff_test(&desired, &current, None, None, Some(&schema_unordered));
     assert!(
@@ -1702,8 +1741,8 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 fn diff_no_change_for_compound_word_dsl_alias() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema =
-        ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(AttributeSchema::new(
+    let schema = ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(
+        AttributeSchema::optional(
             "object_ownership",
             AttributeType::enum_(
                 crate::schema::enum_identity(
@@ -1729,7 +1768,9 @@ fn diff_no_change_for_compound_word_dsl_alias() {
                 None,
                 None,
             ),
-        ));
+        )
+        .build(),
+    );
 
     // Desired: typed DSL alias emitted by the parser.
     let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test", None)

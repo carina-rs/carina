@@ -1015,7 +1015,7 @@ impl PlanSchemaFingerprints {
                     reference.kind,
                 )
                 .map_or(TypeSchemaFingerprint::Absent, |schema| {
-                    TypeSchemaFingerprint::Present(schema.semantic_fingerprint())
+                    TypeSchemaFingerprint::Present(schema.as_schema().semantic_fingerprint())
                 });
             grouped.entry(reference.provider.clone()).or_default().push(
                 PlanSchemaTypeFingerprint {
@@ -1111,7 +1111,7 @@ impl PlanSchemaFingerprints {
                         reference.resource_type,
                     )),
                     (TypeSchemaFingerprint::Present(recorded), Some(current))
-                        if current.semantic_fingerprint() != *recorded =>
+                        if current.as_schema().semantic_fingerprint() != *recorded =>
                     {
                         changed_types.push(format!(
                             "{} `{}` (changed)",
@@ -1164,7 +1164,7 @@ mod schema_fingerprint_tests {
 
     fn schema(resource_type: &str, attribute: &str) -> ResourceSchema {
         ResourceSchema::new(resource_type)
-            .attribute(AttributeSchema::new(attribute, AttributeType::string()))
+            .attribute(AttributeSchema::optional(attribute, AttributeType::string()).build())
     }
 
     #[test]
@@ -1185,7 +1185,12 @@ mod schema_fingerprint_tests {
             PlanSchemaReferences(BTreeSet::from([reference("provider", "example.Gone")]));
         let saved = PlanSchemaFingerprints::capture(&references, &SchemaRegistry::new());
         let mut current = SchemaRegistry::new();
-        current.insert("provider", schema("example.Gone", "name"));
+        current.insert(
+            "provider",
+            schema("example.Gone", "name")
+                .validate()
+                .expect("test schema must be valid"),
+        );
 
         let mismatch = saved
             .verify(&references, &current)
@@ -1203,13 +1208,33 @@ mod schema_fingerprint_tests {
             reference("beta", "example.Two"),
         ]));
         let mut planned = SchemaRegistry::new();
-        planned.insert("alpha", schema("example.One", "old"));
-        planned.insert("beta", schema("example.Two", "old"));
+        planned.insert(
+            "alpha",
+            schema("example.One", "old")
+                .validate()
+                .expect("test schema must be valid"),
+        );
+        planned.insert(
+            "beta",
+            schema("example.Two", "old")
+                .validate()
+                .expect("test schema must be valid"),
+        );
         let saved = PlanSchemaFingerprints::capture(&references, &planned);
 
         let mut current = SchemaRegistry::new();
-        current.insert("alpha", schema("example.One", "new"));
-        current.insert("beta", schema("example.Two", "new"));
+        current.insert(
+            "alpha",
+            schema("example.One", "new")
+                .validate()
+                .expect("test schema must be valid"),
+        );
+        current.insert(
+            "beta",
+            schema("example.Two", "new")
+                .validate()
+                .expect("test schema must be valid"),
+        );
         let mismatch = saved
             .verify(&references, &current)
             .expect_err("both providers changed");

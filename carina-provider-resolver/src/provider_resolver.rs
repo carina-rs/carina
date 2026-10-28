@@ -3009,28 +3009,11 @@ impl LockFileMigration {
                         self.from, pin.discovery_sha256
                     )?;
                 }
-                writeln!(
-                    f,
-                    "After verifying out of band that discarding this host's legacy discovery values is intended, run `{}`.",
-                    ProjectCommand::new("providers repin-discovery", &self.project_dir)
-                        .with_argument(host.as_str())
-                )?;
+                let refusal = RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
+                    target: HostRefusalTarget::new(host.as_str(), &self.project_dir),
+                };
+                writeln!(f, "{refusal}")?;
             }
-        }
-        match (repinned_host, self.discarded_discovery_pins.len()) {
-            (Some(_), remaining) if remaining > 1 => {
-                writeln!(
-                    f,
-                    "Registry resolution remains blocked for each other migrated host until its legacy pin is explicitly authorized for discard."
-                )?;
-            }
-            (None, _) => {
-                writeln!(
-                    f,
-                    "Registry resolution is blocked for each migrated host until its legacy pin is explicitly authorized for discard."
-                )?;
-            }
-            (Some(_), _) => {}
         }
         writeln!(
             f,
@@ -5016,29 +4999,703 @@ impl From<String> for FindInstalledProviderError {
 // observation cannot move that anchor, and true first contact has no numeric base.
 const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
-fn identity_repin_remediation(target: &str, project_dir: &Path) -> String {
-    format!(
-        "After verifying out-of-band that the signing-identity change is intended, run `{}` to clear only the identity pin, then re-run `{}` to acquire and verify a new pin.",
-        ProjectCommand::new("providers repin-identity", project_dir).with_argument(target),
-        ProjectCommand::new("init", project_dir),
-    )
+
+/// Per-provider security state or immutable protocol rule that can cause a
+/// registry response to be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderLockState {
+    // Current refusals consult the sequence anchor or presence bit, but the
+    // independently persisted observation is still cleared by re-bootstrap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SequenceObservation,
+    SequenceReferencePoint,
+    SequencePresence,
+    SignerPins,
+    SignaturePresence,
+    ValidUntilPresence,
+    TransparencyLogPresence,
+    YankedFlag,
+    ShasumPin,
+    HostnamePin,
+    StableSourceRefRule,
 }
 
-fn sequence_rebootstrap_remediation(target: &str, project_dir: &Path) -> String {
-    format!(
-        "After verifying out-of-band that resetting registry freshness is intended, run `{}` to clear only the persisted sequence observation and anchor, then re-run `{}`.",
-        ProjectCommand::new("providers re-bootstrap", project_dir).with_argument(target),
-        ProjectCommand::new("init", project_dir),
-    )
+#[cfg(test)]
+#[repr(usize)]
+enum ProviderLockStateIndex {
+    SequenceObservation,
+    SequenceReferencePoint,
+    SequencePresence,
+    SignerPins,
+    SignaturePresence,
+    ValidUntilPresence,
+    TransparencyLogPresence,
+    YankedFlag,
+    ShasumPin,
+    HostnamePin,
+    StableSourceRefRule,
+    Count,
 }
 
-fn discovery_repin_remediation(target: &str, project_dir: &Path) -> String {
-    format!(
-        "After verifying out-of-band that the change to the pinned discovery values (today, the resolved API base) is intended, run `{}` to clear only those host discovery values, then re-run `{}` to acquire and verify new values.",
-        ProjectCommand::new("providers repin-discovery", project_dir).with_argument(target),
-        ProjectCommand::new("init", project_dir),
-    )
+#[cfg(test)]
+const PROVIDER_LOCK_STATE_COUNT: usize = ProviderLockStateIndex::Count as usize;
+
+impl ProviderLockState {
+    #[cfg(test)]
+    const ALL: [Self; PROVIDER_LOCK_STATE_COUNT] = [
+        Self::SequenceObservation,
+        Self::SequenceReferencePoint,
+        Self::SequencePresence,
+        Self::SignerPins,
+        Self::SignaturePresence,
+        Self::ValidUntilPresence,
+        Self::TransparencyLogPresence,
+        Self::YankedFlag,
+        Self::ShasumPin,
+        Self::HostnamePin,
+        Self::StableSourceRefRule,
+    ];
+
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::SequenceObservation => ProviderLockStateIndex::SequenceObservation as usize,
+            Self::SequenceReferencePoint => ProviderLockStateIndex::SequenceReferencePoint as usize,
+            Self::SequencePresence => ProviderLockStateIndex::SequencePresence as usize,
+            Self::SignerPins => ProviderLockStateIndex::SignerPins as usize,
+            Self::SignaturePresence => ProviderLockStateIndex::SignaturePresence as usize,
+            Self::ValidUntilPresence => ProviderLockStateIndex::ValidUntilPresence as usize,
+            Self::TransparencyLogPresence => {
+                ProviderLockStateIndex::TransparencyLogPresence as usize
+            }
+            Self::YankedFlag => ProviderLockStateIndex::YankedFlag as usize,
+            Self::ShasumPin => ProviderLockStateIndex::ShasumPin as usize,
+            Self::HostnamePin => ProviderLockStateIndex::HostnamePin as usize,
+            Self::StableSourceRefRule => ProviderLockStateIndex::StableSourceRefRule as usize,
+        }
+    }
 }
+
+/// Per-host security state that can cause registry discovery to be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostLockState {
+    DiscoveryPin,
+    LegacyDiscoveryValues,
+}
+
+#[cfg(test)]
+#[repr(usize)]
+enum HostLockStateIndex {
+    DiscoveryPin,
+    LegacyDiscoveryValues,
+    Count,
+}
+
+#[cfg(test)]
+const HOST_LOCK_STATE_COUNT: usize = HostLockStateIndex::Count as usize;
+
+impl HostLockState {
+    #[cfg(test)]
+    const ALL: [Self; HOST_LOCK_STATE_COUNT] = [Self::DiscoveryPin, Self::LegacyDiscoveryValues];
+
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::DiscoveryPin => HostLockStateIndex::DiscoveryPin as usize,
+            Self::LegacyDiscoveryValues => HostLockStateIndex::LegacyDiscoveryValues as usize,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderRefusalTarget {
+    source_key: String,
+    project_dir: PathBuf,
+}
+
+impl ProviderRefusalTarget {
+    fn new(source_key: impl Into<String>, project_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            source_key: source_key.into(),
+            project_dir: project_dir.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostRefusalTarget {
+    host: String,
+    project_dir: PathBuf,
+}
+
+impl HostRefusalTarget {
+    fn new(host: impl Into<String>, project_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            host: host.into(),
+            project_dir: project_dir.into(),
+        }
+    }
+}
+
+mod recovery {
+    use super::{
+        HostLockState, HostRefusalTarget, Path, ProjectCommand, ProviderLockState,
+        ProviderRefusalTarget, fmt,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ProviderRecovery {
+        Rebootstrap,
+        IdentityRepin,
+    }
+
+    impl ProviderRecovery {
+        #[cfg(test)]
+        pub(super) const ALL: [Self; 2] = [Self::Rebootstrap, Self::IdentityRepin];
+
+        const fn subcommand(self) -> &'static str {
+            match self {
+                Self::Rebootstrap => "providers re-bootstrap",
+                Self::IdentityRepin => "providers repin-identity",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum HostRecovery {
+        DiscoveryRepin,
+    }
+
+    impl HostRecovery {
+        #[cfg(test)]
+        pub(super) const ALL: [Self; 1] = [Self::DiscoveryRepin];
+
+        const fn subcommand(self) -> &'static str {
+            match self {
+                Self::DiscoveryRepin => "providers repin-discovery",
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RecoveryKind {
+        Rebootstrap,
+        IdentityRepin,
+        DiscoveryRepin,
+    }
+
+    impl ProviderLockState {
+        pub(super) const fn cleared_by(self) -> Option<ProviderRecovery> {
+            match self {
+                Self::SequenceObservation
+                | Self::SequenceReferencePoint
+                | Self::SequencePresence => Some(ProviderRecovery::Rebootstrap),
+                Self::SignerPins => Some(ProviderRecovery::IdentityRepin),
+                Self::SignaturePresence
+                | Self::ValidUntilPresence
+                | Self::TransparencyLogPresence
+                | Self::YankedFlag
+                | Self::ShasumPin
+                | Self::HostnamePin
+                | Self::StableSourceRefRule => None,
+            }
+        }
+    }
+
+    impl HostLockState {
+        pub(super) const fn cleared_by(self) -> Option<HostRecovery> {
+            match self {
+                Self::DiscoveryPin | Self::LegacyDiscoveryValues => {
+                    Some(HostRecovery::DiscoveryRepin)
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RemediationKind<'a> {
+        Provider(
+            ProviderRecovery,
+            ProviderLockState,
+            &'a ProviderRefusalTarget,
+        ),
+        Host(HostRecovery, HostLockState, &'a HostRefusalTarget),
+    }
+
+    /// A recovery paired with the only target scope accepted by that operation.
+    /// Its private representation makes derivation from a lock-state cause the
+    /// only construction path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Remediation<'a>(RemediationKind<'a>);
+
+    impl<'a> Remediation<'a> {
+        pub(super) const fn for_provider(
+            cause: ProviderLockState,
+            target: &'a ProviderRefusalTarget,
+        ) -> Option<Self> {
+            match cause.cleared_by() {
+                Some(operation) => Some(Self(RemediationKind::Provider(operation, cause, target))),
+                None => None,
+            }
+        }
+
+        pub(super) const fn for_host(
+            cause: HostLockState,
+            target: &'a HostRefusalTarget,
+        ) -> Option<Self> {
+            match cause.cleared_by() {
+                Some(operation) => Some(Self(RemediationKind::Host(operation, cause, target))),
+                None => None,
+            }
+        }
+
+        pub(super) fn command(self) -> ProjectCommand<'a> {
+            match self.0 {
+                RemediationKind::Provider(operation, _, target) => {
+                    ProjectCommand::new(operation.subcommand(), &target.project_dir)
+                        .with_argument(&target.source_key)
+                }
+                RemediationKind::Host(operation, _, target) => {
+                    ProjectCommand::new(operation.subcommand(), &target.project_dir)
+                        .with_argument(&target.host)
+                }
+            }
+        }
+
+        pub(super) fn same_operation_and_target(self, other: Self) -> bool {
+            match (self.0, other.0) {
+                (
+                    RemediationKind::Provider(operation, _, target),
+                    RemediationKind::Provider(other_operation, _, other_target),
+                ) => operation == other_operation && target == other_target,
+                (
+                    RemediationKind::Host(operation, _, target),
+                    RemediationKind::Host(other_operation, _, other_target),
+                ) => operation == other_operation && target == other_target,
+                (RemediationKind::Provider(_, _, _), RemediationKind::Host(_, _, _))
+                | (RemediationKind::Host(_, _, _), RemediationKind::Provider(_, _, _)) => false,
+            }
+        }
+
+        fn project_dir(self) -> &'a Path {
+            match self.0 {
+                RemediationKind::Provider(_, _, target) => &target.project_dir,
+                RemediationKind::Host(_, _, target) => &target.project_dir,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) const fn subcommand(self) -> &'static str {
+            match self.0 {
+                RemediationKind::Provider(operation, _, _) => operation.subcommand(),
+                RemediationKind::Host(operation, _, _) => operation.subcommand(),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) const fn kind(self) -> RecoveryKind {
+            match self.0 {
+                RemediationKind::Provider(ProviderRecovery::Rebootstrap, _, _) => {
+                    RecoveryKind::Rebootstrap
+                }
+                RemediationKind::Provider(ProviderRecovery::IdentityRepin, _, _) => {
+                    RecoveryKind::IdentityRepin
+                }
+                RemediationKind::Host(HostRecovery::DiscoveryRepin, _, _) => {
+                    RecoveryKind::DiscoveryRepin
+                }
+            }
+        }
+
+        pub(super) fn fmt(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let command = self.command();
+            let init = ProjectCommand::new("init", self.project_dir());
+            match self.0 {
+                RemediationKind::Provider(ProviderRecovery::Rebootstrap, _, _) => write!(
+                    formatter,
+                    "After verifying out-of-band that resetting registry freshness is intended, run `{command}` to clear only the persisted sequence observation, anchor and presence record, then re-run `{init}`."
+                ),
+                RemediationKind::Provider(ProviderRecovery::IdentityRepin, _, _) => write!(
+                    formatter,
+                    "After verifying out-of-band that the signing-identity change is intended, run `{command}` to clear only the identity pin, then re-run `{init}` to acquire and verify a new pin."
+                ),
+                RemediationKind::Host(
+                    HostRecovery::DiscoveryRepin,
+                    HostLockState::DiscoveryPin,
+                    _,
+                ) => write!(
+                    formatter,
+                    "After verifying out-of-band that the change to the pinned discovery values (today, the resolved API base) is intended, run `{command}` to clear only those host discovery values, then re-run `{init}` to acquire and verify new values."
+                ),
+                RemediationKind::Host(
+                    HostRecovery::DiscoveryRepin,
+                    HostLockState::LegacyDiscoveryValues,
+                    _,
+                ) => write!(
+                    formatter,
+                    "After verifying out of band that discarding this host's legacy discovery values is intended, run `{command}` to clear only those legacy host discovery values, then re-run `{init}`."
+                ),
+            }
+        }
+    }
+}
+
+use recovery::Remediation;
+
+#[cfg(test)]
+use recovery::{HostRecovery, ProviderRecovery, RecoveryKind};
+
+#[derive(Debug, Clone, Copy)]
+enum ScopedRegistryRefusal<'a> {
+    Provider {
+        cause: ProviderLockState,
+        target: &'a ProviderRefusalTarget,
+    },
+    Host {
+        cause: HostLockState,
+        target: &'a HostRefusalTarget,
+    },
+}
+
+impl<'a> ScopedRegistryRefusal<'a> {
+    fn recovery(self) -> Option<Remediation<'a>> {
+        match self {
+            Self::Provider { cause, target } => Remediation::for_provider(cause, target),
+            Self::Host { cause, target } => Remediation::for_host(cause, target),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistryRefusal {
+    SequenceFieldDisappeared {
+        target: ProviderRefusalTarget,
+    },
+    SequenceRollback {
+        previous: u64,
+        current: u64,
+        target: ProviderRefusalTarget,
+    },
+    SequenceFastForward {
+        anchor: u64,
+        current: u64,
+        target: ProviderRefusalTarget,
+    },
+    YankedFlagDisappeared {
+        versions: Vec<String>,
+        target: ProviderRefusalTarget,
+    },
+    ValidUntilFieldDisappeared {
+        target: ProviderRefusalTarget,
+    },
+    DiscoveryMigrationAuthorizationRequired {
+        target: HostRefusalTarget,
+    },
+    DiscoveryPinMismatch {
+        pinned: String,
+        resolved: String,
+        target: HostRefusalTarget,
+    },
+    LegacyShasumPinMismatch {
+        version: String,
+        locked: String,
+        resolved: String,
+        target: ProviderRefusalTarget,
+    },
+    LegacySignatureMissing {
+        version: String,
+        target: ProviderRefusalTarget,
+    },
+    ShasumPinMismatch {
+        version: String,
+        locked: String,
+        resolved: String,
+        target: ProviderRefusalTarget,
+    },
+    HostnamePinMismatch {
+        locked: String,
+        resolved: String,
+        target: ProviderRefusalTarget,
+    },
+    SignatureFieldDisappeared {
+        target: ProviderRefusalTarget,
+    },
+    TransparencyLogFieldDisappeared {
+        target: ProviderRefusalTarget,
+    },
+    Signer {
+        rejection: SignerRejection,
+        target: ProviderRefusalTarget,
+    },
+}
+
+impl RegistryRefusal {
+    fn from_signer_rejection(rejection: SignerRejection, source: &str, project_dir: &Path) -> Self {
+        Self::Signer {
+            rejection,
+            target: ProviderRefusalTarget::new(source, project_dir),
+        }
+    }
+
+    fn scoped(&self) -> ScopedRegistryRefusal<'_> {
+        match self {
+            Self::SequenceFieldDisappeared { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::SequencePresence,
+                target,
+            },
+            Self::SequenceRollback { target, .. } | Self::SequenceFastForward { target, .. } => {
+                ScopedRegistryRefusal::Provider {
+                    cause: ProviderLockState::SequenceReferencePoint,
+                    target,
+                }
+            }
+            Self::YankedFlagDisappeared { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::YankedFlag,
+                target,
+            },
+            Self::ValidUntilFieldDisappeared { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::ValidUntilPresence,
+                target,
+            },
+            Self::DiscoveryMigrationAuthorizationRequired { target, .. } => {
+                ScopedRegistryRefusal::Host {
+                    cause: HostLockState::LegacyDiscoveryValues,
+                    target,
+                }
+            }
+            Self::DiscoveryPinMismatch { target, .. } => ScopedRegistryRefusal::Host {
+                cause: HostLockState::DiscoveryPin,
+                target,
+            },
+            // Identity re-pin would bypass legacy conversion, but it does not
+            // clear changed immutable-version content and is not its recovery.
+            Self::LegacyShasumPinMismatch { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::ShasumPin,
+                target,
+            },
+            Self::LegacySignatureMissing { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::SignaturePresence,
+                target,
+            },
+            Self::ShasumPinMismatch { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::ShasumPin,
+                target,
+            },
+            Self::SignatureFieldDisappeared { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::SignaturePresence,
+                target,
+            },
+            Self::HostnamePinMismatch { target, .. } => ScopedRegistryRefusal::Provider {
+                cause: ProviderLockState::HostnamePin,
+                target,
+            },
+            Self::TransparencyLogFieldDisappeared { target, .. } => {
+                ScopedRegistryRefusal::Provider {
+                    cause: ProviderLockState::TransparencyLogPresence,
+                    target,
+                }
+            }
+            Self::Signer { rejection, target } => {
+                let cause = match rejection {
+                    SignerRejection::StableSourceRef { .. } => {
+                        ProviderLockState::StableSourceRefRule
+                    }
+                    SignerRejection::LegacyIdentity
+                    | SignerRejection::SourceMismatch { .. }
+                    | SignerRejection::Workflow { .. } => ProviderLockState::SignerPins,
+                };
+                ScopedRegistryRefusal::Provider { cause, target }
+            }
+        }
+    }
+
+    fn recovery(&self) -> Option<Remediation<'_>> {
+        self.scoped().recovery()
+    }
+
+    fn fmt_reason(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceFieldDisappeared { target } => write!(
+                formatter,
+                "registry sequence field disappeared for {}",
+                target.source_key
+            ),
+            Self::SequenceRollback {
+                previous,
+                current,
+                target,
+            } => write!(
+                formatter,
+                "registry sequence rollback for {}: previous {previous}, got {current}",
+                target.source_key
+            ),
+            Self::SequenceFastForward {
+                anchor,
+                current,
+                target,
+            } => write!(
+                formatter,
+                "registry sequence fast-forward for {} is too large: established anchor {anchor}, got {current}",
+                target.source_key
+            ),
+            Self::YankedFlagDisappeared { versions, target } => write!(
+                formatter,
+                "registry yanked flag disappeared for {} version(s): {}",
+                target.source_key,
+                versions.join(", ")
+            ),
+            Self::ValidUntilFieldDisappeared { target } => write!(
+                formatter,
+                "registry valid_until field disappeared for {}",
+                target.source_key
+            ),
+            Self::DiscoveryMigrationAuthorizationRequired { target } => write!(
+                formatter,
+                "registry discovery for host {} is blocked because its legacy lock-format migration requires operator authorization",
+                target.host
+            ),
+            Self::DiscoveryPinMismatch {
+                pinned,
+                resolved,
+                target,
+            } => write!(
+                formatter,
+                "registry pinned discovery values mismatch for host {}: pinned providers.v1 was {pinned}; resolved providers.v1 is {resolved}",
+                target.host
+            ),
+            Self::LegacyShasumPinMismatch {
+                version,
+                locked,
+                resolved,
+                target,
+            } => write!(
+                formatter,
+                "registry shasum for the legacy-pinned version {}@{version} differs from carina-providers.lock: lock has {locked}, registry returned {resolved}",
+                target.source_key
+            ),
+            Self::LegacySignatureMissing { version, target } => write!(
+                formatter,
+                "legacy-pinned version {}@{version} was obtained without its required registry signature",
+                target.source_key
+            ),
+            Self::ShasumPinMismatch {
+                version,
+                locked,
+                resolved,
+                target,
+            } => write!(
+                formatter,
+                "registry shasum pin mismatch for {}@{version}: lock has {locked}, registry returned {resolved}",
+                target.source_key
+            ),
+            Self::HostnamePinMismatch {
+                locked,
+                resolved,
+                target,
+            } => write!(
+                formatter,
+                "registry hostname pin mismatch for {}: lock has {locked}, resolved {resolved}",
+                target.source_key
+            ),
+            Self::SignatureFieldDisappeared { target } => write!(
+                formatter,
+                "the resolved version of {} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override",
+                target.source_key
+            ),
+            Self::TransparencyLogFieldDisappeared { target } => write!(
+                formatter,
+                "registry transparency_log field disappeared for {}",
+                target.source_key
+            ),
+            Self::Signer { rejection, .. } => {
+                write!(
+                    formatter,
+                    "{rejection}; signature verification has no override"
+                )
+            }
+        }
+    }
+}
+
+impl fmt::Display for RegistryRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_reason(formatter)?;
+        formatter.write_str(". ")?;
+        match self.recovery() {
+            Some(remediation) => remediation.fmt(formatter),
+            None => formatter.write_str("No sanctioned recovery operation clears this refusal."),
+        }
+    }
+}
+
+impl std::error::Error for RegistryRefusal {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryRefusals {
+    first: RegistryRefusal,
+    rest: Vec<RegistryRefusal>,
+}
+
+impl RegistryRefusals {
+    fn new(first: RegistryRefusal) -> Self {
+        Self {
+            first,
+            rest: Vec::new(),
+        }
+    }
+
+    fn insert(refusals: &mut Option<Self>, refusal: RegistryRefusal) {
+        match refusals {
+            Some(refusals) => refusals.rest.push(refusal),
+            None => *refusals = Some(Self::new(refusal)),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RegistryRefusal> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+impl fmt::Display for RegistryRefusals {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.rest.is_empty() {
+            return self.first.fmt(formatter);
+        }
+
+        formatter.write_str("Registry response was refused for multiple reasons: ")?;
+        for (index, refusal) in self.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            refusal.fmt_reason(formatter)?;
+        }
+        formatter.write_str(". ")?;
+
+        let mut remediations = Vec::new();
+        for refusal in self.iter() {
+            let Some(remediation) = refusal.recovery() else {
+                return formatter
+                    .write_str("No sanctioned recovery operation clears all of these refusals.");
+            };
+            if !remediations
+                .iter()
+                .any(|existing| remediation.same_operation_and_target(*existing))
+            {
+                remediations.push(remediation);
+            }
+        }
+        for (index, remediation) in remediations.into_iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(" ")?;
+            }
+            remediation.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RegistryRefusals {}
 
 /// A registry whose hostname and API base were resolved through §1 discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5482,6 +6139,63 @@ mod registry_listing_validation {
             project_dir: &Path,
         ) -> Result<Self, String> {
             let source_key = source.source_key();
+            let target = ProviderRefusalTarget::new(source_key.as_str(), project_dir);
+            let valid_until_present = versions.valid_until.is_some();
+            let mut refusals = None;
+
+            match sequence_anchor {
+                RegistrySequenceAnchor::Unestablished => {}
+                RegistrySequenceAnchor::Established(previous) => match versions.sequence {
+                    None => RegistryRefusals::insert(
+                        &mut refusals,
+                        RegistryRefusal::SequenceFieldDisappeared {
+                            target: target.clone(),
+                        },
+                    ),
+                    Some(sequence) if sequence < previous => RegistryRefusals::insert(
+                        &mut refusals,
+                        RegistryRefusal::SequenceRollback {
+                            previous,
+                            current: sequence,
+                            target: target.clone(),
+                        },
+                    ),
+                    Some(sequence)
+                        if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD =>
+                    {
+                        RegistryRefusals::insert(
+                            &mut refusals,
+                            RegistryRefusal::SequenceFastForward {
+                                anchor: previous,
+                                current: sequence,
+                                target: target.clone(),
+                            },
+                        );
+                    }
+                    Some(_) => {}
+                },
+            }
+
+            let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
+            if !stripped_versions.is_empty() {
+                RegistryRefusals::insert(
+                    &mut refusals,
+                    RegistryRefusal::YankedFlagDisappeared {
+                        versions: stripped_versions,
+                        target: target.clone(),
+                    },
+                );
+            }
+            if locked.valid_until_present && !valid_until_present {
+                RegistryRefusals::insert(
+                    &mut refusals,
+                    RegistryRefusal::ValidUntilFieldDisappeared { target },
+                );
+            }
+            if let Some(refusals) = refusals {
+                return Err(refusals.to_string());
+            }
+
             let valid_until = versions
                 .valid_until
                 .as_deref()
@@ -5490,61 +6204,6 @@ mod registry_listing_validation {
                         .map_err(|error| format!("Invalid registry valid_until timestamp: {error}"))
                 })
                 .transpose()?;
-            let valid_until_present = valid_until.is_some();
-
-            match sequence_anchor {
-                RegistrySequenceAnchor::Unestablished => {}
-                RegistrySequenceAnchor::Established(previous) => {
-                    let Some(sequence) = versions.sequence else {
-                        return Err(format!(
-                            "registry sequence field disappeared for {}/{}",
-                            source.namespace(),
-                            source.name()
-                        ));
-                    };
-                    if sequence < previous {
-                        let remediation =
-                            sequence_rebootstrap_remediation(source_key.as_str(), project_dir);
-                        return Err(format!(
-                            "registry sequence rollback for {}/{}: previous {}, got {}. {}",
-                            source.namespace(),
-                            source.name(),
-                            previous,
-                            sequence,
-                            remediation
-                        ));
-                    }
-                    if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
-                        let remediation =
-                            sequence_rebootstrap_remediation(source_key.as_str(), project_dir);
-                        return Err(format!(
-                            "registry sequence fast-forward for {}/{} is too large: established anchor {}, got {}. {}",
-                            source.namespace(),
-                            source.name(),
-                            previous,
-                            sequence,
-                            remediation
-                        ));
-                    }
-                }
-            }
-
-            let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
-            if !stripped_versions.is_empty() {
-                return Err(format!(
-                    "registry yanked flag disappeared for {}/{} version(s): {}",
-                    source.namespace(),
-                    source.name(),
-                    stripped_versions.join(", ")
-                ));
-            }
-            if locked.valid_until_present && !valid_until_present {
-                return Err(format!(
-                    "registry valid_until field disappeared for {}/{}",
-                    source.namespace(),
-                    source.name()
-                ));
-            }
             if valid_until.is_some_and(|valid_until| valid_until < OffsetDateTime::now_utc()) {
                 return Err(format!(
                     "registry versions listing valid_until is expired for {}/{}",
@@ -5780,11 +6439,10 @@ fn resolve_registry<H: RegistryHttp>(
 ) -> Result<ResolvedRegistry, String> {
     let existing_discovery = match existing_host {
         Some(host) => Some(host.authorized_discovery().map_err(|_| {
-            let remediation = discovery_repin_remediation(source.hostname(), project_dir);
-            format!(
-                "registry discovery for host {} is blocked because its legacy lock-format migration requires operator authorization. {remediation}",
-                source.hostname()
-            )
+            RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
+                target: HostRefusalTarget::new(source.hostname(), project_dir),
+            }
+            .to_string()
         })?),
         None => None,
     };
@@ -5806,12 +6464,12 @@ fn resolve_registry<H: RegistryHttp>(
         && !same_consumed_discovery_values(existing_pin, &discovery_pin)
     {
         let host = source.hostname();
-        let remediation = discovery_repin_remediation(host, project_dir);
-        return Err(format!(
-            "registry pinned discovery values mismatch for host {host}: pinned providers.v1 was {}; resolved providers.v1 is {}. {remediation}",
-            existing_pin.api_base_url(),
-            discovery_pin.api_base_url()
-        ));
+        return Err(RegistryRefusal::DiscoveryPinMismatch {
+            pinned: existing_pin.api_base_url().to_string(),
+            resolved: discovery_pin.api_base_url().to_string(),
+            target: HostRefusalTarget::new(host, project_dir),
+        }
+        .to_string());
     }
     Ok(ResolvedRegistry {
         hostname: source.hostname().to_string(),
@@ -6264,15 +6922,26 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         LegacyFetch::Unavailable => return Ok(()),
     };
     if download.shasum != locked_sha256 {
-        return Err(format!(
-            "registry shasum for the legacy-pinned version {source_key}@{locked_version} differs from carina-providers.lock: lock has {locked_sha256}, registry returned {}",
-            download.shasum
-        ));
+        return Err(RegistryRefusal::LegacyShasumPinMismatch {
+            version: locked_version.clone(),
+            locked: locked_sha256.clone(),
+            resolved: download.shasum.clone(),
+            target: ProviderRefusalTarget::new(
+                source_key.as_str(),
+                lock_file.install_lock().project_dir(),
+            ),
+        }
+        .to_string());
     }
     let signature = download.signature.as_ref().ok_or_else(|| {
-        format!(
-            "legacy-pinned version {source_key}@{locked_version} was obtained without its required registry signature"
-        )
+        RegistryRefusal::LegacySignatureMissing {
+            version: locked_version.clone(),
+            target: ProviderRefusalTarget::new(
+                source_key.as_str(),
+                lock_file.install_lock().project_dir(),
+            ),
+        }
+        .to_string()
     })?;
     signing::ensure_supported_signature_type(&signature.r#type)?;
     let download_url = parse_registry_resource_url(
@@ -6596,8 +7265,7 @@ fn verify_and_decide_signer<H: RegistryHttp>(
     #[cfg(not(any(test, feature = "test-utils")))]
     let _ = http;
     let acceptance = decide_signer(expected_signer, &identity, version).map_err(|error| {
-        let remediation = identity_repin_remediation(source, project_dir);
-        format!("{error}; signature verification has no override. {remediation}")
+        RegistryRefusal::from_signer_rejection(error, source, project_dir).to_string()
     })?;
     Ok((identity, acceptance))
 }
@@ -6637,6 +7305,7 @@ fn verify_registry_lock_pin(
     signature: Option<&RegistrySignature>,
     transparency_log_present: bool,
 ) -> Result<VerifiedRegistryLockPin, String> {
+    let project_dir = lock_file.install_lock().project_dir().to_path_buf();
     let current_lock = lock_file.lock_file();
     let entry = current_lock.find_by_source_key(source_key);
     let existing_constraint = entry.and_then(|entry| match &entry.kind {
@@ -6665,31 +7334,33 @@ fn verify_registry_lock_pin(
         && entry.kind.resolved_version().as_deref() == Some(version)
         && entry.sha256 != expected_shasum
     {
-        return Err(format!(
-            "registry shasum pin mismatch for {}@{}: lock has {}, registry returned {}",
-            source_key, version, entry.sha256, expected_shasum
-        ));
+        return Err(RegistryRefusal::ShasumPinMismatch {
+            version: version.to_string(),
+            locked: entry.sha256.clone(),
+            resolved: expected_shasum.to_string(),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+        }
+        .to_string());
     }
     let locked_registry = entry.and_then(|entry| entry.registry.as_ref());
     if let Some(locked_registry) = locked_registry
         && locked_registry.resolved_hostname() != registry.hostname
     {
-        return Err(format!(
-            "registry hostname pin mismatch for {}: lock has {}, resolved {}",
-            source_key,
-            locked_registry.resolved_hostname(),
-            registry.hostname
-        ));
+        return Err(RegistryRefusal::HostnamePinMismatch {
+            locked: locked_registry.resolved_hostname().to_string(),
+            resolved: registry.hostname.clone(),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+        }
+        .to_string());
     }
     let ratchets = current_lock
         .known_registry_ratchets(source_key.as_str())
         .map_err(|error| error.to_string())?;
     if ratchets.signature.is_required() && signature.is_none() {
-        let remediation =
-            identity_repin_remediation(source_key.as_str(), lock_file.install_lock().project_dir());
-        return Err(format!(
-            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
-        ));
+        return Err(RegistryRefusal::SignatureFieldDisappeared {
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+        }
+        .to_string());
     }
     let expected_signer = signature.map(|_| {
         ratchets
@@ -6699,9 +7370,10 @@ fn verify_registry_lock_pin(
             .unwrap_or(SignerPinState::Unpinned)
     });
     if ratchets.transparency_log_present && !transparency_log_present {
-        return Err(format!(
-            "registry transparency_log field disappeared for {source_key}"
-        ));
+        return Err(RegistryRefusal::TransparencyLogFieldDisappeared {
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+        }
+        .to_string());
     }
     // Lock-pin validation is the presence observation's acceptance gate.
     // Persist both independent presence ratchets before later signature-type
@@ -10079,6 +10751,63 @@ sha256 = "def"
     }
 
     #[test]
+    fn legacy_locked_content_refusals_name_no_recovery_operation() {
+        let locked_download: serde_json::Value = serde_json::from_slice(&signed_fixture_download(
+            SIGNED_FIXTURE_VERSION,
+            SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
+        ))
+        .unwrap();
+        let mut missing_signature = locked_download.clone();
+        missing_signature
+            .as_object_mut()
+            .unwrap()
+            .remove("signature");
+        let mut changed_shasum = locked_download;
+        changed_shasum["shasum"] = serde_json::json!("00".repeat(32));
+        let scenarios = [
+            (missing_signature, "without its required registry signature"),
+            (changed_shasum, "differs from carina-providers.lock"),
+        ];
+
+        for (download, expected_reason) in scenarios {
+            let dir = tempfile::tempdir().unwrap();
+            let mut lock = signed_fixture_legacy_lock(dir.path());
+            fs::remove_file(cache_path_wasm(
+                dir.path(),
+                &source_key("carina-rs/aws"),
+                SIGNED_FIXTURE_VERSION,
+            ))
+            .unwrap();
+            let http = signed_fixture_registry().json(
+                SIGNED_FIXTURE_DOWNLOAD_URL,
+                serde_json::to_vec(&download).unwrap(),
+            );
+
+            let error = resolve_provider_with_http(
+                dir.path(),
+                &provider_source("carina-rs/aws"),
+                SIGNED_FIXTURE_CANDIDATE_VERSION,
+                "aws",
+                &mut lock,
+                &http,
+            )
+            .expect_err("changed immutable legacy-version content must be refused");
+            assert!(error.contains(expected_reason), "{error}");
+            assert!(
+                error.contains("No sanctioned recovery operation clears this refusal."),
+                "{error}"
+            );
+            for command in [
+                "carina providers re-bootstrap",
+                "carina providers repin-identity",
+                "carina providers repin-discovery",
+            ] {
+                assert!(!error.contains(command), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn captured_certificates_bind_branch_tag_and_sha_revisions() {
         let listing: RegistryVersions =
             serde_json::from_slice(&captured_listing(CAPTURED_AWS_LISTING)).unwrap();
@@ -12961,6 +13690,16 @@ discovery_pin_present = false
             "{error}"
         );
         assert!(
+            error.contains(
+                "verifying out of band that discarding this host's legacy discovery values is intended"
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("change to the pinned discovery values"),
+            "{error}"
+        );
+        assert!(
             error.contains(&format!(
                 "`carina providers repin-discovery registry.carina-rs.dev {}`",
                 project_dir.path().display()
@@ -13439,6 +14178,14 @@ discovery_pin_present = true
                 "`carina providers repin-discovery registry.carina-rs.dev {}`",
                 project_dir.path().display()
             )),
+            "{error}"
+        );
+        assert!(
+            error.contains("change to the pinned discovery values"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("discarding this host's legacy discovery values"),
             "{error}"
         );
         assert!(
@@ -14158,6 +14905,30 @@ transparency_log_present = false
         .unwrap();
         let (mut lock, migration) = loaded.into_parts();
         let migration = migration.unwrap();
+        let migration_report = migration.to_string();
+        assert!(
+            migration_report.contains(
+                "verifying out of band that discarding this host's legacy discovery values is intended"
+            ),
+            "{migration_report}"
+        );
+        assert!(
+            !migration_report.contains("change to the pinned discovery values"),
+            "{migration_report}"
+        );
+        assert_eq!(
+            migration_report
+                .matches("lock-format migration requires operator authorization")
+                .count(),
+            1,
+            "{migration_report}"
+        );
+        assert!(
+            !migration_report.contains(
+                "Registry resolution is blocked for each migrated host until its legacy pin"
+            ),
+            "{migration_report}"
+        );
 
         let prepared = lock
             .prepare_registry_discovery_repin("Registry.Carina-RS.dev")
@@ -14460,10 +15231,11 @@ transparency_log_present = false
 
         assert!(error.contains("signed to unsigned"), "{error}");
         assert!(
-            error.contains(&format!(
-                "`carina providers repin-identity carina-rs/aws {}`",
-                dir.path().display()
-            )),
+            error.contains("No sanctioned recovery operation clears this refusal."),
+            "{error}"
+        );
+        assert!(
+            !error.contains("carina providers repin-identity"),
             "{error}"
         );
     }
@@ -14535,6 +15307,10 @@ transparency_log_present = false
             error.contains("registry sequence field disappeared"),
             "{error}"
         );
+        assert!(
+            error.contains("`carina providers re-bootstrap carina-rs/aws`"),
+            "{error}"
+        );
 
         lock.prepare_registry_rebootstrap("carina-rs/aws")
             .unwrap()
@@ -14559,6 +15335,69 @@ transparency_log_present = false
         assert_eq!(
             validated_sequence.into_anchor(),
             RegistrySequenceAnchor::Unestablished
+        );
+    }
+
+    #[test]
+    fn rollback_with_dropped_yank_suppresses_incomplete_rebootstrap_advice() {
+        let source = registry_source("carina-rs/aws");
+        let lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let locked = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        let sequence_anchor = lock.registry_sequence_anchor("carina-rs/aws");
+        let listing = |yanked| RegistryVersions {
+            sequence: Some(4),
+            valid_until: Some("2999-01-01T00:00:00Z".into()),
+            versions: vec![RegistryVersion {
+                version: "0.4.0".into(),
+                yanked,
+            }],
+        };
+
+        let rollback = match ValidatedRegistryListing::validate(
+            &source,
+            &listing(true),
+            &locked,
+            sequence_anchor,
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("a sequence rollback must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            rollback.contains("registry sequence rollback"),
+            "{rollback}"
+        );
+        assert!(
+            rollback.contains("`carina providers re-bootstrap carina-rs/aws`"),
+            "{rollback}"
+        );
+
+        let rollback_and_yank = match ValidatedRegistryListing::validate(
+            &source,
+            &listing(false),
+            &locked,
+            sequence_anchor,
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("a rollback that also drops a yank must report both refusals"),
+            Err(error) => error,
+        };
+        assert!(
+            rollback_and_yank.contains("registry sequence rollback"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            rollback_and_yank.contains("registry yanked flag disappeared"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            !rollback_and_yank.contains("carina providers re-bootstrap"),
+            "{rollback_and_yank}"
+        );
+        assert!(
+            rollback_and_yank
+                .contains("No sanctioned recovery operation clears all of these refusals."),
+            "{rollback_and_yank}"
         );
     }
 
@@ -14638,6 +15477,69 @@ transparency_log_present = false
         assert!(final_registry.yanked_versions.contains("0.4.0"));
         assert!(final_registry.valid_until_present);
         assert!(final_registry.transparency_log_present);
+    }
+
+    #[test]
+    fn no_recovery_operation_clears_a_disappeared_yanked_flag() {
+        const ARTIFACT: &[u8] = b"unchanged yanked-state artifact";
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(ARTIFACT);
+        let versions_url = "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
+        let http = registry_http(ARTIFACT, &shasum).json(
+            versions_url,
+            r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.4.0","protocols":["1"]}]}"#,
+        );
+        let original = lock_with_registry_security_state(current_signature_pin());
+
+        for operation in ProviderRecovery::ALL {
+            let mut recovered = original.clone();
+            match operation {
+                ProviderRecovery::Rebootstrap => recovered
+                    .prepare_registry_rebootstrap("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+                ProviderRecovery::IdentityRepin => recovered
+                    .prepare_registry_identity_repin("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+            }
+            let error = resolve_provider_with_http(
+                dir.path(),
+                &provider_source("carina-rs/aws"),
+                "0.5.0",
+                "aws",
+                &mut recovered,
+                &http,
+            )
+            .expect_err("provider recovery must preserve the recorded yank");
+            assert!(error.contains("yanked flag disappeared"), "{error}");
+            assert!(
+                error.contains("No sanctioned recovery operation clears this refusal."),
+                "{error}"
+            );
+        }
+
+        let mut recovered = original;
+        recovered
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        let error = resolve_provider_with_http(
+            dir.path(),
+            &provider_source("carina-rs/aws"),
+            "0.5.0",
+            "aws",
+            &mut recovered,
+            &http,
+        )
+        .expect_err("discovery recovery must preserve the recorded yank");
+        assert!(error.contains("yanked flag disappeared"), "{error}");
+        assert!(
+            error.contains("No sanctioned recovery operation clears this refusal."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -14742,33 +15644,605 @@ transparency_log_present = false
         );
     }
 
+    fn observe_provider_lock_state(lock: &LockFile, state: ProviderLockState) -> String {
+        let entry = lock
+            .find_by_source("carina-rs/aws")
+            .expect("fixture provider must remain present");
+        let registry = entry
+            .registry
+            .as_ref()
+            .expect("fixture provider must remain registry-hosted");
+        match state {
+            ProviderLockState::SequenceObservation => {
+                format!("{:?}", registry.sequence.value())
+            }
+            ProviderLockState::SequenceReferencePoint => {
+                format!("{:?}", registry.sequence_anchor.value())
+            }
+            ProviderLockState::SequencePresence => {
+                matches!(registry.sequence, RegistrySequence::Present(_)).to_string()
+            }
+            ProviderLockState::SignerPins => format!("{:?}", registry.signature.pin_state()),
+            ProviderLockState::SignaturePresence => registry.signature.is_required().to_string(),
+            ProviderLockState::ValidUntilPresence => registry.valid_until_present.to_string(),
+            ProviderLockState::TransparencyLogPresence => {
+                registry.transparency_log_present.to_string()
+            }
+            ProviderLockState::YankedFlag => format!("{:?}", registry.yanked_versions),
+            ProviderLockState::ShasumPin => entry.sha256.clone(),
+            ProviderLockState::HostnamePin => registry.resolved_hostname.to_string(),
+            ProviderLockState::StableSourceRefRule => "stable-source-ref-rule".into(),
+        }
+    }
+
+    fn observe_host_lock_state(lock: &LockFile, state: HostLockState) -> String {
+        let discovery = &lock
+            .registry_host
+            .get("registry.carina-rs.dev")
+            .expect("fixture host must remain present")
+            .discovery;
+        match state {
+            HostLockState::DiscoveryPin => match discovery {
+                RegistryDiscoveryPinState::Pinned(pin) => format!("{pin:?}"),
+                RegistryDiscoveryPinState::Unpinned(_)
+                | RegistryDiscoveryPinState::MigrationPendingAuthorization(_) => "absent".into(),
+            },
+            HostLockState::LegacyDiscoveryValues => match discovery {
+                RegistryDiscoveryPinState::MigrationPendingAuthorization(pins) => {
+                    format!("{pins:?}")
+                }
+                RegistryDiscoveryPinState::Pinned(_) | RegistryDiscoveryPinState::Unpinned(_) => {
+                    "absent".into()
+                }
+            },
+        }
+    }
+
+    fn changed_provider_lock_states(before: &LockFile, after: &LockFile) -> Vec<ProviderLockState> {
+        ProviderLockState::ALL
+            .into_iter()
+            .filter(|state| {
+                observe_provider_lock_state(before, *state)
+                    != observe_provider_lock_state(after, *state)
+            })
+            .collect()
+    }
+
+    fn changed_host_lock_states(before: &LockFile, after: &LockFile) -> Vec<HostLockState> {
+        HostLockState::ALL
+            .into_iter()
+            .filter(|state| {
+                observe_host_lock_state(before, *state) != observe_host_lock_state(after, *state)
+            })
+            .collect()
+    }
+
+    fn current_signature_pin() -> RegistrySignatureProtection {
+        RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+            source: SourcePin {
+                oidc_issuer: "issuer-a".into(),
+                repository_owner_id: "owner-a".into(),
+                repository_id: "repo-a".into(),
+            },
+            workflows: WorkflowPins::Both {
+                stable: WorkflowPin("stable.yml".into()),
+                prerelease: WorkflowPin("prerelease.yml".into()),
+            },
+        }))
+    }
+
+    #[test]
+    fn recovery_mapping_matches_real_lock_state_transitions() {
+        for operation in ProviderRecovery::ALL {
+            let before = lock_with_registry_security_state(current_signature_pin());
+            let mut after = before.clone();
+            match operation {
+                ProviderRecovery::Rebootstrap => after
+                    .prepare_registry_rebootstrap("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+                ProviderRecovery::IdentityRepin => after
+                    .prepare_registry_identity_repin("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+            }
+            let expected = ProviderLockState::ALL
+                .into_iter()
+                .filter(|state| state.cleared_by() == Some(operation))
+                .collect::<Vec<_>>();
+            assert_eq!(changed_provider_lock_states(&before, &after), expected);
+            for state in HostLockState::ALL {
+                assert_eq!(
+                    observe_host_lock_state(&after, state),
+                    observe_host_lock_state(&before, state),
+                    "provider recovery {operation:?} changed host state {state:?}"
+                );
+            }
+        }
+
+        let before = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let mut after = before.clone();
+        after
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        let expected = ProviderLockState::ALL
+            .into_iter()
+            .filter(|state| state.cleared_by() == Some(ProviderRecovery::IdentityRepin))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed_provider_lock_states(&before, &after),
+            expected,
+            "legacy and current signer-pin forms must clear the same state"
+        );
+        for state in HostLockState::ALL {
+            assert_eq!(
+                observe_host_lock_state(&after, state),
+                observe_host_lock_state(&before, state),
+                "legacy identity re-pin changed host state {state:?}"
+            );
+        }
+
+        let before = lock_with_registry_security_state(current_signature_pin());
+        let mut after = before.clone();
+        after
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        assert_eq!(
+            changed_host_lock_states(&before, &after),
+            vec![HostLockState::DiscoveryPin]
+        );
+        assert_eq!(
+            HostLockState::DiscoveryPin.cleared_by(),
+            Some(HostRecovery::DiscoveryRepin)
+        );
+        assert!(
+            changed_provider_lock_states(&before, &after).is_empty(),
+            "discovery re-pin changed provider-owned state"
+        );
+
+        let before = LockFile::from_toml_str(
+            fully_protected_v2_lock_toml(),
+            Path::new("carina-providers.lock"),
+        )
+        .unwrap();
+        let mut after = before.clone();
+        after
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        assert_eq!(
+            changed_host_lock_states(&before, &after),
+            vec![HostLockState::LegacyDiscoveryValues]
+        );
+        assert_eq!(
+            HostLockState::LegacyDiscoveryValues.cleared_by(),
+            Some(HostRecovery::DiscoveryRepin)
+        );
+        assert!(
+            changed_provider_lock_states(&before, &after).is_empty(),
+            "legacy discovery re-pin changed provider-owned state"
+        );
+    }
+
+    #[test]
+    fn lock_state_all_inventories_are_complete_and_ordered() {
+        assert_eq!(
+            ProviderLockState::ALL
+                .into_iter()
+                .map(ProviderLockState::index)
+                .collect::<Vec<_>>(),
+            (0..PROVIDER_LOCK_STATE_COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            HostLockState::ALL
+                .into_iter()
+                .map(HostLockState::index)
+                .collect::<Vec<_>>(),
+            (0..HOST_LOCK_STATE_COUNT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recovery_operations_clear_exactly_the_protocol_states() {
+        let states_cleared_by = |operation| {
+            ProviderLockState::ALL
+                .into_iter()
+                .filter(|state| state.cleared_by() == Some(operation))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            states_cleared_by(ProviderRecovery::Rebootstrap),
+            vec![
+                ProviderLockState::SequenceObservation,
+                ProviderLockState::SequenceReferencePoint,
+                ProviderLockState::SequencePresence,
+            ]
+        );
+        assert_eq!(
+            states_cleared_by(ProviderRecovery::IdentityRepin),
+            vec![ProviderLockState::SignerPins]
+        );
+        assert_eq!(
+            HostLockState::ALL
+                .into_iter()
+                .filter(|state| state.cleared_by() == Some(HostRecovery::DiscoveryRepin))
+                .collect::<Vec<_>>(),
+            vec![
+                HostLockState::DiscoveryPin,
+                HostLockState::LegacyDiscoveryValues,
+            ]
+        );
+
+        for state in ProviderLockState::ALL {
+            let clearing_operations = ProviderRecovery::ALL
+                .into_iter()
+                .filter(|operation| state.cleared_by() == Some(*operation))
+                .count();
+            assert!(clearing_operations <= 1, "provider state {state:?}");
+        }
+        for state in HostLockState::ALL {
+            let clearing_operations = HostRecovery::ALL
+                .into_iter()
+                .filter(|operation| state.cleared_by() == Some(*operation))
+                .count();
+            assert!(clearing_operations <= 1, "host state {state:?}");
+        }
+    }
+
+    #[repr(usize)]
+    enum RegistryRefusalVariantIndex {
+        SequenceFieldDisappeared,
+        SequenceRollback,
+        SequenceFastForward,
+        YankedFlagDisappeared,
+        ValidUntilFieldDisappeared,
+        DiscoveryMigrationAuthorizationRequired,
+        DiscoveryPinMismatch,
+        LegacyShasumPinMismatch,
+        LegacySignatureMissing,
+        ShasumPinMismatch,
+        HostnamePinMismatch,
+        SignatureFieldDisappeared,
+        TransparencyLogFieldDisappeared,
+        Signer,
+        Count,
+    }
+
+    const REFUSAL_VARIANT_COUNT: usize = RegistryRefusalVariantIndex::Count as usize;
+
+    fn registry_refusal_variant_index(refusal: &RegistryRefusal) -> usize {
+        match refusal {
+            RegistryRefusal::SequenceFieldDisappeared { .. } => {
+                RegistryRefusalVariantIndex::SequenceFieldDisappeared as usize
+            }
+            RegistryRefusal::SequenceRollback { .. } => {
+                RegistryRefusalVariantIndex::SequenceRollback as usize
+            }
+            RegistryRefusal::SequenceFastForward { .. } => {
+                RegistryRefusalVariantIndex::SequenceFastForward as usize
+            }
+            RegistryRefusal::YankedFlagDisappeared { .. } => {
+                RegistryRefusalVariantIndex::YankedFlagDisappeared as usize
+            }
+            RegistryRefusal::ValidUntilFieldDisappeared { .. } => {
+                RegistryRefusalVariantIndex::ValidUntilFieldDisappeared as usize
+            }
+            RegistryRefusal::DiscoveryMigrationAuthorizationRequired { .. } => {
+                RegistryRefusalVariantIndex::DiscoveryMigrationAuthorizationRequired as usize
+            }
+            RegistryRefusal::DiscoveryPinMismatch { .. } => {
+                RegistryRefusalVariantIndex::DiscoveryPinMismatch as usize
+            }
+            RegistryRefusal::LegacyShasumPinMismatch { .. } => {
+                RegistryRefusalVariantIndex::LegacyShasumPinMismatch as usize
+            }
+            RegistryRefusal::LegacySignatureMissing { .. } => {
+                RegistryRefusalVariantIndex::LegacySignatureMissing as usize
+            }
+            RegistryRefusal::ShasumPinMismatch { .. } => {
+                RegistryRefusalVariantIndex::ShasumPinMismatch as usize
+            }
+            RegistryRefusal::HostnamePinMismatch { .. } => {
+                RegistryRefusalVariantIndex::HostnamePinMismatch as usize
+            }
+            RegistryRefusal::SignatureFieldDisappeared { .. } => {
+                RegistryRefusalVariantIndex::SignatureFieldDisappeared as usize
+            }
+            RegistryRefusal::TransparencyLogFieldDisappeared { .. } => {
+                RegistryRefusalVariantIndex::TransparencyLogFieldDisappeared as usize
+            }
+            RegistryRefusal::Signer { .. } => RegistryRefusalVariantIndex::Signer as usize,
+        }
+    }
+
+    fn expected_recovery_kind(refusal: &RegistryRefusal) -> Option<RecoveryKind> {
+        match refusal {
+            RegistryRefusal::SequenceFieldDisappeared { .. }
+            | RegistryRefusal::SequenceRollback { .. }
+            | RegistryRefusal::SequenceFastForward { .. } => Some(RecoveryKind::Rebootstrap),
+            RegistryRefusal::YankedFlagDisappeared { .. }
+            | RegistryRefusal::ValidUntilFieldDisappeared { .. }
+            | RegistryRefusal::LegacyShasumPinMismatch { .. }
+            | RegistryRefusal::LegacySignatureMissing { .. }
+            | RegistryRefusal::ShasumPinMismatch { .. }
+            | RegistryRefusal::HostnamePinMismatch { .. }
+            | RegistryRefusal::SignatureFieldDisappeared { .. }
+            | RegistryRefusal::TransparencyLogFieldDisappeared { .. } => None,
+            RegistryRefusal::DiscoveryMigrationAuthorizationRequired { .. }
+            | RegistryRefusal::DiscoveryPinMismatch { .. } => Some(RecoveryKind::DiscoveryRepin),
+            RegistryRefusal::Signer { rejection, .. } => match rejection {
+                SignerRejection::StableSourceRef { .. } => None,
+                SignerRejection::LegacyIdentity
+                | SignerRejection::SourceMismatch { .. }
+                | SignerRejection::Workflow { .. } => Some(RecoveryKind::IdentityRepin),
+            },
+        }
+    }
+
+    fn registry_refusal_samples() -> Vec<RegistryRefusal> {
+        let provider_target = ProviderRefusalTarget::new("carina-rs/aws", "infra/foo");
+        let host_target = HostRefusalTarget::new("registry.carina-rs.dev", "infra/foo");
+        let source_pin = SourcePin {
+            oidc_issuer: "issuer-a".into(),
+            repository_owner_id: "owner-a".into(),
+            repository_id: "repo-a".into(),
+        };
+        let other_source_pin = SourcePin {
+            oidc_issuer: "issuer-b".into(),
+            repository_owner_id: "owner-b".into(),
+            repository_id: "repo-b".into(),
+        };
+        let inventory_samples = vec![
+            RegistryRefusal::SequenceFieldDisappeared {
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::SequenceRollback {
+                previous: 7,
+                current: 6,
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::SequenceFastForward {
+                anchor: 7,
+                current: 1_000_008,
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::YankedFlagDisappeared {
+                versions: vec!["0.4.0".into()],
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::ValidUntilFieldDisappeared {
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
+                target: host_target.clone(),
+            },
+            RegistryRefusal::DiscoveryPinMismatch {
+                pinned: "https://registry.carina-rs.dev/v1/providers/".into(),
+                resolved: "https://registry.carina-rs.dev/v2/providers/".into(),
+                target: host_target,
+            },
+            RegistryRefusal::LegacyShasumPinMismatch {
+                version: "0.5.0".into(),
+                locked: "locked-shasum".into(),
+                resolved: "resolved-shasum".into(),
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::LegacySignatureMissing {
+                version: "0.5.0".into(),
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::ShasumPinMismatch {
+                version: "0.5.0".into(),
+                locked: "locked-shasum".into(),
+                resolved: "resolved-shasum".into(),
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::HostnamePinMismatch {
+                locked: "registry.carina-rs.dev".into(),
+                resolved: "registry.example.test".into(),
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::SignatureFieldDisappeared {
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::TransparencyLogFieldDisappeared {
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::SourceMismatch {
+                    expected: Box::new(source_pin),
+                    actual: Box::new(other_source_pin),
+                },
+                target: provider_target.clone(),
+            },
+        ];
+
+        // A new refusal fails to compile until it has an index arm. Giving that
+        // arm a new index increases the count, so omitting its sample makes this
+        // contiguous inventory assertion fail.
+        let sample_indices = inventory_samples
+            .iter()
+            .map(registry_refusal_variant_index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sample_indices,
+            (0..REFUSAL_VARIANT_COUNT).collect::<Vec<_>>()
+        );
+        let mut samples = inventory_samples;
+        samples.extend([
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::LegacyIdentity,
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::Workflow {
+                    channel: ReleaseChannel::Stable,
+                    expected: WorkflowPin("expected.yml".into()),
+                    actual: WorkflowPin("actual.yml".into()),
+                },
+                target: provider_target.clone(),
+            },
+            RegistryRefusal::Signer {
+                rejection: SignerRejection::StableSourceRef {
+                    expected: "refs/tags/v0.5.0".into(),
+                    actual: "refs/tags/v0.5.1".into(),
+                },
+                target: provider_target,
+            },
+        ]);
+        samples
+    }
+
+    #[test]
+    fn registry_refusals_render_only_the_recovery_derived_from_their_cause() {
+        for refusal in registry_refusal_samples() {
+            let recovery = refusal.recovery();
+            let rendered = refusal.to_string();
+            assert_eq!(
+                recovery.map(|remediation| remediation.kind()),
+                expected_recovery_kind(&refusal),
+                "fixed protocol recovery mapping for {refusal:?}"
+            );
+
+            match recovery {
+                Some(remediation) => {
+                    assert!(
+                        !rendered.contains("No sanctioned recovery operation clears this refusal."),
+                        "{rendered}"
+                    );
+                    let command = remediation.command().to_string();
+                    assert_eq!(
+                        rendered.matches(&command).count(),
+                        1,
+                        "expected command {command:?} exactly once in {rendered:?}"
+                    );
+                }
+                None => {
+                    assert!(
+                        rendered.contains("No sanctioned recovery operation clears this refusal."),
+                        "{rendered}"
+                    );
+                }
+            }
+
+            for subcommand in [
+                "providers re-bootstrap",
+                "providers repin-identity",
+                "providers repin-discovery",
+            ] {
+                let expected_count = usize::from(
+                    recovery.is_some_and(|remediation| remediation.subcommand() == subcommand),
+                );
+                assert_eq!(
+                    rendered.matches(subcommand).count(),
+                    expected_count,
+                    "{subcommand:?} command count in {rendered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_refusal_collection_preserves_single_output_and_deduplicates_recovery() {
+        let target = ProviderRefusalTarget::new("carina-rs/aws", "infra/foo");
+        let rollback = RegistryRefusal::SequenceRollback {
+            previous: 7,
+            current: 6,
+            target: target.clone(),
+        };
+        assert_eq!(
+            RegistryRefusals::new(rollback.clone()).to_string(),
+            rollback.to_string()
+        );
+
+        let mut refusals = Some(RegistryRefusals::new(rollback));
+        RegistryRefusals::insert(
+            &mut refusals,
+            RegistryRefusal::SequenceFieldDisappeared {
+                target: target.clone(),
+            },
+        );
+        RegistryRefusals::insert(
+            &mut refusals,
+            RegistryRefusal::SequenceFastForward {
+                anchor: 7,
+                current: 1_000_008,
+                target,
+            },
+        );
+        let rendered = refusals.unwrap().to_string();
+        assert!(rendered.contains("sequence rollback"), "{rendered}");
+        assert!(
+            rendered.contains("sequence field disappeared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("sequence fast-forward"), "{rendered}");
+        assert_eq!(
+            rendered.matches("carina providers re-bootstrap").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("No sanctioned recovery operation"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn rebootstrap_remediation_names_every_cleared_sequence_state() {
+        let rendered = RegistryRefusal::SequenceFieldDisappeared {
+            target: ProviderRefusalTarget::new("carina-rs/aws", "."),
+        }
+        .to_string();
+
+        assert!(
+            rendered.contains("persisted sequence observation, anchor and presence record"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn recovery_remediations_name_operations_without_lock_entry_deletion_advice() {
-        let project_dir = Path::new("infra/foo");
-        let identity = identity_repin_remediation("carina-rs/aws", project_dir);
-        let sequence = sequence_rebootstrap_remediation("carina-rs/aws", project_dir);
-        let discovery = discovery_repin_remediation("registry.carina-rs.dev", project_dir);
-        assert!(
-            identity.contains("`carina providers repin-identity carina-rs/aws infra/foo`"),
-            "{identity}"
-        );
-        assert!(
-            sequence.contains("`carina providers re-bootstrap carina-rs/aws infra/foo`"),
-            "{sequence}"
-        );
-        assert!(
-            discovery
-                .contains("`carina providers repin-discovery registry.carina-rs.dev infra/foo`"),
-            "{discovery}"
-        );
-        for remediation in [&identity, &sequence, &discovery] {
+        let refusals = registry_refusal_samples();
+        for subcommand in [
+            "providers re-bootstrap",
+            "providers repin-identity",
+            "providers repin-discovery",
+        ] {
+            let refusal = refusals
+                .iter()
+                .find(|refusal| {
+                    refusal
+                        .recovery()
+                        .is_some_and(|remediation| remediation.subcommand() == subcommand)
+                })
+                .expect("every recovery operation needs a refusal sample");
+            let remediation = refusal.to_string();
+            let expected_command = refusal
+                .recovery()
+                .expect("selected refusal has a recovery")
+                .command()
+                .to_string();
+            assert!(
+                remediation.contains(&format!("`{expected_command}`")),
+                "{remediation}"
+            );
             let remediation = remediation.to_ascii_lowercase();
             assert!(!remediation.contains("delete"), "{remediation}");
             assert!(!remediation.contains("remove"), "{remediation}");
             assert!(!remediation.contains("lock entry"), "{remediation}");
         }
 
-        let default = identity_repin_remediation("carina-rs/aws", Path::new("."));
+        let default = RegistryRefusal::Signer {
+            rejection: SignerRejection::LegacyIdentity,
+            target: ProviderRefusalTarget::new("carina-rs/aws", "."),
+        }
+        .to_string();
         assert!(
             default.contains("`carina providers repin-identity carina-rs/aws`"),
             "{default}"
@@ -17347,6 +18821,13 @@ transparency_log_present = true
             error.contains("certificate source differs from the lock pin"),
             "{error}"
         );
+        assert!(
+            error.contains(&format!(
+                "`carina providers repin-identity carina-rs/aws {}`",
+                dir.path().display()
+            )),
+            "{error}"
+        );
         assert!(http.inner.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
         assert!(
             http.inner
@@ -17362,6 +18843,22 @@ transparency_log_present = true
             "an artifact rejected with SourceMismatch must not remain cached"
         );
         assert_empty_artifact_directory(artifact_path.parent().unwrap());
+
+        lock_file
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        resolve_provider_with_http(
+            dir.path(),
+            &provider_source("carina-rs/aws"),
+            SIGNED_FIXTURE_VERSION,
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect("identity re-pin must clear a verified signer-source mismatch");
+        assert!(artifact_path.exists());
     }
 
     #[test]
@@ -17386,6 +18883,43 @@ transparency_log_present = true
             ),
         );
 
+        for operation in [
+            ProviderRecovery::Rebootstrap,
+            ProviderRecovery::IdentityRepin,
+        ] {
+            let mut recovered = lock_file.clone();
+            match operation {
+                ProviderRecovery::Rebootstrap => recovered
+                    .prepare_registry_rebootstrap("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+                ProviderRecovery::IdentityRepin => recovered
+                    .prepare_registry_identity_repin("carina-rs/aws")
+                    .unwrap()
+                    .commit()
+                    .unwrap(),
+            }
+            let error = resolve_provider_with_http(
+                dir.path(),
+                &provider_source("carina-rs/aws"),
+                SIGNED_FIXTURE_VERSION,
+                "aws",
+                &mut recovered,
+                &unsigned_http,
+            )
+            .expect_err("provider-scoped recoveries must preserve signature presence");
+            assert!(error.contains("signatures as required"), "{error}");
+            assert!(
+                error.contains("No sanctioned recovery operation clears this refusal."),
+                "{error}"
+            );
+        }
+
+        lock_file
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
         let error = resolve_provider_with_http(
             dir.path(),
             &provider_source("carina-rs/aws"),
@@ -17394,17 +18928,16 @@ transparency_log_present = true
             &mut lock_file,
             &unsigned_http,
         )
-        .unwrap_err();
-
+        .expect_err("discovery re-pin must preserve signature presence");
         assert!(error.contains("signature"), "{error}");
         assert!(error.contains("no override"), "{error}");
         assert!(error.contains("signatures as required"), "{error}");
-        assert!(error.contains("verifying out-of-band"), "{error}");
         assert!(
-            error.contains(&format!(
-                "`carina providers repin-identity carina-rs/aws {}`",
-                dir.path().display()
-            )),
+            error.contains("No sanctioned recovery operation clears this refusal."),
+            "{error}"
+        );
+        assert!(
+            !error.contains("carina providers repin-identity"),
             "{error}"
         );
         assert!(!unsigned_http.was_requested("https://downloads.example.test/aws.wasm"));
@@ -17483,6 +19016,10 @@ transparency_log_present = true
 
         assert!(error.contains("exceeding"), "{error}");
         assert!(error.contains("no override"), "{error}");
+        assert!(
+            !error.contains("carina providers repin-identity"),
+            "{error}"
+        );
         let artifact_path = cache_path_wasm(
             dir.path(),
             &source_key("carina-rs/aws"),
@@ -18073,6 +19610,21 @@ transparency_log_present = false
             !relocated_http.was_requested("/v2/providers/carina-rs/aws"),
             "a changed API base was used before its pin was verified"
         );
+
+        lock_file
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        resolve_provider_with_http(
+            dir.path(),
+            &provider_source("carina-rs/aws"),
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &relocated_http,
+        )
+        .expect("discovery re-pin must authorize and replace the relocated API-base pin");
+        assert!(relocated_http.was_requested("/v2/providers/carina-rs/aws"));
     }
 
     #[test]
@@ -18715,6 +20267,21 @@ transparency_log_present = false
             )),
             "{err}"
         );
+
+        lock_file
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        resolve_provider_with_http(
+            dir.path(),
+            &provider_source("carina-rs/aws"),
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect("re-bootstrap must make the lower sequence first contact");
     }
 
     #[test]
@@ -18761,6 +20328,28 @@ transparency_log_present = false
         )
         .unwrap_err();
         assert!(err.contains("sequence"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "`carina providers re-bootstrap carina-rs/aws {}`",
+                dir.path().display()
+            )),
+            "{err}"
+        );
+
+        lock_file
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        resolve_provider_with_http(
+            dir.path(),
+            &provider_source("carina-rs/aws"),
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect("re-bootstrap must make the missing sequence first contact");
     }
 
     #[test]
@@ -18918,12 +20507,10 @@ transparency_log_present = false
             "{err}"
         );
         assert!(
-            err.contains(&format!(
-                "`carina providers repin-identity carina-rs/aws {}`",
-                dir.path().display()
-            )),
+            err.contains("No sanctioned recovery operation clears this refusal."),
             "{err}"
         );
+        assert!(!err.contains("carina providers repin-identity"), "{err}");
     }
 
     #[test]

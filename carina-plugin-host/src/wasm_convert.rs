@@ -21,7 +21,10 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
-    StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
+    SchemaValidationIssueLocation as CoreSchemaValidationIssueLocation,
+    StructField as CoreStructField, TypeIdentity, UniqueNameSpec as CoreUniqueNameSpec,
+    ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 #[cfg(test)]
 use carina_core::schema::{
@@ -46,7 +49,9 @@ pub struct SchemaDecodeError {
     detail: String,
     resource_type: Option<String>,
     attribute_path: Vec<String>,
+    schema_issue_location: Option<Box<CoreSchemaValidationIssueLocation>>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    render_source: bool,
 }
 
 impl SchemaDecodeError {
@@ -55,7 +60,9 @@ impl SchemaDecodeError {
             detail: detail.into(),
             resource_type: None,
             attribute_path: vec![],
+            schema_issue_location: None,
             source: None,
+            render_source: false,
         }
     }
 
@@ -64,7 +71,9 @@ impl SchemaDecodeError {
             detail: "schema JSON parse error".to_string(),
             resource_type: None,
             attribute_path: vec![],
+            schema_issue_location: None,
             source: Some(Box::new(err)),
+            render_source: true,
         }
     }
 
@@ -73,7 +82,9 @@ impl SchemaDecodeError {
             detail: "schema default value conversion error".to_string(),
             resource_type: None,
             attribute_path: vec![],
+            schema_issue_location: None,
             source: Some(Box::new(err)),
+            render_source: true,
         }
     }
 
@@ -82,7 +93,52 @@ impl SchemaDecodeError {
             detail: "schema default value conversion error".to_string(),
             resource_type: None,
             attribute_path: vec![],
+            schema_issue_location: None,
             source: Some(Box::new(err)),
+            render_source: true,
+        }
+    }
+
+    fn config_schema_validation(err: carina_core::schema::ConfigSchemaValidationError) -> Self {
+        let mut detail = "provider config schema is invalid".to_string();
+        for (index, (path, message)) in err.issues().enumerate() {
+            detail.push_str(if index == 0 { ": " } else { "; " });
+            detail.push_str(path);
+            detail.push_str(": ");
+            detail.push_str(message);
+        }
+        Self {
+            detail,
+            resource_type: None,
+            attribute_path: vec![],
+            schema_issue_location: None,
+            source: Some(Box::new(err)),
+            render_source: false,
+        }
+    }
+
+    fn resource_schema_validation(
+        resource_type: &str,
+        err: carina_core::schema::ResourceSchemaValidationError,
+    ) -> Self {
+        let mut issues = err.located_issues();
+        let (schema_issue_location, mut detail) = match issues.next() {
+            Some((location, message)) => (Some(location.clone()), message.to_string()),
+            None => (None, "resource schema is invalid".to_string()),
+        };
+        for (location, message) in issues {
+            detail.push_str("; ");
+            detail.push_str(&location.to_string());
+            detail.push_str(": ");
+            detail.push_str(message);
+        }
+        Self {
+            detail,
+            resource_type: Some(resource_type.to_string()),
+            attribute_path: Vec::new(),
+            schema_issue_location: schema_issue_location.map(Box::new),
+            source: Some(Box::new(err)),
+            render_source: false,
         }
     }
 
@@ -96,6 +152,13 @@ impl SchemaDecodeError {
 
     fn conflicting_attribute_write_only_mode() -> Self {
         Self::new("attribute cannot be both write-only and provider-populated")
+    }
+
+    fn incompatible_attribute_modifier(mode: CoreInputMode, modifier: &str) -> Self {
+        Self::new(format!(
+            "{modifier} is not valid for {} attribute input mode",
+            core_input_mode_name(mode)
+        ))
     }
 
     fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
@@ -115,14 +178,34 @@ impl SchemaDecodeError {
     }
 }
 
+fn core_input_mode_name(mode: CoreInputMode) -> &'static str {
+    match mode {
+        CoreInputMode::Optional => "optional user-input",
+        CoreInputMode::Required => "required user-input",
+        CoreInputMode::ProviderPopulated => "provider-populated",
+    }
+}
+
 impl fmt::Display for SchemaDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(resource_type) = &self.resource_type {
             write!(f, "resource '{resource_type}'")?;
             if !self.attribute_path.is_empty() {
                 write!(f, " attribute '{}'", self.attribute_path.join("."))?;
+            } else if let Some(attribute_path) = self
+                .schema_issue_location
+                .as_deref()
+                .and_then(CoreSchemaValidationIssueLocation::attribute_path)
+            {
+                write!(f, " attribute '{attribute_path}'")?;
             }
-            write!(f, ": {}", self.detail)?;
+            f.write_str(": ")?;
+            if let Some(location) = &self.schema_issue_location
+                && location.attribute_path().is_none()
+            {
+                write!(f, "{location}: ")?;
+            }
+            f.write_str(&self.detail)?;
         } else if self.attribute_path.is_empty() {
             f.write_str(&self.detail)?;
         } else {
@@ -133,14 +216,22 @@ impl fmt::Display for SchemaDecodeError {
                 self.detail
             )?;
         }
-        if let Some(source) = &self.source {
+        if self.render_source
+            && let Some(source) = &self.source
+        {
             write!(f, ": {source}")?;
         }
         Ok(())
     }
 }
 
-impl std::error::Error for SchemaDecodeError {}
+impl std::error::Error for SchemaDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Failure to decode a JSON-backed recursive value at the WIT boundary.
 ///
@@ -1902,8 +1993,8 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Deserialize JSON to a Vec of core ResourceSchemas.
-pub fn json_to_schemas(json: &str) -> Result<Vec<CoreResourceSchema>, SchemaDecodeError> {
+/// Deserialize JSON to validated core resource schemas.
+pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
     let proto_schemas: Vec<proto::ResourceSchema> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     proto_schemas.iter().map(proto_schema_to_core).collect()
@@ -1911,22 +2002,22 @@ pub fn json_to_schemas(json: &str) -> Result<Vec<CoreResourceSchema>, SchemaDeco
 
 /// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
-pub fn json_to_attribute_types(
-    json: &str,
-) -> Result<HashMap<String, CoreAttributeType>, SchemaDecodeError> {
+pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
     let proto_types: HashMap<String, proto::AttributeType> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    proto_types
+    let attribute_types = proto_types
         .into_iter()
         .map(|(k, v)| proto_attr_type_to_core(&v).map(|attr_type| (k, attr_type)))
-        .collect()
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    CoreValidatedConfigSchema::validate(attribute_types)
+        .map_err(SchemaDecodeError::config_schema_validation)
 }
 
 // -- Protocol schema to core schema conversion --
 
 fn proto_schema_to_core(
     s: &proto::ResourceSchema,
-) -> Result<CoreResourceSchema, SchemaDecodeError> {
+) -> Result<CoreValidatedResourceSchema, SchemaDecodeError> {
     // Exhaustive source destructuring is a compile-time forcing function: a
     // new protocol field cannot be silently omitted from this conversion.
     let proto::ResourceSchema {
@@ -1967,9 +2058,6 @@ fn proto_schema_to_core(
     // providers fall back to the carina-core constants until the protocol
     // gains explicit fields. See carina-rs/carina#2825.
 
-    // Cyclic CFN struct definitions reachable via `AttributeType::Ref` must
-    // be installed before attributes so the invariant-preserving attribute
-    // builder can analyze every referenced definition.
     for (name, definition) in defs {
         let definition = proto_attr_type_to_core(definition).map_err(|error| {
             error
@@ -1990,13 +2078,11 @@ fn proto_schema_to_core(
             .prepend_attribute(map_name)
             .with_resource_type(resource_type));
         }
-        schema = schema.try_attribute(attribute).map_err(|conflict| {
-            SchemaDecodeError::new(conflict.message())
-                .prepend_attribute(conflict.attribute())
-                .with_resource_type(resource_type)
-        })?;
+        schema = schema.attribute(attribute);
     }
-    Ok(schema)
+    schema
+        .validate()
+        .map_err(|error| SchemaDecodeError::resource_schema_validation(resource_type, error))
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -2051,44 +2137,162 @@ fn proto_attr_schema_to_core(
         .transpose()
         .map_err(|error| error.prepend_attribute(name))?;
 
-    let mut schema = CoreAttributeSchema::new(name.clone(), attr_type);
-    schema = match input_mode {
-        CoreInputMode::Optional => schema,
-        CoreInputMode::Required => schema.required(),
-        CoreInputMode::ProviderPopulated => schema.read_only(),
-    };
-    if let Some(default) = default {
-        schema = schema.with_default(default);
+    match input_mode {
+        CoreInputMode::Optional => {
+            if *deferred_populate {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "deferred_populate",
+                )
+                .prepend_attribute(name));
+            }
+            let mut builder = CoreAttributeSchema::optional(name.clone(), attr_type);
+            if let Some(default) = default {
+                builder = builder.with_default(default);
+            }
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if *create_only {
+                builder = builder.create_only();
+            }
+            builder = match removable {
+                Some(true) => builder.removable(),
+                Some(false) => builder.non_removable(),
+                None => builder,
+            };
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *identity {
+                builder = builder.identity();
+            }
+            Ok(builder.build())
+        }
+        CoreInputMode::Required => {
+            if default.is_some() {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode, "default",
+                )
+                .prepend_attribute(name));
+            }
+            if removable.is_some() {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "removable",
+                )
+                .prepend_attribute(name));
+            }
+            if *deferred_populate {
+                return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                    input_mode,
+                    "deferred_populate",
+                )
+                .prepend_attribute(name));
+            }
+            let mut builder = CoreAttributeSchema::required(name.clone(), attr_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if *create_only {
+                builder = builder.create_only();
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *identity {
+                builder = builder.identity();
+            }
+            Ok(builder.build())
+        }
+        CoreInputMode::ProviderPopulated => {
+            for (present, modifier) in [
+                (default.is_some(), "default"),
+                (*create_only, "create_only"),
+                (*write_only, "write_only"),
+                (block_name.is_some(), "block_name"),
+                (removable.is_some(), "removable"),
+                (*identity, "identity"),
+            ] {
+                if present {
+                    return Err(SchemaDecodeError::incompatible_attribute_modifier(
+                        input_mode, modifier,
+                    )
+                    .prepend_attribute(name));
+                }
+            }
+            let mut builder = CoreAttributeSchema::provider_populated(name.clone(), attr_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
     }
-    if let Some(description) = description {
-        schema = schema.with_description(description.clone());
+}
+
+fn decoded_refined_string(
+    identity: Option<TypeIdentity>,
+    pattern: Option<String>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    to_dsl: Option<proto::DslTransform>,
+) -> CoreAttributeType {
+    match identity {
+        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
+            Some(validate) => CoreAttributeType::refined_string_with_validator(
+                identity, pattern, length, validate, to_dsl,
+            ),
+            None => CoreAttributeType::refined_string(Some(identity), pattern, length, to_dsl),
+        },
+        None => CoreAttributeType::refined_string(None, pattern, length, to_dsl),
     }
-    // Provider configuration completions cross through the separate
-    // `provider-config-completions` WIT export, not schema JSON.
-    if let Some(provider_name) = provider_name {
-        schema = schema.with_provider_name(provider_name.clone());
+}
+
+fn decoded_refined_int(
+    identity: Option<TypeIdentity>,
+    range: Option<(Option<i64>, Option<i64>)>,
+) -> CoreAttributeType {
+    match identity {
+        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
+            Some(validate) => {
+                CoreAttributeType::refined_int_with_validator(identity, range, validate)
+            }
+            None => CoreAttributeType::refined_int(Some(identity), range),
+        },
+        None => CoreAttributeType::refined_int(None, range),
     }
-    if *create_only {
-        schema = schema.create_only();
+}
+
+fn decoded_refined_float(
+    identity: Option<TypeIdentity>,
+    range: Option<(Option<f64>, Option<f64>)>,
+) -> CoreAttributeType {
+    match identity {
+        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
+            Some(validate) => {
+                CoreAttributeType::refined_float_with_validator(identity, range, validate)
+            }
+            None => CoreAttributeType::refined_float(Some(identity), range),
+        },
+        None => CoreAttributeType::refined_float(None, range),
     }
-    schema = match removable {
-        Some(true) => schema.removable(),
-        Some(false) => schema.non_removable(),
-        None => schema,
-    };
-    if let Some(block_name) = block_name {
-        schema = schema.with_block_name(block_name.clone());
-    }
-    if *write_only {
-        schema = schema.write_only();
-    }
-    if *identity {
-        schema = schema.identity();
-    }
-    if *deferred_populate {
-        schema = schema.deferred_populate();
-    }
-    Ok(schema)
 }
 
 fn proto_attr_type_to_core(
@@ -2101,10 +2305,10 @@ fn proto_attr_type_to_core(
         proto::AttributeType::String {
             pattern,
             length,
-            validate: _,
+            validate: _validate,
             to_dsl,
             identity,
-        } => CoreAttributeType::refined_string(
+        } => decoded_refined_string(
             identity
                 .as_deref()
                 .filter(|s| !s.is_empty())
@@ -2113,14 +2317,14 @@ fn proto_attr_type_to_core(
             *length,
             to_dsl.clone(),
         ),
-        proto::AttributeType::Int { range, identity } => CoreAttributeType::refined_int(
+        proto::AttributeType::Int { range, identity } => decoded_refined_int(
             identity
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(carina_core::schema::TypeIdentity::from_dotted),
             *range,
         ),
-        proto::AttributeType::Float { range, identity } => CoreAttributeType::refined_float(
+        proto::AttributeType::Float { range, identity } => decoded_refined_float(
             identity
                 .as_deref()
                 .filter(|s| !s.is_empty())
@@ -2155,12 +2359,11 @@ fn proto_attr_type_to_core(
             element_type,
             ordered,
             length,
-            validate: _,
+            validate: _validate,
         } => CoreAttributeType::refined_list(
             proto_attr_type_to_core(element_type)?,
             *ordered,
             *length,
-            legacy_validator(|_| Ok(())),
         ),
         proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
             proto_attr_type_to_core(key)?,
@@ -2184,7 +2387,7 @@ fn proto_attr_type_to_core(
             base,
             pattern,
             length,
-            validate: _,
+            validate: _validate,
             to_dsl,
         } => proto_legacy_custom_to_core(name, base, pattern.clone(), *length, to_dsl.clone())?,
         proto::AttributeType::CustomEnum {
@@ -2222,11 +2425,11 @@ fn proto_legacy_custom_to_core(
     to_dsl: Option<proto::DslTransform>,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
     if let proto::AttributeType::Custom {
-        name: _,
+        name: _inner_name,
         base,
         pattern: inner_pattern,
         length: inner_length,
-        validate: _,
+        validate: _inner_validate,
         to_dsl: inner_to_dsl,
     } = base
     {
@@ -2250,50 +2453,93 @@ fn proto_legacy_custom_to_core(
             enclosing_name,
         ))
     };
-    let validate = legacy_validator(|_| Ok(())); // Validation is handled via ProviderContext.validators
-
     // A legacy Custom's outer record owns its identity and refinements; its
     // base is a shape discriminator (plus List element type/order). Name every
     // unused base field so extending a variant cannot silently change that rule.
     match base {
         proto::AttributeType::String {
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
-            identity: _,
-        } => Ok(CoreAttributeType::refined_string_with_validator(
-            identity, pattern, length, validate, to_dsl,
-        )),
+            pattern: _base_pattern,
+            length: _base_length,
+            validate: _base_validate,
+            to_dsl: _base_to_dsl,
+            identity: _base_identity,
+        } => Ok(decoded_refined_string(identity, pattern, length, to_dsl)),
         proto::AttributeType::Int {
-            range: _,
-            identity: _,
-        } => Ok(CoreAttributeType::refined_int_with_validator(
+            range: _base_range,
+            identity: _base_identity,
+        } => Ok(decoded_refined_int(
             identity,
             length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
-            validate,
         )),
         proto::AttributeType::Float {
-            range: _,
-            identity: _,
-        } => Ok(CoreAttributeType::refined_float_with_validator(
-            identity, None, validate,
-        )),
+            range: _base_range,
+            identity: _base_identity,
+        } => Ok(decoded_refined_float(identity, None)),
         proto::AttributeType::List {
             element_type,
             ordered,
-            length: _,
-            validate: _,
+            length: _base_length,
+            validate: _base_validate,
         } => Ok(CoreAttributeType::refined_list(
             proto_attr_type_to_core(element_type)?,
             *ordered,
             length,
-            validate,
         )),
-        other => Err(SchemaDecodeError::unsupported_custom_base(
+        proto::AttributeType::Bool | proto::AttributeType::Duration => Err(
+            SchemaDecodeError::unsupported_custom_base(enclosing_name, base),
+        ),
+        proto::AttributeType::StringEnum {
+            values: _base_values,
+            name: _base_name,
+            namespace: _base_namespace,
+            dsl_aliases: _base_dsl_aliases,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
-            other,
+            base,
         )),
+        proto::AttributeType::Map {
+            inner: _base_inner,
+            key: _base_key,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            base,
+        )),
+        proto::AttributeType::Struct {
+            name: _base_name,
+            fields: _base_fields,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            base,
+        )),
+        proto::AttributeType::Union {
+            members: _base_members,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            base,
+        )),
+        proto::AttributeType::Custom {
+            name: _base_name,
+            base: _base,
+            pattern: _base_pattern,
+            length: _base_length,
+            validate: _base_validate,
+            to_dsl: _base_to_dsl,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            base,
+        )),
+        proto::AttributeType::CustomEnum {
+            name: _base_name,
+            base: _base,
+            namespace: _base_namespace,
+            dsl_transform: _base_dsl_transform,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            base,
+        )),
+        proto::AttributeType::Ref { name: _base_name } => Err(
+            SchemaDecodeError::unsupported_custom_base(enclosing_name, base),
+        ),
     }
 }
 
@@ -2314,37 +2560,71 @@ fn proto_struct_field_to_core(
         deferred_populate,
     } = f;
 
-    if *read_only && *write_only {
-        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
-    }
-
     let input_mode = proto_input_mode_to_core(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
+
+    if input_mode == CoreInputMode::ProviderPopulated && *write_only {
+        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
+    }
     let field_type =
         proto_attr_type_to_core(field_type).map_err(|error| error.prepend_attribute(name))?;
 
-    let mut field = CoreStructField::new(name.clone(), field_type);
-    field = match input_mode {
-        CoreInputMode::Optional => field,
-        CoreInputMode::Required => field.required(),
-        CoreInputMode::ProviderPopulated => field.read_only(),
-    };
-    if let Some(description) = description {
-        field = field.with_description(description.clone());
+    match input_mode {
+        CoreInputMode::Optional => {
+            let mut builder = CoreStructField::optional(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
+        CoreInputMode::Required => {
+            let mut builder = CoreStructField::required(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *write_only {
+                builder = builder.write_only();
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
+        CoreInputMode::ProviderPopulated => {
+            let mut builder = CoreStructField::provider_populated(name.clone(), field_type);
+            if let Some(description) = description {
+                builder = builder.with_description(description.clone());
+            }
+            if let Some(provider_name) = provider_name {
+                builder = builder.with_provider_name(provider_name.clone());
+            }
+            if let Some(block_name) = block_name {
+                builder = builder.with_block_name(block_name.clone());
+            }
+            if *deferred_populate {
+                builder = builder.deferred_populate();
+            }
+            Ok(builder.build())
+        }
     }
-    if let Some(provider_name) = provider_name {
-        field = field.with_provider_name(provider_name.clone());
-    }
-    if let Some(block_name) = block_name {
-        field = field.with_block_name(block_name.clone());
-    }
-    if *write_only {
-        field = field.write_only();
-    }
-    if *deferred_populate {
-        field = field.deferred_populate();
-    }
-    Ok(field)
 }
 
 fn proto_input_mode_to_core(
@@ -2616,14 +2896,14 @@ mod tests {
         let CoreStructFieldParts {
             name,
             field_type,
-            input_mode,
+            declared_input_mode,
             description,
             provider_name,
             block_name,
             deferred_populate,
             write_only,
         } = field.parts();
-        let (required, read_only) = core_input_mode_to_proto(input_mode);
+        let (required, read_only) = core_input_mode_to_proto(declared_input_mode);
 
         proto::StructField {
             name: name.to_string(),
@@ -2644,7 +2924,7 @@ mod tests {
         let CoreAttributeSchemaParts {
             name,
             attr_type,
-            input_mode,
+            declared_input_mode,
             default,
             description,
             completions,
@@ -2661,7 +2941,7 @@ mod tests {
             completions.is_none(),
             "provider configuration completions use a separate WIT export"
         );
-        let (required, read_only) = core_input_mode_to_proto(input_mode);
+        let (required, read_only) = core_input_mode_to_proto(declared_input_mode);
         proto::AttributeSchema {
             name: name.to_string(),
             attr_type: core_string_to_proto_for_schema_round_trip(attr_type),
@@ -2728,6 +3008,106 @@ mod tests {
             error.to_string(),
             "attribute 'client_secret': struct field cannot be both write-only and provider-populated"
         );
+    }
+
+    #[test]
+    fn host_decodes_a_shared_def_without_changing_its_fields() {
+        let mut writable = proto_attr(
+            "tags",
+            proto::AttributeType::List {
+                element_type: Box::new(proto::AttributeType::Ref {
+                    name: "Tag".to_string(),
+                }),
+                ordered: true,
+                length: None,
+                validate: None,
+            },
+        );
+        writable.required = true;
+        let mut output = proto_attr(
+            "effective_tags",
+            proto::AttributeType::List {
+                element_type: Box::new(proto::AttributeType::Ref {
+                    name: "Tag".to_string(),
+                }),
+                ordered: true,
+                length: None,
+                validate: None,
+            },
+        );
+        output.read_only = true;
+        let mut schema = proto_resource(
+            "test.Widget",
+            [
+                ("tags".to_string(), writable),
+                ("effective_tags".to_string(), output),
+            ],
+        );
+        schema.defs.insert(
+            "Tag".to_string(),
+            proto::AttributeType::Struct {
+                name: "Tag".to_string(),
+                fields: vec![proto::StructField {
+                    name: "key".to_string(),
+                    field_type: proto_string(),
+                    required: true,
+                    description: None,
+                    block_name: Some("tag_key".to_string()),
+                    provider_name: Some("Key".to_string()),
+                    read_only: false,
+                    write_only: false,
+                    deferred_populate: false,
+                }],
+            },
+        );
+
+        let decoded = proto_schema_to_core(&schema)
+            .expect("shared definitions must be validated independently for each path");
+        let tag = decoded
+            .as_schema()
+            .defs()
+            .get("Tag")
+            .expect("Tag definition must survive decode");
+        let fields = match tag.raw_shape() {
+            carina_core::schema::RawShape::Struct {
+                name: _name,
+                fields,
+            } => fields,
+            shape => panic!("expected struct, got {shape:?}"),
+        };
+        assert_eq!(
+            fields[0].parts().declared_input_mode,
+            CoreInputMode::Required
+        );
+        assert_eq!(fields[0].parts().block_name, Some("tag_key"));
+    }
+
+    #[test]
+    fn descendant_write_only_remains_invalid_below_provider_output() {
+        let mut output = proto_attr(
+            "output",
+            proto::AttributeType::Struct {
+                name: "Output".to_string(),
+                fields: vec![proto::StructField {
+                    name: "secret".to_string(),
+                    field_type: proto_string(),
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: true,
+                    deferred_populate: false,
+                }],
+            },
+        );
+        output.read_only = true;
+        let schema = proto_resource("test.Widget", [("output".to_string(), output)]);
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("shared validation must reject write-only output descendants");
+        assert!(error.to_string().contains("write-only"));
+        assert!(error.to_string().contains("secret"));
     }
 
     #[test]
@@ -2942,12 +3322,12 @@ mod tests {
 
     #[test]
     fn schema_transport_round_trip_is_exhaustive_for_touched_types() {
-        let core_field = CoreStructField::new("provider_id", CoreAttributeType::string())
-            .with_description("Provider-assigned identifier")
-            .with_provider_name("ProviderId")
-            .with_block_name("provider_id_block")
-            .read_only()
-            .deferred_populate();
+        let core_field =
+            CoreStructField::provider_populated("provider_id", CoreAttributeType::string())
+                .with_description("Provider-assigned identifier")
+                .with_provider_name("ProviderId")
+                .deferred_populate()
+                .build();
         let field_json = serde_json::to_string(&core_struct_field_to_proto_for_schema_round_trip(
             &core_field,
         ))
@@ -2957,7 +3337,7 @@ mod tests {
         let CoreStructFieldParts {
             name,
             field_type,
-            input_mode,
+            declared_input_mode,
             description,
             provider_name,
             block_name,
@@ -2971,15 +3351,20 @@ mod tests {
                 .expect("round-tripped field type must be Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
-        assert_eq!(input_mode, CoreInputMode::ProviderPopulated);
+        assert_eq!(declared_input_mode, CoreInputMode::ProviderPopulated);
         assert_eq!(description, Some("Provider-assigned identifier"));
         assert_eq!(provider_name, Some("ProviderId"));
-        assert_eq!(block_name, Some("provider_id_block"));
+        assert_eq!(block_name, None);
         assert!(deferred_populate);
         assert!(!write_only);
 
         let write_only_field =
-            CoreStructField::new("client_secret", CoreAttributeType::string()).write_only();
+            CoreStructField::optional("client_secret", CoreAttributeType::string())
+                .with_description("Write-only client secret")
+                .with_provider_name("ClientSecret")
+                .with_block_name("client_secret_block")
+                .write_only()
+                .build();
         let wire = core_struct_field_to_proto_for_schema_round_trip(&write_only_field);
         assert!(wire.write_only);
         let json = serde_json::to_string(&wire).unwrap();
@@ -2990,16 +3375,19 @@ mod tests {
         let round_tripped =
             proto_struct_field_to_core(&serde_json::from_str::<proto::StructField>(&json).unwrap())
                 .unwrap();
-        assert!(round_tripped.is_write_only());
+        assert!(round_tripped.parts().write_only);
 
-        let required_field = CoreStructField::new("name", CoreAttributeType::string()).required();
+        let required_field = CoreStructField::required("name", CoreAttributeType::string()).build();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
         assert!(proto_required.required);
         assert!(!proto_required.read_only);
         let round_tripped_required = proto_struct_field_to_core(&proto_required).unwrap();
-        assert_eq!(round_tripped_required.input_mode(), CoreInputMode::Required);
+        assert_eq!(
+            round_tripped_required.parts().declared_input_mode,
+            CoreInputMode::Required
+        );
 
-        let core_attr = CoreAttributeSchema::new("status", CoreAttributeType::string())
+        let core_attr = CoreAttributeSchema::optional("status", CoreAttributeType::string())
             .with_default(CoreValue::Concrete(ConcreteValue::String(
                 "provider-default".into(),
             )))
@@ -3010,7 +3398,7 @@ mod tests {
             .with_block_name("status_block")
             .write_only()
             .identity()
-            .deferred_populate();
+            .build();
         let attr_json =
             serde_json::to_string(&core_attr_schema_to_proto_for_schema_round_trip(&core_attr))
                 .unwrap();
@@ -3019,7 +3407,7 @@ mod tests {
         let CoreAttributeSchemaParts {
             name,
             attr_type,
-            input_mode,
+            declared_input_mode,
             default,
             description,
             completions,
@@ -3038,7 +3426,7 @@ mod tests {
                 .expect("round-tripped attribute type must be Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
-        assert_eq!(input_mode, CoreInputMode::Optional);
+        assert_eq!(declared_input_mode, CoreInputMode::Optional);
         assert!(matches!(
             default,
             Some(CoreValue::Concrete(ConcreteValue::String(value)))
@@ -3052,10 +3440,14 @@ mod tests {
         assert_eq!(block_name, Some("status_block"));
         assert!(write_only);
         assert!(identity);
-        assert!(deferred_populate);
+        assert!(!deferred_populate);
 
         let provider_populated_attr =
-            CoreAttributeSchema::new("arn", CoreAttributeType::string()).read_only();
+            CoreAttributeSchema::provider_populated("arn", CoreAttributeType::string())
+                .with_description("Provider ARN")
+                .with_provider_name("Arn")
+                .deferred_populate()
+                .build();
         let proto_provider_populated =
             core_attr_schema_to_proto_for_schema_round_trip(&provider_populated_attr);
         assert!(proto_provider_populated.read_only);
@@ -3067,22 +3459,21 @@ mod tests {
             CoreInputMode::ProviderPopulated
         );
         assert!(!round_tripped_provider_populated.is_write_only());
+        assert!(round_tripped_provider_populated.is_deferred_populate());
 
-        let required_attr = CoreAttributeSchema::new("region", CoreAttributeType::string())
-            .required()
-            .with_default(CoreValue::Concrete(ConcreteValue::String(
-                "us-east-1".into(),
-            )));
+        let required_attr = CoreAttributeSchema::required("region", CoreAttributeType::string())
+            .with_description("Required region")
+            .with_provider_name("Region")
+            .with_block_name("region_block")
+            .create_only()
+            .identity()
+            .build();
         let proto_required = core_attr_schema_to_proto_for_schema_round_trip(&required_attr);
         assert!(proto_required.required);
         assert!(!proto_required.read_only);
         let round_tripped_required = proto_attr_schema_to_core(&proto_required).unwrap();
         assert_eq!(round_tripped_required.input_mode(), CoreInputMode::Required);
-        assert!(matches!(
-            round_tripped_required.default_value(),
-            Some(CoreValue::Concrete(ConcreteValue::String(value)))
-                if value == "us-east-1"
-        ));
+        assert_eq!(round_tripped_required.default_value(), None);
     }
 
     #[test]
@@ -3437,7 +3828,12 @@ mod tests {
         assert!(rendered.contains("schema default value conversion error"));
         assert_eq!(rendered.matches("list-val").count(), 1, "{rendered}");
         assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<WasmValueDecodeError>())
+                .is_some(),
+            "typed schema-default decode error must remain in the source chain"
+        );
     }
 
     #[test]
@@ -4350,13 +4746,17 @@ mod tests {
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",
-            carina_core::schema::ResourceSchema::new("test").attribute(
-                carina_core::schema::AttributeSchema::new(
-                    "token",
-                    carina_core::schema::AttributeType::string(),
+            carina_core::schema::ResourceSchema::new("test")
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "token",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .write_only()
+                    .build(),
                 )
-                .write_only(),
-            ),
+                .validate()
+                .expect("test schema must be valid"),
         );
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
@@ -4510,6 +4910,234 @@ mod tests {
     }
 
     #[test]
+    fn released_acm_optional_deferred_descendant_under_read_only_output_loads() {
+        let schemas = json_to_schemas(
+            r#"[{
+                "resource_type":"acm.Certificate",
+                "attributes":{
+                    "domain_validation_options":{
+                        "name":"domain_validation_options",
+                        "attr_type":{
+                            "type":"list",
+                            "element_type":{
+                                "type":"struct",
+                                "name":"DomainValidation",
+                                "fields":[{
+                                    "name":"domain_name",
+                                    "field_type":{"type":"String"},
+                                    "required":true,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"DomainName"
+                                },{
+                                    "name":"http_redirect",
+                                    "field_type":{
+                                        "type":"struct",
+                                        "name":"HttpRedirect",
+                                        "fields":[{
+                                            "name":"redirect_from",
+                                            "field_type":{"type":"String"},
+                                            "required":false,
+                                            "read_only":false,
+                                            "write_only":false,
+                                            "deferred_populate":false,
+                                            "provider_name":"RedirectFrom"
+                                        },{
+                                            "name":"redirect_to",
+                                            "field_type":{"type":"String"},
+                                            "required":false,
+                                            "read_only":false,
+                                            "write_only":false,
+                                            "deferred_populate":false,
+                                            "provider_name":"RedirectTo"
+                                        }]
+                                    },
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"HttpRedirect"
+                                },{
+                                    "name":"resource_record",
+                                    "field_type":{
+                                        "type":"struct",
+                                        "name":"ResourceRecord",
+                                        "fields":[{
+                                            "name":"name",
+                                            "field_type":{"type":"String"},
+                                            "required":true,
+                                            "read_only":false,
+                                            "write_only":false,
+                                            "deferred_populate":false,
+                                            "provider_name":"Name"
+                                        },{
+                                            "name":"type",
+                                            "field_type":{
+                                                "type":"string_enum",
+                                                "values":["CNAME"],
+                                                "name":"Type",
+                                                "namespace":"aws.acm.Certificate.DomainValidation.ResourceRecord",
+                                                "dsl_aliases":[["CNAME","cname"]]
+                                            },
+                                            "required":true,
+                                            "read_only":false,
+                                            "write_only":false,
+                                            "deferred_populate":false,
+                                            "provider_name":"Type"
+                                        },{
+                                            "name":"value",
+                                            "field_type":{"type":"String"},
+                                            "required":true,
+                                            "read_only":false,
+                                            "write_only":false,
+                                            "deferred_populate":false,
+                                            "provider_name":"Value"
+                                        }]
+                                    },
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":true,
+                                    "provider_name":"ResourceRecord"
+                                },{
+                                    "name":"validation_domain",
+                                    "field_type":{"type":"String"},
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"ValidationDomain"
+                                },{
+                                    "name":"validation_emails",
+                                    "field_type":{
+                                        "type":"list",
+                                        "element_type":{"type":"String","identity":"Email"},
+                                        "ordered":true
+                                    },
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"ValidationEmails"
+                                },{
+                                    "name":"validation_method",
+                                    "field_type":{
+                                        "type":"string_enum",
+                                        "values":["DNS","EMAIL","HTTP"],
+                                        "name":"ValidationMethod",
+                                        "namespace":"aws.acm.Certificate.DomainValidation",
+                                        "dsl_aliases":[
+                                            ["DNS","dns"],
+                                            ["EMAIL","email"],
+                                            ["HTTP","http"]
+                                        ]
+                                    },
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"ValidationMethod"
+                                },{
+                                    "name":"validation_status",
+                                    "field_type":{
+                                        "type":"string_enum",
+                                        "values":["FAILED","PENDING_VALIDATION","SUCCESS"],
+                                        "name":"ValidationStatus",
+                                        "namespace":"aws.acm.Certificate.DomainValidation",
+                                        "dsl_aliases":[
+                                            ["FAILED","failed"],
+                                            ["PENDING_VALIDATION","pending_validation"],
+                                            ["SUCCESS","success"]
+                                        ]
+                                    },
+                                    "required":false,
+                                    "read_only":false,
+                                    "write_only":false,
+                                    "deferred_populate":false,
+                                    "provider_name":"ValidationStatus"
+                                }]
+                            },
+                            "ordered":true
+                        },
+                        "required":false,
+                        "read_only":true,
+                        "write_only":false,
+                        "provider_name":"DomainValidationOptions"
+                    }
+                }
+            }]"#,
+        )
+        .expect("the released version-12 ACM schema must remain loadable");
+
+        let validated_schema = &schemas[0];
+        let schema = validated_schema.as_schema();
+        let domain_validation_options = schema
+            .attributes()
+            .get("domain_validation_options")
+            .expect("domain_validation_options");
+        let list_element = match domain_validation_options.attr_type().raw_shape() {
+            carina_core::schema::RawShape::List { element_type, .. } => element_type,
+            other => panic!("expected list, got {other:?}"),
+        };
+        let fields = match list_element.raw_shape() {
+            carina_core::schema::RawShape::Struct { fields, .. } => fields,
+            other => panic!("expected struct, got {other:?}"),
+        };
+        let domain_name = fields
+            .iter()
+            .find(|field| field.name() == "domain_name")
+            .expect("domain_name");
+        assert_eq!(
+            domain_name.parts().declared_input_mode,
+            CoreInputMode::Required
+        );
+
+        let resource_record = fields
+            .iter()
+            .find(|field| field.name() == "resource_record")
+            .expect("resource_record");
+        assert_eq!(
+            resource_record.parts().declared_input_mode,
+            CoreInputMode::Optional
+        );
+        assert!(resource_record.parts().deferred_populate);
+        let record_fields = match resource_record.field_type().raw_shape() {
+            carina_core::schema::RawShape::Struct { fields, .. } => fields,
+            other => panic!("expected resource record struct, got {other:?}"),
+        };
+        assert!(
+            record_fields
+                .iter()
+                .all(|field| field.parts().declared_input_mode == CoreInputMode::Required)
+        );
+
+        let domain_name = validated_schema
+            .effective_node_at_path(&[
+                "domain_validation_options".to_string(),
+                "domain_name".to_string(),
+            ])
+            .expect("domain_name effective path must resolve");
+        assert_eq!(
+            domain_name.effective_input_mode(),
+            CoreInputMode::ProviderPopulated
+        );
+        assert!(domain_name.is_read_only());
+
+        let resource_record = validated_schema
+            .effective_node_at_path(&[
+                "domain_validation_options".to_string(),
+                "resource_record".to_string(),
+            ])
+            .expect("resource_record effective path must resolve");
+        assert_eq!(
+            resource_record.effective_input_mode(),
+            CoreInputMode::ProviderPopulated
+        );
+        assert!(resource_record.is_deferred_populate());
+    }
+
+    #[test]
     fn test_json_to_schemas_requires_nested_write_only_flag() {
         let err = json_to_schemas(
             r#"[{
@@ -4568,6 +5196,15 @@ mod tests {
             "description": "EC2 Security Group",
             "unique_name_attribute": "group_name",
             "attributes": {
+              "group_name": {
+                "name": "group_name",
+                "attr_type": { "type": "String" },
+                "required": true,
+                "description": "Group name",
+                "create_only": true,
+                "read_only": false,
+                "write_only": false
+              },
               "ingress": {
                 "name": "ingress",
                 "attr_type": {
@@ -4663,14 +5300,13 @@ mod tests {
         } = schema.parts();
         assert_eq!(resource_type, "ec2.SecurityGroup");
         assert_eq!(description, Some("EC2 Security Group"));
-        assert!(!schema.is_data_source());
+        assert!(!matches!(kind, carina_core::schema::SchemaKind::DataSource));
         assert_eq!(
             unique_name,
             &CoreUniqueNameSpec::Attribute("group_name".to_string())
         );
         let _ = (
             validation,
-            kind,
             operation_config,
             exclusive_required,
             default_wait_timeout,
@@ -4749,9 +5385,12 @@ mod tests {
                                         .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::Int { .. }
                                 ));
-                                assert!(from_port.is_required());
+                                assert_eq!(
+                                    from_port.parts().declared_input_mode,
+                                    CoreInputMode::Required
+                                );
                                 assert_eq!(from_port.description(), Some("Start of port range"));
-                                assert_eq!(from_port.block_name(), Some("from_port_block"));
+                                assert_eq!(from_port.parts().block_name, Some("from_port_block"));
                                 assert_eq!(from_port.provider_name(), Some("FromPort"));
 
                                 let protocol = &fields[1];
@@ -4763,7 +5402,7 @@ mod tests {
                                         .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::String { .. }
                                 ));
-                                assert!(protocol.block_name().is_none());
+                                assert!(protocol.parts().block_name.is_none());
                                 assert!(protocol.provider_name().is_none());
                             }
                             other => panic!("expected Struct, got {:?}", other),
@@ -4796,6 +5435,7 @@ mod tests {
         let types = json_to_attribute_types(json).unwrap();
         assert!(matches!(
             types
+                .parts()
                 .get("timeout")
                 .map(|t| t.shape_ref_free().expect("test schema is Ref-free")),
             Some(carina_core::schema::Shape::Duration)
@@ -4808,7 +5448,122 @@ mod tests {
         let rendered = error.to_string();
         assert_eq!(rendered.matches("schema JSON parse error").count(), 1);
         assert!(rendered.contains("expected ident"), "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<serde_json::Error>())
+                .is_some(),
+            "JSON parse error must remain reachable through Error::source"
+        );
+    }
+
+    #[test]
+    fn config_schema_validation_error_remains_the_source_with_all_issues() {
+        let error = json_to_attribute_types(
+            r#"{
+                "first":{"type":"ref","name":"MissingFirst"},
+                "second":{"type":"ref","name":"MissingSecond"}
+            }"#,
+        )
+        .expect_err("both dangling config references must be rejected");
+
+        let source = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<carina_core::schema::ConfigSchemaValidationError>()
+            })
+            .expect("typed config validation error must remain in the chain");
+        assert_eq!(source.issues().len(), 2);
+        let rendered = error.to_string();
+        assert!(rendered.contains("MissingFirst"), "{rendered}");
+        assert!(rendered.contains("MissingSecond"), "{rendered}");
+    }
+
+    #[test]
+    fn resource_schema_validation_error_remains_the_source_with_all_issues() {
+        let schema = proto_resource(
+            "test.Widget",
+            [
+                (
+                    "first".to_string(),
+                    proto_attr(
+                        "first",
+                        proto::AttributeType::Ref {
+                            name: "MissingFirst".to_string(),
+                        },
+                    ),
+                ),
+                (
+                    "second".to_string(),
+                    proto_attr(
+                        "second",
+                        proto::AttributeType::Ref {
+                            name: "MissingSecond".to_string(),
+                        },
+                    ),
+                ),
+            ],
+        );
+        let error = proto_schema_to_core(&schema)
+            .expect_err("both dangling resource references must be rejected");
+
+        let source = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<carina_core::schema::ResourceSchemaValidationError>()
+            })
+            .expect("typed resource validation error must remain in the chain");
+        assert_eq!(source.issues().len(), 2);
+        let rendered = error.to_string();
+        assert!(rendered.contains("MissingFirst"), "{rendered}");
+        assert!(rendered.contains("MissingSecond"), "{rendered}");
+    }
+
+    #[test]
+    fn resource_schema_non_attribute_issue_is_not_rendered_as_an_attribute() {
+        let mut schema = proto_resource(
+            "test.Widget",
+            [("known".to_string(), proto_attr("known", proto_string()))],
+        );
+        schema.exclusive_required = vec![vec!["missing".to_string()]];
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("unknown exclusive-required member must be rejected");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("exclusive_required[0]"), "{rendered}");
+        assert!(
+            !rendered.contains("attribute 'exclusive_required[0]'"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn resource_schema_definition_issue_is_not_rendered_as_an_attribute() {
+        let mut schema = proto_resource("test.Widget", std::iter::empty());
+        schema.defs.insert(
+            "Tag".to_string(),
+            proto::AttributeType::Struct {
+                name: "Tag".to_string(),
+                fields: vec![proto::StructField {
+                    name: "key".to_string(),
+                    field_type: proto::AttributeType::Ref {
+                        name: "Missing".to_string(),
+                    },
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: false,
+                    deferred_populate: false,
+                }],
+            },
+        );
+
+        let error = proto_schema_to_core(&schema)
+            .expect_err("a dangling definition reference must be rejected");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("defs.Tag.key"), "{rendered}");
+        assert!(!rendered.contains("attribute 'defs.Tag.key'"), "{rendered}");
     }
 
     #[test]
@@ -4871,7 +5626,16 @@ mod tests {
     fn test_proto_schema_with_tags_validator_reconstructed() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.s3.Bucket".to_string(),
-            attributes: HashMap::new(),
+            attributes: HashMap::from([(
+                "tags".to_string(),
+                proto_attr(
+                    "tags",
+                    proto::AttributeType::Map {
+                        inner: Box::new(proto_string()),
+                        key: Box::new(proto_string()),
+                    },
+                ),
+            )]),
             description: None,
             kind: proto::SchemaKind::Managed,
             unique_name: proto::UniqueNameSpec::Conflicting,
@@ -4882,11 +5646,10 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            core_schema.validation(),
+            core_schema.parts().validation,
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators == &[proto::ValidatorType::TagsKeyValueCheck]
         ));
-        assert!(core_schema.validator().is_some());
     }
 
     #[test]
@@ -4904,11 +5667,10 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            core_schema.validation(),
+            core_schema.parts().validation,
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators.is_empty()
         ));
-        assert!(core_schema.validator().is_none());
     }
 
     #[test]
@@ -4917,7 +5679,18 @@ mod tests {
         // WASM providers can express `oneOf` constraints as data.
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.ec2.Vpc".to_string(),
-            attributes: HashMap::new(),
+            attributes: [
+                (
+                    "cidr_block".to_string(),
+                    proto_attr("cidr_block", proto_string()),
+                ),
+                (
+                    "ipv4_ipam_pool_id".to_string(),
+                    proto_attr("ipv4_ipam_pool_id", proto_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
             description: None,
             kind: proto::SchemaKind::Managed,
             unique_name: proto::UniqueNameSpec::Conflicting,
@@ -4931,7 +5704,7 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert_eq!(
-            core_schema.exclusive_required_groups(),
+            core_schema.parts().exclusive_required,
             &[vec![
                 "cidr_block".to_string(),
                 "ipv4_ipam_pool_id".to_string(),
@@ -4955,7 +5728,12 @@ mod tests {
         // is preserved through full JSON round-trip (guest -> host).
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.ec2.Vpc".to_string(),
-            attributes: HashMap::new(),
+            attributes: [
+                ("a".to_string(), proto_attr("a", proto_string())),
+                ("b".to_string(), proto_attr("b", proto_string())),
+            ]
+            .into_iter()
+            .collect(),
             description: None,
             kind: proto::SchemaKind::Managed,
             unique_name: proto::UniqueNameSpec::Conflicting,
@@ -4968,7 +5746,7 @@ mod tests {
         let schemas = json_to_schemas(&json).unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(
-            schemas[0].exclusive_required_groups(),
+            schemas[0].parts().exclusive_required,
             &[vec!["a".to_string(), "b".to_string()]]
         );
     }
@@ -5500,7 +6278,7 @@ mod tests {
         ]"#;
 
         let schemas = json_to_schemas(json).unwrap();
-        let attr_type = schemas[0].attributes()["id"].attr_type();
+        let attr_type = schemas[0].parts().attributes["id"].attr_type();
         match attr_type.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String { identity, .. } => {
                 assert_eq!(
@@ -5607,10 +6385,67 @@ mod tests {
     }
 
     #[test]
+    fn protocol_json_reconstructs_every_core_builtin_validator_by_identity() {
+        let positive_int_identity = TypeIdentity::bare("PositiveInt");
+
+        for expected_identity in carina_core::schema::builtin_validator_registry().keys() {
+            let wire_type = if expected_identity == &positive_int_identity {
+                proto::AttributeType::Int {
+                    range: None,
+                    identity: Some(expected_identity.to_string()),
+                }
+            } else {
+                proto::AttributeType::String {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: Some(expected_identity.to_string()),
+                }
+            };
+            let json = serde_json::to_string(&wire_type).expect("builtin type must serialize");
+            let decoded_wire: proto::AttributeType =
+                serde_json::from_str(&json).expect("builtin type JSON must decode");
+            let decoded =
+                proto_attr_type_to_core(&decoded_wire).expect("builtin identity must decode");
+
+            let (actual_identity, has_callback) = match decoded.raw_shape() {
+                carina_core::schema::RawShape::String {
+                    identity,
+                    pattern: _,
+                    length: _,
+                    validate,
+                    to_dsl: _,
+                } => (identity, validate.is_some()),
+                carina_core::schema::RawShape::Int {
+                    identity,
+                    range: _,
+                    validate,
+                } => (identity, validate.is_some()),
+                other => panic!("unexpected builtin shape for {expected_identity}: {other:?}"),
+            };
+            assert_eq!(actual_identity, Some(expected_identity));
+            assert!(
+                has_callback,
+                "host decode dropped the callback for {expected_identity}"
+            );
+        }
+    }
+
+    #[test]
     fn test_tags_validator_detects_key_value_pattern() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.s3.Bucket".to_string(),
-            attributes: HashMap::new(),
+            attributes: HashMap::from([(
+                "tags".to_string(),
+                proto_attr(
+                    "tags",
+                    proto::AttributeType::Map {
+                        inner: Box::new(proto_string()),
+                        key: Box::new(proto_string()),
+                    },
+                ),
+            )]),
             description: None,
             kind: proto::SchemaKind::Managed,
             unique_name: proto::UniqueNameSpec::Conflicting,
@@ -5621,11 +6456,10 @@ mod tests {
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
-            core_schema.validation(),
+            core_schema.parts().validation,
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators == &[proto::ValidatorType::TagsKeyValueCheck]
         ));
-        let validator = core_schema.validator().unwrap();
 
         // key/value pattern should fail
         let mut attrs = HashMap::new();
@@ -5646,7 +6480,7 @@ mod tests {
                 .collect(),
             )),
         );
-        assert!(validator(&attrs).is_err());
+        assert!(core_schema.validate(&attrs).is_err());
 
         // normal tags should pass
         let mut attrs = HashMap::new();
@@ -5661,6 +6495,6 @@ mod tests {
                 .collect(),
             )),
         );
-        assert!(validator(&attrs).is_ok());
+        assert!(core_schema.validate(&attrs).is_ok());
     }
 }

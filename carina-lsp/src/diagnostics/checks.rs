@@ -2784,7 +2784,8 @@ impl DiagnosticEngine {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().values() {
+            let config_schema = factory.provider_config_attribute_types();
+            for attr_type in config_schema.parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut provider_config_enum_namespaces);
             }
         }

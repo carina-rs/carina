@@ -750,7 +750,6 @@ mod tests {
     use carina_core::plan::Plan;
     use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
     use carina_core::resource::{ConcreteValue, DataSource, DeferredValue, State, Value};
-    use carina_core::schema::{AttributeType, ResourceSchema};
     use indexmap::IndexMap;
 
     use super::{
@@ -775,8 +774,8 @@ mod tests {
             "Saved-plan artifact test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
         }
 
         fn validate_config(
@@ -800,7 +799,7 @@ mod tests {
             })
         }
 
-        fn schemas(&self) -> Vec<ResourceSchema> {
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }
     }

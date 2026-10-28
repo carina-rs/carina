@@ -111,8 +111,8 @@ fn type_aware_struct_per_field() {
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("count", AttributeType::float()),
-            StructField::new("name", AttributeType::string()),
+            StructField::optional("count", AttributeType::float()).build(),
+            StructField::optional("name", AttributeType::string()).build(),
         ],
     );
     let a = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -154,7 +154,7 @@ fn type_aware_union_numeric() {
 #[test]
 fn type_aware_custom_delegates_to_base() {
     let custom_type = AttributeType::refined_float_with_validator(
-        Some(TypeIdentity::bare("Port")),
+        TypeIdentity::bare("Port"),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
     );
@@ -171,7 +171,7 @@ fn type_aware_diff_no_change_with_schema() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("port", AttributeType::float()));
+        .attribute(AttributeSchema::optional("port", AttributeType::float()).build());
 
     let desired = Resource::new("test.resource", "test")
         .with_attribute("port", Value::Concrete(ConcreteValue::Int(443)));
@@ -211,8 +211,8 @@ fn type_aware_struct_ignores_default_bool_false() {
     let struct_type = AttributeType::struct_(
         "ServerSideEncryptionRule".to_string(),
         vec![
-            StructField::new("bucket_key_enabled", AttributeType::bool()),
-            StructField::new("sse_algorithm", AttributeType::string()),
+            StructField::optional("bucket_key_enabled", AttributeType::bool()).build(),
+            StructField::optional("sse_algorithm", AttributeType::string()).build(),
         ],
     );
 
@@ -252,8 +252,8 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
     let struct_type = AttributeType::struct_(
         "ServerSideEncryptionRule".to_string(),
         vec![
-            StructField::new("bucket_key_enabled", AttributeType::bool()),
-            StructField::new("sse_algorithm", AttributeType::string()),
+            StructField::optional("bucket_key_enabled", AttributeType::bool()).build(),
+            StructField::optional("sse_algorithm", AttributeType::string()).build(),
         ],
     );
 
@@ -498,8 +498,8 @@ fn type_aware_struct_ignores_default_enum_empty() {
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new(
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional(
                 "status",
                 AttributeType::enum_(
                     TypeIdentity::bare("Status"),
@@ -508,7 +508,8 @@ fn type_aware_struct_ignores_default_enum_empty() {
                     None,
                     None,
                 ),
-            ),
+            )
+            .build(),
         ],
     );
 
@@ -548,15 +549,16 @@ fn type_aware_struct_ignores_default_custom_type() {
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new(
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional(
                 "port",
                 AttributeType::refined_int_with_validator(
-                    Some(TypeIdentity::bare("Port")),
+                    TypeIdentity::bare("Port"),
                     None,
                     crate::schema::legacy_validator(|_| Ok(())),
                 ),
-            ),
+            )
+            .build(),
         ],
     );
 
@@ -593,14 +595,15 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
     let struct_type = AttributeType::struct_(
         "Outer".to_string(),
         vec![
-            StructField::new("name", AttributeType::string()),
-            StructField::new(
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional(
                 "inner",
                 AttributeType::struct_(
                     "Inner".to_string(),
-                    vec![StructField::new("value", AttributeType::string())],
+                    vec![StructField::optional("value", AttributeType::string()).build()],
                 ),
-            ),
+            )
+            .build(),
         ],
     );
 
@@ -707,22 +710,27 @@ fn oidc_listener_with_matching_nested_write_only_provenance_converges() {
     let oidc_config = AttributeType::struct_(
         "AuthenticateOidcConfig",
         vec![
-            StructField::new("issuer", AttributeType::string()),
-            StructField::new("client_secret", AttributeType::string()).write_only(),
+            StructField::optional("issuer", AttributeType::string()).build(),
+            StructField::optional("client_secret", AttributeType::string())
+                .write_only()
+                .build(),
         ],
     );
     let schema = ResourceSchema::new("elasticloadbalancingv2.Listener")
-        .attribute(AttributeSchema::new(
-            "default_actions",
-            AttributeType::list(AttributeType::struct_(
-                "Action",
-                vec![
-                    StructField::new("type", AttributeType::string()),
-                    StructField::new("authenticate_oidc_config", oidc_config),
-                ],
-            )),
-        ))
-        .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()));
+        .attribute(
+            AttributeSchema::optional(
+                "default_actions",
+                AttributeType::list(AttributeType::struct_(
+                    "Action",
+                    vec![
+                        StructField::optional("type", AttributeType::string()).build(),
+                        StructField::optional("authenticate_oidc_config", oidc_config).build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .attribute(AttributeSchema::optional("ssl_policy", AttributeType::string()).build());
 
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("oidc-client-secret".into()),
@@ -797,23 +805,32 @@ fn oidc_listener_diff_fixture(
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
 
     let schema = ResourceSchema::new("elasticloadbalancingv2.Listener")
-        .attribute(AttributeSchema::new(
-            "default_actions",
-            AttributeType::list(AttributeType::struct_(
-                "Action",
-                vec![StructField::new(
-                    "authenticate_oidc_config",
-                    AttributeType::struct_(
-                        "AuthenticateOidcConfig",
-                        vec![
-                            StructField::new("issuer", AttributeType::string()),
-                            StructField::new("client_secret", AttributeType::string()).write_only(),
-                        ],
-                    ),
-                )],
-            )),
-        ))
-        .attribute(AttributeSchema::new("ssl_policy", AttributeType::string()));
+        .attribute(
+            AttributeSchema::optional(
+                "default_actions",
+                AttributeType::list(AttributeType::struct_(
+                    "Action",
+                    vec![
+                        StructField::optional(
+                            "authenticate_oidc_config",
+                            AttributeType::struct_(
+                                "AuthenticateOidcConfig",
+                                vec![
+                                    StructField::optional("issuer", AttributeType::string())
+                                        .build(),
+                                    StructField::optional("client_secret", AttributeType::string())
+                                        .write_only()
+                                        .build(),
+                                ],
+                            ),
+                        )
+                        .build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .attribute(AttributeSchema::optional("ssl_policy", AttributeType::string()).build());
     let oidc_action = |secret: Option<&str>| {
         let mut config = IndexMap::from([(
             "issuer".to_string(),
@@ -965,23 +982,30 @@ fn secret_wrapped_oidc_listener_fixture(
 ) {
     use crate::schema::{AttributeSchema, StructField};
 
-    let schema =
-        ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(AttributeSchema::new(
+    let schema = ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(
+        AttributeSchema::optional(
             "default_actions",
             AttributeType::list(AttributeType::struct_(
                 "Action",
-                vec![StructField::new(
-                    "authenticate_oidc_config",
-                    AttributeType::struct_(
-                        "AuthenticateOidcConfig",
-                        vec![
-                            StructField::new("issuer", AttributeType::string()),
-                            StructField::new("client_secret", AttributeType::string()).write_only(),
-                        ],
-                    ),
-                )],
+                vec![
+                    StructField::optional(
+                        "authenticate_oidc_config",
+                        AttributeType::struct_(
+                            "AuthenticateOidcConfig",
+                            vec![
+                                StructField::optional("issuer", AttributeType::string()).build(),
+                                StructField::optional("client_secret", AttributeType::string())
+                                    .write_only()
+                                    .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                ],
             )),
-        ));
+        )
+        .build(),
+    );
     let issuer = || Value::Concrete(ConcreteValue::String("https://issuer.example.com".into()));
     let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("issuer".to_string(), issuer()),
@@ -1080,13 +1104,20 @@ fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() 
     use crate::provider::NestedWriteOnlyRecord;
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
 
-    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
-        "creds",
-        AttributeType::struct_(
-            "Credentials",
-            vec![StructField::new("password", AttributeType::string()).write_only()],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.Credential").attribute(
+        AttributeSchema::optional(
+            "creds",
+            AttributeType::struct_(
+                "Credentials",
+                vec![
+                    StructField::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     let desired = HashMap::from([(
         "creds".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -1123,16 +1154,22 @@ fn omitted_read_with_empty_observable_string_list_converges() {
     use crate::provider::NestedWriteOnlyRecord;
     use crate::schema::{AttributeSchema, StructField};
 
-    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
-        "creds",
-        AttributeType::struct_(
-            "Credentials",
-            vec![
-                StructField::new("aliases", AttributeType::list(AttributeType::string())),
-                StructField::new("password", AttributeType::string()).write_only(),
-            ],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.Credential").attribute(
+        AttributeSchema::optional(
+            "creds",
+            AttributeType::struct_(
+                "Credentials",
+                vec![
+                    StructField::optional("aliases", AttributeType::list(AttributeType::string()))
+                        .build(),
+                    StructField::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     let desired = HashMap::from([(
         "creds".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1175,13 +1212,20 @@ fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
     use crate::provider::NestedWriteOnlyRecord;
     use crate::schema::{AttributeSchema, StructField};
 
-    let schema = ResourceSchema::new("test.Credential").attribute(AttributeSchema::new(
-        "creds",
-        AttributeType::struct_(
-            "Credentials",
-            vec![StructField::new("password", AttributeType::string()).write_only()],
-        ),
-    ));
+    let schema = ResourceSchema::new("test.Credential").attribute(
+        AttributeSchema::optional(
+            "creds",
+            AttributeType::struct_(
+                "Credentials",
+                vec![
+                    StructField::optional("password", AttributeType::string())
+                        .write_only()
+                        .build(),
+                ],
+            ),
+        )
+        .build(),
+    );
     let desired = HashMap::from([(
         "creds".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -1220,8 +1264,12 @@ fn non_create_only_write_only_attr_in_desired_not_in_current_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .build(),
+        );
 
     let desired = HashMap::from([
         (
@@ -1258,11 +1306,12 @@ fn create_only_write_only_attr_in_desired_not_in_current_has_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::new("ipv4_netmask_length", AttributeType::int())
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
                 .write_only()
-                .create_only(),
+                .create_only()
+                .build(),
         );
 
     let desired = HashMap::from([
@@ -1299,8 +1348,12 @@ fn write_only_attr_in_both_same_value_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .build(),
+        );
 
     let desired = HashMap::from([
         (
@@ -1343,8 +1396,12 @@ fn write_only_attr_in_both_different_value_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+                .write_only()
+                .build(),
+        );
 
     let desired = HashMap::from([
         (
@@ -1386,8 +1443,8 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
-        .attribute(AttributeSchema::new("enable_dns", AttributeType::bool()));
+        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("enable_dns", AttributeType::bool()).build());
 
     let desired = HashMap::from([
         (
@@ -1647,7 +1704,9 @@ fn dependent_nested_post_create_read_unknown_cannot_force_replacement() {
         )]),
     );
     let schema = ResourceSchema::new("test.Consumer").attribute(
-        AttributeSchema::new("tags", AttributeType::map(AttributeType::string())).create_only(),
+        AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+            .create_only()
+            .build(),
     );
 
     let result = diff_test(&desired, &current, None, None, Some(&schema));
@@ -1895,10 +1954,9 @@ fn secret_in_map_with_refresh_no_false_diff() {
     ])));
 
     // Build schema with tags as Map(String)
-    let schema = ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new(
-        "tags",
-        AttributeType::map(AttributeType::string()),
-    ));
+    let schema = ResourceSchema::new("ec2.Vpc").attribute(
+        AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+    );
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), current_tags)]);
@@ -2101,12 +2159,13 @@ fn union_string_or_list_compares_string_list() {
 fn into_plan_input_current_map_from_states_canonicalizes_string_or_list_state() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema = ResourceSchema::new("iam.policy").attribute(AttributeSchema::new(
-        "action",
-        string_or_list_of_strings_type(),
-    ));
+    let schema = ResourceSchema::new("iam.policy")
+        .attribute(AttributeSchema::optional("action", string_or_list_of_strings_type()).build());
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", schema);
+    registry.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut desired = Resource::new("iam.policy", "assume-role-policy").with_attribute(
         "action",
@@ -2156,7 +2215,7 @@ fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_s
     use crate::schema::{AttributeSchema, ResourceSchema, enum_identity};
 
     let schema = ResourceSchema::new("acm.Certificate").attribute(
-        AttributeSchema::new(
+        AttributeSchema::optional(
             "key_algorithm",
             AttributeType::enum_(
                 enum_identity("KeyAlgorithm", Some("aws.acm.Certificate")),
@@ -2166,10 +2225,14 @@ fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_s
                 None,
             ),
         )
-        .create_only(),
+        .create_only()
+        .build(),
     );
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", schema);
+    registry.insert(
+        "aws",
+        schema.validate().expect("schema fixture must be valid"),
+    );
 
     let mut desired = Resource::new("acm.Certificate", "cert").with_attribute(
         "key_algorithm",
@@ -2226,20 +2289,28 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     let principal = AttributeType::union(vec![
         AttributeType::struct_(
             "PrincipalStruct".to_string(),
-            vec![StructField::new(
-                "service",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
-                ]),
-            )],
+            vec![
+                StructField::optional(
+                    "service",
+                    AttributeType::union(vec![
+                        AttributeType::string(),
+                        AttributeType::list(AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            ],
         ),
         AttributeType::string(),
     ]);
-    let schema =
-        ResourceSchema::new("iam.policy").attribute(AttributeSchema::new("principal", principal));
+    let schema = ResourceSchema::new("iam.policy")
+        .attribute(AttributeSchema::optional("principal", principal).build());
     let mut registry = crate::schema::SchemaRegistry::new();
-    registry.insert("aws", schema.clone());
+    registry.insert(
+        "aws",
+        (schema.clone())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     // Desired: user's bare scalar inside the Struct member.
     let mut desired_inner = IndexMap::new();
@@ -2302,20 +2373,26 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     let statement = AttributeType::struct_(
         "Statement".to_string(),
         vec![
-            StructField::new("effect", AttributeType::string()),
-            StructField::new(
+            StructField::optional("effect", AttributeType::string()).build(),
+            StructField::optional(
                 "action",
                 AttributeType::union(vec![
                     AttributeType::string(),
                     AttributeType::list(AttributeType::string()),
                 ]),
-            ),
+            )
+            .build(),
         ],
     );
-    let schema =
-        ResourceSchema::new("iam.policy").attribute(AttributeSchema::new("statement", statement));
+    let schema = ResourceSchema::new("iam.policy")
+        .attribute(AttributeSchema::optional("statement", statement).build());
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", schema.clone());
+    registry.insert(
+        "aws",
+        (schema.clone())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let mut desired_statement = IndexMap::new();
     desired_statement.insert(
@@ -2394,22 +2471,29 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     let config = AttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::new("enabled", AttributeType::bool()),
-            StructField::new(
+            StructField::optional("enabled", AttributeType::bool()).build(),
+            StructField::optional(
                 "password",
                 AttributeType::union(vec![
                     AttributeType::string(),
                     AttributeType::list(AttributeType::string()),
                 ]),
-            ),
+            )
+            .build(),
         ],
     );
     let mut schema = ResourceSchema::new("service.Widget");
-    schema
-        .attributes
-        .insert("config".to_string(), AttributeSchema::new("config", config));
+    schema.attributes.insert(
+        "config".to_string(),
+        AttributeSchema::optional("config", config).build(),
+    );
     let mut registry = SchemaRegistry::new();
-    registry.insert("test", schema.clone());
+    registry.insert(
+        "test",
+        (schema.clone())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_config = IndexMap::from([(
         "enabled".to_string(),
@@ -2515,51 +2599,61 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let default_cache_behavior = AttributeType::struct_(
         "DefaultCacheBehavior".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "allowed_methods",
                 AttributeType::unordered_list(method_enum(
                     "AllowedMethods",
                     &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
                 )),
             )
-            .with_provider_name("AllowedMethods"),
-            StructField::new(
+            .with_provider_name("AllowedMethods")
+            .build(),
+            StructField::optional(
                 "cached_methods",
                 AttributeType::unordered_list(method_enum(
                     "CachedMethods",
                     &["GET", "HEAD", "OPTIONS"],
                 )),
             )
-            .with_provider_name("CachedMethods"),
+            .with_provider_name("CachedMethods")
+            .build(),
             // User-authored scalar fields, so the test also covers the
             // "authored field survives projection and compares equal"
             // path alongside the read-back-default stripping.
-            StructField::new("compress", AttributeType::bool()).with_provider_name("Compress"),
-            StructField::new("target_origin_id", AttributeType::string())
-                .with_provider_name("TargetOriginId"),
-            StructField::new(
+            StructField::optional("compress", AttributeType::bool())
+                .with_provider_name("Compress")
+                .build(),
+            StructField::optional("target_origin_id", AttributeType::string())
+                .with_provider_name("TargetOriginId")
+                .build(),
+            StructField::optional(
                 "viewer_protocol_policy",
                 method_enum(
                     "ViewerProtocolPolicy",
                     &["allow-all", "https-only", "redirect-to-https"],
                 ),
             )
-            .with_provider_name("ViewerProtocolPolicy"),
+            .with_provider_name("ViewerProtocolPolicy")
+            .build(),
         ],
     );
     let distribution_config = AttributeType::struct_(
         "DistributionConfig".to_string(),
         vec![
-            StructField::new("default_cache_behavior", default_cache_behavior)
-                .with_provider_name("DefaultCacheBehavior"),
+            StructField::optional("default_cache_behavior", default_cache_behavior)
+                .with_provider_name("DefaultCacheBehavior")
+                .build(),
         ],
     );
-    let schema = ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
-        "distribution_config",
-        distribution_config,
-    ));
+    let schema = ResourceSchema::new("cloudfront.Distribution")
+        .attribute(AttributeSchema::optional("distribution_config", distribution_config).build());
     let mut registry = crate::schema::SchemaRegistry::new();
-    registry.insert("awscc", schema.clone());
+    registry.insert(
+        "awscc",
+        (schema.clone())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired_method = |type_name: &str, alias: &str| {
         Value::Concrete(ConcreteValue::enum_identifier(format!(
@@ -2769,29 +2863,34 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     let default_cache_behavior = AttributeType::struct_(
         "DefaultCacheBehavior".to_string(),
         vec![
-            StructField::new(
+            StructField::optional(
                 "allowed_methods",
                 AttributeType::list(method_enum(
                     "AllowedMethods",
                     &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
                 )),
             )
-            .with_provider_name("AllowedMethods"),
+            .with_provider_name("AllowedMethods")
+            .build(),
         ],
     );
     let distribution_config = AttributeType::struct_(
         "DistributionConfig".to_string(),
         vec![
-            StructField::new("default_cache_behavior", default_cache_behavior)
-                .with_provider_name("DefaultCacheBehavior"),
+            StructField::optional("default_cache_behavior", default_cache_behavior)
+                .with_provider_name("DefaultCacheBehavior")
+                .build(),
         ],
     );
-    let schema = ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
-        "distribution_config",
-        distribution_config,
-    ));
+    let schema = ResourceSchema::new("cloudfront.Distribution")
+        .attribute(AttributeSchema::optional("distribution_config", distribution_config).build());
     let mut registry = crate::schema::SchemaRegistry::new();
-    registry.insert("awscc", schema.clone());
+    registry.insert(
+        "awscc",
+        (schema.clone())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
 
     let desired = |alias: &str| {
         Value::Concrete(ConcreteValue::enum_identifier(format!(

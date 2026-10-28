@@ -772,8 +772,9 @@ impl DiagnosticEngine {
                 }
 
                 // Semantic validation using schema
-                let schema = resource_schema().cloned();
-                if let Some(schema) = &schema {
+                let validated_schema = resource_schema();
+                if let Some(validated_schema) = validated_schema {
+                    let schema = validated_schema.as_schema();
                     // Check data source without `read` keyword
                     if schema.is_data_source()
                         && !matches!(rref, ResourceRef::DataSource(_))
@@ -799,7 +800,8 @@ impl DiagnosticEngine {
                         ));
                     }
                 }
-                if let Some(schema) = schema {
+                if let Some(validated_schema) = validated_schema {
+                    let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
 
@@ -887,10 +889,14 @@ impl DiagnosticEngine {
 
                         // Type validation
                         if let Some(attr_schema) = schema.attributes().get(canonical_name) {
+                            let effective_attribute = validated_schema
+                                .effective_attribute(canonical_name)
+                                .expect("validated schema attributes must have effective views");
+                            let effective_type = effective_attribute.value_type();
                             // The shared resource-level validator below owns read-only
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
-                            if attr_schema.is_read_only() {
+                            if effective_attribute.is_read_only() {
                                 continue;
                             }
 
@@ -901,7 +907,7 @@ impl DiagnosticEngine {
                             // bare-struct attribute is still caught (same
                             // bug class as carina#3349).
                             if matches!(
-                                schema.shape_of(attr_schema.attr_type()),
+                                effective_type.shape(),
                                 carina_core::schema::Shape::Struct { .. }
                             ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
                             {
@@ -927,11 +933,10 @@ impl DiagnosticEngine {
                             // the guarded match below so deferred values keep #2847's
                             // behavior and static values are validated only once.
                             if matches!(
-                                schema.shape_of(attr_schema.attr_type()),
+                                effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
                             ) && let Some(diag) = build_enum_diagnostic(
-                                &schema,
-                                attr_schema.attr_type(),
+                                &effective_attribute,
                                 attr_value,
                                 attr_name,
                                 resource_quoted_string_attrs.contains(attr_name),
@@ -948,7 +953,7 @@ impl DiagnosticEngine {
                             // wildcard arm cannot silently drop a Ref-typed
                             // attribute (carina#3349 invariant lifted into
                             // the type system).
-                            let attr_shape = schema.shape_of(attr_schema.attr_type());
+                            let attr_shape = effective_type.shape();
                             let type_error = match (attr_shape, typecheck_value) {
                                 // Bool type should not receive String
                                 (
@@ -979,9 +984,7 @@ impl DiagnosticEngine {
                                 // for computed Access values. Callers do not
                                 // classify binding kinds independently.
                                 (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
-                                    let schema_view =
-                                        schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view
+                                    effective_attribute
                                         .validate(value)
                                         .err()
                                         .map(|error| error.with_attribute(attr_name).to_string())
@@ -1043,9 +1046,7 @@ impl DiagnosticEngine {
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
                                 (carina_core::schema::Shape::Enum { .. }, value) => {
-                                    let schema_view =
-                                        schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view.validate(value).err().map(|e| {
+                                    effective_attribute.validate(value).err().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
                                             if resource_quoted_string_attrs.contains(attr_name) {
@@ -1097,8 +1098,8 @@ impl DiagnosticEngine {
                                         let lookup = carina_core::parser::provider_context_lookup(
                                             &self.provider_context,
                                         );
-                                        validate(value)
-                                            .err()
+                                        validate
+                                            .and_then(|validator| validator(value).err())
                                             .or_else(|| lookup(identity, value).err())
                                             .map(|inner_err| inner_err.to_string())
                                     }
@@ -1109,19 +1110,14 @@ impl DiagnosticEngine {
                                 // `List<Ref<Struct>>` correctly defers to
                                 // the struct-validation pass (carina#3349).
                                 (
-                                    carina_core::schema::Shape::List {
-                                        element_type: inner,
-                                        ..
-                                    },
+                                    carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
-                                    schema.shape_of(inner),
-                                    carina_core::schema::Shape::Struct { .. }
+                                    effective_type.list_element().map(|inner| inner.shape()),
+                                    Some(carina_core::schema::Shape::Struct { .. })
                                 ) =>
                                 {
-                                    let schema_view =
-                                        schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view
+                                    effective_attribute
                                         .validate(attr_value)
                                         .err()
                                         .map(|e| e.with_attribute(attr_name).to_string())
@@ -1130,14 +1126,10 @@ impl DiagnosticEngine {
                                 (
                                     carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) => {
-                                    let schema_view =
-                                        schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view
-                                        .validate(attr_value)
-                                        .err()
-                                        .map(|e| e.with_attribute(attr_name).to_string())
-                                }
+                                ) => effective_attribute
+                                    .validate(attr_value)
+                                    .err()
+                                    .map(|e| e.with_attribute(attr_name).to_string()),
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
                                 // Ref-shaped values are unresolved at this
                                 // checkpoint and must not be type-checked
@@ -1151,9 +1143,7 @@ impl DiagnosticEngine {
                                             | Value::Deferred(DeferredValue::Coalesce { .. })
                                     ) =>
                                 {
-                                    let schema_view =
-                                        schema.schema_view_for(attr_schema.attr_type().clone());
-                                    schema_view.validate(value).err().and_then(|error| {
+                                    effective_attribute.validate(value).err().and_then(|error| {
                                         let tagged = error.with_attribute(attr_name);
                                         if let Some(diagnostic) = build_enum_diagnostic_from_error(
                                             &tagged,
@@ -1201,25 +1191,24 @@ impl DiagnosticEngine {
                             // struct-field validation. Same bug class as
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
-                            let is_struct_shape = match schema.shape_of(attr_schema.attr_type()) {
+                            let is_struct_shape = match effective_type.shape() {
                                 carina_core::schema::Shape::Struct { .. } => true,
-                                carina_core::schema::Shape::List {
-                                    element_type: inner,
-                                    ..
-                                } => matches!(
-                                    schema.shape_of(inner),
-                                    carina_core::schema::Shape::Struct { .. }
-                                ),
+                                carina_core::schema::Shape::List { .. } => {
+                                    effective_type.list_element().is_some_and(|inner| {
+                                        matches!(
+                                            inner.shape(),
+                                            carina_core::schema::Shape::Struct { .. }
+                                        )
+                                    })
+                                }
                                 _ => false,
                             };
                             if is_struct_shape {
-                                let schema_view =
-                                    schema.schema_view_for(attr_schema.attr_type().clone());
                                 diagnostics.extend(self.validate_struct_value(
                                     doc,
                                     attr_name,
                                     attr_value,
-                                    &schema_view,
+                                    &effective_type,
                                 ));
                             }
                         }
@@ -1241,7 +1230,7 @@ impl DiagnosticEngine {
                         carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
                         |attr: &str| resource_quoted_string_attrs.contains(attr);
-                    if let Err(errors) = schema.validate_with_origins_and_lookup(
+                    if let Err(errors) = validated_schema.validate_with_origins_and_lookup(
                         &resolved_attrs,
                         &is_string_literal,
                         &lookup,
@@ -1328,7 +1317,7 @@ impl DiagnosticEngine {
                     diagnostics.extend(self.check_list_struct_syntax(
                         doc,
                         &resolved_attrs,
-                        &schema,
+                        validated_schema,
                     ));
                 }
             }
@@ -1847,17 +1836,13 @@ fn strip_line_comment(line: &str) -> &str {
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
 fn build_enum_diagnostic(
-    resource_schema: &carina_core::schema::ResourceSchema,
-    attr_type: &carina_core::schema::AttributeType,
+    effective_attribute: &carina_core::schema::EffectiveAttribute<'_>,
     attr_value: &Value,
     attr_name: &str,
     is_quoted_literal: bool,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
-    let err = resource_schema
-        .schema_view_for(attr_type.clone())
-        .validate(attr_value)
-        .err()?;
+    let err = effective_attribute.validate(attr_value).err()?;
     let tagged = err.with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).

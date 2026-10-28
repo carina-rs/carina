@@ -28,8 +28,8 @@ impl ProviderFactory for AwsTestFactory {
         "AWS (carina#3798 validation stub)"
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
     }
 
     fn validate_config(
@@ -67,16 +67,26 @@ impl ProviderFactory for AwsTestFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![
-            vpc_schema(),
-            subnet_schema(),
-            security_group_schema(),
-            log_group_schema(),
-            hosted_zone_schema(),
-            domain_lookup_schema(),
-            nested_domain_consumer_schema(),
-        ]
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
+            vec![
+                vpc_schema(),
+                subnet_schema(),
+                security_group_schema(),
+                log_group_schema(),
+                hosted_zone_schema(),
+                domain_lookup_schema(),
+                nested_domain_consumer_schema(),
+            ]
+        };
+        schema_drafts
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("factory test schema must be valid")
+            })
+            .collect()
     }
 }
 
@@ -180,46 +190,53 @@ fn identity(path: &str, kind: &str) -> AttributeType {
 
 fn vpc_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")).read_only())
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("vpc_id", identity("ec2.Vpc", "Id")).build())
         .with_unique_name_attribute("name")
 }
 
 fn subnet_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.Subnet")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("subnet_id", identity("ec2.Subnet", "Id")).read_only())
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("subnet_id", identity("ec2.Subnet", "Id")).build(),
+        )
         .with_unique_name_attribute("name")
 }
 
 fn security_group_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")).required())
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("vpc_id", identity("ec2.Vpc", "Id")).build())
         .attribute(
-            AttributeSchema::new("group_id", identity("ec2.SecurityGroup", "Id")).read_only(),
+            AttributeSchema::provider_populated("group_id", identity("ec2.SecurityGroup", "Id"))
+                .build(),
         )
         .with_unique_name_attribute("name")
 }
 
 fn log_group_schema() -> ResourceSchema {
     ResourceSchema::new("logs.LogGroup")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("arn", identity("logs.LogGroup", "Arn")).read_only())
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("arn", identity("logs.LogGroup", "Arn")).build(),
+        )
         .with_unique_name_attribute("name")
 }
 
 fn hosted_zone_schema() -> ResourceSchema {
     let domain_name = AttributeType::refined_string(None, None, Some((None, Some(1024))), None);
     ResourceSchema::new("route53.HostedZone")
-        .attribute(AttributeSchema::new("name", domain_name).required())
+        .attribute(AttributeSchema::required("name", domain_name).build())
         .with_unique_name_attribute("name")
 }
 
 fn domain_lookup_schema() -> ResourceSchema {
     ResourceSchema::new("test.DomainLookup")
-        .attribute(AttributeSchema::new("query", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("domain_name", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::required("query", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("domain_name", AttributeType::string()).build(),
+        )
         .as_data_source()
 }
 
@@ -232,11 +249,11 @@ fn nested_domain_consumer_schema() -> ResourceSchema {
     );
     let endpoint = AttributeType::struct_(
         "Endpoint",
-        vec![StructField::new("domain_name", constrained_domain)],
+        vec![StructField::optional("domain_name", constrained_domain).build()],
     );
     ResourceSchema::new("test.NestedDomainConsumer")
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
-        .attribute(AttributeSchema::new("endpoint", endpoint).required())
+        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("endpoint", endpoint).build())
         .with_unique_name_attribute("name")
 }
 
