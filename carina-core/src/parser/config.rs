@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::provider::CanonicalCustomTypeValue;
+use crate::provider::{CanonicalCustomTypeValue, ProviderResult};
 use crate::schema::{AttributeType, SchemaRegistry, TypeIdentity};
 
 /// Signature for a custom type validator function.
@@ -16,11 +16,11 @@ pub type ValidatorFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Signature for a factory-based custom type validator.
 ///
 /// Takes `(identity, value)` and returns `Ok(())` if valid or unknown,
-/// or `Err(message)` if invalid. The identity is structured so the
+/// or a typed provider error if invalid. The identity is structured so the
 /// factory (e.g. a WASM provider) resolves the exact provider-scoped
 /// type instead of splitting a flat name string.
 pub type CustomTypeValidatorFn =
-    Box<dyn Fn(&TypeIdentity, &CanonicalCustomTypeValue) -> Result<(), String> + Send + Sync>;
+    Box<dyn Fn(&TypeIdentity, &CanonicalCustomTypeValue) -> ProviderResult<()> + Send + Sync>;
 
 /// Signature for a decryptor function.
 ///

@@ -35,7 +35,7 @@ impl ProviderFactory for AwsTestFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -43,7 +43,7 @@ impl ProviderFactory for AwsTestFactory {
         &self,
         _type_name: &TypeIdentity,
         _value: &carina_core::provider::CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 

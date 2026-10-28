@@ -6,7 +6,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -15,9 +15,42 @@ use crate::position;
 use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
 };
-use carina_core::provider::ProviderFactory;
+use carina_core::provider::{
+    HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
+};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{SchemaRegistry, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+#[derive(Default)]
+pub(super) struct ProviderValidationDeduplicator {
+    suspended_inputs: Mutex<HashSet<(String, SuspendedValidationId)>>,
+}
+
+impl ProviderValidationDeduplicator {
+    fn should_emit(&self, provider: &str, error: &ProviderError) -> bool {
+        let Some(HostErrorCause::ValidationSuspended(input_id)) = error.detail().host_cause()
+        else {
+            return true;
+        };
+        self.suspended_inputs
+            .lock()
+            .expect("provider validation diagnostic lock must not be poisoned")
+            .insert((provider.to_string(), input_id))
+    }
+
+    fn should_emit_type_error(&self, error: &TypeError) -> bool {
+        let Some(HostErrorCause::ValidationSuspended(input_id)) = error.host_cause() else {
+            return true;
+        };
+        self.suspended_inputs
+            .lock()
+            .expect("provider validation diagnostic lock must not be poisoned")
+            .insert((
+                error.provider_name().unwrap_or("<unknown>").to_string(),
+                input_id,
+            ))
+    }
+}
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -133,7 +166,15 @@ impl DiagnosticEngine {
                 move |identity: &carina_core::schema::TypeIdentity,
                       value: &carina_core::provider::CanonicalCustomTypeValue| {
                     for factory in factories_clone.iter() {
-                        factory.validate_custom_type(identity, value)?;
+                        factory
+                            .validate_custom_type(identity, value)
+                            .map_err(|error| {
+                                if error.detail().provider_name.is_some() {
+                                    error
+                                } else {
+                                    error.for_provider(factory.name())
+                                }
+                            })?;
                     }
                     Ok(())
                 },
@@ -168,6 +209,7 @@ impl DiagnosticEngine {
     /// are derived from it rather than inferred from buffer contents.
     pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let base_path = current_file_path.map(|path| {
             path.parent()
@@ -502,7 +544,11 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_arguments_in_root(doc, parsed, merged));
 
             // Check provider region
-            diagnostics.extend(self.check_provider_region(doc, parsed));
+            diagnostics.extend(self.check_provider_region(
+                doc,
+                parsed,
+                &provider_validation_deduplicator,
+            ));
 
             // Check for unloaded providers
             diagnostics.extend(self.check_unloaded_providers(doc, parsed));
@@ -804,6 +850,7 @@ impl DiagnosticEngine {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut provider_errors_reported_at_attribute_level = HashSet::new();
 
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_attr_value) {
@@ -1101,7 +1148,25 @@ impl DiagnosticEngine {
                                         validate
                                             .and_then(|validator| validator(value).err())
                                             .or_else(|| lookup(identity, value).err())
-                                            .map(|inner_err| inner_err.to_string())
+                                            .and_then(|inner_err| {
+                                                if !provider_validation_deduplicator
+                                                    .should_emit_type_error(&inner_err)
+                                                {
+                                                    return None;
+                                                }
+                                                let message = inner_err.to_string();
+                                                if matches!(
+                                                    inner_err,
+                                                    TypeError::ProviderValidationFailed { .. }
+                                                ) {
+                                                    provider_errors_reported_at_attribute_level
+                                                        .insert((
+                                                            canonical_name.to_string(),
+                                                            message.clone(),
+                                                        ));
+                                                }
+                                                Some(message)
+                                            })
                                     }
                                 }
                                 // Validate List item types (non-Struct items only;
@@ -1236,16 +1301,48 @@ impl DiagnosticEngine {
                         &lookup,
                     ) {
                         for error in errors {
-                            if let carina_core::schema::TypeError::ResourceValidationFailed {
+                            if !provider_validation_deduplicator.should_emit_type_error(&error) {
+                                continue;
+                            }
+                            if let TypeError::ProviderValidationFailed {
                                 attribute: Some(attribute),
                                 ..
                             } = &error
-                                && matches!(
+                                && provider_errors_reported_at_attribute_level
+                                    .contains(&(attribute.clone(), error.to_string()))
+                            {
+                                continue;
+                            }
+                            let deferred_attribute = match &error {
+                                TypeError::ProviderValidationFailed { attribute, .. }
+                                | TypeError::ResourceValidationFailed { attribute, .. } => {
+                                    attribute.as_deref()
+                                }
+                                TypeError::TypeMismatch { .. }
+                                | TypeError::InvalidEnumVariant { .. }
+                                | TypeError::PatternMismatch { .. }
+                                | TypeError::LengthOutOfRange { .. }
+                                | TypeError::StringLiteralExpectedEnum { .. }
+                                | TypeError::ValidationFailed { .. }
+                                | TypeError::MissingRequired { .. }
+                                | TypeError::ReadOnlyAttribute { .. }
+                                | TypeError::UnknownAttribute { .. }
+                                | TypeError::UnknownStructField { .. }
+                                | TypeError::UnionStructMismatch { .. }
+                                | TypeError::UnionAlternativesMismatch { .. }
+                                | TypeError::ListItemError { .. }
+                                | TypeError::MapKeyError { .. }
+                                | TypeError::MapValueError { .. }
+                                | TypeError::StructFieldError { .. }
+                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
+                            };
+                            if deferred_attribute.is_some_and(|attribute| {
+                                matches!(
                                     resource_attributes.get(attribute),
                                     Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
                                         | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
                                 )
-                            {
+                            }) {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
@@ -1273,14 +1370,31 @@ impl DiagnosticEngine {
                             }
                             // Try attribute-level position first, fall back to resource position
                             let position = match &error {
-                                carina_core::schema::TypeError::ResourceValidationFailed {
-                                    attribute: Some(attr),
-                                    ..
+                                TypeError::ProviderValidationFailed { attribute, .. }
+                                | TypeError::ResourceValidationFailed { attribute, .. } => {
+                                    attribute.as_deref().and_then(|attr| {
+                                        self.find_attribute_position(doc, attr, scope)
+                                    })
                                 }
-                                | carina_core::schema::TypeError::ReadOnlyAttribute {
-                                    name: attr,
-                                } => self.find_attribute_position(doc, attr, scope),
-                                _ => None,
+                                TypeError::ReadOnlyAttribute { name } => {
+                                    self.find_attribute_position(doc, name, scope)
+                                }
+                                TypeError::TypeMismatch { .. }
+                                | TypeError::InvalidEnumVariant { .. }
+                                | TypeError::PatternMismatch { .. }
+                                | TypeError::LengthOutOfRange { .. }
+                                | TypeError::StringLiteralExpectedEnum { .. }
+                                | TypeError::ValidationFailed { .. }
+                                | TypeError::MissingRequired { .. }
+                                | TypeError::UnknownAttribute { .. }
+                                | TypeError::UnknownStructField { .. }
+                                | TypeError::UnionStructMismatch { .. }
+                                | TypeError::UnionAlternativesMismatch { .. }
+                                | TypeError::ListItemError { .. }
+                                | TypeError::MapKeyError { .. }
+                                | TypeError::MapValueError { .. }
+                                | TypeError::StructFieldError { .. }
+                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
                             };
                             let position = position.or_else(|| {
                                 self.find_resource_type_position(

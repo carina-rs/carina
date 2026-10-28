@@ -19,7 +19,8 @@ pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::evaluate_pending_constraints;
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
-    CanonicalCustomTypeValue, CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest,
+    CanonicalCustomTypeValue, CreateRequest, ProviderError, ProviderFactory, ProviderNormalizer,
+    ProviderResult, UpdateRequest,
 };
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
@@ -392,9 +393,15 @@ impl From<crate::value::EnumCanonicalizationError> for ProviderPreparationError 
 /// This wrapper retains the provider-specific
 /// [`ProviderFactory::validate_config`] diagnostic as typed data.
 #[derive(Debug, Error)]
-#[error("{message}")]
+#[error("{error}")]
 pub struct ProviderConfigValidationError {
-    message: String,
+    error: crate::provider::ProviderError,
+}
+
+impl ProviderConfigValidationError {
+    pub fn provider_error(&self) -> &crate::provider::ProviderError {
+        &self.error
+    }
 }
 
 /// Failure while preparing configuration for provider construction.
@@ -421,6 +428,14 @@ impl ProviderConfigPreparationError {
         match self {
             Self::InvalidAttribute { attribute, .. } => Some(attribute),
             Self::ProviderValidation { .. } => None,
+        }
+    }
+
+    /// Typed provider failure when provider-specific validation was reached.
+    pub fn provider_error(&self) -> Option<&crate::provider::ProviderError> {
+        match self {
+            Self::InvalidAttribute { .. } => None,
+            Self::ProviderValidation { error, .. } => Some(error.provider_error()),
         }
     }
 }
@@ -474,15 +489,15 @@ pub fn validate_and_canonicalize_provider_config(
         attributes: serializable,
     };
 
-    factory.validate_config(&canonical).map_err(|message| {
-        let message = if canonical.values().any(crate::value::contains_secret) {
-            "configuration containing a secret failed validation".to_string()
+    factory.validate_config(&canonical).map_err(|error| {
+        let error = if canonical.values().any(crate::value::contains_secret) {
+            error.with_redacted_message("configuration containing a secret failed validation")
         } else {
-            message
+            error
         };
         ProviderConfigPreparationError::ProviderValidation {
             provider: provider_name.to_string(),
-            error: ProviderConfigValidationError { message },
+            error: ProviderConfigValidationError { error },
         }
     })?;
 
@@ -773,10 +788,11 @@ pub async fn prepare_update_request(
     ))
 }
 
-/// Build the schema lookup used for provider-defined custom value types.
+/// Build a custom-type lookup that retains typed provider failures for callers
+/// with retry or diagnostic policy.
 pub fn provider_custom_type_lookup(
     factories: &[Box<dyn ProviderFactory>],
-) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + '_ {
+) -> impl Fn(&TypeIdentity, &Value) -> ProviderResult<()> + Send + Sync + '_ {
     move |identity, value| {
         let canonical = match value {
             Value::Concrete(ConcreteValue::String(text)) => {
@@ -788,18 +804,22 @@ pub fn provider_custom_type_lookup(
                 CanonicalCustomTypeValue::from_canonical_enum(value)
             }
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                return Err(TypeError::ValidationFailed {
-                    message: format!(
-                        "unresolved enum identifier `{raw}` reached provider custom-type validation"
-                    ),
-                });
+                return Err(ProviderError::invalid_input(format!(
+                    "unresolved enum identifier `{raw}` reached provider custom-type validation"
+                )));
             }
             _ => return Ok(()),
         };
         for factory in factories {
             factory
                 .validate_custom_type(identity, &canonical)
-                .map_err(|message| TypeError::ValidationFailed { message })?;
+                .map_err(|error| {
+                    if error.detail().provider_name.is_some() {
+                        error
+                    } else {
+                        error.for_provider(factory.name())
+                    }
+                })?;
         }
         Ok(())
     }
@@ -812,7 +832,12 @@ fn validate_known_provider_values(
     quoted_string_attrs: &HashSet<String>,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), ProviderPreparationError> {
-    let lookup = provider_custom_type_lookup(factories);
+    let provider_lookup = provider_custom_type_lookup(factories);
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
+            message: error.to_string(),
+        })
+    };
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
     schema
         .validate_known_values_with_origins_and_lookup(attributes, &is_string_literal, &lookup)
@@ -830,7 +855,12 @@ fn validate_selected_provider_values(
     quoted_string_attrs: &HashSet<String>,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), ProviderPreparationError> {
-    let lookup = provider_custom_type_lookup(factories);
+    let provider_lookup = provider_custom_type_lookup(factories);
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
+            message: error.to_string(),
+        })
+    };
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
     schema
         .validate_selected_known_values_with_origins_and_lookup(
@@ -941,14 +971,16 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             attributes: &CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> crate::provider::ProviderResult<()> {
             match attributes.get("region") {
                 Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
                     if value.api_value() == "ap-northeast-1" =>
                 {
                     Ok(())
                 }
-                other => Err(format!("expected canonical region, got {other:?}")),
+                other => Err(ProviderError::invalid_input(format!(
+                    "expected canonical region, got {other:?}"
+                ))),
             }
         }
 
@@ -971,7 +1003,13 @@ mod provider_config_tests {
 
     struct ConfigFactory {
         validate_calls: AtomicUsize,
-        plugin_error: Option<&'static str>,
+        plugin_error: Option<ConfigFailure>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfigFailure {
+        Invalid(&'static str),
+        Timeout(&'static str),
     }
 
     impl ConfigFactory {
@@ -985,7 +1023,14 @@ mod provider_config_tests {
         fn failing(message: &'static str) -> Self {
             Self {
                 validate_calls: AtomicUsize::new(0),
-                plugin_error: Some(message),
+                plugin_error: Some(ConfigFailure::Invalid(message)),
+            }
+        }
+
+        fn timing_out(message: &'static str) -> Self {
+            Self {
+                validate_calls: AtomicUsize::new(0),
+                plugin_error: Some(ConfigFailure::Timeout(message)),
             }
         }
     }
@@ -1010,10 +1055,14 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> crate::provider::ProviderResult<()> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             match self.plugin_error {
-                Some(message) => Err(message.to_string()),
+                Some(ConfigFailure::Invalid(message)) => Err(ProviderError::invalid_input(message)),
+                Some(ConfigFailure::Timeout(message)) => Err(ProviderError::timeout(message)
+                    .with_host_cause(crate::provider::HostErrorCause::ValidationSuspended(
+                        crate::provider::SuspendedValidationId::from_keyed_fingerprint([0_u8; 32]),
+                    ))),
                 None => Ok(()),
             }
         }
@@ -1142,6 +1191,32 @@ mod provider_config_tests {
         assert!(message.contains("provider test"), "{message}");
         assert!(message.contains("secret"), "{message}");
         assert!(!message.contains(plaintext), "{message}");
+    }
+
+    #[test]
+    fn secret_error_redaction_preserves_provider_error_kind() {
+        let plaintext = "plaintext-timeout-must-not-leak";
+        let factory = ConfigFactory::timing_out(plaintext);
+        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String("good-secret".into())),
+        ))));
+        let resolved = resolved_configs(attributes);
+
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect_err("plugin config validation must fail preparation");
+        let provider_error = error
+            .provider_error()
+            .expect("provider validation errors retain their typed error");
+
+        assert_eq!(
+            provider_error.kind(),
+            crate::provider::ProviderErrorKind::Timeout
+        );
+        assert!(matches!(
+            provider_error.detail().host_cause(),
+            Some(crate::provider::HostErrorCause::ValidationSuspended(_))
+        ));
+        assert!(!error.to_string().contains(plaintext));
     }
 
     #[test]

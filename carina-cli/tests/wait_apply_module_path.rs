@@ -74,14 +74,14 @@ impl ProviderFactory for AwsStub {
     fn validate_config(
         &self,
         _a: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         _t: &carina_core::schema::TypeIdentity,
         _v: &carina_core::provider::CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn extract_region(&self, _a: &IndexMap<String, Value>) -> String {

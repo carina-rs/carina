@@ -74,6 +74,9 @@ pub struct ErrorDetail {
     /// Underlying terminal cause. Flattened to a string when the error crosses
     /// the WIT boundary.
     cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// Host-side policy marker. This is deliberately not transported over the
+    /// provider protocol because guests cannot originate host lifecycle state.
+    host_cause: Option<HostErrorCause>,
     /// Provider name (e.g. `"aws"`, `"awscc"`) attached when the error
     /// is raised at provider-init / `create_provider` boundary points
     /// where the name is known but no specific resource is in scope.
@@ -101,6 +104,48 @@ pub struct ErrorDetail {
     /// `x-ms-request-id`, …). Operators paste this into support
     /// tickets so the provider can look up server-side logs.
     pub request_id: Option<String>,
+}
+
+/// Host-only classification for errors produced by provider lifecycle policy.
+///
+/// Unlike [`ProviderErrorKind`], this marker never crosses the WIT boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HostErrorCause {
+    /// Repeated wall-clock timeouts suspended validation for one input.
+    ValidationSuspended(SuspendedValidationId),
+}
+
+/// Opaque identity of a validation input suspended by host timeout policy.
+///
+/// The identity is built only from a keyed, one-way fingerprint. Its bytes are
+/// intentionally private, have no accessor or serialization path, and are
+/// redacted from `Debug`; callers can only compare or hash it for deduplication.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SuspendedValidationId([u8; 32]);
+
+impl SuspendedValidationId {
+    /// Wrap a keyed validation-input fingerprint without exposing it again.
+    #[must_use]
+    pub const fn from_keyed_fingerprint(keyed_fingerprint: [u8; 32]) -> Self {
+        Self(keyed_fingerprint)
+    }
+}
+
+impl std::fmt::Debug for SuspendedValidationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SuspendedValidationId(<redacted>)")
+    }
+}
+
+/// Stable classification of a [`ProviderError`] for callers that need policy
+/// decisions without parsing diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderErrorKind {
+    InvalidInput,
+    ApiError,
+    NotFound,
+    Timeout,
+    Internal,
 }
 
 /// Structured error returned by every provider operation.
@@ -293,6 +338,17 @@ impl ProviderError {
         }
     }
 
+    /// Typed error classification for retry and diagnostic policy.
+    pub const fn kind(&self) -> ProviderErrorKind {
+        match self {
+            ProviderError::InvalidInput(_) => ProviderErrorKind::InvalidInput,
+            ProviderError::ApiError(_) => ProviderErrorKind::ApiError,
+            ProviderError::NotFound(_) => ProviderErrorKind::NotFound,
+            ProviderError::Timeout(_) => ProviderErrorKind::Timeout,
+            ProviderError::Internal(_) => ProviderErrorKind::Internal,
+        }
+    }
+
     /// User-supplied input is invalid.
     pub fn invalid_input(message: impl Into<String>) -> Self {
         ProviderError::InvalidInput(Box::new(ErrorDetail::new(message)))
@@ -367,7 +423,17 @@ impl ProviderError {
     /// wire format cannot carry `dyn Error`. The returned type is the exact
     /// protocol record consumed by guest SDK encoders.
     pub fn to_wire(&self) -> WireProviderError {
-        let detail = self.detail();
+        let ErrorDetail {
+            message,
+            resource_id,
+            cause,
+            host_cause: _,
+            provider_name,
+            operation,
+            status,
+            code,
+            request_id,
+        } = self.detail();
         let kind = match self {
             ProviderError::InvalidInput(_) => WireProviderErrorKind::InvalidInput,
             ProviderError::ApiError(_) => WireProviderErrorKind::ApiError,
@@ -377,16 +443,16 @@ impl ProviderError {
         };
         WireProviderError {
             kind,
-            message: detail.context().to_string(),
-            resource_id: detail.resource_id.as_deref().map(ResourceId::to_wire),
-            cause: detail
-                .cause()
+            message: message.clone(),
+            resource_id: resource_id.as_deref().map(ResourceId::to_wire),
+            cause: cause
+                .as_deref()
                 .map(|cause| ProviderCauseChain(cause).to_string()),
-            provider_name: detail.provider_name.clone(),
-            operation: detail.operation.clone(),
-            status: detail.status,
-            code: detail.code.clone(),
-            request_id: detail.request_id.clone(),
+            provider_name: provider_name.clone(),
+            operation: operation.clone(),
+            status: *status,
+            code: code.clone(),
+            request_id: request_id.clone(),
         }
     }
 
@@ -415,6 +481,9 @@ impl ProviderError {
             cause: cause.map(|cause| {
                 Box::new(FlattenedWireCause(cause)) as Box<dyn std::error::Error + Send + Sync>
             }),
+            // Host lifecycle markers are intentionally not part of the wire
+            // record and untrusted guest errors cannot acquire one on decode.
+            host_cause: None,
             provider_name,
             operation,
             status,
@@ -474,6 +543,19 @@ impl ProviderError {
         self.detail_mut().request_id = Some(request_id.into());
         self
     }
+
+    /// Attach a host-only lifecycle classification.
+    pub fn with_host_cause(mut self, cause: HostErrorCause) -> Self {
+        self.detail_mut().host_cause = Some(cause);
+        self
+    }
+
+    /// Replace only diagnostic text while preserving the error variant,
+    /// structured metadata, typed cause, and host lifecycle classification.
+    pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
+        self.detail_mut().message = message.into();
+        self
+    }
 }
 
 impl ErrorDetail {
@@ -504,6 +586,11 @@ impl ErrorDetail {
     /// Typed source error, when this detail was built by a cause-bearing path.
     pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
         self.cause.as_deref()
+    }
+
+    /// Host-side lifecycle classification, when the host attached one.
+    pub const fn host_cause(&self) -> Option<HostErrorCause> {
+        self.host_cause
     }
 
     /// Returns `true` when at least one of the cloud-API metadata
@@ -4405,11 +4492,12 @@ pub trait ProviderFactory: Send + Sync {
     /// }
     /// ```
     fn validate_config(&self, attributes: &CanonicalProviderConfigAttributes)
-    -> Result<(), String>;
+    -> ProviderResult<()>;
 
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
-    /// Returns `Err(message)` if the value is invalid for the given type.
+    /// Returns an invalid-input [`ProviderError`] if the value is invalid for
+    /// the given type.
     ///
     /// `identity` is the structured [`TypeIdentity`] of the type, so a
     /// provider resolves the exact provider-scoped type instead of
@@ -4430,7 +4518,7 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         _identity: &TypeIdentity,
         _value: &CanonicalCustomTypeValue,
-    ) -> Result<(), String> {
+    ) -> ProviderResult<()> {
         Ok(())
     }
 
@@ -6292,6 +6380,38 @@ mod tests {
     }
 
     #[test]
+    fn host_error_cause_is_not_transported_over_the_provider_protocol() {
+        let suspended_input = SuspendedValidationId::from_keyed_fingerprint([7_u8; 32]);
+        let error = ProviderError::timeout("suspended")
+            .with_host_cause(HostErrorCause::ValidationSuspended(suspended_input));
+        assert_eq!(
+            error.detail().host_cause(),
+            Some(HostErrorCause::ValidationSuspended(suspended_input))
+        );
+
+        let decoded = ProviderError::from_wire(error.to_wire());
+
+        assert_eq!(decoded.kind(), ProviderErrorKind::Timeout);
+        assert_eq!(decoded.to_string(), "suspended");
+        assert_eq!(decoded.detail().host_cause(), None);
+    }
+
+    #[test]
+    fn suspended_validation_id_is_comparable_hashable_and_debug_redacted() {
+        let first = SuspendedValidationId::from_keyed_fingerprint([1_u8; 32]);
+        let same = SuspendedValidationId::from_keyed_fingerprint([1_u8; 32]);
+        let second = SuspendedValidationId::from_keyed_fingerprint([2_u8; 32]);
+
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        let ids = std::collections::HashSet::from([first, same, second]);
+        assert_eq!(ids.len(), 2);
+
+        let debug = format!("{first:?}");
+        assert_eq!(debug, "SuspendedValidationId(<redacted>)");
+    }
+
+    #[test]
     fn provider_error_display_and_wire_include_external_cause_chain_once() {
         #[derive(Debug)]
         struct ServiceError {
@@ -7353,7 +7473,7 @@ mod tests {
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
-            ) -> Result<(), String> {
+            ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
@@ -7438,7 +7558,7 @@ mod tests {
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
-            ) -> Result<(), String> {
+            ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {

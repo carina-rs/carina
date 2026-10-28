@@ -50,7 +50,7 @@ impl ProviderFactory for RegionConfigFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
@@ -90,6 +90,270 @@ pub(super) fn test_engine_with_region_config_provider(name: &'static str) -> Dia
         vec![name.to_string()],
         Arc::new(factories),
     )
+}
+
+struct SuspendedValidationFactory;
+
+impl SuspendedValidationFactory {
+    const ERROR: &'static str = "provider validation is suspended after repeated wall-clock \
+        timeouts for this input in validate_custom_type; changing this value (or restarting with \
+        a new provider version) resumes validation";
+
+    fn suspended_input_id(discriminator: u8) -> carina_core::provider::SuspendedValidationId {
+        carina_core::provider::SuspendedValidationId::from_keyed_fingerprint([discriminator; 32])
+    }
+
+    fn custom_type_suspended_input_id(value: &str) -> carina_core::provider::SuspendedValidationId {
+        let discriminator = match value {
+            "same" | "suspended" => 2,
+            "suspended-a" => 3,
+            "suspended-b" => 4,
+            "suspended-custom-type" => 5,
+            _ => 6,
+        };
+        Self::suspended_input_id(discriminator)
+    }
+}
+
+impl ProviderFactory for SuspendedValidationFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+            "region".to_string(),
+            carina_core::schema::AttributeType::string(),
+        )]))
+        .expect("test provider config schema must be valid")
+    }
+
+    fn validate_config(
+        &self,
+        attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        if attributes.contains_key("region") {
+            Err(
+                carina_core::provider::ProviderError::timeout(Self::ERROR).with_host_cause(
+                    carina_core::provider::HostErrorCause::ValidationSuspended(
+                        Self::suspended_input_id(1),
+                    ),
+                ),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &carina_core::schema::TypeIdentity,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        if value.as_str() == "invalid-input" {
+            return Err(carina_core::provider::ProviderError::invalid_input(
+                "rejected custom-type value",
+            ));
+        }
+        if value.as_str() == "first-time-timeout" {
+            return Err(carina_core::provider::ProviderError::timeout(
+                "first custom-type timeout",
+            ));
+        }
+        let message = match value.as_str() {
+            "ordinary-a" => "ordinary timeout for input a",
+            "ordinary-b" => "ordinary timeout for input b",
+            _ => Self::ERROR,
+        };
+        let error = carina_core::provider::ProviderError::timeout(message);
+        if matches!(
+            value.as_str(),
+            "ordinary-a" | "ordinary-b" | "unmarked-lookalike"
+        ) {
+            Err(error)
+        } else {
+            Err(
+                error.with_host_cause(carina_core::provider::HostErrorCause::ValidationSuspended(
+                    Self::custom_type_suspended_input_id(value.as_str()),
+                )),
+            )
+        }
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!(
+            "SuspendedValidationFactory::create_provider is not used in diagnostics tests"
+        )
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::resource::Value;
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+        };
+
+        let probe = AttributeType::refined_string_with_validator(
+            TypeIdentity::new(Some("mock"), ["test", "resource"], "Probe"),
+            None,
+            None,
+            legacy_validator(|_value: &Value| Ok(())),
+            None,
+        );
+        vec![
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::optional("probe", probe).build())
+                .validate()
+                .expect("test resource schema must be valid"),
+        ]
+    }
+}
+
+pub(super) fn test_engine_with_suspended_validation_provider() -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(SuspendedValidationFactory)];
+    DiagnosticEngine::new(
+        Arc::new(provider_mod::collect_schemas(&factories)),
+        vec!["mock".to_string()],
+        Arc::new(factories),
+    )
+}
+
+struct EnumDeclaredCustomTypeFactory {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ProviderFactory for EnumDeclaredCustomTypeFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &carina_core::schema::TypeIdentity,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        self.seen.lock().unwrap().push(value.to_string());
+        if value.as_str() == "ENABLED" {
+            Ok(())
+        } else {
+            Err(carina_core::provider::ProviderError::invalid_input(
+                "expected canonical enum API spelling",
+            ))
+        }
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!(
+            "EnumDeclaredCustomTypeFactory::create_provider is not used in diagnostics tests"
+        )
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+        };
+
+        let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
+        let custom = AttributeType::refined_string_with_validator(
+            identity,
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        );
+        vec![
+            ResourceSchema::new("test.consumer")
+                .attribute(AttributeSchema::optional("mode", custom).build())
+                .validate()
+                .expect("test resource schema must be valid"),
+        ]
+    }
+}
+
+pub(super) fn test_engine_with_enum_declared_custom_type()
+-> (DiagnosticEngine, Arc<std::sync::Mutex<Vec<String>>>) {
+    use carina_core::schema::{AttributeType, TypeIdentity};
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumDeclaredCustomTypeFactory {
+        seen: Arc::clone(&seen),
+    })];
+    let schemas = Arc::new(provider_mod::collect_schemas(&factories));
+    let mut engine = DiagnosticEngine::new(
+        Arc::clone(&schemas),
+        vec!["mock".to_string()],
+        Arc::new(factories),
+    );
+    let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
+    engine.provider_context.custom_type_attribute_types.insert(
+        identity.clone(),
+        AttributeType::enum_(
+            identity,
+            Some(vec!["ENABLED".to_string()]),
+            vec![("ENABLED".to_string(), "enabled".to_string())],
+            None,
+            None,
+        ),
+    );
+    (engine, seen)
 }
 
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {

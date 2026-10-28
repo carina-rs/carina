@@ -781,7 +781,7 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-        ) -> Result<(), String> {
+        ) -> ProviderResult<()> {
             Ok(())
         }
 
