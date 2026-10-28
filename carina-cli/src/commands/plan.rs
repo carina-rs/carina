@@ -282,7 +282,7 @@ mod recorded_provider_artifact_tests {
 /// the contents through [`PlanFileContents::record`] so the referenced schemas
 /// and loaded provider artifacts are captured together.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_cli::commands::plan::PlanFile;
 ///
 /// fn rebuild(plan: PlanFile) -> PlanFile {
@@ -290,7 +290,7 @@ mod recorded_provider_artifact_tests {
 /// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_cli::commands::plan::PlanFileContents;
 ///
 /// fn serialize_unrecorded(contents: &PlanFileContents) {
@@ -308,11 +308,13 @@ pub struct PlanFileContents {
     /// Plan format 26 adds mandatory identities for every loaded provider
     /// artifact. Plan format 25 adds the mandatory typed `data_source_values`
     /// outcomes and removes duplicate data-source rows from `current_states`.
-    /// Plan format 23 adds the mandatory `schema_fingerprints` snapshot. Plan
-    /// format 21 explicitly tags managed and data-source current-state entries,
-    /// and explicitly tags each managed [`Current`] variant. A serialized
-    /// `Present` row is classified again through [`Current::from_state`] when
-    /// decoded, so the tag cannot mint an invalid provider identifier.
+    /// Plan format 24 removes the redundant wait target schema kind now that
+    /// waits are managed-only. Plan format 23 adds the mandatory
+    /// `schema_fingerprints` snapshot. Plan format 21 explicitly tags managed
+    /// and data-source current-state entries, and explicitly tags each managed
+    /// [`Current`] variant. A serialized `Present` row is classified again
+    /// through [`Current::from_state`] when decoded, so the tag cannot mint an
+    /// invalid provider identifier.
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
@@ -965,7 +967,8 @@ impl PlanFileContents {
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 26;
 
-    pub fn into_contents(self) -> PlanFileContents {
+    #[cfg(test)]
+    pub(crate) fn into_contents(self) -> PlanFileContents {
         self.contents
     }
 
@@ -2720,9 +2723,13 @@ fn build_plan_file<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4045: format 26 records the exact loaded provider artifacts,
-        // and carina#4060 makes recording artifacts and schema fingerprints a
-        // single consuming transition from PlanFileContents to PlanFile.
+        // carina#4045: bumped 25→26 — saved plans persist the exact loaded
+        // provider artifacts used to compute the plan. carina#4060 keeps the
+        // format at 26 because it only tightens validation.
+        // carina#3993: bumped 24→25 — saved plans persist every data-source
+        // outcome so apply never re-derives it from a partial graph.
+        // carina#3916: bumped 23→24 — saved plans remove the redundant wait
+        // target schema kind now that waits are managed-only.
         // carina#3983: bumped 22→23 — saved plans bind every referenced
         // managed/data-source type to the canonical provider schema used by
         // planning. Apply must verify this snapshot before provider I/O.

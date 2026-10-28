@@ -109,15 +109,7 @@ fn provider_config_for_evidence_test(name: &str) -> ProviderConfig {
     }
 }
 
-fn record_test_plan(mut contents: PlanFileContents, providers: &[&str]) -> PlanFile {
-    if contents.provider_configs.as_provider_configs().is_empty() {
-        contents.provider_configs = saved_provider_configs(
-            providers
-                .iter()
-                .map(|provider| provider_config_for_evidence_test(provider))
-                .collect(),
-        );
-    }
+fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile {
     let factories = providers
         .iter()
         .map(|provider| {
@@ -3204,7 +3196,9 @@ fn plan_file_serialization_redacts_secrets() {
             source_path: "example.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: saved_provider_configs(Vec::new()),
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "awscc",
+            )]),
             backend_config: None,
             plan: redact_secrets_in_plan(&plan).unwrap(),
             sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
@@ -3255,7 +3249,9 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             source_path: "main.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: saved_provider_configs(Vec::new()),
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: vec![Resource::pending_with_provider(
@@ -3295,7 +3291,9 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             source_path: "main.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: saved_provider_configs(Vec::new()),
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: vec![Resource::with_provider(
@@ -3364,7 +3362,9 @@ fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
             source_path: "main.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: saved_provider_configs(Vec::new()),
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
             backend_config: None,
             plan,
             sorted_resources: vec![managed_target.into_inner()],
@@ -3479,7 +3479,9 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             source_path: "main.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: saved_provider_configs(Vec::new()),
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
             backend_config: None,
             plan,
             sorted_resources: Vec::new(),
