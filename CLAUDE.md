@@ -492,20 +492,49 @@ A struct type represents a nested object with typed fields.
   outside `carina-core`).
 - Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
   `field_type` (recursive `AttributeType`), `input_mode: InputMode`,
-  `description`, `provider_name`, `block_name`, and `deferred_populate`.
-  `InputMode` is the shared optional/required/provider-populated axis used by
-  both `StructField` and `AttributeSchema`; required user input and
-  provider-populated output are mutually exclusive, and conflicting builder
-  calls panic instead of silently choosing the last one. Assigning a
+  `description`, `provider_name`, `block_name`, `deferred_populate`, and
+  `write_only`. `InputMode` is the shared optional/required/provider-populated
+  axis used by both `StructField` and `AttributeSchema`; required user input
+  and provider-populated output are mutually exclusive, and conflicting
+  builder calls panic instead of silently choosing the last one. Assigning a
   provider-populated nested field is rejected the same as a top-level
   read-only attribute (carina#3772).
+- **Schema types are builder-only.** `StructField`, `AttributeSchema`, and
+  `ResourceSchema` keep their fields `pub(crate)` (carina#3984 / PR #3999).
+  Code outside `carina-core` builds them only through the builders
+  (`StructField::new(..).write_only()`, `AttributeSchema::new(..)`,
+  `ResourceSchema::new(..).attribute(..)`), so a field set can't be mutated
+  after construction into a state the builders reject. To destructure
+  exhaustively (provider conversions, the WASM seam), use the read-only views
+  `parts()` → `StructFieldParts` / `AttributeSchemaParts` /
+  `ResourceSchemaParts`. Their fields are all `pub` and they are not
+  `#[non_exhaustive]`, so adding a field still breaks every destructuring
+  site until it is carried across. Don't add `pub` back to the schema
+  structs' fields to "make a conversion easier".
+- **Write-only, top-level and nested.** `write_only` marks a value that is
+  sent on create/update but never returned by reads (CloudFormation
+  `writeOnlyProperties`). It is set by `.write_only()` on `AttributeSchema`
+  or on a nested `StructField`. Combining write-only with provider-populated
+  panics in the builder. Whether a top-level attribute contains a nested
+  write-only field is **derived** from the type
+  (`ResourceSchema::write_only_bearing`), never stored, so the flag can't
+  disagree with the type. `first_write_only_conflict` rejects shapes that
+  can't carry nested write-only provenance (for example, write-only inside a
+  union). On Update, every updatable desired attribute that is write-only or
+  write-only-bearing is re-sent as `PatchOp::Reassert` alongside a real
+  change (carina#3981, carina#3984). Write-only values alone never trigger
+  an Update. Accepted nested write-only leaves are recorded in state (state
+  v18; secrets as hashes) so plans converge.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
   by `carina-plugin-host/src/wasm_convert.rs`. The `ResourceSchema`,
   `AttributeSchema`, and `StructField` conversions destructure protocol
   records exhaustively (`OperationConfig` needs no conversion: carina-core
   re-exports the protocol type, carina#3907), and `AttributeType` conversion
-  patterns name every variant field. Adding a protocol field must break
+  patterns name every variant field. The nested `write_only` flag is a
+  required field in the schema JSON (no `#[serde(default)]`), and the protocol
+  minimum is v12, so a host and provider that disagree about it fail at load
+  instead of silently dropping nested write-only members. Adding a protocol field must break
   compilation until it is consciously carried across or explicitly bound and
   documented as unavailable on the destination side. Never use a catch-all
   `_` or `..` at this seam; a silently dropped field is invisible in production
