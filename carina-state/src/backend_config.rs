@@ -467,9 +467,12 @@ mod tests {
     use super::*;
 
     fn resolve(source: &str) -> Result<BackendConfig, BackendConfigError> {
-        let parsed =
-            carina_core::parser::parse(source, &carina_core::parser::ProviderContext::default())
-                .expect("backend fixture must parse");
+        let parsed = carina_core::parser::parse_file(
+            source,
+            std::path::Path::new("backend.crn"),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("backend fixture must parse");
         BackendConfig::try_from(parsed.backend.as_ref().expect("backend fixture"))
     }
 
@@ -727,7 +730,9 @@ mod tests {
         );
 
         let context = carina_core::parser::ProviderContext::default();
-        let mut parsed = carina_core::parser::parse(&source, &context).unwrap();
+        let mut parsed =
+            carina_core::parser::parse_file(&source, std::path::Path::new("backend.crn"), &context)
+                .unwrap();
         carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         unsafe {

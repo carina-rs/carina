@@ -133,6 +133,13 @@ fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
     assert!(inputs.parsed.get().is_none());
 }
 
+fn parse(
+    input: &str,
+    config: &carina_core::parser::ProviderContext,
+) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
+    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+}
+
 macro_rules! unexpected_resume_create {
     () => {
         fn resume_create(
@@ -567,8 +574,10 @@ async fn unverified_official_factory_load_is_fatal_before_loader() {
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "aws".into(),
         source: source.into(),
-        kind: carina_provider_resolver::LockEntryKind::Version {
-            version: version.into(),
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            version: version.parse().unwrap(),
+            tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
+            asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
         sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
@@ -1812,7 +1821,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
 
 #[tokio::test]
 async fn plan_deletes_managed_orphan_and_reads_same_id_data_source() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::ResourceState;
 
     let parsed = parse(
@@ -2461,7 +2470,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
 #[test]
 fn same_type_moved_block_parses_and_materializes_state() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -2527,7 +2536,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
 #[test]
 fn moved_in_flight_rebinds_resume_to_destination() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_core::provider::Sent;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -2610,7 +2619,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
 #[test]
 fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     let parsed = parse(
@@ -3302,7 +3311,7 @@ fn assert_collision_contains(result: Result<(), AppError>, needle: &str) {
 
 #[tokio::test]
 async fn test_plan_fails_on_moved_from_colliding_with_desired() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
 
     let source = r#"
 let live = awscc.s3.Bucket {
@@ -3359,7 +3368,7 @@ moved {
 
 #[tokio::test]
 async fn test_plan_fails_on_removed_from_colliding_with_expanded_loop_child() {
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     let source = r#"
@@ -4142,7 +4151,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
 async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_identity_reconcile() {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     fn string(value: &str) -> Value {
@@ -4361,7 +4370,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 #[tokio::test]
 async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
     use carina_core::effect::Effect;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
 
     // This plan-level fixture pins moved materialization and Move-effect
@@ -5710,16 +5719,17 @@ fn validate_rejects_empty_interpolation_nested_in_list() {
 
 #[test]
 fn validate_rejects_empty_interpolation_in_export_value() {
-    use carina_core::parser::ParsedExportParam;
     use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let parsed = ParsedFile {
-        export_params: vec![ParsedExportParam::new("url".to_string(), None, Some(bad))],
-        ..ParsedFile::default()
-    };
+    let mut parsed = parse(
+        "exports { url = 'placeholder' }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("authored export fixture must parse");
+    parsed.export_params[0].value = Some(bad);
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -5741,20 +5751,17 @@ fn validate_rejects_empty_interpolation_in_export_value() {
 
 #[test]
 fn validate_rejects_empty_interpolation_in_attribute_param_default() {
-    use carina_core::parser::AttributeParameter;
     use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let parsed = ParsedFile {
-        attribute_params: vec![AttributeParameter::new(
-            "region".to_string(),
-            None,
-            Some(bad),
-        )],
-        ..ParsedFile::default()
-    };
+    let mut parsed = parse(
+        "attributes { region = 'placeholder' }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("authored attribute fixture must parse");
+    parsed.attribute_params[0].value = Some(bad);
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -6174,7 +6181,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
 mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;
-    use carina_core::parser::{ProviderContext, WarningKind, parse};
+    use carina_core::parser::{ProviderContext, WarningKind};
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::{HashMap, HashSet};
 
@@ -7713,8 +7720,10 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
         source: source.into(),
-        kind: carina_provider_resolver::LockEntryKind::Version {
-            version: "1.0.0".into(),
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            version: "1.0.0".parse().unwrap(),
+            tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
+            asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
         sha256: "fixture".into(),
@@ -7852,8 +7861,10 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
         source: source.into(),
-        kind: carina_provider_resolver::LockEntryKind::Version {
-            version: "1.0.0".into(),
+        kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            version: "1.0.0".parse().unwrap(),
+            tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
+            asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
         sha256: "fixture".into(),
@@ -7892,7 +7903,7 @@ mod resolved_value_constraint_gate {
 
     use carina_core::binding_index::PreApplyInputs;
     use carina_core::effect::PlanOp;
-    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
+    use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
         AppliedIdentifier, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
@@ -7900,8 +7911,8 @@ mod resolved_value_constraint_gate {
         ready_noop,
     };
     use carina_core::resource::{
-        AccessPath, Composition, CompositionArgument, DataSource, InterpolationPart,
-        ModuleConstraintId, PendingModuleConstraint, Signature, UnknownReason,
+        AccessPath, Composition, DataSource, InterpolationPart, ModuleConstraintId,
+        PendingModuleConstraint, Signature, UnknownReason,
     };
     use carina_core::schema::{TypeError, TypeIdentity};
 
@@ -8240,7 +8251,7 @@ mod resolved_value_constraint_gate {
                     .map(|(name, value)| {
                         (
                             name.to_string(),
-                            CompositionArgument::from_value(value, TypeExpr::String),
+                            serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap(),
                         )
                     })
                     .collect(),

@@ -48,7 +48,7 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
             && let Ok(content) = fs::read_to_string(&path)
         {
             let ctx = ProviderContext::default();
-            if let Ok(parsed) = parser::parse(&content, &ctx)
+            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx)
                 && !parsed.providers.is_empty()
             {
                 let source_dir = path.parent().unwrap_or(dir).to_path_buf();
@@ -94,7 +94,7 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet
             && let Ok(content) = fs::read_to_string(&path)
         {
             let ctx = ProviderContext::default();
-            if let Ok(parsed) = parser::parse(&content, &ctx) {
+            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx) {
                 let caller_dir = path.parent().unwrap_or(dir);
                 for import in &parsed.uses {
                     let module_path = caller_dir.join(&import.path);

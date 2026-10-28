@@ -173,18 +173,24 @@ impl CompositionAttribute {
     }
 }
 
-/// One resolved module-call argument together with its declared boundary type.
+/// One resolved module-call argument together with its live boundary metadata.
 ///
-/// The declaration is validation-only and deliberately travels with every
-/// value rewrite. Keeping both fields private means callers cannot insert a
-/// raw [`Value`] into [`Signature::arguments`]; every live construction site
-/// must supply the declared type. The optional storage only keeps saved-plan
-/// deserialization backward-compatible: skipped validation metadata
-/// deserializes as `None`, while [`Self::from_value`] always stores `Some`.
+/// The declaration and resolver origin are validation-only and deliberately
+/// travel together through every value rewrite. Keeping the fields private
+/// means callers cannot insert a raw [`Value`] into [`Signature::arguments`];
+/// every live construction site must supply both pieces of metadata. Saved
+/// plans keep the historical value-only shape and deserialize into the
+/// explicitly metadata-free state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompositionArgument {
     operand: StructuralOperand,
-    declared_type: Option<TypeExpr>,
+    live_metadata: Option<CompositionArgumentMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CompositionArgumentMetadata {
+    declared_type: TypeExpr,
+    origin: crate::parser::ArgumentOrigin,
 }
 
 impl CompositionArgument {
@@ -195,15 +201,22 @@ impl CompositionArgument {
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
         let Self {
             operand,
-            declared_type: _declared_type,
+            live_metadata: _live_metadata,
         } = self;
         crate::value::contains_redacted_secret(operand.traversal_value())
     }
 
-    pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
+    pub fn from_value(
+        value: Value,
+        declared_type: TypeExpr,
+        origin: crate::parser::ArgumentOrigin,
+    ) -> Self {
         Self {
             operand: StructuralOperand::from_value(value),
-            declared_type: Some(declared_type),
+            live_metadata: Some(CompositionArgumentMetadata {
+                declared_type,
+                origin,
+            }),
         }
     }
 
@@ -211,10 +224,14 @@ impl CompositionArgument {
         value: Value,
         declared_type: TypeExpr,
         handle: crate::eval_value::StructuralHandle,
+        origin: crate::parser::ArgumentOrigin,
     ) -> Self {
         Self {
             operand: StructuralOperand::from_handle_with_access_base(handle, value),
-            declared_type: Some(declared_type),
+            live_metadata: Some(CompositionArgumentMetadata {
+                declared_type,
+                origin,
+            }),
         }
     }
 
@@ -223,7 +240,15 @@ impl CompositionArgument {
     }
 
     pub fn declared_type(&self) -> Option<&TypeExpr> {
-        self.declared_type.as_ref()
+        self.live_metadata
+            .as_ref()
+            .map(|metadata| &metadata.declared_type)
+    }
+
+    pub(crate) fn validation_metadata(&self) -> Option<(&TypeExpr, crate::parser::ArgumentOrigin)> {
+        self.live_metadata
+            .as_ref()
+            .map(|metadata| (&metadata.declared_type, metadata.origin))
     }
 
     pub(crate) fn is_handle(&self) -> bool {
@@ -246,7 +271,18 @@ impl CompositionArgument {
         };
         Self {
             operand,
-            declared_type: self.declared_type.clone(),
+            live_metadata: self.live_metadata.clone(),
+        }
+    }
+
+    pub(crate) fn with_handle(
+        &self,
+        value: Value,
+        handle: crate::eval_value::StructuralHandle,
+    ) -> Self {
+        Self {
+            operand: StructuralOperand::from_handle_with_access_base(handle, value),
+            live_metadata: self.live_metadata.clone(),
         }
     }
 }
@@ -264,7 +300,7 @@ impl<'de> Deserialize<'de> for CompositionArgument {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self {
             operand: StructuralOperand::from_value(Value::deserialize(deserializer)?),
-            declared_type: None,
+            live_metadata: None,
         })
     }
 }
@@ -738,6 +774,7 @@ mod tests {
                 path: AccessPath::new("vpc", "vpc_id"),
             }),
             declared.clone(),
+            crate::parser::ArgumentOrigin::Defaulted,
         );
 
         let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
@@ -750,7 +787,11 @@ mod tests {
         let value = Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("vpc", "vpc_id"),
         });
-        let typed = CompositionArgument::from_value(value.clone(), TypeExpr::String);
+        let typed = CompositionArgument::from_value(
+            value.clone(),
+            TypeExpr::String,
+            crate::parser::ArgumentOrigin::Defaulted,
+        );
 
         let typed_json = serde_json::to_value(&typed).expect("serialize typed argument");
         let value_json = serde_json::to_value(&value).expect("serialize argument value");
@@ -786,6 +827,7 @@ mod tests {
                             ConcreteValue::String("plaintext-secret".into()),
                         )))),
                         TypeExpr::String,
+                        crate::parser::ArgumentOrigin::Defaulted,
                     ),
                 )]),
                 attributes: IndexMap::new(),

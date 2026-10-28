@@ -4,10 +4,11 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{BackendConfig, UpstreamState};
+use crate::parser::ast::{BackendConfig, SourceSpan, UpstreamState};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;
+use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::util::unwrap_to_primary;
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 pub(in crate::parser) fn parse_backend_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<BackendConfig, ParseError> {
     let mut inner = pair.into_inner();
     let backend_type = next_pair(&mut inner, "backend type", "backend block")?
@@ -27,25 +29,13 @@ pub(in crate::parser) fn parse_backend_block(
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
-            let key_span = key_pair.as_span();
-            let (start_line, start_column) = key_span.start_pos().line_col();
-            let (end_line, end_column) = key_span.end_pos().line_col();
+            let key_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
             let key = key_pair.as_str().to_string();
             let value = parse_expression(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
             )?;
-            attribute_spans.insert(
-                key.clone(),
-                crate::parser::ModuleCallSourceSpan {
-                    start_byte: key_span.start(),
-                    end_byte: key_span.end(),
-                    start_line,
-                    start_column,
-                    end_line,
-                    end_column,
-                },
-            );
+            attribute_spans.insert(key.clone(), key_span);
             attributes.insert(key, value);
         }
     }

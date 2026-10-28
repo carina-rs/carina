@@ -19,10 +19,9 @@ fn backend_directory_diagnostics_with_sibling(
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), sibling_source).unwrap();
     std::fs::write(fixture.path().join("backend.crn"), backend_source).unwrap();
-    test_engine().analyze_with_filename(
+    test_engine().analyze(
         &create_document(backend_source),
-        Some("backend.crn"),
-        Some(fixture.path()),
+        Some(&(fixture.path()).join("backend.crn")),
     )
 }
 
@@ -503,10 +502,9 @@ let orphan = mock.test.resource {
             std::fs::write(fixture.path().join("functions.crn"), function_source).unwrap();
         }
 
-        let diagnostics = engine.analyze_with_filename(
+        let diagnostics = engine.analyze(
             &create_document(&main),
-            Some("main.crn"),
-            Some(fixture.path()),
+            Some(&(fixture.path()).join("main.crn")),
         );
         let lsp_unused = unused_binding_names(&diagnostics);
         let loaded = carina_core::config_loader::load_configuration_with_config(
@@ -594,10 +592,9 @@ let orphan = mock.test.resource {
         "malformed directory fixture unexpectedly parsed",
     );
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(main),
-        Some("main.crn"),
-        Some(fixture.path()),
+        Some(&(fixture.path()).join("main.crn")),
     );
     let unused = unused_binding_names(&diagnostics);
 
@@ -628,13 +625,14 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
     std::fs::write(temp.path().join("alpha.crn"), alpha).unwrap();
     std::fs::write(temp.path().join("beta.crn"), beta).unwrap();
 
-    let alpha_diagnostics = engine.analyze_with_filename(
+    let alpha_diagnostics = engine.analyze(
         &create_document(alpha),
-        Some("alpha.crn"),
-        Some(temp.path()),
+        Some(&(temp.path()).join("alpha.crn")),
     );
-    let beta_diagnostics =
-        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(temp.path()));
+    let beta_diagnostics = engine.analyze(
+        &create_document(beta),
+        Some(&(temp.path()).join("beta.crn")),
+    );
 
     assert!(
         unused_binding_names(&alpha_diagnostics).is_empty(),
@@ -669,10 +667,9 @@ import {
     std::fs::write(temp.path().join("resources.crn"), resource).unwrap();
     std::fs::write(temp.path().join("state.crn"), state_block).unwrap();
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(resource),
-        Some("resources.crn"),
-        Some(temp.path()),
+        Some(&(temp.path()).join("resources.crn")),
     );
 
     assert!(
@@ -740,9 +737,8 @@ fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored()
     std::fs::write(base.join("beta.crn"), beta).unwrap();
 
     let alpha_diagnostics =
-        engine.analyze_with_filename(&create_document(alpha), Some("alpha.crn"), Some(base));
-    let beta_diagnostics =
-        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(base));
+        engine.analyze(&create_document(alpha), Some(&(base).join("alpha.crn")));
+    let beta_diagnostics = engine.analyze(&create_document(beta), Some(&(base).join("beta.crn")));
 
     for (diagnostics, expected_line) in [(&alpha_diagnostics, 0), (&beta_diagnostics, 1)] {
         let matching = diagnostics
@@ -773,10 +769,9 @@ fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaratio
     let source = "mock.test.resource {\n  name = \"alpha\"\n}\n\nmock.test.resource {\n  name = \"beta\"\n}\n";
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(source),
-        Some("main.crn"),
-        Some(temp.path()),
+        Some(&(temp.path()).join("main.crn")),
     );
     let matching = diagnostics
         .iter()
@@ -820,10 +815,9 @@ mock.test.resource {
 "#;
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(source),
-        Some("main.crn"),
-        Some(temp.path()),
+        Some(&(temp.path()).join("main.crn")),
     );
     let matching = diagnostics
         .iter()
@@ -865,10 +859,9 @@ mock.test.resource {
 "#;
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(source),
-        Some("main.crn"),
-        Some(temp.path()),
+        Some(&(temp.path()).join("main.crn")),
     );
     let matching = diagnostics
         .iter()
@@ -1514,10 +1507,9 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
     std::fs::write(fixture.path().join("providers.crn"), "provider test {}\n")
         .expect("write providers.crn");
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(main),
-        Some("main.crn"),
-        Some(fixture.path()),
+        Some(&(fixture.path()).join("main.crn")),
     );
     let matching = diagnostics
         .iter()
@@ -2137,7 +2129,7 @@ fn provider_in_module_with_sibling_arguments_emits_error() {
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
     let doc = create_document(&buffer);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("providers.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("providers.crn")));
 
     let provider_diag = diagnostics.iter().find(|diagnostic| {
         diagnostic
@@ -2171,7 +2163,7 @@ fn arguments_buffer_with_sibling_provider_has_no_provider_diagnostic() {
 
     let engine = test_engine();
     let doc = create_document(arguments);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("arguments.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("arguments.crn")));
     let provider_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2197,7 +2189,7 @@ fn provider_in_root_shaped_directory_no_error() {
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
     let doc = create_document(&buffer);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("providers.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("providers.crn")));
 
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -2276,7 +2268,7 @@ import {
 
     let engine = test_engine();
     let doc = create_document(state_blocks);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("state.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("state.crn")));
     let state_block_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2327,7 +2319,7 @@ fn arguments_buffer_with_sibling_state_block_has_no_state_block_diagnostic() {
 
     let engine = test_engine();
     let doc = create_document(arguments);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("arguments.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("arguments.crn")));
     let state_block_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2366,7 +2358,7 @@ import {
 
     let engine = test_engine();
     let doc = create_document(state_blocks);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("state.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("state.crn")));
 
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -2504,7 +2496,7 @@ fn arguments_with_sibling_backend_emits_error() {
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("main.crn")).unwrap();
     let doc = create_document(&buffer);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     assert!(
         diagnostics.iter().any(|d| d
@@ -4288,10 +4280,9 @@ exports {
     std::fs::write(directory.path().join("main.crn"), main).unwrap();
     std::fs::write(directory.path().join("exports.crn"), exports).unwrap();
 
-    let diagnostics = engine.analyze_with_filename(
+    let diagnostics = engine.analyze(
         &create_document(exports),
-        Some("exports.crn"),
-        Some(directory.path()),
+        Some(&(directory.path()).join("exports.crn")),
     );
     let false_unknown = diagnostics.iter().find(|diagnostic| {
         diagnostic.message.contains("unknown binding 'parts[5]'")
@@ -4745,7 +4736,7 @@ let sg = aws.ec2.SecurityGroup {
 #[test]
 fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use carina_core::binding_index::BindingIndex;
-    use carina_core::parser::TypeExpr;
+    use carina_core::parser::{ArgumentOrigin, TypeExpr};
     use carina_core::resource::{
         Composition, CompositionArgument, CompositionAttribute, CompositionCall,
         CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
@@ -4807,8 +4798,9 @@ let first = unrelated { }
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
         CompositionArgument::from_value(
-            Value::resource_ref("source", "sg", vec![]),
+            Value::resource_ref("source", "missing", vec![]),
             schema_type("ec2.Vpc"),
+            ArgumentOrigin::Defaulted,
         ),
     );
     binding_input.compositions.extend([source, consumer]);
@@ -4817,7 +4809,6 @@ let first = unrelated { }
         super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), None, true);
 
     let diagnostics = engine.check_composition_ref_types(
-        &doc,
         parsed,
         &semantic_view,
         &binding_input.compositions,
@@ -5299,7 +5290,7 @@ fn sibling_bare_structural_handle_is_a_real_engine_parse_error() {
         document.parsed().is_some(),
         "the buffer-only parser cannot yet classify a sibling name"
     );
-    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(tmp.path()));
+    let diagnostics = engine.analyze(&document, Some(&(tmp.path()).join("main.crn")));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -5355,7 +5346,7 @@ let child = imported {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let document = create_document(source);
-    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(&root));
+    let diagnostics = engine.analyze(&document, Some(&(root).join("main.crn")));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -5368,6 +5359,165 @@ let child = imported {
     assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:#?}");
     assert_eq!(diagnostic.range.end.line, 5, "{diagnostic:#?}");
+}
+
+#[test]
+fn resolver_error_with_repeated_module_name_anchors_the_failing_call() {
+    let main = "let selector = use { source = './selector' }\n\
+let a = selector { items = ['a', 'b', 'c', 'd', 'e', 'f'] }\n\
+let b = selector { items = ['x', 'y'] }\n";
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "selector/arguments.crn",
+            "arguments { items: list(String) }\n",
+        ),
+        (
+            "selector/resource.crn",
+            "mock.test.resource { name = items[5] }\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("index 5 out of range for list of length 2")
+        })
+        .unwrap_or_else(|| panic!("missing resolver access diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 8), Position::new(2, 16)),
+        "the second call owns the failing argument value"
+    );
+}
+
+#[test]
+fn heredoc_argument_type_diagnostic_anchors_the_argument_key() {
+    let main = r#"let m = use { source = './m' }
+let inst = m {
+  enabled = <<EOT
+yes
+EOT
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("m/arguments.crn", "arguments { enabled: Bool }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message.contains("expected Bool")
+                && diagnostic.message.contains("got string")
+        })
+        .unwrap_or_else(|| panic!("missing heredoc argument type diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 2), Position::new(2, 9)),
+        "type mismatches must underline the argument key"
+    );
+}
+
+fn nested_bare_handle_fixture() -> (DiagnosticEngine, tempfile::TempDir, String) {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let main = "let a = use { source = './a' }\na {}\n".to_string();
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", &main),
+        ("a/import.crn", "let b = use { source = '../b' }\n"),
+        (
+            "a/body.crn",
+            "let vpc = mock.test.network { name = 'network' }\nb { parent = vpc }\nattributes { ok = 'ok' }\n",
+        ),
+        ("b/arguments.crn", "arguments { parent: String }\n"),
+    ]);
+    (engine, fixture, main)
+}
+
+#[test]
+fn nested_bare_handle_diagnostic_is_anchored_at_the_root_call() {
+    let (engine, fixture, main) = nested_bare_handle_fixture();
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", &main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing nested bare-handle diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 0), Position::new(1, 1)),
+        "the root call must own a failure raised inside its imported module"
+    );
+}
+
+#[test]
+fn resolver_diagnostic_uses_explicit_current_file_path() {
+    let (engine, fixture, main) = nested_bare_handle_fixture();
+    let document = create_document(&main);
+    let current_file = fixture.path().join("main.crn");
+
+    let diagnostics = engine.analyze(&document, Some(&current_file));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing file-backed resolver diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 0), Position::new(1, 1))
+    );
+}
+
+#[test]
+fn explicit_current_file_does_not_anchor_sibling_with_identical_span() {
+    let engine = test_engine();
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", "let s = use { source = './safe' }\ns {}\n"),
+        ("other.crn", "let a = use { source = './aaaa' }\na {}\n"),
+        ("safe/attributes.crn", "attributes { ok = 'ok' }\n"),
+        ("aaaa/import.crn", "let b = use { source = '../bbbb' }\n"),
+        (
+            "aaaa/body.crn",
+            "let vpc = mock.test.network { name = 'network' }\nb { parent = vpc }\nattributes { ok = 'ok' }\n",
+        ),
+        ("bbbb/arguments.crn", "arguments { parent: String }\n"),
+    ]);
+    let current_source = "let s = use { source = './safe' }\ns {}\n";
+    let document = create_document(current_source);
+
+    let diagnostics = engine.analyze(&document, Some(&fixture.path().join("main.crn")));
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("'vpc' is a resource, not a value")),
+        "a sibling failure must not be anchored on a different current file: \
+         {diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -5402,7 +5552,7 @@ let instance = imported { parent = vpc }
         document.parsed().is_some(),
         "module arguments retain handles"
     );
-    let diagnostics = engine.analyze_with_filename(&document, Some("main.crn"), Some(&root));
+    let diagnostics = engine.analyze(&document, Some(&(root).join("main.crn")));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -5487,6 +5637,11 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
     assert!(
         matching[0].message.contains("'abcd'") && !matching[0].message.contains("enum identifier"),
         "the diagnostic must render the expanded value: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 6)),
+        "an authored argument constraint must underline its key"
     );
 }
 
@@ -5635,9 +5790,9 @@ checked {}
         "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got 'abcdef')"
     );
     assert_eq!(
-        matching[0].range.start.line, 2,
-        "diagnostic: {:#?}",
-        matching[0]
+        matching[0].range,
+        Range::new(Position::new(2, 0), Position::new(2, 10)),
+        "a defaulted argument constraint must underline its owning call"
     );
 }
 
@@ -5838,6 +5993,52 @@ let web2 = issue {
         "the structured call label must anchor the second call, not the first",
     );
     assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn defaulted_composition_argument_mismatch_anchors_the_authored_call() {
+    let engine = module_boundary_identity_engine();
+    let main = r#"let checked = use { source = './module' }
+
+let sg = aws.ec2.SecurityGroup {
+  name = "root"
+}
+
+let instance = checked {
+  source_id = sg.group_id
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "module/arguments.crn",
+            r#"arguments {
+  source_id: aws.ec2.SecurityGroup.Id
+  target_id: aws.ec2.Vpc.Id = source_id
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'instance': argument 'target_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from sg.group_id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(6, 15), Position::new(6, 22)),
+        "a defaulted argument has no authored key, so the call must own the diagnostic",
+    );
 }
 
 #[test]
@@ -6228,7 +6429,7 @@ fn upstream_state_missing_source_directory_is_flagged() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
 
     let diag = diagnostics
         .iter()
@@ -6271,7 +6472,7 @@ let orgs = upstream_state {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
 
     let diag = diagnostics
         .iter()
@@ -6303,7 +6504,7 @@ fn upstream_state_existing_source_directory_is_ok() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
 
     let diag = diagnostics
         .iter()
@@ -6342,7 +6543,7 @@ fn analyze_with_buffer(
     buffer: &str,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let doc = create_document(buffer);
-    engine.analyze_with_filename(&doc, Some(filename), Some(base))
+    engine.analyze(&doc, Some(&(base).join(filename)))
 }
 
 #[test]
@@ -6529,10 +6730,9 @@ for key, value in (producer.tags ?? 5) {
 "#;
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), source).unwrap();
-    let diagnostics = custom_engine(schemas).analyze_with_filename(
+    let diagnostics = custom_engine(schemas).analyze(
         &create_document(source),
-        Some("main.crn"),
-        Some(fixture.path()),
+        Some(&(fixture.path()).join("main.crn")),
     );
 
     assert!(
@@ -8480,7 +8680,7 @@ fn sibling_user_function_is_not_reported_as_unknown() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let unknown_fn = diagnostics
         .iter()
@@ -8501,7 +8701,7 @@ fn truly_unknown_function_is_reported_without_redlining_sibling_function() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let unknown_fn = diagnostics
         .iter()
@@ -8566,7 +8766,7 @@ fn check_attributes_blocks_skips_sibling_resource_binding() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let undefined_resource = diagnostics
         .iter()
@@ -8626,7 +8826,7 @@ fn check_attributes_blocks_skips_sibling_resource_binding_even_when_merge_fails(
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let undefined_resource = diagnostics
         .iter()
@@ -8664,7 +8864,7 @@ fn check_attributes_blocks_skips_sibling_argument_even_when_merge_fails() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let phantom_arg = diagnostics
         .iter()
@@ -8689,7 +8889,7 @@ fn check_attributes_blocks_warns_when_truly_undefined_even_when_merge_fails() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let phantom_bar = diagnostics
         .iter()
@@ -8719,7 +8919,7 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
 
     let engine = test_engine();
     let doc = create_document(main_text);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let undefined_resource = diagnostics
         .iter()
@@ -8943,7 +9143,7 @@ fn empty_interpolation_does_not_cascade_undefined_for_sibling_bindings() {
 
     let engine = test_engine();
     let doc = create_document(main);
-    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
 
     let bucket_undefined = diagnostics
         .iter()
@@ -9183,10 +9383,9 @@ fn lsp_rejects_sibling_data_source_wait_target_at_target_anchor() {
     until = lookup.status == "ISSUED"
 }
 "#;
-    let diagnostics = test_engine_with_wait_target().analyze_with_filename(
+    let diagnostics = test_engine_with_wait_target().analyze(
         &create_document(source),
-        Some("main.crn"),
-        Some(fixture.path()),
+        Some(&(fixture.path()).join("main.crn")),
     );
     let diagnostic = diagnostics
         .iter()
@@ -9382,7 +9581,7 @@ fn duplicate_export_across_buffer_and_sibling_is_one_anchored_error() {
     let source = "exports {\n  x = \"buffer\"\n}\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
@@ -9407,7 +9606,7 @@ fn duplicate_binding_across_buffer_and_sibling_is_one_anchored_error() {
     let source = "let v = \"buffer\"\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate binding 'v'"))
@@ -9432,7 +9631,7 @@ fn duplicate_user_function_anchors_on_exact_identifier() {
     let source = "fn tag_name() {\n  \"longer name\"\n}\n\nfn tag() {\n  \"buffer\"\n}\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate function 'tag'"))
@@ -9452,7 +9651,7 @@ fn same_block_duplicate_export_has_error_without_last_wins_warning() {
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
@@ -9478,7 +9677,7 @@ fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
     let source = "attributes {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -9509,7 +9708,7 @@ fn same_block_duplicate_export_survives_broken_sibling_parse() {
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let doc = create_document(source);
 
-    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
@@ -9811,6 +10010,288 @@ exports {
 }
 
 #[test]
+fn one_line_module_call_type_mismatch_is_anchored_to_argument_key() {
+    let main = "let m = use { source = './m' }\n\
+let inst = m { n = 'abc' label = 'x' }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'abc'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(1, 15), Position::new(1, 16))
+    );
+}
+
+#[test]
+fn one_line_module_call_unknown_argument_is_anchored_to_argument_key() {
+    let main = "let m = use { source = './m' }\n\
+let inst = m { n = 1 label = 'x' nn = 2 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(1, 33), Position::new(1, 35))
+    );
+}
+
+#[test]
+fn one_line_module_call_missing_argument_is_anchored_to_second_call() {
+    let main = "let m = use { source = './m' }\n\
+let first = m { n = 1 label = 'x' }\n\
+let second = m { n = 2 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(2, 13), Position::new(2, 14))
+    );
+}
+
+#[test]
+fn issue_3859_anonymous_one_line_calls_keep_their_own_ranges() {
+    let main = "let m = use { source = './m' }\n\
+m { n = 'abc' }\n\
+m { label = 'x' }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("m/main.crn", "arguments {\n  n: Int\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let mismatch = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'abc'")
+        })
+        .collect::<Vec<_>>();
+    let missing_label = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatch[0].range,
+        Range::new(Position::new(1, 4), Position::new(1, 5))
+    );
+    assert_eq!(missing_label.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        missing_label[0].range,
+        Range::new(Position::new(1, 0), Position::new(1, 1))
+    );
+    assert_ne!(missing_label[0].range.start.line, 0);
+}
+
+#[test]
+fn issue_3859_heredoc_inside_call_keeps_unknown_parameter_range() {
+    let main = "let m = use { source = './m' }\n";
+    let calls = r#"let inst = m {
+  doc = <<EOT
+a
+b
+EOT
+  nn = 1
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("calls.crn", calls),
+        ("m/main.crn", "arguments { doc: String }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(5, 2), Position::new(5, 4))
+    );
+}
+
+#[test]
+fn issue_3859_module_call_diagnostics_stay_in_the_owning_sibling_file() {
+    let main = "let m = use { source = './m' }\n";
+    let calls = "\n\nlet inst = m { nn = 1 }\n";
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("calls.crn", calls),
+        ("m/main.crn", "arguments { n: Int }\n"),
+    ]);
+
+    let main_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    assert!(
+        main_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Unknown parameter 'nn'")),
+        "main.crn diagnostics: {main_diagnostics:#?}"
+    );
+
+    let call_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
+    let unknown = call_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+    assert_eq!(unknown.len(), 1, "diagnostics: {call_diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(2, 15), Position::new(2, 17))
+    );
+}
+
+#[test]
+fn module_call_diagnostics_use_original_line_after_heredoc() {
+    let main = r#"let m = use { source = './m' }
+let resource = mock.test.resource {
+  name = <<EOT
+alpha
+beta
+gamma
+delta
+EOT
+}
+let inst = m { nn = 1 }
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  label: String\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let unknown = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .unwrap_or_else(|| panic!("missing unknown-parameter diagnostic: {diagnostics:#?}"));
+    let missing = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .unwrap_or_else(|| panic!("missing required-parameter diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        unknown.range,
+        Range::new(Position::new(9, 15), Position::new(9, 17))
+    );
+    assert_eq!(
+        missing.range,
+        Range::new(Position::new(9, 11), Position::new(9, 12))
+    );
+}
+
+#[test]
+fn for_body_module_call_diagnostics_are_emitted_once_per_authored_site() {
+    let main = r#"let m = use { source = './m' }
+for x in ['a', 'b', 'c'] {
+  m { nn = 1 }
+}
+"#;
+    let parsed = carina_core::parser::parse_file(
+        main,
+        std::path::Path::new("main.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.module_calls.len(), 3);
+    assert!(
+        parsed
+            .module_calls
+            .windows(2)
+            .all(|calls| calls[0].source_span() == calls[1].source_span())
+    );
+    assert!(parsed.module_calls.windows(2).all(|calls| {
+        calls[0]
+            .authored_argument("nn")
+            .map(|argument| argument.key_span())
+            == calls[1]
+                .authored_argument("nn")
+                .map(|argument| argument.key_span())
+    }));
+
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        ("m/main.crn", "arguments {\n  label: String\n}\n"),
+    ]);
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .collect::<Vec<_>>();
+    let missing = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required parameter 'label'")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(missing.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(2, 6), Position::new(2, 8))
+    );
+    assert_eq!(
+        missing[0].range,
+        Range::new(Position::new(2, 2), Position::new(2, 3))
+    );
+}
+
+#[test]
 fn module_call_reports_literal_union_and_bool_value_mismatches() {
     let main = r#"let web_tier = use { source = './modules/web_tier' }
 
@@ -9982,6 +10463,30 @@ fn export_uses_value_resolved_from_sibling_let_binding() {
     assert!(
         warnings.is_empty(),
         "directory-resolved sibling export values must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn authored_export_span_anchors_sibling_resolved_type_warning() {
+    let exports = "exports {\n    count: Int = my_count\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("values.crn", "let my_count = 'wrong'\n"),
+        ("exports.crn", exports),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "exports.crn", exports);
+    let warning = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'wrong'")
+        })
+        .unwrap_or_else(|| panic!("missing export type warning: {diagnostics:#?}"));
+
+    assert_eq!(
+        warning.range,
+        Range::new(Position::new(1, 4), Position::new(1, 9))
     );
 }
 
@@ -11113,8 +11618,9 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         "tags = {\n    Name = \"application\"\n    Environment = \"production\"\n}";
     let merged_result = carina_core::config_loader::DirectoryParseResult {
         parsed: carina_core::parser::ParsedFile::default(),
-        authored_bindings: carina_core::config_loader::AuthoredBindingView::parse_source(
+        authored_bindings: carina_core::config_loader::AuthoredBindingView::parse_file_source(
             "",
+            std::path::Path::new("test.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap(),

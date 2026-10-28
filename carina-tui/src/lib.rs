@@ -857,7 +857,7 @@ mod tests {
     // ---- Module info key handler tests ----
 
     fn make_module_info_app() -> ModuleInfoApp {
-        use carina_core::parser::{ProviderContext, parse};
+        use carina_core::parser::{ProviderContext, parse_file};
         let input = r#"
             arguments {
                 vpc: aws.vpc
@@ -871,7 +871,12 @@ mod tests {
                 vpc_id = vpc
             }
         "#;
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse_file(
+            input,
+            std::path::Path::new("test_module.crn"),
+            &ProviderContext::default(),
+        )
+        .unwrap();
         let sig = FileSignature::from_parsed_file_with_name(&parsed, "test_module");
         ModuleInfoApp::new(&sig)
     }

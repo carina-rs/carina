@@ -1267,7 +1267,7 @@ mod tests {
                 type_expr: TypeExpr::Int,
                 default: None,
                 description: None,
-                validations: vec![ValidationBlock::new(
+                validations: vec![ValidationBlock::dummy(
                     ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("y".to_string())),
                         op: CompareOp::Gt,
@@ -1313,7 +1313,7 @@ mod tests {
             type_expr: TypeExpr::String,
             default: None,
             description: None,
-            validations: vec![ValidationBlock::new(
+            validations: vec![ValidationBlock::dummy(
                 ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::Var("name".to_string())),
                     op: CompareOp::Gt,

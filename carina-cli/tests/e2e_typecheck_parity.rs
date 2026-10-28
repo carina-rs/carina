@@ -3,7 +3,7 @@
 //! Each scenario builds the same directory-shaped fixture as
 //! `carina-lsp/tests/e2e_typecheck.rs` (#2215), runs both:
 //!
-//! 1. `DiagnosticEngine::analyze_with_filename` (LSP path)
+//! 1. `DiagnosticEngine::analyze` (LSP path)
 //! 2. `validate_with_factories` (CLI path, the production pipeline
 //!    behind `carina validate` minus stdout formatting)
 //!
@@ -96,11 +96,12 @@ fn lsp_diagnostics(
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let path = fixture.path().join(file_name);
     let text = std::fs::read_to_string(&path).expect("read fixture file");
-    let doc = Document::new(
+    let doc = Document::new_with_path(
         text,
+        path.clone(),
         Arc::new(carina_core::parser::ProviderContext::default()),
     );
-    engine.analyze_with_filename(&doc, Some(file_name), Some(fixture.path()))
+    engine.analyze(&doc, Some(&path))
 }
 
 /// Run the CLI path on a fixture directory and return the diagnostic
@@ -269,16 +270,14 @@ inner {
             .all(|message| !message.contains("Invalid argument type")),
         "CLI validation must use schema assignability policy: {cli:#?}"
     );
-    let outer_text = std::fs::read_to_string(outer.join("main.crn")).expect("read outer module");
-    let outer_doc = Document::new(
+    let outer_path = outer.join("main.crn");
+    let outer_text = std::fs::read_to_string(&outer_path).expect("read outer module");
+    let outer_doc = Document::new_with_path(
         outer_text,
+        outer_path.clone(),
         Arc::new(carina_core::parser::ProviderContext::default()),
     );
-    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze_with_filename(
-        &outer_doc,
-        Some("main.crn"),
-        Some(&outer),
-    );
+    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze(&outer_doc, Some(&outer_path));
     assert!(
         lsp.iter()
             .all(|diagnostic| !diagnostic.message.contains("Invalid argument type")),
@@ -317,16 +316,14 @@ fn nested_int_argument_to_literal_union_is_rejected_by_cli_and_lsp() {
         "CLI BindingIndex must reject Int forwarded to a literal-string union: {cli:#?}"
     );
 
-    let outer_text = std::fs::read_to_string(outer.join("main.crn")).expect("read outer module");
-    let outer_doc = Document::new(
+    let outer_path = outer.join("main.crn");
+    let outer_text = std::fs::read_to_string(&outer_path).expect("read outer module");
+    let outer_doc = Document::new_with_path(
         outer_text,
+        outer_path.clone(),
         Arc::new(carina_core::parser::ProviderContext::default()),
     );
-    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze_with_filename(
-        &outer_doc,
-        Some("main.crn"),
-        Some(&outer),
-    );
+    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze(&outer_doc, Some(&outer_path));
     assert!(
         lsp.iter().any(|diagnostic| {
             diagnostic.message.contains("cannot assign Int to 'env'")
@@ -378,13 +375,14 @@ inner { x = a }
         cli_messages_contain(&module_cli, expected),
         "validating the module directory must reject Ref -> Int forwarding: {module_cli:#?}"
     );
-    let lsp = engine_with_schemas(schemas.clone()).analyze_with_filename(
-        &Document::new(
+    let outer_path = outer.join("main.crn");
+    let lsp = engine_with_schemas(schemas.clone()).analyze(
+        &Document::new_with_path(
             outer_source.to_string(),
+            outer_path.clone(),
             Arc::new(carina_core::parser::ProviderContext::default()),
         ),
-        Some("main.crn"),
-        Some(&outer),
+        Some(&outer_path),
     );
     assert!(
         lsp_messages_contain(&lsp, expected),
@@ -395,13 +393,13 @@ inner { x = a }
         .expect("String sink module");
     let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
-    let lsp = engine_with_schemas(schemas).analyze_with_filename(
-        &Document::new(
+    let lsp = engine_with_schemas(schemas).analyze(
+        &Document::new_with_path(
             outer_source.to_string(),
+            outer_path.clone(),
             Arc::new(carina_core::parser::ProviderContext::default()),
         ),
-        Some("main.crn"),
-        Some(&outer),
+        Some(&outer_path),
     );
     assert!(
         root_cli

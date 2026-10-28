@@ -3346,7 +3346,11 @@ fn pending_module_composition(
                 .map(|(name, value)| {
                     (
                         name.to_string(),
-                        CompositionArgument::from_value(value, TypeExpr::String),
+                        CompositionArgument::from_value(
+                            value,
+                            TypeExpr::String,
+                            crate::parser::ArgumentOrigin::Defaulted,
+                        ),
                     )
                 })
                 .collect(),

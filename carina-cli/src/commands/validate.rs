@@ -491,8 +491,12 @@ mod tests {
                 }
             }
         "#;
-        let parsed =
-            carina_core::parser::parse(src, &ProviderContext::default()).expect("fixture parses");
+        let parsed = carina_core::parser::parse_file(
+            src,
+            std::path::Path::new("validate_fixture.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("fixture parses");
         // The loop is deferred (iterable is a same-config provider-read
         // attribute), so it is not in `parsed.resources` but is in
         // `deferred_for_expressions` — exactly the carina#3121 shape.

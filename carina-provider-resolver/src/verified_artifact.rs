@@ -10,10 +10,12 @@ use carina_core::provider_source::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::github_location::{ArtifactId, AssetId, GithubLocationError, ReleaseTag, RepoSlug};
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
-    RegistrySignatureProtection, WasmArtifactPath, cache_path_wasm, sha256_file,
+    RegistrySignatureProtection, WasmArtifactPath, cache_path_github_release, cache_path_wasm,
+    sha256_file,
 };
 use crate::provider_trust::{ProviderLoadIdentity, ProviderTrust};
 use crate::revision_resolver::cache_path_revision;
@@ -126,9 +128,46 @@ pub(crate) struct OriginUrl {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OriginUrlKind {
-    GithubRelease(url::Url),
-    GithubRevision(GithubSource),
+    GithubRelease {
+        location: GithubReleaseDownloadLocation,
+        requested: url::Url,
+    },
+    GithubRevision {
+        location: GithubRevisionDownloadLocation,
+        requested: url::Url,
+    },
     VerifiedRegistry(url::Url),
+}
+
+/// The typed GitHub API location used to download a release asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GithubReleaseDownloadLocation {
+    repo: RepoSlug,
+    tag: ReleaseTag,
+    asset_id: AssetId,
+}
+
+impl GithubReleaseDownloadLocation {
+    pub(crate) fn new(repo: RepoSlug, tag: ReleaseTag, asset_id: AssetId) -> Self {
+        Self {
+            repo,
+            tag,
+            asset_id,
+        }
+    }
+}
+
+/// The typed GitHub API location used to download an Actions artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GithubRevisionDownloadLocation {
+    repo: RepoSlug,
+    artifact_id: ArtifactId,
+}
+
+impl GithubRevisionDownloadLocation {
+    pub(crate) fn new(repo: RepoSlug, artifact_id: ArtifactId) -> Self {
+        Self { repo, artifact_id }
+    }
 }
 
 #[derive(Debug)]
@@ -143,8 +182,14 @@ pub(crate) enum OriginUrlError {
     ExpectedRegistrySource {
         source_key: String,
     },
-    MissingRequestedUrl {
+    InvalidGithubLocation {
         source_key: String,
+        source: GithubLocationError,
+    },
+    WrongRepository {
+        source_key: String,
+        expected: String,
+        actual: String,
     },
     InvalidUrl {
         requested: String,
@@ -189,9 +234,20 @@ impl fmt::Display for OriginUrlError {
                 formatter,
                 "origin source identity {source_key:?} is not a registry source"
             ),
-            Self::MissingRequestedUrl { source_key } => write!(
+            Self::InvalidGithubLocation {
+                source_key,
+                source: _,
+            } => write!(
                 formatter,
-                "origin download for {source_key} did not carry the requested URL"
+                "GitHub origin location for {source_key} is invalid"
+            ),
+            Self::WrongRepository {
+                source_key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GitHub origin repository for {source_key} must be {expected}, got {actual}"
             ),
             Self::InvalidUrl {
                 requested,
@@ -235,10 +291,11 @@ impl Error for OriginUrlError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidSource { source, .. } => Some(source),
+            Self::InvalidGithubLocation { source, .. } => Some(source),
             Self::InvalidUrl { source, .. } => Some(source),
             Self::ExpectedGithubSource { .. }
             | Self::ExpectedRegistrySource { .. }
-            | Self::MissingRequestedUrl { .. }
+            | Self::WrongRepository { .. }
             | Self::ContainsUserinfo { .. }
             | Self::MustUseHttps { .. }
             | Self::NonDefaultPort { .. }
@@ -249,35 +306,41 @@ impl Error for OriginUrlError {
 }
 
 impl OriginUrl {
-    fn github_release(source: &RemoteSourceKey, requested: &str) -> Result<Self, OriginUrlError> {
-        let github = github_source_from_key(source)?;
-        let parsed = parse_secure_origin_url(requested)?;
-        if parsed.host_str() != Some("github.com") {
-            return Err(OriginUrlError::WrongHost {
-                source_key: source.to_string(),
-                expected: "github.com",
-                actual: parsed.host_str().map(str::to_owned),
-            });
-        }
-        let expected_prefix = format!("/{}/{}/releases/download/", github.owner(), github.repo());
-        if !parsed.path().starts_with(&expected_prefix) {
-            return Err(OriginUrlError::WrongPath {
-                source_key: source.to_string(),
-                expected_prefix,
-                actual: parsed.path().to_string(),
-            });
-        }
+    fn github_release(
+        source: &RemoteSourceKey,
+        location: GithubReleaseDownloadLocation,
+    ) -> Result<Self, OriginUrlError> {
+        require_matching_github_repo(source, &location.repo)?;
+        let requested = location
+            .repo
+            .release_asset_url(location.asset_id)
+            .map_err(|error| invalid_github_location(source, error))?;
+        let requested = validate_github_api_origin_url(source, &location.repo, requested.as_str())?;
         Ok(Self {
             source: source.clone(),
-            kind: OriginUrlKind::GithubRelease(parsed),
+            kind: OriginUrlKind::GithubRelease {
+                location,
+                requested,
+            },
         })
     }
 
-    fn github_revision(source: &RemoteSourceKey) -> Result<Self, OriginUrlError> {
-        let github = github_source_from_key(source)?;
+    fn github_revision(
+        source: &RemoteSourceKey,
+        location: GithubRevisionDownloadLocation,
+    ) -> Result<Self, OriginUrlError> {
+        require_matching_github_repo(source, &location.repo)?;
+        let requested = location
+            .repo
+            .artifact_zip_url(location.artifact_id)
+            .map_err(|error| invalid_github_location(source, error))?;
+        let requested = validate_github_api_origin_url(source, &location.repo, requested.as_str())?;
         Ok(Self {
             source: source.clone(),
-            kind: OriginUrlKind::GithubRevision(github),
+            kind: OriginUrlKind::GithubRevision {
+                location,
+                requested,
+            },
         })
     }
 
@@ -301,12 +364,52 @@ impl OriginUrl {
     fn into_source(self) -> RemoteSourceKey {
         let Self { source, kind } = self;
         match kind {
-            OriginUrlKind::GithubRelease(requested)
-            | OriginUrlKind::VerifiedRegistry(requested) => drop(requested),
-            OriginUrlKind::GithubRevision(github) => drop(github),
+            OriginUrlKind::GithubRelease {
+                location,
+                requested,
+            } => drop((location, requested)),
+            OriginUrlKind::GithubRevision {
+                location,
+                requested,
+            } => drop((location, requested)),
+            OriginUrlKind::VerifiedRegistry(requested) => drop(requested),
         }
         source
     }
+}
+
+fn invalid_github_location(source: &RemoteSourceKey, error: GithubLocationError) -> OriginUrlError {
+    OriginUrlError::InvalidGithubLocation {
+        source_key: source.to_string(),
+        source: error,
+    }
+}
+
+fn validate_github_api_origin_url(
+    source: &RemoteSourceKey,
+    repo: &RepoSlug,
+    requested: &str,
+) -> Result<url::Url, OriginUrlError> {
+    // Parse again at the trust boundary. `url::Url` applies WHATWG path
+    // normalization, so traversal segments cannot hide outside the repo path.
+    let parsed = parse_secure_origin_url(requested)?;
+    if parsed.host_str() != Some("api.github.com") {
+        return Err(OriginUrlError::WrongHost {
+            source_key: source.to_string(),
+            expected: "api.github.com",
+            actual: parsed.host_str().map(str::to_owned),
+        });
+    }
+    let expected_prefix = format!("/repos/{}/{}/", repo.owner(), repo.repo());
+    if !parsed.path().starts_with(&expected_prefix) {
+        return Err(OriginUrlError::WrongPath {
+            source_key: source.to_string(),
+            expected_prefix,
+            actual: parsed.path().to_string(),
+        });
+    }
+    repo.validate_url(requested)
+        .map_err(|error| invalid_github_location(source, error))
 }
 
 fn parse_secure_origin_url(requested: &str) -> Result<url::Url, OriginUrlError> {
@@ -351,6 +454,26 @@ fn github_source_from_key(source: &RemoteSourceKey) -> Result<GithubSource, Orig
             source_key: source.to_string(),
         }),
     }
+}
+
+fn github_repo_from_key(source: &RemoteSourceKey) -> Result<RepoSlug, OriginUrlError> {
+    let github = github_source_from_key(source)?;
+    RepoSlug::try_from(&github).map_err(|error| invalid_github_location(source, error))
+}
+
+fn require_matching_github_repo(
+    source: &RemoteSourceKey,
+    actual: &RepoSlug,
+) -> Result<(), OriginUrlError> {
+    let expected = github_repo_from_key(source)?;
+    if expected == *actual {
+        return Ok(());
+    }
+    Err(OriginUrlError::WrongRepository {
+        source_key: source.to_string(),
+        expected: format!("{}/{}", expected.owner(), expected.repo()),
+        actual: format!("{}/{}", actual.owner(), actual.repo()),
+    })
 }
 
 fn require_registry_source(source: &RemoteSourceKey) -> Result<(), OriginUrlError> {
@@ -428,11 +551,9 @@ pub(crate) enum ArtifactPin<'a, P, R = RegistryLock> {
         provider_name: &'a str,
         pin: P,
         source: RemoteSourceKey,
-        requested_origin_url: Option<String>,
     },
     Unpinned {
         first_use: FirstUse,
-        requested_origin_url: Option<String>,
     },
 }
 
@@ -447,7 +568,6 @@ impl<P, R> ArtifactPin<'_, P, R> {
                 provider_name: _,
                 pin,
                 source,
-                requested_origin_url: _,
             } if !ProviderTrust::remote_source_is_allowlisted(source)
                 || user_trust_record_exists(&lock_entry.sha256, source) =>
             {
@@ -456,26 +576,6 @@ impl<P, R> ArtifactPin<'_, P, R> {
             Self::Pinned { .. } => None,
             Self::Unpinned { .. } => None,
         }
-    }
-}
-
-impl<R> ArtifactPin<'_, VersionArtifactPin, R> {
-    pub(crate) fn with_requested_origin_url(mut self, requested: &str) -> Self {
-        let slot = match &mut self {
-            Self::Pinned {
-                requested_origin_url,
-                ..
-            }
-            | Self::Unpinned {
-                requested_origin_url,
-                ..
-            } => requested_origin_url,
-        };
-        assert!(
-            slot.replace(requested.to_string()).is_none(),
-            "a download pin can carry only one requested origin URL"
-        );
-        self
     }
 }
 
@@ -531,21 +631,20 @@ pub(crate) fn record_test_github_origin_download(
     sha256: &str,
     signer: Option<&RegistrySignatureProtection>,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
-    let github = github_source_from_key(source)
+    let repo = github_repo_from_key(source)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
-    let requested = format!(
-        "https://github.com/{}/{}/releases/download/test/provider.wasm",
-        github.owner(),
-        github.repo()
+    let location = GithubReleaseDownloadLocation::new(
+        repo,
+        ReleaseTag::from_lock("test".into()),
+        AssetId::from_lock(1),
     );
-    let origin = OriginUrl::github_release(source, &requested)
+    let origin = OriginUrl::github_release(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
     record_verified_origin_download(origin, sha256, signer)
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VersionArtifactPin {
-    pub(crate) version: String,
+pub(crate) struct GithubReleaseArtifactPin {
     pub(crate) constraint: Option<String>,
 }
 
@@ -556,45 +655,42 @@ pub(crate) struct RevisionArtifactPin {
 }
 
 pub(crate) trait OriginDownloadPin {
+    type Location;
+
     fn validated_origin(
         source: &RemoteSourceKey,
-        requested_origin_url: Option<&str>,
+        location: Self::Location,
     ) -> Result<OriginUrl, OriginUrlError>;
 }
 
-impl OriginDownloadPin for VersionArtifactPin {
+impl OriginDownloadPin for GithubReleaseArtifactPin {
+    type Location = GithubReleaseDownloadLocation;
+
     fn validated_origin(
         source: &RemoteSourceKey,
-        requested_origin_url: Option<&str>,
+        location: Self::Location,
     ) -> Result<OriginUrl, OriginUrlError> {
-        let requested =
-            requested_origin_url.ok_or_else(|| OriginUrlError::MissingRequestedUrl {
-                source_key: source.to_string(),
-            })?;
-        OriginUrl::github_release(source, requested)
+        OriginUrl::github_release(source, location)
     }
 }
 
 impl OriginDownloadPin for RevisionArtifactPin {
+    type Location = GithubRevisionDownloadLocation;
+
     fn validated_origin(
         source: &RemoteSourceKey,
-        requested_origin_url: Option<&str>,
+        location: Self::Location,
     ) -> Result<OriginUrl, OriginUrlError> {
-        debug_assert!(requested_origin_url.is_none());
-        // `revision_resolver::download_artifact` assembles this endpoint from a
-        // parsed `GithubSource` and a numeric `u64` artifact id. Keeping this
-        // evidence constructor on `RevisionArtifactPin` is the no-raw-URL
-        // bridge for that resolver without weakening release URL validation.
-        OriginUrl::github_revision(source)
+        OriginUrl::github_revision(source, location)
     }
 }
 
 fn record_verified_pin_origin<P: OriginDownloadPin>(
     source: &RemoteSourceKey,
-    requested_origin_url: Option<&str>,
+    location: P::Location,
     sha256: &str,
 ) -> Result<(), RecordVerifiedOriginDownloadError> {
-    let origin = P::validated_origin(source, requested_origin_url)
+    let origin = P::validated_origin(source, location)
         .map_err(|error| RecordVerifiedOriginDownloadError::new(source, sha256, error))?;
     record_verified_origin_download(origin, sha256, None)
 }
@@ -820,26 +916,38 @@ impl VerifiedArtifact {
     }
 }
 
-pub(crate) fn lookup_version_artifact_pin<'a>(
+pub(crate) fn lookup_github_release_artifact_pin<'a>(
     lock_file: &'a LockFile,
     source: &RemoteSourceKey,
-    version: &str,
+    version: &semver::Version,
     provider_name: &'a str,
-) -> ArtifactPin<'a, VersionArtifactPin> {
+) -> ArtifactPin<'a, GithubReleaseArtifactPin> {
+    let version_string = version.to_string();
     let pinned = lock_file
-        .find_by_source_key_and_version(source, version)
+        .find_by_source_key_and_version(source, &version_string)
         .and_then(|entry| match &entry.kind {
-            LockEntryKind::Version {
+            LockEntryKind::GithubRelease {
                 version: locked_version,
+                tag: _,
+                asset_id: _,
                 constraint,
-            } => Some((
+            } if locked_version == version => Some((
                 entry,
-                VersionArtifactPin {
-                    version: locked_version.clone(),
+                GithubReleaseArtifactPin {
                     constraint: constraint.clone(),
                 },
             )),
-            LockEntryKind::Revision {
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
             }
@@ -855,13 +963,11 @@ pub(crate) fn lookup_version_artifact_pin<'a>(
             provider_name,
             pin,
             source: source.clone(),
-            requested_origin_url: None,
         },
         None => ArtifactPin::Unpinned {
             first_use: FirstUse {
                 source: source.clone(),
             },
-            requested_origin_url: None,
         },
     }
 }
@@ -894,6 +1000,12 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
                 version: _,
                 constraint: _,
             }
+            | LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
             | LockEntryKind::RegistryRevision {
                 revision: _,
                 version: _,
@@ -906,13 +1018,11 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
             provider_name,
             pin,
             source: source.clone(),
-            requested_origin_url: None,
         },
         None => ArtifactPin::Unpinned {
             first_use: FirstUse {
                 source: source.clone(),
             },
-            requested_origin_url: None,
         },
     }
 }
@@ -963,13 +1073,15 @@ pub(crate) fn publish_cached<R>(
 pub(crate) fn publish_download<R, P: OriginDownloadPin>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
+    location: P::Location,
 ) -> Result<DownloadedArtifact<P>, String> {
-    publish_download_verified(staged, pin).map_err(String::from)
+    publish_download_verified(staged, pin, location).map_err(String::from)
 }
 
 fn publish_download_verified<R, P: OriginDownloadPin>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
+    location: P::Location,
 ) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
     match pin {
         ArtifactPin::Pinned {
@@ -977,16 +1089,11 @@ fn publish_download_verified<R, P: OriginDownloadPin>(
             provider_name,
             pin,
             source,
-            requested_origin_url,
         } => {
             let artifact = publish_cached(staged, lock_entry, provider_name)?;
-            record_verified_pin_origin::<P>(
-                &source,
-                requested_origin_url.as_deref(),
-                artifact.sha256(),
-            )
-            .map_err(String::from)
-            .map_err(VerifiedArtifactError::Other)?;
+            record_verified_pin_origin::<P>(&source, location, artifact.sha256())
+                .map_err(String::from)
+                .map_err(VerifiedArtifactError::Other)?;
             Ok(DownloadedArtifact::Verified {
                 artifact: Box::new(artifact),
                 pin,
@@ -994,7 +1101,6 @@ fn publish_download_verified<R, P: OriginDownloadPin>(
         }
         ArtifactPin::Unpinned {
             first_use: FirstUse { source },
-            requested_origin_url,
         } => {
             let sha256 = sha256_file(staged.path()).map_err(|error| {
                 VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
@@ -1007,7 +1113,7 @@ fn publish_download_verified<R, P: OriginDownloadPin>(
                     published_path.display()
                 ))
             })?;
-            record_verified_pin_origin::<P>(&source, requested_origin_url.as_deref(), &sha256)
+            record_verified_pin_origin::<P>(&source, location, &sha256)
                 .map_err(String::from)
                 .map_err(VerifiedArtifactError::Other)?;
             Ok(DownloadedArtifact::FirstUse { path, sha256 })
@@ -1049,6 +1155,37 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
                 constraint: constraint.clone(),
             },
         ),
+        (
+            LockEntryKind::GithubRelease {
+                version,
+                tag,
+                asset_id,
+                constraint,
+            },
+            RemoteSource::GithubDirect(source),
+        ) => (
+            cache_path_github_release(project_dir, &source.source_key(), version),
+            version.to_string(),
+            LockedProviderPin::GithubRelease {
+                version: version.to_string(),
+                tag: tag.clone(),
+                asset_id: *asset_id,
+                constraint: constraint.clone(),
+            },
+        ),
+        (
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            },
+            RemoteSource::Registry(_source),
+        ) => {
+            return Err(format!(
+                "Provider '{provider_name}' has a GitHub release lock pin for a registry source"
+            ));
+        }
         (LockEntryKind::RegistryRevision { revision, version }, source) => (
             cache_path_wasm(project_dir, &source.source_key(), version),
             version.clone(),
@@ -1193,8 +1330,12 @@ mod tests {
         staged.write_all(bytes).unwrap();
         let lock_file = LockFile::default();
         let pin = lookup_revision_artifact_pin(&lock_file, &source, "main", resolved_sha, "aws");
+        let location = GithubRevisionDownloadLocation::new(
+            RepoSlug::try_from(&github).unwrap(),
+            ArtifactId::from_lock(42),
+        );
 
-        let downloaded = publish_download(staged, pin).unwrap();
+        let downloaded = publish_download(staged, pin, location).unwrap();
 
         assert!(matches!(downloaded, DownloadedArtifact::FirstUse { .. }));
         assert!(
@@ -1231,28 +1372,61 @@ mod tests {
     }
 
     #[test]
-    fn github_release_origin_url_requires_canonical_secure_source_location() {
-        let source = match "github.com/carina-rs/carina-provider-aws"
+    fn github_release_origin_uses_typed_api_location_and_rejects_escaped_paths() {
+        let github = match "github.com/carina-rs/carina-provider-aws"
             .parse::<ProviderSource>()
             .unwrap()
         {
-            ProviderSource::Remote(source) => source.source_key(),
-            ProviderSource::File(_) => unreachable!(),
+            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
+            source => panic!("expected GitHub source: {source}"),
         };
-        let normal = "https://github.com/carina-rs/carina-provider-aws/releases/download/v1.2.3/carina-provider-aws-v1.2.3.wasm";
+        let source = github.source_key();
+        let repo = RepoSlug::try_from(&github).unwrap();
+        let location = GithubReleaseDownloadLocation::new(
+            repo.clone(),
+            ReleaseTag::from_lock("v1.2.3".into()),
+            AssetId::from_lock(42),
+        );
 
-        OriginUrl::github_release(&source, normal).unwrap();
+        let origin = OriginUrl::github_release(&source, location).unwrap();
+        assert!(matches!(
+            origin.kind,
+            OriginUrlKind::GithubRelease { requested, .. }
+                if requested.as_str()
+                    == "https://api.github.com/repos/carina-rs/carina-provider-aws/releases/assets/42"
+        ));
 
         for rejected in [
-            "https://user@github.com/carina-rs/carina-provider-aws/releases/download/v1/p.wasm",
-            "http://github.com/carina-rs/carina-provider-aws/releases/download/v1/p.wasm",
-            "https://github.com:8443/carina-rs/carina-provider-aws/releases/download/v1/p.wasm",
-            "https://example.com/carina-rs/carina-provider-aws/releases/download/v1/p.wasm",
-            "https://github.com/evil/repo/releases/download/v1/p.wasm",
+            "https://user@api.github.com/repos/carina-rs/carina-provider-aws/releases/assets/42",
+            "http://api.github.com/repos/carina-rs/carina-provider-aws/releases/assets/42",
+            "https://api.github.com:8443/repos/carina-rs/carina-provider-aws/releases/assets/42",
+            "https://example.com/repos/carina-rs/carina-provider-aws/releases/assets/42",
+            "https://api.github.com/repos/evil/repo/releases/assets/42",
         ] {
-            let error: OriginUrlError = OriginUrl::github_release(&source, rejected).unwrap_err();
+            let error = validate_github_api_origin_url(&source, &repo, rejected).unwrap_err();
             assert!(!error.to_string().is_empty(), "{rejected}");
         }
+
+        let escaped = "https://api.github.com/repos/carina-rs/carina-provider-aws/releases/assets/../../../attacker";
+        assert!(matches!(
+            validate_github_api_origin_url(&source, &repo, escaped),
+            Err(OriginUrlError::WrongPath { actual, .. })
+                if actual == "/repos/carina-rs/attacker"
+        ));
+
+        let other = match "github.com/evil/repo".parse::<ProviderSource>().unwrap() {
+            ProviderSource::Remote(RemoteSource::GithubDirect(source)) => source,
+            source => panic!("expected GitHub source: {source}"),
+        };
+        let wrong_repo = GithubReleaseDownloadLocation::new(
+            RepoSlug::try_from(&other).unwrap(),
+            ReleaseTag::from_lock("v1.2.3".into()),
+            AssetId::from_lock(42),
+        );
+        assert!(matches!(
+            OriginUrl::github_release(&source, wrong_repo),
+            Err(OriginUrlError::WrongRepository { .. })
+        ));
     }
 
     #[test]
@@ -1268,13 +1442,17 @@ mod tests {
             ProviderSource::Remote(source) => source.source_key(),
             ProviderSource::File(_) => unreachable!(),
         };
-        let version = "1.0.0";
+        let version = semver::Version::parse("1.0.0").unwrap();
+        let tag = ReleaseTag::from_lock("v1.0.0".into());
+        let asset_id = AssetId::from_lock(42);
         let locked_bytes = b"repository-installed bytes";
         let downloaded_bytes = b"changed origin bytes";
         let expected_sha256 = format!("{:x}", Sha256::digest(locked_bytes));
-        let destination =
-            WasmArtifactPath::new(cache_path_wasm(project.path(), &source, version), "aws")
-                .unwrap();
+        let destination = WasmArtifactPath::new(
+            cache_path_github_release(project.path(), &source, &version),
+            "aws",
+        )
+        .unwrap();
         std::fs::create_dir_all(destination.as_path().parent().unwrap()).unwrap();
         std::fs::write(destination.as_path(), locked_bytes).unwrap();
         let install_lock = crate::ProviderInstallLock::acquire(project.path()).unwrap();
@@ -1284,16 +1462,23 @@ mod tests {
         lock_file.upsert(LockEntry {
             name: "aws".into(),
             source: source.to_string(),
-            kind: LockEntryKind::Version {
-                version: version.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: version.clone(),
+                tag: tag.clone(),
+                asset_id,
                 constraint: None,
             },
             sha256: expected_sha256,
             registry: None,
         });
-        let pin = lookup_version_artifact_pin(&lock_file, &source, version, "aws");
+        let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
+        let location = GithubReleaseDownloadLocation::new(
+            github_repo_from_key(&source).unwrap(),
+            tag,
+            asset_id,
+        );
 
-        let error = publish_download_verified(staged, pin)
+        let error = publish_download_verified(staged, pin, location)
             .expect_err("origin bytes must match the existing lock pin");
 
         assert!(matches!(error, VerifiedArtifactError::ChecksumMismatch(_)));

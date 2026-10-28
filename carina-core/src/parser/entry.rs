@@ -151,8 +151,21 @@ impl<'a> BindingSeed<'a> {
 /// values, and then re-parses again with the resolved directory scope.
 /// See #2817 (directory-aware parse) and #3394 (pass-1 sibling-aware
 /// value seeds) for the broader contract.
-pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
+#[cfg(test)]
+pub(crate) fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
     let parsed = parse_with_seeded_bindings(input, config, &[])?;
+    super::resolve::reject_cyclic_let_bindings(&parsed)?;
+    Ok(parsed)
+}
+
+/// Parse one source with a concrete file identity suitable for module resolution.
+pub fn parse_file(
+    input: &str,
+    path: &std::path::Path,
+    config: &ProviderContext,
+) -> Result<ParsedFile, ParseError> {
+    let user_functions = resolve_top_level_user_functions(&[(Some(path), input)], config)?;
+    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
 }
@@ -294,14 +307,14 @@ pub fn top_level_anonymous_resource_spans(
             let Some((provider, resource_type)) = full_type.split_once('.') else {
                 continue;
             };
-            let (preprocessed_line, start_column) = type_pair.as_span().start_pos().line_col();
+            let start = preprocessed_file.original_position(type_pair.as_span().start());
             spans.push(AnonymousResourceSourceSpan {
                 provider: provider.to_string(),
                 resource_type: resource_type.to_string(),
                 span: TopLevelBlockSourceSpan {
-                    start_line: preprocessed_file.original_line(preprocessed_line),
-                    start_column,
-                    end_column: start_column + full_type.chars().count(),
+                    start_line: start.line,
+                    start_column: start.column,
+                    end_column: start.column + full_type.chars().count(),
                 },
             });
         }
@@ -336,11 +349,11 @@ fn top_level_block_spans(
             let Some(keyword) = keyword_for_statement(&block) else {
                 continue;
             };
-            let (preprocessed_line, start_column) = block.as_span().start_pos().line_col();
+            let start = preprocessed_file.original_position(block.as_span().start());
             spans.push(TopLevelBlockSourceSpan {
-                start_line: preprocessed_file.original_line(preprocessed_line),
-                start_column,
-                end_column: start_column + keyword.len(),
+                start_line: start.line,
+                start_column: start.column,
+                end_column: start.column + keyword.len(),
             });
         }
     }
@@ -377,19 +390,28 @@ fn pair_contains_rule(pair: &pest::iterators::Pair<Rule>, expected: Rule) -> boo
 /// regular parse) win over the seeded placeholder — the parser overwrites
 /// the seed entry the moment it processes the local `let` / `arguments`
 /// / etc. that introduces the name.
-pub fn parse_with_seeded_bindings(
+#[cfg(test)]
+pub(crate) fn parse_with_seeded_bindings(
     input: &str,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
     let user_functions = top_level_user_functions(input, config)?;
-    parse_with_seeded_bindings_inner(input, config, seeds, &user_functions, true)
+    parse_with_seeded_bindings_inner(
+        input,
+        config,
+        seeds,
+        &user_functions,
+        true,
+        std::path::Path::new("test.crn"),
+    )
 }
 
 /// Parse only the top-level function declarations from one source file.
 /// Directory parsing uses this lightweight prepass to make sibling and
 /// forward functions available while parsing structure-producing expressions
 /// such as `for n in names(...)`.
+#[cfg(test)]
 pub(crate) fn top_level_user_functions(
     input: &str,
     config: &ProviderContext,
@@ -571,6 +593,7 @@ pub(crate) fn top_level_argument_names(input: &str) -> Result<Vec<String>, Parse
 
 pub(crate) fn parse_with_directory_context(
     input: &str,
+    source_file: &std::path::Path,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
     user_functions: &HashMap<String, UserFunction>,
@@ -582,6 +605,7 @@ pub(crate) fn parse_with_directory_context(
         seeds,
         user_functions,
         bindings_fully_classified,
+        source_file,
     )
 }
 
@@ -591,6 +615,7 @@ fn parse_with_seeded_bindings_inner(
     seeds: &[BindingSeed<'_>],
     seeded_user_functions: &HashMap<String, UserFunction>,
     bindings_fully_classified: bool,
+    source_file: &std::path::Path,
 ) -> Result<ParsedFile, ParseError> {
     let preprocessed_file = super::preprocess_file(input)?;
     let pairs = preprocessed_file.parse()?;
@@ -633,7 +658,8 @@ fn parse_with_seeded_bindings_inner(
                     for stmt in inner.into_inner() {
                         match stmt.as_rule() {
                             Rule::backend_block => {
-                                backend = Some(parse_backend_block(stmt, &ctx)?);
+                                backend =
+                                    Some(parse_backend_block(stmt, &ctx, &preprocessed_file)?);
                             }
                             Rule::provider_block => {
                                 let provider = parse_provider_block(stmt, &ctx)?;
@@ -651,6 +677,8 @@ fn parse_with_seeded_bindings_inner(
                                         stmt,
                                         config,
                                         &mut ctx,
+                                        &preprocessed_file,
+                                        source_file,
                                         &mut warnings,
                                     );
                                     ctx.warnings = warnings;
@@ -662,7 +690,13 @@ fn parse_with_seeded_bindings_inner(
                                 let parsed_attribute_params = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_attributes_block(stmt, &ctx, &mut warnings);
+                                    let result = parse_attributes_block(
+                                        stmt,
+                                        &ctx,
+                                        &preprocessed_file,
+                                        source_file,
+                                        &mut warnings,
+                                    );
                                     ctx.warnings = warnings;
                                     result?
                                 };
@@ -672,7 +706,13 @@ fn parse_with_seeded_bindings_inner(
                                 let parsed_export_params = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_exports_block(stmt, &ctx, &mut warnings);
+                                    let result = parse_exports_block(
+                                        stmt,
+                                        &ctx,
+                                        &preprocessed_file,
+                                        source_file,
+                                        &mut warnings,
+                                    );
                                     ctx.warnings = warnings;
                                     result?
                                 };
@@ -688,7 +728,12 @@ fn parse_with_seeded_bindings_inner(
                                 state_blocks.push(parse_moved_block(stmt)?);
                             }
                             Rule::require_statement => {
-                                requires.push(parse_require_statement(stmt, &ctx)?);
+                                requires.push(parse_require_statement(
+                                    stmt,
+                                    &ctx,
+                                    &preprocessed_file,
+                                    source_file,
+                                )?);
                             }
                             Rule::for_expr => {
                                 let iterable_name =
@@ -698,7 +743,13 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_resources,
                                     expanded_data_sources,
                                     expanded_module_calls,
-                                ) = parse_for_expr(stmt, &mut ctx, &iterable_name)?;
+                                ) = parse_for_expr(
+                                    stmt,
+                                    &mut ctx,
+                                    &iterable_name,
+                                    &preprocessed_file,
+                                    source_file,
+                                )?;
                                 resources.extend(expanded_resources);
                                 data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
@@ -713,7 +764,13 @@ fn parse_with_seeded_bindings_inner(
                                     expanded_module_calls,
                                     _import,
                                     _binding_kind,
-                                ) = parse_if_expr(stmt, &mut ctx, &binding_name)?;
+                                ) = parse_if_expr(
+                                    stmt,
+                                    &mut ctx,
+                                    &binding_name,
+                                    &preprocessed_file,
+                                    source_file,
+                                )?;
                                 resources.extend(expanded_resources);
                                 data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
@@ -757,7 +814,12 @@ fn parse_with_seeded_bindings_inner(
                                     maybe_import,
                                     binding_kind,
                                     is_structural,
-                                ) = parse_let_binding_extended(stmt, &mut ctx)?;
+                                ) = parse_let_binding_extended(
+                                    stmt,
+                                    &mut ctx,
+                                    &preprocessed_file,
+                                    source_file,
+                                )?;
                                 if is_structural {
                                     ctx.structural_bindings.insert(name.clone());
                                 }
@@ -883,7 +945,8 @@ fn parse_with_seeded_bindings_inner(
                                 }
                             }
                             Rule::module_call => {
-                                let call = parse_module_call(stmt, &ctx)?;
+                                let call =
+                                    parse_module_call(stmt, &ctx, &preprocessed_file, source_file)?;
                                 module_calls.push(call);
                             }
                             Rule::anonymous_resource => {
@@ -1036,18 +1099,14 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
     {
         let content = content_pair.as_str();
         for (start, end) in interpolation_like_spans(content) {
-            let (preprocessed_line, column) = line_column_after_prefix(
-                content_pair.as_span().start_pos().line_col(),
-                &content[..start],
-            );
-            let snippet = &content[start..end];
-            let (preprocessed_end_line, end_column) =
-                line_column_after_prefix((preprocessed_line, column), snippet);
+            let content_start = content_pair.as_span().start();
+            let start = preprocessed_file.original_position(content_start + start);
+            let end = preprocessed_file.original_position(content_start + end);
             let span = ParseWarningSpan {
-                start_line: preprocessed_file.original_line(preprocessed_line),
-                start_column: column,
-                end_line: preprocessed_file.original_line(preprocessed_end_line),
-                end_column,
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
             };
             warnings.push(ParseWarning {
                 file: None,
@@ -1077,21 +1136,6 @@ fn interpolation_like_spans(content: &str) -> Vec<(usize, usize)> {
         search_start = end;
     }
     spans
-}
-
-fn line_column_after_prefix(
-    (base_line, base_column): (usize, usize),
-    prefix: &str,
-) -> (usize, usize) {
-    prefix
-        .chars()
-        .fold((base_line, base_column), |(line, column), ch| {
-            if ch == '\n' {
-                (line + 1, 1)
-            } else {
-                (line, column + 1)
-            }
-        })
 }
 
 /// Pre-register `seeds` as lexical bindings in `ctx`.
@@ -1195,12 +1239,20 @@ pub(crate) fn parse_expression_eval(
 /// `load_configuration_with_config`) finalize **after**
 /// `module_resolver::resolve_modules_with_config` so that composition
 /// resources from module expansion are visible to the resolver pass.
-pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
-    let mut parsed = parse(input, &ProviderContext::default())?;
+pub fn parse_file_and_resolve(
+    input: &str,
+    path: &std::path::Path,
+) -> Result<ParsedFile, ParseError> {
+    let mut parsed = parse_file(input, path, &ProviderContext::default())?;
     resolve_resource_refs(&mut parsed)?;
     resolve_provider_unresolved_attributes(&mut parsed, &ProviderContext::default())?;
     finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
+    parse_file_and_resolve(input, std::path::Path::new("test.crn"))
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ pub struct LoadedModule {
 /// Get parsed file info for display (supports both module definitions and root configs)
 pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
     let content = fs::read_to_string(path)?;
-    let parsed = crate::parser::parse(&content, &ProviderContext::default())?;
+    let parsed = crate::parser::parse_file(&content, path, &ProviderContext::default())?;
     Ok(parsed)
 }
 

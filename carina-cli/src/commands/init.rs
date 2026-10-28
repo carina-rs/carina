@@ -29,6 +29,7 @@ pub async fn run_init(
         |install_lock, providers, mode| {
             carina_provider_resolver::resolve_all(install_lock, providers, mode)
                 .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
         },
     )
     .await
@@ -207,8 +208,8 @@ mod tests {
     use super::*;
     use carina_core::provider_source::{ProviderSource, RemoteSource};
     use carina_provider_resolver::{
-        FixtureRegistryHttp, LockEntry, LockEntryKind, LockFile, ProviderTrustClass,
-        TrustedLocalGrants,
+        AssetId, FixtureGithubHttp, FixtureRegistryHttp, LockEntry, LockEntryKind, LockFile,
+        ProviderTrustClass, ReleaseTag, TrustedLocalGrants,
     };
     use std::fs;
 
@@ -293,6 +294,34 @@ mod tests {
                     http,
                 )
                 .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn run_init_with_fixtures(
+        project: &Path,
+        registry_http: &FixtureRegistryHttp,
+        github_http: &FixtureGithubHttp,
+    ) {
+        run_init_with_provider_resolver(
+            project,
+            false,
+            false,
+            false,
+            false,
+            |install_lock, providers, mode| {
+                carina_provider_resolver::resolve_all_with_fixture_clients(
+                    install_lock,
+                    providers,
+                    mode,
+                    registry_http,
+                    github_http,
+                )
+                .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
             },
         )
         .await
@@ -348,8 +377,10 @@ mod tests {
         lock.upsert(LockEntry {
             name: "aws".into(),
             source: source.into(),
-            kind: LockEntryKind::Version {
-                version: version.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: version.parse().unwrap(),
+                tag: serde_json::from_str::<ReleaseTag>(&format!("\"v{version}\"")).unwrap(),
+                asset_id: serde_json::from_str::<AssetId>("42").unwrap(),
                 constraint: None,
             },
             sha256: carina_provider_resolver::sha256_file(&artifact).unwrap(),
@@ -358,19 +389,38 @@ mod tests {
         let lock_path = project.path().join("carina-providers.lock");
         lock.save(&lock_path).unwrap();
         let lock_before = fs::read(&lock_path).unwrap();
-        let origin_url = carina_provider_resolver::download_url_wasm(github_source, version);
-        let http = FixtureRegistryHttp::default().downloadable_bytes(&origin_url, bytes.to_vec());
+        let origin_url = format!(
+            "https://api.github.com/repos/{}/{}/releases/assets/42",
+            github_source.owner(),
+            github_source.repo()
+        );
+        let registry_http = FixtureRegistryHttp::default();
+        let github_http = FixtureGithubHttp::default().bytes(&origin_url, bytes);
 
-        run_init_with_fixture(project.path(), &http).await;
+        run_init_with_fixtures(project.path(), &registry_http, &github_http).await;
 
-        assert_eq!(request_count(&http, &origin_url), 1);
+        assert_eq!(
+            github_http
+                .requested_urls()
+                .iter()
+                .filter(|requested| requested.as_str() == origin_url)
+                .count(),
+            1
+        );
         assert!(tree_contains_file(trust.path()));
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         assert_installed_provider_loads_as_aws(project.path()).await;
 
-        run_init_with_fixture(project.path(), &http).await;
+        run_init_with_fixtures(project.path(), &registry_http, &github_http).await;
 
-        assert_eq!(request_count(&http, &origin_url), 1);
+        assert_eq!(
+            github_http
+                .requested_urls()
+                .iter()
+                .filter(|requested| requested.as_str() == origin_url)
+                .count(),
+            1
+        );
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
     }
 
@@ -449,6 +499,7 @@ mod tests {
                     &http,
                 )
                 .map(|resolved| resolved.len())
+                .map_err(|error| error.to_string())
             },
         )
         .await

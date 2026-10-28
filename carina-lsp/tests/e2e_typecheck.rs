@@ -2,7 +2,7 @@
 //!
 //! Each scenario builds a directory-shaped fixture (`main.crn`,
 //! `exports.crn`, `providers.crn`) under `tempfile::tempdir()` and runs the
-//! LSP `DiagnosticEngine::analyze_with_filename` against it. The point is to
+//! LSP `DiagnosticEngine::analyze` against it. The point is to
 //! catch interaction bugs between parsing, resolution, and schema validation
 //! that the existing per-`AttributeType::validate` unit tests miss — and to
 //! enforce the "directory-scoped, never single-file" rule from `CLAUDE.md`

@@ -1629,8 +1629,9 @@ mod tests {
     }
 
     fn mock_provider_config() -> ProviderConfig {
-        carina_core::parser::parse(
+        carina_core::parser::parse_file(
             "provider mock {}\n",
+            std::path::Path::new("mock_provider_config.crn"),
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()

@@ -10,9 +10,9 @@
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
-    DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule, WarningKind,
-    display_string_literal, evaluate_static_value, first_inner, next_pair, parse_expression,
-    parse_module_call, parse_read_resource_expr, parse_resource_expr,
+    DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, PreprocessedFile,
+    Rule, WarningKind, display_string_literal, evaluate_static_value, first_inner, next_pair,
+    parse_expression, parse_module_call, parse_read_resource_expr, parse_resource_expr,
 };
 use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, UnknownReason, Value};
 
@@ -115,6 +115,8 @@ pub(crate) fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
     binding_name: &str,
+    preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
@@ -206,7 +208,13 @@ pub(crate) fn parse_for_expr(
                     var,
                     EvalValue::computed(item.clone(), metadata),
                 );
-                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -237,7 +245,13 @@ pub(crate) fn parse_for_expr(
                     val_var,
                     EvalValue::computed(item.clone(), metadata),
                 );
-                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -272,7 +286,13 @@ pub(crate) fn parse_for_expr(
                     val_var,
                     EvalValue::computed(val.clone(), metadata),
                 );
-                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                let result = parse_for_body(
+                    body_pair.clone(),
+                    &iter_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 collect(
                     result,
                     address,
@@ -340,9 +360,13 @@ pub(crate) fn parse_for_expr(
             }
 
             let address = format!("{}[?]", binding_name);
-            if let Ok(ForBodyResult::Resource(resource)) =
-                parse_for_body(body_pair, &template_ctx, &address)
-            {
+            if let Ok(ForBodyResult::Resource(resource)) = parse_for_body(
+                body_pair,
+                &template_ctx,
+                &address,
+                preprocessed_file,
+                source_file,
+            ) {
                 let attrs: Vec<(String, Value)> = resource
                     .attributes
                     .iter()
@@ -416,9 +440,13 @@ pub(crate) fn parse_for_expr(
                     }
                 }
                 let address = format!("{}[?]", binding_name);
-                if let Ok(ForBodyResult::Resource(resource)) =
-                    parse_for_body(body_pair, &template_ctx, &address)
-                {
+                if let Ok(ForBodyResult::Resource(resource)) = parse_for_body(
+                    body_pair,
+                    &template_ctx,
+                    &address,
+                    preprocessed_file,
+                    source_file,
+                ) {
                     let attrs: Vec<(String, Value)> = resource
                         .attributes
                         .iter()
@@ -609,6 +637,8 @@ pub(crate) fn parse_for_body(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     address: &str,
+    preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<ForBodyResult, ParseError> {
     let mut local_ctx = ctx.clone();
 
@@ -634,7 +664,8 @@ pub(crate) fn parse_for_body(
                 return Ok(ForBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
-                let mut call = parse_module_call(inner, &local_ctx)?;
+                let mut call =
+                    parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = Some(address.to_string());
                 return Ok(ForBodyResult::ModuleCall(call));
             }
