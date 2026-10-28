@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -27,8 +29,9 @@ use crate::install_lock::{
 };
 use crate::signing;
 use crate::verified_artifact::{
-    DownloadedArtifact, LockArtifactSelection, VerifiedArtifact, VerifiedArtifactError,
-    VersionArtifactPin, lock_artifact_selection, lookup_version_artifact_pin, publish_download,
+    DownloadedArtifact, LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact,
+    VerifiedArtifactError, VersionArtifactPin, lock_artifact_selection,
+    lookup_version_artifact_pin, publish_download,
 };
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -4015,8 +4018,9 @@ impl WasmArtifactPath {
 }
 
 /// An installed provider artifact together with the resolution provenance that
-/// selected it. The path is private so load callers must retain this wrapper
-/// and therefore cannot accidentally separate an artifact from its lock mode.
+/// selected it. [`InstalledProvider::load_with`] gives the loader only the
+/// bytes retained from lookup (and verified there for lock-controlled
+/// artifacts). [`InstalledProvider::path`] is for display and provenance only.
 ///
 /// Lock provenance also has no public attachment constructor:
 ///
@@ -4036,6 +4040,7 @@ enum InstalledArtifact {
     LockFile(VerifiedArtifact),
     File {
         path: WasmArtifactPath,
+        bytes: ProviderArtifactBytes,
         source: String,
     },
 }
@@ -4044,7 +4049,11 @@ impl InstalledProvider {
     pub fn path(&self) -> &WasmArtifactPath {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => artifact.path(),
-            InstalledArtifact::File { path, source: _ } => path,
+            InstalledArtifact::File {
+                path,
+                bytes: _,
+                source: _,
+            } => path,
         }
     }
 
@@ -4054,7 +4063,11 @@ impl InstalledProvider {
                 project_dir: artifact.project_dir().to_path_buf(),
                 pin: artifact.pin().clone(),
             },
-            InstalledArtifact::File { path: _, source } => ProviderArtifactProvenance::File {
+            InstalledArtifact::File {
+                path: _,
+                bytes: _,
+                source,
+            } => ProviderArtifactProvenance::File {
                 source: source.clone(),
             },
         }
@@ -4075,10 +4088,31 @@ impl InstalledProvider {
         path: WasmArtifactPath,
         provider_name: String,
         source: String,
-    ) -> Self {
-        Self {
-            artifact: InstalledArtifact::File { path, source },
+    ) -> Result<Self, String> {
+        let bytes = ProviderArtifactBytes::read(path.as_path()).map_err(|error| {
+            format!(
+                "Failed to read provider artifact {}: {error}",
+                path.as_path().display()
+            )
+        })?;
+        Ok(Self {
+            artifact: InstalledArtifact::File {
+                path,
+                bytes,
+                source,
+            },
             provider_name,
+        })
+    }
+
+    fn artifact_bytes(&self) -> ProviderArtifactBytes {
+        match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => artifact.bytes().clone(),
+            InstalledArtifact::File {
+                path: _,
+                bytes,
+                source: _,
+            } => bytes.clone(),
         }
     }
 
@@ -4088,6 +4122,7 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error,
             provider_name: self.provider_name.clone(),
+            artifact_path: self.path().as_path().to_path_buf(),
             provenance: Box::new(self.provenance()),
         }
     }
@@ -4099,10 +4134,10 @@ impl InstalledProvider {
         loader: F,
     ) -> Result<T, ProviderArtifactLoadError<E>>
     where
-        F: FnOnce(PathBuf) -> Fut,
+        F: FnOnce(ProviderArtifactBytes) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        loader(self.path().as_path().to_path_buf())
+        loader(self.artifact_bytes())
             .await
             .map_err(|error| self.with_load_error(error))
     }
@@ -4191,6 +4226,7 @@ impl fmt::Display for ProviderArtifactProvenance {
 pub struct ProviderArtifactLoadError<E> {
     error: E,
     provider_name: String,
+    artifact_path: PathBuf,
     provenance: Box<ProviderArtifactProvenance>,
 }
 
@@ -4198,8 +4234,11 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}\nProvider: {}\n{}",
-            self.error, self.provider_name, self.provenance
+            "{}\nProvider: {}\nArtifact: {}\n{}",
+            self.error,
+            self.provider_name,
+            self.artifact_path.display(),
+            self.provenance
         )
     }
 }
@@ -6522,11 +6561,7 @@ pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledPro
         return Err(format!("file not found: {file_path}"));
     }
     let path = WasmArtifactPath::new(path, &config.name)?;
-    Ok(InstalledProvider::file_source(
-        path,
-        config.name.clone(),
-        source.to_string(),
-    ))
+    InstalledProvider::file_source(path, config.name.clone(), source.to_string())
 }
 
 fn select_locked_artifact<'lock>(
@@ -6543,12 +6578,10 @@ fn select_locked_artifact<'lock>(
                     lock_file
                         .find_by_source_key(&source_key)
                         .and_then(|lock_entry| match &lock_entry.kind {
-                            LockEntryKind::RegistryRevision { revision, version }
-                                if revision == requested_revision =>
-                            {
-                                let _ = version;
-                                Some(lock_entry)
-                            }
+                            LockEntryKind::RegistryRevision {
+                                revision,
+                                version: _,
+                            } if revision == requested_revision => Some(lock_entry),
                             LockEntryKind::RegistryRevision {
                                 revision: _,
                                 version: _,
@@ -6623,29 +6656,67 @@ fn installed_provider_from_lock(
     ))
 }
 
-/// Check whether the artifact selected for `config` is present on disk.
+/// Cheap filesystem metadata used to detect in-place provider changes without
+/// hashing provider bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMetadataFingerprint {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    pub dev: u64,
+    #[cfg(unix)]
+    pub ino: u64,
+}
+
+/// Metadata for the selected provider artifact and its project lock file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderArtifactFingerprint {
+    pub artifact: Option<FileMetadataFingerprint>,
+    pub lock_file: Option<FileMetadataFingerprint>,
+}
+
+fn file_metadata_fingerprint(path: &Path) -> Option<FileMetadataFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(FileMetadataFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        dev: metadata.dev(),
+        #[cfg(unix)]
+        ino: metadata.ino(),
+    })
+}
+
+/// Observe the artifact selected for `config` and `carina-providers.lock`.
 ///
 /// This intentionally does not hash bytes or construct an [`InstalledProvider`].
 /// It is suitable for frequent drift polling; actual loads still go through
 /// [`find_installed_provider`] and lock-pin verification.
-pub fn provider_artifact_present(base_dir: &Path, config: &ProviderConfig) -> bool {
-    let Some(source) = config.source.as_ref() else {
-        return false;
-    };
-    match source {
+pub fn provider_artifact_fingerprint(
+    base_dir: &Path,
+    config: &ProviderConfig,
+) -> ProviderArtifactFingerprint {
+    let lock_file = file_metadata_fingerprint(&provider_lock_path(base_dir));
+    let artifact = config.source.as_ref().and_then(|source| match source {
         ProviderSource::File(file_source) => {
             WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)
-                .is_ok_and(|path| path.as_path().is_file())
+                .ok()
+                .and_then(|path| file_metadata_fingerprint(path.as_path()))
         }
         ProviderSource::Remote(remote_source) => {
-            let Ok(Some(lock_file)) = load_lock_file(base_dir) else {
-                return false;
-            };
-            select_locked_artifact(base_dir, config, remote_source, &lock_file)
+            let loaded_lock = load_lock_file(base_dir).ok().flatten()?;
+            select_locked_artifact(base_dir, config, remote_source, &loaded_lock)
                 .ok()
                 .flatten()
-                .is_some_and(|selection| selection.path.as_path().exists())
+                .and_then(|selection| file_metadata_fingerprint(selection.path.as_path()))
         }
+    });
+    ProviderArtifactFingerprint {
+        artifact,
+        lock_file,
     }
 }
 
@@ -6669,11 +6740,11 @@ pub fn find_installed_provider(
             let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
             if dest.as_path().exists() {
-                return Ok(InstalledProvider::file_source(
+                return InstalledProvider::file_source(
                     dest,
                     config.name.clone(),
                     source.to_string(),
-                ));
+                );
             }
             return Err(format!(
                 "not installed. Run `{}`",
@@ -17353,9 +17424,15 @@ transparency_log_present = false
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
 
+        let fingerprint =
+            provider_artifact_fingerprint(project.path(), &provider_config(source, None));
         assert!(
-            provider_artifact_present(project.path(), &provider_config(source, None)),
-            "the drift probe must observe presence without hashing provider bytes"
+            fingerprint.artifact.is_some(),
+            "the drift probe must observe artifact metadata without hashing provider bytes"
+        );
+        assert!(
+            fingerprint.lock_file.is_some(),
+            "the drift probe must observe lock-file metadata"
         );
         let error = find_installed_provider(project.path(), &provider_config(source, None))
             .expect_err("the runtime loader must verify lock-controlled provider bytes");
@@ -17371,26 +17448,38 @@ transparency_log_present = false
     }
 
     #[test]
-    fn provider_artifact_present_checks_direct_file_path_and_wasm_extension() {
+    fn provider_artifact_fingerprint_checks_direct_file_path_and_wasm_extension() {
         let project = tempfile::tempdir().unwrap();
         let wasm = project.path().join("local.wasm");
         let native = project.path().join("local-provider");
         fs::write(&wasm, b"local wasm").unwrap();
         fs::write(&native, b"native binary").unwrap();
 
-        assert!(provider_artifact_present(
-            project.path(),
-            &provider_config(&format!("file://{}", wasm.display()), None),
-        ));
-        assert!(!provider_artifact_present(
-            project.path(),
-            &provider_config(&format!("file://{}", native.display()), None),
-        ));
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", wasm.display()), None),
+            )
+            .artifact
+            .is_some()
+        );
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", native.display()), None),
+            )
+            .artifact
+            .is_none()
+        );
         fs::remove_file(&wasm).unwrap();
-        assert!(!provider_artifact_present(
-            project.path(),
-            &provider_config(&format!("file://{}", wasm.display()), None),
-        ));
+        assert!(
+            provider_artifact_fingerprint(
+                project.path(),
+                &provider_config(&format!("file://{}", wasm.display()), None),
+            )
+            .artifact
+            .is_none()
+        );
     }
 
     #[test]
@@ -17429,6 +17518,68 @@ transparency_log_present = false
                 },
             }
         );
+    }
+
+    #[tokio::test]
+    async fn load_with_keeps_lock_verified_bytes_after_artifact_is_replaced() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let original_bytes = b"verified installed provider";
+        let swapped_bytes = b"provider swapped after verification";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, original_bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(original_bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        let installed = find_installed_provider(project.path(), &provider_config(source, None))
+            .expect("the lock-matching provider should be loadable");
+        fs::write(&wasm_path, swapped_bytes).unwrap();
+
+        let loaded = installed
+            .load_with(|bytes| async move {
+                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, original_bytes);
+        assert_ne!(loaded, swapped_bytes);
+    }
+
+    #[tokio::test]
+    async fn load_with_keeps_file_source_bytes_after_source_is_replaced() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let original_bytes = b"local provider at lookup";
+        let swapped_bytes = b"local provider swapped after lookup";
+        fs::write(&source_path, original_bytes).unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+
+        let installed = find_file_provider_source(&config)
+            .expect("the file provider should be loadable at lookup");
+        fs::write(&source_path, swapped_bytes).unwrap();
+
+        let loaded = installed
+            .load_with(|bytes| async move {
+                Ok::<_, std::convert::Infallible>(bytes.as_bytes().to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, original_bytes);
+        assert_ne!(loaded, swapped_bytes);
     }
 
     #[test]
@@ -17666,6 +17817,7 @@ transparency_log_present = false
         let rendered = error.to_string();
 
         assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
+        assert!(rendered.contains(&format!("Artifact: {}", wasm_path.display())));
         assert!(rendered.contains("provider resolved from"));
         assert!(rendered.contains("carina-providers.lock"));
         assert!(rendered.contains("revision main"));
@@ -17692,6 +17844,7 @@ transparency_log_present = false
             .with_load_error("Failed to instantiate WASM component (HTTP)")
             .to_string();
 
+        assert!(rendered.contains(&format!("Artifact: {}", installed_path.display())));
         assert!(rendered.contains(&format!("provider resolved from {source}")));
         assert!(rendered.contains("not controlled by carina-providers.lock"));
         assert!(!rendered.contains("if this lock is stale"));

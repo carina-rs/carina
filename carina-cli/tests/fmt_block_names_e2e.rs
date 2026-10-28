@@ -86,7 +86,12 @@ fn formatting_factory_builder() -> FactoryBuilder {
         let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(FormattingFactory)];
         let fingerprint = configs
             .iter()
-            .map(|(_, config)| (config.name.clone(), true))
+            .map(|(_, config)| {
+                (
+                    config.name.clone(),
+                    carina_provider_resolver::ProviderArtifactFingerprint::default(),
+                )
+            })
             .collect();
         (factories, HashMap::new(), fingerprint)
     })

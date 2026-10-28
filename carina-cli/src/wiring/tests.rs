@@ -7205,9 +7205,14 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     };
     let installed = carina_provider_resolver::find_installed_provider(base, &config).unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let cache_path = cache.path().to_path_buf();
 
-    let error = match load_installed_wasm_provider_using(&installed, |path| {
-        carina_plugin_host::WasmProviderFactory::new_with_cache_dir(path, cache.path())
+    let error = match load_installed_wasm_provider_using(&installed, |bytes| async move {
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+            bytes.as_bytes(),
+            &cache_path,
+        )
+        .await
     })
     .await
     {
@@ -7218,6 +7223,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
 
     assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
     assert!(rendered.contains("Provider: awscc"));
+    assert!(rendered.contains(&format!("Artifact: {}", wasm_path.display())));
     assert!(rendered.contains("wasi:http/types@0.2.9"));
     assert!(rendered.contains("Host wasi:http version: 0.2.6"));
     assert!(rendered.contains("carina-providers.lock"));
@@ -7424,6 +7430,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let rendered = error.to_string();
     assert!(rendered.contains("runtime instantiation failed"));
     assert!(rendered.contains("Provider: local"));
+    assert!(rendered.contains(&format!("Artifact: {}", wasm_path.display())));
     assert!(rendered.contains("provider resolved from file://"));
     assert!(rendered.contains("not controlled by carina-providers.lock"));
 }

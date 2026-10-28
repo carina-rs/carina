@@ -1,9 +1,11 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::{ProviderSource, RemoteSource, RemoteSourceKey};
+use sha2::{Digest, Sha256};
 
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
@@ -12,11 +14,35 @@ use crate::provider_resolver::{
 };
 use crate::revision_resolver::cache_path_revision;
 
-/// A provider artifact whose bytes matched an existing lock-file SHA256 pin
-/// when they were hashed.
+/// Provider artifact bytes captured by the resolver.
 ///
-/// Loading reopens the path, so a local writer could still replace the file
-/// between verification and loading; that residual TOCTOU is out of scope.
+/// The private representation prevents callers from attaching resolver-owned
+/// provenance to arbitrary bytes. Cloning this value only clones its `Arc`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderArtifactBytes(Arc<[u8]>);
+
+impl ProviderArtifactBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn read(path: &Path) -> io::Result<Self> {
+        std::fs::read(path).map(|bytes| Self(Arc::from(bytes)))
+    }
+}
+
+impl fmt::Debug for ProviderArtifactBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderArtifactBytes")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+/// A provider artifact that owns the exact bytes matched against an existing
+/// lock-file SHA256 pin.
+///
 /// The fields and constructors are private to this crate, so a raw path cannot
 /// claim lock-file provenance without verification:
 ///
@@ -26,6 +52,7 @@ use crate::revision_resolver::cache_path_revision;
 /// # let path: WasmArtifactPath = panic!();
 /// let artifact = VerifiedArtifact {
 ///     path,
+///     bytes: panic!(),
 ///     sha256: String::new(),
 ///     source: "github.com/carina-rs/carina-provider-aws".into(),
 ///     project_dir: PathBuf::from("."),
@@ -38,6 +65,7 @@ use crate::revision_resolver::cache_path_revision;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedArtifact {
     path: WasmArtifactPath,
+    bytes: ProviderArtifactBytes,
     sha256: String,
     source: String,
     project_dir: PathBuf,
@@ -195,6 +223,10 @@ impl VerifiedArtifact {
         &self.sha256
     }
 
+    pub(crate) fn bytes(&self) -> &ProviderArtifactBytes {
+        &self.bytes
+    }
+
     pub(crate) fn source(&self) -> &str {
         &self.source
     }
@@ -248,9 +280,12 @@ impl VerifiedArtifact {
         project_dir: &Path,
         pin: LockedProviderPin,
     ) -> Result<Self, VerifiedArtifactError> {
-        let actual_sha256 = sha256_file(bytes_path).map_err(|error| {
+        let bytes = ProviderArtifactBytes::read(bytes_path).map_err(|error| {
             VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
         })?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes.as_bytes());
+        let actual_sha256 = format!("{:x}", hasher.finalize());
         if actual_sha256 != lock_entry.sha256 {
             return Err(VerifiedArtifactError::ChecksumMismatch(Box::new(
                 ChecksumMismatch {
@@ -265,6 +300,7 @@ impl VerifiedArtifact {
         }
         Ok(Self {
             path: published_path,
+            bytes,
             sha256: actual_sha256,
             source: lock_entry.source.clone(),
             project_dir: project_dir.to_path_buf(),
@@ -285,18 +321,14 @@ pub(crate) fn lookup_version_artifact_pin<'a>(
             LockEntryKind::Version {
                 version: locked_version,
                 constraint,
-            } if locked_version == version => Some((
+            } => Some((
                 entry,
                 VersionArtifactPin {
                     version: locked_version.clone(),
                     constraint: constraint.clone(),
                 },
             )),
-            LockEntryKind::Version {
-                version: _,
-                constraint: _,
-            }
-            | LockEntryKind::Revision {
+            LockEntryKind::Revision {
                 revision: _,
                 resolved_sha: _,
             }
