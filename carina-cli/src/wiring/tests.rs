@@ -5446,16 +5446,17 @@ fn validate_rejects_empty_interpolation_nested_in_list() {
 
 #[test]
 fn validate_rejects_empty_interpolation_in_export_value() {
-    use carina_core::parser::ParsedExportParam;
     use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let parsed = ParsedFile {
-        export_params: vec![ParsedExportParam::new("url".to_string(), None, Some(bad))],
-        ..ParsedFile::default()
-    };
+    let mut parsed = carina_core::parser::parse(
+        "exports { url = 'placeholder' }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("authored export fixture must parse");
+    parsed.export_params[0].value = Some(bad);
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -5477,20 +5478,17 @@ fn validate_rejects_empty_interpolation_in_export_value() {
 
 #[test]
 fn validate_rejects_empty_interpolation_in_attribute_param_default() {
-    use carina_core::parser::AttributeParameter;
     use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
     let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
-    let parsed = ParsedFile {
-        attribute_params: vec![AttributeParameter::new(
-            "region".to_string(),
-            None,
-            Some(bad),
-        )],
-        ..ParsedFile::default()
-    };
+    let mut parsed = carina_core::parser::parse(
+        "attributes { region = 'placeholder' }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("authored attribute fixture must parse");
+    parsed.attribute_params[0].value = Some(bad);
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -7621,7 +7619,7 @@ mod resolved_value_constraint_gate {
 
     use carina_core::binding_index::PreApplyInputs;
     use carina_core::effect::PlanOp;
-    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
+    use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
         AppliedIdentifier, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
@@ -7629,8 +7627,8 @@ mod resolved_value_constraint_gate {
         ready_noop,
     };
     use carina_core::resource::{
-        AccessPath, Composition, CompositionArgument, DataSource, InterpolationPart,
-        ModuleConstraintId, PendingModuleConstraint, Signature, UnknownReason,
+        AccessPath, Composition, DataSource, InterpolationPart, ModuleConstraintId,
+        PendingModuleConstraint, Signature, UnknownReason,
     };
     use carina_core::schema::{TypeError, TypeIdentity};
 
@@ -7969,7 +7967,7 @@ mod resolved_value_constraint_gate {
                     .map(|(name, value)| {
                         (
                             name.to_string(),
-                            CompositionArgument::from_value(value, TypeExpr::String),
+                            serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap(),
                         )
                     })
                     .collect(),

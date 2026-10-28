@@ -4259,7 +4259,7 @@ exports { region: String = "ap-northeast-1" }"#,
 #[cfg(test)]
 mod run_plan_out_tests {
     use super::*;
-    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
+    use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
         AccessPath, Composition, CompositionArgument, DataSource, DeferredValue,
@@ -4275,6 +4275,10 @@ mod run_plan_out_tests {
             .file()
             .expect("file image requested")
             .clone()
+    }
+
+    fn saved_composition_argument(value: Value) -> CompositionArgument {
+        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
     }
 
     fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
@@ -4777,10 +4781,7 @@ mod run_plan_out_tests {
         let mut arguments = indexmap::IndexMap::new();
         arguments.insert(
             "name".to_string(),
-            CompositionArgument::from_value(
-                Value::resource_ref("producer", "name", vec![]),
-                TypeExpr::String,
-            ),
+            saved_composition_argument(Value::resource_ref("producer", "name", vec![])),
         );
         let prepared = Composition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(

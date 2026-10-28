@@ -1890,7 +1890,7 @@ mod tests {
         parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -1914,7 +1914,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "zone_id".to_string(),
                 None,
                 // `lookup` returns Any: inference fails, sentinel produced.
@@ -1945,7 +1945,7 @@ mod tests {
         parsed.resources.push(resource); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -1984,7 +1984,7 @@ mod tests {
         parsed.resources.push(resource); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2014,7 +2014,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 Some(TypeExpr::Simple("vpc_id".to_string())),
                 Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
@@ -2089,7 +2089,7 @@ mod tests {
         parsed.compositions.push(virt); // allow: direct — fixture test inspection
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "role_id".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2132,7 +2132,7 @@ mod tests {
         ));
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "role_arn".to_string(),
                 None,
                 Some(Value::resource_ref(
@@ -2159,7 +2159,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
-            .push(crate::parser::ParsedExportParam::new(
+            .push(crate::parser::ParsedExportParam::dummy(
                 "vpc_id".to_string(),
                 None,
                 None,

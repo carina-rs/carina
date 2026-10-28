@@ -593,15 +593,15 @@ fn find_duplicate_attrs_in_pair<'source>(
             // only changes text from `<<` to the end of its line; a valid
             // marker cannot have a later key on that line, so key columns are
             // unchanged even though only line numbers need remapping here.
-            let (preprocessed_line, column) = key_span.start_pos().line_col();
-            let (_, end_column) = key_span.end_pos().line_col();
-            let first_preprocessed_line = first_span.start_pos().line_col().0;
+            let start = preprocessed_file.original_position(key_span.start());
+            let end = preprocessed_file.original_position(key_span.end());
+            let first = preprocessed_file.original_position(first_span.start());
             results.push(DuplicateAttr {
                 name,
-                line: preprocessed_file.original_line(preprocessed_line),
-                column,
-                end_column,
-                first_line: preprocessed_file.original_line(first_preprocessed_line),
+                line: start.line,
+                column: start.column,
+                end_column: end.column,
+                first_line: first.line,
             });
         } else {
             first_spans.insert(name, key_span);

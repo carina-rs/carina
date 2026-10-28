@@ -78,17 +78,6 @@ pub(crate) fn display_double_quoted_literal_part(value: &str) -> String {
     escape_double_quoted_literal_part(value, true, UnrepresentableControl::EscapeForDisplay)
 }
 
-pub(crate) fn escape_double_quoted_heredoc_part(
-    value: &str,
-    preserve_interpolation: bool,
-) -> String {
-    escape_double_quoted_literal_part(
-        value,
-        !preserve_interpolation,
-        UnrepresentableControl::PreserveAuthored,
-    )
-}
-
 pub(crate) fn parse_string_literal(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<String, ParseError> {

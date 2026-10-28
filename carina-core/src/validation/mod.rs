@@ -769,6 +769,7 @@ pub enum CompositionRefError {
 #[derive(Debug, Clone)]
 pub struct CompositionModuleCallRefError {
     pub argument: String,
+    pub origin: Box<crate::parser::ArgumentOrigin>,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
     pub call: CompositionCall,
@@ -1408,6 +1409,11 @@ pub fn validate_composition_ref_types_with_bindings(
                     errors.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
+                            origin: Box::new(
+                                composition
+                                    .diagnostic_argument_origin(argument_name)
+                                    .expect("live composition arguments retain resolver origin"),
+                            ),
                             path: path.to_owned(),
                             kind,
                             call: call.clone(),

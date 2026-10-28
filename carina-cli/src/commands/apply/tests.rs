@@ -567,6 +567,12 @@ fn deserialize_saved_provider_configs(
     serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
 }
 
+fn saved_composition_argument(value: Value) -> CompositionArgument {
+    let saved_shape: CompositionArgument =
+        serde_json::from_value(serde_json::to_value(string_value("")).unwrap()).unwrap();
+    saved_shape.with_value(value)
+}
+
 fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
     let argument_name = "value";
     Composition {
@@ -577,7 +583,7 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
         signature: Signature {
             arguments: indexmap::IndexMap::from([(
                 argument_name.to_string(),
-                CompositionArgument::from_value(argument, carina_core::parser::TypeExpr::String),
+                saved_composition_argument(argument),
             )]),
             attributes: indexmap::IndexMap::new(),
             pending_constraints: vec![PendingModuleConstraint {

@@ -4,17 +4,36 @@ use crate::parser::ParseError;
 use crate::validation::typecheck::TypeExprValueError;
 use std::path::{Path, PathBuf};
 
+use super::resolver::ModuleCallSystemIdentity;
 use super::validation::ModuleConstraintDiagnostic;
+
+/// Source ownership attached to a resolver error.
+#[derive(Debug, Clone, Copy)]
+pub enum ModuleErrorCallSource<'a> {
+    /// One concrete expansion failed.
+    Failing(&'a ModuleCallSystemIdentity),
+    /// An imported graph failed before one of its calls could be singled out.
+    Owners(&'a [ModuleCallSystemIdentity]),
+    /// The error has no meaningful source-local module-call anchor.
+    Unavailable,
+}
 
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
-    /// Resolver failure owned by a particular import alias in the containing
+    /// Resolver failure owned by concrete call sites in the containing
     /// configuration. Nested wrappers preserve the full import chain; editor
-    /// diagnostics anchor at the outermost owner.
+    /// diagnostics anchor at the outermost source identities.
     #[error("{error}")]
-    OwnedByImport {
-        import: String,
+    OwnedByCalls {
+        calls: Vec<ModuleCallSystemIdentity>,
+        error: Box<ModuleError>,
+    },
+
+    /// Failure raised while expanding one concrete call site.
+    #[error("{error}")]
+    AtCall {
+        call: ModuleCallSystemIdentity,
         error: Box<ModuleError>,
     },
 
@@ -123,26 +142,74 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
-    pub(crate) fn with_owning_import(self, import: impl Into<String>) -> Self {
-        Self::OwnedByImport {
-            import: import.into(),
+    pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallSystemIdentity>) -> Self {
+        if calls.is_empty() {
+            self
+        } else {
+            Self::OwnedByCalls {
+                calls,
+                error: Box::new(self),
+            }
+        }
+    }
+
+    pub(crate) fn with_failing_call(self, call: ModuleCallSystemIdentity) -> Self {
+        Self::AtCall {
+            call,
             error: Box::new(self),
         }
     }
 
-    /// Outermost import alias whose graph produced this failure.
-    pub fn owning_import(&self) -> Option<&str> {
+    /// Outermost typed source ownership for this failure.
+    pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         match self {
-            Self::OwnedByImport { import, .. } => Some(import),
-            _ => None,
+            Self::OwnedByCalls { calls, .. } => ModuleErrorCallSource::Owners(calls),
+            Self::AtCall { call, .. } => ModuleErrorCallSource::Failing(call),
+            Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument { .. }
+            | Self::InvalidArgumentType { .. }
+            | Self::BareStructuralHandleArgument { .. }
+            | Self::ArgumentValueAccess { .. }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { .. }
+            | Self::UnknownArgument { .. }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { .. } => ModuleErrorCallSource::Unavailable,
         }
     }
 
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
-            Self::OwnedByImport { error, .. } => error.root_cause(),
-            error => error,
+            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => error.root_cause(),
+            error @ (Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument { .. }
+            | Self::InvalidArgumentType { .. }
+            | Self::BareStructuralHandleArgument { .. }
+            | Self::ArgumentValueAccess { .. }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { .. }
+            | Self::UnknownArgument { .. }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { .. }) => error,
         }
     }
 

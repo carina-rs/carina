@@ -294,14 +294,14 @@ pub fn top_level_anonymous_resource_spans(
             let Some((provider, resource_type)) = full_type.split_once('.') else {
                 continue;
             };
-            let (preprocessed_line, start_column) = type_pair.as_span().start_pos().line_col();
+            let start = preprocessed_file.original_position(type_pair.as_span().start());
             spans.push(AnonymousResourceSourceSpan {
                 provider: provider.to_string(),
                 resource_type: resource_type.to_string(),
                 span: TopLevelBlockSourceSpan {
-                    start_line: preprocessed_file.original_line(preprocessed_line),
-                    start_column,
-                    end_column: start_column + full_type.chars().count(),
+                    start_line: start.line,
+                    start_column: start.column,
+                    end_column: start.column + full_type.chars().count(),
                 },
             });
         }
@@ -336,11 +336,11 @@ fn top_level_block_spans(
             let Some(keyword) = keyword_for_statement(&block) else {
                 continue;
             };
-            let (preprocessed_line, start_column) = block.as_span().start_pos().line_col();
+            let start = preprocessed_file.original_position(block.as_span().start());
             spans.push(TopLevelBlockSourceSpan {
-                start_line: preprocessed_file.original_line(preprocessed_line),
-                start_column,
-                end_column: start_column + keyword.len(),
+                start_line: start.line,
+                start_column: start.column,
+                end_column: start.column + keyword.len(),
             });
         }
     }
@@ -1062,18 +1062,14 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
     {
         let content = content_pair.as_str();
         for (start, end) in interpolation_like_spans(content) {
-            let (preprocessed_line, column) = line_column_after_prefix(
-                content_pair.as_span().start_pos().line_col(),
-                &content[..start],
-            );
-            let snippet = &content[start..end];
-            let (preprocessed_end_line, end_column) =
-                line_column_after_prefix((preprocessed_line, column), snippet);
+            let content_start = content_pair.as_span().start();
+            let start = preprocessed_file.original_position(content_start + start);
+            let end = preprocessed_file.original_position(content_start + end);
             let span = ParseWarningSpan {
-                start_line: preprocessed_file.original_line(preprocessed_line),
-                start_column: column,
-                end_line: preprocessed_file.original_line(preprocessed_end_line),
-                end_column,
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
             };
             warnings.push(ParseWarning {
                 file: None,
@@ -1103,21 +1099,6 @@ fn interpolation_like_spans(content: &str) -> Vec<(usize, usize)> {
         search_start = end;
     }
     spans
-}
-
-fn line_column_after_prefix(
-    (base_line, base_column): (usize, usize),
-    prefix: &str,
-) -> (usize, usize) {
-    prefix
-        .chars()
-        .fold((base_line, base_column), |(line, column), ch| {
-            if ch == '\n' {
-                (line + 1, 1)
-            } else {
-                (line, column + 1)
-            }
-        })
 }
 
 /// Pre-register `seeds` as lexical bindings in `ctx`.

@@ -18,8 +18,8 @@ mod types;
 mod util;
 
 pub use ast::{
-    ArgumentParameter, AttributeParameter, AuthoredArgumentRef, BackendConfig, BindingName,
-    DeclarationDiagnosticSource, DeferredForExpansionError, DeferredForExpression, ExportParamLike,
+    ArgumentOrigin, ArgumentParameter, AttributeParameter, AuthoredArgumentRef, BackendConfig,
+    BindingName, DeferredForExpansionError, DeferredForExpression, ExportParamLike,
     ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
     ModuleCallDiagnosticSource, MovedAddresses, ParsedExportParam, ParsedFile,
     ParserBindingMetadata, ProviderConfig, RequireBlock, ResourceContext, ResourceRef,
@@ -44,9 +44,7 @@ pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
-pub(crate) use expressions::string_literal::{
-    display_double_quoted_literal_part, escape_double_quoted_heredoc_part, unescape_string,
-};
+pub(crate) use expressions::string_literal::{display_double_quoted_literal_part, unescape_string};
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
 pub use functions::{contains_function_call, provider_context_lookup, validate_custom_type};
 pub(crate) use functions::{evaluate_resolved_user_function, function_argument_as_eval};

@@ -2352,17 +2352,13 @@ awscc.ec2.SecurityGroup {
         let parsed =
             parse_directory_files(&files, &ProviderContext::default()).expect("directory parse");
         let attribute_file = parsed[0].1.parsed();
-        let attribute_source = attribute_file.attribute_params[0]
-            .diagnostic_source()
-            .expect("attribute source");
-        assert_eq!(attribute_source.file, attributes_path);
-        assert_eq!(attribute_source.span.start_line(), 2);
+        let attribute = &attribute_file.attribute_params[0];
+        assert_eq!(attribute.source_file(), Some(attributes_path.as_path()));
+        assert_eq!(attribute.source_span().start_line(), 2);
         let export_file = parsed[1].1.parsed();
-        let export_source = export_file.export_params[0]
-            .diagnostic_source()
-            .expect("export source");
-        assert_eq!(export_source.file, exports_path);
-        assert_eq!(export_source.span.start_line(), 2);
+        let export = &export_file.export_params[0];
+        assert_eq!(export.source_file(), Some(exports_path.as_path()));
+        assert_eq!(export.source_span().start_line(), 2);
     }
 
     fn duplicate_messages(dir: &Path, sources: &[(&str, &str)]) -> Vec<String> {
@@ -2433,7 +2429,7 @@ awscc.ec2.SecurityGroup {
             .into_iter()
             .map(|name| {
                 let parsed = ParsedFile {
-                    export_params: vec![crate::parser::ParsedExportParam::new(
+                    export_params: vec![crate::parser::ParsedExportParam::dummy(
                         "_".to_string(),
                         None,
                         None,

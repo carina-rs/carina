@@ -14,7 +14,8 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentParameter, ModuleArgument, ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, ModuleArgument, ModuleCall, ParsedFile, ProviderContext,
+    TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -722,7 +723,7 @@ fn create_module_with_attributes() -> ParsedFile {
         uses: vec![],
         module_calls: vec![],
         arguments: vec![],
-        attribute_params: vec![AttributeParameter::new(
+        attribute_params: vec![AttributeParameter::dummy(
             "security_group".to_string(),
             None,
             Some(Value::resource_ref(
@@ -1034,7 +1035,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
                 validations: vec![],
             },
         ],
-        attribute_params: vec![AttributeParameter::new(
+        attribute_params: vec![AttributeParameter::dummy(
             "endpoint".to_string(),
             None,
             Some(Value::Concrete(ConcreteValue::String(
@@ -2922,7 +2923,7 @@ fn create_module_with_port_validation() -> ParsedFile {
             type_expr: TypeExpr::Int,
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
-            validations: vec![ValidationBlock::new(
+            validations: vec![ValidationBlock::dummy(
                 ValidateExpr::And(
                     Box::new(ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("port".to_string())),
@@ -2987,7 +2988,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
 
     let mut module = create_module_with_port_validation();
     module.arguments[0].type_expr = TypeExpr::String;
-    module.arguments[0].validations = vec![ValidationBlock::new(
+    module.arguments[0].validations = vec![ValidationBlock::dummy(
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
                 name: "length".to_string(),
@@ -3079,6 +3080,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         provenance: Box::new(CompositionProvenance::expanded(
             inner_call.clone(),
             inner_call,
+            IndexMap::from([("port".to_string(), ArgumentOrigin::Defaulted)]),
         )),
         quoted_string_attrs: HashSet::new(),
     };
@@ -3273,7 +3275,7 @@ fn test_argument_validation_no_message_uses_default() {
             type_expr: TypeExpr::Int,
             default: None,
             description: None,
-            validations: vec![ValidationBlock::new(
+            validations: vec![ValidationBlock::dummy(
                 ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::Var("count".to_string())),
                     op: CompareOp::Gt,
@@ -3336,7 +3338,7 @@ fn test_argument_validation_len_with_list() {
             type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
             default: None,
             description: None,
-            validations: vec![ValidationBlock::new(
+            validations: vec![ValidationBlock::dummy(
                 ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::FunctionCall {
                         name: "len".to_string(),
@@ -3437,7 +3439,7 @@ fn test_require_block_passes() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock::new(
+        requires: vec![RequireBlock::dummy(
             // !enable_https || cert_arn != null
             ValidateExpr::Or(
                 Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
@@ -3516,7 +3518,7 @@ fn test_require_block_fails_with_not_expr() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock::new(
+        requires: vec![RequireBlock::dummy(
             // !enable_https || has_cert
             ValidateExpr::Or(
                 Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
@@ -3587,7 +3589,7 @@ fn test_require_block_len_function() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock::new(
+        requires: vec![RequireBlock::dummy(
             // len(subnet_ids) >= 2
             ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::FunctionCall {
@@ -3681,7 +3683,7 @@ fn test_require_block_multiple_constraints() {
         user_functions: HashMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
-        requires: vec![RequireBlock::new(
+        requires: vec![RequireBlock::dummy(
             // min_size <= max_size
             ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::Var("min_size".to_string())),
@@ -6815,16 +6817,12 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
     let parsed = load_directory_module(temp.path()).expect("directory module");
-    let attribute_source = parsed.attribute_params[0]
-        .diagnostic_source()
-        .expect("attribute source");
-    assert_eq!(attribute_source.file, attributes_path);
-    assert_eq!(attribute_source.span.start_line(), 2);
-    let export_source = parsed.export_params[0]
-        .diagnostic_source()
-        .expect("export source");
-    assert_eq!(export_source.file, exports_path);
-    assert_eq!(export_source.span.start_line(), 2);
+    let attribute = &parsed.attribute_params[0];
+    assert_eq!(attribute.source_file(), Some(attributes_path.as_path()));
+    assert_eq!(attribute.source_span().start_line(), 2);
+    let export = &parsed.export_params[0];
+    assert_eq!(export.source_file(), Some(exports_path.as_path()));
+    assert_eq!(export.source_span().start_line(), 2);
 }
 
 #[test]

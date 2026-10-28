@@ -8700,8 +8700,9 @@ let inst = m { nn = 1 }
 
     assert_eq!(call.source_span().start_line(), 8);
     assert_eq!(
-        call.argument_source_span("nn")
-            .expect("argument key span")
+        call.authored_argument("nn")
+            .expect("authored argument")
+            .key_span()
             .start_line(),
         8
     );
@@ -8723,11 +8724,146 @@ EOT
 
     assert_eq!(call.source_span().start_line(), 1);
     assert_eq!(
-        call.argument_source_span("nn")
-            .expect("argument key span")
+        call.authored_argument("nn")
+            .expect("authored argument")
+            .key_span()
             .start_line(),
         6
     );
+}
+
+#[test]
+fn module_call_heredoc_value_span_uses_original_coordinates_and_bytes() {
+    let input = "let inst = m {\n  doc = <<EOT\nalpha\nbeta\nEOT\n}\n";
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let call = parsed.module_calls.first().expect("module call");
+    let span = call
+        .authored_argument("doc")
+        .expect("authored heredoc argument")
+        .value_span();
+
+    let expected_start = input.find("<<EOT").expect("opening marker");
+    let closing_start = input.rfind("\nEOT").expect("closing marker") + 1;
+    let expected_end = closing_start + "EOT".len();
+
+    assert_eq!(span.start_byte(), expected_start);
+    assert_eq!(span.end_byte(), expected_end);
+    assert_eq!(span.start_line(), 2);
+    assert_eq!(span.start_column(), 9);
+    assert_eq!(span.end_line(), 5);
+    assert_eq!(span.end_column(), 4);
+}
+
+fn assert_module_argument_span(
+    input: &str,
+    argument: &str,
+    expected: (usize, usize, usize, usize, usize, usize),
+) {
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let span = parsed
+        .module_calls
+        .first()
+        .expect("module call")
+        .authored_argument(argument)
+        .expect("authored argument")
+        .value_span();
+    assert_eq!(
+        (
+            span.start_byte(),
+            span.end_byte(),
+            span.start_line(),
+            span.start_column(),
+            span.end_line(),
+            span.end_column(),
+        ),
+        expected,
+    );
+}
+
+#[test]
+fn module_call_indented_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<-EOT\n    alpha\n      beta\n    EOT\n}\n",
+        "doc",
+        (23, 58, 2, 9, 5, 8),
+    );
+}
+
+#[test]
+fn module_call_literal_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<'EOT'\n${name}\nEOT\n}\n",
+        "doc",
+        (23, 42, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_call_empty_heredoc_span_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nEOT\n}\n",
+        "doc",
+        (23, 32, 2, 9, 3, 4),
+    );
+}
+
+#[test]
+fn module_call_crlf_heredoc_span_stops_at_the_closing_marker() {
+    assert_module_argument_span(
+        "let inst = m {\r\n  doc = <<EOT\r\nalpha\r\nEOT\r\n}\r\n",
+        "doc",
+        (24, 41, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_call_multibyte_heredoc_span_uses_byte_and_character_coordinates() {
+    assert_module_argument_span(
+        "let inst = m { label = '日本' doc = <<EOT\né🙂\nEOT\n}\n",
+        "doc",
+        (38, 54, 1, 35, 3, 4),
+    );
+}
+
+#[test]
+fn module_call_heredoc_span_excludes_closing_marker_trailing_spaces() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nalpha\nEOT  \n}\n",
+        "doc",
+        (23, 38, 2, 9, 4, 4),
+    );
+}
+
+#[test]
+fn module_argument_after_heredoc_uses_exact_original_position() {
+    assert_module_argument_span(
+        "let inst = m {\n  doc = <<EOT\nx\nEOT\n  after = \"ok\"\n}\n",
+        "after",
+        (45, 49, 5, 11, 5, 15),
+    );
+}
+
+#[test]
+fn authored_spans_share_trailing_whitespace_semantics_across_sites() {
+    let input = "attributes {\n  output = {\n    enabled = true\n  }   \n}\nlet inst = m {\n  options = {\n    enabled = true\n  }   \n}\n";
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+
+    let declaration = parsed
+        .attribute_params
+        .first()
+        .expect("attribute declaration")
+        .source_span();
+    let argument = parsed
+        .module_calls
+        .first()
+        .expect("module call")
+        .authored_argument("options")
+        .expect("authored argument")
+        .value_span();
+
+    assert_eq!((declaration.end_line(), declaration.end_column()), (4, 4));
+    assert_eq!((argument.end_line(), argument.end_column()), (9, 4));
 }
 
 #[test]
@@ -10641,7 +10777,7 @@ fn type_expr_unknown_serde_round_trips() {
 
 #[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p = ParsedExportParam::new("vpc_id".to_string(), None, None);
+    let p = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
     assert!(p.type_expr.is_none());
 }
 

@@ -209,5 +209,5 @@ pub(in crate::parser) fn parse_require_statement(
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
     let raw = message_pair.as_str();
     let error_message = raw[1..raw.len() - 1].to_string();
-    Ok(RequireBlock::new(condition, error_message).with_source_span(source_span))
+    Ok(RequireBlock::new(condition, error_message, source_span))
 }

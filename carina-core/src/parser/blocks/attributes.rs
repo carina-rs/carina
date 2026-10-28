@@ -66,11 +66,6 @@ pub(in crate::parser) fn parse_arguments_block(
                                     default = Some(parse_expression(expr_pair, ctx)?);
                                 }
                                 Rule::arg_validation_block => {
-                                    let source_span = SourceSpan::from_pest(
-                                        inner_attr.as_span(),
-                                        preprocessed_file,
-                                    );
-                                    let mut condition_source_span = None;
                                     let mut rule = None;
                                     let mut error_msg = None;
                                     for vattr in inner_attr.into_inner() {
@@ -87,15 +82,14 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validate_expr",
                                                         "validation_condition_attr",
                                                     )?;
-                                                    condition_source_span =
-                                                        Some(SourceSpan::from_pest(
-                                                            validate_pair.as_span(),
-                                                            preprocessed_file,
-                                                        ));
-                                                    rule = Some(parse_validate_expr(
-                                                        validate_pair,
-                                                        ctx,
-                                                    )?);
+                                                    let source_span = SourceSpan::from_pest(
+                                                        validate_pair.as_span(),
+                                                        preprocessed_file,
+                                                    );
+                                                    rule = Some((
+                                                        parse_validate_expr(validate_pair, ctx)?,
+                                                        source_span,
+                                                    ));
                                                 }
                                                 Rule::validation_error_message_attr => {
                                                     let string_pair = first_inner(
@@ -116,13 +110,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                             }
                                         }
                                     }
-                                    if let Some(condition) = rule {
-                                        validations.push(
-                                            ValidationBlock::new(condition, error_msg)
-                                                .with_source_span(
-                                                    condition_source_span.unwrap_or(source_span),
-                                                ),
-                                        );
+                                    if let Some((condition, source_span)) = rule {
+                                        validations.push(ValidationBlock::new(
+                                            condition,
+                                            error_msg,
+                                            source_span,
+                                        ));
                                     }
                                 }
                                 _ => {}
@@ -212,9 +205,7 @@ pub(in crate::parser) fn parse_attributes_block(
                 (None, value)
             };
 
-            attribute_params.push(
-                AttributeParameter::new(name, type_expr, value).with_source_span(source_span),
-            );
+            attribute_params.push(AttributeParameter::new(name, type_expr, value, source_span));
         }
     }
 
@@ -248,8 +239,7 @@ pub(in crate::parser) fn parse_exports_block(
                 (None, value)
             };
 
-            export_params
-                .push(ExportParameter::new(name, type_expr, value).with_source_span(source_span));
+            export_params.push(ExportParameter::new(name, type_expr, value, source_span));
         }
     }
 

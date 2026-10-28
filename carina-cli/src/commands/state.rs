@@ -2291,7 +2291,7 @@ mod tests {
         provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
     };
     use carina_core::parser::parse;
-    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
+    use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
@@ -2311,6 +2311,10 @@ mod tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn saved_composition_argument(value: Value) -> CompositionArgument {
+        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
     }
 
     fn structural_legacy_secret(hash_hex: &str) -> serde_json::Value {
@@ -3032,10 +3036,9 @@ mod tests {
             signature: Signature {
                 arguments: IndexMap::from([(
                     "value".to_string(),
-                    CompositionArgument::from_value(
-                        Value::Concrete(ConcreteValue::String("bad".into())),
-                        TypeExpr::String,
-                    ),
+                    saved_composition_argument(Value::Concrete(ConcreteValue::String(
+                        "bad".into(),
+                    ))),
                 )]),
                 attributes: IndexMap::new(),
                 pending_constraints: vec![PendingModuleConstraint {
@@ -3116,10 +3119,9 @@ mod tests {
             signature: Signature {
                 arguments: IndexMap::from([(
                     "value".to_string(),
-                    CompositionArgument::from_value(
-                        Value::Concrete(ConcreteValue::String("bad".into())),
-                        TypeExpr::String,
-                    ),
+                    saved_composition_argument(Value::Concrete(ConcreteValue::String(
+                        "bad".into(),
+                    ))),
                 )]),
                 attributes: IndexMap::new(),
                 pending_constraints: vec![PendingModuleConstraint {

@@ -332,11 +332,10 @@ impl SemanticLookup for AttributeParameter {
         merged: &'a ParsedFile,
         current_file: &std::path::Path,
     ) -> Option<&'a Self> {
-        let authored_span = self.source_span()?;
+        let authored_span = self.source_span();
         merged.attribute_params.iter().find(|candidate| {
-            candidate
-                .diagnostic_source()
-                .is_some_and(|source| source.file == current_file && source.span == authored_span)
+            candidate.source_file() == Some(current_file)
+                && candidate.source_span() == authored_span
         })
     }
 
@@ -353,11 +352,10 @@ impl SemanticLookup for ParsedExportParam {
         merged: &'a ParsedFile,
         current_file: &std::path::Path,
     ) -> Option<&'a Self> {
-        let authored_span = self.source_span()?;
+        let authored_span = self.source_span();
         merged.export_params.iter().find(|candidate| {
-            candidate
-                .diagnostic_source()
-                .is_some_and(|source| source.file == current_file && source.span == authored_span)
+            candidate.source_file() == Some(current_file)
+                && candidate.source_span() == authored_span
         })
     }
 
@@ -1264,46 +1262,31 @@ impl DiagnosticEngine {
         base_path: &std::path::Path,
         current_file_name: Option<&str>,
     ) -> Option<Diagnostic> {
-        let owner = error.owning_import();
-        let error = error.root_cause();
         let current_source = current_file_name.map(|name| base_path.join(name));
-        if let carina_core::module_resolver::ModuleError::BareStructuralHandleArgument {
-            module,
-            source_path,
-            ..
-        } = error
-        {
-            let error_source = std::path::Path::new(source_path);
-            let error_source = if error_source.is_absolute() {
-                error_source.to_path_buf()
-            } else {
-                base_path.join(error_source)
-            };
-            if parsed.module_calls.iter().any(|call| {
-                call.module_name == *module
-                    && current_source
-                        .as_ref()
-                        .is_some_and(|current_source| current_source == &error_source)
-            }) {
-                // `check_module_calls` runs the same shared handle-sink check
-                // and can underline the exact argument expression. Keep the
-                // resolver fallback for nested/module-owned failures only.
-                return None;
+        let call_source = error.call_source();
+        let error = error.root_cause();
+
+        if matches!(
+            error,
+            carina_core::module_resolver::ModuleError::BareStructuralHandleArgument { .. }
+        ) && match call_source {
+            carina_core::module_resolver::ModuleErrorCallSource::Failing(identity) => {
+                current_source
+                    .as_deref()
+                    .is_some_and(|current| identity.source_file() == current)
             }
+            carina_core::module_resolver::ModuleErrorCallSource::Owners(_)
+            | carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
+        } {
+            // `check_module_calls` runs the same shared handle-sink check and
+            // can underline the exact argument expression in this document.
+            return None;
         }
+
         let relative_message = error.display_relative_to(base_path);
-        let (
-            constraint_instance,
-            direct_module,
-            direct_error_line,
-            direct_error_source,
-            severity,
-            message,
-        ) = match error {
+        let (constraint_instance, direct_error_location, severity, message) = match error {
             carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
                 Some(diagnostic.instance.as_str()),
-                None,
-                None,
                 None,
                 DiagnosticSeverity::ERROR,
                 relative_message,
@@ -1322,8 +1305,6 @@ impl DiagnosticEngine {
                 (
                     None,
                     None,
-                    None,
-                    None,
                     DiagnosticSeverity::WARNING,
                     format!(
                         "Reference type validation failed: {}",
@@ -1332,65 +1313,78 @@ impl DiagnosticEngine {
                 )
             }
             carina_core::module_resolver::ModuleError::ArgumentValueAccess {
-                module,
                 source_path,
                 line,
                 ..
             }
             | carina_core::module_resolver::ModuleError::BareStructuralHandleArgument {
-                module,
                 source_path,
                 line,
                 ..
             } => (
                 None,
-                Some(module.as_str()),
-                Some(*line),
-                Some(source_path.as_str()),
+                Some((*line, source_path.as_str())),
                 DiagnosticSeverity::ERROR,
                 relative_message,
             ),
             carina_core::module_resolver::ModuleError::Parse(_)
-            | carina_core::module_resolver::ModuleError::ParseInFile { .. } => (
-                None,
-                None,
-                None,
-                None,
-                DiagnosticSeverity::ERROR,
-                relative_message,
-            ),
-            _ => return None,
+            | carina_core::module_resolver::ModuleError::ParseInFile { .. } => {
+                (None, None, DiagnosticSeverity::ERROR, relative_message)
+            }
+            carina_core::module_resolver::ModuleError::OwnedByCalls { .. }
+            | carina_core::module_resolver::ModuleError::AtCall { .. }
+            | carina_core::module_resolver::ModuleError::NotFound(_)
+            | carina_core::module_resolver::ModuleError::CircularImport(_)
+            | carina_core::module_resolver::ModuleError::MissingArgument { .. }
+            | carina_core::module_resolver::ModuleError::InvalidArgumentType { .. }
+            | carina_core::module_resolver::ModuleError::Io(_)
+            | carina_core::module_resolver::ModuleError::UnknownArgument { .. }
+            | carina_core::module_resolver::ModuleError::UnknownModule(_)
+            | carina_core::module_resolver::ModuleError::ProviderInModule
+            | carina_core::module_resolver::ModuleError::StateBlockInModule
+            | carina_core::module_resolver::ModuleError::BackendInModule
+            | carina_core::module_resolver::ModuleError::UpstreamStateInModule
+            | carina_core::module_resolver::ModuleError::ExportsInModule
+            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => return None,
         };
 
-        parsed.module_calls.iter().find_map(|call| {
-            let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
-            let owns_failure = constraint_instance.is_some_and(|instance| {
-                instance == root_instance
-                    || instance
-                        .strip_prefix(&root_instance)
-                        .is_some_and(|suffix| suffix.starts_with('.'))
-            }) || direct_module.is_some_and(|module| call.module_name == module)
-                || owner.is_some_and(|alias| call.module_name == alias);
-            if !owns_failure {
-                return None;
-            }
-            if constraint_instance.is_some_and(|instance| instance == root_instance) {
-                return None;
-            }
-            if direct_module.is_some_and(|module| call.module_name == module)
-                && let Some(line) = direct_error_line.filter(|line| *line > 0)
-                && direct_error_source.is_some_and(|error_source| {
-                    let error_source = std::path::Path::new(error_source);
-                    let error_source = if error_source.is_absolute() {
-                        error_source.to_path_buf()
+        let call = parsed.module_calls.iter().find(|call| {
+            let matches_identity =
+                |identity: &carina_core::module_resolver::ModuleCallSystemIdentity| {
+                    if let Some(current_source) = &current_source {
+                        identity
+                            == &carina_core::module_resolver::ModuleCallSystemIdentity::for_authored_call(
+                                current_source.clone(),
+                                call,
+                            )
                     } else {
-                        base_path.join(error_source)
-                    };
-                    current_source
-                        .as_ref()
-                        .is_some_and(|current_source| error_source == *current_source)
-                })
-            {
+                        identity.call_span() == call.source_span()
+                            && identity.expansion_key() == call.expansion_key()
+                    }
+                };
+            match call_source {
+                carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
+                    matches_identity(failing)
+                }
+                carina_core::module_resolver::ModuleErrorCallSource::Owners(owners) => {
+                    owners.iter().any(matches_identity)
+                }
+                carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
+            }
+        })?;
+        let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
+        if constraint_instance.is_some_and(|instance| instance == root_instance) {
+            return None;
+        }
+
+        if let Some((line, error_source)) = direct_error_location.filter(|(line, _)| *line > 0) {
+            let error_source = std::path::Path::new(error_source);
+            let error_source = if error_source.is_absolute() {
+                error_source.to_path_buf()
+            } else {
+                base_path.join(error_source)
+            };
+            if current_source.as_deref() == Some(error_source.as_path()) {
                 let line = (line as u32).saturating_sub(1);
                 let width = doc
                     .text()
@@ -1398,18 +1392,13 @@ impl DiagnosticEngine {
                     .nth(line as usize)
                     .map_or(1, |source| source.chars().count().max(1))
                     as u32;
-                return Some(carina_diagnostic(line, 0, width, severity, message.clone()));
+                return Some(carina_diagnostic(line, 0, width, severity, message));
             }
-            let (line, col) = module_call_position(call);
-            let width = call.module_name.chars().count() as u32;
-            Some(carina_diagnostic(
-                line,
-                col,
-                col + width,
-                severity,
-                message.clone(),
-            ))
-        })
+        }
+
+        let (line, col) = module_call_position(call);
+        let width = call.module_name.chars().count() as u32;
+        Some(carina_diagnostic(line, col, col + width, severity, message))
     }
 
     /// Check tag-key casing against the directory-wide CLI population while
@@ -2057,21 +2046,21 @@ impl DiagnosticEngine {
                 continue;
             }
             for outcome in &report.outcomes {
-                let carina_core::module_resolver::ResolvedModuleConstraintStatus::Failed(failure) =
-                    &outcome.status
+                let carina_core::module_resolver::ResolvedModuleConstraintStatus::Failed {
+                    diagnostic,
+                    origin,
+                } = &outcome.status
                 else {
                     continue;
                 };
-                let span = match &failure.kind {
-                    carina_core::module_resolver::ModuleConstraintKind::ArgumentValidation {
-                        argument,
-                    } => report
-                        .source
-                        .argument_spans
-                        .get(argument)
-                        .copied()
-                        .unwrap_or(report.source.call_span),
-                    carina_core::module_resolver::ModuleConstraintKind::Require => {
+                let span = match origin {
+                    carina_core::module_resolver::ResolvedModuleConstraintOrigin::Argument(
+                        carina_core::parser::ArgumentOrigin::Authored { key_span, .. },
+                    ) => *key_span,
+                    carina_core::module_resolver::ResolvedModuleConstraintOrigin::Argument(
+                        carina_core::parser::ArgumentOrigin::Defaulted,
+                    )
+                    | carina_core::module_resolver::ResolvedModuleConstraintOrigin::Call => {
                         report.source.call_span
                     }
                 };
@@ -2086,7 +2075,7 @@ impl DiagnosticEngine {
                     col,
                     col + width.max(1),
                     DiagnosticSeverity::ERROR,
-                    failure.to_string(),
+                    diagnostic.to_string(),
                 ));
             }
         }
@@ -2227,9 +2216,16 @@ impl DiagnosticEngine {
                 }
             };
 
-            let argument_span = anchor_argument
-                .then(|| authored_call.argument_source_span(&expanded_error.argument))
-                .flatten();
+            let argument_span = if anchor_argument {
+                match *expanded_error.origin {
+                    carina_core::parser::ArgumentOrigin::Authored { key_span, .. } => {
+                        Some(key_span)
+                    }
+                    carina_core::parser::ArgumentOrigin::Defaulted => None,
+                }
+            } else {
+                None
+            };
             let (line, col, width) = if let Some(span) = argument_span {
                 let (line, col) = source_span_position(span);
                 (line, col, expanded_error.argument.chars().count() as u32)
@@ -2567,7 +2563,7 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
-            let fallback;
+            let mut fallback;
             let semantic_param = match semantic_view.lookup(param) {
                 Some(semantic_param) => semantic_param,
                 None => {
@@ -2576,11 +2572,8 @@ impl DiagnosticEngine {
                     else {
                         continue;
                     };
-                    fallback = ParsedExportParam::new(
-                        param.name.clone(),
-                        param.type_expr.clone(),
-                        Some(value.clone()),
-                    );
+                    fallback = param.clone();
+                    fallback.value = Some(value.clone());
                     &fallback
                 }
             };

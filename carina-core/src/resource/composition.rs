@@ -180,7 +180,7 @@ impl CompositionAttribute {
 /// raw [`Value`] into [`Signature::arguments`]; every live construction site
 /// must supply the declared type. The optional storage only keeps saved-plan
 /// deserialization backward-compatible: skipped validation metadata
-/// deserializes as `None`, while [`Self::from_value`] always stores `Some`.
+/// deserializes as `None`, while live resolver construction stores `Some`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompositionArgument {
     operand: StructuralOperand,
@@ -200,7 +200,15 @@ impl CompositionArgument {
         crate::value::contains_redacted_secret(operand.traversal_value())
     }
 
-    pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_value(value: Value, declared_type: TypeExpr) -> Self {
+        Self {
+            operand: StructuralOperand::from_value(value),
+            declared_type: Some(declared_type),
+        }
+    }
+
+    pub(crate) fn from_resolved_value(value: Value, declared_type: TypeExpr) -> Self {
         Self {
             operand: StructuralOperand::from_value(value),
             declared_type: Some(declared_type),
@@ -420,14 +428,20 @@ enum CompositionProvenanceState {
 struct ExpandedCompositionProvenance {
     call: CompositionCall,
     root_call: CompositionCall,
+    argument_origins: IndexMap<String, crate::parser::ArgumentOrigin>,
 }
 
 impl CompositionProvenance {
-    pub fn expanded(call: CompositionCall, root_call: CompositionCall) -> Self {
+    pub fn expanded(
+        call: CompositionCall,
+        root_call: CompositionCall,
+        argument_origins: IndexMap<String, crate::parser::ArgumentOrigin>,
+    ) -> Self {
         Self {
             state: CompositionProvenanceState::Expanded(Box::new(ExpandedCompositionProvenance {
                 call,
                 root_call,
+                argument_origins,
             })),
         }
     }
@@ -452,6 +466,15 @@ impl CompositionProvenance {
             CompositionProvenanceState::Expanded(expanded) => {
                 Some((&mut expanded.call, &mut expanded.root_call))
             }
+            CompositionProvenanceState::Deserialized => None,
+        }
+    }
+
+    pub(crate) fn argument_origins(
+        &self,
+    ) -> Option<&IndexMap<String, crate::parser::ArgumentOrigin>> {
+        match &self.state {
+            CompositionProvenanceState::Expanded(expanded) => Some(&expanded.argument_origins),
             CompositionProvenanceState::Deserialized => None,
         }
     }
@@ -569,6 +592,13 @@ impl Composition {
     pub fn diagnostic_root_call(&self) -> Option<&CompositionCall> {
         self.provenance.calls().map(|(_, root_call)| root_call)
     }
+
+    pub(crate) fn diagnostic_argument_origin(
+        &self,
+        argument: &str,
+    ) -> Option<crate::parser::ArgumentOrigin> {
+        self.provenance.argument_origins()?.get(argument).copied()
+    }
 }
 
 #[cfg(test)]
@@ -587,7 +617,11 @@ mod tests {
                 module_source: Some(format!("../{binding}")),
                 module_directory: None,
             };
-            Box::new(CompositionProvenance::expanded(call.clone(), call))
+            Box::new(CompositionProvenance::expanded(
+                call.clone(),
+                call,
+                IndexMap::new(),
+            ))
         };
         let left = Composition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "call")),

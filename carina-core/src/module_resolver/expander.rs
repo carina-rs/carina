@@ -9,8 +9,8 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    BindingName, DeferredForExpression, ModuleArgument, ModuleCall, ParseError, ParsedFile,
-    WaitBinding,
+    ArgumentOrigin, BindingName, DeferredForExpression, ModuleArgument, ModuleCall, ParseError,
+    ParsedFile, WaitBinding,
 };
 use crate::resource::{
     AccessMissPolicy, Composition, CompositionCall, CompositionProvenance, ConcreteValue,
@@ -21,10 +21,13 @@ use crate::resource::{
 
 use super::error::ModuleError;
 use super::resolver::{
-    ModuleCallConstraintReport, ModuleResolver, ResolvedModuleConstraintOutcome,
+    ModuleCallConstraintReport, ModuleCallSystemIdentity, ModuleResolver,
+    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, TypeResolutionPolicy,
 };
-use super::validation::{ConstraintEvaluation, ModuleConstraints, evaluate_module_constraints};
+use super::validation::{
+    ConstraintEvaluation, ModuleConstraintKind, ModuleConstraints, evaluate_module_constraints,
+};
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// Expand a module call into resources.
@@ -58,6 +61,32 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// boundary). The recursive parser-phase caller
     /// (`resolve_nested_modules`) merges directly.
     pub(super) fn expand_module_call_checked(
+        &self,
+        call: &ModuleCall,
+        instance_prefix: &str,
+        ref_check: &super::resolver::RefCheckWitness,
+        binding_index: Option<&BindingIndex<'_>>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    ) -> Result<ParsedFile, ModuleError> {
+        let result = self.expand_module_call_inner(
+            call,
+            instance_prefix,
+            ref_check,
+            binding_index,
+            resolved_bindings,
+        );
+        match call.source_file() {
+            Some(source_file) => result.map_err(|error| {
+                error.with_failing_call(ModuleCallSystemIdentity::for_authored_call(
+                    source_file.to_path_buf(),
+                    call,
+                ))
+            }),
+            None => result,
+        }
+    }
+
+    fn expand_module_call_inner(
         &self,
         call: &ModuleCall,
         instance_prefix: &str,
@@ -145,24 +174,26 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // per argument plus one) bounds genuinely cyclic shapes
         // (`a = b`, `b = a`); leftover unresolved refs surface to the
         // post-merge scope check as undefined identifiers. #2817.
-        let mut resolved_arguments: HashMap<String, ModuleArgument> = HashMap::new();
+        let mut resolved_arguments: HashMap<String, ResolvedArgument> = HashMap::new();
         let call_line = call.source_span().start_line();
-        let argument_lines: HashMap<String, usize> = module
-            .arguments
-            .iter()
-            .map(|argument| {
-                let line = call
-                    .argument_value_source_span(&argument.name)
-                    .map_or(call_line, |span| span.start_line());
-                (argument.name.clone(), line)
-            })
-            .collect();
         for arg in &module.arguments {
-            let argument = call
-                .argument(&arg.name)
-                .cloned()
-                .or_else(|| arg.default.clone().map(ModuleArgument::new))
-                .unwrap();
+            let argument = match call.authored_argument(&arg.name) {
+                Some(authored) => ResolvedArgument {
+                    argument: authored.argument().clone(),
+                    origin: ArgumentOrigin::Authored {
+                        key_span: authored.key_span(),
+                        value_span: authored.value_span(),
+                    },
+                },
+                None => ResolvedArgument {
+                    argument: ModuleArgument::new(
+                        arg.default
+                            .clone()
+                            .expect("required arguments were checked above"),
+                    ),
+                    origin: ArgumentOrigin::Defaulted,
+                },
+            };
             resolved_arguments.insert(arg.name.clone(), argument);
         }
         let caller_supplied_arguments: HashSet<&str> =
@@ -177,7 +208,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             let snapshot = resolved_arguments.clone();
             let substitutions = ArgumentSubstitutions {
                 arguments: &snapshot,
-                source_lines: &argument_lines,
                 default_line: call_line,
                 caller_source_file: call_source_file,
                 binding_index,
@@ -225,8 +255,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         .map_err(contextualize_access_error)?
                 };
                 let next = ModuleArgument::from_parts(next, next_access);
-                if &next != current {
-                    resolved_arguments.insert(arg.name.clone(), next);
+                if next != current.argument {
+                    resolved_arguments.insert(
+                        arg.name.clone(),
+                        ResolvedArgument {
+                            argument: next,
+                            origin: current.origin,
+                        },
+                    );
                     changed = true;
                 }
             }
@@ -236,7 +272,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
         let argument_substitutions = ArgumentSubstitutions {
             arguments: &resolved_arguments,
-            source_lines: &argument_lines,
             default_line: call_line,
             caller_source_file: call_source_file,
             binding_index,
@@ -253,9 +288,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Type-check argument values against declared types
         for arg in &module.arguments {
             let argument = resolved_arguments.get(&arg.name).unwrap();
-            let line = call
-                .argument_value_source_span(&arg.name)
-                .map_or(call_line, |span| span.start_line());
+            let line = match argument.origin {
+                ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
+                ArgumentOrigin::Defaulted => call_line,
+            };
             let Some(resolved_parameter) =
                 crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config)
                     .map_err(|message| {
@@ -321,15 +357,31 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         }
                         ConstraintEvaluation::Pending => ResolvedModuleConstraintStatus::Pending,
                         ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
-                            ResolvedModuleConstraintStatus::Failed(
-                                evaluated
-                                    .module_diagnostic(
-                                        &call.module_name,
-                                        instance_prefix,
-                                        call.binding_name.as_deref(),
+                            let origin = match evaluated.kind() {
+                                ModuleConstraintKind::ArgumentValidation { argument } => {
+                                    ResolvedModuleConstraintOrigin::Argument(
+                                        resolved_arguments
+                                            .get(argument)
+                                            .expect("validated argument was resolved")
+                                            .origin,
                                     )
-                                    .expect("concrete outcome has a diagnostic"),
-                            )
+                                }
+                                ModuleConstraintKind::Require => {
+                                    ResolvedModuleConstraintOrigin::Call
+                                }
+                            };
+                            ResolvedModuleConstraintStatus::Failed {
+                                diagnostic: Box::new(
+                                    evaluated
+                                        .module_diagnostic(
+                                            &call.module_name,
+                                            instance_prefix,
+                                            call.binding_name.as_deref(),
+                                        )
+                                        .expect("concrete outcome has a diagnostic"),
+                                ),
+                                origin,
+                            }
                         }
                     };
                     ResolvedModuleConstraintOutcome {
@@ -512,8 +564,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         ArgumentSubstitutionPosition::Value,
                     )
                     .map_err(|error| {
-                        let source_file = attr_param.diagnostic_source().map(|source| source.file);
-                        contextualize_access_error(error.with_source_file(source_file.as_deref()))
+                        contextualize_access_error(error.with_source_file(attr_param.source_file()))
                     })?;
                     // Same post-substitution canonicalize as the
                     // resource-attribute path above (#2815 / #2817).
@@ -536,11 +587,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // call-site argument was a value or a structural handle.
             let mut signature_arguments: IndexMap<String, crate::resource::CompositionArgument> =
                 IndexMap::new();
+            let mut signature_argument_origins = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
                     let recorded = match argument.value_ref() {
                         StructuralOperandRef::Value(value) => {
-                            crate::resource::CompositionArgument::from_value(
+                            crate::resource::CompositionArgument::from_resolved_value(
                                 value.clone(),
                                 arg.type_expr.clone(),
                             )
@@ -554,13 +606,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                             handle.clone(),
                         ),
                         StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::CompositionArgument::from_value(
+                            crate::resource::CompositionArgument::from_resolved_value(
                                 access_base.clone(),
                                 arg.type_expr.clone(),
                             )
                         }
                     };
                     signature_arguments.insert(arg.name.clone(), recorded);
+                    signature_argument_origins.insert(arg.name.clone(), argument.origin);
                 }
             }
 
@@ -581,6 +634,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 provenance: Box::new(CompositionProvenance::expanded(
                     expanded_call.clone(),
                     expanded_call.clone(),
+                    signature_argument_origins,
                 )),
                 quoted_string_attrs: HashSet::new(),
             };
@@ -965,10 +1019,23 @@ fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
     }
 }
 
+#[derive(Clone)]
+struct ResolvedArgument {
+    argument: ModuleArgument,
+    origin: ArgumentOrigin,
+}
+
+impl std::ops::Deref for ResolvedArgument {
+    type Target = ModuleArgument;
+
+    fn deref(&self) -> &Self::Target {
+        &self.argument
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ArgumentSubstitutions<'a> {
-    arguments: &'a HashMap<String, ModuleArgument>,
-    source_lines: &'a HashMap<String, usize>,
+    arguments: &'a HashMap<String, ResolvedArgument>,
     default_line: usize,
     caller_source_file: Option<&'a std::path::Path>,
     binding_index: Option<&'a BindingIndex<'a>>,
@@ -981,10 +1048,10 @@ impl<'a> ArgumentSubstitutions<'a> {
     }
 
     fn source_line(self, name: &str) -> usize {
-        self.source_lines
-            .get(name)
-            .copied()
-            .unwrap_or(self.default_line)
+        match self.arguments.get(name).map(|argument| argument.origin) {
+            Some(ArgumentOrigin::Authored { value_span, .. }) => value_span.start_line(),
+            Some(ArgumentOrigin::Defaulted) | None => self.default_line,
+        }
     }
 
     fn get(
@@ -1029,11 +1096,8 @@ fn bind_module_constraints(
     let mut constraints = Vec::new();
     for parameter in &module.arguments {
         for (ordinal, validation) in parameter.validations.iter().enumerate() {
-            let source = validation.diagnostic_source();
-            let line = source
-                .as_ref()
-                .map_or(arguments.default_line, |source| source.span.start_line());
-            let source_file = source.as_ref().map(|source| source.file.clone());
+            let line = validation.source_span().start_line();
+            let source_file = validation.source_file();
             constraints.push(crate::resource::PendingModuleConstraint {
                 id: crate::resource::ModuleConstraintId::argument_validation(
                     &parameter.name,
@@ -1044,7 +1108,7 @@ fn bind_module_constraints(
                     arguments,
                     resolved_bindings,
                     line,
-                    source_file.as_deref(),
+                    source_file,
                 )?,
                 message: validation.error_message.clone().unwrap_or_else(|| {
                     format!("validation failed for argument '{}'", parameter.name)
@@ -1053,11 +1117,8 @@ fn bind_module_constraints(
         }
     }
     for (ordinal, requirement) in module.requires.iter().enumerate() {
-        let source = requirement.diagnostic_source();
-        let line = source
-            .as_ref()
-            .map_or(arguments.default_line, |source| source.span.start_line());
-        let source_file = source.as_ref().map(|source| source.file.clone());
+        let line = requirement.source_span().start_line();
+        let source_file = requirement.source_file();
         constraints.push(crate::resource::PendingModuleConstraint {
             id: crate::resource::ModuleConstraintId::require(ordinal),
             expression: bind_constraint_expression(
@@ -1065,7 +1126,7 @@ fn bind_module_constraints(
                 arguments,
                 resolved_bindings,
                 line,
-                source_file.as_deref(),
+                source_file,
             )?,
             message: requirement.error_message.clone(),
         });
@@ -1510,7 +1571,13 @@ fn prefix_module_composition(
     if let Some(binding) = &call.binding {
         call.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
-    *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
+    let argument_origins = composition
+        .provenance
+        .argument_origins()
+        .expect("nested compositions are produced by live expansion")
+        .clone();
+    *new_virtual.provenance =
+        CompositionProvenance::expanded(call, root_call.clone(), argument_origins);
 
     let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
     new_virtual.id = composition
@@ -1550,10 +1617,10 @@ fn prefix_module_composition(
                     )
                 }
                 StructuralOperandRef::Value(_) => {
-                    crate::resource::CompositionArgument::from_value(value, declared_type)
+                    crate::resource::CompositionArgument::from_resolved_value(value, declared_type)
                 }
                 StructuralOperandRef::Parameter { .. } => {
-                    crate::resource::CompositionArgument::from_value(value, declared_type)
+                    crate::resource::CompositionArgument::from_resolved_value(value, declared_type)
                 }
             };
             check_composition_argument_type(
@@ -1837,17 +1904,20 @@ pub(super) fn substitute_arguments(
     let config = crate::parser::ProviderContext::default();
     let arguments = arguments
         .iter()
-        .map(|(name, value)| (name.clone(), ModuleArgument::new(value.clone())))
-        .collect::<HashMap<_, _>>();
-    let source_lines = arguments
-        .keys()
-        .map(|name| (name.clone(), 1))
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                ResolvedArgument {
+                    argument: ModuleArgument::new(value.clone()),
+                    origin: ArgumentOrigin::Defaulted,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
     substitute_arguments_with_position(
         value,
         ArgumentSubstitutions {
             arguments: &arguments,
-            source_lines: &source_lines,
             default_line: 1,
             caller_source_file: None,
             binding_index: None,
@@ -2737,11 +2807,9 @@ mod tests {
             .extend(["target".to_string(), "module_argument".to_string()]);
 
         let arguments = HashMap::new();
-        let source_lines = HashMap::new();
         let config = crate::parser::ProviderContext::default();
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
-            source_lines: &source_lines,
             default_line: 1,
             caller_source_file: None,
             binding_index: None,
@@ -2786,11 +2854,9 @@ mod tests {
         ]);
 
         let arguments = HashMap::new();
-        let source_lines = HashMap::new();
         let config = crate::parser::ProviderContext::default();
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
-            source_lines: &source_lines,
             default_line: 1,
             caller_source_file: None,
             binding_index: None,
@@ -2828,11 +2894,9 @@ mod tests {
 
         let intra_module_bindings = HashSet::from(["target".to_string(), "roles".to_string()]);
         let arguments = HashMap::new();
-        let source_lines = HashMap::new();
         let config = crate::parser::ProviderContext::default();
         let substitutions = ArgumentSubstitutions {
             arguments: &arguments,
-            source_lines: &source_lines,
             default_line: 1,
             caller_source_file: None,
             binding_index: None,

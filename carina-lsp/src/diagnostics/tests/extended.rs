@@ -4747,8 +4747,8 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use carina_core::binding_index::BindingIndex;
     use carina_core::parser::TypeExpr;
     use carina_core::resource::{
-        Composition, CompositionArgument, CompositionAttribute, CompositionCall,
-        CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
+        Composition, CompositionAttribute, CompositionCall, CompositionProvenance, ConcreteValue,
+        ResourceId, Signature, Value,
     };
     use indexmap::IndexMap;
 
@@ -4760,7 +4760,11 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
-    fn composition(binding: &'static str, call_binding: &str) -> Composition {
+    fn composition(
+        binding: &'static str,
+        call_binding: &str,
+        argument_origins: IndexMap<String, carina_core::parser::ArgumentOrigin>,
+    ) -> Composition {
         let call = CompositionCall {
             module_name: "missing".to_string(),
             binding: Some(call_binding.to_string()),
@@ -4781,7 +4785,11 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             dependency_bindings: Default::default(),
             module_name: "missing".to_string(),
             instance: call_binding.to_string(),
-            provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+            provenance: Box::new(CompositionProvenance::expanded(
+                call.clone(),
+                call,
+                argument_origins,
+            )),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -4795,7 +4803,7 @@ let first = unrelated { }
     let parsed = doc.parsed().expect("fixture must parse");
     let mut binding_input = parsed.clone();
 
-    let mut source = composition("source", "missing-source-call");
+    let mut source = composition("source", "missing-source-call", IndexMap::new());
     source.signature.attributes.insert(
         "sg".to_string(),
         CompositionAttribute::from_value(
@@ -4803,13 +4811,20 @@ let first = unrelated { }
             Some(schema_type("ec2.SecurityGroup")),
         ),
     );
-    let mut consumer = composition("consumer", "missing-consumer-call");
+    let mut consumer = composition(
+        "consumer",
+        "missing-consumer-call",
+        IndexMap::from([(
+            "vpc_id".to_string(),
+            carina_core::parser::ArgumentOrigin::Defaulted,
+        )]),
+    );
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
-        CompositionArgument::from_value(
-            Value::resource_ref("source", "sg", vec![]),
-            schema_type("ec2.Vpc"),
-        ),
+        serde_json::from_value(
+            serde_json::to_value(Value::resource_ref("source", "missing", vec![])).unwrap(),
+        )
+        .unwrap(),
     );
     binding_input.compositions.extend([source, consumer]);
     let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
@@ -5370,6 +5385,136 @@ let child = imported {
 }
 
 #[test]
+fn resolver_error_with_repeated_module_name_anchors_the_failing_call() {
+    let main = "let selector = use { source = './selector' }\n\
+let a = selector { items = ['a', 'b', 'c', 'd', 'e', 'f'] }\n\
+let b = selector { items = ['x', 'y'] }\n";
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "selector/arguments.crn",
+            "arguments { items: list(String) }\n",
+        ),
+        (
+            "selector/resource.crn",
+            "mock.test.resource { name = items[5] }\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("index 5 out of range for list of length 2")
+        })
+        .unwrap_or_else(|| panic!("missing resolver access diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 8), Position::new(2, 16)),
+        "the second call owns the failing argument value"
+    );
+}
+
+#[test]
+fn heredoc_argument_type_diagnostic_anchors_the_argument_key() {
+    let main = r#"let m = use { source = './m' }
+let inst = m {
+  enabled = <<EOT
+yes
+EOT
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("m/arguments.crn", "arguments { enabled: Bool }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message.contains("expected Bool")
+                && diagnostic.message.contains("got string")
+        })
+        .unwrap_or_else(|| panic!("missing heredoc argument type diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 2), Position::new(2, 9)),
+        "type mismatches must underline the argument key"
+    );
+}
+
+fn nested_bare_handle_fixture() -> (DiagnosticEngine, tempfile::TempDir, String) {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.network")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let main = "let a = use { source = './a' }\na {}\n".to_string();
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", &main),
+        ("a/import.crn", "let b = use { source = '../b' }\n"),
+        (
+            "a/body.crn",
+            "let vpc = mock.test.network { name = 'network' }\nb { parent = vpc }\nattributes { ok = 'ok' }\n",
+        ),
+        ("b/arguments.crn", "arguments { parent: String }\n"),
+    ]);
+    (engine, fixture, main)
+}
+
+#[test]
+fn nested_bare_handle_diagnostic_is_anchored_at_the_root_call() {
+    let (engine, fixture, main) = nested_bare_handle_fixture();
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", &main);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing nested bare-handle diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 0), Position::new(1, 1)),
+        "the root call must own a failure raised inside its imported module"
+    );
+}
+
+#[test]
+fn resolver_diagnostic_survives_base_path_without_a_file_name() {
+    let (engine, fixture, main) = nested_bare_handle_fixture();
+    let document = create_document(&main);
+
+    let diagnostics = engine.analyze(&document, Some(fixture.path()));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'vpc' is a resource, not a value")
+        })
+        .unwrap_or_else(|| panic!("missing filename-less resolver diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 0), Position::new(1, 1))
+    );
+}
+
+#[test]
 fn bare_structural_handle_for_string_module_argument_is_an_error() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -5486,6 +5631,11 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
     assert!(
         matching[0].message.contains("'abcd'") && !matching[0].message.contains("enum identifier"),
         "the diagnostic must render the expanded value: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 6)),
+        "an authored argument constraint must underline its key"
     );
 }
 
@@ -5634,9 +5784,9 @@ checked {}
         "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got 'abcdef')"
     );
     assert_eq!(
-        matching[0].range.start.line, 2,
-        "diagnostic: {:#?}",
-        matching[0]
+        matching[0].range,
+        Range::new(Position::new(2, 0), Position::new(2, 10)),
+        "a defaulted argument constraint must underline its owning call"
     );
 }
 
@@ -10094,7 +10244,12 @@ for x in ['a', 'b', 'c'] {
             .all(|calls| calls[0].source_span() == calls[1].source_span())
     );
     assert!(parsed.module_calls.windows(2).all(|calls| {
-        calls[0].argument_source_span("nn") == calls[1].argument_source_span("nn")
+        calls[0]
+            .authored_argument("nn")
+            .map(|argument| argument.key_span())
+            == calls[1]
+                .authored_argument("nn")
+                .map(|argument| argument.key_span())
     }));
 
     let temp = write_tag_key_fixture(&[
@@ -10300,6 +10455,30 @@ fn export_uses_value_resolved_from_sibling_let_binding() {
     assert!(
         warnings.is_empty(),
         "directory-resolved sibling export values must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn authored_export_span_anchors_sibling_resolved_type_warning() {
+    let exports = "exports {\n    count: Int = my_count\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("values.crn", "let my_count = 'wrong'\n"),
+        ("exports.crn", exports),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "exports.crn", exports);
+    let warning = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected Int, got string 'wrong'")
+        })
+        .unwrap_or_else(|| panic!("missing export type warning: {diagnostics:#?}"));
+
+    assert_eq!(
+        warning.range,
+        Range::new(Position::new(1, 4), Position::new(1, 9))
     );
 }
 

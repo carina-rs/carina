@@ -509,34 +509,41 @@ pub struct ArgumentParameter {
 }
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ValidationBlock {
     pub condition: ValidateExpr,
     pub error_message: Option<String>,
-    #[serde(skip)]
     source: DeclarationSource,
 }
 
 impl ValidationBlock {
-    pub fn new(condition: ValidateExpr, error_message: Option<String>) -> Self {
+    pub fn new(
+        condition: ValidateExpr,
+        error_message: Option<String>,
+        source_span: SourceSpan,
+    ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::default(),
+            source: DeclarationSource::authored(source_span),
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
-        self.source.span = Some(span);
-        self
+    #[cfg(test)]
+    pub(crate) fn dummy(condition: ValidateExpr, error_message: Option<String>) -> Self {
+        Self::new(condition, error_message, SourceSpan::dummy())
     }
 
     pub(crate) fn set_source_file(&mut self, file: PathBuf) {
         self.source.file = Some(file);
     }
 
-    pub(crate) fn diagnostic_source(&self) -> Option<DeclarationDiagnosticSource> {
-        self.source.diagnostic_source()
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
+    }
+
+    pub fn source_file(&self) -> Option<&std::path::Path> {
+        self.source.file.as_deref()
     }
 }
 
@@ -597,34 +604,37 @@ pub enum ValidateExpr {
 
 /// A require block: `require <condition>, "error message"`
 /// Used for cross-argument constraints at the module top level.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RequireBlock {
     pub condition: ValidateExpr,
     pub error_message: String,
-    #[serde(skip)]
     source: DeclarationSource,
 }
 
 impl RequireBlock {
-    pub fn new(condition: ValidateExpr, error_message: String) -> Self {
+    pub fn new(condition: ValidateExpr, error_message: String, source_span: SourceSpan) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::default(),
+            source: DeclarationSource::authored(source_span),
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
-        self.source.span = Some(span);
-        self
+    #[cfg(test)]
+    pub(crate) fn dummy(condition: ValidateExpr, error_message: String) -> Self {
+        Self::new(condition, error_message, SourceSpan::dummy())
     }
 
     pub(crate) fn set_source_file(&mut self, file: PathBuf) {
         self.source.file = Some(file);
     }
 
-    pub(crate) fn diagnostic_source(&self) -> Option<DeclarationDiagnosticSource> {
-        self.source.diagnostic_source()
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
+    }
+
+    pub fn source_file(&self) -> Option<&std::path::Path> {
+        self.source.file.as_deref()
     }
 }
 
@@ -638,30 +648,42 @@ pub struct AttributeParameter {
 }
 
 impl AttributeParameter {
-    pub fn new(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+    /// Authored declarations must include their parser-assigned source span.
+    ///
+    /// ```compile_fail
+    /// use carina_core::parser::AttributeParameter;
+    ///
+    /// let _ = AttributeParameter::new("name".to_string(), None, None);
+    /// ```
+    pub fn new(
+        name: String,
+        type_expr: Option<TypeExpr>,
+        value: Option<Value>,
+        source_span: SourceSpan,
+    ) -> Self {
         Self {
             name,
             type_expr,
             value,
-            source: DeclarationSource::default(),
+            source: DeclarationSource::authored(source_span),
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
-        self.source.span = Some(span);
-        self
+    #[cfg(test)]
+    pub(crate) fn dummy(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+        Self::new(name, type_expr, value, SourceSpan::dummy())
     }
 
     pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
         self.source.file = Some(file);
     }
 
-    pub fn diagnostic_source(&self) -> Option<DeclarationDiagnosticSource> {
-        self.source.diagnostic_source()
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
     }
 
-    pub fn source_span(&self) -> Option<SourceSpan> {
-        self.source.span
+    pub fn source_file(&self) -> Option<&std::path::Path> {
+        self.source.file.as_deref()
     }
 }
 
@@ -681,30 +703,35 @@ pub struct ParsedExportParam {
 }
 
 impl ParsedExportParam {
-    pub fn new(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+    pub fn new(
+        name: String,
+        type_expr: Option<TypeExpr>,
+        value: Option<Value>,
+        source_span: SourceSpan,
+    ) -> Self {
         Self {
             name,
             type_expr,
             value,
-            source: DeclarationSource::default(),
+            source: DeclarationSource::authored(source_span),
         }
     }
 
-    pub(crate) fn with_source_span(mut self, span: SourceSpan) -> Self {
-        self.source.span = Some(span);
-        self
+    #[cfg(test)]
+    pub(crate) fn dummy(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+        Self::new(name, type_expr, value, SourceSpan::dummy())
     }
 
     pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
         self.source.file = Some(file);
     }
 
-    pub fn diagnostic_source(&self) -> Option<DeclarationDiagnosticSource> {
-        self.source.diagnostic_source()
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
     }
 
-    pub fn source_span(&self) -> Option<SourceSpan> {
-        self.source.span
+    pub fn source_file(&self) -> Option<&std::path::Path> {
+        self.source.file.as_deref()
     }
 }
 
@@ -1225,6 +1252,17 @@ impl ModuleCall {
         self.arguments.get(name).map(|argument| &argument.argument)
     }
 
+    pub fn authored_argument(&self, name: &str) -> Option<AuthoredArgumentRef<'_>> {
+        self.arguments
+            .get_key_value(name)
+            .map(|(name, argument)| AuthoredArgumentRef {
+                name,
+                argument: &argument.argument,
+                key_span: argument.key_span,
+                value_span: argument.value_span,
+            })
+    }
+
     pub fn contains_argument(&self, name: &str) -> bool {
         self.arguments.contains_key(name)
     }
@@ -1235,26 +1273,11 @@ impl ModuleCall {
             .map(|argument| &mut argument.argument)
     }
 
-    /// Parser-authored key span for one call argument.
-    pub fn argument_source_span(&self, name: &str) -> Option<SourceSpan> {
-        self.arguments.get(name).map(|argument| argument.key_span)
-    }
-
-    /// Parser-authored span for one call argument's value expression.
-    pub fn argument_value_source_span(&self, name: &str) -> Option<SourceSpan> {
-        self.arguments.get(name).map(|argument| argument.value_span)
-    }
-
     /// Source identity retained by a directory-loaded module call.
     pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
         Some(ModuleCallDiagnosticSource {
             file: self.source.file.clone()?,
             call_span: self.source.call_span,
-            argument_spans: self
-                .arguments
-                .iter()
-                .map(|(name, argument)| (name.clone(), argument.key_span))
-                .collect(),
             expansion_key: self.source.expansion_key.clone(),
         })
     }
@@ -1315,18 +1338,15 @@ struct ModuleCallSite {
     expansion_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct DeclarationSource {
     file: Option<std::path::PathBuf>,
-    span: Option<SourceSpan>,
+    span: SourceSpan,
 }
 
 impl DeclarationSource {
-    fn diagnostic_source(&self) -> Option<DeclarationDiagnosticSource> {
-        Some(DeclarationDiagnosticSource {
-            file: self.file.clone()?,
-            span: self.span?,
-        })
+    fn authored(span: SourceSpan) -> Self {
+        Self { file: None, span }
     }
 }
 
@@ -1346,21 +1366,44 @@ pub struct SourceSpan {
     end_column: usize,
 }
 
+/// Source provenance for a resolved module argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentOrigin {
+    Authored {
+        key_span: SourceSpan,
+        value_span: SourceSpan,
+    },
+    Defaulted,
+}
+
 impl SourceSpan {
-    /// Build a parser-authored span while restoring heredoc-collapsed lines.
+    /// Build a parser-authored span while restoring heredoc-collapsed positions.
     pub(in crate::parser) fn from_pest(
         span: pest::Span<'_>,
         file: &crate::parser::PreprocessedFile,
     ) -> Self {
-        let (start_line, start_column) = span.start_pos().line_col();
-        let (end_line, end_column) = span.end_pos().line_col();
+        // Pest's implicit WHITESPACE can be consumed while expression
+        // repetitions probe for another operand. Canonicalize the tail for
+        // every authored span instead of special-casing individual parsers.
+        let start = span.start();
+        let end = start + span.as_str().trim_end().len();
+        Self::from_preprocessed_range(start, end, file)
+    }
+
+    pub(in crate::parser) fn from_preprocessed_range(
+        start_byte: usize,
+        end_byte: usize,
+        file: &crate::parser::PreprocessedFile,
+    ) -> Self {
+        let start = file.original_position(start_byte);
+        let end = file.original_position(end_byte);
         Self {
-            start_byte: span.start(),
-            end_byte: span.end(),
-            start_line: file.original_line(start_line),
-            start_column,
-            end_line: file.original_line(end_line),
-            end_column,
+            start_byte: start.byte,
+            end_byte: end.byte,
+            start_line: start.line,
+            start_column: start.column,
+            end_line: end.line,
+            end_column: end.column,
         }
     }
 
@@ -1401,19 +1444,22 @@ impl SourceSpan {
     }
 }
 
-/// Source identity for a declaration with its required parser-authored span.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeclarationDiagnosticSource {
-    pub file: std::path::PathBuf,
-    pub span: SourceSpan,
-}
-
 /// Source identity carried from parsing through module expansion.
+///
+/// Argument anchors travel with typed resolved arguments, not in a parallel
+/// map keyed by an authored name.
+///
+/// ```compile_fail
+/// use carina_core::parser::ModuleCallDiagnosticSource;
+///
+/// fn name_keyed_anchor(source: &ModuleCallDiagnosticSource) {
+///     let _ = &source.argument_spans;
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleCallDiagnosticSource {
     pub file: std::path::PathBuf,
     pub call_span: SourceSpan,
-    pub argument_spans: HashMap<String, SourceSpan>,
     /// Distinguishes concrete calls expanded from the same authored `for`
     /// body. Direct calls have no expansion key.
     pub expansion_key: Option<String>,

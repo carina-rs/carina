@@ -9,8 +9,6 @@
 //! - `<<'MARKER'` — literal heredoc (`${...}` is NOT expanded)
 //! - `<<-'MARKER'` — literal + indented
 
-use crate::parser::escape_double_quoted_heredoc_part;
-
 /// Result of preprocessing: the transformed source and a list of heredoc
 /// replacements (for the formatter to restore them in the output).
 #[derive(Debug)]
@@ -20,10 +18,271 @@ pub struct PreprocessResult {
     /// Original heredoc texts, in order of replacement.
     /// Each entry is the full heredoc text from `<<MARKER` through the closing `MARKER` line.
     pub heredocs: Vec<String>,
-    /// Maps each 1-indexed line in `source` back to the original 1-indexed
-    /// input line. A multi-line heredoc replacement maps to the line where
-    /// the heredoc started.
-    pub line_map: Vec<usize>,
+    /// Non-identity byte mappings, one per collapsed heredoc. Everywhere else
+    /// maps through the byte delta established by the preceding segment.
+    position_segments: Vec<PositionSegment>,
+    /// Original line starts used to turn restored bytes into line/column
+    /// coordinates by binary search.
+    original_line_starts: Vec<usize>,
+    /// The authored source is needed only when heredocs changed the text.
+    /// Heredoc-free files reuse `source` and allocate no mapping segments.
+    original_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalPosition {
+    pub(crate) byte: usize,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
+}
+
+impl PreprocessResult {
+    pub(crate) fn original_position(&self, preprocessed_byte: usize) -> OriginalPosition {
+        assert!(
+            preprocessed_byte <= self.source.len(),
+            "preprocessed byte must be within the transformed source"
+        );
+        let byte = self.original_byte(preprocessed_byte);
+        let line_index = self
+            .original_line_starts
+            .partition_point(|line_start| *line_start <= byte)
+            .saturating_sub(1);
+        let line_start = self.original_line_starts[line_index];
+        let original_source = self.original_source.as_deref().unwrap_or(&self.source);
+        let column = original_source[line_start..byte].chars().count() + 1;
+        OriginalPosition {
+            byte,
+            line: line_index + 1,
+            column,
+        }
+    }
+
+    fn original_byte(&self, preprocessed_byte: usize) -> usize {
+        let preceding = self
+            .position_segments
+            .partition_point(|segment| segment.preprocessed_start <= preprocessed_byte);
+        if let Some(segment) = preceding
+            .checked_sub(1)
+            .map(|index| &self.position_segments[index])
+        {
+            if preprocessed_byte <= segment.preprocessed_end {
+                return segment.original_byte(preprocessed_byte);
+            }
+            return shift_byte(
+                preprocessed_byte,
+                segment.original_end as isize - segment.preprocessed_end as isize,
+            );
+        }
+        preprocessed_byte
+    }
+}
+
+#[derive(Debug)]
+struct PositionSegment {
+    preprocessed_start: usize,
+    preprocessed_end: usize,
+    mapping_pieces: Vec<MappingPiece>,
+    mapped_end_original: usize,
+    /// Authored byte consumed by the collapsed heredoc, including whitespace
+    /// after the marker but excluding the following newline.
+    original_end: usize,
+}
+
+impl PositionSegment {
+    fn original_byte(&self, preprocessed_byte: usize) -> usize {
+        mapped_original_byte(
+            &self.mapping_pieces,
+            self.preprocessed_end - self.preprocessed_start,
+            self.mapped_end_original,
+            preprocessed_byte - self.preprocessed_start,
+        )
+    }
+}
+
+#[cfg(test)]
+impl PositionSegment {
+    fn mapping_entry_count(&self) -> usize {
+        self.mapping_pieces.len()
+    }
+}
+
+fn shift_byte(byte: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        byte + delta as usize
+    } else {
+        byte - delta.unsigned_abs()
+    }
+}
+
+#[derive(Debug)]
+struct MappedText {
+    text: String,
+    mapping_pieces: Vec<MappingPiece>,
+    end_original: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MappingPiece {
+    output_start: usize,
+    output_end: usize,
+    original_start: usize,
+    original_end: usize,
+    kind: MappingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingKind {
+    Exact,
+    Transformed,
+}
+
+impl MappedText {
+    fn new(initial: usize, capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            mapping_pieces: Vec::new(),
+            end_original: initial,
+        }
+    }
+
+    fn set_boundary(&mut self, byte: usize) {
+        self.end_original = byte;
+    }
+
+    fn start_original(&self) -> usize {
+        self.mapping_pieces
+            .first()
+            .map_or(self.end_original, |piece| piece.original_start)
+    }
+
+    fn original_byte(&self, output_byte: usize) -> usize {
+        mapped_original_byte(
+            &self.mapping_pieces,
+            self.text.len(),
+            self.end_original,
+            output_byte,
+        )
+    }
+
+    fn push_exact(&mut self, text: &str, original_start: usize) {
+        let output_start = self.text.len();
+        let original_end = original_start + text.len();
+        self.set_boundary(original_start);
+        self.text.push_str(text);
+        if text.is_empty() {
+            return;
+        }
+        let output_end = self.text.len();
+        if let Some(previous) = self.mapping_pieces.last_mut()
+            && previous.kind == MappingKind::Exact
+            && previous.output_end == output_start
+            && previous.original_end == original_start
+        {
+            previous.output_end = output_end;
+            previous.original_end = original_end;
+        } else {
+            self.mapping_pieces.push(MappingPiece {
+                output_start,
+                output_end,
+                original_start,
+                original_end,
+                kind: MappingKind::Exact,
+            });
+        }
+        self.set_boundary(original_end);
+    }
+
+    fn push_transformed(&mut self, text: &str, original_start: usize, original_end: usize) {
+        let output_start = self.text.len();
+        self.set_boundary(original_start);
+        self.text.push_str(text);
+        if text.is_empty() {
+            self.set_boundary(original_end);
+            return;
+        }
+        self.mapping_pieces.push(MappingPiece {
+            output_start,
+            output_end: self.text.len(),
+            original_start,
+            original_end,
+            kind: MappingKind::Transformed,
+        });
+        self.set_boundary(original_end);
+    }
+
+    fn push_mapped(&mut self, mapped: &MappedText) {
+        self.push_mapped_range(mapped, 0, mapped.text.len());
+    }
+
+    fn push_mapped_range(&mut self, mapped: &MappedText, start: usize, end: usize) {
+        assert!(start <= end && end <= mapped.text.len());
+        if start == end {
+            self.set_boundary(mapped.original_byte(end));
+            return;
+        }
+
+        let first_piece = mapped
+            .mapping_pieces
+            .partition_point(|piece| piece.output_start <= start)
+            .saturating_sub(1);
+        for piece in &mapped.mapping_pieces[first_piece..] {
+            if piece.output_start >= end {
+                break;
+            }
+            let piece_start = start.max(piece.output_start);
+            let piece_end = end.min(piece.output_end);
+            if piece_start >= piece_end {
+                continue;
+            }
+            let text = &mapped.text[piece_start..piece_end];
+            match piece.kind {
+                MappingKind::Exact => self.push_exact(
+                    text,
+                    piece.original_start + (piece_start - piece.output_start),
+                ),
+                MappingKind::Transformed => {
+                    let original_end = if piece_end == piece.output_end {
+                        piece.original_end
+                    } else {
+                        piece.original_start
+                    };
+                    self.push_transformed(text, piece.original_start, original_end);
+                }
+            }
+        }
+        self.set_boundary(mapped.original_byte(end));
+    }
+}
+
+fn mapped_original_byte(
+    pieces: &[MappingPiece],
+    output_len: usize,
+    end_original: usize,
+    output_byte: usize,
+) -> usize {
+    assert!(output_byte <= output_len);
+    if output_byte == output_len {
+        return end_original;
+    }
+    let piece = &pieces[pieces
+        .partition_point(|piece| piece.output_start <= output_byte)
+        .saturating_sub(1)];
+    debug_assert!(output_byte < piece.output_end);
+    match piece.kind {
+        MappingKind::Exact => piece.original_start + (output_byte - piece.output_start),
+        MappingKind::Transformed => piece.original_start,
+    }
+}
+
+fn line_starts(input: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(
+        input
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
 }
 
 /// Preprocess heredocs in the input, replacing them with double-quoted strings.
@@ -32,18 +291,20 @@ pub struct PreprocessResult {
 /// (for round-trip preservation in the formatter).
 pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError> {
     let lines: Vec<&str> = input.split('\n').collect();
-    let mut result = String::with_capacity(input.len());
+    let original_line_starts = line_starts(input);
+    let mut source = String::with_capacity(input.len());
     let mut heredocs = Vec::new();
-    let mut line_map = Vec::new();
+    let mut position_segments = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
 
         if let Some(heredoc_start) = find_heredoc_start(line) {
-            line_map.push(i + 1);
+            let opening_line = i;
+            let opening_line_start = original_line_starts[opening_line];
             // Emit the part of the line before the heredoc
-            result.push_str(&line[..heredoc_start.prefix_end]);
+            source.push_str(&line[..heredoc_start.prefix_end]);
 
             let marker = heredoc_start.marker;
             let strip_indent = heredoc_start.strip_indent;
@@ -55,7 +316,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
             original.push('\n');
 
             // Collect body lines until we find the closing marker
-            let mut body_lines: Vec<&str> = Vec::new();
+            let mut body_lines: Vec<(usize, &str)> = Vec::new();
             i += 1;
             let mut found_end = false;
 
@@ -68,7 +329,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
                     break;
                 }
                 original.push('\n');
-                body_lines.push(body_line);
+                body_lines.push((i, body_line));
                 i += 1;
             }
 
@@ -81,47 +342,139 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
 
             heredocs.push(original);
 
-            // Build the body string
-            let body = if body_lines.is_empty() {
-                String::new()
-            } else if strip_indent {
-                strip_common_indent(&body_lines)
-            } else {
-                body_lines.join("\n")
-            };
+            let closing_line = i;
+            let closing_line_start = original_line_starts[closing_line];
+            let closing_text = lines[closing_line];
+            let closing_indent = closing_text.len() - closing_text.trim_start().len();
+            let closing_marker_start = closing_line_start + closing_indent;
+            let closing_marker_end = closing_marker_start + marker.len();
 
-            // Escape for embedding in a double-quoted string.
-            // Quoted heredocs (<<'EOT') escape ${...} to prevent interpolation.
-            // Unquoted heredocs (<<EOT) leave ${...} intact for interpolation.
-            let escaped = if quoted {
-                escape_for_double_quote(&body)
-            } else {
-                escape_for_double_quote_interpolating(&body)
-            };
-            result.push('"');
-            result.push_str(&escaped);
-            result.push('"');
+            let body = mapped_heredoc_body(
+                &body_lines,
+                strip_indent,
+                &original_line_starts,
+                closing_marker_start,
+            );
+            let escaped = escape_mapped_heredoc_body(&body, !quoted);
+
+            let opening_start = opening_line_start + heredoc_start.prefix_end;
+            let opening_end = escaped.start_original();
+            let mut placeholder = MappedText::new(opening_start, escaped.text.len() + 2);
+            placeholder.push_transformed("\"", opening_start, opening_end);
+            placeholder.push_mapped(&escaped);
+            placeholder.push_transformed("\"", closing_marker_start, closing_marker_end);
+            let preprocessed_start = source.len();
+            source.push_str(&placeholder.text);
+            position_segments.push(PositionSegment {
+                preprocessed_start,
+                preprocessed_end: source.len(),
+                mapping_pieces: placeholder.mapping_pieces,
+                mapped_end_original: placeholder.end_original,
+                original_end: closing_line_start + closing_text.len(),
+            });
 
             // The closing marker line is consumed; continue with the next line
             i += 1;
             if i < lines.len() {
-                result.push('\n');
+                source.push('\n');
             }
         } else {
-            line_map.push(i + 1);
-            result.push_str(line);
+            source.push_str(line);
             i += 1;
             if i < lines.len() {
-                result.push('\n');
+                source.push('\n');
             }
         }
     }
 
+    let original_source = (!position_segments.is_empty()).then(|| input.to_string());
     Ok(PreprocessResult {
-        source: result,
+        source,
         heredocs,
-        line_map,
+        position_segments,
+        original_line_starts,
+        original_source,
     })
+}
+
+fn common_indent(lines: &[(usize, &str)]) -> usize {
+    lines
+        .iter()
+        .map(|(_, line)| *line)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0)
+}
+
+fn mapped_heredoc_body(
+    lines: &[(usize, &str)],
+    strip_indent: bool,
+    line_starts: &[usize],
+    empty_position: usize,
+) -> MappedText {
+    let indent = if strip_indent {
+        common_indent(lines)
+    } else {
+        0
+    };
+    let first_start = lines
+        .first()
+        .map(|(line_index, line)| {
+            line_starts[*line_index] + heredoc_line_content_start(line, indent)
+        })
+        .unwrap_or(empty_position);
+    let mut body = MappedText::new(first_start, 0);
+
+    for (body_index, (line_index, line)) in lines.iter().enumerate() {
+        let content_start = heredoc_line_content_start(line, indent);
+        body.push_exact(
+            &line[content_start..],
+            line_starts[*line_index] + content_start,
+        );
+        if body_index + 1 < lines.len() {
+            body.push_exact("\n", line_starts[*line_index] + line.len());
+        }
+    }
+
+    body
+}
+
+fn heredoc_line_content_start(line: &str, indent: usize) -> usize {
+    if line.len() >= indent {
+        indent
+    } else {
+        line.len()
+    }
+}
+
+fn escape_mapped_heredoc_body(body: &MappedText, preserve_interpolation: bool) -> MappedText {
+    let mut escaped = MappedText::new(body.start_original(), body.text.len());
+    let mut chars = body.text.char_indices().peekable();
+    let mut unescaped_start = 0;
+    while let Some((start, ch)) = chars.next() {
+        let end = start + ch.len_utf8();
+        let rendered = match ch {
+            '\\' => Some("\\\\"),
+            '"' => Some("\\\""),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            '$' if !preserve_interpolation
+                && chars.peek().is_some_and(|(_, next)| *next == '{') =>
+            {
+                Some("\\$")
+            }
+            _ => None,
+        };
+        if let Some(rendered) = rendered {
+            escaped.push_mapped_range(body, unescaped_start, start);
+            escaped.push_transformed(rendered, body.original_byte(start), body.original_byte(end));
+            unescaped_start = end;
+        }
+    }
+    escaped.push_mapped_range(body, unescaped_start, body.text.len());
+    escaped
 }
 
 /// Restore heredocs in formatted output, replacing placeholder strings back
@@ -153,99 +506,8 @@ pub fn restore_heredocs(formatted: &str, heredocs: &[String]) -> String {
 /// Preprocess a single heredoc text (from `<<MARKER\n...\nMARKER`) into its
 /// placeholder double-quoted string (for matching during restore).
 fn preprocess_single_heredoc(heredoc_text: &str) -> Option<String> {
-    let lines: Vec<&str> = heredoc_text.split('\n').collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let first_line = lines[0];
-    let heredoc_start = find_heredoc_start_in_fragment(first_line)?;
-    let strip_indent = heredoc_start.strip_indent;
-    let quoted = heredoc_start.quoted;
-
-    // Body is everything except first and last lines
-    let body_lines: Vec<&str> = if lines.len() > 2 {
-        lines[1..lines.len() - 1].to_vec()
-    } else {
-        vec![]
-    };
-
-    let body = if body_lines.is_empty() {
-        String::new()
-    } else if strip_indent {
-        strip_common_indent(&body_lines)
-    } else {
-        body_lines.join("\n")
-    };
-
-    let escaped = if quoted {
-        escape_for_double_quote(&body)
-    } else {
-        escape_for_double_quote_interpolating(&body)
-    };
-    Some(format!("\"{}\"", escaped))
-}
-
-/// Find heredoc start in a fragment that begins with `<<MARKER` (used for restore).
-fn find_heredoc_start_in_fragment(line: &str) -> Option<HeredocStart<'_>> {
-    let bytes = line.as_bytes();
-    if bytes.len() < 3 || bytes[0] != b'<' || bytes[1] != b'<' {
-        return None;
-    }
-    let mut j = 2;
-    let strip_indent = j < bytes.len() && bytes[j] == b'-';
-    if strip_indent {
-        j += 1;
-    }
-    let quoted = j < bytes.len() && bytes[j] == b'\'';
-    if quoted {
-        j += 1;
-    }
-    let marker_start = j;
-    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-        j += 1;
-    }
-    let marker = &line[marker_start..j];
-    if marker.is_empty() {
-        return None;
-    }
-    Some(HeredocStart {
-        prefix_end: 0,
-        marker,
-        strip_indent,
-        quoted,
-    })
-}
-
-/// Strip common leading whitespace from lines.
-fn strip_common_indent(lines: &[&str]) -> String {
-    let min_indent = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    lines
-        .iter()
-        .map(|l| {
-            if l.len() >= min_indent {
-                &l[min_indent..]
-            } else {
-                l.trim()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Escape a string for embedding inside double quotes (literal — escapes `${`).
-fn escape_for_double_quote(s: &str) -> String {
-    escape_double_quoted_heredoc_part(s, false)
-}
-
-/// Escape for double quotes but preserve `${...}` for interpolation.
-fn escape_for_double_quote_interpolating(s: &str) -> String {
-    escape_double_quoted_heredoc_part(s, true)
+    let result = preprocess_heredocs(heredoc_text).ok()?;
+    (result.heredocs.len() == 1).then_some(result.source)
 }
 
 /// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`),
@@ -374,6 +636,26 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_free_source_has_no_position_segments() {
+        let result = preprocess_heredocs("x = 'plain'\n").unwrap();
+        assert!(result.position_segments.is_empty());
+    }
+
+    #[test]
+    fn unescaped_heredoc_uses_sparse_position_mapping() {
+        let body = "a".repeat(8 * 1024);
+        let input = format!("x = <<EOT\n{body}\nEOT\n");
+        let result = preprocess_heredocs(&input).unwrap();
+
+        assert_eq!(result.position_segments.len(), 1);
+        assert!(
+            result.position_segments[0].mapping_entry_count() <= 4,
+            "one unescaped body run should not allocate per-byte mappings; got {} entries",
+            result.position_segments[0].mapping_entry_count(),
+        );
+    }
+
+    #[test]
     fn test_indented_heredoc() {
         let input = "x = <<-EOT\n    line1\n    line2\n    EOT\n";
         let result = preprocess_heredocs(input).unwrap();
@@ -438,6 +720,18 @@ mod tests {
         let result = preprocess_heredocs(input).unwrap();
         let restored = restore_heredocs(&result.source, &result.heredocs);
         assert_eq!(restored, input);
+    }
+
+    #[test]
+    fn formatter_restores_unquoted_heredoc_with_the_shared_escaper() {
+        let input = "mock.test.resource {\n  name = <<EOT\npath\\to \\\"${name}\\\"\nEOT\n}\n";
+        let formatted = crate::formatter::format(input, &crate::formatter::FormatConfig::default())
+            .expect("heredoc fixture must format");
+
+        assert!(
+            formatted.contains("<<EOT\npath\\to \\\"${name}\\\"\nEOT"),
+            "formatter must restore the authored heredoc: {formatted}"
+        );
     }
 
     #[test]
