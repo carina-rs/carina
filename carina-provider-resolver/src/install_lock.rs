@@ -6,9 +6,10 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::provider_resolver::{
-    LockFile, LockFileError, LockFileMigration, WasmArtifactPath, provider_lock_path,
+    LockEntry, LockFile, LockFileError, LockFileMigration, WasmArtifactPath, provider_lock_path,
     resolve_lock_file_save_path, resolve_parent, sha256_file,
 };
+use crate::verified_artifact::{VerifiedArtifact, VerifiedArtifactError, publish_cached};
 
 const PROVIDER_INSTALL_LOCK_FILE_NAME: &str = "provider-install.lock";
 
@@ -206,8 +207,41 @@ impl ArtifactTarget<'_> {
 /// The destination is private and publication consumes the stage, so callers can
 /// only make bytes visible through the atomic rename implemented here.
 pub(crate) struct StagedArtifact<'a> {
+    file: StagedFile,
+    install_lock: &'a ProviderInstallLock,
+    destination: WasmArtifactPath,
+}
+
+struct StagedFile {
     file: NamedTempFile,
-    target: ArtifactTarget<'a>,
+    needs_data_sync: bool,
+}
+
+impl StagedFile {
+    fn writable(file: NamedTempFile) -> Self {
+        Self {
+            file,
+            needs_data_sync: true,
+        }
+    }
+
+    fn hard_link(file: NamedTempFile) -> Self {
+        Self {
+            file,
+            needs_data_sync: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    fn sync_data_if_needed(&self) -> io::Result<()> {
+        if self.needs_data_sync {
+            self.file.as_file().sync_all()?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct GlobalArtifactPath(PathBuf);
@@ -236,16 +270,8 @@ impl<'a> StagedArtifact<'a> {
         install_lock: &'a ProviderInstallLock,
         destination: &WasmArtifactPath,
     ) -> io::Result<Self> {
-        let destination = destination.as_path();
-        validate_project_target(install_lock, destination)?;
-        Self::new(ArtifactTarget::Project {
-            _install_lock: install_lock,
-            path: destination.to_path_buf(),
-        })
-    }
-
-    fn new(target: ArtifactTarget<'a>) -> io::Result<Self> {
-        let parent = resolve_parent(target.path());
+        validate_project_target(install_lock, destination.as_path())?;
+        let parent = resolve_parent(destination.as_path());
         fs::create_dir_all(parent)?;
 
         #[cfg(unix)]
@@ -260,19 +286,47 @@ impl<'a> StagedArtifact<'a> {
         #[cfg(not(unix))]
         let file = NamedTempFile::new_in(parent)?;
 
-        Ok(Self { file, target })
+        Ok(Self {
+            file: StagedFile::writable(file),
+            install_lock,
+            destination: destination.clone(),
+        })
+    }
+
+    fn from_source_for_project(
+        install_lock: &'a ProviderInstallLock,
+        source: &Path,
+        destination: &WasmArtifactPath,
+    ) -> io::Result<Self> {
+        validate_project_target(install_lock, destination.as_path())?;
+        let parent = resolve_parent(destination.as_path());
+        fs::create_dir_all(parent)?;
+        let file = stage_artifact_with(source, parent, |source, temporary_path| {
+            fs::hard_link(source, temporary_path)
+        })?;
+        Ok(Self {
+            file,
+            install_lock,
+            destination: destination.clone(),
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
         self.file.path()
     }
 
+    pub(crate) fn destination(&self) -> &WasmArtifactPath {
+        &self.destination
+    }
+
+    pub(crate) fn project_dir(&self) -> &Path {
+        self.install_lock.project_dir()
+    }
+
     pub(crate) fn publish(self) -> io::Result<()> {
-        self.file.as_file().sync_all()?;
-        let parent = resolve_parent(self.target.path()).to_path_buf();
-        self.file
-            .persist(self.target.path())
-            .map_err(|error| error.error)?;
+        self.file.sync_data_if_needed()?;
+        let parent = resolve_parent(self.destination.as_path()).to_path_buf();
+        publish_staged_file(self.file.file, self.destination.as_path())?;
         sync_parent_directory(&parent);
         Ok(())
     }
@@ -280,11 +334,11 @@ impl<'a> StagedArtifact<'a> {
 
 impl Write for StagedArtifact<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.file.write(buffer)
+        self.file.file.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.file.flush()
     }
 }
 
@@ -299,6 +353,20 @@ pub(crate) fn install_project_artifact_atomically(
     };
     validate_project_target(install_lock, target.path())?;
     install_artifact_atomically(source, target)
+}
+
+pub(crate) fn install_project_artifact_from_global_cache<R>(
+    install_lock: &ProviderInstallLock,
+    source: &Path,
+    destination: &WasmArtifactPath,
+    lock_entry: &LockEntry<R>,
+    provider_name: &str,
+) -> Result<VerifiedArtifact, VerifiedArtifactError> {
+    let staged = StagedArtifact::from_source_for_project(install_lock, source, destination)
+        .map_err(|error| {
+            VerifiedArtifactError::Other(format!("Failed to link/copy from global cache: {error}"))
+        })?;
+    publish_cached(staged, lock_entry, provider_name)
 }
 
 pub(crate) fn install_global_artifact_atomically(
@@ -359,45 +427,58 @@ fn install_artifact_atomically_with(
         return sha256_file(source);
     }
 
-    let placeholder = NamedTempFile::new_in(&parent)?;
+    let stage = stage_artifact_with(source, &parent, link)?;
+    stage.sync_data_if_needed()?;
+    let hash = sha256_file(stage.path())?;
+    publish_staged_file(stage.file, target.path())?;
+    sync_parent_directory(&parent);
+    Ok(hash)
+}
+
+fn publish_staged_file(stage: NamedTempFile, destination: &Path) -> io::Result<()> {
+    let staged_path = stage.path().to_path_buf();
+    stage.persist(destination).map_err(|error| error.error)?;
+    match is_same_file(&staged_path, destination) {
+        Ok(true) => match fs::remove_file(staged_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        },
+        Ok(false) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn stage_artifact_with(
+    source: &Path,
+    parent: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<StagedFile> {
+    let placeholder = NamedTempFile::new_in(parent)?;
     let temporary_path = placeholder.into_temp_path();
     fs::remove_file(&temporary_path)?;
 
     match link(source, &temporary_path) {
         Ok(()) => {
-            let hash = sha256_file(&temporary_path)?;
-            let linked_path = temporary_path.to_path_buf();
-            temporary_path
-                .persist(target.path())
-                .map_err(|error| error.error)?;
-            match is_same_file(&linked_path, target.path()) {
-                Ok(true) => match fs::remove_file(linked_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                },
-                Ok(false) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            sync_parent_directory(&parent);
-            Ok(hash)
+            let file = File::open(&temporary_path)?;
+            Ok(StagedFile::hard_link(NamedTempFile::from_parts(
+                file,
+                temporary_path,
+            )))
         }
         Err(link_error) => {
             drop(temporary_path);
-            (|| -> io::Result<String> {
-                let mut stage = NamedTempFile::new_in(&parent)?;
+            (|| -> io::Result<StagedFile> {
+                let mut stage = NamedTempFile::new_in(parent)?;
                 let mut source_file = File::open(source)?;
                 let source_permissions = source_file.metadata()?.permissions();
                 io::copy(&mut source_file, &mut stage)?;
                 stage.as_file().set_permissions(source_permissions)?;
-                stage.as_file().sync_all()?;
-                let hash = sha256_file(stage.path())?;
-                stage.persist(target.path()).map_err(|error| error.error)?;
-                sync_parent_directory(&parent);
-                Ok(hash)
+                Ok(StagedFile::writable(stage))
             })()
-            .map_err(|copy_error: io::Error| {
+            .map_err(|copy_error| {
                 io::Error::new(
                     copy_error.kind(),
                     format!(

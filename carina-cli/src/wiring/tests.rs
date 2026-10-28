@@ -7112,7 +7112,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
             revision: revision.into(),
             resolved_sha: resolved_sha.into(),
         },
-        sha256: "fixture".into(),
+        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -7224,7 +7224,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
             version: version.into(),
             constraint: None,
         },
-        sha256: "fixture".into(),
+        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -7273,7 +7273,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
             version: version.into(),
             constraint: None,
         },
-        sha256: "fixture".into(),
+        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();

@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [lib]
-doctest = false
+doctest = true
 
 [features]
 test-utils = []
