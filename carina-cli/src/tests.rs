@@ -73,7 +73,7 @@ impl ProviderFactory for EvidenceTestFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
-    ) -> Result<(), String> {
+    ) -> ProviderResult<()> {
         Ok(())
     }
 
