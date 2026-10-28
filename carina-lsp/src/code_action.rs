@@ -20,7 +20,7 @@
 //!   replacement is the canonical identifier form (no quotes), so
 //!   applying the action drops the quotes too.
 
-use carina_core::schema::ExpectedEnumVariant;
+use carina_core::schema::{ExpectedEnumVariant, TypeError};
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{CodeAction, CodeActionKind, Diagnostic, TextEdit, Url, WorkspaceEdit};
 
@@ -49,6 +49,10 @@ pub struct EnumDiagnosticData {
     pub tag: EnumDiagnosticTag,
     pub kind: EnumDiagnosticKind,
     pub expected: Vec<ExpectedEnumVariant>,
+    /// At least one equally plausible Union arm was not an Enum. Its enum
+    /// candidates remain available as manual quick-fixes, but none may be
+    /// preferred for automatic application.
+    pub has_non_enum_alternative: bool,
 }
 
 /// Static tag value used as a structural marker. `serde` rejects
@@ -66,6 +70,7 @@ impl EnumDiagnosticData {
             tag: EnumDiagnosticTag::EnumMismatch,
             kind,
             expected,
+            has_non_enum_alternative: false,
         }
     }
 
@@ -78,12 +83,80 @@ impl EnumDiagnosticData {
     }
 }
 
+/// Extract enum quick-fix candidates from a validation error, merging direct
+/// tied Union-arm failures in declaration order.
+///
+/// Path wrappers deliberately stop the search: the diagnostic range covers
+/// the whole attribute value, so a fix for an enum nested inside a collection
+/// would replace the entire collection with one identifier.
+pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDiagnosticData> {
+    match error {
+        TypeError::InvalidEnumVariant { expected, .. } => Some(EnumDiagnosticData::new(
+            EnumDiagnosticKind::BareInvalid,
+            expected.clone(),
+        )),
+        TypeError::StringLiteralExpectedEnum { expected, .. } => Some(EnumDiagnosticData::new(
+            EnumDiagnosticKind::StringLiteral,
+            expected.clone(),
+        )),
+        TypeError::UnionAlternativesMismatch { failures } => {
+            let mut merged: Option<EnumDiagnosticData> = None;
+            // Alias metadata can differ while rendering the same edit text.
+            let mut replacements = Vec::new();
+            let mut has_non_enum_alternative = false;
+
+            for failure in failures.iter() {
+                let Some(payload) = enum_diagnostic_data_for_error(failure) else {
+                    has_non_enum_alternative = true;
+                    continue;
+                };
+                has_non_enum_alternative |= payload.has_non_enum_alternative;
+
+                if let Some(merged) = &mut merged {
+                    // A single authored value produces one kind in practice. If
+                    // malformed input disagrees, declaration order wins.
+                    for candidate in payload.expected {
+                        let replacement = candidate.to_string();
+                        if !replacements.contains(&replacement) {
+                            replacements.push(replacement);
+                            merged.expected.push(candidate);
+                        }
+                    }
+                } else {
+                    replacements.extend(payload.expected.iter().map(ToString::to_string));
+                    merged = Some(payload);
+                }
+            }
+
+            let mut merged = merged?;
+            merged.has_non_enum_alternative = has_non_enum_alternative;
+            Some(merged)
+        }
+        TypeError::TypeMismatch { .. }
+        | TypeError::PatternMismatch { .. }
+        | TypeError::LengthOutOfRange { .. }
+        | TypeError::ValidationFailed { .. }
+        | TypeError::ResourceValidationFailed { .. }
+        | TypeError::MissingRequired { .. }
+        | TypeError::ReadOnlyAttribute { .. }
+        | TypeError::UnknownAttribute { .. }
+        | TypeError::UnknownStructField { .. }
+        | TypeError::UnionStructMismatch { .. }
+        | TypeError::ListItemError { .. }
+        | TypeError::MapKeyError { .. }
+        | TypeError::MapValueError { .. }
+        | TypeError::StructFieldError { .. }
+        | TypeError::BlockSyntaxNotAllowed { .. } => None,
+    }
+}
+
 /// Build the `CodeAction` list for one diagnostic. Returns an empty
 /// vec when the payload is absent or no candidates apply.
 pub fn code_actions_for_diagnostic(uri: &Url, diag: &Diagnostic) -> Vec<CodeAction> {
     let Some(payload) = EnumDiagnosticData::from_diagnostic(diag) else {
         return Vec::new();
     };
+    let has_non_enum_alternative = payload.has_non_enum_alternative;
 
     // Drop alias entries when at least one canonical entry is present.
     // The issue's spec: "skipping `is_alias = true` unless no canonical
@@ -115,7 +188,7 @@ pub fn code_actions_for_diagnostic(uri: &Url, diag: &Diagnostic) -> Vec<CodeActi
                     changes: Some(changes),
                     ..Default::default()
                 }),
-                is_preferred: Some(!variant.is_alias),
+                is_preferred: Some(!has_non_enum_alternative && !variant.is_alias),
                 ..Default::default()
             }
         })
@@ -180,6 +253,31 @@ mod tests {
         let diag = diag_with_payload(original.clone());
         let read = EnumDiagnosticData::from_diagnostic(&diag).expect("payload present");
         assert_eq!(read, original);
+    }
+
+    #[test]
+    fn payload_without_union_ambiguity_flag_is_rejected() {
+        let diag = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 5,
+                },
+                end: Position {
+                    line: 0,
+                    character: 12,
+                },
+            },
+            data: Some(serde_json::json!({
+                "tag": "carina_enum_mismatch",
+                "kind": "bare_invalid",
+                "expected": [s3_versioning_variant(Some("aws"), "Enabled", false)],
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(EnumDiagnosticData::from_diagnostic(&diag), None);
+        assert!(code_actions_for_diagnostic(&dummy_uri(), &diag).is_empty());
     }
 
     #[test]
@@ -283,6 +381,111 @@ mod tests {
         let diag = diag_with_payload(payload);
         let actions = code_actions_for_diagnostic(&dummy_uri(), &diag);
         assert_eq!(actions[0].is_preferred, Some(true));
+    }
+
+    #[test]
+    fn enum_failure_nested_in_union_keeps_its_quickfix() {
+        let union = AttributeType::union(vec![
+            AttributeType::enum_(
+                enum_identity(
+                    "CloudFrontHostedZoneId",
+                    Some("test.route53.Record.AliasTarget"),
+                ),
+                Some(vec!["global".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+            AttributeType::refined_string(
+                Some(carina_core::schema::TypeIdentity::new(
+                    Some("test"),
+                    ["route53", "Record", "AliasTarget"],
+                    "Route53HostedZoneId",
+                )),
+                Some("^Z[A-Z0-9]+$".to_string()),
+                None,
+                None,
+            ),
+        ]);
+        let error = carina_core::schema::Schema::flat(union)
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "z14grhdcwa56qt".into(),
+            )))
+            .expect_err("both union alternatives must reject the value")
+            .with_attribute("hosted_zone_id");
+        let payload = enum_diagnostic_data_for_error(&error)
+            .expect("the nested enum failure must retain structured candidates");
+        let diagnostic = diag_with_payload(payload);
+        let actions = code_actions_for_diagnostic(&dummy_uri(), &diagnostic);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].title,
+            "Replace with `test.route53.Record.AliasTarget.CloudFrontHostedZoneId.global`"
+        );
+        assert_eq!(actions[0].is_preferred, Some(false));
+    }
+
+    #[test]
+    fn enum_failure_below_a_list_wrapper_has_no_attribute_wide_quickfix() {
+        let union = AttributeType::union(vec![
+            AttributeType::list(AttributeType::enum_(
+                enum_identity("ItemKind", Some("test.items")),
+                Some(vec!["valid".to_string()]),
+                vec![],
+                None,
+                None,
+            )),
+            AttributeType::string(),
+        ]);
+        let error = carina_core::schema::Schema::flat(union)
+            .validate(&Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("bogus".into())),
+            ])))
+            .expect_err("the List<Enum> arm must reject its item");
+
+        assert_eq!(enum_diagnostic_data_for_error(&error), None);
+    }
+
+    #[test]
+    fn tied_enum_arms_merge_quickfix_candidates_in_declaration_order() {
+        let union = AttributeType::union(vec![
+            AttributeType::enum_(
+                enum_identity("EnumA", None),
+                Some(vec!["x".to_string(), "y".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+            AttributeType::enum_(
+                enum_identity("EnumB", None),
+                Some(vec!["z".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+        ]);
+        let error = carina_core::schema::Schema::flat(union)
+            .validate(&Value::Concrete(ConcreteValue::String("q".into())))
+            .expect_err("both Enum arms must reject the string");
+        let payload = enum_diagnostic_data_for_error(&error)
+            .expect("both Enum arms must contribute structured candidates");
+        assert_eq!(payload.kind, EnumDiagnosticKind::StringLiteral);
+        let actions = code_actions_for_diagnostic(&dummy_uri(), &diag_with_payload(payload));
+
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Replace with `x`", "Replace with `y`", "Replace with `z`",]
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.is_preferred == Some(true)),
+            "an all-Enum Union keeps canonical quick-fixes preferred: {actions:#?}"
+        );
     }
 
     #[test]

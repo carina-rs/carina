@@ -3244,15 +3244,16 @@ impl AttributeType {
 
     /// Validate a `Union` variant: succeed if any member accepts the value.
     ///
-    /// On failure, return the structurally-closest member's error rather
+    /// On failure, return the structurally-closest member error rather
     /// than a generic `TypeMismatch`. "Closest" is measured by
     /// [`union_member_judgement_on_path`]: members whose outer constructor matches
     /// the input's (Map↔Struct, List↔List, String↔Enum, scalar↔
     /// scalar) outscore unrelated members. A unique maximum preserves
-    /// that member's error verbatim; tied closed-Struct failures are
-    /// combined into a Union-level alternatives diagnostic. When no
-    /// member shares any structural similarity, fall through to
-    /// `TypeMismatch`. See #2219 and #3754.
+    /// that member's error verbatim. Tied non-Struct failures retain every
+    /// distinct arm error in declaration order; tied closed-Struct failures
+    /// keep the specialized alternatives diagnostic from #3754. When no member
+    /// shares any structural similarity, fall through to `TypeMismatch`. See
+    /// #2219, #3754, and #3834.
     fn validate_union(
         &self,
         value: ConcreteValueRef<'_>,
@@ -4458,8 +4459,10 @@ impl UnionMemberJudgement {
 /// The failure rank keeps #2219's tiers unchanged: Map↔Struct is 100,
 /// same-constructor matches are 80, List peeks at its first element, nested
 /// Union takes its best inner rank, and unrelated shapes are zero. Refined
-/// primitives retain their declared primitive constructor. Declaration order
-/// remains the strict-max tie-break used before #3754.
+/// primitives retain their declared primitive constructor. Callers that need
+/// one member, such as canonicalization's closest-member selector, retain the
+/// declaration-order strict-max tie-break. Diagnostic selection preserves all
+/// co-maximal failures instead.
 fn union_member_judgement_on_path<'a>(
     member: &'a AttributeType,
     value: ConcreteValueRef<'_>,
@@ -4555,12 +4558,12 @@ struct UnionMemberFailure {
     diagnostic_identity: UnionDiagnosticIdentity,
 }
 
-/// A non-empty set of failures in the best canonical structural tier.
+/// A non-empty set of failures in the best structural tier.
 ///
-/// This type never escapes the shared selector: callers receive either
-/// `Ok(())` or the fully resolved `TypeError`, so neither validator can
-/// accidentally recover the pre-#3754 behavior by taking only the first
-/// candidate.
+/// This accumulator never selects the first member as a fallback. Its complete
+/// contents are either consumed by the closed-Struct diagnostic from #3754 or
+/// passed to [`UnionArmFailures`], which owns deduplication and the at-least-two
+/// invariant for general Union diagnostics.
 struct BestUnionMemberFailures {
     failure_rank: UnionFailureRank,
     first: UnionMemberFailure,
@@ -4578,36 +4581,31 @@ impl BestUnionMemberFailures {
 
     fn into_error(self, value: ConcreteValueRef<'_>, members: UnionMembers<'_>) -> TypeError {
         let BestUnionMemberFailures {
+            failure_rank: _,
             first,
             tied,
-            failure_rank: _,
         } = self;
-        if tied.is_empty() {
-            return first.error;
-        }
 
-        let ConcreteValueRef::Map(map) = value else {
-            // #3754 changes the tied closed-Struct case only. Preserve
-            // declaration-order attribution for other tied shapes.
-            return first.error;
-        };
-        let Some(alternatives) = describe_struct_union_members(members) else {
-            // A diagnostic listing only the Struct subset would falsely
-            // narrow a mixed-shape Union. Preserve the best member error.
-            return first.error;
+        let struct_context = if let ConcreteValueRef::Map(map) = value
+            && !tied.is_empty()
+            && let Some(alternatives) = describe_struct_union_members(members)
+            && std::iter::once(&first).chain(&tied).all(|failure| {
+                matches!(
+                    &failure.diagnostic_identity,
+                    UnionDiagnosticIdentity::ClosedStruct(_)
+                )
+            }) {
+            Some((map, alternatives))
+        } else {
+            None
         };
 
+        let Some((map, alternatives)) = struct_context else {
+            return TypeError::from_union_member_failures(first, tied);
+        };
         let mut failures = Vec::with_capacity(tied.len() + 1);
         failures.push(first);
         failures.extend(tied);
-        if failures.iter().any(|failure| {
-            !matches!(
-                &failure.diagnostic_identity,
-                UnionDiagnosticIdentity::ClosedStruct(_)
-            )
-        }) {
-            return failures.remove(0).error;
-        }
 
         // One non-empty recognized-field identity is a unique relevant arm,
         // even though every Struct shares the same canonical rank. Preserve
@@ -4732,9 +4730,11 @@ pub(crate) fn closest_union_member_for_value_on_path<'a>(
 ///
 /// Accepted candidates are ordered only by semantic exactness and then by
 /// declaration order. If every member rejects, the old structural failure
-/// rank is used solely to retain the most useful member diagnostic. Both
-/// Validation-only callers use this routine. Canonicalization consumes the
-/// richer [`Fit`] witness directly, so it never has to select the member again.
+/// rank is used solely to retain the most useful diagnostic tier. A unique
+/// best failure is returned verbatim; co-maximal non-Struct failures are
+/// retained in declaration order. Both Validation-only callers use this
+/// routine. Canonicalization consumes the richer [`Fit`] witness directly, so
+/// it never has to select the member again.
 pub(crate) fn select_union_member_on_path<'a>(
     members: &'a [AttributeType],
     original: &Value,
@@ -5047,31 +5047,6 @@ fn enum_expected_variants(
     expected
 }
 
-/// Render the `InvalidEnumVariant` message with the richest available
-/// context. Presence of `attribute` and `type_name` is independent — both,
-/// either, or neither may be set. `expected` is rendered as-is; callers are
-/// responsible for passing fully-qualified variants for namespaced enums.
-/// Reshape an error from `AttrTypeKind::validate` into a shape-mismatch
-/// diagnostic when the attribute's value came from a quoted string literal
-/// and the schema expects an enum-shaped identifier (a `Enum`, or a
-/// namespaced `Custom` type).
-///
-/// For `Enum`, `into_string_literal_diagnostic` does the work since
-/// the underlying error already carries type name and variants.
-fn reshape_for_string_literal(
-    tagged: TypeError,
-    attr_type: &AttributeType,
-    _value: &Value,
-    _attr_name: &str,
-) -> TypeError {
-    // Enum: the error already has enough structure to reshape cleanly.
-    if matches!(&attr_type.kind, AttrTypeKind::Enum { .. }) {
-        return tagged.into_string_literal_diagnostic();
-    }
-
-    tagged
-}
-
 fn join_expected(expected: &[ExpectedEnumVariant]) -> String {
     expected
         .iter()
@@ -5109,6 +5084,10 @@ fn format_string_literal_expected_enum(
     )
 }
 
+/// Render the `InvalidEnumVariant` message with the richest available
+/// context. Presence of `attribute` and `type_name` is independent — both,
+/// either, or neither may be set. `expected` is rendered as-is; callers are
+/// responsible for passing fully-qualified variants for namespaced enums.
 fn format_invalid_enum(
     value: &DiagnosticValue,
     value_kind: InvalidEnumValueKind,
@@ -5661,6 +5640,137 @@ impl From<&ValueString> for DiagnosticValue {
     }
 }
 
+/// Declaration-ordered failures from distinct, equally relevant Union arms.
+///
+/// The fields are private and crate code constructs this value only after
+/// deduplication, so every public instance contains at least two failures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionArmFailures {
+    first: Box<TypeError>,
+    second: Box<TypeError>,
+    rest: Vec<TypeError>,
+}
+
+struct DistinctUnionErrors {
+    first: TypeError,
+    rest: Vec<TypeError>,
+}
+
+impl DistinctUnionErrors {
+    fn new(error: TypeError) -> Self {
+        match error {
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let (first, rest) = failures.into_parts();
+                let mut distinct = Self::new(first);
+                for failure in rest {
+                    distinct.push(failure);
+                }
+                distinct
+            }
+            first => Self {
+                first,
+                rest: Vec::new(),
+            },
+        }
+    }
+
+    fn push(&mut self, error: TypeError) {
+        let Self { first, rest } = Self::new(error);
+        self.push_distinct(first);
+        for error in rest {
+            self.push_distinct(error);
+        }
+    }
+
+    fn push_distinct(&mut self, error: TypeError) {
+        if error != self.first && !self.rest.contains(&error) {
+            self.rest.push(error);
+        }
+    }
+
+    fn into_parts(self) -> (TypeError, Vec<TypeError>) {
+        (self.first, self.rest)
+    }
+}
+
+impl UnionArmFailures {
+    pub(crate) fn new(
+        first: TypeError,
+        rest: impl IntoIterator<Item = TypeError>,
+    ) -> Result<Self, TypeError> {
+        let mut distinct = DistinctUnionErrors::new(first);
+        for failure in rest {
+            distinct.push(failure);
+        }
+
+        let (first, rest) = distinct.into_parts();
+        let mut failures = rest.into_iter();
+        let Some(second) = failures.next() else {
+            return Err(first);
+        };
+        Ok(Self {
+            first: Box::new(first),
+            second: Box::new(second),
+            rest: failures.collect(),
+        })
+    }
+
+    /// Iterate over the distinct failures in Union declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &TypeError> {
+        std::iter::once(self.first.as_ref())
+            .chain(std::iter::once(self.second.as_ref()))
+            .chain(self.rest.iter())
+    }
+
+    fn into_parts(self) -> (TypeError, Vec<TypeError>) {
+        let mut rest = Vec::with_capacity(self.rest.len() + 1);
+        rest.push(*self.second);
+        rest.extend(self.rest);
+        (*self.first, rest)
+    }
+}
+
+fn format_union_alternatives_mismatch(failures: &UnionArmFailures) -> String {
+    format!(
+        "No union alternative accepts this value: {}",
+        failures
+            .iter()
+            .map(|failure| {
+                let rendered = failure.to_string();
+                if contains_union_alternatives_mismatch(failure) {
+                    format!("({rendered})")
+                } else {
+                    rendered
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; or ")
+    )
+}
+
+fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
+    match error {
+        TypeError::UnionAlternativesMismatch { .. } => true,
+        TypeError::ListItemError { inner, .. }
+        | TypeError::MapKeyError { inner, .. }
+        | TypeError::MapValueError { inner, .. }
+        | TypeError::StructFieldError { inner, .. } => contains_union_alternatives_mismatch(inner),
+        TypeError::TypeMismatch { .. }
+        | TypeError::InvalidEnumVariant { .. }
+        | TypeError::PatternMismatch { .. }
+        | TypeError::LengthOutOfRange { .. }
+        | TypeError::StringLiteralExpectedEnum { .. }
+        | TypeError::ValidationFailed { .. }
+        | TypeError::ResourceValidationFailed { .. }
+        | TypeError::MissingRequired { .. }
+        | TypeError::ReadOnlyAttribute { .. }
+        | TypeError::UnknownAttribute { .. }
+        | TypeError::UnknownStructField { .. }
+        | TypeError::UnionStructMismatch { .. }
+        | TypeError::BlockSyntaxNotAllowed { .. } => false,
+    }
+}
+
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
@@ -5791,6 +5901,12 @@ pub enum TypeError {
         alternatives: Vec<UnionStructAlternative>,
     },
 
+    #[error("{}", format_union_alternatives_mismatch(failures))]
+    UnionAlternativesMismatch {
+        /// Every distinct tied arm failure, in declaration order.
+        failures: UnionArmFailures,
+    },
+
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
 
@@ -5811,6 +5927,20 @@ pub enum TypeError {
 }
 
 impl TypeError {
+    fn from_union_member_failures(
+        first: UnionMemberFailure,
+        rest: impl IntoIterator<Item = UnionMemberFailure>,
+    ) -> Self {
+        Self::from_union_arm_errors(first.error, rest.into_iter().map(|failure| failure.error))
+    }
+
+    fn from_union_arm_errors(first: TypeError, rest: impl IntoIterator<Item = TypeError>) -> Self {
+        match UnionArmFailures::new(first, rest) {
+            Ok(failures) => Self::UnionAlternativesMismatch { failures },
+            Err(error) => error,
+        }
+    }
+
     /// Remove user-authored data from an error produced while validating the
     /// contents of a [`DeferredValue::Secret`]. Structured schema context is
     /// retained, while free-form validator messages are replaced wholesale
@@ -5908,6 +6038,13 @@ impl TypeError {
                 supplied_fields: Vec::new(),
                 alternatives,
             },
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let (first, rest) = failures.into_parts();
+                TypeError::from_union_arm_errors(
+                    first.masked_for_secret(),
+                    rest.into_iter().map(TypeError::masked_for_secret),
+                )
+            }
             TypeError::ListItemError { index, inner } => TypeError::ListItemError {
                 index,
                 inner: Box::new(inner.masked_for_secret()),
@@ -5943,29 +6080,42 @@ impl TypeError {
     /// See #2098. Adding the same slot to `ValidationFailed` /
     /// `TypeMismatch` is tracked as future work.
     #[must_use]
-    pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
-        match &mut self {
-            TypeError::InvalidEnumVariant {
-                attribute: attr_slot,
-                ..
+    pub fn with_attribute(self, attribute: impl Into<String>) -> Self {
+        match self {
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let attribute = attribute.into();
+                let (first, rest) = failures.into_parts();
+                TypeError::from_union_arm_errors(
+                    first.with_attribute(attribute.clone()),
+                    rest.into_iter()
+                        .map(|failure| failure.with_attribute(attribute.clone())),
+                )
             }
-            | TypeError::PatternMismatch {
-                attribute: attr_slot,
-                ..
+            mut other => {
+                match &mut other {
+                    TypeError::InvalidEnumVariant {
+                        attribute: attr_slot,
+                        ..
+                    }
+                    | TypeError::PatternMismatch {
+                        attribute: attr_slot,
+                        ..
+                    }
+                    | TypeError::LengthOutOfRange {
+                        attribute: attr_slot,
+                        ..
+                    }
+                    | TypeError::StringLiteralExpectedEnum {
+                        attribute: attr_slot,
+                        ..
+                    } => {
+                        *attr_slot = Some(attribute.into());
+                    }
+                    _ => {}
+                }
+                other
             }
-            | TypeError::LengthOutOfRange {
-                attribute: attr_slot,
-                ..
-            }
-            | TypeError::StringLiteralExpectedEnum {
-                attribute: attr_slot,
-                ..
-            } => {
-                *attr_slot = Some(attribute.into());
-            }
-            _ => {}
         }
-        self
     }
 
     /// If this error describes an enum-variant mismatch on a value that
@@ -7853,8 +8003,13 @@ impl ResourceSchema {
                     // wrote (which may be a block-name alias), so diagnostics
                     // point back at a token that appears in their source.
                     let tagged = e.with_attribute(name);
-                    let reshaped = if is_string_literal(name.as_str()) {
-                        reshape_for_string_literal(tagged, &schema.attr_type, value, name)
+                    // Other schema shapes may use custom validators that return
+                    // `InvalidEnumVariant`; quoted-form reshaping belongs only
+                    // to an Enum attribute.
+                    let reshaped = if is_string_literal(name.as_str())
+                        && matches!(self.shape_of(&schema.attr_type), Shape::Enum { .. })
+                    {
+                        tagged.into_string_literal_diagnostic()
                     } else {
                         tagged
                     };

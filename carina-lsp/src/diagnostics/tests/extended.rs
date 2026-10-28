@@ -1122,6 +1122,141 @@ mode = "invalid_mode"
 }
 
 #[test]
+fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, enum_identity,
+    };
+
+    let hosted_zone_id = AttributeType::union(vec![
+        AttributeType::enum_(
+            enum_identity(
+                "CloudFrontHostedZoneId",
+                Some("test.route53.Record.AliasTarget"),
+            ),
+            Some(vec!["global".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+        AttributeType::refined_string(
+            Some(TypeIdentity::new(
+                Some("test"),
+                ["route53", "Record", "AliasTarget"],
+                "Route53HostedZoneId",
+            )),
+            Some("^Z[A-Z0-9]+$".to_string()),
+            None,
+            None,
+        ),
+    ]);
+    let schema = ResourceSchema::new("route53.Record")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("hosted_zone_id", hosted_zone_id));
+    let attributes = std::collections::HashMap::from([
+        (
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("record".into())),
+        ),
+        (
+            "hosted_zone_id".to_string(),
+            Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into())),
+        ),
+    ]);
+    let core_errors = schema
+        .validate_with_origins(&attributes, &|name| name == "hosted_zone_id")
+        .expect_err("core validation must reject both union alternatives");
+    assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
+    let core_message = core_errors[0].to_string();
+    assert!(
+        core_message.contains("CloudFrontHostedZoneId.global")
+            && core_message.contains("/^Z[A-Z0-9]+$/"),
+        "core must render both tied alternatives: {core_message}"
+    );
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let main = r#"test.route53.Record {
+  name = "record"
+  hosted_zone_id = "z14grhdcwa56qt"
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), main).expect("write main.crn");
+    std::fs::write(fixture.path().join("providers.crn"), "provider test {}\n")
+        .expect("write providers.crn");
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(main),
+        Some("main.crn"),
+        Some(fixture.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == core_message)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "LSP must report the core union diagnostic exactly once: {diagnostics:#?}"
+    );
+    assert_eq!(matching[0].range.start.line, 2);
+    let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/main.crn").unwrap();
+    let actions = crate::code_action::code_actions_for_diagnostic(&uri, matching[0]);
+    let enum_action = actions
+        .iter()
+        .find(|action| {
+            action.title
+                == "Replace with `test.route53.Record.AliasTarget.CloudFrontHostedZoneId.global`"
+        })
+        .unwrap_or_else(|| {
+            panic!("the enum arm's quick-fix must survive the Union diagnostic: {actions:#?}")
+        });
+    assert_eq!(enum_action.is_preferred, Some(false));
+}
+
+#[test]
+fn union_attribute_with_deferred_resource_ref_emits_no_diagnostic() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
+
+    let source = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new("value", AttributeType::string()));
+    let sink = ResourceSchema::new("sink.Item").attribute(AttributeSchema::new(
+        "target",
+        AttributeType::union(vec![
+            AttributeType::enum_(
+                enum_identity("TargetKind", None),
+                Some(vec!["known".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+            AttributeType::refined_string(None, Some("^value-".to_string()), None, None),
+        ]),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source);
+    schemas.insert("test", sink);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"let source = test.source.Item {
+  value = "value-from-source"
+}
+
+test.sink.Item {
+  target = source.value
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.is_empty(),
+        "a deferred ResourceRef must not be validated as a concrete Union value: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn resource_scalar_string_mismatches_use_core_value_descriptions_once() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 

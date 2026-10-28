@@ -164,6 +164,46 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
     );
 }
 
+#[test]
+fn single_quoted_string_range_covers_whole_literal_and_quick_fix_replaces_it() {
+    let engine = engine_with_schemas(versioning_schema());
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            "aws.s3.bucket {\n  name = \"b1\"\n  versioning = 'foo bar'\n}\n",
+        ),
+        ("providers.crn", "provider aws {}\n"),
+    ]);
+    let diagnostics = analyze(&engine, &fixture, "main.crn");
+    let diagnostic = first_enum_diagnostic(&diagnostics);
+    let text = std::fs::read_to_string(fixture.path().join("main.crn")).expect("read fixture file");
+    let line = text.lines().nth(2).expect("third line");
+    let open = line.find('\'').expect("opening quote") as u32;
+    let close = (line.rfind('\'').expect("closing quote") + 1) as u32;
+
+    assert_eq!(diagnostic.range.start.character, open);
+    assert_eq!(diagnostic.range.end.character, close);
+
+    let actions = code_actions_for_diagnostic(&dummy_uri(), diagnostic);
+    let edit = actions[0].edit.as_ref().expect("quick-fix edit");
+    let text_edit = &edit
+        .changes
+        .as_ref()
+        .expect("workspace changes")
+        .get(&dummy_uri())
+        .expect("fixture URI edit")[0];
+    let mut applied = String::new();
+    applied.push_str(&line[..open as usize]);
+    applied.push_str(&text_edit.new_text);
+    applied.push_str(&line[close as usize..]);
+
+    assert_eq!(text_edit.range, diagnostic.range);
+    assert_eq!(
+        applied,
+        "  versioning = aws.s3.Bucket.VersioningStatus.enabled"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 3: non-namespaced Enum
 // ---------------------------------------------------------------------------
@@ -207,5 +247,98 @@ fn non_namespaced_enum_quick_fix_uses_bare_value() {
             "Replace with `slow`".to_string()
         ],
         "non-namespaced enums replace with bare values, no provider prefix"
+    );
+}
+
+#[test]
+fn heredoc_enum_mismatch_is_plain_diagnostic_without_quick_fix() {
+    let engine = engine_with_schemas(versioning_schema());
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            r#"aws.s3.bucket {
+  name = "b1"
+  versioning = <<EOT
+Bogus
+EOT
+}
+"#,
+        ),
+        ("providers.crn", "provider aws {}\n"),
+    ]);
+    let diagnostics = analyze(&engine, &fixture, "main.crn");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("VersioningStatus"))
+        .unwrap_or_else(|| panic!("expected the Enum mismatch diagnostic: {diagnostics:#?}"));
+
+    assert!(
+        EnumDiagnosticData::from_diagnostic(diagnostic).is_none(),
+        "a heredoc must not receive an edit-range payload: {diagnostic:#?}"
+    );
+    assert!(
+        code_actions_for_diagnostic(&dummy_uri(), diagnostic).is_empty(),
+        "a heredoc must not receive an enum replacement action"
+    );
+}
+
+fn all_enum_union_schema() -> SchemaRegistry {
+    let mode = AttributeType::union(vec![
+        AttributeType::enum_(
+            carina_core::schema::TypeIdentity::bare("ModeA"),
+            Some(vec!["x".to_string(), "y".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+        AttributeType::enum_(
+            carina_core::schema::TypeIdentity::bare("ModeB"),
+            Some(vec!["z".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+    ]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("r.mode_holder")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("mode", mode)),
+    );
+    schemas
+}
+
+#[test]
+fn interpolated_union_mismatch_is_plain_diagnostic_without_quick_fix() {
+    let engine = engine_with_schemas(all_enum_union_schema());
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            r#"test.r.mode_holder {
+  name = "a"
+  mode = "q-${upper("a")}"
+}
+"#,
+        ),
+        ("providers.crn", "provider test {}\n"),
+    ]);
+    let diagnostics = analyze(&engine, &fixture, "main.crn");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("No union alternative accepts this value")
+        })
+        .unwrap_or_else(|| panic!("expected the Union mismatch diagnostic: {diagnostics:#?}"));
+
+    assert!(
+        EnumDiagnosticData::from_diagnostic(diagnostic).is_none(),
+        "an interpolated literal must not receive an edit-range payload: {diagnostic:#?}"
+    );
+    assert!(
+        code_actions_for_diagnostic(&dummy_uri(), diagnostic).is_empty(),
+        "an interpolated literal must not receive an enum replacement action"
     );
 }

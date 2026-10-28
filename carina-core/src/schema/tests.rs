@@ -8797,9 +8797,15 @@ fn schema_union_judgement_resets_ref_path_for_list_failure_attribution() {
     else {
         panic!("the recursive List member must own failure attribution")
     };
+    let TypeError::UnionAlternativesMismatch { failures } = *inner else {
+        panic!("the recursive List member must preserve the tied failures")
+    };
+    assert_eq!(failures.iter().count(), 2);
     assert!(
-        matches!(*inner, TypeError::ListItemError { index: 0, .. }),
-        "the recursive List member must preserve the nested item error, got {inner:?}"
+        failures
+            .iter()
+            .all(|failure| matches!(failure, TypeError::ListItemError { index: 0, .. })),
+        "the recursive List member must preserve every nested item error, got {failures:?}"
     );
 }
 
@@ -8835,7 +8841,7 @@ fn scalar_union_without_a_shape_match_keeps_generic_type_mismatch() {
 }
 
 #[test]
-fn tied_scalar_union_keeps_detailed_declaration_order_error() {
+fn tied_scalar_union_reports_every_distinct_failure_in_declaration_order() {
     fn reject_first(_: &Value) -> Result<(), String> {
         Err("first scalar alternative failed".to_string())
     }
@@ -8861,14 +8867,450 @@ fn tied_scalar_union_keeps_detailed_declaration_order_error() {
     let value = Value::Concrete(ConcreteValue::String("value".into()));
 
     for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &err else {
+            panic!("{path} must return UnionAlternativesMismatch, got {err:?}")
+        };
         assert_eq!(
-            err,
-            TypeError::ValidationFailed {
-                message: "first scalar alternative failed".to_string()
-            },
-            "{path} must keep a useful scalar member error"
+            failures.iter().collect::<Vec<_>>(),
+            vec![
+                &TypeError::ValidationFailed {
+                    message: "first scalar alternative failed".to_string(),
+                },
+                &TypeError::ValidationFailed {
+                    message: "second scalar alternative failed".to_string(),
+                },
+            ],
+            "{path} changed the tied failure order"
+        );
+        assert_eq!(
+            err.to_string(),
+            "No union alternative accepts this value: Validation failed: first scalar alternative failed; or Validation failed: second scalar alternative failed",
+            "{path} must retain every tied scalar member error"
         );
     }
+}
+
+fn hosted_zone_id_union(enum_first: bool) -> AttributeType {
+    let enum_arm = AttributeType::enum_(
+        enum_identity(
+            "CloudFrontHostedZoneId",
+            Some("test.route53.Record.AliasTarget"),
+        ),
+        Some(vec!["global".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let pattern_arm = AttributeType::refined_string(
+        Some(TypeIdentity::new(
+            Some("test"),
+            ["route53", "Record", "AliasTarget"],
+            "Route53HostedZoneId",
+        )),
+        Some("^Z[A-Z0-9]+$".to_string()),
+        None,
+        None,
+    );
+    let members = if enum_first {
+        vec![enum_arm, pattern_arm]
+    } else {
+        vec![pattern_arm, enum_arm]
+    };
+    AttributeType::union(members)
+}
+
+#[test]
+fn scalar_enum_and_pattern_union_reports_both_failures_in_declaration_order() {
+    let invalid = Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into()));
+
+    for enum_first in [true, false] {
+        let union = hosted_zone_id_union(enum_first);
+        for (path, error) in union_errors_from_public_paths(&union, &invalid) {
+            let TypeError::UnionAlternativesMismatch { failures } = &error else {
+                panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+            };
+            let failures = failures.iter().collect::<Vec<_>>();
+            assert_eq!(failures.len(), 2, "{path} lost a tied failure");
+            let ordered_as_declared = if enum_first {
+                matches!(failures[0], TypeError::StringLiteralExpectedEnum { .. })
+                    && matches!(failures[1], TypeError::PatternMismatch { .. })
+            } else {
+                matches!(failures[0], TypeError::PatternMismatch { .. })
+                    && matches!(failures[1], TypeError::StringLiteralExpectedEnum { .. })
+            };
+            assert!(
+                ordered_as_declared,
+                "{path} changed failure order: {failures:#?}"
+            );
+
+            let message = error.to_string();
+            assert!(
+                message.contains("test.route53.Record.AliasTarget.CloudFrontHostedZoneId.global"),
+                "{path} lost the enum alternative: {message}"
+            );
+            assert!(
+                message.contains("/^Z[A-Z0-9]+$/"),
+                "{path} lost the pattern alternative: {message}"
+            );
+            let enum_position = message
+                .find("CloudFrontHostedZoneId")
+                .expect("enum failure must be rendered");
+            let pattern_position = message
+                .find("Route53HostedZoneId")
+                .expect("pattern failure must be rendered");
+            assert_eq!(
+                enum_position < pattern_position,
+                enum_first,
+                "{path} changed declaration order: {message}"
+            );
+        }
+    }
+
+    let valid = Value::Concrete(ConcreteValue::String("Z14GRHDCWA56QT".into()));
+    assert_union_valid_through_public_paths(&hosted_zone_id_union(true), &valid);
+    assert_union_valid_through_public_paths(&hosted_zone_id_union(false), &valid);
+}
+
+#[test]
+fn nested_union_failures_are_flattened_in_declaration_order() {
+    let enum_a = AttributeType::enum_(
+        enum_identity("EnumA", Some("test.nested")),
+        Some(vec!["a".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let pattern = AttributeType::refined_string(
+        Some(TypeIdentity::new(Some("test"), ["nested"], "PatternValue")),
+        Some("^Z+$".to_string()),
+        None,
+        None,
+    );
+    let enum_b = AttributeType::enum_(
+        enum_identity("EnumB", Some("test.nested")),
+        Some(vec!["b".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let union = AttributeType::union(vec![AttributeType::union(vec![enum_a, pattern]), enum_b]);
+    let value = Value::Concrete(ConcreteValue::String("q".into()));
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &error else {
+            panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+        };
+        let failures = failures.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            failures.as_slice(),
+            [
+                TypeError::StringLiteralExpectedEnum { type_name: first, .. },
+                TypeError::PatternMismatch { type_name: Some(second), .. },
+                TypeError::StringLiteralExpectedEnum { type_name: third, .. },
+            ] if first == "EnumA" && second == "PatternValue" && third == "EnumB"
+        ));
+        let message = error.to_string();
+        assert_eq!(
+            message
+                .matches("No union alternative accepts this value")
+                .count(),
+            1,
+            "{path} nested the Union diagnostic prefix: {message}"
+        );
+    }
+}
+
+#[test]
+fn nested_union_failure_below_list_wrapper_is_parenthesized() {
+    let enum_a = AttributeType::enum_(
+        enum_identity("EnumA", None),
+        Some(vec!["a".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let pattern_x = AttributeType::refined_string(
+        Some(TypeIdentity::bare("PatternX")),
+        Some("^x$".to_string()),
+        None,
+        None,
+    );
+    let pattern_y = AttributeType::refined_string(
+        Some(TypeIdentity::bare("PatternY")),
+        Some("^y$".to_string()),
+        None,
+        None,
+    );
+    let union = AttributeType::union(vec![
+        AttributeType::list(AttributeType::union(vec![enum_a, pattern_x])),
+        AttributeType::list(pattern_y),
+    ]);
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("q".into()),
+    )]));
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &error else {
+            panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+        };
+        let rendered = failures.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 2, "{path} lost an outer Union arm");
+        assert!(matches!(
+            failures.iter().next(),
+            Some(TypeError::ListItemError { inner, .. })
+                if matches!(inner.as_ref(), TypeError::UnionAlternativesMismatch { .. })
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "No union alternative accepts this value: ({}); or {}",
+                rendered[0], rendered[1]
+            ),
+            "{path} must group the nested Union arm"
+        );
+    }
+}
+
+#[test]
+fn quoted_non_enum_validator_error_is_not_reshaped_as_an_enum_attribute() {
+    let enum_error = TypeError::InvalidEnumVariant {
+        value: "q".into(),
+        value_kind: InvalidEnumValueKind::String,
+        attribute: None,
+        type_name: Some("ValidatorEnum".to_string()),
+        expected: vec![ExpectedEnumVariant::from_namespaced(
+            None,
+            "ValidatorEnum",
+            "valid",
+            false,
+        )],
+    };
+    let attr_type = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("StringWithValidator")),
+        None,
+        None,
+        validator(move |_| Err(enum_error.clone())),
+        None,
+    );
+    let schema =
+        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("value", attr_type));
+    let attributes = std::collections::HashMap::from([(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("q".into())),
+    )]);
+
+    let errors = schema
+        .validate_with_origins(&attributes, &|name| name == "value")
+        .expect_err("the custom validator must reject the quoted string");
+    assert!(matches!(
+        errors.as_slice(),
+        [TypeError::InvalidEnumVariant {
+            attribute: Some(attribute),
+            ..
+        }] if attribute == "value"
+    ));
+}
+
+#[test]
+fn quoted_union_string_validator_error_is_not_reshaped_as_an_enum_arm() {
+    let validator_error = TypeError::InvalidEnumVariant {
+        value: "q".into(),
+        value_kind: InvalidEnumValueKind::String,
+        attribute: None,
+        type_name: Some("ValidatorEnum".to_string()),
+        expected: vec![ExpectedEnumVariant::from_namespaced(
+            None,
+            "ValidatorEnum",
+            "valid",
+            false,
+        )],
+    };
+    let expected = validator_error.clone().with_attribute("value");
+    let validated_string = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("StringWithValidator")),
+        None,
+        None,
+        validator(move |_| Err(validator_error.clone())),
+        None,
+    );
+    let attr_type = AttributeType::union(vec![AttributeType::int(), validated_string]);
+    let schema =
+        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("value", attr_type));
+    let attributes = std::collections::HashMap::from([(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("q".into())),
+    )]);
+
+    let errors = schema
+        .validate_with_origins(&attributes, &|name| name == "value")
+        .expect_err("the custom validator must reject the quoted string");
+    assert_eq!(errors, vec![expected]);
+}
+
+#[test]
+fn tied_list_union_reports_each_element_failure() {
+    let union = AttributeType::union(vec![
+        AttributeType::list(AttributeType::string()),
+        AttributeType::list(AttributeType::int()),
+    ]);
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Bool(true),
+    )]));
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &error else {
+            panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+        };
+        let failures = failures.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            failures.as_slice(),
+            [
+                TypeError::ListItemError { index: 0, inner: first },
+                TypeError::ListItemError { index: 0, inner: second },
+            ] if matches!(first.as_ref(), TypeError::TypeMismatch { expected, got } if expected == "String" && got == "Bool")
+                && matches!(second.as_ref(), TypeError::TypeMismatch { expected, got } if expected == "Int" && got == "Bool")
+        ));
+        assert_eq!(
+            error.to_string(),
+            "No union alternative accepts this value: List item at index 0: Type mismatch: expected String, got Bool; or List item at index 0: Type mismatch: expected Int, got Bool",
+            "{path} must retain both tied List failures"
+        );
+    }
+}
+
+#[test]
+fn tied_map_union_reports_each_value_failure() {
+    let union = AttributeType::union(vec![
+        AttributeType::map(AttributeType::string()),
+        AttributeType::map(AttributeType::int()),
+    ]);
+    let value = union_map(vec![("key", Value::Concrete(ConcreteValue::Bool(true)))]);
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &error else {
+            panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+        };
+        assert_eq!(failures.iter().count(), 2, "{path} lost a Map failure");
+        assert_eq!(
+            error.to_string(),
+            "No union alternative accepts this value: Map value for key 'key': Type mismatch: expected String, got Bool; or Map value for key 'key': Type mismatch: expected Int, got Bool",
+            "{path} must retain both tied Map failures"
+        );
+    }
+}
+
+#[test]
+fn duplicate_tied_union_failures_collapse_to_the_verbatim_error() {
+    let member = AttributeType::refined_string(
+        Some(TypeIdentity::bare("HostedZoneId")),
+        Some("^Z[A-Z0-9]+$".to_string()),
+        None,
+        None,
+    );
+    let union = AttributeType::union(vec![member.clone(), member]);
+    let value = Value::Concrete(ConcreteValue::String("invalid".into()));
+    let expected = TypeError::PatternMismatch {
+        value: "invalid".into(),
+        pattern: "^Z[A-Z0-9]+$".to_string(),
+        attribute: None,
+        type_name: Some("HostedZoneId".to_string()),
+    };
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(error, expected, "{path} must deduplicate equal failures");
+    }
+}
+
+#[test]
+fn unique_best_union_failure_remains_verbatim() {
+    let union = AttributeType::union(vec![
+        AttributeType::refined_string(
+            Some(TypeIdentity::bare("HostedZoneId")),
+            Some("^Z[A-Z0-9]+$".to_string()),
+            None,
+            None,
+        ),
+        AttributeType::bool(),
+    ]);
+    let value = Value::Concrete(ConcreteValue::String("invalid".into()));
+    let expected = TypeError::PatternMismatch {
+        value: "invalid".into(),
+        pattern: "^Z[A-Z0-9]+$".to_string(),
+        attribute: None,
+        type_name: Some("HostedZoneId".to_string()),
+    };
+
+    for (path, error) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(error, expected, "{path} changed the unique best failure");
+    }
+}
+
+#[test]
+fn secret_scalar_union_masks_every_tied_failure() {
+    let plaintext = "z14grhdcwa56qt";
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.into()),
+    ))));
+
+    for (path, error) in union_errors_from_public_paths(&hosted_zone_id_union(true), &value) {
+        let TypeError::UnionAlternativesMismatch { failures } = &error else {
+            panic!("{path} must return UnionAlternativesMismatch, got {error:?}")
+        };
+        let nested = failures.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            nested.as_slice(),
+            [
+                TypeError::StringLiteralExpectedEnum {
+                    user_typed: DiagnosticValue::Masked,
+                    ..
+                },
+                TypeError::PatternMismatch {
+                    value: DiagnosticValue::Masked,
+                    ..
+                },
+            ]
+        ));
+        let message = error.to_string();
+        assert_eq!(
+            message.matches("(secret)").count(),
+            2,
+            "{path} must mask each tied failure independently: {message}"
+        );
+        assert!(
+            !message.contains(plaintext),
+            "{path} leaked secret plaintext: {message}"
+        );
+        assert!(
+            message.contains("CloudFrontHostedZoneId.global") && message.contains("/^Z[A-Z0-9]+$/"),
+            "{path} lost structured schema context while masking: {message}"
+        );
+    }
+}
+
+#[test]
+fn union_alternatives_mismatch_propagates_attribute_to_every_failure() {
+    let value = Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into()));
+    let error = hosted_zone_id_union(true)
+        .validate(&value)
+        .expect_err("both union alternatives must reject the value")
+        .with_attribute("hosted_zone_id");
+    let TypeError::UnionAlternativesMismatch { failures } = error else {
+        panic!("expected UnionAlternativesMismatch")
+    };
+    let nested = failures.iter().collect::<Vec<_>>();
+    assert!(matches!(
+        nested.as_slice(),
+        [
+            TypeError::StringLiteralExpectedEnum {
+                attribute: Some(first),
+                ..
+            },
+            TypeError::PatternMismatch {
+                attribute: Some(second),
+                ..
+            },
+        ] if first == "hosted_zone_id" && second == "hosted_zone_id"
+    ));
 }
 
 #[test]
