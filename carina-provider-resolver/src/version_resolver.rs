@@ -33,6 +33,10 @@ impl ReleaseTag {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn semver(&self) -> Option<Version> {
+        parse_tag(self.as_str())
+    }
 }
 
 impl<'de> Deserialize<'de> for ReleaseTag {
@@ -51,28 +55,61 @@ impl fmt::Display for ReleaseTag {
     }
 }
 
+/// A GitHub release asset ID obtained from release selection or a lock file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ReleaseAssetId(u64);
+
+impl ReleaseAssetId {
+    fn from_api(id: u64) -> Self {
+        Self(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_lock(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ReleaseAssetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseAsset {
+pub(crate) struct ReleaseAsset {
     name: String,
-    id: u64,
+    id: ReleaseAssetId,
 }
 
 impl ReleaseAsset {
-    pub fn name(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> ReleaseAssetId {
         self.id
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedReleaseAsset {
+    name: String,
+    id: u64,
+}
+
 /// A semver release paired with its exact GitHub tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GithubRelease {
+pub(crate) struct GithubRelease {
     version: Version,
     tag: ReleaseTag,
-    assets: Vec<ReleaseAsset>,
+    assets: Vec<ListedReleaseAsset>,
 }
 
 impl GithubRelease {
@@ -101,26 +138,22 @@ impl GithubRelease {
             tag,
             assets: assets
                 .into_iter()
-                .map(|GithubAssetResponse { id, name }| ReleaseAsset { name, id })
+                .map(|GithubAssetResponse { id, name }| ListedReleaseAsset { name, id })
                 .collect(),
         })
     }
 
-    pub fn version(&self) -> &Version {
+    pub(crate) fn version(&self) -> &Version {
         &self.version
     }
 
-    pub fn tag(&self) -> &ReleaseTag {
+    pub(crate) fn tag(&self) -> &ReleaseTag {
         &self.tag
-    }
-
-    pub fn assets(&self) -> &[ReleaseAsset] {
-        &self.assets
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReleaseAssetSelectionError {
+pub(crate) enum ReleaseAssetSelectionError {
     NoWasmAsset {
         tag: ReleaseTag,
         candidates: Vec<String>,
@@ -151,7 +184,7 @@ impl fmt::Display for ReleaseAssetSelectionError {
 impl std::error::Error for ReleaseAssetSelectionError {}
 
 /// Select the release's only `.wasm` asset.
-pub fn select_release_asset(
+pub(crate) fn select_release_asset(
     release: &GithubRelease,
 ) -> Result<ReleaseAsset, ReleaseAssetSelectionError> {
     let candidates = release
@@ -165,7 +198,10 @@ pub fn select_release_asset(
         .filter(|asset| asset.name.ends_with(".wasm"))
         .collect::<Vec<_>>();
     match wasm_assets.as_slice() {
-        [asset] => Ok((*asset).clone()),
+        [asset] => Ok(ReleaseAsset {
+            name: asset.name.clone(),
+            id: ReleaseAssetId::from_api(asset.id),
+        }),
         [] => Err(ReleaseAssetSelectionError::NoWasmAsset {
             tag: release.tag.clone(),
             candidates,
@@ -182,7 +218,7 @@ fn parse_tag(tag: &str) -> Option<Version> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReleaseResolutionError {
+pub(crate) enum ReleaseResolutionError {
     AmbiguousVersion {
         version: Version,
         tags: Vec<ReleaseTag>,
@@ -232,7 +268,7 @@ fn resolve_exact_release(
 }
 
 /// Find the highest release matching a semver constraint without changing its tag.
-pub fn resolve_from_releases(
+pub(crate) fn resolve_from_releases(
     releases: &[GithubRelease],
     constraint: &VersionReq,
 ) -> Result<Option<GithubRelease>, ReleaseResolutionError> {
@@ -350,7 +386,7 @@ mod tests {
         let asset = select_release_asset(&resolved).unwrap();
 
         assert_eq!(resolved.tag().as_str(), "v0.1.0");
-        assert_eq!(asset.id(), 41);
+        assert_eq!(asset.id().get(), 41);
     }
 
     #[test]
@@ -362,7 +398,7 @@ mod tests {
         let asset = select_release_asset(&resolved).unwrap();
 
         assert_eq!(resolved.tag().as_str(), "0.1.0");
-        assert_eq!(asset.id(), 42);
+        assert_eq!(asset.id().get(), 42);
     }
 
     #[test]
@@ -378,7 +414,7 @@ mod tests {
         let asset = select_release_asset(&resolved).unwrap();
 
         assert_eq!(resolved.tag().as_str(), "v0.1.0");
-        assert_eq!(asset.id(), 43);
+        assert_eq!(asset.id().get(), 43);
     }
 
     #[test]
@@ -394,7 +430,7 @@ mod tests {
         let asset = select_release_asset(&resolved).unwrap();
 
         assert_eq!(resolved.tag().as_str(), "0.1.0");
-        assert_eq!(asset.id(), 44);
+        assert_eq!(asset.id().get(), 44);
     }
 
     #[test]
@@ -461,7 +497,7 @@ mod tests {
         let asset = select_release_asset(&release).unwrap();
 
         assert_eq!(asset.name(), "arbitrary-provider-name.wasm");
-        assert_eq!(asset.id(), 42);
+        assert_eq!(asset.id().get(), 42);
     }
 
     #[test]

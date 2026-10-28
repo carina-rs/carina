@@ -55,10 +55,12 @@ pub fn get_github_token() -> Result<String, String> {
     }
 
     let output = std::process::Command::new("gh")
-        .args(["auth", "token"])
+        .args(["auth", "token", "--hostname", "github.com"])
         .output()
         .map_err(|e| {
-            format!("Failed to run `gh auth token`: {e}. Set GITHUB_TOKEN or install gh CLI.")
+            format!(
+                "Failed to run `gh auth token --hostname github.com`: {e}. Set GITHUB_TOKEN or install gh CLI."
+            )
         })?;
 
     if !output.status.success() {

@@ -36,9 +36,9 @@ use crate::verified_artifact::{
     lookup_github_release_artifact_pin, publish_download,
 };
 use crate::version_resolver::{
-    GithubRelease, ReleaseAssetSelectionError, ReleaseTag, fetch_latest_release_with_api,
-    fetch_releases_with_api, resolve_from_releases, resolve_release_at_version,
-    select_release_asset,
+    GithubRelease, ReleaseAssetId, ReleaseAssetSelectionError, ReleaseTag,
+    fetch_latest_release_with_api, fetch_releases_with_api, resolve_from_releases,
+    resolve_release_at_version, select_release_asset,
 };
 
 const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -77,7 +77,7 @@ pub enum LockEntryKind {
     GithubRelease {
         version: String,
         tag: ReleaseTag,
-        asset_id: u64,
+        asset_id: ReleaseAssetId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<String>,
     },
@@ -2095,11 +2095,42 @@ impl fmt::Display for LegacyReason {
 }
 
 /// A raw legacy lock entry retained for safe migration or a typed error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LegacyLockEntry {
     pub source: String,
     pub reason: LegacyReason,
+    raw: toml::Table,
 }
+
+impl LegacyLockEntry {
+    fn error(&self, project_dir: &Path) -> LegacyLockEntryError {
+        LegacyLockEntryError {
+            source: self.source.clone(),
+            reason: self.reason.clone(),
+            project_dir: project_dir.to_path_buf(),
+        }
+    }
+}
+
+/// Why a GitHub-direct legacy table could not be retained safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyLockEntryParseError {
+    /// A checksum or version pin was absent or was not a TOML string.
+    MissingStringField { source: String, field: &'static str },
+}
+
+impl fmt::Display for LegacyLockEntryParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingStringField { source, field } => write!(
+                formatter,
+                "legacy GitHub version entry for '{source}' is missing string field '{field}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LegacyLockEntryParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyLockEntryError {
@@ -2122,46 +2153,59 @@ impl fmt::Display for LegacyLockEntryError {
 
 impl std::error::Error for LegacyLockEntryError {}
 
-fn github_direct_version_without_tag(entry: &toml::Table) -> Option<LegacyReason> {
+fn github_direct_version_without_tag(
+    entry: &toml::Table,
+) -> Result<Option<(String, LegacyReason)>, LegacyLockEntryParseError> {
     if entry.get("mode").and_then(toml::Value::as_str) != Some("version") {
-        return None;
+        return Ok(None);
     }
-    let source = entry.get("source").and_then(toml::Value::as_str)?;
+    let Some(source) = entry.get("source").and_then(toml::Value::as_str) else {
+        return Ok(None);
+    };
     if !matches!(
         source.parse::<ProviderSource>(),
         Ok(ProviderSource::Remote(RemoteSource::GithubDirect(_)))
     ) {
-        return None;
+        return Ok(None);
     }
-    Some(LegacyReason::GithubDirectVersionWithoutTag {
-        version: entry
-            .get("version")
-            .and_then(toml::Value::as_str)?
-            .to_string(),
-        sha256: entry
-            .get("sha256")
-            .and_then(toml::Value::as_str)?
-            .to_string(),
-    })
+    let required = |field: &'static str| {
+        entry
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| LegacyLockEntryParseError::MissingStringField {
+                source: source.to_string(),
+                field,
+            })
+    };
+    Ok(Some((
+        source.to_string(),
+        LegacyReason::GithubDirectVersionWithoutTag {
+            version: required("version")?,
+            sha256: required("sha256")?,
+        },
+    )))
 }
 
 /// Split migratable legacy entries from tables accepted by the typed schema.
-pub fn split_legacy_entries(entries: Vec<toml::Table>) -> (Vec<toml::Table>, Vec<LegacyLockEntry>) {
+pub(crate) fn split_legacy_entries(
+    entries: Vec<toml::Table>,
+) -> Result<(Vec<toml::Table>, Vec<LegacyLockEntry>), LegacyLockEntryParseError> {
     let mut retained = Vec::with_capacity(entries.len());
     let mut legacy = Vec::new();
     for entry in entries {
-        if let Some(reason) = github_direct_version_without_tag(&entry) {
-            if let Some(source) = entry.get("source").and_then(toml::Value::as_str) {
+        match github_direct_version_without_tag(&entry)? {
+            Some((source, reason)) => {
                 legacy.push(LegacyLockEntry {
-                    source: source.to_string(),
+                    source,
                     reason,
+                    raw: entry,
                 });
             }
-        } else {
-            retained.push(entry);
+            None => retained.push(entry),
         }
     }
-    (retained, legacy)
+    Ok((retained, legacy))
 }
 
 /// The full carina-providers.lock file.
@@ -2179,6 +2223,11 @@ pub struct LockFile {
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
 }
 
+enum SourceLockEntry<'a> {
+    Typed(&'a LockEntry<RegistryLock>),
+    Legacy(&'a LegacyLockEntry),
+}
+
 /// The crate-internal serialization view of [`LockFile`]. Field order and
 /// omission rules are part of the lock-file byte format and must stay aligned
 /// with the former direct `LockFile` serialization.
@@ -2187,9 +2236,16 @@ struct SerializableLockFile<'a> {
     version: &'a u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registry_host: &'a BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
-    provider: &'a Vec<LockEntry<RegistryLock>>,
+    provider: Vec<SerializableProviderEntry<'a>>,
     #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: &'a UnpinnedRegistryRatchets,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SerializableProviderEntry<'a> {
+    Current(&'a LockEntry<RegistryLock>),
+    Legacy(&'a toml::Table),
 }
 
 mod registry_lock_with_host {
@@ -2716,7 +2772,11 @@ fn split_lock_table_legacy_entries(
         }
         None => Vec::new(),
     };
-    let (retained, legacy) = split_legacy_entries(entries);
+    let (retained, legacy) =
+        split_legacy_entries(entries).map_err(|source| LockFileError::LegacyEntryParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     table.insert(
         "provider".to_string(),
         toml::Value::Array(retained.into_iter().map(toml::Value::Table).collect()),
@@ -2724,17 +2784,19 @@ fn split_lock_table_legacy_entries(
     Ok((table, legacy))
 }
 
-/// Details of an older provider-lock migration applied in memory.
+/// Details of a provider-lock migration applied in memory.
 ///
 /// The event carries every legacy discovery pin that now requires operator
-/// authorization before it can be discarded. The load operation itself never
-/// rewrites the on-disk file.
+/// authorization before it can be discarded, plus legacy GitHub sources that
+/// remain verbatim until successful resolution replaces them. The load
+/// operation itself never rewrites the on-disk file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockFileMigration {
     project_dir: PathBuf,
     from: u32,
     to: u32,
     discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins>,
+    legacy_sources: Vec<String>,
 }
 
 impl LockFileMigration {
@@ -2763,6 +2825,16 @@ impl LockFileMigration {
             "Lock file: {}",
             provider_lock_path(&self.project_dir).display()
         )?;
+        if !self.legacy_sources.is_empty() {
+            writeln!(f, "Legacy GitHub release entries retained for conversion:")?;
+            for source in &self.legacy_sources {
+                writeln!(f, "  {source}")?;
+            }
+            writeln!(
+                f,
+                "Each entry remains verbatim until a successful `carina init` replaces it with an exact release tag and asset ID."
+            )?;
+        }
         if self.discarded_discovery_pins.is_empty() {
             if self.from <= 2 {
                 writeln!(
@@ -2770,7 +2842,7 @@ impl LockFileMigration {
                     "Migration found no v{} discovery pins requiring operator authorization.",
                     self.from
                 )?;
-            } else {
+            } else if self.from < self.to {
                 writeln!(
                     f,
                     "Existing signer state is preserved; any legacy signer pin remains gated until verified conversion."
@@ -2867,6 +2939,7 @@ fn finish_legacy_lock_migration(
     path: &Path,
     project_dir: &Path,
 ) -> Result<LoadedLockFile, LockFileError> {
+    let legacy_sources = legacy.iter().map(|entry| entry.source.clone()).collect();
     let ParsedLegacyLockBody {
         registry_host,
         provider,
@@ -2899,6 +2972,7 @@ fn finish_legacy_lock_migration(
         from,
         to: LockFile::CURRENT_VERSION,
         discarded_discovery_pins,
+        legacy_sources,
     };
     Ok(LoadedLockFile::Migrated {
         lock_file,
@@ -3022,24 +3096,33 @@ define_lock_file_error! {
             source,
         }
     },
+    LegacyEntryParse {
+        path: PathBuf,
+        source: LegacyLockEntryParseError,
+    } => Self::LegacyEntryParse {
+        path: PathBuf::from("carina-providers.lock"),
+        source: LegacyLockEntryParseError::MissingStringField {
+            source: "github.com/acme/widget".into(),
+            field: "sha256",
+        },
+    },
+    InvalidGithubReleasePin {
+        path: PathBuf,
+        source: String,
+        version: String,
+        tag: ReleaseTag,
+    } => Self::InvalidGithubReleasePin {
+        path: PathBuf::from("carina-providers.lock"),
+        source: "github.com/acme/widget".into(),
+        version: "1.0.0".into(),
+        tag: ReleaseTag::from_lock("v2.0.0".into()),
+    },
     InvalidRegistryState {
         path: PathBuf,
         detail: String,
     } => Self::InvalidRegistryState {
         path: PathBuf::from("carina-providers.lock"),
         detail: "inconsistent migrated registry state".into(),
-    },
-    LegacyEntry {
-        error: LegacyLockEntryError,
-    } => Self::LegacyEntry {
-        error: LegacyLockEntryError {
-            source: "github.com/acme/widget".into(),
-            reason: LegacyReason::GithubDirectVersionWithoutTag {
-                version: "0.1.0".into(),
-                sha256: "abc".into(),
-            },
-            project_dir: PathBuf::from("."),
-        },
     },
     RegistryIdentityPinConflict {
         path: PathBuf,
@@ -3077,7 +3160,21 @@ impl fmt::Display for LockFileError {
                 "Failed to migrate registry security state from {}: {detail}",
                 path.display()
             ),
-            Self::LegacyEntry { error } => error.fmt(f),
+            Self::LegacyEntryParse { path, source } => write!(
+                f,
+                "Failed to parse legacy provider entry in {}: {source}",
+                path.display()
+            ),
+            Self::InvalidGithubReleasePin {
+                path,
+                source,
+                version,
+                tag,
+            } => write!(
+                f,
+                "Malformed GitHub release entry for '{source}' in {}: version '{version}' does not match tag '{tag}'",
+                path.display()
+            ),
             Self::VersionTooNew { found, supported } => write!(
                 f,
                 "Lock file version {found} is newer than supported version {supported}. Please upgrade Carina."
@@ -3127,6 +3224,7 @@ impl std::error::Error for LockFileError {}
 #[derive(Debug)]
 pub enum LockConstraintError {
     LockFile(LockFileError),
+    LegacyEntry(LegacyLockEntryError),
     ConstraintMismatch {
         provider: String,
         locked_version: String,
@@ -3139,6 +3237,7 @@ impl fmt::Display for LockConstraintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockFile(error) => error.fmt(f),
+            Self::LegacyEntry(error) => error.fmt(f),
             Self::ConstraintMismatch {
                 provider,
                 locked_version,
@@ -3153,7 +3252,20 @@ impl fmt::Display for LockConstraintError {
     }
 }
 
-impl std::error::Error for LockConstraintError {}
+impl std::error::Error for LockConstraintError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LockFile(error) => Some(error),
+            Self::LegacyEntry(error) => Some(error),
+            Self::ConstraintMismatch {
+                provider: _,
+                locked_version: _,
+                constraint: _,
+                project_dir: _,
+            } => None,
+        }
+    }
+}
 
 impl From<LockFileError> for LockConstraintError {
     fn from(error: LockFileError) -> Self {
@@ -3400,14 +3512,6 @@ impl LockFile {
         self.registry_host.get(hostname)
     }
 
-    fn legacy_entry_error(&self, project_dir: &Path) -> Option<LegacyLockEntryError> {
-        self.legacy.first().map(|entry| LegacyLockEntryError {
-            source: entry.source.clone(),
-            reason: entry.reason.clone(),
-            project_dir: project_dir.to_path_buf(),
-        })
-    }
-
     fn legacy_github_version_pin(&self, source: &RemoteSourceKey) -> Option<(String, String)> {
         self.legacy
             .iter()
@@ -3490,8 +3594,25 @@ impl LockFile {
         match version {
             Self::CURRENT_VERSION => {
                 let unchecked: UncheckedLockFile = parse_lock_table(&table, path)?;
+                let legacy_sources = legacy_entries
+                    .iter()
+                    .map(|entry| entry.source.clone())
+                    .collect::<Vec<_>>();
                 let lock_file = Self::from_unchecked(unchecked, legacy_entries, path, project_dir)?;
-                Ok(LoadedLockFile::Pristine(lock_file))
+                if legacy_sources.is_empty() {
+                    Ok(LoadedLockFile::Pristine(lock_file))
+                } else {
+                    Ok(LoadedLockFile::Migrated {
+                        lock_file,
+                        migration: LockFileMigration {
+                            project_dir: project_dir.to_path_buf(),
+                            from: version,
+                            to: Self::CURRENT_VERSION,
+                            discarded_discovery_pins: BTreeMap::new(),
+                            legacy_sources,
+                        },
+                    })
+                }
             }
             3 => {
                 let legacy: UncheckedLockFileV3 = parse_lock_table(&table, path)?;
@@ -3592,6 +3713,42 @@ impl LockFile {
                     source: Box::new(conflict.source),
                 })?;
         for entry in &provider {
+            match &entry.kind {
+                LockEntryKind::GithubRelease {
+                    version,
+                    tag,
+                    asset_id: _,
+                    constraint: _,
+                } => {
+                    let version_matches_tag = Version::parse(version)
+                        .ok()
+                        .zip(tag.semver())
+                        .is_some_and(|(version, tag_version)| version == tag_version);
+                    if !version_matches_tag {
+                        return Err(LockFileError::InvalidGithubReleasePin {
+                            path: path.to_path_buf(),
+                            source: entry.source.clone(),
+                            version: version.clone(),
+                            tag: tag.clone(),
+                        });
+                    }
+                }
+                LockEntryKind::Version {
+                    version: _,
+                    constraint: _,
+                }
+                | LockEntryKind::Revision {
+                    revision: _,
+                    resolved_sha: _,
+                }
+                | LockEntryKind::RegistryRevision {
+                    revision: _,
+                    version: _,
+                }
+                | LockEntryKind::File => {}
+            }
+        }
+        for entry in &provider {
             let Some(registry) = &entry.registry else {
                 continue;
             };
@@ -3620,10 +3777,20 @@ impl LockFile {
     }
 
     pub(crate) fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        let provider = self
+            .provider
+            .iter()
+            .map(SerializableProviderEntry::Current)
+            .chain(
+                self.legacy
+                    .iter()
+                    .map(|entry| SerializableProviderEntry::Legacy(&entry.raw)),
+            )
+            .collect();
         toml::to_string_pretty(&SerializableLockFile {
             version: &self.version,
             registry_host: &self.registry_host,
-            provider: &self.provider,
+            provider,
             unpinned_registry_ratchets: &self.unpinned_registry_ratchets,
         })
     }
@@ -3659,6 +3826,14 @@ impl LockFile {
     /// Find a lock entry selected by a validated remote provider source.
     pub fn find_by_source_key(&self, source: &RemoteSourceKey) -> Option<&LockEntry<RegistryLock>> {
         self.find_by_source(source.as_str())
+    }
+
+    fn find_source_entry(&self, source: &RemoteSourceKey) -> Option<SourceLockEntry<'_>> {
+        self.legacy
+            .iter()
+            .find(|entry| Self::sources_match(&entry.source, source.as_str()))
+            .map(SourceLockEntry::Legacy)
+            .or_else(|| self.find_by_source_key(source).map(SourceLockEntry::Typed))
     }
 
     fn resolve_registry_recovery(
@@ -4017,14 +4192,7 @@ impl LockFile {
 
 fn load_lock_file(project_dir: &Path) -> Result<Option<LockFile>, LockFileError> {
     let loaded = LockFile::load(project_dir)?;
-    let lock_file = loaded.map(LoadedLockFile::into_resolution_lock_file);
-    if let Some(error) = lock_file
-        .as_ref()
-        .and_then(|lock_file| lock_file.legacy_entry_error(project_dir))
-    {
-        return Err(LockFileError::LegacyEntry { error });
-    }
-    Ok(lock_file)
+    Ok(loaded.map(LoadedLockFile::into_resolution_lock_file))
 }
 
 #[cfg(test)]
@@ -4394,7 +4562,7 @@ pub enum LockedProviderPin {
     GithubRelease {
         version: String,
         tag: ReleaseTag,
-        asset_id: u64,
+        asset_id: ReleaseAssetId,
         constraint: Option<String>,
     },
     Revision {
@@ -6056,15 +6224,16 @@ fn record_verified_github_release_pin(
     lock_file: &mut LockFile,
     artifact: &VerifiedArtifact,
     pin: GithubReleaseArtifactPin,
+    resolved: &ResolvedGithubRelease,
     name: &str,
 ) {
     lock_file.upsert(LockEntry {
         name: name.to_string(),
         source: artifact.source().to_string(),
         kind: LockEntryKind::GithubRelease {
-            version: pin.version,
-            tag: pin.tag,
-            asset_id: pin.asset_id,
+            version: resolved.version.to_string(),
+            tag: resolved.tag.clone(),
+            asset_id: resolved.asset_id,
             constraint: pin.constraint,
         },
         sha256: artifact.sha256().to_string(),
@@ -6569,7 +6738,7 @@ fn annotate_github_release_lock_entry(
 struct ResolvedGithubRelease {
     version: Version,
     tag: ReleaseTag,
-    asset_id: u64,
+    asset_id: ReleaseAssetId,
 }
 
 impl ResolvedGithubRelease {
@@ -6582,7 +6751,7 @@ impl ResolvedGithubRelease {
         })
     }
 
-    fn from_lock_entry(version: Version, tag: ReleaseTag, asset_id: u64) -> Self {
+    fn from_lock_entry(version: Version, tag: ReleaseTag, asset_id: ReleaseAssetId) -> Self {
         Self {
             version,
             tag,
@@ -6628,7 +6797,7 @@ where
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
-        record_verified_github_release_pin(lock_file, &verified, pin, name);
+        record_verified_github_release_pin(lock_file, &verified, pin, resolved, name);
         return Ok(verified.path().clone());
     }
 
@@ -6652,7 +6821,7 @@ where
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
-        record_verified_github_release_pin(lock_file, &verified, pin, name);
+        record_verified_github_release_pin(lock_file, &verified, pin, resolved, name);
         eprintln!(
             "Installed WASM provider '{}' from global cache ({}@{})",
             name, source_key, version
@@ -6688,7 +6857,7 @@ where
 
     let installed_path = match publish_download(staged, artifact_pin)? {
         DownloadedArtifact::Verified { artifact, pin } => {
-            record_verified_github_release_pin(lock_file, &artifact, pin, name);
+            record_verified_github_release_pin(lock_file, &artifact, pin, resolved, name);
             artifact.path().clone()
         }
         DownloadedArtifact::FirstUse { path, sha256 } => {
@@ -6956,128 +7125,125 @@ fn select_locked_artifact<'lock>(
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
     let source_key = remote_source.source_key();
-    let selected =
-        if let Some(requested_revision) = &config.revision {
-            match remote_source {
-                RemoteSource::Registry(_) => {
-                    lock_file
-                        .find_by_source_key(&source_key)
-                        .and_then(|lock_entry| match &lock_entry.kind {
-                            LockEntryKind::RegistryRevision {
-                                revision,
-                                version: _,
-                            } if revision == requested_revision => Some(lock_entry),
-                            LockEntryKind::RegistryRevision {
-                                revision: _,
-                                version: _,
-                            }
-                            | LockEntryKind::Version {
-                                version: _,
-                                constraint: _,
-                            }
-                            | LockEntryKind::GithubRelease {
-                                version: _,
-                                tag: _,
-                                asset_id: _,
-                                constraint: _,
-                            }
-                            | LockEntryKind::Revision {
-                                revision: _,
-                                resolved_sha: _,
-                            }
-                            | LockEntryKind::File => None,
-                        })
+    let lock_entry = match lock_file.find_source_entry(&source_key) {
+        Some(SourceLockEntry::Typed(entry)) => Some(entry),
+        Some(SourceLockEntry::Legacy(entry)) => {
+            return Err(FindInstalledProviderError::LegacyEntry(
+                entry.error(base_dir),
+            ));
+        }
+        None => None,
+    };
+    let selected = if let Some(requested_revision) = &config.revision {
+        match remote_source {
+            RemoteSource::Registry(_) => lock_entry.and_then(|lock_entry| match &lock_entry.kind {
+                LockEntryKind::RegistryRevision {
+                    revision,
+                    version: _,
+                } if revision == requested_revision => Some(lock_entry),
+                LockEntryKind::RegistryRevision {
+                    revision: _,
+                    version: _,
                 }
-                RemoteSource::GithubDirect(_) => lock_file
-                    .find_by_source_key(&source_key)
-                    .and_then(|lock_entry| match &lock_entry.kind {
-                        LockEntryKind::Revision {
-                            revision: _,
-                            resolved_sha: _,
-                        } => Some(lock_entry),
-                        LockEntryKind::Version {
-                            version: _,
-                            constraint: _,
-                        }
-                        | LockEntryKind::GithubRelease {
-                            version: _,
-                            tag: _,
-                            asset_id: _,
-                            constraint: _,
-                        }
-                        | LockEntryKind::RegistryRevision {
-                            revision: _,
-                            version: _,
-                        }
-                        | LockEntryKind::File => None,
-                    }),
-            }
-        } else {
-            match remote_source {
-                RemoteSource::Registry(_) => {
-                    lock_file
-                        .find_by_source_key(&source_key)
-                        .and_then(|lock_entry| match &lock_entry.kind {
-                            LockEntryKind::Version {
-                                version: _,
-                                constraint: _,
-                            } => Some(lock_entry),
-                            LockEntryKind::GithubRelease {
-                                version: _,
-                                tag: _,
-                                asset_id: _,
-                                constraint: _,
-                            }
-                            | LockEntryKind::Revision {
-                                revision: _,
-                                resolved_sha: _,
-                            }
-                            | LockEntryKind::RegistryRevision {
-                                revision: _,
-                                version: _,
-                            }
-                            | LockEntryKind::File => None,
-                        })
+                | LockEntryKind::Version {
+                    version: _,
+                    constraint: _,
                 }
-                RemoteSource::GithubDirect(_) => {
-                    let lock_entry = lock_file.find_by_source_key(&source_key);
-                    match lock_entry.map(|entry| (&entry.kind, entry)) {
-                        Some((
-                            LockEntryKind::GithubRelease {
-                                version: _,
-                                tag: _,
-                                asset_id: _,
-                                constraint: _,
-                            },
-                            entry,
-                        )) => Some(entry),
-                        Some((
-                            LockEntryKind::Version {
-                                version: _,
-                                constraint: _,
-                            },
-                            _,
-                        ))
-                        | Some((
-                            LockEntryKind::Revision {
-                                revision: _,
-                                resolved_sha: _,
-                            },
-                            _,
-                        ))
-                        | Some((
-                            LockEntryKind::RegistryRevision {
-                                revision: _,
-                                version: _,
-                            },
-                            _,
-                        ))
-                        | Some((LockEntryKind::File, _))
-                        | None => None,
+                | LockEntryKind::GithubRelease {
+                    version: _,
+                    tag: _,
+                    asset_id: _,
+                    constraint: _,
+                }
+                | LockEntryKind::Revision {
+                    revision: _,
+                    resolved_sha: _,
+                }
+                | LockEntryKind::File => None,
+            }),
+            RemoteSource::GithubDirect(_) => {
+                lock_entry.and_then(|lock_entry| match &lock_entry.kind {
+                    LockEntryKind::Revision {
+                        revision: _,
+                        resolved_sha: _,
+                    } => Some(lock_entry),
+                    LockEntryKind::Version {
+                        version: _,
+                        constraint: _,
                     }
-                }
+                    | LockEntryKind::GithubRelease {
+                        version: _,
+                        tag: _,
+                        asset_id: _,
+                        constraint: _,
+                    }
+                    | LockEntryKind::RegistryRevision {
+                        revision: _,
+                        version: _,
+                    }
+                    | LockEntryKind::File => None,
+                })
             }
-        };
+        }
+    } else {
+        match remote_source {
+            RemoteSource::Registry(_) => lock_entry.and_then(|lock_entry| match &lock_entry.kind {
+                LockEntryKind::Version {
+                    version: _,
+                    constraint: _,
+                } => Some(lock_entry),
+                LockEntryKind::GithubRelease {
+                    version: _,
+                    tag: _,
+                    asset_id: _,
+                    constraint: _,
+                }
+                | LockEntryKind::Revision {
+                    revision: _,
+                    resolved_sha: _,
+                }
+                | LockEntryKind::RegistryRevision {
+                    revision: _,
+                    version: _,
+                }
+                | LockEntryKind::File => None,
+            }),
+            RemoteSource::GithubDirect(_) => match lock_entry.map(|entry| (&entry.kind, entry)) {
+                Some((
+                    LockEntryKind::GithubRelease {
+                        version: _,
+                        tag: _,
+                        asset_id: _,
+                        constraint: _,
+                    },
+                    entry,
+                )) => Some(entry),
+                Some((
+                    LockEntryKind::Version {
+                        version: _,
+                        constraint: _,
+                    },
+                    _,
+                ))
+                | Some((
+                    LockEntryKind::Revision {
+                        revision: _,
+                        resolved_sha: _,
+                    },
+                    _,
+                ))
+                | Some((
+                    LockEntryKind::RegistryRevision {
+                        revision: _,
+                        version: _,
+                    },
+                    _,
+                ))
+                | Some((LockEntryKind::File, _))
+                | None => None,
+            },
+        }
+    };
 
     selected
         .map(|lock_entry| {
@@ -7145,26 +7311,33 @@ fn file_metadata_fingerprint(path: &Path) -> Option<FileMetadataFingerprint> {
 pub fn provider_artifact_fingerprint(
     base_dir: &Path,
     config: &ProviderConfig,
-) -> ProviderArtifactFingerprint {
+) -> Result<ProviderArtifactFingerprint, LegacyLockEntryError> {
     let lock_file = file_metadata_fingerprint(&provider_lock_path(base_dir));
-    let artifact = config.source.as_ref().and_then(|source| match source {
-        ProviderSource::File(file_source) => {
+    let artifact = match config.source.as_ref() {
+        Some(ProviderSource::File(file_source)) => {
             WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)
                 .ok()
                 .and_then(|path| file_metadata_fingerprint(path.as_path()))
         }
-        ProviderSource::Remote(remote_source) => {
-            let loaded_lock = load_lock_file(base_dir).ok().flatten()?;
-            select_locked_artifact(base_dir, config, remote_source, &loaded_lock)
-                .ok()
-                .flatten()
-                .and_then(|selection| file_metadata_fingerprint(selection.path.as_path()))
+        Some(ProviderSource::Remote(remote_source)) => {
+            let Some(loaded_lock) = load_lock_file(base_dir).ok().flatten() else {
+                return Ok(ProviderArtifactFingerprint {
+                    artifact: None,
+                    lock_file,
+                });
+            };
+            match select_locked_artifact(base_dir, config, remote_source, &loaded_lock) {
+                Ok(Some(selection)) => file_metadata_fingerprint(selection.path.as_path()),
+                Ok(None) | Err(FindInstalledProviderError::Other(_)) => None,
+                Err(FindInstalledProviderError::LegacyEntry(error)) => return Err(error),
+            }
         }
-    });
-    ProviderArtifactFingerprint {
+        None => None,
+    };
+    Ok(ProviderArtifactFingerprint {
         artifact,
         lock_file,
-    }
+    })
 }
 
 /// Find an already-installed provider without downloading.
@@ -7201,10 +7374,7 @@ pub fn find_installed_provider(
         ProviderSource::Remote(remote_source) => remote_source,
     };
     let lock_file = load_lock_file(base_dir)
-        .map_err(|error| match error {
-            LockFileError::LegacyEntry { error } => FindInstalledProviderError::LegacyEntry(error),
-            other => FindInstalledProviderError::Other(other.to_string()),
-        })?
+        .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
         .unwrap_or_default();
 
     // Only the project-local `.carina/` counts. The global plugin cache is an
@@ -7275,8 +7445,9 @@ fn try_reuse_locked_github_release(
     constraint: Option<&VersionConstraint>,
     lock_file: &LockFile,
 ) -> Result<Option<ResolvedGithubRelease>, String> {
-    let Some(entry) = lock_file.find_by_source_key(source) else {
-        return Ok(None);
+    let entry = match lock_file.find_source_entry(source) {
+        Some(SourceLockEntry::Typed(entry)) => entry,
+        Some(SourceLockEntry::Legacy(_)) | None => return Ok(None),
     };
     match &entry.kind {
         LockEntryKind::GithubRelease {
@@ -7337,6 +7508,17 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
         && let Some((legacy_version, legacy_sha256)) =
             lock_file.legacy_github_version_pin(&source_key)
     {
+        if let Some(constraint) = constraint
+            && !constraint.matches(&legacy_version).unwrap_or(false)
+        {
+            return Err(mismatch_error(
+                provider_name,
+                &format!("version = '{legacy_version}'"),
+                &format!("constraint = '{}'", constraint.raw),
+                lock_file.project_dir(),
+            )
+            .to_string());
+        }
         let version = Version::parse(&legacy_version).map_err(|error| {
             format!(
                 "Invalid semantic version '{}' in legacy GitHub release lock entry for {}: {error}",
@@ -7523,11 +7705,6 @@ pub fn check_lock_mismatch(
     if mode == LockMode::Upgrade {
         return Ok(());
     }
-    if mode == LockMode::Locked
-        && let Some(error) = lock_file.legacy_entry_error(project_dir)
-    {
-        return Err(LockMismatchError::LegacyEntry(error));
-    }
     let mismatch_error =
         |name, lock_shape, crn_shape| mismatch_error(name, lock_shape, crn_shape, project_dir);
 
@@ -7540,8 +7717,34 @@ pub fn check_lock_mismatch(
         };
         let source_key = remote_source.source_key();
 
-        let lock_entry = match lock_file.find_by_source_key(&source_key) {
-            Some(entry) => entry,
+        let lock_entry = match lock_file.find_source_entry(&source_key) {
+            Some(SourceLockEntry::Typed(entry)) => entry,
+            Some(SourceLockEntry::Legacy(entry)) => {
+                let LegacyReason::GithubDirectVersionWithoutTag {
+                    version: legacy_version,
+                    sha256: _,
+                } = &entry.reason;
+                if let Some(crn_revision) = &config.revision {
+                    return Err(mismatch_error(
+                        &config.name,
+                        &format!("version = '{legacy_version}'"),
+                        &format!("revision = '{crn_revision}'"),
+                    ));
+                }
+                if let Some(constraint) = &config.version
+                    && !constraint.matches(legacy_version).unwrap_or(false)
+                {
+                    return Err(mismatch_error(
+                        &config.name,
+                        &format!("version = '{legacy_version}'"),
+                        &format!("constraint = '{}'", constraint.raw),
+                    ));
+                }
+                if mode == LockMode::Locked {
+                    return Err(LockMismatchError::LegacyEntry(entry.error(project_dir)));
+                }
+                continue;
+            }
             None => {
                 if mode == LockMode::Locked {
                     return Err(LockMismatchError::Mismatch(format!(
@@ -7892,18 +8095,25 @@ pub fn validate_lock_constraints(
     };
 
     for config in providers {
-        // Skip revision-based providers — they don't use semver constraints
-        if config.revision.is_some() {
-            continue;
-        }
-
         let remote_source = match &config.source {
             Some(ProviderSource::Remote(source)) => source,
             Some(ProviderSource::File(_)) | None => continue,
         };
         let source_key = remote_source.source_key();
 
-        let lock_entry = lock_file.find_by_source_key(&source_key);
+        let lock_entry = match lock_file.find_source_entry(&source_key) {
+            Some(SourceLockEntry::Typed(entry)) => Some(entry),
+            Some(SourceLockEntry::Legacy(entry)) => {
+                return Err(LockConstraintError::LegacyEntry(entry.error(base_dir)));
+            }
+            None => None,
+        };
+
+        // Revision-based providers do not use semver constraints, but a
+        // legacy version entry for the same source must still surface above.
+        if config.revision.is_some() {
+            continue;
+        }
 
         let constraint = match &config.version {
             Some(c) => c,
@@ -8035,19 +8245,149 @@ sha256 = "def"
         )
         .unwrap();
 
-        let (retained, legacy) = split_legacy_entries(vec![github, registry.clone()]);
+        let (retained, legacy) =
+            split_legacy_entries(vec![github.clone(), registry.clone()]).unwrap();
 
         assert_eq!(retained, vec![registry]);
-        assert_eq!(
-            legacy,
-            vec![LegacyLockEntry {
-                source: "github.com/acme/widget".into(),
-                reason: LegacyReason::GithubDirectVersionWithoutTag {
-                    version: "0.1.0".into(),
-                    sha256: "abc".into(),
-                },
-            }]
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].source, "github.com/acme/widget");
+        assert!(matches!(
+            &legacy[0].reason,
+            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
+                if version == "0.1.0" && sha256 == "abc"
+        ));
+        assert_eq!(legacy[0].raw, github);
+    }
+
+    #[test]
+    fn split_legacy_entries_rejects_missing_pinned_fields() {
+        for (field, body) in [
+            (
+                "version",
+                r#"name = "widget"
+source = "github.com/acme/widget"
+mode = "version"
+sha256 = "abc"
+"#,
+            ),
+            (
+                "sha256",
+                r#"name = "widget"
+source = "github.com/acme/widget"
+mode = "version"
+version = "0.1.0"
+"#,
+            ),
+        ] {
+            let entry = toml::from_str::<toml::Table>(body).unwrap();
+
+            let error = split_legacy_entries(vec![entry]).unwrap_err();
+
+            assert!(matches!(
+                error,
+                LegacyLockEntryParseError::MissingStringField {
+                    source,
+                    field: missing,
+                } if source == "github.com/acme/widget" && missing == field
+            ));
+        }
+    }
+
+    #[test]
+    fn current_lock_with_legacy_entry_reports_an_in_memory_migration() {
+        let loaded = LockFile::parse_toml_str(
+            r#"version = 4
+
+[[provider]]
+name = "widget"
+source = "github.com/acme/widget"
+mode = "version"
+version = "0.1.0"
+sha256 = "abc"
+"#,
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .unwrap();
+        let (_, migration) = loaded.into_parts();
+        let migration = migration.expect("filtering must produce a migration event");
+
+        assert_eq!(migration.legacy_sources, ["github.com/acme/widget"]);
+        let report = migration.to_string();
+        assert!(report.contains("github.com/acme/widget"), "{report}");
+        assert!(
+            report.contains("exact release tag and asset ID"),
+            "{report}"
         );
+    }
+
+    #[test]
+    fn saving_loaded_lock_preserves_complete_legacy_provider_table() {
+        let project = tempfile::tempdir().unwrap();
+        let lock_path = provider_lock_path(project.path());
+        fs::write(
+            &lock_path,
+            r#"version = 4
+
+[[provider]]
+name = "widget"
+source = "github.com/acme/widget"
+mode = "version"
+version = "0.1.0"
+sha256 = "abc"
+future_protection_field = "retain-me"
+"#,
+        )
+        .unwrap();
+        let lock = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+
+        lock.save(&lock_path).unwrap();
+
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            saved.contains("source = \"github.com/acme/widget\""),
+            "{saved}"
+        );
+        assert!(saved.contains("version = \"0.1.0\""), "{saved}");
+        assert!(saved.contains("sha256 = \"abc\""), "{saved}");
+        assert!(
+            saved.contains("future_protection_field = \"retain-me\""),
+            "{saved}"
+        );
+    }
+
+    #[test]
+    fn github_release_lock_rejects_version_that_does_not_match_tag() {
+        let error = LockFile::parse_toml_str(
+            r#"version = 4
+
+[[provider]]
+name = "widget"
+source = "github.com/acme/widget"
+mode = "release"
+version = "1.0.0"
+tag = "v2.0.0"
+asset_id = 42
+sha256 = "abc"
+"#,
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .expect_err("a release lock version must be derived from its exact tag");
+
+        assert!(matches!(
+            &error,
+            LockFileError::InvalidGithubReleasePin {
+                path: _,
+                source,
+                version,
+                tag,
+            } if source == "github.com/acme/widget"
+                && version == "1.0.0"
+                && tag.as_str() == "v2.0.0"
+        ));
+        assert!(error.to_string().contains("v2.0.0"), "{error}");
+        assert!(error.to_string().contains("1.0.0"), "{error}");
     }
 
     #[test]
@@ -8078,16 +8418,13 @@ sha256 = "def"
         assert_eq!(migration.unwrap().from, 1);
         assert_eq!(lock.provider.len(), 1);
         assert_eq!(lock.provider[0].source, "carina-rs/aws");
-        assert_eq!(
-            lock.legacy,
-            vec![LegacyLockEntry {
-                source: "github.com/acme/widget".into(),
-                reason: LegacyReason::GithubDirectVersionWithoutTag {
-                    version: "0.1.0".into(),
-                    sha256: "abc".into(),
-                },
-            }]
-        );
+        assert_eq!(lock.legacy.len(), 1);
+        assert_eq!(lock.legacy[0].source, "github.com/acme/widget");
+        assert!(matches!(
+            &lock.legacy[0].reason,
+            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
+                if version == "0.1.0" && sha256 == "abc"
+        ));
     }
 
     #[test]
@@ -8123,16 +8460,13 @@ sha256 = "def"
             assert_eq!(migration.unwrap().from, version);
             assert_eq!(lock.provider.len(), 1);
             assert_eq!(lock.provider[0].source, "carina-rs/aws");
-            assert_eq!(
-                lock.legacy,
-                vec![LegacyLockEntry {
-                    source: "github.com/acme/widget".into(),
-                    reason: LegacyReason::GithubDirectVersionWithoutTag {
-                        version: "0.1.0".into(),
-                        sha256: "abc".into(),
-                    },
-                }]
-            );
+            assert_eq!(lock.legacy.len(), 1);
+            assert_eq!(lock.legacy[0].source, "github.com/acme/widget");
+            assert!(matches!(
+                &lock.legacy[0].reason,
+                LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
+                    if version == "0.1.0" && sha256 == "abc"
+            ));
         }
     }
 
@@ -8147,8 +8481,12 @@ sha256 = "def"
         ResolvedGithubRelease::from_lock_entry(
             Version::parse(version).unwrap(),
             ReleaseTag::from_lock(format!("v{version}")),
-            42,
+            release_asset_id(42),
         )
+    }
+
+    fn release_asset_id(id: u64) -> ReleaseAssetId {
+        ReleaseAssetId::from_lock(id)
     }
 
     fn github_asset_url(source: &str, asset_id: u64) -> String {
@@ -9853,7 +10191,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: "abc".into(),
@@ -10081,7 +10419,7 @@ transparency_log_present = false
                 kind: LockEntryKind::GithubRelease {
                     version: "0.5.2".into(),
                     tag: crate::version_resolver::ReleaseTag::from_lock("v0.5.2".into()),
-                    asset_id: 42,
+                    asset_id: release_asset_id(42),
                     constraint: Some("~0.5.0".into()),
                 },
                 sha256: "abc123".into(),
@@ -10332,10 +10670,7 @@ sha256 = "abc"
         let lock_path = dir.path().join("carina-providers.lock");
 
         let mut lock = LockFile::default();
-        lock.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.1.0",
-        ));
+        lock.upsert(version_entry("carina-rs/awscc", "0.1.0"));
 
         lock.save(&lock_path).unwrap();
         let loaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
@@ -10369,10 +10704,7 @@ sha256 = "abc"
         fs::write(&lock_path, old_content).unwrap();
 
         let mut new_lock = LockFile::default();
-        new_lock.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        new_lock.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected = new_lock.to_toml_string().unwrap();
 
         new_lock.save(&lock_path).unwrap();
@@ -10437,18 +10769,12 @@ sha256 = "abc"
         let lock_path = dir.path().join("carina-providers.lock");
 
         let mut original = LockFile::default();
-        original.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.1.0",
-        ));
+        original.upsert(version_entry("carina-rs/awscc", "0.1.0"));
         original.save(&lock_path).unwrap();
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut replacement = LockFile::default();
-        replacement.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        replacement.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected = replacement.to_toml_string().unwrap();
 
         replacement
@@ -10483,10 +10809,7 @@ sha256 = "abc"
         symlink(&target_path, &link_path).unwrap();
 
         let mut replacement = LockFile::default();
-        replacement.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        replacement.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected = replacement.to_toml_string().unwrap();
         replacement.save(&link_path).unwrap();
 
@@ -10515,10 +10838,7 @@ sha256 = "abc"
         symlink(Path::new("../targets/carina-providers.lock"), &link_path).unwrap();
 
         let mut lock = LockFile::default();
-        lock.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        lock.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected = lock.to_toml_string().unwrap();
         lock.save(&link_path).unwrap();
 
@@ -10551,10 +10871,7 @@ sha256 = "abc"
         assert!(!missing_path.exists());
 
         let mut lock = LockFile::default();
-        lock.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        lock.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected = lock.to_toml_string().unwrap();
         lock.save(&top_path).unwrap();
 
@@ -10618,18 +10935,12 @@ sha256 = "abc"
         let lock_path = dir.path().join("carina-providers.lock");
 
         let mut original = LockFile::default();
-        original.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.1.0",
-        ));
+        original.upsert(version_entry("carina-rs/awscc", "0.1.0"));
         let original_content = original.to_toml_string().unwrap();
         fs::write(&lock_path, &original_content).unwrap();
 
         let mut replacement = LockFile::default();
-        replacement.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        replacement.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         let expected_temporary_content = replacement.to_toml_string().unwrap();
         let expected_target = lock_path.clone();
 
@@ -10715,10 +11026,7 @@ sha256 = "abc"
         let old_inode = fs::metadata(&lock_path).unwrap().ino();
 
         let mut new_lock = LockFile::default();
-        new_lock.upsert(version_entry(
-            "github.com/carina-rs/carina-provider-awscc",
-            "0.2.0",
-        ));
+        new_lock.upsert(version_entry("carina-rs/awscc", "0.2.0"));
         new_lock.save(&lock_path).unwrap();
 
         let new_inode = fs::metadata(&lock_path).unwrap().ino();
@@ -13660,7 +13968,7 @@ transparency_log_present = true
 
     #[test]
     fn upsert_replaces_existing_entry_by_source() {
-        let source = "github.com/carina-rs/carina-provider-awscc";
+        let source = "carina-rs/awscc";
         let mut lock = LockFile::default();
         lock.upsert(version_entry(source, "0.1.0"));
         lock.upsert(version_entry(source, "0.2.0"));
@@ -13793,14 +14101,15 @@ transparency_log_present = true
     fn version_cache_checksum_mismatch_hint_uses_project_dir() {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("infra/foo");
-        let artifact = cache_path_wasm(&project_dir, &source_key("github.com/acme/aws"), "1.0.0");
+        let source = "carina-rs/aws";
+        let artifact = cache_path_wasm(&project_dir, &source_key(source), "1.0.0");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, b"tampered").unwrap();
         let mut lock = LockFile::default();
-        lock.upsert(version_entry("github.com/acme/aws", "1.0.0"));
+        lock.upsert(version_entry(source, "1.0.0"));
 
         let error = VerifiedArtifact::from_existing(
-            lock.find_by_source_key_and_version(&source_key("github.com/acme/aws"), "1.0.0")
+            lock.find_by_source_key_and_version(&source_key(source), "1.0.0")
                 .unwrap(),
             "aws",
             &project_dir,
@@ -13860,7 +14169,7 @@ transparency_log_present = true
 
         // Reverse: version-mode entry doesn't answer a revision query.
         let mut lock = LockFile::default();
-        lock.upsert(version_entry(source, "0.5.2"));
+        lock.upsert(github_release_entry(source, "0.5.2"));
         assert!(lock.find(source, "0.5.2").is_some());
         assert!(lock.find_by_source_and_sha(source, sha).is_none());
     }
@@ -17922,7 +18231,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag,
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some("^0.1".into()),
             },
             sha256: sha256_bytes(bytes),
@@ -17975,7 +18284,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag,
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some("^0.1".into()),
             },
             sha256: sha256_bytes(bytes),
@@ -18029,7 +18338,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock("v0.1.0".into()),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: sha256_bytes(bytes),
@@ -18118,7 +18427,7 @@ transparency_log_present = false
                 tag,
                 asset_id,
                 constraint: Some(constraint),
-            } if version == "0.1.0" && tag.as_str() == "0.1.0" && *asset_id == 42 && constraint == "^0"
+            } if version == "0.1.0" && tag.as_str() == "0.1.0" && asset_id.get() == 42 && constraint == "^0"
         ));
         assert_eq!(fs::read(resolved["awscc"].as_path()).unwrap(), legacy_bytes);
         let requests = github_http.requests();
@@ -18130,6 +18439,99 @@ transparency_log_present = false
         );
         assert_eq!(requests[1].accept(), "application/octet-stream");
         assert_eq!(requests[1].authorization(), None);
+    }
+
+    #[test]
+    fn orphan_legacy_entry_survives_normal_init_save() {
+        let project = tempfile::tempdir().unwrap();
+        let lock_path = provider_lock_path(project.path());
+        let legacy_source = "github.com/acme/orphan";
+        fs::write(
+            &lock_path,
+            format!(
+                r#"version = 4
+
+[[provider]]
+name = "orphan"
+source = "{legacy_source}"
+mode = "version"
+version = "0.1.0"
+sha256 = "abc"
+future_protection_field = "retain-me"
+"#
+            ),
+        )
+        .unwrap();
+        let local_wasm = project.path().join("local.wasm");
+        fs::write(&local_wasm, b"local provider").unwrap();
+        let local_source = format!("file://{}", local_wasm.display());
+
+        resolve_all_with_http(
+            project.path(),
+            &[provider_config(&local_source, None)],
+            LockMode::Normal,
+            &FakeRegistryHttp::default(),
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(saved.contains(legacy_source), "{saved}");
+        assert!(
+            saved.contains("future_protection_field = \"retain-me\""),
+            "{saved}"
+        );
+        assert!(saved.contains(&local_source), "{saved}");
+    }
+
+    #[test]
+    fn failed_github_step_does_not_drop_legacy_entry_after_registry_persistence() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let lock_path = provider_lock_path(project.path());
+        let legacy_source = "github.com/acme/widget";
+        fs::write(
+            &lock_path,
+            format!(
+                r#"version = 4
+
+[[provider]]
+name = "widget"
+source = "{legacy_source}"
+mode = "version"
+version = "0.1.0"
+sha256 = "abc"
+future_protection_field = "retain-me"
+"#
+            ),
+        )
+        .unwrap();
+        let registry_bytes = b"registry provider";
+        let registry_sha256 = sha256_bytes(registry_bytes);
+        let registry = registry_http(registry_bytes, &registry_sha256);
+        let github_http = FixtureGithubHttp::default();
+        let github = GithubApi::new(&github_http, None);
+
+        resolve_all_with_github(
+            project.path(),
+            &[
+                versioned_config("carina-rs/aws", "^0.5"),
+                versioned_config(legacy_source, "^0.1"),
+            ],
+            LockMode::Normal,
+            &registry,
+            &github,
+        )
+        .expect_err("the GitHub fixture intentionally has no release-list response");
+
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(saved.contains(legacy_source), "{saved}");
+        assert!(
+            saved.contains("future_protection_field = \"retain-me\""),
+            "{saved}"
+        );
+        assert!(saved.contains("unpinned_registry_ratchets"), "{saved}");
     }
 
     #[test]
@@ -18228,9 +18630,9 @@ transparency_log_present = false
             LockEntryKind::GithubRelease {
                 version,
                 tag,
-                asset_id: 99,
+                asset_id,
                 constraint: Some(constraint),
-            } if version == "0.2.0" && tag.as_str() == "0.2.0" && constraint == "^0"
+            } if version == "0.2.0" && tag.as_str() == "0.2.0" && asset_id.get() == 99 && constraint == "^0"
         ));
     }
 
@@ -18280,9 +18682,9 @@ transparency_log_present = false
             LockEntryKind::GithubRelease {
                 version,
                 tag,
-                asset_id: 77,
+                asset_id,
                 constraint: None,
-            } if version == "0.2.0" && tag.as_str() == "v0.2.0"
+            } if version == "0.2.0" && tag.as_str() == "v0.2.0" && asset_id.get() == 77
         ));
     }
 
@@ -18336,6 +18738,71 @@ transparency_log_present = false
     }
 
     #[test]
+    fn upgrade_cache_hit_records_the_newly_resolved_release_identity() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let source = "github.com/acme/widget";
+        let version = "1.0.0";
+        let bytes = b"identical release bytes";
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "widget".into(),
+            source: source.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: version.into(),
+                tag: ReleaseTag::from_lock("v1.0.0".into()),
+                asset_id: release_asset_id(111),
+                constraint: Some("^1".into()),
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
+        fs::write(&project_wasm, bytes).unwrap();
+        let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
+        let github_http = FixtureGithubHttp::default().json(
+            releases_url,
+            r#"[{"tag_name":"1.0.0","assets":[{"name":"provider.wasm","id":222}]}]"#,
+        );
+        let github = GithubApi::new(&github_http, None);
+
+        resolve_all_with_github(
+            project.path(),
+            &[versioned_config(source, "^1")],
+            LockMode::Upgrade,
+            &FixtureRegistryHttp::default(),
+            &github,
+        )
+        .unwrap();
+
+        let saved = load_lock_file_for_test(&provider_lock_path(project.path()))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &saved.find_by_source(source).unwrap().kind,
+            LockEntryKind::GithubRelease {
+                version: saved_version,
+                tag,
+                asset_id,
+                constraint: Some(constraint),
+            } if saved_version == version && tag.as_str() == "1.0.0" && asset_id.get() == 222 && constraint == "^1"
+        ));
+        assert_eq!(
+            github_http
+                .requests()
+                .iter()
+                .map(|request| request.url())
+                .collect::<Vec<_>>(),
+            [releases_url],
+            "a verified project-cache hit must not redownload identical bytes"
+        );
+    }
+
+    #[test]
     fn reuploaded_asset_for_locked_version_keeps_checksum_pin() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
@@ -18351,7 +18818,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: "0.1.0".into(),
                 tag: ReleaseTag::from_lock("v0.1.0".into()),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some("^0.1".into()),
             },
             sha256: sha256_bytes(locked_bytes),
@@ -18413,7 +18880,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: expected_sha256.clone(),
@@ -18488,7 +18955,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some("^0.1".into()),
             },
             sha256: expected_sha256.clone(),
@@ -18567,7 +19034,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: sha256.clone(),
@@ -18703,7 +19170,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: expected_sha256.clone(),
@@ -18755,7 +19222,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some("^0.1".into()),
             },
             sha256: expected_sha256.clone(),
@@ -18895,7 +19362,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: sha256_bytes(b"locked installed provider"),
@@ -18904,7 +19371,7 @@ transparency_log_present = false
         lock.save(&provider_lock_path(project.path())).unwrap();
 
         let fingerprint =
-            provider_artifact_fingerprint(project.path(), &provider_config(source, None));
+            provider_artifact_fingerprint(project.path(), &provider_config(source, None)).unwrap();
         assert!(
             fingerprint.artifact.is_some(),
             "the drift probe must observe artifact metadata without hashing provider bytes"
@@ -18942,6 +19409,7 @@ transparency_log_present = false
                 project.path(),
                 &provider_config(&format!("file://{}", wasm.display()), None),
             )
+            .unwrap()
             .artifact
             .is_some()
         );
@@ -18950,6 +19418,7 @@ transparency_log_present = false
                 project.path(),
                 &provider_config(&format!("file://{}", native.display()), None),
             )
+            .unwrap()
             .artifact
             .is_none()
         );
@@ -18959,6 +19428,7 @@ transparency_log_present = false
                 project.path(),
                 &provider_config(&format!("file://{}", wasm.display()), None),
             )
+            .unwrap()
             .artifact
             .is_none()
         );
@@ -18980,7 +19450,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: sha256_bytes(artifact_bytes),
@@ -18999,7 +19469,7 @@ transparency_log_present = false
                 pin: LockedProviderPin::GithubRelease {
                     version: version.into(),
                     tag: ReleaseTag::from_lock(format!("v{version}")),
-                    asset_id: 42,
+                    asset_id: release_asset_id(42),
                     constraint: None,
                 },
             }
@@ -19023,7 +19493,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: None,
             },
             sha256: sha256_bytes(original_bytes),
@@ -19123,6 +19593,74 @@ transparency_log_present = false
     }
 
     #[test]
+    fn legacy_entry_for_one_source_does_not_block_installed_lookup_for_another() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy_source = "github.com/acme/legacy";
+        let installed_source = "github.com/acme/installed";
+        let installed_version = "0.2.0";
+        let bytes = b"installed provider";
+        fs::write(
+            provider_lock_path(project.path()),
+            format!(
+                r#"version = 4
+
+[[provider]]
+name = "legacy"
+source = "{legacy_source}"
+mode = "version"
+version = "0.1.0"
+sha256 = "abc"
+
+[[provider]]
+name = "installed"
+source = "{installed_source}"
+mode = "release"
+version = "{installed_version}"
+tag = "v{installed_version}"
+asset_id = 42
+sha256 = "{}"
+"#,
+                sha256_bytes(bytes)
+            ),
+        )
+        .unwrap();
+        let installed_path = cache_path_wasm(
+            project.path(),
+            &source_key(installed_source),
+            installed_version,
+        );
+        fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        fs::write(&installed_path, bytes).unwrap();
+
+        let installed =
+            find_installed_provider(project.path(), &provider_config(installed_source, None))
+                .expect("an unrelated legacy source must not block this installed provider");
+
+        assert_eq!(installed.path().as_path(), installed_path);
+    }
+
+    #[test]
+    fn provider_artifact_fingerprint_returns_typed_error_for_matching_legacy_source() {
+        let project = tempfile::tempdir().unwrap();
+        let source = "github.com/acme/legacy";
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(source, "0.1.0"));
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        let error = provider_artifact_fingerprint(project.path(), &provider_config(source, None))
+            .unwrap_err();
+
+        assert_eq!(error.source, source);
+        assert!(matches!(
+            error.reason,
+            LegacyReason::GithubDirectVersionWithoutTag {
+                version,
+                sha256: _,
+            } if version == "0.1.0"
+        ));
+    }
+
+    #[test]
     fn legacy_lock_boundary_is_typed_error_for_constraint_validation() {
         let tmp = tempfile::tempdir().unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
@@ -19135,15 +19673,13 @@ transparency_log_present = false
 
         assert!(matches!(
             &error,
-            LockConstraintError::LockFile(LockFileError::LegacyEntry {
-                error: LegacyLockEntryError {
-                    source: locked_source,
-                    reason: LegacyReason::GithubDirectVersionWithoutTag {
-                        version: _,
-                        sha256: _,
-                    },
-                    project_dir: _
-                }
+            LockConstraintError::LegacyEntry(LegacyLockEntryError {
+                source: locked_source,
+                reason: LegacyReason::GithubDirectVersionWithoutTag {
+                    version: _,
+                    sha256: _,
+                },
+                project_dir: _
             }) if locked_source == source
         ));
         assert!(error.to_string().contains("carina init"));
@@ -19223,7 +19759,7 @@ transparency_log_present = false
             kind: LockEntryKind::GithubRelease {
                 version: version.into(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
-                asset_id: 42,
+                asset_id: release_asset_id(42),
                 constraint: Some(constraint.into()),
             },
             sha256: "abc".into(),
@@ -19411,6 +19947,26 @@ transparency_log_present = false
         }
     }
 
+    fn legacy_github_lock(source: &str, version: &str, sha256: &str) -> LockFile {
+        LockFile::parse_toml_str(
+            &format!(
+                r#"version = 4
+
+[[provider]]
+name = "legacy"
+source = "{source}"
+mode = "version"
+version = "{version}"
+sha256 = "{sha256}"
+"#
+            ),
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .unwrap()
+        .into_lock_file()
+    }
+
     const SRC: &str = "github.com/carina-rs/carina-provider-awscc";
 
     #[test]
@@ -19434,6 +19990,19 @@ transparency_log_present = false
     }
 
     #[test]
+    fn check_mismatch_detects_legacy_constraint_unsatisfied() {
+        let lock = legacy_github_lock(SRC, "0.1.0", "abc");
+        let cfg = versioned_config(SRC, "^0.2");
+
+        let error = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err("legacy 0.1.0 must not bypass a ^0.2 constraint");
+
+        assert!(error.to_string().contains("0.1.0"), "{error}");
+        assert!(error.to_string().contains("^0.2"), "{error}");
+        assert!(matches!(error, LockMismatchError::Mismatch(_)));
+    }
+
+    #[test]
     fn check_mismatch_detects_version_to_revision_switch() {
         let mut lock = LockFile::default();
         lock.upsert(github_release_entry(SRC, "0.5.2"));
@@ -19445,6 +20014,19 @@ transparency_log_present = false
         assert!(err.to_string().contains("revision"), "{err}");
         assert!(err.to_string().contains("version"), "{err}");
         assert!(err.to_string().contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_detects_legacy_version_to_revision_switch() {
+        let lock = legacy_github_lock(SRC, "0.1.0", "abc");
+        let cfg = provider_config(SRC, Some("main"));
+
+        let error = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err("a legacy version pin cannot satisfy revision mode");
+
+        assert!(error.to_string().contains("version"), "{error}");
+        assert!(error.to_string().contains("revision"), "{error}");
+        assert!(matches!(error, LockMismatchError::Mismatch(_)));
     }
 
     #[test]
@@ -19613,6 +20195,15 @@ transparency_log_present = false
             )) if source == SRC
         ));
         assert!(error.to_string().contains("carina init"));
+    }
+
+    #[test]
+    fn locked_mode_tolerates_orphan_legacy_entry() {
+        let mut lock = legacy_github_lock("github.com/acme/orphan", "0.1.0", "abc");
+        lock.upsert(github_release_entry(SRC, "0.5.2"));
+        let cfg = versioned_config(SRC, "~0.5.0");
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Locked).is_ok());
     }
 
     #[test]

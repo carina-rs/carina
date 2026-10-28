@@ -7447,7 +7447,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
             version: "1.0.0".into(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
-            asset_id: 42,
+            asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
         sha256: "fixture".into(),
@@ -7586,7 +7586,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
             version: "1.0.0".into(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
-            asset_id: 42,
+            asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
         sha256: "fixture".into(),

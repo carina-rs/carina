@@ -13,7 +13,6 @@ use crate::provider_resolver::{
     cache_path_wasm, sha256_file,
 };
 use crate::revision_resolver::cache_path_revision;
-use crate::version_resolver::ReleaseTag;
 
 /// Provider artifact bytes captured by the resolver.
 ///
@@ -101,9 +100,6 @@ impl<P, R> ArtifactPin<'_, P, R> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GithubReleaseArtifactPin {
-    pub(crate) version: String,
-    pub(crate) tag: ReleaseTag,
-    pub(crate) asset_id: u64,
     pub(crate) constraint: Option<String>,
 }
 
@@ -324,15 +320,12 @@ pub(crate) fn lookup_github_release_artifact_pin<'a>(
         .and_then(|entry| match &entry.kind {
             LockEntryKind::GithubRelease {
                 version: locked_version,
-                tag,
-                asset_id: locked_asset_id,
+                tag: _,
+                asset_id: _,
                 constraint,
             } if locked_version == &version => Some((
                 entry,
                 GithubReleaseArtifactPin {
-                    version: locked_version.clone(),
-                    tag: tag.clone(),
-                    asset_id: *locked_asset_id,
                     constraint: constraint.clone(),
                 },
             )),
@@ -507,7 +500,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
                 version,
                 constraint,
             },
-            RemoteSource::Registry(source),
+            source,
         ) => (
             cache_path_wasm(project_dir, &source.source_key(), version),
             version.clone(),
@@ -516,17 +509,6 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
                 constraint: constraint.clone(),
             },
         ),
-        (
-            LockEntryKind::Version {
-                version: _,
-                constraint: _,
-            },
-            RemoteSource::GithubDirect(_),
-        ) => {
-            return Err(format!(
-                "Provider '{provider_name}' has a registry version lock pin for a GitHub direct source"
-            ));
-        }
         (
             LockEntryKind::GithubRelease {
                 version,
