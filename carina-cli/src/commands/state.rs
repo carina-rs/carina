@@ -905,6 +905,20 @@ async fn run_state_bucket_delete(
     let selection = BackendSelection::for_bucket_delete(settings, bucket_name)
         .map_err(|error| AppError::Config(error.into_message()))?;
 
+    let base_dir = get_base_dir(path);
+    // Provider loading depends only on the authored source/version. Validate
+    // that command wiring before asking the operator to confirm deletion; the
+    // resolved provider values needed for construction can wait until after
+    // confirmation.
+    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
+    let wiring = providers.validate_evaluated_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
+
     println!(
         "{}",
         "WARNING: This will delete the state bucket and all state history."
@@ -931,19 +945,10 @@ async fn run_state_bucket_delete(
         }
     }
 
-    let base_dir = get_base_dir(path);
     let provider_name = selection.provider_name();
     let resource_type = selection.resource_type();
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
-    let providers = ProviderLoad::load(provider_inputs.configs().as_provider_configs(), base_dir)?;
-    let wiring = providers.validate_evaluated_config(
-        &mut parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
     let bucket_provider =
         create_state_bucket_delete_provider(&wiring, provider_inputs.configs(), provider_name)
             .await?;

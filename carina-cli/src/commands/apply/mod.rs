@@ -76,13 +76,14 @@ use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, CompleteProviderLoad, LateAnonymousIdentityInputs, ProviderLoad,
-    ValidatedWiring, create_normalizers_from_configs_with_ctx,
-    create_providers_from_configs_with_ctx, get_provider_with_ctx, module_constraint_plan_errors,
-    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    read_managed_state_with_retry, reconcile_canonical_anonymous_identifiers_with_ctx,
-    reconcile_canonical_prefixed_names, reconcile_late_anonymous_identities,
-    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
+    AddressedDataSourceReadInputs, CheckedSavedPlanInputs, CompleteProviderLoad,
+    LateAnonymousIdentityInputs, ProviderLoad, ValidatedWiring,
+    create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
+    get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
+    prepare_default_provider_ready_config, read_managed_state_with_retry,
+    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
+    reconcile_late_anonymous_identities, refresh_loaded_orphan_with_retry,
+    refresh_loaded_resource_with_retry,
 };
 #[cfg(test)]
 use crate::wiring::{WiringContext, read_with_retry};
@@ -106,11 +107,9 @@ struct PlanFileHeader {
     source_path: Option<serde_json::Value>,
 }
 
-struct SavedPlanCurrentConfigInputs {
-    parsed: carina_core::parser::InferredFile,
-    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-    inference_errors: Vec<carina_core::validation::inference::ExportInferenceError>,
-    duplicate_declarations: Vec<carina_core::config_loader::DuplicateDeclaration>,
+enum SavedPlanProviderLoad {
+    Complete(CompleteProviderLoad),
+    CurrentConfigChecked(CheckedSavedPlanInputs),
 }
 
 fn saved_plan_secret_rehydration_error(
@@ -3163,13 +3162,14 @@ async fn run_apply_from_plan_with_observer_factory(
     let base_dir = get_base_dir(&source_path);
     let inspected_plan = InspectedPlanFile::inspect(plan_file);
     // Load exactly once from the saved plan's provider configs: this is the
-    // provider instance that will execute. Current-config secret validation
-    // borrows this load, then its diagnostics are completed before any backend
-    // drift, saved-plan backend mismatch, or state-lock gate.
+    // provider instance that will execute. Complete its diagnostics before
+    // current-config secret validation, backend drift, saved-plan backend
+    // mismatch, or the state-lock gate.
     let providers = ProviderLoad::load(
         inspected_plan.provider_configs().as_provider_configs(),
         base_dir,
-    )?;
+    )?
+    .into_complete()?;
     let needs_secret_verification = inspected_plan.needs_secret_verification();
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
@@ -3194,41 +3194,28 @@ async fn run_apply_from_plan_with_observer_factory(
     let parsed_backend = loaded_current_config
         .as_ref()
         .map(|config| config.parsed.backend.clone());
-    let current_config_inputs = if needs_secret_verification {
+    let providers = if needs_secret_verification {
         let current_config = loaded_current_config
             .take()
             .expect("secret verification requires a loaded current configuration");
-        let module_walk = crate::module_walk::ModuleWalk::load(&current_config.parsed, base_dir);
-        let duplicate_errors = crate::commands::duplicate_declaration_errors(
-            &current_config.duplicate_declarations,
-            &module_walk,
-        );
-        if !duplicate_errors.is_empty() {
-            return Err(saved_plan_secret_evaluation_error(
-                crate::commands::collapse_errors(duplicate_errors),
-                apply_target,
-            ));
-        }
-        providers
-            .check_config_pair(
-                current_config.parsed.clone(),
-                current_config.unresolved_parsed.clone(),
+        let parsed = current_config.parsed;
+        let unresolved = current_config.unresolved_parsed;
+        let inference_errors = current_config.inference_errors;
+        let duplicate_declarations = current_config.duplicate_declarations;
+        let providers = providers
+            .check_saved_plan_config_pair(
+                parsed,
+                unresolved,
                 base_dir,
                 false,
-                &current_config.inference_errors,
-                &current_config.duplicate_declarations,
+                &inference_errors,
+                &duplicate_declarations,
             )
             .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-        Some(SavedPlanCurrentConfigInputs {
-            parsed: current_config.parsed,
-            unresolved: current_config.unresolved_parsed,
-            inference_errors: current_config.inference_errors,
-            duplicate_declarations: current_config.duplicate_declarations,
-        })
+        SavedPlanProviderLoad::CurrentConfigChecked(providers)
     } else {
-        None
+        SavedPlanProviderLoad::Complete(providers)
     };
-    let providers = providers.into_complete()?;
     let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
         Some(current_backend) => current_backend,
@@ -3275,7 +3262,6 @@ async fn run_apply_from_plan_with_observer_factory(
 
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        current_config_inputs,
         providers,
         provider_context,
         auto_approve,
@@ -3301,8 +3287,7 @@ async fn run_apply_from_plan_with_observer_factory(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
     inspected_plan: InspectedPlanFile,
-    current_config_inputs: Option<SavedPlanCurrentConfigInputs>,
-    providers: CompleteProviderLoad,
+    providers: SavedPlanProviderLoad,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3410,16 +3395,27 @@ async fn run_apply_from_plan_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-            // Artifact and schema verification consumes the preloaded complete
-            // load and mints the wiring witness before normalizer construction
-            // or secret evaluation.
-            let (schema_checked_plan, validated_wiring) =
-                inspected_plan.verify_provider_load(providers, apply_target)?;
+            // Artifact and schema verification consumes the preloaded provider
+            // state and mints the wiring witness. The secret-bearing variant
+            // returns its retained current-config pair alongside that witness,
+            // so validation is not repeated under the lock.
+            let (schema_checked_plan, validated_wiring, canonical_resources) = match providers {
+                SavedPlanProviderLoad::Complete(providers) => {
+                    let (plan, wiring) =
+                        inspected_plan.verify_provider_load(providers, apply_target)?;
+                    (plan, wiring, None)
+                }
+                SavedPlanProviderLoad::CurrentConfigChecked(providers) => {
+                    let (plan, wiring, canonical_resources) = inspected_plan
+                        .verify_provider_load_with_current_config(providers, apply_target)?;
+                    (plan, wiring, Some(canonical_resources))
+                }
+            };
 
             let desired_plan = match schema_checked_plan {
                 SchemaCheckedPlanFile::Verified(plan) => DesiredPlanFile::Verified(plan),
                 SchemaCheckedPlanFile::NeedsSecretVerification(pending) => {
-                    let current_config_inputs = current_config_inputs.ok_or_else(|| {
+                    let canonical_resources = canonical_resources.ok_or_else(|| {
                         saved_plan_secret_evaluation_error(
                             AppError::Config(
                                 "the current configuration was unavailable".to_string(),
@@ -3427,24 +3423,6 @@ async fn run_apply_from_plan_locked_owned(
                             apply_target,
                         )
                     })?;
-                    let SavedPlanCurrentConfigInputs {
-                        parsed,
-                        unresolved,
-                        inference_errors,
-                        duplicate_declarations,
-                    } = current_config_inputs;
-                    let canonical_resources = validated_wiring
-                        .revalidate_config_pair(
-                            parsed,
-                            unresolved,
-                            project_dir,
-                            false,
-                            &inference_errors,
-                            &duplicate_declarations,
-                        )
-                        .map_err(|source| {
-                            saved_plan_secret_evaluation_error(source, apply_target)
-                        })?;
                     let candidates = prepare_saved_plan_secret_candidates(
                         canonical_resources,
                         &pending,
@@ -3818,7 +3796,6 @@ async fn run_apply_from_plan_locked_owned(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
     inspected_plan: InspectedPlanFile,
-    current_config_inputs: Option<SavedPlanCurrentConfigInputs>,
     provider_context: &ProviderContext,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -3850,8 +3827,7 @@ async fn run_apply_from_plan_locked(
     };
     let outcome = run_apply_from_plan_locked_owned(
         inspected_plan,
-        current_config_inputs,
-        providers,
+        SavedPlanProviderLoad::Complete(providers),
         provider_context,
         auto_approve,
         Arc::clone(&backend),

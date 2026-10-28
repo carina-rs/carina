@@ -422,7 +422,6 @@ async fn run_saved_plan_schema_fingerprint_case(
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -889,7 +888,6 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         backend,
@@ -1135,7 +1133,6 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
 
     let error = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         Arc::clone(&backend),
@@ -3057,7 +3054,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -3177,7 +3173,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -3246,7 +3241,6 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -3329,7 +3323,6 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 
     let error = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -3430,7 +3423,6 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
 
     run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         &ProviderContext::default(),
         true,
         fixture.backend_handle(),
@@ -3839,7 +3831,6 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
 
     let error = run_apply_from_plan_locked(
         inspected_saved_plan(plan_file),
-        None,
         fixture.provider_context(),
         true,
         backend.clone(),

@@ -37,8 +37,10 @@ pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    ProviderLoad, WiringContext, compute_anonymous_identifiers_with_ctx,
+    WiringContext, compute_anonymous_identifiers_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
     resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
     validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
@@ -367,14 +369,15 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     )
 }
 
-/// Collecting, non-minting validation entry point.
+/// Test-support collecting, non-minting validation entry point.
 ///
 /// The `&ProviderLoad` privately owns both the factory context and
 /// per-provider diagnostics used to build the report. This helper neither
 /// performs another load nor exposes a context or mints
 /// [`ValidatedWiring`](crate::wiring::ValidatedWiring).
-/// Execution commands use the consuming validation methods on
-/// [`ProviderLoad`] instead.
+/// Production commands use the consuming validation methods on
+/// [`ProviderLoad`] or the report-only loader instead.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_errors(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,

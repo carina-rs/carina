@@ -402,12 +402,11 @@ pub enum LoadedProviderArtifact {
 
 /// The opaque context and diagnostics produced by one provider load operation.
 ///
-/// Before consumption, this raw state can supply only non-minting validation
-/// reports and read-only schemas; it cannot expose its context. A concrete
-/// validation or saved-plan verification transition must consume it before
-/// planners and executors can borrow that context. The type does not prevent
-/// a caller from loading twice; it prevents either result from reaching those
-/// consumers under evidence produced from the other result.
+/// This raw state cannot expose its context. A concrete validation or
+/// saved-plan verification transition must consume it before planners and
+/// executors can borrow that context. The type does not prevent a caller from
+/// loading twice; it prevents either result from reaching those consumers
+/// under evidence produced from the other result.
 pub struct ProviderLoad {
     context: WiringContext,
     load_errors: HashMap<String, String>,
@@ -420,6 +419,16 @@ pub struct ProviderLoad {
 /// borrow the context through [`ValidatedWiring`].
 pub(crate) struct CompleteProviderLoad {
     context: WiringContext,
+}
+
+/// A complete load bound to the canonical current configuration checked for
+/// saved-plan secret verification.
+///
+/// Both fields are private so the pair cannot be detached from its provider
+/// load before saved-plan artifact verification mints executable wiring.
+pub(crate) struct CheckedSavedPlanInputs {
+    load: CompleteProviderLoad,
+    canonical_resources: Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
 }
 
 /// Schema-only provider state used by collect-all validation and lint.
@@ -585,10 +594,8 @@ impl ProviderLoad {
         ))
     }
 
-    /// Run evaluated-config validation without minting executable wiring.
-    ///
-    /// Best-effort commands use this report so an incomplete load can still
-    /// contribute schemas and collect independent static diagnostics.
+    /// Test-support report that validates without minting executable wiring.
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn validation_report<'a>(
         &'a self,
         parsed: &mut carina_core::parser::InferredFile,
@@ -618,13 +625,26 @@ impl ProviderLoad {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedWiring, AppError> {
-        self.into_complete()?.validate_evaluated_config(
+        let errors = validation_report_from(
+            &self.context,
+            &self.load_errors,
             parsed,
             base_dir,
             skip_resource_validation,
             prior_inference_errors,
             duplicate_declarations,
         )
+        .into_errors();
+        if !errors.is_empty() {
+            return Err(crate::commands::collapse_errors(errors));
+        }
+
+        // With resource validation skipped, per-provider load diagnostics are
+        // intentionally absent from the collecting pass. Completeness remains
+        // the final fail-fast gate before execution wiring can be minted.
+        Ok(ValidatedWiring {
+            load: self.into_complete()?,
+        })
     }
 
     /// Validate and canonicalize both snapshots, then mint executable wiring
@@ -645,28 +665,7 @@ impl ProviderLoad {
         ),
         AppError,
     > {
-        self.into_complete()?.validate_config_pair(
-            parsed,
-            unresolved,
-            base_dir,
-            skip_resource_validation,
-            prior_inference_errors,
-            duplicate_declarations,
-        )
-    }
-
-    /// Validate both config snapshots without exposing resources or minting wiring.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn check_config_pair(
-        &self,
-        parsed: carina_core::parser::InferredFile,
-        unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-        base_dir: &Path,
-        skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
-        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-    ) -> Result<(), AppError> {
-        resolve_config_pair_with_context(
+        let canonical_resources = resolve_config_pair_with_context(
             &self.context,
             &self.load_errors,
             parsed,
@@ -675,8 +674,13 @@ impl ProviderLoad {
             skip_resource_validation,
             prior_inference_errors,
             duplicate_declarations,
-        )
-        .map(|_| ())
+        )?;
+        Ok((
+            ValidatedWiring {
+                load: self.into_complete()?,
+            },
+            canonical_resources,
+        ))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -720,34 +724,10 @@ impl ProviderLoad {
 }
 
 impl CompleteProviderLoad {
-    /// Validate an evaluated config after loader completeness has been proven.
-    fn validate_evaluated_config(
-        self,
-        parsed: &mut carina_core::parser::InferredFile,
-        base_dir: &Path,
-        skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
-        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-    ) -> Result<ValidatedWiring, AppError> {
-        let errors = validation_report_from(
-            &self.context,
-            &HashMap::new(),
-            parsed,
-            base_dir,
-            skip_resource_validation,
-            prior_inference_errors,
-            duplicate_declarations,
-        )
-        .into_errors();
-        if !errors.is_empty() {
-            return Err(crate::commands::collapse_errors(errors));
-        }
-        Ok(ValidatedWiring { load: self })
-    }
-
-    /// Validate both snapshots after loader completeness has been proven.
+    /// Validate the current config once and retain its canonical pair with the
+    /// exact complete load that will verify and execute a saved plan.
     #[allow(clippy::too_many_arguments)]
-    fn validate_config_pair(
+    pub(crate) fn check_saved_plan_config_pair(
         self,
         parsed: carina_core::parser::InferredFile,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
@@ -755,14 +735,8 @@ impl CompleteProviderLoad {
         skip_resource_validation: bool,
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-    ) -> Result<
-        (
-            ValidatedWiring,
-            CanonicalResourcePair<carina_core::parser::InferredExportParam>,
-        ),
-        AppError,
-    > {
-        let pair = resolve_config_pair_with_context(
+    ) -> Result<CheckedSavedPlanInputs, AppError> {
+        let canonical_resources = resolve_config_pair_with_context(
             &self.context,
             &HashMap::new(),
             parsed,
@@ -772,7 +746,10 @@ impl CompleteProviderLoad {
             prior_inference_errors,
             duplicate_declarations,
         )?;
-        Ok((ValidatedWiring { load: self }, pair))
+        Ok(CheckedSavedPlanInputs {
+            load: self,
+            canonical_resources: Box::new(canonical_resources),
+        })
     }
 
     /// Bind a saved-plan artifact proof to this exact complete provider load.
@@ -794,6 +771,34 @@ impl CompleteProviderLoad {
         let checked = check(&self.context)?;
         let checked_plan = checked.into_plan();
         Ok((checked_plan, ValidatedWiring { load: self }))
+    }
+}
+
+impl CheckedSavedPlanInputs {
+    /// Bind saved-plan artifact proof to the load that already checked the
+    /// retained current-config pair, returning all three values together.
+    pub(crate) fn verify_saved_plan_artifacts(
+        self,
+        check: impl for<'context> FnOnce(
+            &'context WiringContext,
+        ) -> Result<
+            crate::commands::apply::saved_plan::SavedPlanArtifactsChecked<'context>,
+            AppError,
+        >,
+    ) -> Result<
+        (
+            crate::commands::apply::saved_plan::SchemaCheckedPlanFile,
+            ValidatedWiring,
+            CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+        ),
+        AppError,
+    > {
+        let Self {
+            load,
+            canonical_resources,
+        } = self;
+        let (plan, wiring) = load.verify_saved_plan_artifacts(check)?;
+        Ok((plan, wiring, *canonical_resources))
     }
 }
 

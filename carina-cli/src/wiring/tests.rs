@@ -19,7 +19,7 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
-fn execution_minting_checks_load_completeness_first_in_provider_name_order() {
+fn execution_minting_checks_load_completeness_after_skipped_validation_in_provider_name_order() {
     let incomplete_load = || {
         ProviderLoad::for_test_with_load_errors(
             Vec::new(),
@@ -64,6 +64,49 @@ fn execution_minting_checks_load_completeness_first_in_provider_name_order() {
 
     assert_eq!(evaluated_error.to_string(), "alpha failed\nzeta failed");
     assert_eq!(pair_error.to_string(), "alpha failed\nzeta failed");
+}
+
+#[test]
+fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors() {
+    let provider = ProviderConfig {
+        name: "broken".to_string(),
+        source: Some("file:///definitely-missing/broken.wasm".parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let providers = ProviderLoad::for_test_with_load_errors(
+        Vec::new(),
+        std::slice::from_ref(&provider),
+        HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
+    );
+    let parsed = carina_core::parser::InferredFile {
+        providers: vec![provider],
+        arguments: vec![carina_core::parser::ArgumentParameter {
+            name: "unrelated".to_string(),
+            type_expr: carina_core::parser::TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }],
+        ..Default::default()
+    };
+
+    let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
+        carina_core::parser::ParsedFile::default(),
+    );
+    let error =
+        match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[], &[]) {
+            Ok(_) => panic!("plan-style validation must reject both independent errors"),
+            Err(error) => error,
+        };
+    let message = error.to_string();
+
+    assert!(message.contains("broken provider failed"), "{message}");
+    assert!(message.contains("arguments blocks"), "{message}");
 }
 
 #[test]

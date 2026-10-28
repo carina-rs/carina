@@ -17,7 +17,8 @@ use crate::error::{
     SavedPlanSchemaMismatchError,
 };
 use crate::wiring::{
-    CompleteProviderLoad, ExpandedCanonicalResources, ValidatedWiring, WiringContext,
+    CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, ValidatedWiring,
+    WiringContext,
 };
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
@@ -252,6 +253,24 @@ impl ReloadedInspectedPlanFile {
         providers: CompleteProviderLoad,
         apply_target: ApplyTarget<'_>,
     ) -> Result<(SchemaCheckedPlanFile, ValidatedWiring), AppError> {
+        providers.verify_saved_plan_artifacts(|ctx| self.check_loaded_providers(ctx, apply_target))
+    }
+
+    /// Verify artifacts against the complete load that already checked the
+    /// current config, and return its retained canonical pair with the checked
+    /// plan and executable wiring.
+    pub(crate) fn verify_provider_load_with_current_config(
+        self,
+        providers: CheckedSavedPlanInputs,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<
+        (
+            SchemaCheckedPlanFile,
+            ValidatedWiring,
+            carina_core::override_aware::CanonicalResourcePair<InferredExportParam>,
+        ),
+        AppError,
+    > {
         providers.verify_saved_plan_artifacts(|ctx| self.check_loaded_providers(ctx, apply_target))
     }
 
