@@ -543,7 +543,7 @@ pub fn build_detail_rows_by_instance(
         Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
             let schema = registry
                 .and_then(|reg| reg.get_for(r))
-                .map(|schema| schema.as_schema());
+                .map(|schema| schema.schema().as_schema());
             build_create_rows(&r.attributes, &r.default_tag_keys, schema, detail)
         }
         Effect::Update {
@@ -555,7 +555,7 @@ pub fn build_detail_rows_by_instance(
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
             let schema = registry
                 .and_then(|registry| registry.get_for(to))
-                .map(|schema| schema.as_schema());
+                .map(|schema| schema.schema().as_schema());
             let Some(masked_from) = historical_attributes.update(&from.id) else {
                 return Vec::new();
             };
@@ -577,7 +577,7 @@ pub fn build_detail_rows_by_instance(
         Effect::Read { resource } => {
             let schema = registry
                 .and_then(|reg| reg.get_for_data_source(resource))
-                .map(|schema| schema.as_schema());
+                .map(|schema| schema.schema().as_schema());
             build_create_rows(
                 &resource.attributes,
                 &DefaultTagKeys::default(),
@@ -1254,7 +1254,7 @@ pub fn build_replace_detail_rows_from_display(
     };
     let schema = registry
         .and_then(|reg| reg.get_for(to))
-        .map(|schema| schema.as_schema());
+        .map(|schema| schema.schema().as_schema());
     build_replace_rows_from_attributes(
         &historical_attributes.attributes,
         &historical_attributes.nested_write_only,

@@ -4,6 +4,7 @@
 //! It is responsible for converting Effects into actual API calls.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,10 @@ use crate::resource::{
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
-use crate::schema::{LeafPath, ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
+use crate::schema::{
+    AttributeType, LeafPath, RawShape, RefinedScalarKind, ResourceSchema, SchemaRegistry, Shape,
+    TypeIdentity, ValidatedConfigSchema, ValidatedResourceSchema,
+};
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
 };
@@ -444,7 +448,9 @@ impl ProviderError {
         WireProviderError {
             kind,
             message: message.clone(),
-            resource_id: resource_id.as_deref().map(ResourceId::to_wire),
+            resource_id: resource_id
+                .as_deref()
+                .map(crate::protocol_convert::resource_id_to_protocol),
             cause: cause
                 .as_deref()
                 .map(|cause| ProviderCauseChain(cause).to_string()),
@@ -474,7 +480,8 @@ impl ProviderError {
             code,
             request_id,
         } = error;
-        let resource_id = resource_id.map(|id| Box::new(ResourceId::from_wire(id)));
+        let resource_id =
+            resource_id.map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id)));
         let detail = Box::new(ErrorDetail {
             message,
             resource_id,
@@ -1597,9 +1604,9 @@ impl LiftedSavedAttrs {
 /// [`State`] is centralized in [`AppliedState::into_state_for_writeback`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppliedState {
-    id: ResourceId,
-    identifier: AppliedIdentifier,
-    attributes: HashMap<String, Value>,
+    pub(crate) id: ResourceId,
+    pub(crate) identifier: AppliedIdentifier,
+    pub(crate) attributes: HashMap<String, Value>,
 }
 
 impl AppliedState {
@@ -1764,8 +1771,8 @@ pub enum UpdateOutcome {
 /// Diagnostic details for a partial post-mutation read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialReadDiagnostic {
-    reason: String,
-    missing_attributes: Vec<String>,
+    pub(crate) reason: String,
+    pub(crate) missing_attributes: Vec<String>,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -4433,6 +4440,316 @@ impl CanonicalCustomTypeValue {
     }
 }
 
+/// Typed failure while projecting one identified scalar value to the guest
+/// validator's canonical text representation.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CustomTypeCanonicalizationError {
+    #[error(
+        "custom-type canonicalization requires an identified scalar declaration, got {type_name}"
+    )]
+    UnidentifiedDeclaration { type_name: String },
+    #[error("custom type `{identity}` has no scalar bridge kind ({type_name})")]
+    MissingScalarKind {
+        identity: TypeIdentity,
+        type_name: String,
+    },
+    #[error("custom type `{identity}` requires a finite float")]
+    NonFiniteFloat { identity: TypeIdentity },
+    #[error("could not canonicalize enum `{identity}`: {error}")]
+    EnumResolution {
+        identity: TypeIdentity,
+        error: Box<crate::schema::TypeError>,
+    },
+    #[error("expected enum `{expected}`, got `{actual}`")]
+    EnumIdentityMismatch {
+        expected: Box<TypeIdentity>,
+        actual: Box<TypeIdentity>,
+    },
+    #[error("custom type `{identity}` expects {expected}, got {actual}")]
+    ConcreteKindMismatch {
+        identity: TypeIdentity,
+        expected: RefinedScalarKind,
+        actual: &'static str,
+    },
+}
+
+impl CustomTypeCanonicalizationError {
+    pub(crate) fn into_type_error(self) -> crate::schema::TypeError {
+        match self {
+            Self::EnumResolution { error, .. } => *error,
+            Self::ConcreteKindMismatch {
+                identity,
+                expected: _expected,
+                actual,
+            } => crate::schema::TypeError::TypeMismatch {
+                expected: identity.to_string(),
+                got: actual.to_string(),
+            },
+            error @ (Self::UnidentifiedDeclaration { .. }
+            | Self::MissingScalarKind { .. }
+            | Self::NonFiniteFloat { .. }
+            | Self::EnumIdentityMismatch { .. }) => crate::schema::TypeError::ValidationFailed {
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+/// Return the identity carried by an identified scalar or enum declaration.
+pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
+    match attribute_type.raw_shape() {
+        RawShape::String { identity, .. }
+        | RawShape::Int { identity, .. }
+        | RawShape::Float { identity, .. } => identity,
+        RawShape::Enum { identity, .. } => Some(identity),
+        RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    }
+}
+
+/// Return the primitive bridge kind carried by an identified declaration.
+/// Enums use their preserved protocol base rather than being treated as
+/// strings by convention.
+pub fn identified_custom_type_scalar_kind(
+    attribute_type: &AttributeType,
+) -> Option<RefinedScalarKind> {
+    match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(_), ..
+        } => Some(RefinedScalarKind::String),
+        RawShape::Int {
+            identity: Some(_), ..
+        } => Some(RefinedScalarKind::Int),
+        RawShape::Float {
+            identity: Some(_), ..
+        } => Some(RefinedScalarKind::Float),
+        RawShape::Enum { base, .. } => scalar_kind_from_base(base),
+        RawShape::String { identity: None, .. }
+        | RawShape::Int { identity: None, .. }
+        | RawShape::Float { identity: None, .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    }
+}
+
+fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
+    match attribute_type.raw_shape() {
+        RawShape::String { .. } => Some(RefinedScalarKind::String),
+        RawShape::Int { .. } => Some(RefinedScalarKind::Int),
+        RawShape::Float { .. } => Some(RefinedScalarKind::Float),
+        RawShape::Enum { base, .. } => scalar_kind_from_base(base),
+        RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    }
+}
+
+/// Canonicalize a value using its identified scalar/enum declaration.
+///
+/// Requiring the declaration makes unresolved enum identifiers impossible to
+/// project by convention: enum spelling always resolves through the exact
+/// owning schema type, while refined strings may still accept their raw
+/// identifier-shaped DSL literal.
+pub fn canonicalize_custom_type_value(
+    declared_type: &AttributeType,
+    value: &Value,
+) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
+    let identity = identified_custom_type_identity(declared_type).ok_or_else(|| {
+        CustomTypeCanonicalizationError::UnidentifiedDeclaration {
+            type_name: declared_type.type_name(),
+        }
+    })?;
+    let scalar_kind = identified_custom_type_scalar_kind(declared_type).ok_or_else(|| {
+        CustomTypeCanonicalizationError::MissingScalarKind {
+            identity: identity.clone(),
+            type_name: declared_type.type_name(),
+        }
+    })?;
+    match (declared_type.raw_shape(), value) {
+        (
+            RawShape::String {
+                identity: _,
+                pattern: _,
+                length: _,
+                validate: _,
+                to_dsl: _,
+            },
+            Value::Concrete(ConcreteValue::String(value)),
+        ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
+        (
+            RawShape::String {
+                identity: _,
+                pattern: _,
+                length: _,
+                validate: _,
+                to_dsl: _,
+            },
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
+        ) => Ok(Some(CanonicalCustomTypeValue(raw.as_str().to_string()))),
+        (
+            RawShape::Int {
+                identity: _,
+                range: _,
+                validate: _,
+            },
+            Value::Concrete(ConcreteValue::Int(value)),
+        ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
+        (
+            RawShape::Float {
+                identity: _,
+                range: _,
+                validate: _,
+            },
+            Value::Concrete(ConcreteValue::Int(value)),
+        ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
+        (
+            RawShape::Float {
+                identity: _,
+                range: _,
+                validate: _,
+            },
+            Value::Concrete(ConcreteValue::Float(value)),
+        ) => {
+            if value.is_finite() {
+                Ok(Some(CanonicalCustomTypeValue(value.to_string())))
+            } else {
+                Err(CustomTypeCanonicalizationError::NonFiniteFloat {
+                    identity: identity.clone(),
+                })
+            }
+        }
+        (
+            RawShape::Enum {
+                identity: _,
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                validate: _,
+                to_dsl: _,
+            },
+            Value::Concrete(ConcreteValue::String(value)),
+        ) => {
+            let canonical = crate::resource::EnumValueResolver::new(declared_type)
+                .resolve_state_text(value.expose_plaintext())
+                .map_err(|error| CustomTypeCanonicalizationError::EnumResolution {
+                    identity: identity.clone(),
+                    error: Box::new(error),
+                })?;
+            if !canonical.identity().same_type(identity) {
+                return Err(CustomTypeCanonicalizationError::EnumIdentityMismatch {
+                    expected: Box::new(identity.clone()),
+                    actual: Box::new(canonical.identity().clone()),
+                });
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
+                &canonical,
+            )))
+        }
+        (
+            RawShape::Enum {
+                identity: _,
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                validate: _,
+                to_dsl: _,
+            },
+            Value::Concrete(ConcreteValue::CanonicalEnum(value)),
+        ) => {
+            if !value.identity().same_type(identity) {
+                return Err(CustomTypeCanonicalizationError::EnumIdentityMismatch {
+                    expected: Box::new(identity.clone()),
+                    actual: Box::new(value.identity().clone()),
+                });
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(value)))
+        }
+        (
+            RawShape::Enum {
+                identity: _,
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                validate: _,
+                to_dsl: _,
+            },
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
+        ) => {
+            let canonical = crate::resource::EnumValueResolver::new(declared_type)
+                .resolve_raw(raw)
+                .map_err(|error| CustomTypeCanonicalizationError::EnumResolution {
+                    identity: identity.clone(),
+                    error: Box::new(error),
+                })?;
+            if !canonical.identity().same_type(identity) {
+                return Err(CustomTypeCanonicalizationError::EnumIdentityMismatch {
+                    expected: Box::new(identity.clone()),
+                    actual: Box::new(canonical.identity().clone()),
+                });
+            }
+            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
+                &canonical,
+            )))
+        }
+        (
+            RawShape::String { .. }
+            | RawShape::Int { .. }
+            | RawShape::Float { .. }
+            | RawShape::Enum { .. },
+            Value::Deferred(_),
+        ) => Ok(None),
+        (
+            RawShape::String { .. }
+            | RawShape::Int { .. }
+            | RawShape::Float { .. }
+            | RawShape::Enum { .. },
+            Value::Concrete(value),
+        ) => Err(CustomTypeCanonicalizationError::ConcreteKindMismatch {
+            identity: identity.clone(),
+            expected: scalar_kind,
+            actual: custom_type_concrete_value_kind(value),
+        }),
+        (
+            RawShape::Bool
+            | RawShape::Duration
+            | RawShape::List { .. }
+            | RawShape::Map { .. }
+            | RawShape::Struct { .. }
+            | RawShape::Union(_)
+            | RawShape::Ref(_),
+            _,
+        ) => unreachable!("identified scalar guard excludes non-scalar declarations"),
+    }
+}
+
+fn custom_type_concrete_value_kind(value: &ConcreteValue) -> &'static str {
+    match value {
+        ConcreteValue::String(_) => "string",
+        ConcreteValue::EnumIdentifier(_) => "enum identifier",
+        ConcreteValue::CanonicalEnum(_) => "canonical enum",
+        ConcreteValue::Int(_) => "integer",
+        ConcreteValue::Float(_) => "float",
+        ConcreteValue::Bool(_) => "boolean",
+        ConcreteValue::Duration(_) => "duration",
+        ConcreteValue::List(_) | ConcreteValue::StringList(_) => "list",
+        ConcreteValue::Map(_) => "map",
+    }
+}
+
 impl std::ops::Deref for CanonicalCustomTypeValue {
     type Target = str;
 
@@ -4494,10 +4811,11 @@ pub trait ProviderFactory: Send + Sync {
     fn validate_config(&self, attributes: &CanonicalProviderConfigAttributes)
     -> ProviderResult<()>;
 
-    /// Validate a value against a provider-defined custom type.
-    /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
-    /// Returns an invalid-input [`ProviderError`] if the value is invalid for
-    /// the given type.
+    /// Validate a value against a provider-defined custom type after local
+    /// schema constraints have run. The native default adds no extra
+    /// factory-side constraint; host-backed factories override this and the
+    /// SDK guest rejects identities absent from its schema-derived table.
+    /// Failures retain the provider's structured [`ProviderError`].
     ///
     /// `identity` is the structured [`TypeIdentity`] of the type, so a
     /// provider resolves the exact provider-scoped type instead of
@@ -4510,7 +4828,10 @@ pub trait ProviderFactory: Send + Sync {
     ///
     /// fn bypass(factory: &dyn ProviderFactory) {
     ///     factory
-    ///         .validate_custom_type(&TypeIdentity::bare("Mode"), "raw.dsl.text")
+    ///         .validate_custom_type(
+    ///             &TypeIdentity::bare("Mode"),
+    ///             "raw.dsl.text",
+    ///         )
     ///         .unwrap();
     /// }
     /// ```
@@ -4609,197 +4930,23 @@ pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry
     registry
 }
 
-/// Extract custom type validators from a registry.
-///
-/// Walks all `AttributeType::Custom` types in every registered schema and
-/// returns a map of (snake_case type name → validator function) suitable
-/// for populating `ProviderContext.validators`.
-pub fn collect_custom_type_validators(
-    registry: &SchemaRegistry,
-) -> HashMap<TypeIdentity, crate::parser::ValidatorFn> {
-    let mut validators: HashMap<TypeIdentity, crate::parser::ValidatorFn> = HashMap::new();
-
-    for (_provider, _resource_type, _kind, schema) in registry.iter() {
-        let schema = schema.as_schema();
-        for attr_schema in schema.attributes.values() {
-            collect_validators_from_type(&attr_schema.attr_type, &mut validators);
-        }
-        // Visit cyclic-struct definitions directly so any
-        // `Custom { identity, validate }` nested inside a `Ref` target
-        // (e.g. WAFv2 `Statement -> AndStatement` carrying a custom
-        // ARN type) gets its validator registered. The recursion in
-        // `collect_validators_from_type` stops at `Ref` to avoid
-        // infinite cycles; iterating `schema.defs.values()` here
-        // closes the loop in one bounded pass (carina#3340).
-        for def in schema.defs.values() {
-            collect_validators_from_type(def, &mut validators);
-        }
-    }
-
-    validators
-}
-
-/// Collect every identity-bearing schema type used by type-expression
-/// validation.
-///
-/// The retained [`AttributeType`] is the authority needed to turn an authored
-/// enum identifier into provider API spelling. Walking each definition once
-/// mirrors [`collect_custom_type_validators`] and avoids recursively following
-/// cyclic [`crate::schema::AttrTypeKind::Ref`] graphs.
-pub fn collect_custom_type_attribute_types(
-    registry: &SchemaRegistry,
-) -> HashMap<TypeIdentity, crate::schema::AttributeType> {
-    let mut types = HashMap::new();
-    for (_provider, _resource_type, _kind, schema) in registry.iter() {
-        let schema = schema.as_schema();
-        for attr_schema in schema.attributes.values() {
-            collect_identified_attribute_types_from_type(&attr_schema.attr_type, &mut types);
-        }
-        for def in schema.defs.values() {
-            collect_identified_attribute_types_from_type(def, &mut types);
-        }
-    }
-    types
-}
-
-fn collect_identified_attribute_types_from_type(
-    attr_type: &crate::schema::AttributeType,
-    types: &mut HashMap<TypeIdentity, crate::schema::AttributeType>,
-) {
-    use crate::schema::RawShape;
-
-    match attr_type.raw_shape() {
-        RawShape::String {
-            identity: Some(identity),
-            ..
-        }
-        | RawShape::Int {
-            identity: Some(identity),
-            ..
-        }
-        | RawShape::Float {
-            identity: Some(identity),
-            ..
-        }
-        | RawShape::Enum { identity, .. } => {
-            types
-                .entry(identity.clone())
-                .or_insert_with(|| attr_type.clone());
-        }
-        RawShape::List { element_type, .. } => {
-            collect_identified_attribute_types_from_type(element_type, types);
-        }
-        RawShape::Map { key, value } => {
-            collect_identified_attribute_types_from_type(key, types);
-            collect_identified_attribute_types_from_type(value, types);
-        }
-        RawShape::Struct { fields, .. } => {
-            for field in fields {
-                collect_identified_attribute_types_from_type(&field.field_type, types);
-            }
-        }
-        RawShape::Union(members) => {
-            for member in members {
-                collect_identified_attribute_types_from_type(member, types);
-            }
-        }
-        RawShape::Ref(_)
-        | RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
-        | RawShape::Float { identity: None, .. }
-        | RawShape::Bool
-        | RawShape::Duration => {}
-    }
-}
-
-/// Collect custom type identities from a registry without allocating
-/// validators.
-///
-/// Cheaper than `collect_custom_type_validators` when only the
-/// identities are needed (e.g., for LSP completions).
+/// Collect custom type identities from a registry for completion display.
 pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity> {
-    let mut names = std::collections::HashSet::new();
+    let mut names = HashSet::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
         let schema = schema.as_schema();
         for attr_schema in schema.attributes.values() {
             collect_type_names_from_type(&attr_schema.attr_type, &mut names);
         }
-        // Walk cyclic-struct definitions for the same reason as
-        // `collect_custom_type_validators` above (carina#3340).
+        // Definitions are visited once; `Ref` edges are not followed, so
+        // cyclic generated schemas terminate.
         for def in schema.defs.values() {
             collect_type_names_from_type(def, &mut names);
         }
     }
 
     names.into_iter().collect()
-}
-
-/// Recursively extract Custom type validators from an AttributeType.
-fn collect_validators_from_type(
-    attr_type: &crate::schema::AttributeType,
-    validators: &mut HashMap<TypeIdentity, crate::parser::ValidatorFn>,
-) {
-    use crate::schema::RawShape;
-
-    match attr_type.raw_shape() {
-        RawShape::String {
-            identity: Some(id),
-            validate: Some(validate),
-            ..
-        }
-        | RawShape::Int {
-            identity: Some(id),
-            validate: Some(validate),
-            ..
-        }
-        | RawShape::Float {
-            identity: Some(id),
-            validate: Some(validate),
-            ..
-        } => {
-            validators.entry(id.clone()).or_insert_with(|| {
-                let validate_fn = validate.clone();
-                Box::new(move |s: &str| {
-                    validate_fn(&crate::resource::Value::Concrete(
-                        crate::resource::ConcreteValue::String(s.to_string().into()),
-                    ))
-                    .map_err(|e| e.to_string())
-                })
-            });
-        }
-        RawShape::String { .. } | RawShape::Int { .. } | RawShape::Float { .. } => {}
-        RawShape::List {
-            element_type: inner,
-            ..
-        } => {
-            collect_validators_from_type(inner, validators);
-        }
-        RawShape::Map { key, value: inner } => {
-            collect_validators_from_type(key, validators);
-            collect_validators_from_type(inner, validators);
-        }
-        RawShape::Struct { fields, .. } => {
-            for field in fields {
-                collect_validators_from_type(&field.field_type, validators);
-            }
-        }
-        RawShape::Union(types) => {
-            for t in types {
-                collect_validators_from_type(t, validators);
-            }
-        }
-        // `AttributeType::Ref`: do NOT recurse into the resolved target
-        // here — that would loop forever on cyclic CFN schemas
-        // (`Statement -> AndStatement -> List<Statement>`). The
-        // callers (`collect_custom_type_validators` /
-        // `collect_custom_type_names`) walk every entry of
-        // `schema.defs` directly in a separate loop, which terminates
-        // because each def is visited exactly once. (carina#3340.)
-        RawShape::Ref(_) => {}
-        // Primitives carry no nested Custom types and no Ref.
-        RawShape::Bool | RawShape::Duration | RawShape::Enum { .. } => {}
-    }
 }
 
 /// Recursively collect Custom type identities from an AttributeType
@@ -4819,6 +4966,14 @@ fn collect_type_names_from_type(
         }
         | RawShape::Float {
             identity: Some(id), ..
+        }
+        | RawShape::Enum {
+            identity: id,
+            base: _,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
         } => {
             names.insert(id.clone());
         }
@@ -4845,12 +5000,650 @@ fn collect_type_names_from_type(
                 collect_type_names_from_type(t, names);
             }
         }
-        // See `collect_validators_from_type` for the rationale: the
-        // caller walks `schema.defs` separately to avoid infinite
+        // The caller walks `schema.defs` separately to avoid infinite
         // recursion on cyclic schemas (carina#3340).
         RawShape::Ref(_) => {}
-        RawShape::Bool | RawShape::Duration | RawShape::Enum { .. } => {}
+        RawShape::Bool | RawShape::Duration => {}
     }
+}
+
+fn visit_identified_types(
+    attribute_type: &AttributeType,
+    visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
+) {
+    match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(identity),
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: Some(identity),
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: Some(identity),
+            range: _,
+            validate: _,
+        }
+        | RawShape::Enum {
+            identity,
+            base: _,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => visitor(identity, attribute_type),
+        RawShape::List {
+            element_type,
+            ordered: _,
+            length: _,
+        } => visit_identified_types(element_type, visitor),
+        RawShape::Map { key, value } => {
+            visit_identified_types(key, visitor);
+            visit_identified_types(value, visitor);
+        }
+        RawShape::Struct { name: _, fields } => {
+            for field in fields {
+                visit_identified_types(&field.field_type, visitor);
+            }
+        }
+        RawShape::Union(members) => {
+            for member in members {
+                visit_identified_types(member, visitor);
+            }
+        }
+        RawShape::String {
+            identity: None,
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Ref(_) => {}
+    }
+}
+
+fn identified_types_from_witnesses(
+    schemas: &[ValidatedResourceSchema],
+    config: &ValidatedConfigSchema,
+) -> Vec<(TypeIdentity, AttributeType)> {
+    let mut declarations = Vec::new();
+    let mut collect = |identity: &TypeIdentity, attribute_type: &AttributeType| {
+        declarations.push((identity.clone(), attribute_type.clone()));
+    };
+    for schema in schemas {
+        let schema = schema.as_schema();
+        for attribute in schema.attributes.values() {
+            visit_identified_types(&attribute.attr_type, &mut collect);
+        }
+        for definition in schema.defs.values() {
+            visit_identified_types(definition, &mut collect);
+        }
+    }
+    for attribute_type in config.parts().values() {
+        visit_identified_types(attribute_type, &mut collect);
+    }
+    declarations
+}
+
+fn local_custom_validator(
+    attribute_type: &AttributeType,
+) -> Option<&crate::schema::CustomValidator> {
+    match attribute_type.raw_shape() {
+        RawShape::String { validate, .. }
+        | RawShape::Int { validate, .. }
+        | RawShape::Float { validate, .. }
+        | RawShape::Enum { validate, .. } => validate,
+        RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    }
+}
+
+fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
+    match error {
+        crate::schema::TypeError::ValidationFailed { message } => message,
+        error => error.to_string(),
+    }
+}
+
+fn validate_declared_custom_type_locally(
+    declared_type: &AttributeType,
+    value: &Value,
+) -> Result<Option<CanonicalCustomTypeValue>, crate::schema::TypeError> {
+    declared_type.validate_identified_scalar_value(value)?;
+    canonicalize_custom_type_value(declared_type, value)
+        .map_err(CustomTypeCanonicalizationError::into_type_error)
+}
+
+#[derive(Debug)]
+pub enum CustomTypeFactoryValidationError {
+    InvalidValue(crate::schema::TypeError),
+    ProviderRejected(ProviderError),
+}
+
+impl fmt::Display for CustomTypeFactoryValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidValue(error) => error.fmt(formatter),
+            Self::ProviderRejected(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CustomTypeFactoryValidationError {}
+
+/// Validate the exact identified declaration supplied by a schema walk.
+///
+/// This function deliberately does not search the factory's other schemas.
+/// Sibling declarations can share an identity while carrying different local
+/// constraints; only an authored annotation is conjunctive across declarations.
+pub fn validate_custom_type_with_factory(
+    factory: &dyn ProviderFactory,
+    declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+    value: &Value,
+) -> Result<(), CustomTypeFactoryValidationError> {
+    let declared_type = declaration.declared_type();
+    let identity = declaration.identity();
+    let canonical = validate_declared_custom_type_locally(declared_type, value)
+        .map_err(CustomTypeFactoryValidationError::InvalidValue)?;
+    if local_custom_validator(declared_type).is_some() {
+        return Ok(());
+    }
+    canonical.map_or(Ok(()), |canonical| {
+        factory
+            .validate_custom_type(identity, &canonical)
+            .map_err(CustomTypeFactoryValidationError::ProviderRejected)
+    })
+}
+
+fn owner_validation_error(
+    owner: &str,
+    identity: &TypeIdentity,
+    error: CustomTypeFactoryValidationError,
+) -> crate::parser::CustomTypeValidationError {
+    match error {
+        CustomTypeFactoryValidationError::InvalidValue(error) => {
+            crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                owner: owner.to_string(),
+                identity: identity.clone(),
+                error: Box::new(error),
+            }
+        }
+        CustomTypeFactoryValidationError::ProviderRejected(error) => {
+            let error = if error.detail().provider_name.is_some() {
+                error
+            } else {
+                error.for_provider(owner)
+            };
+            crate::parser::CustomTypeValidationError::ProviderRejected {
+                owner: owner.to_string(),
+                identity: identity.clone(),
+                error: std::sync::Arc::new(error),
+                masked: false,
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_custom_type_declaration_with_factory(
+    factory: &dyn ProviderFactory,
+    declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+    value: &Value,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    let owner = factory.name();
+    validate_custom_type_with_factory(factory, declaration, value)
+        .map_err(|error| owner_validation_error(owner, declaration.identity(), error))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomTypeDispatchTableError {
+    MissingScalarKind {
+        identity: TypeIdentity,
+    },
+    ConflictingScalarKinds {
+        identity: TypeIdentity,
+        first_kind: RefinedScalarKind,
+        second_kind: RefinedScalarKind,
+    },
+}
+
+impl fmt::Display for CustomTypeDispatchTableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingScalarKind { identity } => {
+                write!(
+                    formatter,
+                    "custom type `{identity}` has no scalar bridge kind"
+                )
+            }
+            Self::ConflictingScalarKinds {
+                identity,
+                first_kind,
+                second_kind,
+            } => write!(
+                formatter,
+                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CustomTypeDispatchTableError {}
+
+struct CustomTypeDispatchBinding {
+    scalar_kind: RefinedScalarKind,
+    callbacks: Vec<crate::schema::CustomValidator>,
+}
+
+/// Precomputed SDK guest validator dispatch keyed by semantic identity.
+///
+/// Each identity owns its scalar kind. Callers supply only the canonical wire
+/// text, so they cannot invoke a validator with a mismatched scalar shape.
+pub struct CustomTypeDispatchTable {
+    bindings: HashMap<TypeIdentity, CustomTypeDispatchBinding>,
+}
+
+impl fmt::Debug for CustomTypeDispatchTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CustomTypeDispatchTable")
+            .field("binding_count", &self.bindings.len())
+            .finish()
+    }
+}
+
+impl CustomTypeDispatchTable {
+    pub fn build(
+        schemas: &[ValidatedResourceSchema],
+        config: &ValidatedConfigSchema,
+    ) -> Result<Self, CustomTypeDispatchTableError> {
+        let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
+        for (identity, declaration) in identified_types_from_witnesses(schemas, config) {
+            let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
+                return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
+            };
+            let callback = local_custom_validator(&declaration).cloned();
+            match bindings.entry(identity.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CustomTypeDispatchBinding {
+                        scalar_kind: kind,
+                        callbacks: callback.into_iter().collect(),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let binding = entry.get_mut();
+                    if binding.scalar_kind != kind {
+                        return Err(CustomTypeDispatchTableError::ConflictingScalarKinds {
+                            identity,
+                            first_kind: binding.scalar_kind,
+                            second_kind: kind,
+                        });
+                    }
+                    if let Some(callback) = callback
+                        && !binding
+                            .callbacks
+                            .iter()
+                            .any(|existing| std::sync::Arc::ptr_eq(existing, &callback))
+                    {
+                        binding.callbacks.push(callback);
+                    }
+                }
+            }
+        }
+        Ok(Self { bindings })
+    }
+
+    pub fn dispatch(&self, identity: &TypeIdentity, canonical_text: &str) -> Result<(), String> {
+        let binding = self
+            .bindings
+            .get(identity)
+            .ok_or_else(|| format!("custom type `{identity}` is not declared by this provider"))?;
+        let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text)?;
+        for callback in &binding.callbacks {
+            callback(&value).map_err(custom_validator_bridge_message)?;
+        }
+        Ok(())
+    }
+}
+
+fn bridge_text_to_typed_value(
+    scalar_kind: RefinedScalarKind,
+    canonical_text: &str,
+) -> Result<Value, String> {
+    match scalar_kind {
+        RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(
+            canonical_text.to_string().into(),
+        ))),
+        RefinedScalarKind::Int => Ok(Value::Concrete(ConcreteValue::Int(
+            canonical_text
+                .parse::<i64>()
+                .map_err(|error| format!("invalid integer bridge value: {error}"))?,
+        ))),
+        RefinedScalarKind::Float => {
+            let value = canonical_text
+                .parse::<f64>()
+                .map_err(|error| format!("invalid float bridge value: {error}"))?;
+            if !value.is_finite() {
+                return Err("custom-type validation requires a finite float".to_string());
+            }
+            Ok(Value::Concrete(ConcreteValue::Float(value)))
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EnumDefinitionSignature {
+    values: Option<Vec<String>>,
+    aliases: Vec<(String, String)>,
+}
+
+fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefinitionSignature> {
+    let RawShape::Enum {
+        identity: _,
+        base: _,
+        values,
+        dsl_aliases,
+        validate: _,
+        to_dsl: _,
+    } = attribute_type.raw_shape()
+    else {
+        return None;
+    };
+    let mut values = values.map(<[String]>::to_vec);
+    if let Some(values) = &mut values {
+        values.sort();
+    }
+    let mut aliases = dsl_aliases.to_vec();
+    aliases.sort();
+    Some(EnumDefinitionSignature { values, aliases })
+}
+
+struct OwnerCustomTypeIndex {
+    factory_index: usize,
+    declarations: HashMap<TypeIdentity, Vec<AttributeType>>,
+}
+
+pub(crate) trait ProviderFactorySource: Send + Sync {
+    fn as_factories(&self) -> &[Box<dyn ProviderFactory>];
+}
+
+impl ProviderFactorySource for std::sync::Arc<Vec<Box<dyn ProviderFactory>>> {
+    fn as_factories(&self) -> &[Box<dyn ProviderFactory>] {
+        self.as_slice()
+    }
+}
+
+impl ProviderFactorySource for &[Box<dyn ProviderFactory>] {
+    fn as_factories(&self) -> &[Box<dyn ProviderFactory>] {
+        self
+    }
+}
+
+/// One indexed resolver implementation for provider-owned declarations and
+/// authored multi-owner annotations. Storage may be shared (`Arc`) or borrowed,
+/// but both forms execute the same owner/declaration logic below.
+pub(crate) struct FactoryCustomTypeResolver<F> {
+    factories: F,
+    index: HashMap<String, OwnerCustomTypeIndex>,
+}
+
+impl<F> FactoryCustomTypeResolver<F>
+where
+    F: ProviderFactorySource,
+{
+    pub(crate) fn new(factories: F) -> Self {
+        let index = build_owner_custom_type_index(factories.as_factories());
+        Self { factories, index }
+    }
+
+    fn known_custom_types(&self) -> HashSet<crate::parser::OwnedTypeIdentity> {
+        let mut owners_by_identity =
+            HashMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
+        for (owner, indexed) in &self.index {
+            let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
+                crate::parser::SchemaTypeOwner::Provider(owner.clone()),
+            );
+            for identity in indexed.declarations.keys() {
+                owners_by_identity
+                    .entry(identity.clone())
+                    .and_modify(|owners| *owners = owners.union(&owner_set))
+                    .or_insert_with(|| owner_set.clone());
+            }
+        }
+        owners_by_identity
+            .into_iter()
+            .map(|(identity, owners)| {
+                crate::parser::OwnedTypeIdentity::with_owners(identity, owners)
+            })
+            .collect()
+    }
+}
+
+impl<F> crate::parser::CustomTypeResolver for FactoryCustomTypeResolver<F>
+where
+    F: ProviderFactorySource,
+{
+    fn validate<'a>(
+        &self,
+        target: crate::parser::CustomTypeValidationTarget<'a>,
+        value: &'a Value,
+    ) -> Result<(), crate::parser::CustomTypeValidationError> {
+        let factories = self.factories.as_factories();
+        match target {
+            crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration } => {
+                let Some(owner_index) = self.index.get(owner) else {
+                    return Err(
+                        crate::parser::CustomTypeValidationError::MissingDeclaration {
+                            owner: owner.to_string(),
+                            identity: declaration.identity().clone(),
+                        },
+                    );
+                };
+                let factory = factories[owner_index.factory_index].as_ref();
+                validate_custom_type_declaration_with_factory(factory, declaration, value)
+            }
+            crate::parser::CustomTypeValidationTarget::Annotation(owned) => {
+                validate_custom_type_annotation(factories, &self.index, owned, value)
+            }
+        }
+    }
+}
+
+impl<F> crate::parser::ProviderCustomTypeSource for FactoryCustomTypeResolver<F>
+where
+    F: ProviderFactorySource + 'static,
+{
+    fn known_custom_types(&self) -> HashSet<crate::parser::OwnedTypeIdentity> {
+        FactoryCustomTypeResolver::known_custom_types(self)
+    }
+}
+
+fn build_owner_custom_type_index(
+    factories: &[Box<dyn ProviderFactory>],
+) -> HashMap<String, OwnerCustomTypeIndex> {
+    factories
+        .iter()
+        .enumerate()
+        .map(|(factory_index, factory)| {
+            let schemas = factory.schemas();
+            let config = factory.provider_config_attribute_types();
+            let mut declarations = HashMap::<TypeIdentity, Vec<AttributeType>>::new();
+            for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
+                declarations.entry(identity).or_default().push(declaration);
+            }
+            (
+                factory.name().to_string(),
+                OwnerCustomTypeIndex {
+                    factory_index,
+                    declarations,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Build the opaque loaded custom-type state shared by CLI, LSP, and planning.
+/// Recognition keys and resolver declarations come from the same factory
+/// schema/config snapshot and are indexed once.
+pub fn provider_custom_types_from_factories(
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+) -> crate::parser::ProviderCustomTypes {
+    let resolver = FactoryCustomTypeResolver::new(factories);
+    crate::parser::ProviderCustomTypes::from_source(resolver)
+}
+
+fn validate_custom_type_annotation(
+    factories: &[Box<dyn ProviderFactory>],
+    index: &HashMap<String, OwnerCustomTypeIndex>,
+    owned: &crate::parser::OwnedTypeIdentity,
+    value: &Value,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    use crate::parser::{CustomTypeValidationError, SchemaTypeOwner};
+
+    let identity = owned.identity();
+    let mut first_enum_definition: Option<(String, EnumDefinitionSignature)> = None;
+    for owner in owned.owners().iter() {
+        let SchemaTypeOwner::Provider(owner) = owner;
+        let Some(owner_index) = index.get(owner) else {
+            return Err(CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: identity.clone(),
+            });
+        };
+        let Some(declarations) = owner_index.declarations.get(identity) else {
+            return Err(CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: identity.clone(),
+            });
+        };
+        for declaration in declarations {
+            let Some(signature) = enum_definition_signature(declaration) else {
+                continue;
+            };
+            if let Some((first_owner, first_signature)) = &first_enum_definition {
+                if first_owner != owner && first_signature != &signature {
+                    return Err(CustomTypeValidationError::ConflictingEnumDefinitions {
+                        identity: identity.clone(),
+                        first_owner: first_owner.clone(),
+                        second_owner: owner.clone(),
+                    });
+                }
+            } else {
+                first_enum_definition = Some((owner.clone(), signature));
+            }
+        }
+    }
+
+    let mut first_enum_spelling: Option<(String, String)> = None;
+    for owner in owned.owners().iter() {
+        let SchemaTypeOwner::Provider(owner) = owner;
+        let Some(owner_index) = index.get(owner) else {
+            return Err(CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: identity.clone(),
+            });
+        };
+        let Some(declarations) = owner_index.declarations.get(identity) else {
+            return Err(CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: identity.clone(),
+            });
+        };
+        let factory = factories[owner_index.factory_index].as_ref();
+        let mut bridge: Option<(RefinedScalarKind, CanonicalCustomTypeValue)> = None;
+        for declaration in declarations {
+            let canonical =
+                validate_declared_custom_type_locally(declaration, value).map_err(|error| {
+                    CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        error: Box::new(error),
+                    }
+                })?;
+
+            if enum_definition_signature(declaration).is_some()
+                && let Some(canonical) = &canonical
+            {
+                if let Some((first_owner, first_spelling)) = &first_enum_spelling {
+                    if first_owner != owner && first_spelling != canonical.as_str() {
+                        return Err(CustomTypeValidationError::ConflictingEnumSpelling {
+                            identity: Box::new(identity.clone()),
+                            first_owner: first_owner.clone(),
+                            first_spelling: first_spelling.clone(),
+                            second_owner: owner.clone(),
+                            second_spelling: canonical.as_str().to_string(),
+                        });
+                    }
+                } else {
+                    first_enum_spelling = Some((owner.clone(), canonical.as_str().to_string()));
+                }
+            }
+
+            if local_custom_validator(declaration).is_none()
+                && let Some(canonical) = canonical
+            {
+                let Some(kind) = identified_custom_type_scalar_kind(declaration) else {
+                    return Err(CustomTypeValidationError::Rejected {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        message: "identified declaration has no scalar bridge kind".to_string(),
+                    });
+                };
+                if let Some((previous_kind, previous)) = &bridge {
+                    if *previous_kind != kind || previous != &canonical {
+                        return Err(CustomTypeValidationError::Rejected {
+                            owner: owner.clone(),
+                            identity: identity.clone(),
+                            message:
+                                "same-identity annotation declarations canonicalize inconsistently"
+                                    .to_string(),
+                        });
+                    }
+                } else {
+                    bridge = Some((kind, canonical));
+                }
+            }
+        }
+        if let Some((_kind, canonical)) = bridge {
+            factory
+                .validate_custom_type(identity, &canonical)
+                .map_err(|error| {
+                    let error = if error.detail().provider_name.is_some() {
+                        error
+                    } else {
+                        error.for_provider(owner)
+                    };
+                    CustomTypeValidationError::ProviderRejected {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        error: std::sync::Arc::new(error),
+                        masked: false,
+                    }
+                })?;
+        }
+    }
+    Ok(())
 }
 
 /// Provider implementation for Box<dyn Provider>
@@ -4926,6 +5719,473 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_derived_guest_dispatch_restores_the_typed_scalar() {
+        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+
+        let identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
+        let schema = ResourceSchema::new("test.Guarded")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_int_with_validator(
+                        identity.clone(),
+                        None,
+                        legacy_validator(|value| match value {
+                            Value::Concrete(ConcreteValue::Int(5)) => {
+                                Err("schema-derived callback rejected five".to_string())
+                            }
+                            _ => Err("Expected integer".to_string()),
+                        }),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("dispatch fixture schema must validate");
+
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("one scalar kind must build a dispatch table");
+        let error = table
+            .dispatch(&identity, "5")
+            .expect_err("the schema callback must be exported without a provider override");
+        assert_eq!(error, "schema-derived callback rejected five");
+    }
+
+    #[test]
+    fn schema_derived_guest_dispatch_uses_the_declared_scalar_kind() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
+        let schema = ResourceSchema::new("test.Guarded")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_int(Some(identity.clone()), None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("dispatch fixture schema must validate");
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("one scalar kind must build a dispatch table");
+
+        table
+            .dispatch(&identity, "5")
+            .expect("the table parses a known integer identity");
+        let error = table
+            .dispatch(&identity, "not-an-integer")
+            .expect_err("the table must parse using the identity's declared scalar kind");
+        assert!(error.contains("invalid integer bridge value"), "{error}");
+        assert!(!error.contains("not-an-integer"), "{error}");
+    }
+
+    #[test]
+    fn schema_derived_guest_dispatch_rejects_an_unknown_identity() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let known_identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
+        let schema = ResourceSchema::new("test.Guarded")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_int(Some(known_identity), None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("dispatch fixture schema must validate");
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("one scalar kind must build a dispatch table");
+        let unknown_identity = TypeIdentity::new(Some("test"), ["number"], "Unknown");
+
+        let error = table
+            .dispatch(&unknown_identity, "5")
+            .expect_err("an identity absent from the provider schemas must be rejected");
+        assert!(
+            error.contains("is not declared by this provider"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn aggregate_dispatch_validation_rejects_cross_schema_scalar_kind_reuse() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
+        let string_schema = ResourceSchema::new("test.StringValue")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("single-kind schema must validate");
+        let int_schema = ResourceSchema::new("test.IntValue")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_int(Some(identity), None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("single-kind schema must validate");
+
+        let error = CustomTypeDispatchTable::build(
+            &[string_schema, int_schema],
+            &ValidatedConfigSchema::default(),
+        )
+        .expect_err("one provider cannot reuse an identity across scalar kinds");
+        assert!(error.to_string().contains("both String and Int"), "{error}");
+    }
+
+    #[test]
+    fn aggregate_dispatch_runs_distinct_validators_for_one_identity() {
+        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
+        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_counter = first_calls.clone();
+        let second_counter = second_calls.clone();
+        let schema = ResourceSchema::new("test.Values")
+            .attribute(
+                AttributeSchema::optional(
+                    "first",
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        None,
+                        legacy_validator(move |_| {
+                            first_counter.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "second",
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        None,
+                        legacy_validator(move |_| {
+                            second_counter.fetch_add(1, Ordering::SeqCst);
+                            Err("second declaration rejected".to_string())
+                        }),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("same-kind declarations remain a valid resource schema");
+
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("v12 dispatch combines every callback attached to one identity");
+        let error = table
+            .dispatch(&identity, "value")
+            .expect_err("every callback must run conjunctively");
+        assert_eq!(error, "second declaration rejected");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn aggregate_dispatch_applies_identity_callback_to_callback_free_declarations() {
+        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let with_callback = ResourceSchema::new("test.WithCallback")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        None,
+                        legacy_validator(move |_value| {
+                            callback_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("callback schema must validate");
+        let without_callback = ResourceSchema::new("test.WithoutCallback")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("callback-free schema must validate");
+
+        let table = CustomTypeDispatchTable::build(
+            &[without_callback, with_callback],
+            &ValidatedConfigSchema::default(),
+        )
+        .expect("callback presence is a property of the identity, not one declaration");
+        table
+            .dispatch(&identity, "value-from-callback-free-resource")
+            .expect("the identity callback must accept the sibling resource value");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn aggregate_dispatch_accepts_fresh_callbacks_from_repeated_constructor_calls() {
+        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn provider_type(
+            identity: &TypeIdentity,
+            calls: &std::sync::Arc<AtomicUsize>,
+        ) -> AttributeType {
+            let calls = calls.clone();
+            AttributeType::refined_string_with_validator(
+                identity.clone(),
+                None,
+                None,
+                legacy_validator(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                None,
+            )
+        }
+
+        let identity = TypeIdentity::new(Some("aws"), ["common"], "Region");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let schemas = ["aws.First", "aws.Second"].map(|resource_type| {
+            ResourceSchema::new(resource_type)
+                .attribute(
+                    AttributeSchema::optional("region", provider_type(&identity, &calls)).build(),
+                )
+                .validate()
+                .expect("repeated provider-type constructor schema must validate")
+        });
+
+        let table = CustomTypeDispatchTable::build(&schemas, &ValidatedConfigSchema::default())
+            .expect("fresh callback allocations for one identity must load");
+        table.dispatch(&identity, "ap-northeast-1").unwrap();
+        table.dispatch(&identity, "us-east-1").unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "both distinct callback allocations run for both resources' values"
+        );
+    }
+
+    struct ConfigOnlyCustomTypeFactory;
+
+    impl ProviderFactory for ConfigOnlyCustomTypeFactory {
+        fn name(&self) -> &str {
+            "config-owner"
+        }
+
+        fn display_name(&self) -> &str {
+            "config-only custom type fixture"
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            Vec::new()
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::validate(HashMap::from([(
+                "endpoint".to_string(),
+                AttributeType::refined_string(
+                    Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
+                    None,
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("config-only custom type must validate")
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &crate::executor::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Err(ProviderError::internal("not used")) })
+        }
+    }
+
+    #[test]
+    fn loaded_custom_types_derive_known_config_identities_and_resolver_from_factories() {
+        let identity = TypeIdentity::new(Some("test"), ["config"], "Endpoint");
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(ConfigOnlyCustomTypeFactory)]);
+        let custom_types = provider_custom_types_from_factories(factories);
+
+        assert!(
+            custom_types
+                .known()
+                .contains(&crate::parser::OwnedTypeIdentity::provider(
+                    "config-owner",
+                    identity.clone()
+                ))
+        );
+        crate::parser::CustomTypeResolver::validate(
+            &custom_types,
+            crate::parser::CustomTypeValidationTarget::Annotation(
+                &crate::parser::OwnedTypeIdentity::provider("config-owner", identity),
+            ),
+            &Value::Concrete(ConcreteValue::String("https://example.test".into())),
+        )
+        .expect("the same factory source must drive recognition and resolution");
+    }
+
+    #[test]
+    fn aggregate_dispatch_deduplicates_one_shared_validator_pointer() {
+        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let validator = legacy_validator(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let schema = ResourceSchema::new("test.Values")
+            .attribute(
+                AttributeSchema::optional(
+                    "first",
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        None,
+                        validator.clone(),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "second",
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        None,
+                        validator,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("same-kind declarations remain a valid resource schema");
+
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("pointer-identical validators are one v12 dispatch binding");
+        table
+            .dispatch(&identity, "value")
+            .expect("the shared callback accepts the value");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn custom_type_scalar_canonicalizer_covers_every_wire_scalar_kind() {
+        let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+        let enum_type = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["API_VALUE".to_string()]),
+            vec![("API_VALUE".to_string(), "dsl_value".to_string())],
+            None,
+            None,
+        );
+        let cases = vec![
+            (
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                Value::Concrete(ConcreteValue::String("literal".into())),
+                "literal",
+            ),
+            (
+                AttributeType::refined_int(Some(identity.clone()), None),
+                Value::Concrete(ConcreteValue::Int(-42)),
+                "-42",
+            ),
+            (
+                AttributeType::refined_float(Some(identity.clone()), None),
+                Value::Concrete(ConcreteValue::Float(1.25)),
+                "1.25",
+            ),
+            (
+                enum_type.clone(),
+                Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value")),
+                "API_VALUE",
+            ),
+        ];
+
+        for (declared_type, value, expected) in cases {
+            let canonical = canonicalize_custom_type_value(&declared_type, &value)
+                .expect("supported scalar must canonicalize")
+                .expect("supported scalar must produce bridge text");
+            assert_eq!(canonical.as_str(), expected);
+        }
+
+        assert!(
+            canonicalize_custom_type_value(
+                &AttributeType::refined_float(Some(identity.clone()), None),
+                &Value::Concrete(ConcreteValue::Float(f64::INFINITY)),
+            )
+            .is_err()
+        );
+        assert!(
+            canonicalize_custom_type_value(
+                &enum_type,
+                &Value::Concrete(ConcreteValue::enum_identifier("unresolved")),
+            )
+            .is_err(),
+            "an unresolved enum identifier must not be treated as canonical"
+        );
+
+        let error = canonicalize_custom_type_value(
+            &AttributeType::refined_int(Some(identity.clone()), None),
+            &Value::Concrete(ConcreteValue::Bool(true)),
+        )
+        .expect_err("a concrete value with the wrong scalar kind must be rejected");
+        assert!(matches!(
+            error,
+            CustomTypeCanonicalizationError::ConcreteKindMismatch {
+                identity: ref actual,
+                expected: RefinedScalarKind::Int,
+                actual: "boolean",
+            } if actual == &identity
+        ));
+    }
 
     macro_rules! unexpected_resume_create {
         () => {

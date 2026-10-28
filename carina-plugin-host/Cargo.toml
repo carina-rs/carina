@@ -43,6 +43,7 @@ argon2 = "0.5"
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 carina-plugin-host = { path = ".", features = ["test-utils"] }
 carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }
+carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 carina-state = { path = "../carina-state" }
 hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

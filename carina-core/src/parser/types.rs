@@ -83,30 +83,42 @@ pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
     "redirect_query",
 ];
 
-/// True iff a snake-cased bare type name resolves to a known custom
-/// type — either a `carina-core` built-in or an identity registered in
-/// `config.validators` with no provider/segment axis. The carina#3239
-/// strict-parse gate consults this when
-/// [`ProviderContext::customs_loaded`] is `true`.
+/// Resolve a snake-cased bare custom-type annotation without discarding its
+/// schema owner.
 ///
-/// `TypeExpr::Simple` only carries the bare axis, so this check is
-/// deliberately scoped to bare identities — dotted type expressions are
-/// parsed as unresolved paths and classified during validation.
-///
-/// Exposed at the crate root so the validation layer
-/// (`crate::validation`) can apply the same predicate to argument
-/// declarations parsed earlier with a bootstrap context — the
-/// standalone-module-validate path where the strict parse-time gate
-/// did not fire.
-pub(crate) fn is_known_bare_custom_type(snake: &str, config: &ProviderContext) -> bool {
+/// Core built-ins remain [`TypeExpr::Simple`]. Every schema-declared bare
+/// identity becomes [`TypeExpr::SchemaType`], including identities whose
+/// semantic provider axis is empty. This is the owner-bearing counterpart to
+/// dotted type resolution and prevents a bare provider type from falling back
+/// to an identity-only validation route.
+pub(crate) fn resolve_known_bare_custom_type(
+    snake: &str,
+    config: &ProviderContext,
+) -> Result<Option<TypeExpr>, String> {
     if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
-        return true;
+        return Ok(Some(TypeExpr::Simple(snake.to_string())));
     }
     let pascal = snake_to_pascal(snake);
-    config
-        .validators
-        .keys()
-        .any(|id| id.provider.is_none() && id.segments.is_empty() && id.kind == pascal)
+    let matches = config
+        .known_custom_types()
+        .iter()
+        .filter(|owned| {
+            owned.identity().provider.is_none()
+                && owned.identity().segments.is_empty()
+                && owned.identity().kind == pascal
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = matches.first() else {
+        return Ok(None);
+    };
+    let owners = matches
+        .iter()
+        .skip(1)
+        .fold(first.owners().clone(), |owners, owned| {
+            owners.union(owned.owners())
+        });
+    let owned = crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners);
+    Ok(Some(TypeExpr::SchemaType { owned }))
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
@@ -132,18 +144,18 @@ pub(crate) fn suggest_registered_dotted_custom_type(
     config: &ProviderContext,
 ) -> Option<String> {
     let input_key = custom_type_input_key(input);
-    let mut candidates: Vec<(&TypeIdentity, String)> = config
-        .validators
-        .keys()
-        .filter(|id| id.provider.is_some())
-        .map(|id| (id, custom_type_suggestion_key(id)))
+    let mut candidates: Vec<(&super::OwnedTypeIdentity, String)> = config
+        .known_custom_types()
+        .iter()
+        .filter(|owned| owned.provider_names().next().is_some())
+        .map(|owned| (owned, custom_type_suggestion_key(owned.identity())))
         .collect();
-    candidates.sort_by_key(|(id, _)| id.to_string());
+    candidates.sort_by_key(|(owned, _)| owned.authored_name());
 
     candidates
         .iter()
         .find(|(_, key)| key == &input_key)
-        .map(|(id, _)| id.to_string())
+        .map(|(owned, _)| owned.authored_name())
         .or_else(|| {
             let max_distance = match input_key.len() {
                 0..=2 => 1,
@@ -152,10 +164,10 @@ pub(crate) fn suggest_registered_dotted_custom_type(
             };
             candidates
                 .iter()
-                .map(|(id, key)| (*id, levenshtein_distance(&input_key, key)))
+                .map(|(owned, key)| (*owned, levenshtein_distance(&input_key, key)))
                 .filter(|(_, distance)| *distance <= max_distance)
                 .min_by_key(|(_, distance)| *distance)
-                .map(|(id, _)| id.to_string())
+                .map(|(owned, _)| owned.authored_name())
         })
 }
 
@@ -208,11 +220,15 @@ fn parse_type_expr_atom(
                     // `TypeExpr::Simple(snake)` and downstream `validate`
                     // silently treated unknowns as untyped strings — so
                     // typos and renamed-then-removed types went unnoticed.
-                    if config.customs_loaded && !is_known_bare_custom_type(&snake, config) {
-                        return Err(ParseError::InvalidExpression {
-                            line,
-                            message: unknown_custom_type_message(other, config),
-                        });
+                    if config.custom_types_loaded() {
+                        return match resolve_known_bare_custom_type(&snake, config) {
+                            Ok(Some(resolved)) => Ok(resolved),
+                            Ok(None) => Err(ParseError::InvalidExpression {
+                                line,
+                                message: unknown_custom_type_message(other, config),
+                            }),
+                            Err(message) => Err(ParseError::InvalidExpression { line, message }),
+                        };
                     }
                     Ok(TypeExpr::Simple(snake))
                 }
@@ -297,6 +313,25 @@ fn parse_type_expr_atom(
 mod tests {
     use super::*;
 
+    fn loaded_context(
+        known: std::collections::HashSet<crate::parser::OwnedTypeIdentity>,
+    ) -> ProviderContext {
+        ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                known,
+                Box::new(|target, _value| {
+                    Err(
+                        crate::parser::CustomTypeValidationError::MissingDeclaration {
+                            owner: "test".to_string(),
+                            identity: target.identity().clone(),
+                        },
+                    )
+                }),
+            ),
+            ..ProviderContext::default()
+        }
+    }
+
     #[test]
     fn parse_type_expr_str_accepts_primitive() {
         let ctx = ProviderContext::default();
@@ -361,14 +396,14 @@ mod tests {
         assert_eq!(parse_type_expr_str("", &ctx), None);
     }
 
-    /// Default `ProviderContext` (no provider phase has run yet, so
-    /// `customs_loaded` is false) keeps the legacy lax behavior: any
+    /// Default `ProviderContext` (no provider phase has run yet, so custom
+    /// types are `Unloaded`) keeps the legacy lax behavior: any
     /// PascalCase identifier becomes `TypeExpr::Simple(snake_case)`. This
     /// preserves the LSP early-parse path that runs before schemas are
     /// loaded — without it, every mid-edit buffer would lose all
     /// `Simple`-shaped type completions.
     #[test]
-    fn parse_type_expr_str_accepts_unknown_when_customs_not_loaded() {
+    fn parse_type_expr_str_accepts_unknown_when_custom_types_are_unloaded() {
         let ctx = ProviderContext::default();
         assert!(matches!(
             parse_type_expr_str("TotallyMadeUpType", &ctx),
@@ -376,17 +411,14 @@ mod tests {
         ));
     }
 
-    /// After the provider phase has run (`customs_loaded = true`), an
+    /// After the provider phase has produced `ProviderCustomTypes::Loaded`, an
     /// unknown bare PascalCase custom-type name in a type position is
     /// rejected at parse time rather than silently accepted as
     /// `TypeExpr::Simple`. This is the carina#3239 fix: typos and
     /// renamed-then-removed types stop being silent.
     #[test]
-    fn parse_type_expr_str_rejects_unknown_when_customs_loaded() {
-        let ctx = ProviderContext {
-            customs_loaded: true,
-            ..Default::default()
-        };
+    fn parse_type_expr_str_rejects_unknown_when_custom_types_are_loaded() {
+        let ctx = loaded_context(Default::default());
         // No validators registered → only the BUILTIN_BARE_CUSTOM_TYPES
         // set is valid. A clearly-fake name is rejected.
         assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
@@ -399,38 +431,35 @@ mod tests {
     /// are always accepted, even when no provider has registered any
     /// validators — they are part of `carina-core` itself.
     #[test]
-    fn parse_type_expr_str_accepts_builtins_when_customs_loaded() {
-        let ctx = ProviderContext {
-            customs_loaded: true,
-            ..Default::default()
-        };
+    fn parse_type_expr_str_accepts_builtins_when_custom_types_are_loaded() {
+        let ctx = loaded_context(Default::default());
         for snake in BUILTIN_BARE_CUSTOM_TYPES {
             let name = snake_to_pascal(snake);
             assert!(
                 matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
-                "built-in custom type '{name}' must parse with customs_loaded=true"
+                "built-in custom type '{name}' must parse with loaded custom types"
             );
         }
     }
 
-    /// A bare custom-type identity registered in `ProviderContext.validators`
+    /// A provider-owned bare custom-type identity registered in
+    /// `ProviderContext.known_custom_types`
     /// makes the corresponding PascalCase name acceptable in a type
     /// position. Dotted identities (`aws.iam.Role.Arn`) are parsed as
     /// unresolved paths, not here — `TypeExpr::Simple` only carries the
     /// *bare* axis.
     #[test]
-    fn parse_type_expr_str_accepts_registered_bare_custom_when_customs_loaded() {
+    fn parse_type_expr_str_accepts_registered_bare_custom_when_custom_types_are_loaded() {
         use crate::schema::TypeIdentity;
 
-        let mut ctx = ProviderContext {
-            customs_loaded: true,
-            ..Default::default()
-        };
-        ctx.validators
-            .insert(TypeIdentity::bare("EmailAddress"), Box::new(|_| Ok(())));
+        let ctx = loaded_context(std::collections::HashSet::from([
+            crate::parser::OwnedTypeIdentity::provider("test", TypeIdentity::bare("EmailAddress")),
+        ]));
         assert!(matches!(
             parse_type_expr_str("EmailAddress", &ctx),
-            Some(TypeExpr::Simple(ref s)) if s == "email_address"
+            Some(TypeExpr::SchemaType { owned })
+                if owned.identity() == &TypeIdentity::bare("EmailAddress")
+                    && owned.provider_names().eq(["test"])
         ));
         // A bare key does NOT make an unrelated name valid.
         assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);

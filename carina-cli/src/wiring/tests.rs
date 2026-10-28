@@ -400,19 +400,19 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
 #[test]
 fn tied_union_error_reports_shared_attribute() {
     let error = tied_union_error_with_attributes("target", "target");
-    assert_eq!(type_error_attribute(&error), Some("target"));
+    assert_eq!(error.attribute_name(), Some("target"));
 }
 
 #[test]
 fn tied_union_error_with_different_attributes_has_no_single_attribute() {
     let error = tied_union_error_with_attributes("first", "second");
-    assert_eq!(type_error_attribute(&error), None);
+    assert_eq!(error.attribute_name(), None);
 }
 
 #[test]
 fn tied_union_error_ignores_failures_without_an_attribute() {
     let error = tied_union_error_with_one_unattributed_failure();
-    assert_eq!(type_error_attribute(&error), Some("target"));
+    assert_eq!(error.attribute_name(), Some("target"));
 }
 
 #[tokio::test]

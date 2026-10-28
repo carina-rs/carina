@@ -136,7 +136,7 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
         | TypeError::ValidationFailed { .. }
-        | TypeError::ProviderValidationFailed { .. }
+        | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
         | TypeError::ReadOnlyAttribute { .. }
@@ -201,8 +201,8 @@ mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeError,
-        ValidatedConfigSchema, enum_identity,
+        AttributeSchema, AttributeType, ResourceSchema, RootlessType, SchemaKind, SchemaRegistry,
+        TypeError, ValidatedConfigSchema, enum_identity,
     };
     use std::collections::HashMap;
     use tower_lsp::lsp_types::{Position, Range};
@@ -520,10 +520,16 @@ mod tests {
             "Version".to_string(),
             Value::Concrete(ConcreteValue::enum_identifier("bad_version")),
         );
-        let mut errs = schema
+        let schema = schema
             .validate()
-            .expect("quick-fix test schema must be valid")
-            .validate(&attrs)
+            .expect("quick-fix test schema must be valid");
+        let mut registry = SchemaRegistry::new();
+        registry.insert("aws", schema);
+        let resolver = carina_core::parser::ProviderCustomTypes::default();
+        let mut errs = registry
+            .get("aws", "aws.iam.PolicyDocument", SchemaKind::Resource)
+            .expect("quick-fix schema must be owner-bound")
+            .validate_with_resolver(&attrs, &|_| false, &resolver)
             .unwrap_err();
         let err = errs.remove(0);
         let TypeError::InvalidEnumVariant { expected, .. } = err else {

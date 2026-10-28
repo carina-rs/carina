@@ -927,7 +927,7 @@ fn classify_replacement_outcome(
                 upsert.resource,
                 schemas
                     .get_for(upsert.resource)
-                    .map(|schema| schema.as_schema()),
+                    .map(|schema| schema.schema().as_schema()),
                 state_file,
                 managed_current,
                 moved_origins,
@@ -1180,7 +1180,7 @@ fn plan_displaced_identifier_deposes(
             input
                 .schemas
                 .get_for(upsert.resource)
-                .map(|schema| schema.as_schema()),
+                .map(|schema| schema.schema().as_schema()),
             input.state_file,
             input.managed_current,
             moved_origins,
@@ -1390,7 +1390,9 @@ pub(crate) fn build_state_after_apply(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let schema = schemas.get_for(resource).map(|schema| schema.as_schema());
+        let schema = schemas
+            .get_for(resource)
+            .map(|schema| schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
                 ResourceState::from_provider_state_for_resource_and_schema(

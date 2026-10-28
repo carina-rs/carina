@@ -96,12 +96,15 @@ impl TypeIdentity {
         }
     }
 
-    /// Build an identity from a `TypeExpr::SchemaType`'s three parts.
+    /// Build an identity whose semantic provider matches an authored provider
+    /// path.
     ///
     /// `provider` is the provider segment, `path` the dotted
     /// service/resource path (`"ec2"` or `"iam.Role"`, possibly empty),
-    /// and `kind` the PascalCase type name. Used to project a parsed
-    /// dotted type annotation onto the structured identity it denotes.
+    /// and `kind` the PascalCase type name. Do not use this to recover a
+    /// [`crate::parser::TypeExpr::SchemaType`]: that variant carries an
+    /// [`crate::parser::OwnedTypeIdentity`] because the schema owner may differ
+    /// from the semantic provider axis (notably AWSCC-owned `aws.*` types).
     pub fn from_schema_type(provider: &str, path: &str, kind: &str) -> Self {
         let segments = if path.is_empty() {
             Vec::new()

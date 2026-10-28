@@ -1146,6 +1146,7 @@ dependencies = [
  "argon2",
  "carina-core",
  "carina-plugin-host",
+ "carina-plugin-sdk",
  "carina-provider-protocol",
  "carina-provider-resolver",
  "carina-state",
@@ -1182,6 +1183,7 @@ version = "0.7.1"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "carina-core",
  "carina-provider-protocol",
  "http 1.4.0",
  "serde",

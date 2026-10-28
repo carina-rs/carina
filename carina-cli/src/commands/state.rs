@@ -1969,7 +1969,7 @@ where
         }
         let schema = schemas
             .get_for(&masking_resource)
-            .map(|schema| schema.as_schema());
+            .map(|schema| schema.schema().as_schema());
         let attributes = target
             .generation
             .refreshed_attributes_for_resource_and_schema(
@@ -2155,7 +2155,7 @@ fn diff_display_update_resource(
             carina_core::schema::SchemaKind::Resource,
         ),
     };
-    let resource_schema = schema.map(carina_core::schema::ValidatedResourceSchema::as_schema);
+    let resource_schema = schema.map(|schema| schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
         match resource {
@@ -2225,7 +2225,10 @@ fn diff_display_update_resource(
             match (old_val, new_val) {
                 (Some(old), Some(new))
                     if !carina_core::diff_helpers::resource_attribute_values_equal(
-                        old, new, schema, key,
+                        old,
+                        new,
+                        schema.as_deref(),
+                        key,
                     ) =>
                 {
                     has_changes = true;
@@ -4998,7 +5001,9 @@ mod tests {
                 &fresh,
                 &saved,
                 Some(&row.explicit),
-                schemas.get_for(&desired).map(|schema| schema.as_schema()),
+                schemas
+                    .get_for(&desired)
+                    .map(|schema| schema.schema().as_schema()),
             ),
             Diff::NoChange(_)
         ));
@@ -5092,7 +5097,9 @@ mod tests {
             &fresh,
             &saved,
             Some(&row.explicit),
-            schemas.get_for(&desired).map(|schema| schema.as_schema()),
+            schemas
+                .get_for(&desired)
+                .map(|schema| schema.schema().as_schema()),
         )
         else {
             panic!("refresh must preserve the pending tags removal");

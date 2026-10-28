@@ -27,7 +27,14 @@ pub use ast::{
     UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
     ValidationBlock, WaitBinding, expand_deferred_children,
 };
-pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
+pub(crate) use config::ProviderCustomTypeSource;
+pub use config::{
+    CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
+    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, NonEmptySchemaTypeOwners,
+    OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, SchemaTypeOwner,
+};
+#[cfg(test)]
+pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
 pub use entry::{
     AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
     top_level_anonymous_resource_spans, top_level_backend_block_spans,
@@ -48,8 +55,13 @@ pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
 };
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
-pub use functions::{contains_function_call, provider_context_lookup, validate_custom_type};
-pub(crate) use functions::{evaluate_resolved_user_function, function_argument_as_eval};
+pub use functions::{
+    contains_function_call, custom_type_lookup_for_factory, validate_custom_type,
+    validate_schema_custom_type,
+};
+pub(crate) use functions::{
+    custom_type_lookup_for_schema, evaluate_resolved_user_function, function_argument_as_eval,
+};
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
     ResolvedProviderConfigs, SavedProviderConfigs, check_identifier_scope,
@@ -65,7 +77,7 @@ pub(crate) use resolve::{
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
-pub(crate) use types::{is_known_bare_custom_type, unknown_custom_type_message};
+pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_message};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 

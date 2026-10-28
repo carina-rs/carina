@@ -1,5 +1,122 @@
 use super::*;
 
+fn attributed_validation_failure(attribute: &str, message: &str) -> TypeError {
+    TypeError::ResourceValidationFailed {
+        message: message.to_string(),
+        attribute: Some(attribute.to_string()),
+    }
+}
+
+#[test]
+fn type_error_attribute_name_requires_union_arms_to_agree() {
+    let shared = TypeError::UnionAlternativesMismatch {
+        failures: UnionArmFailures::new(
+            attributed_validation_failure("target", "first"),
+            [attributed_validation_failure("target", "second")],
+        )
+        .expect("distinct failures form a union diagnostic"),
+    };
+    assert_eq!(shared.attribute_name(), Some("target"));
+
+    let conflicting = TypeError::UnionAlternativesMismatch {
+        failures: UnionArmFailures::new(
+            attributed_validation_failure("first", "first"),
+            [attributed_validation_failure("second", "second")],
+        )
+        .expect("distinct failures form a union diagnostic"),
+    };
+    assert_eq!(conflicting.attribute_name(), None);
+}
+
+#[test]
+fn type_error_attribute_name_keeps_read_only_and_unknown_names() {
+    assert_eq!(
+        TypeError::ReadOnlyAttribute {
+            name: "output".to_string(),
+        }
+        .attribute_name(),
+        Some("output")
+    );
+    assert_eq!(
+        TypeError::UnknownAttribute {
+            name: "typo".to_string(),
+            suggestion: None,
+        }
+        .attribute_name(),
+        Some("typo")
+    );
+}
+
+#[test]
+fn secret_masking_preserves_custom_type_attribute_position() {
+    let error = TypeError::CustomTypeValidation {
+        error: Box::new(
+            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                owner: "test".to_string(),
+                identity: TypeIdentity::bare("SecretIdentifier"),
+            },
+        ),
+        attribute: Some("secret_value".to_string()),
+    };
+
+    let masked = error.masked_for_secret();
+    assert_eq!(masked.attribute_name(), Some("secret_value"));
+    assert!(matches!(
+        masked,
+        TypeError::CustomTypeValidation {
+            attribute: Some(attribute),
+            ..
+        } if attribute == "secret_value"
+    ));
+}
+
+#[test]
+fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
+    let schema = ResourceSchema::new("test.Widget")
+        .validate()
+        .expect("fixture schema must validate");
+    let mut registry = SchemaRegistry::new();
+    registry.insert("actual-owner", schema);
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("registered schema");
+    assert_eq!(bound.owner(), "actual-owner");
+    assert_eq!(bound.schema().parts().resource_type, "test.Widget");
+}
+
+#[test]
+fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
+    let identity = TypeIdentity::new(Some("test"), Vec::<String>::new(), "Identifier");
+    let root = RootlessType::new(AttributeType::list(AttributeType::refined_string(
+        Some(identity),
+        None,
+        None,
+        None,
+    )));
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("first".into())),
+        Value::Concrete(ConcreteValue::String("second".into())),
+    ]));
+    let lookup = |_declared_type: &AttributeType, _value: &Value| {
+        Err(TypeError::ValidationFailed {
+            message: "rejected".to_string(),
+        })
+    };
+
+    let errors = root
+        .validate_with_lookup(&value, &lookup)
+        .expect_err("both identified list items must be rejected");
+
+    assert_eq!(errors.len(), 2);
+    assert!(errors.iter().all(|error| error.attribute_name().is_none()));
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.to_string().contains("<root>"))
+    );
+}
+
 fn admission_error(schema: ResourceSchema) -> String {
     schema
         .validate()
@@ -123,12 +240,13 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
     let registry = builtin_validator_registry();
     assert_eq!(registry.len(), 12);
 
-    let positive_int = builtin_validator(&TypeIdentity::bare("PositiveInt"))
-        .expect("PositiveInt must be registered by its exact identity");
+    let positive_int =
+        builtin_validator(RefinedScalarKind::Int, &TypeIdentity::bare("PositiveInt"))
+            .expect("PositiveInt must be registered by its exact identity");
     assert!(positive_int(&Value::Concrete(ConcreteValue::Int(1))).is_ok());
     assert!(positive_int(&Value::Concrete(ConcreteValue::Int(0))).is_err());
 
-    let email = builtin_validator(&TypeIdentity::bare("Email"))
+    let email = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("Email"))
         .expect("Email must be registered by its exact identity");
     assert!(
         email(&Value::Concrete(ConcreteValue::String(
@@ -753,6 +871,137 @@ fn config_schema_admission_rejects_dangling_refs_and_duplicate_fields() {
 }
 
 #[test]
+fn schema_admission_rejects_one_identity_bound_to_multiple_scalar_kinds() {
+    let identity = TypeIdentity::new(Some("test"), ["widget"], "Value");
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "text",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("count", AttributeType::refined_int(Some(identity), None))
+                .build(),
+        )
+        .validate()
+        .expect_err("one provider schema cannot bind an identity as both String and Int");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("test.widget.Value"), "{rendered}");
+    assert!(rendered.contains("String"), "{rendered}");
+    assert!(rendered.contains("Int"), "{rendered}");
+}
+
+#[test]
+fn schema_admission_rejects_identified_enum_without_a_scalar_base() {
+    let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::enum_with_base(
+                    identity,
+                    AttributeType::bool(),
+                    Some(vec!["true".to_string()]),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("test.widget.Mode"), "{error}");
+    assert!(error.contains("scalar base"), "{error}");
+}
+
+#[test]
+fn schema_admission_checks_identified_types_inside_referenced_definitions() {
+    let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional("mode", AttributeType::ref_("Alias".to_string())).build(),
+        )
+        .with_def("Alias", AttributeType::ref_("Mode".to_string()))
+        .with_def(
+            "Mode",
+            AttributeType::enum_with_base(
+                identity,
+                AttributeType::bool(),
+                Some(vec!["true".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )
+        .validate()
+        .expect_err("referenced definitions must satisfy identified-type admission invariants")
+        .to_string();
+
+    assert!(error.contains("test.widget.Mode"), "{error}");
+    assert!(error.contains("scalar base"), "{error}");
+}
+
+#[test]
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
+    let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::enum_(
+                    identity,
+                    Some(vec!["api-value".to_string()]),
+                    Vec::new(),
+                    None,
+                    Some(DslTransform::HyphenToUnderscore),
+                ),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("test.widget.Mode"), "{error}");
+    assert!(error.contains("protocol v12"), "{error}");
+    assert!(error.contains("transform"), "{error}");
+}
+
+#[test]
+fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
+    let errors = ValidatedConfigSchema::validate(HashMap::from([
+        (
+            "non_scalar".to_string(),
+            AttributeType::enum_with_base(
+                TypeIdentity::new(Some("test"), ["config"], "NonScalar"),
+                AttributeType::bool(),
+                Some(vec!["true".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        ),
+        (
+            "transformed".to_string(),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("test"), ["config"], "Transformed"),
+                Some(vec!["api-value".to_string()]),
+                Vec::new(),
+                None,
+                Some(DslTransform::HyphenToUnderscore),
+            ),
+        ),
+    ]))
+    .expect_err("config witnesses must satisfy the same wire invariants as resources");
+
+    let rendered = errors.to_string();
+    assert!(rendered.contains("scalar base"), "{rendered}");
+    assert!(rendered.contains("protocol v12"), "{rendered}");
+}
+
+#[test]
 fn config_schema_admission_allows_declared_user_input_below_provider_output() {
     let types = HashMap::from([(
         "output".to_string(),
@@ -886,7 +1135,9 @@ fn enum_custom_lookup_receives_resolved_api_spelling() {
         Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow")),
     )]);
     let seen = std::sync::Mutex::new(Vec::new());
-    let lookup = |identity: &TypeIdentity, value: &Value| {
+    let lookup = |declared_type: &AttributeType, value: &Value| {
+        let identity = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("enum declaration must carry its identity");
         let api_value = match value.as_concrete() {
             Some(ConcreteValueRef::CanonicalEnum(value)) => value.api_value().to_string(),
             other => panic!("enum custom lookup must receive CanonicalEnum, got {other:?}"),
@@ -1580,6 +1831,22 @@ fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
     let expected_msg = original.to_string();
     let wrapped = original.with_attribute("foo").to_string();
     assert_eq!(wrapped, expected_msg);
+}
+
+#[test]
+fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
+    let tagged = TypeError::ValidationFailed {
+        message: "invalid CIDR".to_string(),
+    }
+    .with_attribute("cidr_block");
+
+    assert!(matches!(
+        tagged,
+        TypeError::ResourceValidationFailed {
+            message,
+            attribute: Some(attribute),
+        } if message == "invalid CIDR" && attribute == "cidr_block"
+    ));
 }
 
 #[test]
@@ -2880,7 +3147,9 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
         ("range".to_string(), unknown()),
         ("custom".to_string(), unknown()),
     ]);
-    let lookup = |identity: &TypeIdentity, value: &Value| {
+    let lookup = |declared_type: &AttributeType, value: &Value| {
+        let identity = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("custom declaration must carry its identity");
         if identity.kind == "CheckedId"
             && matches!(value, Value::Concrete(ConcreteValue::String(value)) if value == "invalid")
         {
@@ -2927,9 +3196,13 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
         "missing length error: {errors:?}"
     );
     assert!(
-        errors.iter().any(
-            |error| matches!(error, TypeError::ValidationFailed { message } if message.contains("outside allowed range"))
-        ),
+        errors.iter().any(|error| matches!(
+            error,
+            TypeError::ResourceValidationFailed {
+                message,
+                attribute: Some(name),
+            } if message.contains("outside allowed range") && name == "range"
+        )),
         "missing range error: {errors:?}"
     );
     assert!(
@@ -3078,7 +3351,7 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
             Value::Concrete(ConcreteValue::Map(tags)),
         ),
     ]);
-    let lookup = |_identity: &TypeIdentity, value: &Value| match value {
+    let lookup = |_declared_type: &AttributeType, value: &Value| match value {
         Value::Concrete(ConcreteValue::String(value)) => Err(TypeError::ValidationFailed {
             message: format!("provider lookup rejected {}", value.expose_plaintext()),
         }),
@@ -5968,9 +6241,10 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
         (
             "SchemaType(aws.ec2.Vpc.Id)",
             TypeExpr::SchemaType {
-                provider: "aws".into(),
-                path: "ec2.Vpc".into(),
-                type_name: "Id".into(),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                ),
             },
         ),
         (
@@ -10656,7 +10930,7 @@ fn walk_custom_lookup_skips_value_unknown() {
     walk_custom_lookup(
         &custom_type,
         &Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
-        "vpc_id",
+        Some("vpc_id"),
         &|_, _| {
             Err(TypeError::ValidationFailed {
                 message: "should never be called".to_string(),
@@ -10715,13 +10989,8 @@ fn resource_schema_validate_self_cyclic_union_with_invalid_value_terminates() {
 fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let custom_string = AttributeType::refined_string_with_validator(
-        TypeIdentity::bare("cyclic_leaf"),
-        None,
-        None,
-        validator(|_| Ok(())),
-        None,
-    );
+    let custom_string =
+        AttributeType::refined_string(Some(TypeIdentity::bare("cyclic_leaf")), None, None, None);
     let schema = ResourceSchema::new("test.CyclicCustomLookup")
         .attribute(AttributeSchema::optional("value", AttributeType::ref_("A")).build())
         .with_def(
@@ -10741,7 +11010,9 @@ fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
         )])),
     )]);
     let calls = AtomicUsize::new(0);
-    let lookup = |identity: &TypeIdentity, value: &Value| {
+    let lookup = |declared_type: &AttributeType, value: &Value| {
+        let identity = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("custom declaration must carry its identity");
         if identity.kind != "cyclic_leaf" {
             return Ok(());
         }
@@ -10783,17 +11054,13 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     // because the approving arm matches; the sibling's failure is
     // discarded.
     let custom = |name: &str| {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare(name),
-            None,
-            None,
-            validator(|_v: &Value| Ok(())),
-            None,
-        )
+        AttributeType::refined_string(Some(TypeIdentity::bare(name)), None, None, None)
     };
     let union = AttributeType::union(vec![custom("ok_arm"), custom("fail_arm")]);
 
-    let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
+    let lookup = |declared_type: &AttributeType, _v: &Value| -> Result<(), TypeError> {
+        let id = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("custom union arm must carry its identity");
         if id.kind == "ok_arm" {
             Ok(())
         } else {
@@ -10807,7 +11074,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     walk_custom_lookup(
         &union,
         &Value::Concrete(ConcreteValue::String("anything".into())),
-        "attr",
+        Some("attr"),
         &lookup,
         crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
@@ -10825,17 +11092,13 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     // sum. Both arms emit a single error here, so the Union's error
     // count must be 1, not 2.
     let custom = |name: &str| {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare(name),
-            None,
-            None,
-            validator(|_v: &Value| Ok(())),
-            None,
-        )
+        AttributeType::refined_string(Some(TypeIdentity::bare(name)), None, None, None)
     };
     let union = AttributeType::union(vec![custom("a"), custom("b")]);
 
-    let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
+    let lookup = |declared_type: &AttributeType, _v: &Value| -> Result<(), TypeError> {
+        let id = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("custom union arm must carry its identity");
         Err(TypeError::ValidationFailed {
             message: format!("{} rejects", id.kind),
         })
@@ -10845,7 +11108,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     walk_custom_lookup(
         &union,
         &Value::Concrete(ConcreteValue::String("anything".into())),
-        "attr",
+        Some("attr"),
         &lookup,
         crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
@@ -10866,9 +11129,14 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
     // `"10.0.0.0/8"` and rejects `Ipv6Cidr`. The Union must surface
     // no errors — the previous loop would have pushed the IPv6
     // rejection through anyway. This is the awscc#217 reproduction.
-    let cidr = AttributeType::union(vec![types::ipv4_cidr(), types::ipv6_cidr()]);
+    let bridged = |name: &str| {
+        AttributeType::refined_string(Some(TypeIdentity::bare(name)), None, None, None)
+    };
+    let cidr = AttributeType::union(vec![bridged("Ipv4Cidr"), bridged("Ipv6Cidr")]);
 
-    let lookup = |id: &TypeIdentity, value: &Value| -> Result<(), TypeError> {
+    let lookup = |declared_type: &AttributeType, value: &Value| -> Result<(), TypeError> {
+        let id = crate::provider::identified_custom_type_identity(declared_type)
+            .expect("custom union arm must carry its identity");
         let Value::Concrete(ConcreteValue::String(s)) = value else {
             return Ok(());
         };
@@ -10885,7 +11153,7 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
     walk_custom_lookup(
         &cidr,
         &Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())),
-        "cidr",
+        Some("cidr"),
         &lookup,
         crate::schema::empty_defs_for_schema_walks(),
         &mut errors,

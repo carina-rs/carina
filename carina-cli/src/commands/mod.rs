@@ -248,31 +248,8 @@ fn enrich_provider_context(
 ) -> ProviderContext {
     ProviderContext {
         decryptor: None,
-        validators: carina_core::provider::collect_custom_type_validators(schemas),
-        custom_type_attribute_types: carina_core::provider::collect_custom_type_attribute_types(
-            schemas,
-        ),
-        custom_type_validator: Some(Box::new(
-            move |identity: &carina_core::schema::TypeIdentity,
-                  value: &carina_core::provider::CanonicalCustomTypeValue| {
-                for factory in factories.iter() {
-                    factory
-                        .validate_custom_type(identity, value)
-                        .map_err(|error| {
-                            if error.detail().provider_name.is_some() {
-                                error
-                            } else {
-                                error.for_provider(factory.name())
-                            }
-                        })?;
-                }
-                Ok(())
-            },
-        )),
+        custom_types: carina_core::provider::provider_custom_types_from_factories(factories),
         resource_types: ProviderContext::resource_types_from_schema_registry(schemas),
-        // carina#3239: schemas are loaded at this point, so the strict
-        // "unknown custom type in type position" parser check applies.
-        customs_loaded: true,
     }
 }
 
@@ -652,8 +629,8 @@ fn validate_and_resolve_errors_with_context_inner<'a>(
     // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
     // unknown bare custom-type names in the root parse. The root
     // config was parsed up in `load_configuration_with_config` with
-    // the bootstrap context (`customs_loaded = false`) — schemas had
-    // not been collected yet, so the parser-side `customs_loaded` gate
+    // the bootstrap `ProviderCustomTypes::Unloaded` context — schemas had
+    // not been collected yet, so the parser-side loaded-state gate
     // could not fire there. This post-parse walk re-applies the same
     // predicate against the now-enriched context, closing the
     // standalone-module-validate path so a typo or renamed-then-

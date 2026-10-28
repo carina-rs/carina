@@ -6,16 +6,10 @@ use super::ast::{FnParam, PendingFunctionTypeCheck, TypeExpr, UserFunction, User
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
-use super::util::value_type_name;
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{BareStructuralHandle, EvalValue, StructuralHandleKind};
-use crate::provider::CanonicalCustomTypeValue;
 use crate::resource::{ConcreteValue, DeferredValue, FunctionArgument, UnknownReason, Value};
-use crate::schema::{
-    TypeIdentity, validate_http_response_status_code, validate_ipv4_address, validate_ipv4_cidr,
-    validate_ipv6_address, validate_ipv6_cidr, validate_redirect_host, validate_redirect_path,
-    validate_redirect_port, validate_redirect_protocol, validate_redirect_query,
-};
+use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -416,30 +410,56 @@ fn contains_module_argument(value: &Value) -> bool {
     }
 }
 
-/// Adapter that turns a [`ProviderContext`] into the
-/// [`crate::schema::CustomTypeLookup`] shape consumed by the schema-walk
-/// validator. The lookup is keyed on a structured [`TypeIdentity`], so
-/// [`validate_custom_type`] runs the registered validator chain against
-/// the exact provider-scoped identity — no flat-string normalization.
-/// The returned closure may be hoisted out of any per-resource loop —
-/// it borrows the context only.
-pub fn provider_context_lookup(
-    ctx: &ProviderContext,
-) -> impl Fn(&TypeIdentity, &Value) -> Result<(), crate::schema::TypeError> + use<'_> {
-    move |identity, value| {
-        validate_custom_type(identity, value, ctx).map_err(|error| {
-            crate::schema::TypeError::ProviderValidationFailed {
-                message: error.to_string(),
-                host_cause: error.detail().host_cause(),
-                provider_name: error
-                    .detail()
-                    .provider_name
-                    .clone()
-                    .or_else(|| identity.provider.clone()),
-                attribute: None,
-            }
+/// Internal adapter used only by [`crate::schema::OwnerBoundResourceSchema`]
+/// and owner-routing unit tests. Public callers validate through the bound
+/// schema so a lookup cannot be paired with a different witness.
+pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
+    resolver: &'resolver dyn crate::parser::CustomTypeResolver,
+    schema: crate::schema::OwnerBoundResourceSchema<'schema>,
+) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError>
++ use<'resolver, 'schema> {
+    let owner = schema.owner();
+    move |declared_type, value| {
+        validate_identified_declaration(declared_type, |declaration| {
+            resolver
+                .validate(
+                    crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration },
+                    value,
+                )
+                .map_err(crate::schema::TypeError::from)
         })
     }
+}
+
+/// Bind a provider-config schema walk directly to the factory already selected
+/// for that config. No provider-name comparison or owner lookup is involved.
+pub fn custom_type_lookup_for_factory<'a>(
+    factory: &'a dyn crate::provider::ProviderFactory,
+) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError> + use<'a>
+{
+    move |declared_type, value| {
+        validate_identified_declaration(declared_type, |declaration| {
+            crate::provider::validate_custom_type_declaration_with_factory(
+                factory,
+                declaration,
+                value,
+            )
+            .map_err(crate::schema::TypeError::from)
+        })
+    }
+}
+
+fn validate_identified_declaration(
+    declared_type: &crate::schema::AttributeType,
+    validate: impl FnOnce(
+        crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Result<(), crate::schema::TypeError>,
+) -> Result<(), crate::schema::TypeError> {
+    let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(declared_type)
+    else {
+        return Ok(());
+    };
+    validate(declaration)
 }
 
 /// Validate a value against a custom type (`Ipv4Cidr`, `Ipv4Address`, …).
@@ -447,168 +467,98 @@ pub fn provider_context_lookup(
 /// statically (e.g., ResourceRef, FunctionCall, Interpolation are
 /// deferred).
 ///
-/// Checks built-in validators first (matched on the identity's `kind`),
-/// then falls back to custom validators registered in the
-/// [`ProviderContext`], keyed by the full structured [`TypeIdentity`].
+/// Bare built-in identities use the kind-aware built-in registry. Provider
+/// identities must already have resolved schema owners and route through those
+/// factories, even if their descriptive identity collides with a built-in.
 pub fn validate_custom_type(
     identity: &TypeIdentity,
     value: &Value,
-    config: &ProviderContext,
+    _config: &ProviderContext,
 ) -> crate::provider::ProviderResult<()> {
-    // Built-in DSL custom types carry no provider axis — match on `kind`.
-    let builtin = identity.provider.is_none() && identity.segments.is_empty();
-    fn text(value: &Value) -> Option<&str> {
-        match value.as_concrete()? {
-            crate::resource::ConcreteValueRef::CanonicalEnum(value) => Some(value.api_value()),
-            concrete => concrete.as_string_like(),
-        }
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => return Ok(()),
+        Value::Deferred(DeferredValue::Access(_access)) => return Ok(()),
+        Value::Deferred(DeferredValue::Interpolation(_parts)) => return Ok(()),
+        Value::Deferred(DeferredValue::Unknown(_reason)) => return Ok(()),
+        Value::Concrete(_concrete) => {}
+        Value::Deferred(_deferred) => {}
     }
-    match (builtin.then_some(identity.kind.as_str()), value) {
-        (Some("Ipv4Cidr"), value) if text(value).is_some() => {
-            validate_ipv4_cidr(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
+
+    use crate::schema::RefinedScalarKind;
+
+    let builtin_kind = match value {
+        Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
+            Some(RefinedScalarKind::String)
         }
-        (Some("Ipv4Address"), value) if text(value).is_some() => {
-            validate_ipv4_address(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("Ipv6Cidr"), value) if text(value).is_some() => {
-            validate_ipv6_cidr(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("Ipv6Address"), value) if text(value).is_some() => {
-            validate_ipv6_address(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("HttpResponseStatusCode"), value) if text(value).is_some() => {
-            validate_http_response_status_code(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("RedirectHost"), value) if text(value).is_some() => {
-            validate_redirect_host(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("RedirectPath"), value) if text(value).is_some() => {
-            validate_redirect_path(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("RedirectPort"), value) if text(value).is_some() => {
-            validate_redirect_port(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("RedirectProtocol"), value) if text(value).is_some() => {
-            validate_redirect_protocol(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (Some("RedirectQuery"), value) if text(value).is_some() => {
-            validate_redirect_query(text(value).unwrap())
-                .map_err(crate::provider::ProviderError::invalid_input)
-        }
-        (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
-        (
-            _,
-            Value::Deferred(
-                DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
-            ),
-        ) => Ok(()), // will be resolved later
-        (_, Value::Deferred(DeferredValue::Access(_))) => Ok(()),          // will be resolved later
-        (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()),   // will be resolved later
-        (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
-        (_, value) if text(value).is_some() => {
-            // Both `String` (quoted-literal source) and `EnumIdentifier`
-            // (bare or namespaced identifier source) are accepted: this
-            // lookup runs from `walk_custom_lookup`, which is reached
-            // *after* `expand_enum_shorthand` has normalized the value
-            // for `validate_custom`. The strict-shape rejection for
-            // quoted literals on namespaced Custom types happens in the
-            // LSP / CLI surface code (carina#2986 Phase 4), not here —
-            // this fallback validator just needs the textual payload.
-            // Check custom validators from config (schema-extracted),
-            // keyed by the full structured identity so two providers'
-            // same-named types do not collide.
-            let authored_text = text(value).unwrap();
-            let canonical = canonical_custom_type_value(identity, value, config)
-                .map_err(crate::provider::ProviderError::invalid_input)?;
-            let validation_text = canonical
-                .as_ref()
-                .map_or(authored_text, CanonicalCustomTypeValue::as_str);
-            if let Some(validator) = config.validators.get(identity) {
-                validator(validation_text)
-                    .map_err(crate::provider::ProviderError::invalid_input)?;
-            }
-            // Fall back to factory-based validator (e.g., WASM providers)
-            if let Some(ref factory_validator) = config.custom_type_validator {
-                let canonical = canonical.ok_or_else(|| {
-                    crate::provider::ProviderError::invalid_input(format!(
-                        "cannot resolve enum identifier `{authored_text}` through declared type {identity}"
-                    ))
-                })?;
-                factory_validator(identity, &canonical)
+        Value::Concrete(ConcreteValue::Int(_)) => {
+            if crate::schema::builtin_validator(RefinedScalarKind::Int, identity).is_some() {
+                Some(RefinedScalarKind::Int)
             } else {
-                Ok(())
+                Some(RefinedScalarKind::Float)
             }
         }
-        (_, value) => Err(crate::provider::ProviderError::invalid_input(format!(
-            "expected {}, got {}",
-            identity,
-            value_type_name(value)
-        ))),
+        Value::Concrete(ConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
+        Value::Concrete(
+            ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::List(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::Map(_),
+        )
+        | Value::Deferred(_) => None,
+    };
+    if let Some(kind) = builtin_kind
+        && let Some(validator) = crate::schema::builtin_validator(kind, identity)
+    {
+        let identifier_text;
+        let validation_value = match value {
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                identifier_text =
+                    Value::Concrete(ConcreteValue::String(raw.as_str().to_string().into()));
+                &identifier_text
+            }
+            _ => value,
+        };
+        return validator(validation_value).map_err(|error| {
+            crate::provider::ProviderError::invalid_input_caused_by(
+                "Custom type validation failed",
+                error,
+            )
+        });
     }
+
+    Err(crate::provider::ProviderError::invalid_input(format!(
+        "unknown custom type `{identity}`; provider-owned annotations must resolve to an owner-qualified schema type"
+    )))
 }
 
-fn canonical_custom_type_value(
-    identity: &TypeIdentity,
+/// Validate an authored provider schema annotation against every owner that
+/// declares its semantic identity.
+pub fn validate_schema_custom_type(
+    owned: &crate::parser::OwnedTypeIdentity,
     value: &Value,
     config: &ProviderContext,
-) -> Result<Option<CanonicalCustomTypeValue>, String> {
+) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => {
-            if let Some(declared_type) = config.custom_type_attribute_types.get(identity)
-                && declared_type.enum_parts().is_some()
-            {
-                let canonical = crate::resource::EnumValueResolver::new(declared_type)
-                    .resolve_state_text(value.expose_plaintext())
-                    .map_err(|error| error.to_string())?;
-                if !canonical.identity().same_type(identity) {
-                    return Err(format!(
-                        "expected {identity}, got resolved enum {}",
-                        canonical.identity()
-                    ));
-                }
-                return Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
-                    &canonical,
-                )));
-            }
-            Ok(Some(CanonicalCustomTypeValue::from_literal_string(value)))
-        }
-        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            if !value.identity().same_type(identity) {
-                return Err(format!(
-                    "expected {identity}, got canonical enum {}",
-                    value.identity()
-                ));
-            }
-            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(value)))
-        }
-        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-            let Some(declared_type) = config.custom_type_attribute_types.get(identity) else {
-                return Ok(None);
-            };
-            let canonical = crate::resource::EnumValueResolver::new(declared_type)
-                .resolve_raw(raw)
-                .map_err(|error| error.to_string())?;
-            if !canonical.identity().same_type(identity) {
-                return Err(format!(
-                    "expected {identity}, got resolved enum {}",
-                    canonical.identity()
-                ));
-            }
-            Ok(Some(CanonicalCustomTypeValue::from_canonical_enum(
-                &canonical,
-            )))
-        }
-        _ => Ok(None),
+        Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::Secret(_)
+            | DeferredValue::Unknown(_),
+        ) => return Ok(()),
+        Value::Concrete(_) | Value::Deferred(_) => {}
     }
+    config.custom_type_resolver().validate(
+        crate::parser::CustomTypeValidationTarget::Annotation(owned),
+        value,
+    )
 }
 
 /// Check that a function argument matches the declared parameter type.

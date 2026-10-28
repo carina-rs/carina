@@ -6196,7 +6196,7 @@ pub fn canonicalize_states_with_schemas(
             continue;
         };
         if let Some(attributes) = current.attributes_mut() {
-            canonicalize_state_attribute_map_with_schema(attributes, schema);
+            canonicalize_state_attribute_map_with_schema(attributes, schema.schema());
         }
     }
 }

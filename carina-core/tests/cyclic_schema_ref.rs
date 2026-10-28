@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, HashMap};
 use carina_core::differ::{Diff, diff};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
+    ValidatedConfigSchema,
 };
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
@@ -225,7 +226,7 @@ fn resource_schema_defs_field_default_is_empty() {
     let _: &BTreeMap<String, AttributeType> = schema.defs();
 }
 
-/// Regression for carina#3345: `ResourceSchema::validate` must route a
+/// Regression for carina#3345: owner-bound resource validation must route a
 /// `Ref`-containing attribute through its ancestry-carrying effective view so
 /// the enclosing `defs` are in scope, not through a rootless type walker.
 ///
@@ -243,10 +244,16 @@ fn resource_schema_validate_routes_ref_through_defs() {
         Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)])),
     );
 
-    let result = schema.validate(&attrs);
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", schema);
+    let resolver = carina_core::parser::ProviderCustomTypes::default();
+    let result = registry
+        .get("aws", "wafv2.WebACL", SchemaKind::Resource)
+        .expect("cyclic schema fixture must be owner-bound")
+        .validate_with_resolver(&attrs, &|_| false, &resolver);
     assert!(
         result.is_ok(),
-        "ResourceSchema::validate on a Ref-typed attribute with valid value \
+        "owner-bound validation on a Ref-typed attribute with valid value \
          must succeed, but got: {:?}",
         result.err()
     );

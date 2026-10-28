@@ -180,6 +180,26 @@ fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> 
     }
 }
 
+#[derive(Debug)]
+struct ProviderSchemaDecodeDiagnostic(wasm_convert::SchemaDecodeError);
+
+impl fmt::Display for ProviderSchemaDecodeDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut current: &(dyn std::error::Error + 'static) = &self.0;
+        write!(formatter, "{current}")?;
+        while let Some(source) = current.source() {
+            write!(formatter, ": {source}")?;
+            current = source;
+        }
+        Ok(())
+    }
+}
+
+// `WasmProviderLoadError::Metadata` deliberately renders its source and does
+// not expose it again. This adapter follows that policy while retaining every
+// typed schema-decode cause in the one rendered diagnostic.
+impl std::error::Error for ProviderSchemaDecodeDiagnostic {}
+
 fn provider_schema_decode_error(
     provider_name: &str,
     provider_version: &str,
@@ -189,7 +209,7 @@ fn provider_schema_decode_error(
         format!(
             "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode; the provider revision may predate this host"
         ),
-        detail,
+        ProviderSchemaDecodeDiagnostic(detail),
     )
 }
 
