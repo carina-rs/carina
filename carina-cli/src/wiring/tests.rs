@@ -618,6 +618,18 @@ async fn unverified_official_factory_load_is_fatal_before_loader() {
     let Err(error) = result else {
         panic!("unverified official providers must be fatal")
     };
+    let rendered = error.to_string();
+    assert!(
+        rendered.starts_with(&format!(
+            "{source} is a carina-rs provider but this user hasn't verified it; run `carina init {}`",
+            project.path().display()
+        )),
+        "{rendered}"
+    );
+    assert!(
+        std::error::Error::source(&error).is_none(),
+        "the transparent AppError must not re-expose the self-contained diagnostic"
+    );
     assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
 
     let configs = validated_provider_configs(vec![config]);

@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use carina_core::provider_source::GithubSource;
 
-use crate::github::{GithubApi, GithubArtifactResponse, GithubHttp, UreqGithubHttp};
+use crate::github::{
+    FetchedLocation, GithubApi, GithubArtifactResponse, GithubHttp, UreqGithubHttp,
+};
 use crate::github_location::{ArtifactId, CommitSha, GitRef, RepoSlug};
 use crate::install_lock::{
     GlobalArtifactPath, GuardedLockFile, ProviderInstallLock, StagedArtifact,
@@ -222,10 +224,17 @@ fn download_artifact<'lock, H: GithubHttp + ?Sized>(
     artifact_id: ArtifactId,
     destination: &WasmArtifactPath,
     api: &GithubApi<'_, H>,
-) -> Result<StagedArtifact<'lock>, String> {
-    let zip_data = api
+) -> Result<
+    (
+        StagedArtifact<'lock>,
+        FetchedLocation<GithubRevisionDownloadLocation>,
+    ),
+    String,
+> {
+    let (zip_data, download_location) = api
         .download_artifact_zip(repo, artifact_id)
-        .map_err(|error| format!("Failed to download artifact {artifact_id}: {error}"))?;
+        .map_err(|error| format!("Failed to download artifact {artifact_id}: {error}"))?
+        .into_parts();
 
     // Extract the .wasm file from the ZIP
     let cursor = io::Cursor::new(zip_data);
@@ -250,7 +259,7 @@ fn download_artifact<'lock, H: GithubHttp + ?Sized>(
                 })?;
             io::copy(&mut file, &mut staged)
                 .map_err(|e| format!("Failed to write WASM file: {e}"))?;
-            return Ok(staged);
+            return Ok((staged, download_location));
         }
     }
 
@@ -411,8 +420,8 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
         select_artifact_from_runs(&run_ids, &expected_name, source, &sha, |run_id| {
             fetch_run_artifacts(&repo, run_id, api)
         })?;
-    let staged = download_artifact(install_lock, source, &repo, artifact_id, &wasm_path, api)?;
-    let download_location = GithubRevisionDownloadLocation::new(repo, artifact_id);
+    let (staged, download_location) =
+        download_artifact(install_lock, source, &repo, artifact_id, &wasm_path, api)?;
     let installed_path = match publish_download(staged, artifact_pin, download_location)? {
         DownloadedArtifact::Verified { artifact, pin } => {
             record_verified_revision_pin(lock_file, &artifact, pin, name);
@@ -615,10 +624,10 @@ mod tests {
         });
         let pin =
             lookup_revision_artifact_pin(&lock_file, &source.source_key(), "main", TEST_SHA, "aws");
-        let location = GithubRevisionDownloadLocation::new(
+        let location = FetchedLocation::for_test(GithubRevisionDownloadLocation::new(
             RepoSlug::try_from(&source).unwrap(),
             ArtifactId::from_lock(42),
-        );
+        ));
 
         let error = publish_download(staged, pin, location)
             .expect_err("fresh revision bytes must match an existing lock pin");

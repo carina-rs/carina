@@ -6,8 +6,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::github_location::{
-    ArtifactId, AssetId, CommitSha, GitRef, GithubLocationError, RepoSlug,
+    ArtifactId, AssetId, CommitSha, GitRef, GithubLocationError, ReleaseTag, RepoSlug,
 };
+use crate::verified_artifact::{GithubReleaseDownloadLocation, GithubRevisionDownloadLocation};
 
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
 const OCTET_STREAM_ACCEPT: &str = "application/octet-stream";
@@ -44,6 +45,42 @@ impl GithubResponse {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
+    }
+}
+
+/// Bytes returned by GitHub together with the typed location used to fetch
+/// them. Only this module can mint the accompanying fetched-location token.
+pub(crate) struct DownloadedFrom<L> {
+    bytes: Vec<u8>,
+    location: L,
+}
+
+impl<L> DownloadedFrom<L> {
+    fn new(bytes: Vec<u8>, location: L) -> Self {
+        Self { bytes, location }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, FetchedLocation<L>) {
+        (self.bytes, FetchedLocation(self.location))
+    }
+}
+
+/// Proof that the typed GitHub client successfully fetched a location.
+pub(crate) struct FetchedLocation<L>(L);
+
+impl<L> FetchedLocation<L> {
+    pub(crate) fn into_inner(self) -> L {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(location: L) -> Self {
+        Self(location)
+    }
+
+    #[cfg(test)]
+    fn as_ref(&self) -> &L {
+        &self.0
     }
 }
 
@@ -324,11 +361,13 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
     pub(crate) fn download_release_asset(
         &self,
         repo: &RepoSlug,
+        tag: &ReleaseTag,
         asset_id: AssetId,
-    ) -> Result<Vec<u8>, GithubApiError> {
+    ) -> Result<DownloadedFrom<GithubReleaseDownloadLocation>, GithubApiError> {
         let url = repo.release_asset_url(asset_id)?;
+        let location = GithubReleaseDownloadLocation::new(repo.clone(), tag.clone(), asset_id);
         self.get(&url, OCTET_STREAM_ACCEPT, GithubAuthentication::Optional)
-            .map(|response| response.body)
+            .map(|response| DownloadedFrom::new(response.body, location))
     }
 
     pub(crate) fn commit(
@@ -376,10 +415,11 @@ impl<'http, H: GithubHttp + ?Sized> GithubApi<'http, H> {
         &self,
         repo: &RepoSlug,
         artifact_id: ArtifactId,
-    ) -> Result<Vec<u8>, GithubApiError> {
+    ) -> Result<DownloadedFrom<GithubRevisionDownloadLocation>, GithubApiError> {
         let url = repo.artifact_zip_url(artifact_id)?;
+        let location = GithubRevisionDownloadLocation::new(repo.clone(), artifact_id);
         self.get(&url, GITHUB_JSON_ACCEPT, GithubAuthentication::Required)
-            .map(|response| response.body)
+            .map(|response| DownloadedFrom::new(response.body, location))
     }
 
     fn get(
@@ -688,16 +728,48 @@ mod tests {
         let url = "https://api.github.com/repos/acme/widget/releases/assets/42";
         let http = FixtureGithubHttp::default().bytes(url, b"wasm");
         let api = GithubApi::new(&http, Some("test-token"));
+        let repo = repo_slug();
+        let tag = ReleaseTag::from_lock("v1.2.3".into());
+        let asset_id = AssetId::from_lock(42);
 
-        let bytes = api
-            .download_release_asset(&repo_slug(), AssetId::from_lock(42))
-            .unwrap();
+        let (bytes, location) = api
+            .download_release_asset(&repo, &tag, asset_id)
+            .unwrap()
+            .into_parts();
 
         assert_eq!(bytes, b"wasm");
+        assert_eq!(
+            location.as_ref(),
+            &GithubReleaseDownloadLocation::new(repo, tag, asset_id)
+        );
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url(), url);
         assert_eq!(requests[0].accept(), "application/octet-stream");
+        assert_eq!(requests[0].authorization(), Some("Bearer test-token"));
+    }
+
+    #[test]
+    fn authenticated_actions_artifact_download_returns_typed_location() {
+        let url = "https://api.github.com/repos/acme/widget/actions/artifacts/42/zip";
+        let http = FixtureGithubHttp::default().bytes(url, b"zip");
+        let api = GithubApi::new(&http, Some("test-token"));
+        let repo = repo_slug();
+        let artifact_id = ArtifactId::from_lock(42);
+
+        let (bytes, location) = api
+            .download_artifact_zip(&repo, artifact_id)
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(bytes, b"zip");
+        assert_eq!(
+            location.as_ref(),
+            &GithubRevisionDownloadLocation::new(repo, artifact_id)
+        );
+        let requests = http.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url(), url);
         assert_eq!(requests[0].authorization(), Some("Bearer test-token"));
     }
 
@@ -730,9 +802,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let api = GithubApi::with_token_provider(&http, &tokens);
+        let tag = ReleaseTag::from_lock("v1.2.3".into());
 
         api.list_releases(&repo_slug()).unwrap();
-        api.download_release_asset(&repo_slug(), AssetId::from_lock(42))
+        api.download_release_asset(&repo_slug(), &tag, AssetId::from_lock(42))
             .unwrap();
 
         assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);

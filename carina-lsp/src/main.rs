@@ -409,8 +409,10 @@ mod tests {
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
             source: source.into(),
-            kind: carina_provider_resolver::LockEntryKind::Version {
-                version: version.into(),
+            kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                version: version.parse().unwrap(),
+                tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
+                asset_id: serde_json::from_str("42").unwrap(),
                 constraint: None,
             },
             sha256: carina_provider_resolver::sha256_file(&wasm).unwrap(),

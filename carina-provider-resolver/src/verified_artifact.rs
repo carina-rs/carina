@@ -10,6 +10,7 @@ use carina_core::provider_source::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::github::FetchedLocation;
 use crate::github_location::{ArtifactId, AssetId, GithubLocationError, ReleaseTag, RepoSlug};
 use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
@@ -1073,7 +1074,7 @@ pub(crate) fn publish_cached<R>(
 pub(crate) fn publish_download<R, P: OriginDownloadPin>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
-    location: P::Location,
+    location: FetchedLocation<P::Location>,
 ) -> Result<DownloadedArtifact<P>, String> {
     publish_download_verified(staged, pin, location).map_err(String::from)
 }
@@ -1081,8 +1082,9 @@ pub(crate) fn publish_download<R, P: OriginDownloadPin>(
 fn publish_download_verified<R, P: OriginDownloadPin>(
     staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
-    location: P::Location,
+    location: FetchedLocation<P::Location>,
 ) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
+    let location = location.into_inner();
     match pin {
         ArtifactPin::Pinned {
             lock_entry,
@@ -1330,10 +1332,10 @@ mod tests {
         staged.write_all(bytes).unwrap();
         let lock_file = LockFile::default();
         let pin = lookup_revision_artifact_pin(&lock_file, &source, "main", resolved_sha, "aws");
-        let location = GithubRevisionDownloadLocation::new(
+        let location = FetchedLocation::for_test(GithubRevisionDownloadLocation::new(
             RepoSlug::try_from(&github).unwrap(),
             ArtifactId::from_lock(42),
-        );
+        ));
 
         let downloaded = publish_download(staged, pin, location).unwrap();
 
@@ -1472,11 +1474,11 @@ mod tests {
             registry: None,
         });
         let pin = lookup_github_release_artifact_pin(&lock_file, &source, &version, "aws");
-        let location = GithubReleaseDownloadLocation::new(
+        let location = FetchedLocation::for_test(GithubReleaseDownloadLocation::new(
             github_repo_from_key(&source).unwrap(),
             tag,
             asset_id,
-        );
+        ));
 
         let error = publish_download_verified(staged, pin, location)
             .expect_err("origin bytes must match the existing lock pin");

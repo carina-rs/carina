@@ -41,10 +41,9 @@ use crate::user_trust::{load_user_verified_identity, user_trust_record_exists};
 #[cfg(test)]
 use crate::verified_artifact::record_test_github_origin_download;
 use crate::verified_artifact::{
-    DownloadedArtifact, GithubReleaseArtifactPin, GithubReleaseDownloadLocation,
-    LockArtifactSelection, ProviderArtifactBytes, VerifiedArtifact, VerifiedArtifactError,
-    VerifiedLoad, lock_artifact_selection, lookup_github_release_artifact_pin, publish_download,
-    record_verified_registry_origin_download,
+    DownloadedArtifact, GithubReleaseArtifactPin, LockArtifactSelection, ProviderArtifactBytes,
+    VerifiedArtifact, VerifiedArtifactError, VerifiedLoad, lock_artifact_selection,
+    lookup_github_release_artifact_pin, publish_download, record_verified_registry_origin_download,
 };
 use crate::version_resolver::{
     GithubRelease, ReleaseAssetSelectionError, fetch_latest_release_with_api,
@@ -4843,17 +4842,11 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     }
 }
 
-impl<E> std::error::Error for ProviderArtifactLoadError<E>
-where
-    E: std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.error {
-            ProviderArtifactLoadFailure::Identity(error) => Some(error),
-            ProviderArtifactLoadFailure::Loader(error) => Some(error),
-        }
-    }
-}
+// `Display` is the sole rendering surface for this composite diagnostic: CLI
+// and LSP callers require one self-contained message containing both the child
+// error and provenance. Exposing the same child through `source()` would make
+// standard chain walkers print it again.
+impl<E> std::error::Error for ProviderArtifactLoadError<E> where E: std::error::Error + 'static {}
 
 fn missing_locked_artifact_error(
     base_dir: &Path,
@@ -5046,6 +5039,7 @@ impl fmt::Display for RegistryDownloadError {
 trait RegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String>;
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn fixture_signer_identity(&self) -> Option<signing::VerifiedSignerIdentity> {
         None
     }
@@ -6465,8 +6459,11 @@ fn verify_and_decide_signer<H: RegistryHttp>(
     project_dir: &Path,
     http: &H,
 ) -> Result<(signing::VerifiedSignerIdentity, SignerAcceptance), String> {
-    let verified_identity = signing::verify_artifact(artifact_digest, bundle)?;
-    let identity = http.fixture_signer_identity().unwrap_or(verified_identity);
+    let identity = signing::verify_artifact(artifact_digest, bundle)?;
+    #[cfg(any(test, feature = "test-utils"))]
+    let identity = http.fixture_signer_identity().unwrap_or(identity);
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let _ = http;
     let acceptance = decide_signer(expected_signer, &identity, version).map_err(|error| {
         let remediation = identity_repin_remediation(source, project_dir);
         format!("{error}; signature verification has no override. {remediation}")
@@ -7116,20 +7113,19 @@ where
         resolved.tag,
         asset_id
     );
-    let bytes = github
-        .download_release_asset(&repo, asset_id)
+    let (bytes, download_location) = github
+        .download_release_asset(&repo, &resolved.tag, asset_id)
         .map_err(|error| {
             format!(
                 "Failed to download GitHub release asset id {asset_id} for tag '{}': {error}",
                 resolved.tag
             )
-        })?;
+        })?
+        .into_parts();
     staged
         .write_all(&bytes)
         .map_err(|error| format!("Failed to write downloaded file: {error}"))?;
 
-    let download_location =
-        GithubReleaseDownloadLocation::new(repo, resolved.tag.clone(), resolved.asset_id);
     let installed_path = match publish_download(staged, artifact_pin, download_location)? {
         DownloadedArtifact::Verified { artifact, pin } => {
             record_verified_github_release_pin(lock_file, &artifact, pin, resolved, name);
@@ -20786,21 +20782,20 @@ future_protection_field = "retain-me"
 
         assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
         let identity_error = error.identity_error().expect("typed identity failure");
+        let unverified = identity_error
+            .unverified_official()
+            .expect("unverified-official identity failure");
         assert_eq!(
-            identity_error.unverified_official().unwrap().reason(),
+            unverified.reason(),
             crate::UnverifiedOfficialProviderReason::InvalidRecord
         );
-        let unverified_source = std::error::Error::source(identity_error)
-            .expect("the identity error must retain the unverified-official error");
-        let record_source = std::error::Error::source(unverified_source)
-            .expect("the unverified-official error must retain the record error");
         assert!(
-            std::error::Error::source(record_source).is_some(),
-            "the record error must retain the JSON parse error"
+            std::error::Error::source(unverified).is_none(),
+            "the self-contained unverified-official diagnostic must not expose its rendered child again"
         );
         assert!(
-            std::error::Error::source(&error).is_some(),
-            "the artifact failure must retain the identity error"
+            std::error::Error::source(&error).is_none(),
+            "the self-contained artifact diagnostic must not expose its rendered child again"
         );
         let rendered = error.to_string();
         assert!(rendered.contains(source), "{rendered}");
@@ -21367,11 +21362,9 @@ sha256 = "{}"
         let error = installed.with_load_error(io::Error::other(
             "Failed to instantiate WASM component (HTTP)",
         ));
-        let source = std::error::Error::source(&error)
-            .expect("the typed artifact failure must preserve its loader error source");
-        assert_eq!(
-            source.to_string(),
-            "Failed to instantiate WASM component (HTTP)"
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the self-contained Display contract must not expose the rendered child again"
         );
         let rendered = error.to_string();
 

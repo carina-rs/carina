@@ -248,15 +248,10 @@ impl fmt::Display for UnverifiedOfficialProviderError {
     }
 }
 
-impl std::error::Error for UnverifiedOfficialProviderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.failure {
-            UnverifiedOfficialProviderFailure::InvalidRecord(error) => Some(error),
-            UnverifiedOfficialProviderFailure::MissingRecord
-            | UnverifiedOfficialProviderFailure::SignerNotCarinaRs => None,
-        }
-    }
-}
+// `Display` embeds the complete trust-record failure chain so CLI and LSP
+// callers receive one self-contained diagnostic. Exposing the same child via
+// `source()` would make standard chain walkers render it again.
+impl std::error::Error for UnverifiedOfficialProviderError {}
 
 #[derive(Debug)]
 pub enum ProviderLoadIdentityError {
