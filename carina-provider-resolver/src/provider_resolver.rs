@@ -4156,7 +4156,7 @@ impl InstalledProvider {
         notice_sink: &mut impl FnMut(&str),
     ) -> Result<ProviderLoadIdentity, ProviderLoadIdentityError> {
         let (trust, notice) = match &self.artifact {
-            InstalledArtifact::LockFile(artifact) => remote_provider_trust(artifact, notice_sink),
+            InstalledArtifact::LockFile(artifact) => (remote_provider_trust(artifact)?, None),
             InstalledArtifact::File {
                 path: _,
                 bytes,
@@ -4232,31 +4232,28 @@ impl InstalledProvider {
 
 fn remote_provider_trust(
     artifact: &VerifiedArtifact,
-    notice_sink: &mut impl FnMut(&str),
-) -> (ProviderTrust, Option<String>) {
-    match load_user_verified_identity(artifact.sha256(), artifact.source()) {
-        Ok(Some(identity)) => (ProviderTrust::from_verified_remote(&identity), None),
-        Ok(None) => untrusted_remote_provider(artifact),
-        Err(error) => {
-            notice_sink(&format!(
-                "carina: warning: failed to load user trust for {}: {}",
-                artifact.source(),
-                error.display_chain()
-            ));
-            untrusted_remote_provider(artifact)
-        }
+) -> Result<ProviderTrust, ProviderLoadIdentityError> {
+    if !ProviderTrust::remote_source_is_allowlisted(artifact.source()) {
+        return Ok(ProviderTrust::untrusted());
     }
-}
 
-fn untrusted_remote_provider(artifact: &VerifiedArtifact) -> (ProviderTrust, Option<String>) {
-    let notice = ProviderTrust::remote_source_is_allowlisted(artifact.source()).then(|| {
-        format!(
-            "carina: run `{}` to verify {} before it receives credentials",
-            ProjectCommand::new("init", artifact.project_dir()),
+    match load_user_verified_identity(artifact.sha256(), artifact.source()) {
+        Ok(Some(identity)) => ProviderTrust::from_verified_remote(&identity).ok_or_else(|| {
+            ProviderLoadIdentityError::non_carina_official_signer(
+                artifact.source(),
+                artifact.project_dir(),
+            )
+        }),
+        Ok(None) => Err(ProviderLoadIdentityError::missing_official_record(
             artifact.source(),
-        )
-    });
-    (ProviderTrust::untrusted(), notice)
+            artifact.project_dir(),
+        )),
+        Err(error) => Err(ProviderLoadIdentityError::invalid_official_record(
+            artifact.source(),
+            artifact.project_dir(),
+            error,
+        )),
+    }
 }
 
 fn local_provider_trust(
@@ -4392,6 +4389,24 @@ impl<E> ProviderArtifactLoadError<E> {
             ProviderArtifactLoadFailure::Loader(error) => Some(error),
         }
     }
+
+    pub fn into_identity_error(self) -> Result<ProviderLoadIdentityError, Self> {
+        let Self {
+            error,
+            provider_name,
+            artifact_path,
+            provenance,
+        } = self;
+        match error {
+            ProviderArtifactLoadFailure::Identity(error) => Ok(error),
+            ProviderArtifactLoadFailure::Loader(error) => Err(Self {
+                error: ProviderArtifactLoadFailure::Loader(error),
+                provider_name,
+                artifact_path,
+                provenance,
+            }),
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
@@ -4411,11 +4426,17 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     }
 }
 
-// `Display` is the sole rendering surface for this composite diagnostic: CLI
-// and LSP callers require one self-contained message containing both the child
-// error and provenance. Exposing the same child through `source()` would make
-// standard chain walkers print it again.
-impl<E> std::error::Error for ProviderArtifactLoadError<E> where E: std::error::Error + 'static {}
+impl<E> std::error::Error for ProviderArtifactLoadError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.error {
+            ProviderArtifactLoadFailure::Identity(error) => Some(error),
+            ProviderArtifactLoadFailure::Loader(error) => Some(error),
+        }
+    }
+}
 
 fn missing_locked_artifact_error(
     base_dir: &Path,
@@ -4595,6 +4616,10 @@ impl fmt::Display for RegistryDownloadError {
 trait RegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String>;
 
+    fn fixture_signer_identity(&self) -> Option<signing::VerifiedSignerIdentity> {
+        None
+    }
+
     fn download_into(
         &self,
         url: &RegistryResourceUrl,
@@ -4629,6 +4654,7 @@ pub struct FixtureRegistryHttp {
     responses: HashMap<String, FixtureRegistryResponse>,
     downloads: HashMap<String, Vec<u8>>,
     requested: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    signer_identity: Option<signing::VerifiedSignerIdentity>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -4640,6 +4666,34 @@ enum FixtureRegistryResponse {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl FixtureRegistryHttp {
+    /// Override the identity extracted from an otherwise genuinely verified
+    /// fixture bundle. This keeps cross-crate install tests small: they can use
+    /// the conformance artifact and bundle while exercising official-signer
+    /// trust-record behavior without checking a production provider WASM into
+    /// this repository.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verified_signer_identity(
+        mut self,
+        certificate_san: &str,
+        oidc_issuer: &str,
+        repository_owner_id: &str,
+        repository_id: &str,
+        source_ref: &str,
+        workflow: &str,
+        repository_digest: Option<&str>,
+    ) -> Self {
+        self.signer_identity = Some(signing::VerifiedSignerIdentity::for_test(
+            certificate_san,
+            oidc_issuer,
+            repository_owner_id,
+            repository_id,
+            source_ref,
+            workflow,
+            repository_digest,
+        ));
+        self
+    }
+
     pub fn json(mut self, url: &str, body: impl AsRef<[u8]>) -> Self {
         self.responses.insert(
             url.to_string(),
@@ -4684,6 +4738,10 @@ impl FixtureRegistryHttp {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl RegistryHttp for FixtureRegistryHttp {
+    fn fixture_signer_identity(&self) -> Option<signing::VerifiedSignerIdentity> {
+        self.signer_identity.clone()
+    }
+
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
         let url = request.url();
         self.requested.lock().unwrap().push(url.to_string());
@@ -5712,6 +5770,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         &version,
         source_key.as_str(),
         lock_file.install_lock().project_dir(),
+        http,
     ) {
         Ok(verified) => verified,
         Err(error) => {
@@ -5952,15 +6011,17 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
     Ok(VerifiedRegistryArtifact { state, digest })
 }
 
-fn verify_and_decide_signer(
+fn verify_and_decide_signer<H: RegistryHttp>(
     artifact_digest: Sha256,
     bundle: &[u8],
     expected_signer: &SignerPinState,
     version: &ListedVersion,
     source: &str,
     project_dir: &Path,
+    http: &H,
 ) -> Result<(signing::VerifiedSignerIdentity, SignerAcceptance), String> {
-    let identity = signing::verify_artifact(artifact_digest, bundle)?;
+    let verified_identity = signing::verify_artifact(artifact_digest, bundle)?;
+    let identity = http.fixture_signer_identity().unwrap_or(verified_identity);
     let acceptance = decide_signer(expected_signer, &identity, version).map_err(|error| {
         let remediation = identity_repin_remediation(source, project_dir);
         format!("{error}; signature verification has no override. {remediation}")
@@ -6342,6 +6403,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
                 &version,
                 source_key.as_str(),
                 project_dir,
+                http,
             ) {
                 Ok(verified) => Some(verified),
                 Err(error) => {
@@ -14873,7 +14935,7 @@ transparency_log_present = true
     }
 
     #[test]
-    fn registry_signed_origin_install_writes_user_trust() {
+    fn registry_signed_origin_install_records_non_carina_signer_and_refuses_load() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -14896,12 +14958,16 @@ transparency_log_present = true
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let class = block_on(
-            installed.load_with(&no_local_grants(), |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            }),
-        )
-        .unwrap();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
+        let error = block_on(installed.load_with(
+            &no_local_grants(),
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
+            },
+        ))
+        .unwrap_err();
 
         assert_eq!(
             http.request_count("https://downloads.example.test/aws.wasm"),
@@ -14912,10 +14978,16 @@ transparency_log_present = true
                 .iter()
                 .any(|(_, contents)| contents.is_some())
         );
-        // The fixture signer is intentionally not an official carina-rs
-        // identity, so writing its verified record must not bypass the fixed
-        // provider allow-list.
-        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            error
+                .identity_error()
+                .unwrap()
+                .unverified_official()
+                .unwrap()
+                .reason(),
+            crate::UnverifiedOfficialProviderReason::SignerNotCarinaRs
+        );
     }
 
     #[test]
@@ -18218,7 +18290,7 @@ transparency_log_present = false
     #[tokio::test]
     async fn load_with_keeps_lock_verified_bytes_after_artifact_is_replaced() {
         let project = tempfile::tempdir().unwrap();
-        let source = "github.com/carina-rs/carina-provider-awscc";
+        let source = "github.com/example/carina-provider-awscc";
         let version = "0.1.0";
         let original_bytes = b"verified installed provider";
         let swapped_bytes = b"provider swapped after verification";
@@ -18467,7 +18539,10 @@ transparency_log_present = false
             .await
             .unwrap_err();
 
-        assert_eq!(error.identity_error().unwrap().configured_name(), "foo");
+        assert_eq!(
+            error.identity_error().unwrap().name_mismatch(),
+            Some(("foo", "aws or awscc"))
+        );
     }
 
     #[test]
@@ -18520,12 +18595,11 @@ transparency_log_present = false
 
         assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
         let identity_error = error.identity_error().unwrap();
-        assert_eq!(identity_error.configured_name(), "awscc");
-        assert_eq!(identity_error.expected(), "aws");
+        assert_eq!(identity_error.name_mismatch(), Some(("awscc", "aws")));
     }
 
     #[test]
-    fn remote_lock_and_project_artifact_without_user_trust_are_untrusted_and_hint_once() {
+    fn official_remote_without_user_trust_fails_before_loader() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18551,29 +18625,40 @@ transparency_log_present = false
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let mut emitted = Vec::new();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
 
-        let class = block_on(installed.load_with_notice_sink(
+        let error = block_on(installed.load_with(
             &no_local_grants(),
-            |line| emitted.push(line.to_string()),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
             },
         ))
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
-            emitted,
-            vec![format!(
-                "carina: run `{}` to verify {source} before it receives credentials",
+            error
+                .identity_error()
+                .unwrap()
+                .unverified_official()
+                .unwrap()
+                .reason(),
+            crate::UnverifiedOfficialProviderReason::MissingRecord
+        );
+        assert!(error.loader_error().is_none());
+        assert!(
+            error.to_string().starts_with(&format!(
+                "{source} is a carina-rs provider but this user hasn't verified it; run `{}`",
                 ProjectCommand::new("init", project.path()),
-            )]
+            )),
+            "{error}"
         );
     }
 
     #[test]
-    fn broken_remote_user_trust_record_warns_and_is_untrusted() {
+    fn broken_official_remote_user_trust_record_fails_before_loader() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18606,28 +18691,50 @@ transparency_log_present = false
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let mut emitted = Vec::new();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
 
-        let class = block_on(installed.load_with_notice_sink(
+        let error = block_on(installed.load_with(
             &no_local_grants(),
-            |line| emitted.push(line.to_string()),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
             },
         ))
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
+        let identity_error = error.identity_error().expect("typed identity failure");
+        assert_eq!(
+            identity_error.unverified_official().unwrap().reason(),
+            crate::UnverifiedOfficialProviderReason::InvalidRecord
+        );
+        let unverified_source = std::error::Error::source(identity_error)
+            .expect("the identity error must retain the unverified-official error");
+        let record_source = std::error::Error::source(unverified_source)
+            .expect("the unverified-official error must retain the record error");
         assert!(
-            emitted.iter().any(|line| {
-                line.contains("warning") && line.contains("Failed to parse provider trust record")
-            }),
-            "a broken record must be surfaced through the notice sink: {emitted:?}"
+            std::error::Error::source(record_source).is_some(),
+            "the record error must retain the JSON parse error"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the artifact failure must retain the identity error"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains(source), "{rendered}");
+        assert!(
+            rendered.contains("Failed to parse provider trust record"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&ProjectCommand::new("init", project.path()).to_string()),
+            "{rendered}"
         );
     }
 
     #[test]
-    fn relative_user_trust_record_dir_warns_and_loads_as_untrusted() {
+    fn unusable_official_user_trust_record_dir_fails_before_loader() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", "relative/trust");
@@ -18652,30 +18759,36 @@ transparency_log_present = false
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let mut emitted = Vec::new();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
 
-        let class = block_on(installed.load_with_notice_sink(
+        let error = block_on(installed.load_with(
             &no_local_grants(),
-            |line| emitted.push(line.to_string()),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
             },
         ))
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(class, ProviderTrustClass::Untrusted);
-        assert!(
-            emitted.iter().any(|line| {
-                line.contains("warning")
-                    && line.contains("CARINA_TRUST_RECORD_DIR")
-                    && line.contains("must be an absolute path")
-            }),
-            "a relative trust directory must be surfaced through the notice sink: {emitted:?}"
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            error
+                .identity_error()
+                .unwrap()
+                .unverified_official()
+                .unwrap()
+                .reason(),
+            crate::UnverifiedOfficialProviderReason::InvalidRecord
         );
+        let rendered = error.to_string();
+        assert!(rendered.contains(source), "{rendered}");
+        assert!(rendered.contains("CARINA_TRUST_RECORD_DIR"), "{rendered}");
+        assert!(rendered.contains("must be an absolute path"), "{rendered}");
     }
 
     #[test]
-    fn official_github_revision_without_user_trust_is_untrusted_and_hinted() {
+    fn official_github_revision_without_user_trust_fails_before_loader() {
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
@@ -18706,26 +18819,29 @@ transparency_log_present = false
         let mut config = provider_config(source, Some(revision));
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let mut emitted = Vec::new();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
 
-        let class = block_on(installed.load_with_notice_sink(
+        let error = block_on(installed.load_with(
             &no_local_grants(),
-            |line| emitted.push(line.to_string()),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
             },
         ))
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(class, ProviderTrustClass::Untrusted);
-        assert_eq!(emitted.len(), 1);
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
-            emitted[0],
-            format!(
-                "carina: run `{}` to verify {source} before it receives credentials",
-                ProjectCommand::new("init", project.path()),
-            )
+            error
+                .identity_error()
+                .unwrap()
+                .unverified_official()
+                .unwrap()
+                .reason(),
+            crate::UnverifiedOfficialProviderReason::MissingRecord
         );
+        assert!(error.to_string().contains(source), "{error}");
     }
 
     #[test]
@@ -18759,22 +18875,62 @@ transparency_log_present = false
         let mut config = provider_config(source, None);
         config.name = "aws".into();
         let installed = find_installed_provider(project.path(), &config).unwrap();
-        let mut emitted = Vec::new();
+        let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::clone(&loader_called);
 
-        let class = block_on(installed.load_with_notice_sink(
+        let error = block_on(installed.load_with(
             &no_local_grants(),
-            |line| emitted.push(line.to_string()),
-            |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            move |_verified| async move {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(())
             },
         ))
+        .unwrap_err();
+
+        assert!(!loader_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.identity_error().is_some());
+        assert!(
+            error.to_string().contains("signer is not carina-rs"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn third_party_remote_without_user_trust_is_untrusted_and_loads() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/example/provider-widget";
+        let version = "1.2.3";
+        let bytes = b"third-party provider";
+        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "widget".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(project.path())).unwrap();
+        let mut config = provider_config(source, None);
+        config.name = "widget".into();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+
+        let class = block_on(
+            installed.load_with(&no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            }),
+        )
         .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
-        assert!(
-            emitted.is_empty(),
-            "an existing record must not emit the init hint"
-        );
     }
 
     #[test]
@@ -19005,9 +19161,11 @@ transparency_log_present = false
         let error = installed.with_load_error(io::Error::other(
             "Failed to instantiate WASM component (HTTP)",
         ));
-        assert!(
-            std::error::Error::source(&error).is_none(),
-            "the self-contained Display contract must not expose the rendered child again"
+        let source = std::error::Error::source(&error)
+            .expect("the typed artifact failure must preserve its loader error source");
+        assert_eq!(
+            source.to_string(),
+            "Failed to instantiate WASM component (HTTP)"
         );
         let rendered = error.to_string();
 

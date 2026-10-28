@@ -400,10 +400,7 @@ fn build_factories_from_providers_impl(
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
-) -> Result<
-    (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>),
-    carina_provider_resolver::GrantParseError,
-> {
+) -> Result<(Vec<Box<dyn ProviderFactory>>, HashMap<String, String>), AppError> {
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     build_factories_from_providers_impl_using(
@@ -421,10 +418,7 @@ fn build_factories_from_providers_impl_using<L, Fut>(
     report_errors: bool,
     grant_inputs: &TrustedLocalGrantInputs,
     mut loader: L,
-) -> Result<
-    (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>),
-    carina_provider_resolver::GrantParseError,
->
+) -> Result<(Vec<Box<dyn ProviderFactory>>, HashMap<String, String>), AppError>
 where
     L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
     Fut: std::future::Future<
@@ -475,6 +469,10 @@ where
                 factories.push(Box::new(factory));
             }
             Err(error) => {
+                let error = match take_unverified_official_load_error(error) {
+                    Ok(unverified) => return Err(AppError::from(unverified)),
+                    Err(error) => error,
+                };
                 // Final UI boundary: `ProviderArtifactLoadError::Display`
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
@@ -2150,6 +2148,7 @@ async fn try_add_source_provider(
         }
         Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::TrustedLocalGrant(error)) => Err(AppError::from(error)),
+        Err(LoadSourceError::UnverifiedOfficial(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::Wasm(error)) => {
             // Terminal display boundary for the structured host error plus
             // resolver provenance. The underlying error remains typed until
@@ -2177,10 +2176,13 @@ fn source_provider_kind_mismatch_from_load_error(
         carina_plugin_host::WasmProviderLoadError,
     >,
 ) -> Option<AppError> {
-    if let Some(identity) = error.identity_error() {
+    if let Some((configured, expected)) = error
+        .identity_error()
+        .and_then(|identity| identity.name_mismatch())
+    {
         return Some(AppError::SourceProviderTrustMismatch {
-            configured: identity.configured_name().to_string(),
-            expected: identity.expected().to_string(),
+            configured: configured.to_string(),
+            expected: expected.to_string(),
             provider_source: source.to_string(),
         });
     }
@@ -2199,6 +2201,28 @@ fn source_provider_kind_mismatch_from_load_error(
         | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
     }
+}
+
+fn take_unverified_official_load_error<E>(
+    error: carina_provider_resolver::ProviderArtifactLoadError<E>,
+) -> Result<
+    carina_provider_resolver::UnverifiedOfficialProviderError,
+    carina_provider_resolver::ProviderArtifactLoadError<E>,
+> {
+    if error
+        .identity_error()
+        .and_then(|identity| identity.unverified_official())
+        .is_none()
+    {
+        return Err(error);
+    }
+
+    let identity = error
+        .into_identity_error()
+        .unwrap_or_else(|_| unreachable!("the load error was checked as an identity failure"));
+    Ok(identity
+        .into_unverified_official()
+        .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
 /// Failure mode for `load_source_provider`. Distinguishing between a
@@ -2225,6 +2249,8 @@ enum LoadSourceError {
     ),
     /// A process-local privilege grant was invalid when provider loading began.
     TrustedLocalGrant(carina_provider_resolver::GrantParseError),
+    /// An allow-listed provider did not have usable user-owned verification.
+    UnverifiedOfficial(carina_provider_resolver::UnverifiedOfficialProviderError),
     /// Plumbing failure such as an artifact lookup or configuration error.
     /// Logged and skipped.
     Other(String),
@@ -2251,6 +2277,10 @@ async fn load_source_provider(
     let factory = match load_installed_wasm_provider(&installed, grants).await {
         Ok(factory) => factory,
         Err(error) => {
+            let error = match take_unverified_official_load_error(error) {
+                Ok(unverified) => return Err(LoadSourceError::UnverifiedOfficial(unverified)),
+                Err(error) => error,
+            };
             if let Some(mismatch) = source_provider_kind_mismatch_from_load_error(source, &error) {
                 return Err(LoadSourceError::KindMismatch(mismatch));
             }

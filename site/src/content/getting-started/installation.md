@@ -65,9 +65,9 @@ carina init
 
 After upgrading Carina, the first `carina init` re-downloads each allow-listed `carina-rs` provider from its origin to create the current trust record, so it needs network access. For a GitHub `revision` source whose locked commit artifact has expired (GitHub normally retains artifacts for about 90 days), run `carina init --upgrade` to resolve a current artifact.
 
-Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing. An allow-listed `carina-rs` AWS, AWSCC, or GitHub provider receives credentials and metadata access only when the exact bytes being loaded match this user's trust record. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot grant that access; without the user record, the provider remains untrusted and Carina prints a hint to run `carina init`.
+Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing. An allow-listed `carina-rs` AWS, AWSCC, or GitHub provider loads only when the exact bytes match this user's valid trust record. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot create that verification. If the record is absent, unreadable, malformed, or names a signer outside `carina-rs`, Carina fails before running the provider and the error tells the user to run `carina init`.
 
-In CI, restoring `.carina/` without `~/.carina/trust/` therefore loads `carina-rs` providers as untrusted, without credentials. Run `carina init` in the job or persist the trust directory; set `CARINA_TRUST_RECORD_DIR` when the CI cache uses another location.
+In CI, restoring `.carina/` without `~/.carina/trust/` therefore makes `carina-rs` providers fail to load. Run `carina init` in the job or persist the trust directory; set `CARINA_TRUST_RECORD_DIR` when the CI cache uses another location.
 
 `source` takes one of three forms:
 

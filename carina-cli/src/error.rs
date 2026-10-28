@@ -480,6 +480,10 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// An official provider artifact lacks usable user-owned verification.
+    #[error(transparent)]
+    UnverifiedOfficialProvider(#[from] carina_provider_resolver::UnverifiedOfficialProviderError),
+
     /// A local provider privilege grant was malformed or unusable.
     #[error(transparent)]
     TrustedLocalGrant(#[from] carina_provider_resolver::GrantParseError),

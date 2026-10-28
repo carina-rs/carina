@@ -1,9 +1,11 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
 
+use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::RemoteSourceKey;
 
 use crate::provider_resolver::RegistrySignatureProtection;
-use crate::user_trust::UserVerifiedIdentity;
+use crate::user_trust::{UserTrustRecordError, UserVerifiedIdentity};
 
 const CARINA_RS_GITHUB_ORG_ID: &str = "260157389";
 const CARINA_RS_GITHUB_SAN_PREFIX: &str = "https://github.com/carina-rs/";
@@ -33,7 +35,7 @@ impl ProviderTrust {
         self.class
     }
 
-    pub(crate) fn from_verified_remote(identity: &UserVerifiedIdentity) -> Self {
+    pub(crate) fn from_verified_remote(identity: &UserVerifiedIdentity) -> Option<Self> {
         classify_verified_remote(identity.source(), identity.signer())
     }
 
@@ -63,17 +65,14 @@ impl ProviderTrust {
 fn classify_verified_remote(
     source: &RemoteSourceKey,
     signature: Option<&RegistrySignatureProtection>,
-) -> ProviderTrust {
+) -> Option<ProviderTrust> {
     if !signer_is_carina_rs(signature) {
-        return ProviderTrust::untrusted();
+        return None;
     }
-    match remote_trust_shape(source) {
-        Some((class, name_requirement)) => ProviderTrust {
-            class,
-            name_requirement,
-        },
-        None => ProviderTrust::untrusted(),
-    }
+    remote_trust_shape(source).map(|(class, name_requirement)| ProviderTrust {
+        class,
+        name_requirement,
+    })
 }
 
 fn remote_trust_shape(
@@ -129,7 +128,7 @@ impl ProviderLoadIdentity {
             ProviderNameRequirement::AwsFamily => None,
         };
         if let Some(expected) = expected {
-            return Err(ProviderLoadIdentityError {
+            return Err(ProviderLoadIdentityError::ConfiguredNameMismatch {
                 configured_name,
                 expected,
             });
@@ -152,33 +151,197 @@ impl ProviderLoadIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderLoadIdentityError {
-    configured_name: String,
-    expected: &'static str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnverifiedOfficialProviderReason {
+    MissingRecord,
+    InvalidRecord,
+    SignerNotCarinaRs,
+}
+
+#[derive(Debug)]
+enum UnverifiedOfficialProviderFailure {
+    MissingRecord,
+    InvalidRecord(UserTrustRecordError),
+    SignerNotCarinaRs,
+}
+
+/// An allow-listed provider source whose user-owned verification is absent or
+/// unusable. This state never produces a [`ProviderLoadIdentity`].
+#[derive(Debug)]
+pub struct UnverifiedOfficialProviderError {
+    source: RemoteSourceKey,
+    project_dir: PathBuf,
+    failure: UnverifiedOfficialProviderFailure,
+}
+
+impl UnverifiedOfficialProviderError {
+    pub fn source_key(&self) -> &RemoteSourceKey {
+        &self.source
+    }
+
+    pub fn reason(&self) -> UnverifiedOfficialProviderReason {
+        match &self.failure {
+            UnverifiedOfficialProviderFailure::MissingRecord => {
+                UnverifiedOfficialProviderReason::MissingRecord
+            }
+            UnverifiedOfficialProviderFailure::InvalidRecord(_) => {
+                UnverifiedOfficialProviderReason::InvalidRecord
+            }
+            UnverifiedOfficialProviderFailure::SignerNotCarinaRs => {
+                UnverifiedOfficialProviderReason::SignerNotCarinaRs
+            }
+        }
+    }
+
+    fn missing_record(source: &RemoteSourceKey, project_dir: &Path) -> Self {
+        Self {
+            source: source.clone(),
+            project_dir: project_dir.to_path_buf(),
+            failure: UnverifiedOfficialProviderFailure::MissingRecord,
+        }
+    }
+
+    fn invalid_record(
+        source: &RemoteSourceKey,
+        project_dir: &Path,
+        error: UserTrustRecordError,
+    ) -> Self {
+        Self {
+            source: source.clone(),
+            project_dir: project_dir.to_path_buf(),
+            failure: UnverifiedOfficialProviderFailure::InvalidRecord(error),
+        }
+    }
+
+    fn signer_not_carina_rs(source: &RemoteSourceKey, project_dir: &Path) -> Self {
+        Self {
+            source: source.clone(),
+            project_dir: project_dir.to_path_buf(),
+            failure: UnverifiedOfficialProviderFailure::SignerNotCarinaRs,
+        }
+    }
+}
+
+impl fmt::Display for UnverifiedOfficialProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let command = ProjectCommand::new("init", &self.project_dir);
+        match &self.failure {
+            UnverifiedOfficialProviderFailure::MissingRecord => write!(
+                formatter,
+                "{} is a carina-rs provider but this user hasn't verified it; run `{command}`",
+                self.source
+            ),
+            UnverifiedOfficialProviderFailure::InvalidRecord(error) => {
+                let record_problem = error.display_chain();
+                write!(
+                    formatter,
+                    "{} is a carina-rs provider but this user's verification record is unusable: {record_problem}; run `{command}`",
+                    self.source
+                )
+            }
+            UnverifiedOfficialProviderFailure::SignerNotCarinaRs => write!(
+                formatter,
+                "{} is a carina-rs provider but this user's verification record signer is not carina-rs; run `{command}`",
+                self.source
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnverifiedOfficialProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.failure {
+            UnverifiedOfficialProviderFailure::InvalidRecord(error) => Some(error),
+            UnverifiedOfficialProviderFailure::MissingRecord
+            | UnverifiedOfficialProviderFailure::SignerNotCarinaRs => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProviderLoadIdentityError {
+    ConfiguredNameMismatch {
+        configured_name: String,
+        expected: &'static str,
+    },
+    UnverifiedOfficial(UnverifiedOfficialProviderError),
 }
 
 impl ProviderLoadIdentityError {
-    pub fn configured_name(&self) -> &str {
-        &self.configured_name
+    pub(crate) fn missing_official_record(source: &RemoteSourceKey, project_dir: &Path) -> Self {
+        Self::UnverifiedOfficial(UnverifiedOfficialProviderError::missing_record(
+            source,
+            project_dir,
+        ))
     }
 
-    pub fn expected(&self) -> &str {
-        self.expected
+    pub(crate) fn invalid_official_record(
+        source: &RemoteSourceKey,
+        project_dir: &Path,
+        error: UserTrustRecordError,
+    ) -> Self {
+        Self::UnverifiedOfficial(UnverifiedOfficialProviderError::invalid_record(
+            source,
+            project_dir,
+            error,
+        ))
+    }
+
+    pub(crate) fn non_carina_official_signer(source: &RemoteSourceKey, project_dir: &Path) -> Self {
+        Self::UnverifiedOfficial(UnverifiedOfficialProviderError::signer_not_carina_rs(
+            source,
+            project_dir,
+        ))
+    }
+
+    pub fn name_mismatch(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::ConfiguredNameMismatch {
+                configured_name,
+                expected,
+            } => Some((configured_name, expected)),
+            Self::UnverifiedOfficial(_) => None,
+        }
+    }
+
+    pub fn unverified_official(&self) -> Option<&UnverifiedOfficialProviderError> {
+        match self {
+            Self::ConfiguredNameMismatch { .. } => None,
+            Self::UnverifiedOfficial(error) => Some(error),
+        }
+    }
+
+    pub fn into_unverified_official(self) -> Result<UnverifiedOfficialProviderError, Self> {
+        match self {
+            Self::UnverifiedOfficial(error) => Ok(error),
+            mismatch @ Self::ConfiguredNameMismatch { .. } => Err(mismatch),
+        }
     }
 }
 
 impl fmt::Display for ProviderLoadIdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "configured provider name '{}' does not match trusted provider identity {}",
-            self.configured_name, self.expected
-        )
+        match self {
+            Self::ConfiguredNameMismatch {
+                configured_name,
+                expected,
+            } => write!(
+                formatter,
+                "configured provider name '{configured_name}' does not match trusted provider identity {expected}"
+            ),
+            Self::UnverifiedOfficial(error) => error.fmt(formatter),
+        }
     }
 }
 
-impl std::error::Error for ProviderLoadIdentityError {}
+impl std::error::Error for ProviderLoadIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConfiguredNameMismatch { .. } => None,
+            Self::UnverifiedOfficial(error) => Some(error),
+        }
+    }
+}
 
 fn signer_is_carina_rs(signature: Option<&RegistrySignatureProtection>) -> bool {
     use crate::provider_resolver::SignerPinState;
@@ -225,14 +388,14 @@ mod tests {
     }
 
     #[test]
-    fn evil_github_aws_source_is_untrusted() {
+    fn evil_github_aws_source_has_no_official_classification() {
         let trust = classify_verified_remote(&source_key("github.com/evil/aws"), None);
 
-        assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
+        assert!(trust.is_none());
     }
 
     #[test]
-    fn non_official_registry_aws_sources_are_untrusted() {
+    fn non_official_registry_aws_sources_have_no_official_classification() {
         for source in [
             "registry.example.com/carina-rs/aws",
             "registry.carina-rs.dev/evil/aws",
@@ -241,11 +404,7 @@ mod tests {
             "github.com/carina-rs/Carina-provider-aws",
         ] {
             let trust = classify_verified_remote(&source_key(source), None);
-            assert_eq!(
-                trust.class(),
-                ProviderTrustClass::Untrusted,
-                "source {source} must fail closed"
-            );
+            assert!(trust.is_none(), "source {source} must fail closed");
         }
     }
 
@@ -257,7 +416,7 @@ mod tests {
             "carina-rs/aws",
             "registry.carina-rs.dev/carina-rs/awscc",
         ] {
-            let trust = classify_verified_remote(&source_key(source), None);
+            let trust = classify_verified_remote(&source_key(source), None).unwrap();
             assert_eq!(
                 trust.class(),
                 ProviderTrustClass::Aws,
@@ -272,13 +431,13 @@ mod tests {
             "github.com/carina-rs/carina-provider-github",
             "carina-rs/github",
         ] {
-            let trust = classify_verified_remote(&source_key(source), None);
+            let trust = classify_verified_remote(&source_key(source), None).unwrap();
             assert_eq!(trust.class(), ProviderTrustClass::GitHub);
         }
     }
 
     #[test]
-    fn official_source_with_non_carina_signer_pin_is_untrusted() {
+    fn official_source_with_non_carina_signer_pin_has_no_loadable_trust() {
         let source = source_key("carina-rs/aws");
         let signatures = [
             current_signer("999"),
@@ -292,7 +451,7 @@ mod tests {
 
         for signature in &signatures {
             let trust = classify_verified_remote(&source, Some(signature));
-            assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
+            assert!(trust.is_none());
         }
     }
 
@@ -310,7 +469,7 @@ mod tests {
         ];
 
         for signature in &signatures {
-            let trust = classify_verified_remote(&source, Some(signature));
+            let trust = classify_verified_remote(&source, Some(signature)).unwrap();
             assert_eq!(trust.class(), ProviderTrustClass::Aws);
         }
     }
@@ -320,21 +479,17 @@ mod tests {
         let trust = classify_verified_remote(
             &source_key("github.com/carina-rs/carina-provider-aws"),
             None,
-        );
+        )
+        .unwrap();
 
         let error = ProviderLoadIdentity::new("foo".into(), trust).unwrap_err();
 
-        assert_eq!(error.configured_name, "foo");
-        assert_eq!(error.expected, "aws");
+        assert_eq!(error.name_mismatch(), Some(("foo", "aws")));
     }
 
     #[test]
     fn untrusted_identity_accepts_any_configured_name_without_gaining_privilege() {
-        let identity = ProviderLoadIdentity::new(
-            "aws".into(),
-            classify_verified_remote(&source_key("github.com/evil/aws"), None),
-        )
-        .unwrap();
+        let identity = ProviderLoadIdentity::new("aws".into(), ProviderTrust::untrusted()).unwrap();
 
         assert_eq!(identity.configured_name(), "aws");
         assert_eq!(identity.trust().class(), ProviderTrustClass::Untrusted);

@@ -190,6 +190,37 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
 
+    fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct ScopedTestEnvVar {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedTestEnvVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: callers hold test_env_guard while this process-wide override is active.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for ScopedTestEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: the test still holds test_env_guard while this guard is dropped.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
     fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
         carina_provider_resolver::TrustedLocalGrants::parse(&[], None).unwrap()
     }
@@ -347,6 +378,58 @@ mod tests {
             .expect("registry source should resolve through the shared provider source type");
 
         assert_eq!(installed.path().as_path(), wasm);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unverified_official_provider_is_reported_before_wasm_loading() {
+        let _env_guard = test_env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _trust_env = ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.5.0";
+        let parsed_source: ProviderSource = source.parse().unwrap();
+        let ProviderSource::Remote(remote_source) = &parsed_source else {
+            panic!("GitHub source must parse as remote")
+        };
+        let wasm = carina_provider_resolver::cache_path_wasm(
+            tmp.path(),
+            &remote_source.source_key(),
+            version,
+        );
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, b"not a wasm component").unwrap();
+        let mut lock = carina_provider_resolver::LockFile::default();
+        lock.upsert(carina_provider_resolver::LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: carina_provider_resolver::LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: carina_provider_resolver::sha256_file(&wasm).unwrap(),
+            registry: None,
+        });
+        lock.save(&tmp.path().join("carina-providers.lock"))
+            .unwrap();
+        let (_, config) = cfg("aws", Some(source), None);
+
+        let (factories, errors, _) =
+            build_factories(&[(tmp.path().to_path_buf(), config)], &no_local_grants());
+
+        assert!(factories.is_empty());
+        let message = errors.get("aws").expect("LSP load diagnostic");
+        assert!(
+            message.starts_with(&format!(
+                "{source} is a carina-rs provider but this user hasn't verified it; run `carina init {}`",
+                tmp.path().display()
+            )),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Failed to load WASM component"),
+            "{message}"
+        );
     }
 
     #[test]

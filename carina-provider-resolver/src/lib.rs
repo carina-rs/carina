@@ -14,6 +14,7 @@ pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
 pub use provider_trust::{
     ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust, ProviderTrustClass,
+    UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
 };
 pub use trusted_local::{GrantParseError, TrustedLocalGrants};
 pub use user_trust::{UserTrustRecord, UserTrustRecordDirError, user_trust_record_dir};

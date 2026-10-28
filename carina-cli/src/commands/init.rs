@@ -205,7 +205,11 @@ async fn run_init_with_provider_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_provider_resolver::FixtureRegistryHttp;
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    use carina_provider_resolver::{
+        FixtureRegistryHttp, LockEntry, LockEntryKind, LockFile, ProviderTrustClass,
+        TrustedLocalGrants,
+    };
     use std::fs;
 
     const SIGNED_ARTIFACT: &[u8] = include_bytes!(concat!(
@@ -241,6 +245,181 @@ mod tests {
             )
             .response(SIGNED_BUNDLE_URL, 200, SIGNED_BUNDLE)
             .downloadable_bytes(SIGNED_ARTIFACT_URL, SIGNED_ARTIFACT.to_vec())
+    }
+
+    fn official_signed_fixture_registry() -> FixtureRegistryHttp {
+        const WORKFLOW: &str =
+            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml";
+        signed_fixture_registry().verified_signer_identity(
+            &format!("{WORKFLOW}@refs/heads/main"),
+            "https://token.actions.githubusercontent.com",
+            "260157389",
+            "123456789",
+            "refs/heads/main",
+            WORKFLOW,
+            None,
+        )
+    }
+
+    fn tree_contains_file(path: &Path) -> bool {
+        fs::read_dir(path).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry.file_type().is_ok_and(|kind| {
+                    kind.is_file() || (kind.is_dir() && tree_contains_file(&entry.path()))
+                })
+            })
+        })
+    }
+
+    fn request_count(http: &FixtureRegistryHttp, url: &str) -> usize {
+        http.requested_urls()
+            .iter()
+            .filter(|requested| requested.as_str() == url)
+            .count()
+    }
+
+    async fn run_init_with_fixture(project: &Path, http: &FixtureRegistryHttp) {
+        run_init_with_provider_resolver(
+            project,
+            false,
+            false,
+            false,
+            false,
+            |install_lock, providers, mode| {
+                carina_provider_resolver::resolve_all_with_fixture_registry(
+                    install_lock,
+                    providers,
+                    mode,
+                    http,
+                )
+                .map(|resolved| resolved.len())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn assert_installed_provider_loads_as_aws(project: &Path) {
+        let loaded = load_configuration_with_config(
+            project,
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        let config = loaded.parsed.providers.first().unwrap();
+        let installed = carina_provider_resolver::find_installed_provider(project, config).unwrap();
+        let grants = TrustedLocalGrants::parse(&[], None).unwrap();
+        let class = installed
+            .load_with(&grants, |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+            })
+            .await
+            .unwrap();
+        assert_eq!(class, ProviderTrustClass::Aws);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let source = "github.com/carina-rs/carina-provider-aws";
+        let version = "0.1.0";
+        let bytes = b"up-to-date GitHub provider";
+        fs::write(
+            project.path().join("providers.crn"),
+            format!("provider aws {{\n  source = '{source}'\n}}\n"),
+        )
+        .unwrap();
+        let parsed_source: ProviderSource = source.parse().unwrap();
+        let ProviderSource::Remote(RemoteSource::GithubDirect(github_source)) = &parsed_source
+        else {
+            panic!("test source must be GitHub-direct")
+        };
+        let source_key = github_source.source_key();
+        let artifact =
+            carina_provider_resolver::cache_path_wasm(project.path(), &source_key, version);
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: carina_provider_resolver::sha256_file(&artifact).unwrap(),
+            registry: None,
+        });
+        let lock_path = project.path().join("carina-providers.lock");
+        lock.save(&lock_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+        let origin_url = carina_provider_resolver::download_url_wasm(github_source, version);
+        let http = FixtureRegistryHttp::default().downloadable_bytes(&origin_url, bytes.to_vec());
+
+        run_init_with_fixture(project.path(), &http).await;
+
+        assert_eq!(request_count(&http, &origin_url), 1);
+        assert!(tree_contains_file(trust.path()));
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        assert_installed_provider_loads_as_aws(project.path()).await;
+
+        run_init_with_fixture(project.path(), &http).await;
+
+        assert_eq!(request_count(&http, &origin_url), 1);
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
+        let _env_guard = crate::test_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let first_trust = tempfile::tempdir().unwrap();
+        let fresh_trust = tempfile::tempdir().unwrap();
+        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let _first_trust_env =
+            crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", first_trust.path());
+        fs::write(
+            project.path().join("providers.crn"),
+            "provider aws {\n  source = 'carina-rs/aws'\n}\n",
+        )
+        .unwrap();
+        let http = official_signed_fixture_registry();
+
+        run_init_with_fixture(project.path(), &http).await;
+
+        let lock_path = project.path().join("carina-providers.lock");
+        let lock_before = fs::read(&lock_path).unwrap();
+        let downloads_before = request_count(&http, SIGNED_ARTIFACT_URL);
+        assert_eq!(downloads_before, 1);
+        assert_installed_provider_loads_as_aws(project.path()).await;
+
+        let _fresh_trust_env =
+            crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", fresh_trust.path());
+        assert!(!tree_contains_file(fresh_trust.path()));
+
+        run_init_with_fixture(project.path(), &http).await;
+
+        assert_eq!(
+            request_count(&http, SIGNED_ARTIFACT_URL),
+            downloads_before + 1
+        );
+        assert!(tree_contains_file(fresh_trust.path()));
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        assert_installed_provider_loads_as_aws(project.path()).await;
+
+        run_init_with_fixture(project.path(), &http).await;
+
+        assert_eq!(
+            request_count(&http, SIGNED_ARTIFACT_URL),
+            downloads_before + 1
+        );
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
     }
 
     async fn assert_init_runs_real_verifier_inside_async_command() {

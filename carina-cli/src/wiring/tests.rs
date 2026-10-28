@@ -81,7 +81,9 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     };
     assert!(matches!(
         error,
-        carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+        AppError::TrustedLocalGrant(
+            carina_provider_resolver::GrantParseError::MissingSeparator { .. }
+        )
     ));
     assert!(!loader_called.load(Ordering::SeqCst));
 
@@ -540,6 +542,83 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
             .is_some_and(|message| message.contains("artifact-reported name 'reported'")),
         "the factory-discovery path must retain mismatches as load diagnostics: {errors:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unverified_official_factory_load_is_fatal_before_loader() {
+    let _env_guard = crate::test_env_guard();
+    let project = tempfile::tempdir().unwrap();
+    let trust = tempfile::tempdir().unwrap();
+    let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+    let source = "github.com/carina-rs/carina-provider-aws";
+    let version = "0.1.0";
+    let provider_source: ProviderSource = source.parse().unwrap();
+    let ProviderSource::Remote(remote_source) = &provider_source else {
+        panic!("official source must be remote")
+    };
+    let wasm_path = carina_provider_resolver::cache_path_wasm(
+        project.path(),
+        &remote_source.source_key(),
+        version,
+    );
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(&wasm_path, b"official provider fixture").unwrap();
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "aws".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: version.into(),
+            constraint: None,
+        },
+        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        registry: None,
+    });
+    lock.save(&project.path().join("carina-providers.lock"))
+        .unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(provider_source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let loader_called = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&loader_called);
+    let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
+
+    let result = build_factories_from_providers_impl_using(
+        &[config.clone()],
+        project.path(),
+        false,
+        &inputs,
+        move |_verified| {
+            called.store(true, Ordering::SeqCst);
+            async {
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "loader must not run".into(),
+                ))
+            }
+        },
+    );
+
+    assert!(!loader_called.load(Ordering::SeqCst));
+    let Err(error) = result else {
+        panic!("unverified official providers must be fatal")
+    };
+    assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
+
+    let configs = validated_provider_configs(vec![config]);
+    let ctx = WiringContext::new(Vec::new(), configs.as_provider_configs());
+    let Err(error) =
+        get_provider_with_ctx(&ctx, &configs, project.path(), ProgressSink::Human).await
+    else {
+        panic!("plan/apply wiring must not skip an unverified official provider")
+    };
+    assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -7337,7 +7416,7 @@ mod kind_default_source_tests {
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "github.com/carina-rs/carina-provider-awscc";
+    let source = "github.com/example/carina-provider-awscc";
     let revision = "main";
     let resolved_sha = "deadbeefcafe1234567890";
     let github_source = match source
@@ -7477,7 +7556,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
 async fn registry_source_reaches_cli_artifact_loader() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "carina-rs/awscc";
+    let source = "example/awscc";
     let version = "0.5.0";
     let provider_source: ProviderSource = source.parse().unwrap();
     let ProviderSource::Remote(remote_source) = &provider_source else {
@@ -7526,7 +7605,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
 async fn registry_source_reaches_plan_apply_provider_loader() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let source = "carina-rs/awscc";
+    let source = "example/awscc";
     let version = "0.5.0";
     let provider_source: ProviderSource = source.parse().unwrap();
     let ProviderSource::Remote(remote_source) = &provider_source else {
