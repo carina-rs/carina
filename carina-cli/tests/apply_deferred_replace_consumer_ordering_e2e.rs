@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::{CurrentStateEntry, PlanFile, PlanFileContents};
-use carina_cli::wiring::{LoadedProviderFactory, WiringContext};
+use carina_cli::wiring::{LoadedProviderFactory, ProviderLoad};
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::parser::{
     BackendConfig, DeferredForExpression, ForBinding, ProviderConfig, ProviderContext,
@@ -62,9 +62,9 @@ fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let ctx = WiringContext::new(Vec::<LoadedProviderFactory>::new(), &configs);
+    let providers = ProviderLoad::for_test(Vec::<LoadedProviderFactory>::new(), &configs);
     contents
-        .record(&ctx)
+        .record(providers.context())
         .expect("mock plan provider evidence must be valid")
 }
 

@@ -142,6 +142,13 @@ impl InspectedPlanFile {
         }
     }
 
+    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
+        match self {
+            Self::Verified(plan) => &plan.plan_file.provider_configs,
+            Self::NeedsSecretVerification(plan) => &plan.plan_file.provider_configs,
+        }
+    }
+
     pub(super) fn needs_secret_verification(&self) -> bool {
         matches!(self, Self::NeedsSecretVerification(_))
     }
@@ -223,13 +230,6 @@ impl VerifiedWiringContext {
 }
 
 impl ReloadedInspectedPlanFile {
-    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        match self {
-            Self::Verified(plan) => plan.plan_file.provider_configs(),
-            Self::NeedsSecretVerification(plan) => plan.plan_file.provider_configs(),
-        }
-    }
-
     /// Check artifact identities and schemas immediately after provider loading.
     /// Every later secret/normalizer/provider transition consumes this proof.
     pub(super) fn verify_loaded_providers(
@@ -761,7 +761,7 @@ mod tests {
         PlanFile, PlanFileContents, RecordedProviderArtifact, SavedDataSourceValue,
     };
     use crate::error::AppError;
-    use crate::wiring::{LoadedProviderFactory, WiringContext};
+    use crate::wiring::{LoadedProviderFactory, ProviderLoad, WiringContext};
 
     struct ArtifactFactory {
         name: &'static str,
@@ -819,14 +819,23 @@ mod tests {
         }
     }
 
+    fn remote_provider_config(name: &str, source: &str) -> ProviderConfig {
+        ProviderConfig {
+            source: Some(source.parse().unwrap()),
+            ..provider_config(name)
+        }
+    }
+
     fn wasm_context(name: &'static str, bytes: &[u8]) -> WiringContext {
-        WiringContext::new(
+        ProviderLoad::for_test(
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
                 bytes,
             )],
             &[provider_config(name)],
         )
+        .into_complete_context()
+        .expect("test provider load must be complete")
     }
 
     fn builtin_context() -> WiringContext {
@@ -904,6 +913,65 @@ mod tests {
             panic!("changed provider bytes must not produce SchemaCheckedPlanFile")
         };
         assert_eq!(mismatch.providers.keys().collect::<Vec<_>>(), vec!["mock"]);
+    }
+
+    #[test]
+    fn record_rejects_artifact_origin_that_does_not_match_config_source() {
+        let context = wasm_context("mock", b"artifact");
+        let error = empty_plan_contents(vec![remote_provider_config("mock", "carina-rs/mock")])
+            .record(&context)
+            .expect_err("a file-origin load cannot evidence a remote provider source")
+            .to_string();
+
+        assert!(error.contains("mock"), "provider is missing: {error}");
+        assert!(
+            error.contains("carina-rs/mock"),
+            "expected source is missing: {error}"
+        );
+        assert!(
+            error.contains("file"),
+            "recorded origin is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_locked_artifact_source_that_does_not_match_config_source() {
+        let context = wasm_context("mock", b"artifact");
+        let plan = plan_recorded_with(&context, vec![provider_config("mock")]);
+        let mut encoded = serde_json::to_value(plan).expect("saved plan serializes");
+        encoded["provider_configs"][0]["source"] = serde_json::json!("carina-rs/mock");
+        encoded["provider_artifacts"]["mock"]["origin"] = serde_json::json!({
+            "kind": "locked",
+            "source": "other/mock",
+            "version": {
+                "kind": "version",
+                "version": "1.0.0"
+            }
+        });
+
+        let error = serde_json::from_value::<PlanFile>(encoded)
+            .expect_err("decode must bind a locked artifact to the saved remote source")
+            .to_string();
+
+        assert!(
+            error.contains("carina-rs/mock"),
+            "expected source is missing: {error}"
+        );
+        assert!(
+            error.contains("other/mock"),
+            "recorded source is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn valid_file_artifact_origin_round_trips() {
+        let context = wasm_context("mock", b"artifact");
+        let plan = plan_recorded_with(&context, vec![provider_config("mock")]);
+        let encoded = serde_json::to_vec(&plan).expect("saved plan serializes");
+        let decoded =
+            serde_json::from_slice::<PlanFile>(&encoded).expect("matching file origin must decode");
+
+        assert_eq!(decoded.provider_artifacts(), plan.provider_artifacts());
     }
 
     #[test]

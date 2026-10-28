@@ -18,6 +18,7 @@ use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
 use carina_core::plan::Plan;
+use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
@@ -52,7 +53,7 @@ use crate::plan_image::{
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LoadedProviderArtifact, WiringContext, build_factories_from_providers,
+    LoadedProviderArtifact, ProviderLoad, WiringContext,
     create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
@@ -165,6 +166,61 @@ pub enum RecordedArtifactOrigin {
     File,
 }
 
+impl std::fmt::Display for RecordedArtifactOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked { source, version: _ } => {
+                write!(formatter, "locked source `{source}`")
+            }
+            Self::File => formatter.write_str("file"),
+        }
+    }
+}
+
+/// Artifact origin required by a saved provider configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedRecordedArtifactOrigin {
+    File,
+    Locked { source: String },
+}
+
+impl ExpectedRecordedArtifactOrigin {
+    fn from_source(source: &ProviderSource) -> Self {
+        match source {
+            ProviderSource::File(_source) => Self::File,
+            ProviderSource::Remote(remote) => Self::Locked {
+                source: remote.source_key().to_string(),
+            },
+        }
+    }
+
+    fn matches(&self, recorded: &RecordedArtifactOrigin) -> bool {
+        match (self, recorded) {
+            (Self::File, RecordedArtifactOrigin::File) => true,
+            (Self::File, RecordedArtifactOrigin::Locked { .. }) => false,
+            (Self::Locked { .. }, RecordedArtifactOrigin::File) => false,
+            (
+                Self::Locked {
+                    source: expected_source,
+                },
+                RecordedArtifactOrigin::Locked {
+                    source: recorded_source,
+                    version: _version,
+                },
+            ) => expected_source == recorded_source,
+        }
+    }
+}
+
+impl std::fmt::Display for ExpectedRecordedArtifactOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File => formatter.write_str("file"),
+            Self::Locked { source } => write!(formatter, "locked source `{source}`"),
+        }
+    }
+}
+
 /// Lock-resolved version facts persisted for one provider artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -219,13 +275,6 @@ impl From<&LoadedProviderArtifact> for RecordedProviderArtifact {
 }
 
 impl RecordedProviderArtifact {
-    fn kind(&self) -> ProviderArtifactKind {
-        match self {
-            Self::BuiltIn => ProviderArtifactKind::BuiltIn,
-            Self::Wasm { .. } => ProviderArtifactKind::Wasm,
-        }
-    }
-
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::BuiltIn => "built-in".to_string(),
@@ -523,6 +572,11 @@ pub enum ProviderEvidenceError {
         expected: ProviderArtifactKind,
         recorded: ProviderArtifactKind,
     },
+    UnexpectedProviderArtifactOrigin {
+        provider: String,
+        expected: ExpectedRecordedArtifactOrigin,
+        recorded: RecordedArtifactOrigin,
+    },
 }
 
 impl std::fmt::Display for ProviderEvidenceError {
@@ -576,6 +630,14 @@ impl std::fmt::Display for ProviderEvidenceError {
                 formatter,
                 "provider_artifacts records provider `{provider}` as {recorded}, expected {expected}"
             ),
+            Self::UnexpectedProviderArtifactOrigin {
+                provider,
+                expected,
+                recorded,
+            } => write!(
+                formatter,
+                "provider_artifacts records provider `{provider}` with origin {recorded}, expected {expected}"
+            ),
         }
     }
 }
@@ -585,25 +647,44 @@ impl std::error::Error for ProviderEvidenceError {}
 /// Provider artifact kinds determined by the saved provider configuration.
 ///
 /// Factory-backed providers use the same source-presence rule as
-/// [`build_factories_from_providers`]. Source-less named instances therefore do
+/// [`provider_factory_source`]. Source-less named instances therefore do
 /// not add an artifact. The built-in mock occupies the same `mock` key as a
 /// plugin factory and is also selected for the providerless fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedProviderArtifact {
+    BuiltIn,
+    Wasm {
+        origin: ExpectedRecordedArtifactOrigin,
+    },
+}
+
 fn expected_provider_artifacts(
     provider_configs: &SavedProviderConfigs,
-) -> BTreeMap<String, ProviderArtifactKind> {
+) -> BTreeMap<String, ExpectedProviderArtifact> {
     let configs = provider_configs.as_provider_configs();
     let mut expected = configs
         .iter()
-        .filter(|config| provider_factory_source(config).is_some())
-        .map(|config| (config.name.clone(), ProviderArtifactKind::Wasm))
+        .filter_map(|config| {
+            provider_factory_source(config).map(|source| {
+                (
+                    config.name.clone(),
+                    ExpectedProviderArtifact::Wasm {
+                        origin: ExpectedRecordedArtifactOrigin::from_source(source),
+                    },
+                )
+            })
+        })
         .collect::<BTreeMap<_, _>>();
     let uses_builtin_mock = carina_provider_mock::uses_builtin_provider(configs, |provider_name| {
-        expected.get(provider_name) == Some(&ProviderArtifactKind::Wasm)
+        matches!(
+            expected.get(provider_name),
+            Some(ExpectedProviderArtifact::Wasm { .. })
+        )
     });
     if uses_builtin_mock {
         expected.insert(
             carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
-            ProviderArtifactKind::BuiltIn,
+            ExpectedProviderArtifact::BuiltIn,
         );
     }
     expected
@@ -698,13 +779,43 @@ impl ProviderEvidence {
             });
         }
         for (provider, expected) in expected_artifacts {
-            let recorded = self.provider_artifacts[&provider].kind();
-            if recorded != expected {
-                return Err(ProviderEvidenceError::UnexpectedProviderArtifactKind {
-                    provider,
-                    expected,
-                    recorded,
-                });
+            let recorded = &self.provider_artifacts[&provider];
+            match (expected, recorded) {
+                (ExpectedProviderArtifact::BuiltIn, RecordedProviderArtifact::BuiltIn) => {}
+                (ExpectedProviderArtifact::BuiltIn, RecordedProviderArtifact::Wasm { .. }) => {
+                    return Err(ProviderEvidenceError::UnexpectedProviderArtifactKind {
+                        provider,
+                        expected: ProviderArtifactKind::BuiltIn,
+                        recorded: ProviderArtifactKind::Wasm,
+                    });
+                }
+                (
+                    ExpectedProviderArtifact::Wasm { origin: _origin },
+                    RecordedProviderArtifact::BuiltIn,
+                ) => {
+                    return Err(ProviderEvidenceError::UnexpectedProviderArtifactKind {
+                        provider,
+                        expected: ProviderArtifactKind::Wasm,
+                        recorded: ProviderArtifactKind::BuiltIn,
+                    });
+                }
+                (
+                    ExpectedProviderArtifact::Wasm {
+                        origin: expected_origin,
+                    },
+                    RecordedProviderArtifact::Wasm {
+                        sha256: _sha256,
+                        origin: recorded_origin,
+                    },
+                ) => {
+                    if !expected_origin.matches(recorded_origin) {
+                        return Err(ProviderEvidenceError::UnexpectedProviderArtifactOrigin {
+                            provider,
+                            expected: expected_origin,
+                            recorded: recorded_origin.clone(),
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -1658,7 +1769,7 @@ mod schema_fingerprint_tests {
     fn providerless_artifact_inventory_is_the_builtin_mock() {
         assert_eq!(
             expected_provider_artifacts(&saved_provider_configs(Vec::new())),
-            BTreeMap::from([("mock".to_string(), ProviderArtifactKind::BuiltIn)])
+            BTreeMap::from([("mock".to_string(), ExpectedProviderArtifact::BuiltIn)])
         );
     }
 
@@ -1669,7 +1780,12 @@ mod schema_fingerprint_tests {
         let configs = saved_provider_configs(vec![default, provider_config("aws", Some("us"))]);
         assert_eq!(
             expected_provider_artifacts(&configs),
-            BTreeMap::from([("aws".to_string(), ProviderArtifactKind::Wasm)])
+            BTreeMap::from([(
+                "aws".to_string(),
+                ExpectedProviderArtifact::Wasm {
+                    origin: ExpectedRecordedArtifactOrigin::File,
+                },
+            )])
         );
     }
 
@@ -3067,10 +3183,12 @@ pub async fn run_plan(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
+    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
     let mut canonical_resources = crate::commands::validate_and_resolve_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
+        &providers,
         false,
         &inference_errors,
         &duplicate_declarations,
@@ -3204,8 +3322,7 @@ pub async fn run_plan(
         progress_sink.blank_line();
     }
 
-    let PreparedPlanIdentityInputs {
-        wiring,
+    let PreparedPlanIdentityData {
         state_blocks:
             crate::wiring::StateBlockResolution {
                 claims: state_block_claims,
@@ -3218,8 +3335,10 @@ pub async fn run_plan(
         base_dir,
         provider_context,
         UpstreamMissingStatePolicy::Lenient,
+        providers.context(),
     )
     .await?;
+    let wiring = providers.context();
     if !refresh {
         eprintln!(
             "{}",
@@ -3232,7 +3351,7 @@ pub async fn run_plan(
     // prints post-expansion warnings and returns the still-unresolved
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
+        wiring,
         canonical_resources,
         provider_inputs.configs(),
         &state_file,
@@ -3349,7 +3468,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            &wiring,
+            wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -3409,7 +3528,7 @@ pub async fn run_plan(
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
-            &wiring,
+            wiring,
         )
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -3506,52 +3625,12 @@ fn write_plan_artifacts(
 /// planning and saved-plan secret verification. It is intentionally the only
 /// owner of this ordering: prefix recovery, state-block target resolution,
 /// module/anonymous identity reconciliation, then provider/upstream folding.
-pub(crate) struct PreparedPlanIdentityInputs {
-    pub(crate) wiring: WiringContext,
-    pub(crate) state_blocks: crate::wiring::StateBlockResolution,
-    pub(crate) provider_inputs: ResolvedProviderInputs,
-}
-
-/// Identity and provider inputs prepared with a caller-owned wiring context.
 pub(crate) struct PreparedPlanIdentityData {
     pub(crate) state_blocks: crate::wiring::StateBlockResolution,
     pub(crate) provider_inputs: ResolvedProviderInputs,
 }
 
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
-    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
-    state_file: &mut Option<StateFile>,
-    base_dir: &Path,
-    provider_context: &ProviderContext,
-    upstream_policy: UpstreamMissingStatePolicy,
-) -> Result<PreparedPlanIdentityInputs, AppError> {
-    // Factory/schema wiring uses declaration metadata only. Provider values
-    // are folded after identities are reconciled against state.
-    let parsed = canonical_resources.parsed();
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let wiring = WiringContext::new(factories, &parsed.providers);
-    let PreparedPlanIdentityData {
-        state_blocks,
-        provider_inputs,
-    } = prepare_plan_identity_and_provider_inputs_with_wiring(
-        canonical_resources,
-        state_file,
-        base_dir,
-        provider_context,
-        upstream_policy,
-        &wiring,
-    )
-    .await?;
-    Ok(PreparedPlanIdentityInputs {
-        wiring,
-        state_blocks,
-        provider_inputs,
-    })
-}
-
-/// Prepare identity and provider inputs while leaving the caller-owned wiring
-/// context in place. Saved-plan apply passes only its verified context here.
-pub(crate) async fn prepare_plan_identity_and_provider_inputs_with_wiring(
     canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     state_file: &mut Option<StateFile>,
     base_dir: &Path,
@@ -5043,6 +5122,87 @@ mod run_plan_out_tests {
                 ConcreteValue::String(plaintext.to_string().into()),
             )))),
         )
+    }
+
+    #[tokio::test]
+    async fn run_plan_loads_provider_wiring_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("main.crn"),
+            r#"exports { region: String = "ap-northeast-1" }"#,
+        )
+        .unwrap();
+        crate::commands::ensure_backend_lock(dir, None).unwrap();
+
+        let load_count = crate::wiring::track_provider_loads_for_test();
+        run_plan(
+            dir,
+            None,
+            None,
+            None,
+            DetailLevel::None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("plan should succeed");
+
+        assert_eq!(
+            load_count.count(),
+            1,
+            "one command must construct exactly one provider load"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_plan_out_surfaces_file_provider_load_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let source_path = dir.join("broken-provider.wasm");
+        let installed_path =
+            dir.join(".carina/providers/file/broken-provider/broken-provider.wasm");
+        fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"not a wasm component").unwrap();
+        fs::write(&installed_path, b"not a wasm component").unwrap();
+        fs::write(
+            dir.join("main.crn"),
+            format!(
+                "provider broken {{\n  source = 'file://{}'\n}}\n",
+                source_path.display()
+            ),
+        )
+        .unwrap();
+
+        let error = run_plan(
+            dir,
+            Some(&dir.join("plan.json")),
+            None,
+            None,
+            DetailLevel::None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect_err("an invalid file provider must fail planning")
+        .to_string();
+
+        assert!(
+            error.contains("Failed to load WASM component"),
+            "the provider load diagnostic must survive planning: {error}"
+        );
+        assert!(
+            !error.contains("provider_artifacts is missing expected provider"),
+            "provider evidence must not replace the load failure: {error}"
+        );
     }
 
     #[test]

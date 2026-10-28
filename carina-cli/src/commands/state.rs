@@ -49,10 +49,9 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, WiringContext, build_factories_from_providers,
-    get_provider_with_ctx, prepare_default_provider_ready_config,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    refresh_loaded_orphan_with_retry,
+    AddressedDataSourceReadInputs, ProviderLoad, WiringContext, get_provider_with_ctx,
+    prepare_default_provider_ready_config, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -935,11 +934,13 @@ async fn run_state_bucket_delete(
     let resource_type = selection.resource_type();
     let provider_inputs =
         load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
-    let (factories, _) =
-        build_factories_from_providers(provider_inputs.configs().as_provider_configs(), base_dir)?;
-    let ctx = WiringContext::new(factories, provider_inputs.configs().as_provider_configs());
-    let bucket_provider =
-        create_state_bucket_delete_provider(&ctx, provider_inputs.configs(), provider_name).await?;
+    let providers = ProviderLoad::load(provider_inputs.configs().as_provider_configs(), base_dir)?;
+    let bucket_provider = create_state_bucket_delete_provider(
+        providers.context(),
+        provider_inputs.configs(),
+        provider_name,
+    )
+    .await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -1029,9 +1030,11 @@ pub async fn run_state_refresh(
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
+    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
+        &providers,
         true,
         &inference_errors,
         &duplicate_declarations,
@@ -1072,6 +1075,7 @@ pub async fn run_state_refresh(
         base_dir,
         provider_context,
         cancel.clone(),
+        providers.context(),
     )
     .await;
 
@@ -1088,31 +1092,6 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    parsed: &mut carina_core::parser::InferredFile,
-    backend: &dyn StateBackend,
-    lock: StateLockRef<'_>,
-    base_dir: &std::path::Path,
-    provider_context: &ProviderContext,
-    cancel: ShutdownToken,
-) -> Result<(), AppError> {
-    // Provider declaration metadata is sufficient for schema/factory wiring;
-    // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories, &parsed.providers);
-
-    run_state_refresh_locked_with_ctx(
-        parsed,
-        backend,
-        lock,
-        base_dir,
-        provider_context,
-        cancel,
-        &ctx,
-    )
-    .await
-}
-
-async fn run_state_refresh_locked_with_ctx(
     parsed: &mut carina_core::parser::InferredFile,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
@@ -2424,7 +2403,7 @@ mod tests {
         );
         let backend = non_empty_refresh_backend("test");
 
-        run_state_refresh_locked_with_ctx(
+        run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2466,7 +2445,7 @@ mod tests {
             &parsed.providers,
         );
         let backend = non_empty_refresh_backend("test");
-        run_state_refresh_locked_with_ctx(
+        run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2497,7 +2476,7 @@ mod tests {
         );
         let backend = non_empty_refresh_backend("test");
 
-        let error = match run_state_refresh_locked_with_ctx(
+        let error = match run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -2542,6 +2521,7 @@ mod tests {
         .unwrap();
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
+        let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2550,6 +2530,7 @@ mod tests {
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
+            providers.context(),
         )
         .await
         .expect("state refresh must return before resolving providers when no local state exists");
@@ -2559,6 +2540,7 @@ mod tests {
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
+        let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2567,6 +2549,7 @@ mod tests {
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
+            providers.context(),
         )
         .await
         .expect("state refresh must defer provider default tags until resource normalization");
@@ -2576,6 +2559,7 @@ mod tests {
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
+        let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
 
         run_state_refresh_locked(
             &mut parsed,
@@ -2584,6 +2568,7 @@ mod tests {
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
+            providers.context(),
         )
         .await
         .expect("state refresh must not load upstream state used only by default tags");
@@ -3024,7 +3009,7 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
 
-        let error = run_state_refresh_locked_with_ctx(
+        let error = run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3112,7 +3097,7 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
 
-        run_state_refresh_locked_with_ctx(
+        run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3186,7 +3171,7 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
 
-        run_state_refresh_locked_with_ctx(
+        run_state_refresh_locked(
             &mut parsed,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3399,6 +3384,32 @@ mod tests {
 
     fn encoded_persisted_attributes(attributes: &PersistedAttributes) -> serde_json::Value {
         serde_json::to_value(attributes).expect("persisted attributes should serialize")
+    }
+
+    #[tokio::test]
+    async fn state_refresh_loads_providers_once() {
+        let fixture = CancellationFixtureBase::new();
+        let state_path = fixture.state_path().display();
+        fixture.write_crn(format!(
+            "backend local {{ path = \"{state_path}\" }}\nprovider mock {{}}\n"
+        ));
+        fixture.write_backend_lock();
+
+        let load_count = crate::wiring::track_provider_loads_for_test();
+        run_state_refresh(
+            fixture.config_path(),
+            false,
+            &ProviderContext::default(),
+            fixture.shutdown_token(),
+        )
+        .await
+        .expect("empty state refresh must succeed");
+
+        assert_eq!(
+            load_count.count(),
+            1,
+            "validation and locked refresh must share one provider load"
+        );
     }
 
     #[tokio::test]

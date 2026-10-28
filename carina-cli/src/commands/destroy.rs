@@ -63,9 +63,8 @@ use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, get_provider_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
+    ProviderLoad, WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -89,9 +88,11 @@ pub async fn run_destroy(
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
+    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
+        &providers,
         true,
         &inference_errors,
         &duplicate_declarations,
@@ -135,6 +136,7 @@ pub async fn run_destroy(
     };
 
     let outcome = run_destroy_locked_owned(
+        providers.context(),
         &mut parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -151,50 +153,6 @@ pub async fn run_destroy(
     finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_owned(
-    parsed: &mut carina_core::parser::InferredFile,
-    auto_approve: bool,
-    backend: Arc<dyn StateBackend>,
-    protected_bucket: Option<String>,
-    lock: StateLock,
-    refresh: bool,
-    force: bool,
-    base_dir: &std::path::Path,
-    provider_context: &ProviderContext,
-    parallelism: NonZeroUsize,
-    cancel: ShutdownToken,
-) -> LockCommandOutcome<Result<(), AppError>> {
-    // Provider declaration metadata is sufficient for schema/factory wiring;
-    // construction attributes are resolved after state reconciliation below.
-    let (factories, _) = match build_factories_from_providers(&parsed.providers, base_dir) {
-        Ok(factories) => factories,
-        Err(error) => {
-            return LockCommandOutcome::Kept {
-                result: Err(error),
-                lock,
-            };
-        }
-    };
-    let ctx = WiringContext::new(factories, &parsed.providers);
-
-    run_destroy_locked_with_ctx_owned(
-        parsed,
-        auto_approve,
-        backend,
-        protected_bucket,
-        lock,
-        refresh,
-        force,
-        base_dir,
-        provider_context,
-        parallelism,
-        cancel,
-        &ctx,
-    )
-    .await
 }
 
 enum DestroyAfterHeartbeat {
@@ -241,7 +199,8 @@ impl DestroyedInstances {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx_owned(
+async fn run_destroy_locked_owned(
+    ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -253,7 +212,6 @@ async fn run_destroy_locked_with_ctx_owned(
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-    ctx: &WiringContext,
 ) -> LockCommandOutcome<Result<(), AppError>> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
@@ -1327,7 +1285,22 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let providers = match ProviderLoad::load(&parsed.providers, base_dir) {
+        Ok(providers) => providers,
+        Err(error) => {
+            return finish_lock_command(
+                backend.as_ref(),
+                LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                },
+                &cancel,
+            )
+            .await;
+        }
+    };
     let outcome = run_destroy_locked_owned(
+        providers.context(),
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -1360,7 +1333,8 @@ async fn run_destroy_locked_with_ctx(
     cancel: ShutdownToken,
     ctx: &WiringContext,
 ) -> Result<(), AppError> {
-    let outcome = run_destroy_locked_with_ctx_owned(
+    let outcome = run_destroy_locked_owned(
+        ctx,
         parsed,
         auto_approve,
         Arc::clone(&backend),
@@ -1372,7 +1346,6 @@ async fn run_destroy_locked_with_ctx(
         provider_context,
         parallelism,
         cancel.clone(),
-        ctx,
     )
     .await;
     finish_lock_command(backend.as_ref(), outcome, &cancel).await
@@ -2195,6 +2168,59 @@ mod tests {
         .expect("destroy must not load an upstream unused by provider configuration");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_helper_releases_passed_lock_when_provider_load_hard_fails() {
+        let project = tempfile::tempdir().unwrap();
+        let source = format!(
+            "file://{}",
+            project.path().join("missing-provider.wasm").display()
+        )
+        .parse()
+        .unwrap();
+        let provider_config = carina_core::parser::ProviderConfig {
+            name: "mock".to_string(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
+            source: Some(source),
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let mut parsed = carina_core::parser::InferredFile {
+            providers: vec![provider_config.clone(), provider_config],
+            ..Default::default()
+        };
+        let state_path = project.path().join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let backend: Arc<dyn StateBackend> =
+            Arc::from(crate::commands::local_backend_for_test(state_path));
+        let lock = backend.acquire_lock("destroy").await.unwrap();
+        assert!(lock_path.exists(), "fixture must hold the lock");
+
+        let error = run_destroy_locked(
+            &mut parsed,
+            true,
+            Arc::clone(&backend),
+            None,
+            StateLock::held(lock),
+            false,
+            true,
+            project.path(),
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("duplicate sourced providers must hard-fail loading");
+
+        assert!(
+            error.to_string().contains("declared more than once"),
+            "unexpected loader error: {error}"
+        );
+        assert!(!lock_path.exists(), "load failure must release the lock");
+    }
+
     #[tokio::test]
     async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
@@ -2346,6 +2372,7 @@ mod tests {
             .with_existing_resources(["first", "second"])
             .cancel_after_successes(1);
         let token = fixture.cancel_token();
+        let load_count = crate::wiring::track_provider_loads_for_test();
 
         let err = run_destroy(
             fixture.config_path(),
@@ -2364,6 +2391,7 @@ mod tests {
             matches!(err, AppError::Interrupted),
             "expected Interrupted, got {err:?}"
         );
+        assert_eq!(load_count.count(), 1, "destroy must load providers once");
         let state = fixture.read_state().await;
         assert!(fixture.state_path().exists());
         assert!(
@@ -2403,17 +2431,17 @@ mod tests {
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
+        let providers =
+            ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
         crate::commands::validate_and_resolve_with_config(
             &mut parsed,
             base_dir,
+            &providers,
             true,
             &loaded.inference_errors,
             &loaded.duplicate_declarations,
         )
         .expect("fixture must validate");
-        let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
-            .expect("mock factory must load");
-        let ctx = WiringContext::new(factories, &parsed.providers);
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
 
@@ -2429,7 +2457,7 @@ mod tests {
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),
-            &ctx,
+            providers.context(),
         )
         .await
         .expect_err("heartbeat lock loss must fail destroy");

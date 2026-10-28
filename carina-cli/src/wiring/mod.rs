@@ -1,7 +1,38 @@
+//! Provider loading and command wiring.
+//!
+//! Outside cfg-gated test and fixture support, loaded provider factories are
+//! reachable only through a [`WiringContext`], and command code obtains that
+//! context only from a [`ProviderLoad`] (or the formatting load used by
+//! `carina fmt`). Raw loaders and context constructors are private to this
+//! module. Production validation helpers do not load providers; they receive
+//! the command's `&ProviderLoad`, so validation and execution use the context
+//! and diagnostics from the load that command selected.
+//!
+//! Each non-formatting production command path calls its provider loader once;
+//! formatting does so once per provider-declaring directory. That is a
+//! call-site invariant covered by tests, not a type-level restriction preventing
+//! command code from calling `ProviderLoad::load` more than once.
+//!
+//! ```compile_fail,E0603
+//! let providers = Vec::new();
+//! let _ = carina_cli::wiring::build_factories_from_providers(
+//!     &providers,
+//!     std::path::Path::new("."),
+//! );
+//! ```
+//!
+//! ```compile_fail,E0624
+//! let providers = Vec::new();
+//! let _ = carina_cli::wiring::WiringContext::new(Vec::new(), &providers);
+//! ```
+
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock};
@@ -79,6 +110,52 @@ use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 
 static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TRACKED_PROVIDER_LOAD_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ProviderLoadCountGuard;
+
+#[cfg(test)]
+impl ProviderLoadCountGuard {
+    pub(crate) fn count(&self) -> usize {
+        TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
+            count
+                .get()
+                .expect("provider-load tracking must remain active")
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProviderLoadCountGuard {
+    fn drop(&mut self) {
+        TRACKED_PROVIDER_LOAD_COUNT.with(|count| count.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn track_provider_loads_for_test() -> ProviderLoadCountGuard {
+    TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
+        assert!(
+            count.replace(Some(0)).is_none(),
+            "provider-load tracking is already active on this thread"
+        );
+    });
+    ProviderLoadCountGuard
+}
+
+#[cfg(test)]
+fn record_tracked_provider_load() {
+    TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
+        if let Some(current) = count.get() {
+            count.set(Some(current + 1));
+        }
+    });
+}
 
 #[derive(Debug)]
 struct TrustedLocalGrantInputs {
@@ -225,11 +302,11 @@ pub struct StateBlockResolution {
     pub targets: ResolvedStateBlockTargets,
 }
 
-/// Cached provider factories and schemas, constructed once per CLI invocation.
+/// Cached provider factories and schemas obtained from a command's [`ProviderLoad`].
 ///
-/// Instead of calling `provider_factories()` and `get_schemas()` at each call
-/// site (which rebuilds the full schema set every time), create a single
-/// `WiringContext` and pass it through the command execution path.
+/// Command paths reuse this context for validation and execution. Formatting
+/// obtains a separate context from its formatting load for each directory that
+/// declares providers.
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     schemas: SchemaRegistry,
@@ -288,8 +365,127 @@ pub enum LoadedProviderArtifact {
     Wasm(carina_provider_resolver::LoadedArtifactIdentity),
 }
 
+/// The context and diagnostics produced by one provider load operation.
+///
+/// Commands pass this value to validation and obtain their execution context
+/// from it, keeping both outputs of that load together. The once-per-command
+/// property is maintained by command call sites and tests; this type does not
+/// prevent calling `ProviderLoad::load` again.
+pub struct ProviderLoad {
+    context: WiringContext,
+    load_errors: HashMap<String, String>,
+}
+
+impl ProviderLoad {
+    /// Load the providers declared by one command configuration.
+    pub(crate) fn load(providers: &[ProviderConfig], base_dir: &Path) -> Result<Self, AppError> {
+        let (factories, load_errors) = build_factories_from_providers(providers, base_dir)?;
+        Ok(Self {
+            context: WiringContext::new(factories, providers),
+            load_errors,
+        })
+    }
+
+    /// Attempt one provider load while retaining a context for collect-all diagnostics.
+    ///
+    /// A hard loader error prevents factories from being trusted, so validation and
+    /// lint continue with an empty context and report the loader error alongside
+    /// schema-independent findings.
+    pub(crate) fn load_reporting(
+        providers: &[ProviderConfig],
+        base_dir: &Path,
+    ) -> (Self, Option<AppError>) {
+        match Self::load(providers, base_dir) {
+            Ok(loaded) => (loaded, None),
+            Err(error) => (
+                Self {
+                    context: WiringContext::new(Vec::new(), providers),
+                    load_errors: HashMap::new(),
+                },
+                Some(error),
+            ),
+        }
+    }
+
+    /// Borrow the context from a test provider load.
+    ///
+    /// This is public under `test-utils` for integration fixtures that build a
+    /// [`ProviderLoad`] with [`ProviderLoad::for_test`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn context(&self) -> &WiringContext {
+        &self.context
+    }
+
+    #[cfg(not(any(test, feature = "test-utils")))]
+    pub(crate) fn context(&self) -> &WiringContext {
+        &self.context
+    }
+
+    pub(crate) fn into_complete_context(self) -> Result<WiringContext, AppError> {
+        let Self {
+            context,
+            load_errors,
+        } = self;
+        if load_errors.is_empty() {
+            return Ok(context);
+        }
+
+        let mut load_errors = load_errors.into_iter().collect::<Vec<_>>();
+        load_errors.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Err(crate::commands::collapse_errors(
+            load_errors
+                .into_iter()
+                .map(|(_provider, reason)| AppError::Validation(reason))
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn load_errors(&self) -> &HashMap<String, String> {
+        &self.load_errors
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        factories: Vec<LoadedProviderFactory>,
+        provider_configs: &[ProviderConfig],
+    ) -> Self {
+        Self {
+            context: WiringContext::new(factories, provider_configs),
+            load_errors: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_load_errors(
+        factories: Vec<LoadedProviderFactory>,
+        provider_configs: &[ProviderConfig],
+        load_errors: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            context: WiringContext::new(factories, provider_configs),
+            load_errors,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn for_fixture_with_additional_schemas(
+        factories: Vec<LoadedProviderFactory>,
+        provider_configs: &[ProviderConfig],
+        additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+    ) -> Self {
+        Self {
+            context: WiringContext::new_with_additional_schemas(
+                factories,
+                provider_configs,
+                additional_schemas,
+            ),
+            load_errors: HashMap::new(),
+        }
+    }
+}
+
 /// Provider factories paired with provider-specific load diagnostics.
-pub type ProviderFactoryLoad = (Vec<LoadedProviderFactory>, HashMap<String, String>);
+type ProviderFactoryLoad = (Vec<LoadedProviderFactory>, HashMap<String, String>);
 
 #[derive(Debug)]
 pub(crate) enum ProviderFactoryDiagnostic {
@@ -314,10 +510,42 @@ impl From<String> for ProviderFactoryDiagnostic {
     }
 }
 
-pub(crate) type FormattingFactoryLoad = (
+type FormattingFactoryLoad = (
     Vec<LoadedProviderFactory>,
     HashMap<String, ProviderFactoryDiagnostic>,
 );
+
+pub(crate) struct FormattingProviderLoad {
+    context: WiringContext,
+    load_errors: HashMap<String, ProviderFactoryDiagnostic>,
+}
+
+impl FormattingProviderLoad {
+    pub(crate) fn load(providers: &[ProviderConfig], base_dir: &Path) -> Result<Self, AppError> {
+        let (factories, load_errors) =
+            build_factories_from_providers_for_formatting(providers, base_dir)?;
+        Ok(Self {
+            context: WiringContext::new(factories, providers),
+            load_errors,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (WiringContext, HashMap<String, ProviderFactoryDiagnostic>) {
+        (self.context, self.load_errors)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        factories: Vec<LoadedProviderFactory>,
+        provider_configs: &[ProviderConfig],
+        load_errors: HashMap<String, ProviderFactoryDiagnostic>,
+    ) -> Self {
+        Self {
+            context: WiringContext::new(factories, provider_configs),
+            load_errors,
+        }
+    }
+}
 
 /// Return the source for provider configurations that participate in factory loading.
 ///
@@ -328,11 +556,11 @@ pub(crate) fn provider_factory_source(config: &ProviderConfig) -> Option<&Provid
 }
 
 impl WiringContext {
-    pub fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
+    fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
         Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
     }
 
-    pub(crate) fn new_with_additional_schemas(
+    fn new_with_additional_schemas(
         loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
@@ -454,7 +682,7 @@ impl WiringContext {
 /// Returns `(factories, load_errors)` where `load_errors` maps provider names
 /// to their failure reasons, so callers can show accurate diagnostics. A stale
 /// lock constraint is returned to the supervised command rather than exiting.
-pub fn build_factories_from_providers(
+fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
@@ -470,7 +698,7 @@ pub fn build_factories_from_providers(
 /// `carina fmt` fail or emit a hard provider error.
 /// Suppressed provider and lock-constraint failures are returned as load errors
 /// so `--check` can report degraded conversion without failing formatting.
-pub(crate) fn build_factories_from_providers_for_formatting(
+fn build_factories_from_providers_for_formatting(
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<FormattingFactoryLoad, AppError> {
@@ -499,6 +727,9 @@ fn build_factories_from_providers_impl(
     base_dir: &Path,
     report_errors: bool,
 ) -> Result<ProviderFactoryLoad, AppError> {
+    #[cfg(test)]
+    record_tracked_provider_load();
+
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     build_factories_from_providers_impl_using(

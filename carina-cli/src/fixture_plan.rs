@@ -27,11 +27,11 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
-use crate::commands::validate_and_resolve_config_pair_with_context;
+use crate::commands::validate_and_resolve_config_pair;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
-    WiringContext, add_deferred_create_effects,
+    ProviderLoad, add_deferred_create_effects,
     compute_canonical_pair_anonymous_identifiers_with_ctx,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities,
@@ -265,18 +265,17 @@ where
     // only the enum metadata validation needs here: the full fixture schema
     // catalog would assign anonymous identities earlier than the real plan
     // path and make the harness observe the wrong inputs.
-    let validation_wiring = WiringContext::new_with_additional_schemas(
+    let validation_providers = ProviderLoad::for_fixture_with_additional_schemas(
         load_factories(fixture_provider_config_factories()),
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let mut canonical_resources = validate_and_resolve_config_pair_with_context(
+    let mut canonical_resources = validate_and_resolve_config_pair(
         parsed,
         unresolved_parsed,
         base_dir,
+        &validation_providers,
         true,
-        &validation_wiring,
-        HashMap::new(),
         &inference_errors,
         &duplicate_declarations,
     )
@@ -294,11 +293,12 @@ where
         None
     };
 
-    let wiring = WiringContext::new_with_additional_schemas(
+    let providers = ProviderLoad::for_fixture_with_additional_schemas(
         load_factories(fixture_provider_factories(&fixture_pathbuf)),
         &parsed.providers,
         fixture_schemas(),
     );
+    let wiring = providers.context();
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
@@ -307,7 +307,7 @@ where
         // hash name, so compute the desired anonymous id before claims resolve.
         let providers = parsed.providers.clone();
         let errors = compute_canonical_pair_anonymous_identifiers_with_ctx(
-            &wiring,
+            wiring,
             &mut canonical_resources,
             &providers,
         )
@@ -338,7 +338,7 @@ where
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_canonical_anonymous_identifiers_with_ctx(
-            &wiring,
+            wiring,
             &mut canonical_resources,
             sf,
             &state_block_claims,
@@ -534,7 +534,7 @@ where
             );
         }
         rt.block_on(async {
-            PlanPreprocessor::new(&provider_router, &wiring)
+            PlanPreprocessor::new(&provider_router, wiring)
                 .prepare(
                     &mut override_aware_resources,
                     &constraint_origin_resources,
@@ -588,7 +588,7 @@ where
         };
     }
     let resolved_desired_ids = reconcile_late_anonymous_identities(
-        &wiring,
+        wiring,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
             data_sources: &data_sources_for_plan,
@@ -618,7 +618,7 @@ where
     let reconciled_expansion = expansion_prelude
         .reconcile_addresses(
             crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: &wiring,
+                ctx: wiring,
                 parsed,
                 provider_configs: raw_provider_configs,
                 state_block_claims: &state_block_claims,

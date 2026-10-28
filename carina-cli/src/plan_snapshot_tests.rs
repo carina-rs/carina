@@ -1844,9 +1844,11 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
+    let providers = crate::wiring::ProviderLoad::load(&parsed.providers, &fixture_path).unwrap();
     let errors = crate::commands::validate_and_resolve_errors(
         &mut parsed,
         &fixture_path,
+        &providers,
         true,
         &inference_errors,
         &duplicate_declarations,

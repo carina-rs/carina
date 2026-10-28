@@ -617,7 +617,7 @@ exports {
 /// The root parse used the bootstrap `ProviderContext`
 /// (`customs_loaded = false`), so the strict parser gate did not fire;
 /// the post-parse `validate_argument_custom_types` walk in
-/// `validate_and_resolve_errors_with_factories` is what catches the
+/// `validate_and_resolve_errors` with a test `ProviderLoad` is what catches the
 /// unknown name here. Without that walk, the bug-headline shape
 /// (`arguments { bad_arg: TotallyMadeUpType }` validated standalone)
 /// would slip through and the issue would only partially be fixed.

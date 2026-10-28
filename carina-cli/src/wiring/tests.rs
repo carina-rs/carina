@@ -18,6 +18,25 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[test]
+fn complete_provider_context_reports_every_load_error_in_provider_name_order() {
+    let providers = ProviderLoad::for_test_with_load_errors(
+        Vec::new(),
+        &[],
+        HashMap::from([
+            ("zeta".to_string(), "zeta failed".to_string()),
+            ("alpha".to_string(), "alpha failed".to_string()),
+        ]),
+    );
+
+    let error = match providers.into_complete_context() {
+        Ok(_) => panic!("incomplete provider loads must not yield a wiring context"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.to_string(), "alpha failed\nzeta failed");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let tmp = tempfile::tempdir().unwrap();

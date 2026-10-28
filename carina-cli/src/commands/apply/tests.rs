@@ -32,6 +32,30 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 
+fn validate_with_test_factories(
+    parsed: &mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    factories: Vec<Box<dyn ProviderFactory>>,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+    duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+) -> Vec<AppError> {
+    let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        crate::wiring::LoadedProviderFactory::for_test(factories),
+        &parsed.providers,
+        load_errors,
+    );
+    crate::commands::validate_and_resolve_errors(
+        parsed,
+        base_dir,
+        &providers,
+        skip_resource_validation,
+        prior_inference_errors,
+        duplicate_declarations,
+    )
+}
+
 fn complete_create(state: carina_core::resource::State) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
         state,
@@ -960,6 +984,233 @@ impl ProviderFactory for FailBCreateFactory {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let source_path = project.path().join("broken-provider.wasm");
+    let installed_path = project
+        .path()
+        .join(".carina/providers/file/broken-provider/broken-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"not a wasm component").unwrap();
+    std::fs::write(&installed_path, b"not a wasm component").unwrap();
+    let provider_config = ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let planning_context = WiringContext::new_for_test(
+        vec![Box::new(FailBCreateFactory)],
+        std::slice::from_ref(&provider_config),
+    );
+    let plan_file = PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-29T00:00:00Z".to_string(),
+        source_path: project.path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![provider_config]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    }
+    .record(&planning_context)
+    .expect("planning context must record provider evidence");
+    let plan_path = project.path().join("plan.json");
+    std::fs::write(
+        &plan_path,
+        carina_core::utils::pretty_with_newline(&plan_file).unwrap(),
+    )
+    .expect("write saved plan");
+    let state_path = project
+        .path()
+        .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
+    let lock_path = state_path.with_extension("lock");
+    carina_state::BackendLock::local_default()
+        .save(project.path())
+        .unwrap();
+    let backend = crate::commands::local_backend_for_test(state_path);
+    let held_lock = backend.acquire_lock("test").await.unwrap();
+    assert!(lock_path.exists(), "fixture must hold the state lock");
+
+    let error = run_apply_from_plan(
+        &plan_path,
+        true,
+        true,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+        &ProviderContext::default(),
+        ShutdownToken::running(),
+    )
+    .await
+    .expect_err("the failed provider load must abort saved-plan apply");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("Failed to load WASM component"),
+        "provider load diagnostic is missing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Provider artifact mismatch"),
+        "artifact evidence must not replace the provider load error: {rendered}"
+    );
+    assert!(
+        lock_path.exists(),
+        "provider load diagnostics must fail before state lock acquisition"
+    );
+    backend.release_lock(&held_lock).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let source = format!(
+        "file://{}",
+        project.path().join("missing-provider.wasm").display()
+    )
+    .parse()
+    .unwrap();
+    let provider_config = ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some(source),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let provider_configs = vec![provider_config.clone(), provider_config];
+    let planning_context =
+        WiringContext::new_for_test(vec![Box::new(FailBCreateFactory)], &provider_configs);
+    let plan_file = PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-29T00:00:00Z".to_string(),
+        source_path: project.path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: deserialize_saved_provider_configs(provider_configs),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    }
+    .record(&planning_context)
+    .expect("planning context must record provider evidence");
+    let state_path = project.path().join("state.json");
+    let lock_path = state_path.with_extension("lock");
+    let backend: Arc<dyn StateBackend> =
+        Arc::from(crate::commands::local_backend_for_test(state_path));
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    assert!(lock_path.exists(), "fixture must hold the lock");
+
+    let error = run_apply_from_plan_locked(
+        inspected_saved_plan(plan_file),
+        None,
+        &ProviderContext::default(),
+        true,
+        Arc::clone(&backend),
+        StateLock::held(lock),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: project.path(),
+        },
+        ShutdownToken::running(),
+        &cli_observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("duplicate sourced providers must hard-fail loading");
+
+    assert!(
+        error.to_string().contains("declared more than once"),
+        "unexpected loader error: {error}"
+    );
+    assert!(!lock_path.exists(), "load failure must release the lock");
+}
+
+#[tokio::test]
+async fn secret_bearing_saved_plan_apply_loads_providers_once() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let config = format!(
+        r#"backend local {{ path = "{}" }}
+provider mock {{}}
+let secret_resource = mock.test.resource {{
+  name = "single-load-secret"
+  comment = secret("single-load-plaintext")
+}}
+"#,
+        fixture.state_path().display()
+    );
+    let fixture = fixture.with_raw_config(config);
+    let provider_state_path = fixture.config_path().join("mock-provider-state.json");
+    let _provider_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
+        "CARINA_MOCK_STATE_FILE",
+        &provider_state_path,
+    );
+    let plan_path = fixture.config_path().join("plan.json");
+    crate::commands::plan::run_plan(
+        fixture.config_path(),
+        Some(&plan_path),
+        None,
+        None,
+        DetailLevel::None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        fixture.provider_context(),
+    )
+    .await
+    .expect("secret-bearing plan must be recorded");
+
+    let load_count = crate::wiring::track_provider_loads_for_test();
+    run_apply_from_plan(
+        &plan_path,
+        true,
+        false,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+    )
+    .await
+    .expect("secret-bearing saved plan must apply");
+
+    assert_eq!(
+        load_count.count(),
+        1,
+        "current-config secret validation and locked verification must share one provider load"
+    );
+}
+
 #[tokio::test]
 async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
@@ -1087,6 +1338,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &SchemaRegistry::new(),
     )
     .unwrap();
+    let providers = ProviderLoad::load(&loaded.parsed.providers, &downstream).unwrap();
     let unresolved_parsed = loaded.unresolved_parsed;
     let stale_inputs =
         load_apply_provider_inputs(&loaded.parsed, &downstream, &ProviderContext::default())
@@ -1106,6 +1358,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &downstream,
         &downstream,
         &ProviderContext::default(),
+        &providers,
         unresolved_parsed,
     )
     .expect("bootstrap reload must succeed");
@@ -1170,18 +1423,20 @@ inner { x = a }
     )
     .expect("outer module");
     std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
-    let unresolved = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         fixture.path(),
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
-    .expect("load unresolved bootstrap snapshot")
-    .unresolved_parsed;
+    .expect("load unresolved bootstrap snapshot");
+    let providers = ProviderLoad::load(&loaded.parsed.providers, fixture.path()).unwrap();
+    let unresolved = loaded.unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
+        &providers,
         unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
@@ -1247,17 +1502,19 @@ let y = m { n = x.s }
 fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
-        let unresolved = load_configuration_with_config(
+        let loaded = load_configuration_with_config(
             fixture.path(),
             &ProviderContext::default(),
             &SchemaRegistry::new(),
         )
-        .expect("load unresolved bootstrap snapshot")
-        .unresolved_parsed;
+        .expect("load unresolved bootstrap snapshot");
+        let providers = ProviderLoad::load(&loaded.parsed.providers, fixture.path()).unwrap();
+        let unresolved = loaded.unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
+            &providers,
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
@@ -1935,7 +2192,7 @@ async fn run_apply_cascade_fixture(
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -2279,7 +2536,7 @@ fn load_and_resolve_module_data_source_fixture(
     .expect("module data-source fixture must load");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         get_base_dir(fixture.config_path()),
         false,
@@ -2441,7 +2698,7 @@ let lookup = read mock.iam.Roles {{
     .expect("phase-2 module constraint fixture must load");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         get_base_dir(fixture.config_path()),
         false,
@@ -3404,6 +3661,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
         .with_resources(["first", "second", "third"])
         .cancel_after_successes(1);
     let token = fixture.cancel_token();
+    let load_count = crate::wiring::track_provider_loads_for_test();
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
@@ -3423,6 +3681,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
         matches!(err, AppError::Interrupted),
         "expected Interrupted, got {err:?}"
     );
+    assert_eq!(load_count.count(), 1, "live apply must load providers once");
 
     let state = fixture.read_state().await;
     assert!(fixture.state_path().exists());
@@ -3467,23 +3726,23 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
+    let providers =
+        ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
+        &providers,
         false,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     )
     .expect("fixture must validate");
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
-        .expect("mock factory must load");
-    let ctx = WiringContext::new(factories, &parsed.providers);
     let observer_factory = fixture.observer_factory();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
     let backend = fixture.lock_loss_backend_handle();
 
     let error = run_apply_locked(
-        &ctx,
+        providers.context(),
         &mut parsed,
         &unresolved_parsed,
         true,
@@ -3705,7 +3964,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3782,7 +4041,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3878,7 +4137,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -3948,7 +4207,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4160,7 +4419,7 @@ awscc.ec2.Subnet {{
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4249,7 +4508,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4303,7 +4562,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     .expect("fixture must reload");
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,
@@ -4403,7 +4662,7 @@ let nat = mock.ec2.NatGateway {{
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+        let validation_errors = validate_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -4580,7 +4839,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+        let validation_errors = validate_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -4746,7 +5005,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         )
         .expect("fixture must load");
         let mut parsed = loaded.parsed;
-        let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+        let validation_errors = validate_with_test_factories(
             &mut parsed,
             base_dir,
             false,
@@ -5023,7 +5282,7 @@ let consumer = mock.iam.Role {{
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
-    let validation_errors = crate::commands::validate_and_resolve_errors_with_test_factories(
+    let validation_errors = validate_with_test_factories(
         &mut parsed,
         base_dir,
         false,

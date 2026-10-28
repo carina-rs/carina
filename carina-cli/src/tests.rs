@@ -42,8 +42,8 @@ use crate::commands::shared::state_writeback::{
 use crate::commands::state::run_state_refresh_locked;
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes,
-    resolve_names, validate_resources,
+    ProviderLoad, WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names,
+    resolve_attr_prefixes, resolve_names, validate_resources,
 };
 use carina_core::parser::BackendConfig;
 use carina_core::provider::{Provider, ProviderFactory};
@@ -2134,6 +2134,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
+    let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
     let result = run_state_refresh_locked(
         &mut parsed,
         &backend,
@@ -2141,6 +2142,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
+        providers.context(),
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -2178,6 +2180,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
+    let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
 
     let result = run_state_refresh_locked(
         &mut parsed,
@@ -2186,6 +2189,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
+        providers.context(),
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -2241,6 +2245,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
+    let providers = ProviderLoad::load(&parsed.providers, std::path::Path::new(".")).unwrap();
 
     let result = run_state_refresh_locked(
         &mut parsed,
@@ -2249,6 +2254,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         std::path::Path::new("."),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
+        providers.context(),
     )
     .await;
 
