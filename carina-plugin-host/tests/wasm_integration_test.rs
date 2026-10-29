@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -605,6 +605,87 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
             && followup_rendered.contains("mock_http")
             && followup_rendered.contains("169.254.169.254"),
         "poisoned-provider error lost the denial root cause: {followup_rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let metadata_address = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80));
+    let factory = factory.with_http_test_route("resolved-metadata.invalid", metadata_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-resolved-metadata-denied",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-resolved-metadata-denied",
+        "http://resolved-metadata.invalid/latest/api/token",
+        "PUT",
+        "",
+    );
+
+    let started = Instant::now();
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("post-resolution metadata policy must trap the guest");
+    let elapsed = started.elapsed();
+    let rendered = create_failure_error(failure).to_string();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "post-resolution metadata denial took {elapsed:?}"
+    );
+    assert!(
+        rendered.contains("WASM guest call stopped by the host egress policy")
+            && rendered.contains("create call:")
+            && rendered.contains("provider 'mock_http'")
+            && rendered.contains("file:///test-providers/mock_http.wasm")
+            && rendered.contains(
+                "is untrusted, so it gets no credentials and no instance-metadata access"
+            )
+            && rendered.contains("request to resolved-metadata.invalid was denied")
+            && rendered.contains("--trust-local-provider"),
+        "unexpected post-resolution metadata denial: {rendered}"
+    );
+    assert!(
+        !rendered.contains("not_sent")
+            && !rendered.contains("WASM guest trapped")
+            && !rendered.contains("timed out")
+            && !rendered.contains('\n'),
+        "the post-resolution denial must remain an outer typed trap: {rendered}"
+    );
+
+    let followup_id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "after-resolved-metadata-denial",
+        None,
+    );
+    let followup_started = Instant::now();
+    let followup_error = provider
+        .read(&followup_id, &mock_identifier(), ReadRequest)
+        .await
+        .expect_err("the post-resolution metadata trap must poison the shared instance");
+    let followup_elapsed = followup_started.elapsed();
+    let followup_rendered = followup_error.to_string();
+
+    assert!(
+        followup_elapsed < Duration::from_secs(1),
+        "poisoned provider did not fail fast: {followup_elapsed:?}"
+    );
+    assert!(
+        followup_rendered.contains("provider instance unusable after trap in create")
+            && followup_rendered.contains("mock_http")
+            && followup_rendered.contains("resolved-metadata.invalid"),
+        "poisoned-provider error lost the post-resolution denial: {followup_rendered}"
     );
 }
 

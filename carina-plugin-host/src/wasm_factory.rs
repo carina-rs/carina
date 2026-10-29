@@ -1046,32 +1046,6 @@ struct AllowedHost {
     target: AllowedHostTarget,
 }
 
-impl AllowedHost {
-    fn denied_destination(&self) -> String {
-        match &self.target {
-            AllowedHostTarget::Name(host) => host.clone(),
-            AllowedHostTarget::Literal(address) => address.to_string(),
-        }
-    }
-
-    fn into_vetted_destination(
-        self,
-        first: SocketAddr,
-        rest: &[SocketAddr],
-        is_metadata: bool,
-    ) -> VettedDestination {
-        VettedDestination {
-            host: match self.target {
-                AllowedHostTarget::Name(host) => host,
-                AllowedHostTarget::Literal(address) => address.to_string(),
-            },
-            first,
-            rest: rest.to_vec(),
-            is_metadata,
-        }
-    }
-}
-
 #[derive(Debug)]
 enum AllowedHostTarget {
     Name(String),
@@ -1080,8 +1054,8 @@ enum AllowedHostTarget {
 
 /// The only destination type accepted by the TCP connection handler.
 ///
-/// Instances are created by [`AllowedHost::into_vetted_destination`] after
-/// [`vet_resolved_addresses`] accepts every resolved address.
+/// Instances are created only by [`vet_resolved_destination`], which checks
+/// every resolved address before constructing this value.
 struct VettedDestination {
     host: String,
     first: SocketAddr,
@@ -1183,25 +1157,38 @@ fn is_link_local(address: IpAddr) -> bool {
     }
 }
 
-fn vet_resolved_addresses(
-    allowed_host: &AllowedHost,
+fn vet_resolved_destination(
+    allowed_host: AllowedHost,
     first: SocketAddr,
     rest: &[SocketAddr],
-) -> Result<bool, DestinationDenied> {
+) -> Result<VettedDestination, (DestinationDenied, String)> {
+    let AllowedHost { kind, target } = allowed_host;
+    let host = match target {
+        AllowedHostTarget::Name(host) => host,
+        AllowedHostTarget::Literal(address) => address.to_string(),
+    };
     let mut destination_is_metadata = false;
     for address in std::iter::once(&first).chain(rest) {
         let canonical_ip = canonical_policy_address(address.ip());
         let metadata = is_metadata_host(canonical_ip);
-        if metadata && !provider_permits_metadata(allowed_host.kind, canonical_ip) {
-            return Err(DestinationDenied::MetadataWithheld(canonical_ip));
+        if metadata && !provider_permits_metadata(kind, canonical_ip) {
+            return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
         }
         if !metadata && is_link_local(canonical_ip) {
-            return Err(DestinationDenied::LinkLocalAddressDenied(canonical_ip));
+            return Err((
+                DestinationDenied::LinkLocalAddressDenied(canonical_ip),
+                host,
+            ));
         }
         destination_is_metadata |= metadata;
     }
 
-    Ok(destination_is_metadata)
+    Ok(VettedDestination {
+        host,
+        first,
+        rest: rest.to_vec(),
+        is_metadata: destination_is_metadata,
+    })
 }
 
 /// Apply both the URI host-string policy and the post-resolution address
@@ -1216,8 +1203,8 @@ fn check_destination(
         .split_first()
         .expect("test resolution must contain at least one address");
     let allowed_host = check_host(kind, host)?;
-    let is_metadata = vet_resolved_addresses(&allowed_host, *first, rest)?;
-    Ok(allowed_host.into_vetted_destination(*first, rest, is_metadata))
+    vet_resolved_destination(allowed_host, *first, rest)
+        .map_err(|(reason, _denied_destination)| reason)
 }
 
 /// Memoizes metadata endpoint availability for a single probe owner.
@@ -1436,19 +1423,11 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 Ok(resolved) => match resolved.split_first() {
                     None => Ok(Err(dns_error_code())),
                     Some((first, rest)) => {
-                        match vet_resolved_addresses(&allowed_host, *first, rest) {
-                            Err(reason) => {
-                                let destination = allowed_host.denied_destination();
-                                Err(wasmtime::Error::new(EgressDenied::new(
-                                    label,
-                                    kind,
-                                    destination,
-                                    reason,
-                                )))
-                            }
-                            Ok(is_metadata) => {
-                                let vetted =
-                                    allowed_host.into_vetted_destination(*first, rest, is_metadata);
+                        match vet_resolved_destination(allowed_host, *first, rest) {
+                            Err((reason, destination)) => Err(wasmtime::Error::new(
+                                EgressDenied::new(label, kind, destination, reason),
+                            )),
+                            Ok(vetted) => {
                                 let mut config = config;
                                 let cap = if vetted.is_metadata {
                                     METADATA_PROBE_TIMEOUT
@@ -8117,9 +8096,11 @@ mod tests {
         let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
             .expect("the AWS hostname should pass the pre-resolution allow-list");
         let resolved_denial =
-            match vet_resolved_addresses(&allowed, SocketAddr::new(metadata, 443), &[]) {
-                Ok(_) => panic!("an untrusted provider must not reach resolved metadata"),
-                Err(denial) => denial,
+            match vet_resolved_destination(allowed, SocketAddr::new(metadata, 443), &[]) {
+                Ok(_destination) => {
+                    panic!("an untrusted provider must not reach resolved metadata")
+                }
+                Err((denial, _denied_destination)) => denial,
             };
         assert!(matches!(
             resolved_denial,
@@ -8130,9 +8111,9 @@ mod tests {
         let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
             .expect("the AWS hostname should pass the pre-resolution allow-list");
         let link_local_denial =
-            match vet_resolved_addresses(&allowed, SocketAddr::new(link_local, 443), &[]) {
-                Ok(_) => panic!("a resolved link-local address must remain denied"),
-                Err(denial) => denial,
+            match vet_resolved_destination(allowed, SocketAddr::new(link_local, 443), &[]) {
+                Ok(_destination) => panic!("a resolved link-local address must remain denied"),
+                Err((denial, _denied_destination)) => denial,
             };
         assert!(matches!(
             link_local_denial,
@@ -8797,12 +8778,15 @@ mod tests {
             .body(empty_outgoing_body())
             .unwrap();
         let config = test_outgoing_request_config(false);
-        let destination = VettedDestination {
-            host: "phase-test.invalid".to_string(),
-            first: server_address,
-            rest: Vec::new(),
-            is_metadata: false,
-        };
+        let destination = vet_resolved_destination(
+            AllowedHost {
+                kind: Some(ProviderKind::Untrusted),
+                target: AllowedHostTarget::Name("phase-test.invalid".to_string()),
+            },
+            server_address,
+            &[],
+        )
+        .expect("the public loopback test destination must pass post-resolution policy");
         let server = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (mut stream, _) = loop {

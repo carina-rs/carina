@@ -4773,9 +4773,14 @@ fn local_provider_trust(
     grants: &TrustedLocalGrants,
     notice_sink: &mut impl FnMut(&str),
 ) -> (ProviderTrust, Option<String>, PathBuf) {
-    let canonical_path = fs::canonicalize(source.path())
-        .or_else(|_canonicalize_error| std::path::absolute(source.path()))
-        .unwrap_or_else(|_absolute_error| PathBuf::from(source.path()));
+    let canonical_path = match fs::canonicalize(source.path()) {
+        Ok(canonical_path) => canonical_path,
+        Err(_canonicalize_error) => {
+            let label_path = std::path::absolute(source.path())
+                .unwrap_or_else(|_absolute_error| PathBuf::from(source.path()));
+            return (ProviderTrust::untrusted(), None, label_path);
+        }
+    };
     let Some(grant) = grants.matching(&canonical_path) else {
         return (ProviderTrust::untrusted(), None, canonical_path);
     };
@@ -23063,7 +23068,7 @@ future_protection_field = "retain-me"
     }
 
     #[tokio::test]
-    async fn load_with_keeps_lock_verified_bytes_after_artifact_is_replaced() {
+    async fn lock_file_load_keeps_verified_bytes_and_reports_the_remote_source() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source = "github.com/example/carina-provider-awscc";
@@ -23092,15 +23097,24 @@ future_protection_field = "retain-me"
             .expect("the lock-matching provider should be loadable");
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
-        let loaded = installed
+        let (loaded, load_source) = installed
             .load_with(&user_dirs, &no_local_grants(), |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
+                Ok::<_, std::convert::Infallible>((
+                    verified.bytes().as_bytes().to_vec(),
+                    verified.identity().source().clone(),
+                ))
             })
             .await
             .unwrap();
 
         assert_eq!(loaded, original_bytes);
         assert_ne!(loaded, swapped_bytes);
+        assert_eq!(
+            load_source,
+            ProviderLoadSource::Remote {
+                source: source_key(source),
+            }
+        );
     }
 
     #[tokio::test]
@@ -23214,11 +23228,11 @@ future_protection_field = "retain-me"
 
     #[test]
     fn missing_relative_local_source_falls_back_to_an_absolute_label_path() {
-        let relative_root = tempfile::tempdir_in(".").unwrap();
-        let missing_source = relative_root.path().join("removed-provider.wasm");
-        let cached_source = relative_root.path().join("cached-provider.wasm");
-        fs::write(&cached_source, b"resolver-owned provider bytes").unwrap();
-        let installed_bytes = ProviderArtifactBytes::read(&cached_source).unwrap();
+        let missing_source = PathBuf::from("missing-relative-provider-for-label-test.wasm");
+        assert!(!missing_source.exists());
+        let cached_source = tempfile::NamedTempFile::new().unwrap();
+        fs::write(cached_source.path(), b"resolver-owned provider bytes").unwrap();
+        let installed_bytes = ProviderArtifactBytes::read(cached_source.path()).unwrap();
         let source = local_file_source(&missing_source);
         let expected = std::path::absolute(source.path()).unwrap();
         let mut notices = Vec::new();
@@ -23226,7 +23240,7 @@ future_protection_field = "retain-me"
         let (trust, notice, label_path) = local_provider_trust(
             &source,
             &installed_bytes,
-            relative_root.path(),
+            Path::new("."),
             &no_local_grants(),
             &mut |line| notices.push(line.to_string()),
         );
@@ -23236,6 +23250,36 @@ future_protection_field = "retain-me"
         assert!(notices.is_empty());
         assert!(label_path.is_absolute());
         assert_eq!(label_path, expected);
+    }
+
+    #[test]
+    fn local_source_that_disappears_after_grant_is_untrusted_without_notice() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_project = fs::canonicalize(project.path()).unwrap();
+        let source_path = canonical_project.join("removed-provider.wasm");
+        let cached_path = canonical_project.join("cached-provider.wasm");
+        let bytes = b"resolver-owned provider bytes";
+        fs::write(&source_path, bytes).unwrap();
+        fs::write(&cached_path, bytes).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+        fs::remove_file(&source_path).unwrap();
+        let installed_bytes = ProviderArtifactBytes::read(&cached_path).unwrap();
+        let source = local_file_source(&source_path);
+        let mut notices = Vec::new();
+
+        let (trust, notice, label_path) = local_provider_trust(
+            &source,
+            &installed_bytes,
+            &canonical_project,
+            &grants,
+            &mut |line| notices.push(line.to_string()),
+        );
+
+        assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
+        assert!(notice.is_none());
+        assert!(notices.is_empty());
+        assert_eq!(label_path, source_path);
     }
 
     #[tokio::test]
