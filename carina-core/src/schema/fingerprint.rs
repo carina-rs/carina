@@ -116,8 +116,6 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     encoder.string(resource_type);
     encode_schema_kind(encoder, *kind);
 
-    let mut attributes = attributes.iter().collect::<Vec<_>>();
-    attributes.sort_by_key(|(name, _)| *name);
     encoder.usize(attributes.len());
     for (key, attribute) in attributes {
         encoder.string(key);

@@ -164,7 +164,7 @@ fn json_to_proto_value_for_variant(
                         .map(|value| (key.clone(), value))
                         .map_err(|error| error.prepend_attribute(&key))
                 })
-                .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
             Ok(proto::Value::Map(entries))
         }
         serde_json::Value::Null => Err(WasmValueDecodeError::new(
@@ -233,7 +233,7 @@ fn json_to_proto_persisted_value_for_variant(
                         .map(|value| (decoded_key, value))
                         .map_err(|error| error.prepend_attribute(&key))
                 })
-                .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
             Ok(proto::PersistedValue::Map(entries))
         }
         serde_json::Value::Null => Err(WasmValueDecodeError::new(
@@ -531,7 +531,7 @@ macro_rules! export_provider {
             use super::*;
             use $crate::types as proto;
             use $crate::wasm_guest as helpers;
-            use std::collections::HashMap;
+            use std::collections::{BTreeMap, HashMap};
 
             // Type aliases for the generated types
             use carina::provider::types as wit_types;
@@ -715,7 +715,7 @@ macro_rules! export_provider {
 
             fn wit_to_proto_value_map(
                 entries: &[(String, wit_types::Value)],
-            ) -> Result<HashMap<String, proto::Value>, helpers::WasmValueDecodeError> {
+            ) -> Result<BTreeMap<String, proto::Value>, helpers::WasmValueDecodeError> {
                 entries
                     .iter()
                     .map(|(key, value): &(String, wit_types::Value)| {
@@ -728,7 +728,7 @@ macro_rules! export_provider {
 
             fn wit_to_proto_persisted_value_map(
                 entries: &[(String, wit_types::PersistedValue)],
-            ) -> Result<HashMap<String, proto::PersistedValue>, helpers::WasmValueDecodeError> {
+            ) -> Result<BTreeMap<String, proto::PersistedValue>, helpers::WasmValueDecodeError> {
                 entries
                     .iter()
                     .map(|(key, value)| {
@@ -740,7 +740,7 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_value_map(
-                map: &HashMap<String, proto::Value>,
+                map: &BTreeMap<String, proto::Value>,
             ) -> Result<
                 Vec<(String, wit_types::Value)>,
                 helpers::WasmValueEncodeError,
@@ -755,7 +755,7 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_persisted_value_map(
-                map: &HashMap<String, proto::PersistedValue>,
+                map: &BTreeMap<String, proto::PersistedValue>,
             ) -> Result<
                 Vec<(String, wit_types::PersistedValue)>,
                 helpers::WasmValueEncodeError,
@@ -928,7 +928,7 @@ macro_rules! export_provider {
 
             fn proto_to_wit_created_state(
                 identifier: proto::AppliedIdentifier,
-                attributes: HashMap<String, proto::Value>,
+                attributes: BTreeMap<String, proto::Value>,
             ) -> Result<wit_types::AppliedState, helpers::WasmValueEncodeError> {
                 Ok(wit_types::AppliedState {
                     identifier: identifier.into_inner(),
@@ -1077,7 +1077,7 @@ macro_rules! export_provider {
 
             fn sdk_to_wit_protocol_create_step<T: serde::Serialize>(
                 step: proto::CreateStep<
-                    HashMap<String, proto::Value>,
+                    BTreeMap<String, proto::Value>,
                     proto::PartialReadDiagnostic,
                     T,
                 >,
@@ -2269,7 +2269,7 @@ mod tests {
             proto::PersistedValue::List(vec![
                 proto::PersistedValue::String(marker),
                 proto::PersistedValue::RedactedSecret(digest.to_string()),
-                proto::PersistedValue::Map(std::collections::HashMap::from([(
+                proto::PersistedValue::Map(std::collections::BTreeMap::from([(
                     "$secret".to_string(),
                     proto::PersistedValue::String("user".to_string()),
                 )])),
@@ -2281,7 +2281,7 @@ mod tests {
     fn persisted_json_encoding_tags_only_typed_redacted_secrets() {
         let digest = "argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let marker = format!("_secret:{digest}");
-        let value = proto::PersistedValue::Map(std::collections::HashMap::from([
+        let value = proto::PersistedValue::Map(std::collections::BTreeMap::from([
             (
                 "plain".to_string(),
                 proto::PersistedValue::String(marker.clone()),
@@ -2300,7 +2300,7 @@ mod tests {
         assert_eq!(encoded["plain"], marker);
         assert_eq!(encoded["typed"], serde_json::json!({"$secret": digest}));
         assert_eq!(encoded["$$secret"], "user");
-        let ordinary = proto::Value::Map(std::collections::HashMap::from([(
+        let ordinary = proto::Value::Map(std::collections::BTreeMap::from([(
             "$secret".to_string(),
             proto::Value::String(digest.to_string()),
         )]));

@@ -14,15 +14,15 @@
 //! Provider-config encoding has the same admission requirement:
 //!
 //! ```compile_fail
-//! use std::collections::HashMap;
+//! use std::collections::BTreeMap;
 //! use carina_core::protocol_convert::config_schema_to_protocol;
 //! use carina_core::schema::AttributeType;
 //!
-//! let draft = HashMap::<String, AttributeType>::new();
+//! let draft = BTreeMap::<String, AttributeType>::new();
 //! let _ = config_schema_to_protocol(&draft);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -410,7 +410,7 @@ pub fn resource_schema_to_protocol(
                 .map(|converted| (name.clone(), converted))
                 .map_err(|error| error.context(format!("attribute `{name}`")))
         })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let defs = defs
         .iter()
         .map(|(name, definition)| {
@@ -461,7 +461,7 @@ pub fn resource_schemas_to_protocol<'a>(
 /// Convert a validated provider-config schema to protocol attribute types.
 pub fn config_schema_to_protocol(
     schema: &ValidatedConfigSchema,
-) -> Result<HashMap<String, protocol::AttributeType>, ProtocolConvertError> {
+) -> Result<BTreeMap<String, protocol::AttributeType>, ProtocolConvertError> {
     schema
         .parts()
         .iter()
@@ -752,8 +752,6 @@ pub fn protocol_to_resource_schema(
         })?;
         core = core.with_def(name.clone(), definition);
     }
-    let mut attributes = attributes.iter().collect::<Vec<_>>();
-    attributes.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (map_name, attribute) in attributes {
         let attribute = protocol_to_attribute_schema(attribute)
             .map_err(|error| error.with_resource_type(resource_type))?;
@@ -779,7 +777,7 @@ pub fn protocol_to_resource_schemas(
 
 /// Decode protocol provider-config records and return a graph-validation witness.
 pub fn protocol_to_config_schema(
-    attribute_types: HashMap<String, protocol::AttributeType>,
+    attribute_types: BTreeMap<String, protocol::AttributeType>,
 ) -> Result<ValidatedConfigSchema, SchemaDecodeError> {
     let attribute_types = attribute_types
         .into_iter()
@@ -788,7 +786,7 @@ pub fn protocol_to_config_schema(
                 .map(|converted| (name.clone(), converted))
                 .map_err(|error| error.prepend_attribute(&name))
         })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     ValidatedConfigSchema::validate(attribute_types)
         .map_err(SchemaDecodeError::config_schema_validation)
 }
@@ -1608,7 +1606,7 @@ pub fn protocol_schema_default_to_core(
 /// Convert an ordinary core value map to the provider protocol domain.
 pub fn try_core_to_protocol_value_map(
     values: &HashMap<String, Value>,
-) -> Result<HashMap<String, protocol::Value>, ProtocolConvertError> {
+) -> Result<BTreeMap<String, protocol::Value>, ProtocolConvertError> {
     values
         .iter()
         .map(|(key, value)| {
@@ -1621,7 +1619,7 @@ pub fn try_core_to_protocol_value_map(
 
 /// Decode an ordinary provider protocol value map.
 pub fn protocol_to_core_value_map(
-    values: &HashMap<String, protocol::Value>,
+    values: &BTreeMap<String, protocol::Value>,
 ) -> Result<HashMap<String, Value>, ProtocolConvertError> {
     values
         .iter()
@@ -1750,7 +1748,7 @@ pub fn protocol_to_core_persisted_value(
 /// Convert a core map at a persisted-state position.
 pub fn try_core_to_protocol_persisted_value_map(
     values: &HashMap<String, Value>,
-) -> Result<HashMap<String, protocol::PersistedValue>, ProtocolConvertError> {
+) -> Result<BTreeMap<String, protocol::PersistedValue>, ProtocolConvertError> {
     values
         .iter()
         .map(|(key, value)| {
@@ -1763,7 +1761,7 @@ pub fn try_core_to_protocol_persisted_value_map(
 
 /// Decode a persisted protocol value map.
 pub fn protocol_to_core_persisted_value_map(
-    values: &HashMap<String, protocol::PersistedValue>,
+    values: &BTreeMap<String, protocol::PersistedValue>,
 ) -> Result<HashMap<String, Value>, ProtocolConvertError> {
     values
         .iter()
@@ -2304,7 +2302,7 @@ mod tests {
             Value::Concrete(ConcreteValue::List(values)) if values.len() == 2
         ));
 
-        let nested = protocol::Value::Map(HashMap::from([(
+        let nested = protocol::Value::Map(BTreeMap::from([(
             "items".to_string(),
             protocol::Value::List(vec![protocol::Value::Float(f64::INFINITY)]),
         )]));
@@ -2312,6 +2310,41 @@ mod tests {
             .expect_err("nested non-finite defaults must fail before JSON serialization");
         assert!(error.to_string().contains("map key `items`"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn protocol_ordered_map_conversion_uses_canonical_key_order() {
+        for iteration in 0..200 {
+            let invalid = BTreeMap::from([
+                (
+                    "z_invalid".to_string(),
+                    protocol::Value::Float(f64::INFINITY),
+                ),
+                ("a_invalid".to_string(), protocol::Value::Float(f64::NAN)),
+            ]);
+            let error = protocol_to_core_value_map(&invalid)
+                .expect_err("both protocol values are non-finite");
+            assert_eq!(
+                error.to_string(),
+                "map key `a_invalid`",
+                "iteration {iteration}"
+            );
+
+            let valid = protocol::Value::Map(BTreeMap::from([
+                ("z_last".to_string(), protocol::Value::Int(2)),
+                ("a_first".to_string(), protocol::Value::Int(1)),
+            ]));
+            let Value::Concrete(ConcreteValue::Map(decoded)) =
+                protocol_to_core_value(&valid).expect("finite protocol map must decode")
+            else {
+                panic!("protocol map must decode to a concrete core map")
+            };
+            assert_eq!(
+                decoded.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["a_first", "z_last"],
+                "iteration {iteration}"
+            );
+        }
     }
 
     #[test]
@@ -2487,7 +2520,7 @@ mod tests {
             rendered.join(" -> ")
         }
 
-        let config_validation = ValidatedConfigSchema::validate(HashMap::from([(
+        let config_validation = ValidatedConfigSchema::validate(BTreeMap::from([(
             "value".to_string(),
             AttributeType::ref_("Missing"),
         )]))
@@ -2664,7 +2697,7 @@ mod tests {
 
         let wire_schema = protocol::ResourceSchema {
             resource_type: "test.Counter".to_string(),
-            attributes: HashMap::from([(
+            attributes: BTreeMap::from([(
                 "count".to_string(),
                 protocol::AttributeSchema {
                     name: "count".to_string(),

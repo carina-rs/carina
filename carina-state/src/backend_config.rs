@@ -5,7 +5,7 @@ use carina_core::resource::{ConcreteValue, Value, ValueString};
 use carina_core::schema::{
     AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use thiserror::Error;
 
@@ -242,7 +242,7 @@ impl BackendAttributeError {
 }
 
 fn s3_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(HashMap::from([
+    ValidatedConfigSchema::validate(BTreeMap::from([
         ("bucket".to_string(), AttributeType::string()),
         ("key".to_string(), AttributeType::string()),
         (
@@ -262,7 +262,7 @@ fn s3_schema() -> ValidatedConfigSchema {
 }
 
 fn local_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(HashMap::from([(
+    ValidatedConfigSchema::validate(BTreeMap::from([(
         "path".to_string(),
         AttributeType::string(),
     )]))
