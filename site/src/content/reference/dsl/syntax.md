@@ -338,6 +338,9 @@ moved {
 }
 ```
 
+See [Moving resources in state](/guides/state-management/#moving-resources-in-state)
+for loop-element addresses and plan-time move hints.
+
 ### Removed
 
 Remove a resource from Carina's state without deleting the actual cloud resource:

@@ -7,7 +7,7 @@ let validation_records = for opt in cert.domain_validation_options {
   aws.route53.RecordSet {
     hosted_zone_id   = 'Z123'
     name             = opt.resource_record.name
-    type             = opt.resource_record.type
+    type             = cname
     ttl              = 60
     resource_records = [opt.resource_record.value]
   }

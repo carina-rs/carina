@@ -65,8 +65,9 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                                         )
                                         .build(),
                                         // The real provider uses a string enum here. The
-                                        // provider-less fixture catalog uses a plain string
-                                        // because it has no generated enum registry.
+                                        // provider-less fixture catalog keeps the nested
+                                        // value as a string; RecordSet.type below carries
+                                        // the enum needed at the create-only match seam.
                                         StructField::provider_populated(
                                             "type",
                                             AttributeType::string(),
@@ -93,7 +94,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
         aws(ResourceSchema::new("route53.RecordSet")
             .attribute(create_only_string("hosted_zone_id"))
             .attribute(create_only_string("name"))
-            .attribute(create_only_string("type"))),
+            .attribute(
+                AttributeSchema::optional("type", fixture_route53_record_type())
+                    .create_only()
+                    .build(),
+            )),
         aws(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
         awscc(ResourceSchema::new("ec2.RouteTable").attribute(create_only_string("vpc_id"))),
         awscc(
@@ -497,50 +502,31 @@ where
         .expect("fixture move routes must match their loaded current states");
 
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
-    let (validated_expansion, deferred_for_expansion) = validated_config
-        .expand_deferred_for(
-            &prepared_expansion,
+    let mut validated_expansion = validated_config
+        .expand_deferred_for_plan(
+            prepared_expansion,
             &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Print,
         )
         .expect("fixture deferred-for expansion failed");
-    let crate::wiring::PreparedDeferredForExpansionParts {
-        addressed,
-        data_source_values,
-        wait_aliases,
-    } = prepared_expansion.into_parts();
-    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
-    let parsed = expanded_canonical_resources.parsed();
-    let sorted_resources = deferred_for_expansion.sorted_resources;
-    let deferred_create_targets: Vec<_> = deferred_for_expansion
-        .deferred_create_targets
-        .into_iter()
-        .filter(|target| {
-            target
-                .template
-                .root_bindings()
-                .iter()
-                .any(|binding| managed_bindings.contains(binding))
-        })
-        .collect();
-    let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
-    residual_deferred_for.extend(non_managed_deferred_for);
+    validated_expansion.retain_fixture_deferred_for(&managed_bindings, non_managed_deferred_for);
+    let parsed = validated_expansion.resources().parsed();
     let export_params = parsed.export_params.clone();
     let expansion_trace = parsed.expansion_trace.clone();
+    let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    let schemas = validated_expansion.context().schemas().clone();
     let post_expansion = {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for post-expansion plan construction");
-        rt.block_on(crate::wiring::build_post_expansion_plan(
-            crate::wiring::PostExpansionPlanInput {
-                context: wiring,
-                expanded_resources: expanded_canonical_resources,
-                sorted_resources,
-                addressed,
-                data_source_values,
-                wait_aliases,
+        rt.block_on(validated_expansion.finish_post_expansion_plan(
+            crate::wiring::PostExpansionPlanEnvironment {
                 data_sources: &data_sources,
                 provider: &provider_router,
                 normalizer: &provider_router,
@@ -551,12 +537,13 @@ where
                 resolved_state_block_targets: &resolved_state_block_targets,
                 module_gate: &module_gate,
                 preparation_errors: None,
-                deferred_create_targets,
             },
         ))
         .expect("fixture post-expansion plan construction must succeed")
+        .into_resources_for_fixture()
     };
     let crate::wiring::PostExpansionPlan {
+        residual_deferred_for,
         plan,
         resources,
         compositions,
@@ -566,9 +553,8 @@ where
         prev_explicit,
         ..
     } = post_expansion;
-    let moved_hints = detect_moved_block_hints(&plan, &managed_current, wiring.schemas());
+    let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
     let Some(crate::wiring::PostExpansionResolvedResources {
-        override_aware: override_aware_resources,
         resolved: resolved_resources,
         unresolved: unresolved_resources,
     }) = resources
@@ -583,7 +569,7 @@ where
             managed_current,
             data_source_states: data_source_values.read_states_map(),
             state_file,
-            schemas: wiring.schemas().clone(),
+            schemas,
             moved_origins,
             deferred_for_expressions: residual_deferred_for,
             export_params,
@@ -597,22 +583,21 @@ where
             expansion_trace,
         };
     };
-    let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
-        .wait_bindings
+    let resources_for_exports = resolved_resources
         .iter()
-        .map(carina_core::binding_index::WaitAliasSpec::from)
-        .collect();
+        .map(|resource| resource.as_inner().clone())
+        .collect::<Vec<_>>();
     let provider_context = carina_core::parser::ProviderContext::default();
     let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
         crate::commands::plan::CheckExportsPreApplyInput {
             export_params: &export_params,
-            resources: override_aware_resources.resources(),
+            resources: &resources_for_exports,
             compositions: &compositions,
             managed_current: &managed_current,
             data_source_values: &data_source_values,
             state_file: state_file.as_ref(),
             plan: &plan,
-            schemas: wiring.schemas(),
+            schemas: &schemas,
             wait_aliases: &export_wait_aliases,
             provider_context: &provider_context,
         },
@@ -628,7 +613,7 @@ where
         managed_current,
         data_source_states: data_source_values.into_read_states(),
         state_file,
-        schemas: wiring.schemas().clone(),
+        schemas,
         moved_origins,
         deferred_for_expressions: residual_deferred_for,
         export_params,
@@ -688,7 +673,7 @@ fn fixture_provider_config_factories() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, ValidatedResourceSchema)> {
-    let schemas = match fixture_path.file_name().and_then(|name| name.to_str()) {
+    let mut schemas = match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![(
             "fixture".to_string(),
             ResourceSchema::new("network.Subnet").attribute(
@@ -710,6 +695,14 @@ fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, Validate
         )],
         _ => Vec::new(),
     };
+    schemas.push((
+        "aws".to_string(),
+        ResourceSchema::new("route53.RecordSet").attribute(
+            AttributeSchema::optional("type", fixture_route53_record_type())
+                .create_only()
+                .build(),
+        ),
+    ));
     schemas
         .into_iter()
         .map(|(provider, schema)| {
@@ -746,6 +739,16 @@ fn fixture_instance_tenancy_type() -> AttributeType {
             "host".to_string(),
         ]),
         vec![],
+        None,
+        None,
+    )
+}
+
+fn fixture_route53_record_type() -> AttributeType {
+    AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["route53"], "RecordType"),
+        Some(vec!["CNAME".to_string()]),
+        vec![("CNAME".to_string(), "cname".to_string())],
         None,
         None,
     )

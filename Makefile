@@ -122,10 +122,14 @@ plan-moved-let-to-for-unbound:
 	$(PLAN_FIXTURE) moved_let_to_for_unbound
 plan-moved-let-to-for-read-loop:
 	$(PLAN_FIXTURE) moved_let_to_for_read_loop
+plan-moved-let-to-for-read-loop-module:
+	$(PLAN_FIXTURE) moved_let_to_for_read_loop_module
 plan-moved-hint-let-to-for:
 	$(PLAN_FIXTURE) moved_hint_let_to_for
 plan-moved-hint-read-loop:
 	$(PLAN_FIXTURE) moved_hint_read_loop
+plan-moved-hint-read-loop-module:
+	$(PLAN_FIXTURE) moved_hint_read_loop_module
 plan-moved-hint-ambiguous:
 	$(PLAN_FIXTURE) moved_hint_ambiguous
 plan-moved-claims-precede-heuristics:
@@ -254,11 +258,17 @@ plan-fixtures:
 	@echo "=== moved_let_to_for_read_loop ==="
 	@$(MAKE) plan-moved-let-to-for-read-loop
 	@echo ""
+	@echo "=== moved_let_to_for_read_loop_module ==="
+	@$(MAKE) plan-moved-let-to-for-read-loop-module
+	@echo ""
 	@echo "=== moved_hint_let_to_for ==="
 	@$(MAKE) plan-moved-hint-let-to-for
 	@echo ""
 	@echo "=== moved_hint_read_loop ==="
 	@$(MAKE) plan-moved-hint-read-loop
+	@echo ""
+	@echo "=== moved_hint_read_loop_module ==="
+	@$(MAKE) plan-moved-hint-read-loop-module
 	@echo ""
 	@echo "=== moved_hint_ambiguous ==="
 	@$(MAKE) plan-moved-hint-ambiguous
@@ -395,7 +405,9 @@ plan-multi-instance-module:
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
         plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-nested-write-only plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-let-to-for-bound plan-moved-let-to-for-unbound plan-moved-let-to-for-read-loop \
-	plan-moved-hint-let-to-for plan-moved-hint-read-loop plan-moved-hint-ambiguous \
+        plan-moved-let-to-for-read-loop-module \
+        plan-moved-hint-let-to-for plan-moved-hint-read-loop plan-moved-hint-read-loop-module \
+        plan-moved-hint-ambiguous \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \

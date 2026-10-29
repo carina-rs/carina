@@ -1591,6 +1591,30 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
             })?;
         Ok((ValidatedConfig { wiring, resources }, expansion))
     }
+
+    /// Fixture-plan counterpart of [`Self::expand_deferred_for`] that consumes
+    /// the prepared state into the inseparable post-expansion plan view.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn expand_deferred_for_plan(
+        self,
+        prepared: PreparedDeferredForExpansion,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<ValidatedConfig<PostExpansionPlanView<E>>, AppError> {
+        let Self { wiring, resources } = self;
+        let (resources, ()) =
+            resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
+                prepared
+                    .expand_for_plan(
+                        resources,
+                        wiring.context().schemas(),
+                        remote_bindings,
+                        warning_policy,
+                    )
+                    .map(|expanded| (expanded, ()))
+            })?;
+        Ok(ValidatedConfig { wiring, resources })
+    }
 }
 
 /// Provider factories paired with provider-specific load diagnostics.
@@ -4659,34 +4683,6 @@ async fn read_addressed_data_sources_phase2(
 }
 
 impl ReconciledDeferredForExpansion {
-    pub fn sorted_resources(&self) -> &[Resource] {
-        &self.0.sorted_resources
-    }
-
-    pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
-        &self.0.state.saved_attrs
-    }
-
-    pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
-        &self.0.state.prev_explicit
-    }
-
-    pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
-        &self.0.state.managed_current
-    }
-
-    pub fn orphans(&self) -> &Orphans {
-        &self.0.state.orphans
-    }
-
-    pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
-        &self.0.wait_aliases
-    }
-
-    pub fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
-        &self.0.state.moved_pairs
-    }
-
     pub(crate) async fn read_data_sources_phase2(
         &self,
         inputs: AddressedDataSourceReadInputs<'_, '_>,
@@ -4968,18 +4964,44 @@ pub fn derive_managed_binding_stability<E>(
     Ok(stability)
 }
 
+/// Canonical resources, state, and expansion metadata produced together by
+/// [`PreparedDeferredForExpansion::expand_for_plan`].
+///
+/// The fields are private so a pre-expansion resource order cannot be paired
+/// with a post-expansion canonical resource witness at the plan seam.
+pub(crate) struct PostExpansionPlanView<E> {
+    expanded_resources: ExpandedCanonicalResources<E>,
+    sorted_resources: Vec<Resource>,
+    addressed: AddressedState,
+    data_source_values: DataSourceValues,
+    wait_aliases: Vec<WaitAliasSpec>,
+    residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    deferred_create_targets: Vec<DeferredCreateTarget>,
+    new_child_ids: HashSet<ResourceId>,
+    refreshable_child_ids: RefreshableChildIds,
+    printed_warnings: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<E> PostExpansionPlanView<E> {
+    pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
+        self.expanded_resources.parsed()
+    }
+}
+
 /// Inputs available after deferred-`for` expansion and any child refreshes.
 ///
-/// This is the single plan-construction seam shared by production planning and
-/// the provider-less fixture planner. Provider behavior is supplied through
-/// the two traits; the seam itself has no fixture-specific branches.
+/// This plan-construction seam is shared by production `plan` and the
+/// provider-less fixture planner. Live apply currently has a separate copy of
+/// the post-expansion planning pipeline. Provider behavior enters through the
+/// two traits; this seam itself has no fixture-specific branches.
 pub(crate) struct PostExpansionPlanInput<'a, E> {
     pub context: &'a WiringContext,
-    pub expanded_resources: &'a ExpandedCanonicalResources<E>,
-    pub sorted_resources: Vec<Resource>,
-    pub addressed: AddressedState,
-    pub data_source_values: DataSourceValues,
-    pub wait_aliases: Vec<WaitAliasSpec>,
+    pub expansion: PostExpansionPlanView<E>,
+    pub environment: PostExpansionPlanEnvironment<'a>,
+}
+
+pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub data_sources: &'a [DataSource],
     pub provider: &'a dyn Provider,
     pub normalizer: &'a dyn ProviderNormalizer,
@@ -4990,19 +5012,18 @@ pub(crate) struct PostExpansionPlanInput<'a, E> {
     pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
     pub module_gate: &'a carina_core::executor::ModuleConstraintGate,
     pub preparation_errors: Option<Vec<PlanError>>,
-    pub deferred_create_targets: Vec<DeferredCreateTarget>,
 }
 
 /// Successfully resolved resource views retained for plan consumers.
 pub(crate) struct PostExpansionResolvedResources {
-    #[cfg(any(test, feature = "test-utils"))]
-    pub override_aware: OverrideAwareResources,
     pub resolved: Vec<ResolvedResource>,
     pub unresolved: Vec<UnresolvedResource>,
 }
 
 /// Result of the shared post-expansion plan-construction seam.
-pub(crate) struct PostExpansionPlan {
+pub(crate) struct PostExpansionPlan<E> {
+    pub expanded_resources: ExpandedCanonicalResources<E>,
+    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub plan: Plan,
     /// `None` only when preprocessing produced plan diagnostics. Those plans
     /// abort before any resolved-resource consumer.
@@ -5019,14 +5040,13 @@ pub(crate) struct PostExpansionPlan {
 /// expansion.
 pub(crate) async fn build_post_expansion_plan<E>(
     input: PostExpansionPlanInput<'_, E>,
-) -> Result<PostExpansionPlan, AppError> {
+) -> Result<PostExpansionPlan<E>, AppError> {
     let PostExpansionPlanInput {
         context,
-        expanded_resources,
-        sorted_resources,
-        mut addressed,
-        mut data_source_values,
-        wait_aliases,
+        expansion,
+        environment,
+    } = input;
+    let PostExpansionPlanEnvironment {
         data_sources,
         provider,
         normalizer,
@@ -5037,8 +5057,19 @@ pub(crate) async fn build_post_expansion_plan<E>(
         resolved_state_block_targets,
         module_gate,
         preparation_errors,
+    } = environment;
+    let PostExpansionPlanView {
+        expanded_resources,
+        sorted_resources,
+        mut addressed,
+        mut data_source_values,
+        wait_aliases,
+        residual_deferred_for,
         deferred_create_targets,
-    } = input;
+        new_child_ids: _,
+        refreshable_child_ids: _,
+        printed_warnings: _,
+    } = expansion;
     let parsed = expanded_resources.parsed();
 
     // awscc#251 (follow-up to #3055): data sources do not flow through
@@ -5127,6 +5158,8 @@ pub(crate) async fn build_post_expansion_plan<E>(
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
         return Ok(PostExpansionPlan {
+            expanded_resources,
+            residual_deferred_for,
             plan,
             resources: None,
             compositions,
@@ -5248,10 +5281,10 @@ pub(crate) async fn build_post_expansion_plan<E>(
         .collect();
 
     Ok(PostExpansionPlan {
+        expanded_resources,
+        residual_deferred_for,
         plan,
         resources: Some(PostExpansionResolvedResources {
-            #[cfg(any(test, feature = "test-utils"))]
-            override_aware: override_aware_resources,
             resolved: resolved_resources,
             unresolved,
         }),
@@ -5262,6 +5295,51 @@ pub(crate) async fn build_post_expansion_plan<E>(
         moved_origins,
         prev_explicit,
     })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<E> ValidatedConfig<PostExpansionPlanView<E>> {
+    pub(crate) fn retain_fixture_deferred_for(
+        &mut self,
+        managed_bindings: &HashSet<String>,
+        non_managed: Vec<carina_core::parser::DeferredForExpression>,
+    ) {
+        self.resources
+            .inner
+            .deferred_create_targets
+            .retain(|target| {
+                target
+                    .template
+                    .root_bindings()
+                    .iter()
+                    .any(|binding| managed_bindings.contains(binding))
+            });
+        self.resources
+            .inner
+            .residual_deferred_for
+            .extend(non_managed);
+    }
+
+    /// Run the shared plan seam while retaining the exact fixture wiring that
+    /// validated and expanded the canonical resource pair.
+    pub(crate) async fn finish_post_expansion_plan(
+        self,
+        environment: PostExpansionPlanEnvironment<'_>,
+    ) -> Result<ValidatedConfig<PostExpansionPlan<E>>, AppError> {
+        let Self { wiring, resources } = self;
+        let context = wiring.context();
+        let resources = resources
+            .try_map_async_preserving_binding_use_resolution(|expansion| async move {
+                build_post_expansion_plan(PostExpansionPlanInput {
+                    context,
+                    expansion,
+                    environment,
+                })
+                .await
+            })
+            .await?;
+        Ok(ValidatedConfig { wiring, resources })
+    }
 }
 
 impl PreparedDeferredForExpansion {
@@ -5296,6 +5374,48 @@ impl PreparedDeferredForExpansion {
             warning_policy,
         )?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
+    }
+
+    /// Consume the prepared state and canonical pair as one plan-expansion
+    /// transition. The returned bundle is the only input accepted by the
+    /// shared post-expansion plan builder.
+    pub(crate) fn expand_for_plan<E: Clone>(
+        self,
+        resources: CanonicalResourcePair<E>,
+        schemas: &SchemaRegistry,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        warning_policy: DeferredForWarningPolicy,
+    ) -> Result<PostExpansionPlanView<E>, AppError> {
+        let (expanded_resources, expansion) =
+            self.expand(resources, schemas, remote_bindings, warning_policy)?;
+        let PreparedDeferredForExpansionParts {
+            addressed,
+            data_source_values,
+            wait_aliases,
+        } = self.into_parts();
+        let DeferredForExpansion {
+            sorted_resources,
+            residual_deferred_for,
+            #[cfg(test)]
+                residual_warnings: _,
+            deferred_create_targets,
+            new_child_ids,
+            refreshable_child_ids,
+            printed_warnings,
+            _expanded: _,
+        } = expansion;
+        Ok(PostExpansionPlanView {
+            expanded_resources,
+            sorted_resources,
+            addressed,
+            data_source_values,
+            wait_aliases,
+            residual_deferred_for,
+            deferred_create_targets,
+            new_child_ids,
+            refreshable_child_ids,
+            printed_warnings,
+        })
     }
 }
 
@@ -6134,30 +6254,12 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // here we perform the I/O half — targeted-refresh of the children
     // so a re-plan after they were applied sees their live state
     // instead of a phantom Create.
-    let (expanded_canonical_resources, expansion) = prepared_expansion.expand(
+    let mut plan_expansion = prepared_expansion.expand_for_plan(
         canonical_resources,
         ctx.schemas(),
         remote_bindings,
         DeferredForWarningPolicy::Print,
     )?;
-    let DeferredForExpansion {
-        sorted_resources: resorted,
-        residual_deferred_for,
-        #[cfg(test)]
-            residual_warnings: _,
-        deferred_create_targets,
-        new_child_ids,
-        refreshable_child_ids,
-        printed_warnings,
-        _expanded: _,
-    } = expansion;
-    let sorted_resources = resorted;
-    let PreparedDeferredForExpansionParts {
-        mut addressed,
-        mut data_source_values,
-        wait_aliases,
-    } = prepared_expansion.into_parts();
-    let parsed = expanded_canonical_resources.parsed();
 
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
@@ -6165,11 +6267,20 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // unterminated `✓` line. Tell the phase guard so its eventual close does
     // not add a second, spurious blank line on the deferred-for-with-warnings
     // TTY path (#3150 Round-4 finding). A child refresh below may re-open it.
-    if printed_warnings && let Some(refresh_phase) = refresh_phase.as_ref() {
+    if plan_expansion.printed_warnings
+        && let Some(refresh_phase) = refresh_phase.as_ref()
+    {
         refresh_phase.note_external_line();
     }
 
-    if !new_child_ids.is_empty() {
+    if !plan_expansion.new_child_ids.is_empty() {
+        let PostExpansionPlanView {
+            sorted_resources,
+            addressed,
+            data_source_values,
+            refreshable_child_ids,
+            ..
+        } = &mut plan_expansion;
         // Refresh only `refreshable_child_ids` (carina#3141): a child
         // that is also a `moved` target keeps the migrated state from
         // `materialize_moved_states`; re-reading it here (any of the
@@ -6177,7 +6288,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // `not_found`. `select` is the only constructor for the refresh
         // set — the apply path uses the same one, so the moved-exclusion
         // cannot diverge between the two paths (compile-time parity).
-        let children = || refreshable_child_ids.select(&sorted_resources, &addressed.orphans);
+        let children = || refreshable_child_ids.select(sorted_resources, &addressed.orphans);
         if let Some(refresh_phase) = refresh_phase.as_ref() {
             let projected_state = addressed.projected_state(state_file.as_ref());
             let child_saved_dep_bindings = HashMap::new();
@@ -6195,7 +6306,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             .await?;
             hydrate_prior_data_source_values(
                 &mut addressed.managed_current,
-                &mut data_source_values,
+                data_source_values,
                 &mut addressed.orphans,
                 &provider,
                 &addressed.saved_attrs,
@@ -6216,7 +6327,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             }
             hydrate_prior_data_source_values(
                 &mut addressed.managed_current,
-                &mut data_source_values,
+                data_source_values,
                 &mut addressed.orphans,
                 &provider,
                 &addressed.saved_attrs,
@@ -6233,8 +6344,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     }
 
     drop(refresh_phase);
-    let expansion_trace = parsed.expansion_trace.clone();
     let PostExpansionPlan {
+        expanded_resources,
+        residual_deferred_for,
         plan,
         resources,
         compositions,
@@ -6245,24 +6357,22 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         prev_explicit,
     } = build_post_expansion_plan(PostExpansionPlanInput {
         context: ctx,
-        expanded_resources: &expanded_canonical_resources,
-        sorted_resources,
-        addressed,
-        data_source_values,
-        wait_aliases,
-        data_sources: &data_sources,
-        provider: &provider,
-        normalizer: &provider,
-        provider_configs: raw_provider_configs,
-        remote_bindings,
-        state_file,
-        state_block_claims,
-        resolved_state_block_targets,
-        module_gate: &module_gate,
-        preparation_errors: refresh_module_constraint_errors,
-        deferred_create_targets,
+        expansion: plan_expansion,
+        environment: PostExpansionPlanEnvironment {
+            data_sources: &data_sources,
+            provider: &provider,
+            normalizer: &provider,
+            provider_configs: raw_provider_configs,
+            remote_bindings,
+            state_file,
+            state_block_claims,
+            resolved_state_block_targets,
+            module_gate: &module_gate,
+            preparation_errors: refresh_module_constraint_errors,
+        },
     })
     .await?;
+    let expansion_trace = expanded_resources.parsed().expansion_trace.clone();
     let (sorted_resources, unresolved_resources) = resources.map_or_else(
         || (Vec::new(), Vec::new()),
         |resources| (resources.resolved, resources.unresolved),
@@ -6290,7 +6400,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             residual_deferred_for,
             expansion_trace,
         },
-        expanded_canonical_resources,
+        expanded_resources,
     ))
 }
 

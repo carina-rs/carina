@@ -5,7 +5,7 @@ use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::identifier::canonical_create_only_value_string;
 use carina_core::plan::Plan;
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
-use carina_core::schema::SchemaRegistry;
+use carina_core::schema::{EffectiveAttribute, SchemaRegistry};
 use colored::Colorize;
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -13,15 +13,108 @@ use colored::Colorize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MovedBlockHint {
     /// Exactly one destroyed row pairs with exactly one created resource.
-    Suggest {
-        from: ResolvedResourceId,
-        to: ResolvedResourceId,
-    },
+    Suggest(MatchedPair),
     /// A connected group for which Carina cannot choose pairs safely.
-    Ambiguous {
-        from: Vec<ResolvedResourceId>,
-        to: Vec<ResolvedResourceId>,
+    Ambiguous(AmbiguousGroup),
+}
+
+/// One uniquely matched destroyed row and created resource.
+///
+/// Its fields and constructor are private so a caller cannot fabricate a
+/// cross-provider or cross-type suggestion outside detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedPair {
+    from: ResolvedResourceId,
+    to: ResolvedResourceId,
+}
+
+impl MatchedPair {
+    fn new(from: ResolvedResourceId, to: ResolvedResourceId) -> Option<Self> {
+        (from.provider() == to.provider()
+            && from.resource_type() == to.resource_type()
+            && from.provider_instance() == to.provider_instance())
+        .then_some(Self { from, to })
+    }
+
+    pub fn from(&self) -> &ResolvedResourceId {
+        &self.from
+    }
+
+    pub fn to(&self) -> &ResolvedResourceId {
+        &self.to
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NonEmptyResourceIds(Box<[ResolvedResourceId]>);
+
+impl NonEmptyResourceIds {
+    fn new(ids: Vec<ResolvedResourceId>) -> Option<Self> {
+        (!ids.is_empty()).then(|| Self(ids.into_boxed_slice()))
+    }
+
+    fn as_slice(&self) -> &[ResolvedResourceId] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MultipleResourceIds(Box<[ResolvedResourceId]>);
+
+impl MultipleResourceIds {
+    fn new(ids: Vec<ResolvedResourceId>) -> Option<Self> {
+        (ids.len() >= 2).then(|| Self(ids.into_boxed_slice()))
+    }
+
+    fn as_slice(&self) -> &[ResolvedResourceId] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AmbiguousMembers {
+    MultipleFrom {
+        from: MultipleResourceIds,
+        to: NonEmptyResourceIds,
     },
+    MultipleTo {
+        from: NonEmptyResourceIds,
+        to: MultipleResourceIds,
+    },
+}
+
+/// A connected match component with at least one candidate on both sides and
+/// at least two candidates on one side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousGroup(AmbiguousMembers);
+
+impl AmbiguousGroup {
+    fn new(from: Vec<ResolvedResourceId>, to: Vec<ResolvedResourceId>) -> Option<Self> {
+        if from.len() >= 2 {
+            return Some(Self(AmbiguousMembers::MultipleFrom {
+                from: MultipleResourceIds::new(from)?,
+                to: NonEmptyResourceIds::new(to)?,
+            }));
+        }
+        Some(Self(AmbiguousMembers::MultipleTo {
+            from: NonEmptyResourceIds::new(from)?,
+            to: MultipleResourceIds::new(to)?,
+        }))
+    }
+
+    pub fn from(&self) -> &[ResolvedResourceId] {
+        match &self.0 {
+            AmbiguousMembers::MultipleFrom { from, .. } => from.as_slice(),
+            AmbiguousMembers::MultipleTo { from, .. } => from.as_slice(),
+        }
+    }
+
+    pub fn to(&self) -> &[ResolvedResourceId] {
+        match &self.0 {
+            AmbiguousMembers::MultipleFrom { to, .. } => to.as_slice(),
+            AmbiguousMembers::MultipleTo { to, .. } => to.as_slice(),
+        }
+    }
 }
 
 /// Deterministically ordered moved-block diagnostics for one plan.
@@ -50,31 +143,30 @@ impl MovedBlockHints {
 impl fmt::Display for MovedBlockHint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Suggest { from, to } => {
-                let from = render_address(from);
-                let to = render_address(to);
+            Self::Suggest(pair) => {
+                let from = render_address(pair.from());
+                let to = render_address(pair.to());
                 writeln!(
                     f,
-                    "Warning: {from} is destroyed and {to} is created with matching create-only values; this replaces the existing resource."
+                    "Warning: this plan destroys {from} and creates {to}, whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:"
                 )?;
-                writeln!(f, "To keep it, add:")?;
                 writeln!(f)?;
                 writeln!(f, "  moved {{")?;
                 writeln!(f, "    from = {from}")?;
                 writeln!(f, "    to   = {to}")?;
                 write!(f, "  }}")
             }
-            Self::Ambiguous { from, to } => {
+            Self::Ambiguous(group) => {
                 writeln!(
                     f,
                     "Warning: the following destroyed and created resources have matching create-only values, but Carina cannot tell which pairs belong together:"
                 )?;
                 writeln!(f, "Destroyed:")?;
-                for id in from {
+                for id in group.from() {
                     writeln!(f, "  - {}", render_address(id))?;
                 }
                 writeln!(f, "Created:")?;
-                for id in to {
+                for id in group.to() {
                     writeln!(f, "  - {}", render_address(id))?;
                 }
                 write!(
@@ -100,6 +192,16 @@ impl fmt::Display for MovedBlockHints {
 }
 
 /// Detect possible explicit state moves without changing any plan effect.
+///
+/// Candidates must have the same provider, resource type, and provider
+/// instance. For each concrete create-only attribute configured on an
+/// [`Effect::Create`], detection compares its canonical value with the prior
+/// current state's value canonicalized through that same schema attribute.
+/// Resource identities and bindings are output only and never match keys.
+/// Create-only attributes omitted by configuration are ignored.
+/// `DeferredCreate` effects (including loops whose iterables remain unknown at
+/// plan time) are not candidates, and a resource with no configured
+/// create-only values never matches.
 pub fn detect_moved_block_hints<S>(
     plan: &Plan<S>,
     prior: &HashMap<ResourceId, Current>,
@@ -207,12 +309,18 @@ pub fn detect_moved_block_hints<S>(
         to.sort_by_key(render_address);
         let sort_key = render_address(&from[0]);
         let hint = if from.len() == 1 && to.len() == 1 {
-            MovedBlockHint::Suggest {
-                from: from.pop().expect("one source"),
-                to: to.pop().expect("one destination"),
-            }
+            MovedBlockHint::Suggest(
+                MatchedPair::new(
+                    from.pop().expect("one source"),
+                    to.pop().expect("one destination"),
+                )
+                .expect("a graph edge has one provider, type, and provider instance"),
+            )
         } else {
-            MovedBlockHint::Ambiguous { from, to }
+            MovedBlockHint::Ambiguous(
+                AmbiguousGroup::new(from, to)
+                    .expect("a non-unique connected component is ambiguous"),
+            )
         };
         components.push((sort_key, hint));
     }
@@ -231,9 +339,14 @@ struct DestroyCandidate<'a> {
     attributes: &'a HashMap<String, Value>,
 }
 
-struct CreateCandidate {
+struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
-    create_only_values: Vec<(String, String)>,
+    create_only_values: Vec<CreateOnlyValue<'schema>>,
+}
+
+struct CreateOnlyValue<'schema> {
+    attribute: EffectiveAttribute<'schema>,
+    desired: String,
 }
 
 enum GraphNode {
@@ -250,11 +363,11 @@ fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
     }
 }
 
-fn create_candidate<S>(
+fn create_candidate<'schema, S>(
     created: &ResolvedResource<S>,
-    schemas: &SchemaRegistry,
-) -> Option<CreateCandidate> {
-    let schema = schemas.get_for(created.as_resource())?;
+    schemas: &'schema SchemaRegistry,
+) -> Option<CreateCandidate<'schema>> {
+    let schema = schemas.get_for(created.as_resource())?.schema();
     let create_only_attributes = schema.as_schema().create_only_attributes();
     if create_only_attributes.is_empty() {
         return None;
@@ -266,7 +379,10 @@ fn create_candidate<S>(
             continue;
         };
         let desired_value = canonical_create_only_value_string(desired_value)?;
-        create_only_values.push((attribute.to_string(), desired_value));
+        create_only_values.push(CreateOnlyValue {
+            attribute: schema.effective_attribute(attribute)?,
+            desired: desired_value,
+        });
     }
     if create_only_values.is_empty() {
         return None;
@@ -282,7 +398,7 @@ fn create_candidate<S>(
 /// Desired attributes omitted by configuration are intentionally ignored, so
 /// a match means the compared values agree, not that the full states are
 /// identical.
-fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate) -> bool {
+fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'_>) -> bool {
     if destroyed.id.provider() != created.id.provider()
         || destroyed.id.resource_type() != created.id.resource_type()
         || destroyed.id.provider_instance() != created.id.provider_instance()
@@ -290,15 +406,17 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate) 
         return false;
     }
 
-    for (attribute, desired_value) in &created.create_only_values {
+    for create_only in &created.create_only_values {
         let Some(prior_value) = destroyed
             .attributes
-            .get(attribute)
-            .and_then(canonical_create_only_value_string)
+            .get(create_only.attribute.name())
+            .cloned()
+            .map(|value| create_only.attribute.canonicalize_state(value))
+            .and_then(|value| canonical_create_only_value_string(&value))
         else {
             return false;
         };
-        if desired_value != &prior_value {
+        if create_only.desired != prior_value {
             return false;
         }
     }
@@ -346,10 +464,13 @@ mod tests {
     use carina_core::plan::Plan;
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
-        ConcreteValue, Current, DeferredValue, DeposedKey, Directives, ResolvedResource,
-        ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, UnknownReason, Value,
+        ConcreteValue, Current, DeferredValue, DeposedKey, Directives, EnumValueResolver,
+        ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State,
+        UnknownReason, Value,
     };
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+    };
 
     use super::{MovedBlockHint, detect_moved_block_hints};
 
@@ -423,14 +544,20 @@ mod tests {
     }
 
     fn hint_addresses(hints: &[MovedBlockHint]) -> (Vec<String>, Vec<String>) {
-        let [MovedBlockHint::Ambiguous { from, to }] = hints else {
+        let [MovedBlockHint::Ambiguous(group)] = hints else {
             panic!("expected exactly one ambiguous hint, got {hints:?}");
         };
         (
-            from.iter()
+            group
+                .from()
+                .iter()
                 .map(|id| id.identity_str().to_string())
                 .collect(),
-            to.iter().map(|id| id.identity_str().to_string()).collect(),
+            group
+                .to()
+                .iter()
+                .map(|id| id.identity_str().to_string())
+                .collect(),
         )
     }
 
@@ -449,11 +576,11 @@ mod tests {
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas(true));
 
-        let [MovedBlockHint::Suggest { from, to }] = hints.as_slice() else {
+        let [MovedBlockHint::Suggest(pair)] = hints.as_slice() else {
             panic!("expected one suggestion, got {hints:?}");
         };
-        assert_eq!(from.identity_str(), "old_vpc");
-        assert_eq!(to.identity_str(), "vpcs[0]");
+        assert_eq!(pair.from().identity_str(), "old_vpc");
+        assert_eq!(pair.to().identity_str(), "vpcs[0]");
     }
 
     #[test]
@@ -541,6 +668,59 @@ mod tests {
     }
 
     #[test]
+    fn enum_create_only_value_matches_raw_state_api_string() {
+        let mut plan = Plan::new();
+        let mut prior = HashMap::new();
+        let old_id = id("validation_record", None);
+        add_delete(
+            &mut plan,
+            &mut prior,
+            old_id.clone(),
+            CIDR,
+            EffectGeneration::Current,
+        );
+        let prior_attributes = prior
+            .get_mut(old_id.as_inner())
+            .and_then(Current::attributes_mut)
+            .expect("test prior has attributes");
+        prior_attributes.clear();
+        prior_attributes.insert("type".to_string(), concrete_string("CNAME"));
+
+        let enum_identity = TypeIdentity::new(Some(PROVIDER), ["route53", "RecordSet"], "Type");
+        let enum_type = AttributeType::enum_(
+            enum_identity,
+            Some(vec!["CNAME".to_string()]),
+            vec![("CNAME".to_string(), "cname".to_string())],
+            None,
+            None,
+        );
+        let canonical = EnumValueResolver::new(&enum_type)
+            .resolve_state_text("CNAME")
+            .expect("CNAME is a declared enum API value");
+        let desired = Resource::from_id(id("validation_records[0]", None).into_inner())
+            .with_attribute(
+                "type",
+                Value::Concrete(ConcreteValue::CanonicalEnum(canonical)),
+            );
+        plan.add(Effect::Create(ResolvedResource::new(desired)));
+
+        let schema = ResourceSchema::new(RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::optional("type", enum_type)
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("test enum schema must validate");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(PROVIDER, schema);
+
+        let hints = detect_moved_block_hints(&plan, &prior, &schemas);
+
+        assert!(matches!(hints.as_slice(), [MovedBlockHint::Suggest(_)]));
+    }
+
+    #[test]
     fn differing_create_only_name_value_produces_no_hint() {
         let mut plan = Plan::new();
         let mut prior = HashMap::new();
@@ -618,7 +798,7 @@ mod tests {
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas);
 
-        assert!(matches!(hints.as_slice(), [MovedBlockHint::Suggest { .. }]));
+        assert!(matches!(hints.as_slice(), [MovedBlockHint::Suggest(_)]));
     }
 
     #[test]
@@ -733,10 +913,10 @@ mod tests {
         ];
 
         for (from_name, to_name) in cases {
-            let hint = MovedBlockHint::Suggest {
-                from: id(from_name, None),
-                to: id(to_name, None),
-            };
+            let hint = MovedBlockHint::Suggest(
+                super::MatchedPair::new(id(from_name, None), id(to_name, None))
+                    .expect("test addresses share a provider, type, and instance"),
+            );
             let rendered = hint.to_string();
             let block = rendered
                 .lines()

@@ -1,6 +1,6 @@
 ---
 source: carina-cli/src/plan_snapshot_tests.rs
-expression: output
+expression: moved_hint_snapshot_output(&fp)
 ---
 Execution Plan:
 
@@ -11,8 +11,7 @@ Execution Plan:
 
 Plan: 1 to add, 0 to change, 1 to destroy.
 
-Warning: awscc.ec2.Vpc 'old_vpc' is destroyed and awscc.ec2.Vpc 'vpcs[0]' is created with matching create-only values; this replaces the existing resource.
-To keep it, add:
+Warning: this plan destroys awscc.ec2.Vpc 'old_vpc' and creates awscc.ec2.Vpc 'vpcs[0]', whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:
 
   moved {
     from = awscc.ec2.Vpc 'old_vpc'

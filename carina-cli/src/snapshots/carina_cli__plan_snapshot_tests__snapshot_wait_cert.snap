@@ -13,6 +13,6 @@ Execution Plan:
       name: '_acme.registry.example.com'
       resource_records: ['validation.example.com']
       ttl: 60
-      type: 'CNAME'
+      type: CNAME
 
 Plan: 2 to add, 0 to change, 0 to destroy.

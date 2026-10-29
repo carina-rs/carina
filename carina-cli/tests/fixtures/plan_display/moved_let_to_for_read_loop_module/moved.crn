@@ -1,0 +1,4 @@
+moved {
+  from = aws.route53.RecordSet 'r.validation_record'
+  to   = aws.route53.RecordSet 'r.validation_records[0]'
+}

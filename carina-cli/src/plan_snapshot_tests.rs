@@ -1316,7 +1316,7 @@ fn snapshot_moved_pure() {
     insta::assert_snapshot!(output);
 }
 
-fn assert_pure_move_snapshot(fixture: &str) -> FixturePlan {
+fn assert_pure_move_snapshot(fixture: &str, expected_loop_identity: &str) -> FixturePlan {
     let fp = build_plan_from_fixture_name(fixture);
     let summary = fp.plan.summary();
     assert_eq!(summary.create, 0, "{fixture} unexpectedly creates");
@@ -1326,6 +1326,12 @@ fn assert_pure_move_snapshot(fixture: &str) -> FixturePlan {
         fp.moved_hints.is_empty(),
         "an explicit move must not produce a hint: {:?}",
         fp.moved_hints
+    );
+    assert!(
+        fp.desired_resources
+            .iter()
+            .any(|resource| resource.resolved_id().identity_str() == expected_loop_identity),
+        "{fixture} must materialize {expected_loop_identity} in desired resources"
     );
     let output = strip_ansi(&format_plan(
         &fp.plan,
@@ -1362,11 +1368,82 @@ fn moved_hint_snapshot_output(fp: &FixturePlan) -> String {
     strip_ansi(&format!("{plan_output}{}", fp.moved_hints))
 }
 
+fn assert_suggested_move_snapshot(
+    fixture: &str,
+    expected_from: &str,
+    expected_to: &str,
+) -> FixturePlan {
+    let fp = build_plan_from_fixture_name(fixture);
+    assert!(
+        fp.desired_resources
+            .iter()
+            .any(|resource| resource.resolved_id().identity_str() == expected_to),
+        "{fixture} must materialize {expected_to} in desired resources"
+    );
+    let summary = fp.plan.summary();
+    assert_eq!(summary.create, 1, "{fixture} must create one resource");
+    assert_eq!(summary.delete, 1, "{fixture} must destroy one resource");
+    assert_eq!(summary.moved, 0, "{fixture} must not contain a move");
+    let [MovedBlockHint::Suggest(pair)] = fp.moved_hints.as_slice() else {
+        panic!(
+            "expected one move suggestion for {fixture}: {:?}",
+            fp.moved_hints
+        );
+    };
+    assert_eq!(pair.from().identity_str(), expected_from);
+    assert_eq!(pair.to().identity_str(), expected_to);
+
+    insta::assert_snapshot!(
+        format!("snapshot_{fixture}"),
+        moved_hint_snapshot_output(&fp)
+    );
+    fp
+}
+
+fn assert_suggestion_round_trips(hint: &MovedBlockHint, expected_from: &str, expected_to: &str) {
+    let rendered = hint.to_string();
+    let block = rendered
+        .lines()
+        .skip_while(|line| *line != "  moved {")
+        .take(5)
+        .map(|line| line.strip_prefix("  ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = format!("provider aws {{}}\n\n{block}\n");
+    let parsed = carina_core::parser::parse_file(
+        &source,
+        std::path::Path::new("module-moved-hint-round-trip.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .unwrap_or_else(|error| panic!("rendered block did not parse:\n{block}\n{error}"));
+    assert!(
+        parsed.warnings.is_empty(),
+        "rendered block produced parser warnings:\n{block}\n{:?}",
+        parsed.warnings
+    );
+    let [carina_core::parser::StateBlock::Moved { addresses }] = parsed.state_blocks.as_slice()
+    else {
+        panic!("expected one parsed moved block: {:?}", parsed.state_blocks);
+    };
+    let from = addresses.from();
+    let to = addresses.to();
+    assert_eq!(
+        (from.provider.as_str(), from.resource_type.as_str()),
+        ("aws", "route53.RecordSet")
+    );
+    assert_eq!(
+        (to.provider.as_str(), to.resource_type.as_str()),
+        ("aws", "route53.RecordSet")
+    );
+    assert_eq!(from.name_str(), expected_from);
+    assert_eq!(to.name_str(), expected_to);
+}
+
 /// Moving a named resource into one element of a bound `for` expression is a
 /// state-only move when the user supplies the exact expanded address.
 #[test]
 fn snapshot_moved_let_to_for_bound() {
-    assert_pure_move_snapshot("moved_let_to_for_bound");
+    assert_pure_move_snapshot("moved_let_to_for_bound", "vpcs[0]");
 }
 
 /// The `_for{N}` address is positional and tracked in carina-rs/carina#4109.
@@ -1374,22 +1451,23 @@ fn snapshot_moved_let_to_for_bound() {
 /// counter merely to make the fixture pass.
 #[test]
 fn snapshot_moved_let_to_for_unbound() {
-    assert_pure_move_snapshot("moved_let_to_for_unbound");
+    assert_pure_move_snapshot("moved_let_to_for_unbound", "_for0[0]");
 }
 
 /// A loop expanded from a list held in live resource state accepts the same
 /// explicit move and remains a pure state operation.
 #[test]
 fn snapshot_moved_let_to_for_read_loop() {
-    let fp = assert_pure_move_snapshot("moved_let_to_for_read_loop");
-    assert!(
-        fp.desired_resources.iter().any(|resource| {
-            let id = resource.resolved_id();
-            id.provider() == "aws"
-                && id.resource_type() == "route53.RecordSet"
-                && id.identity_str() == "validation_records[0]"
-        }),
-        "read-loop fixture must materialize validation_records[0] in desired resources"
+    assert_pure_move_snapshot("moved_let_to_for_read_loop", "validation_records[0]");
+}
+
+/// The production certificate-validation rewrite also works inside a module
+/// instance, preserving the module prefix on both moved addresses.
+#[test]
+fn snapshot_moved_let_to_for_read_loop_module() {
+    assert_pure_move_snapshot(
+        "moved_let_to_for_read_loop_module",
+        "r.validation_records[0]",
     );
 }
 
@@ -1398,17 +1476,7 @@ fn snapshot_moved_let_to_for_read_loop() {
 /// those effects.
 #[test]
 fn snapshot_moved_hint_let_to_for() {
-    let fp = build_plan_from_fixture_name("moved_hint_let_to_for");
-    let summary = fp.plan.summary();
-    assert_eq!(summary.create, 1);
-    assert_eq!(summary.delete, 1);
-    assert_eq!(summary.moved, 0);
-    let output = moved_hint_snapshot_output(&fp);
-    insta::assert_snapshot!(output);
-    assert!(matches!(
-        fp.moved_hints.as_slice(),
-        [MovedBlockHint::Suggest { .. }]
-    ));
+    assert_suggested_move_snapshot("moved_hint_let_to_for", "old_vpc", "vpcs[0]");
 }
 
 /// Multiple matching destroys and creates form one connected component. The
@@ -1424,7 +1492,7 @@ fn snapshot_moved_hint_ambiguous() {
     insta::assert_snapshot!(output);
     assert!(matches!(
         fp.moved_hints.as_slice(),
-        [MovedBlockHint::Ambiguous { .. }]
+        [MovedBlockHint::Ambiguous(_)]
     ));
     assert!(
         !output.contains("moved {"),
@@ -1436,30 +1504,26 @@ fn snapshot_moved_hint_ambiguous() {
 /// its loop child, replace the old record, and suggest the exact state move.
 #[test]
 fn snapshot_moved_hint_read_loop() {
-    let fp = build_plan_from_fixture_name("moved_hint_read_loop");
-    assert!(
-        fp.desired_resources.iter().any(|resource| {
-            let id = resource.resolved_id();
-            id.provider() == "aws"
-                && id.resource_type() == "route53.RecordSet"
-                && id.identity_str() == "validation_records[0]"
-        }),
-        "read-loop hint fixture must materialize validation_records[0]"
+    assert_suggested_move_snapshot(
+        "moved_hint_read_loop",
+        "validation_record",
+        "validation_records[0]",
     );
-    let summary = fp.plan.summary();
-    assert_eq!(summary.create, 1);
-    assert_eq!(summary.delete, 1);
-    assert_eq!(summary.moved, 0);
-    let [MovedBlockHint::Suggest { from, to }] = fp.moved_hints.as_slice() else {
-        panic!(
-            "expected one read-loop move suggestion: {:?}",
-            fp.moved_hints
-        );
-    };
-    assert_eq!(from.identity_str(), "validation_record");
-    assert_eq!(to.identity_str(), "validation_records[0]");
+}
 
-    insta::assert_snapshot!(moved_hint_snapshot_output(&fp));
+/// Without an explicit move, a module-scoped read loop keeps the module prefix
+/// in both the diagnostic and the parseable moved block it renders.
+#[test]
+fn snapshot_moved_hint_read_loop_module() {
+    let fp = assert_suggested_move_snapshot(
+        "moved_hint_read_loop_module",
+        "r.validation_record",
+        "r.validation_records[0]",
+    );
+    let [hint @ MovedBlockHint::Suggest(_)] = fp.moved_hints.as_slice() else {
+        unreachable!("the shared helper asserted one suggestion")
+    };
+    assert_suggestion_round_trips(hint, "r.validation_record", "r.validation_records[0]");
 }
 
 /// Production-ordered fixture for RC2 claims precedence: the state row's

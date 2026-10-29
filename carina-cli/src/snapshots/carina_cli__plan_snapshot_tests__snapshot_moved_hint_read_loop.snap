@@ -15,12 +15,11 @@ Execution Plan:
       name: '_acme.registry.example.com'
       resource_records: ['_validation.example.com']
       ttl: 60
-      type: 'CNAME'
+      type: CNAME
 
 Plan: 1 to add, 0 to change, 1 to destroy.
 
-Warning: aws.route53.RecordSet 'validation_record' is destroyed and aws.route53.RecordSet 'validation_records[0]' is created with matching create-only values; this replaces the existing resource.
-To keep it, add:
+Warning: this plan destroys aws.route53.RecordSet 'validation_record' and creates aws.route53.RecordSet 'validation_records[0]', whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:
 
   moved {
     from = aws.route53.RecordSet 'validation_record'
