@@ -202,6 +202,22 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
     }
 }
 
+/// Source-driven inputs needed to resolve exports after apply.
+///
+/// Keeping these values in one bundle makes it impossible to request export
+/// resolution without both the live data-source view and live resources.
+/// The default [`Resource`] parameter is [`ModuleSource`], so saved-plan
+/// resources cannot enter the live export-resolution path.
+pub(crate) struct ExportResolutionInputs<'a> {
+    pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::InferredExportParam,
+    >,
+    /// Total post-read outcomes. Apply-time reads replace their deferred
+    /// entries before this reaches export resolution.
+    pub data_source_values: &'a DataSourceValues,
+    pub resources: &'a [Resource],
+}
+
 /// Input parameters for `finalize_apply`.
 ///
 /// Groups the execution result, resource data, and backend configuration
@@ -210,13 +226,7 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     pub result: &'a ExecutionResult<S>,
     pub state_base: FinalStateBase,
     pub state_save_inputs: Arc<ApplyStateSaveInputs<S>>,
-    /// Total post-read outcomes. Apply-time reads replace their deferred
-    /// entries before this reaches export resolution.
-    pub data_source_values: Option<&'a DataSourceValues>,
-    pub export_resources: Option<&'a [Resource]>,
-    pub backend: &'a dyn StateBackend,
-    pub lock: StateLockRef<'a>,
-    /// `Some(params)` rebuilds `state.exports` from the source
+    /// `Some(inputs)` rebuilds `state.exports` from the source
     /// configuration's `exports {}` block — empty `params` clears the
     /// map (#2932). `None` preserves the existing `state.exports` and
     /// is used by `apply --plan` because saved plan files do not
@@ -224,11 +234,9 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     /// neither resolves nor wipes them, leaving the prior values
     /// intact for the next source-driven `carina apply` to
     /// reconcile.
-    pub export_params: Option<
-        &'a carina_core::validation::ExportsCheckedPreApply<
-            carina_core::parser::InferredExportParam,
-        >,
-    >,
+    pub export_resolution_inputs: Option<ExportResolutionInputs<'a>>,
+    pub backend: &'a dyn StateBackend,
+    pub lock: StateLockRef<'a>,
     /// Provider-aware builtin context used when post-apply bindings make a
     /// previously deferred export expression concrete.
     pub provider_context: &'a carina_core::parser::ProviderContext,
@@ -238,7 +246,7 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     /// at writeback, the same passthrough the plan path now applies.
     /// Empty when the configuration declares no `wait` bindings, or
     /// for the `apply --plan` path that has no source-side wait view
-    /// (paired with `export_params: None`, so no export resolution
+    /// (paired with `export_resolution_inputs: None`, so no export resolution
     /// runs there anyway).
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
     /// Pre-resolve snapshot of every `LiveComposition` in the
@@ -258,7 +266,7 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     /// that head-of-pipeline pass, so the export-resolution path
     /// (#3169 / #3177) can re-resolve compositions against the
     /// post-apply state. Empty for the `apply --plan` path, where
-    /// `export_params` is also `None` and no export resolution
+    /// `export_resolution_inputs` is also `None` and no export resolution
     /// runs.
     pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
 }

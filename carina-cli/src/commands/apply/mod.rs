@@ -70,8 +70,9 @@ use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt, format_duration,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
-    SkippedExports, materialize_exports, resolve_export_values_post_apply,
+    ApplyStateSaveInputs, ExportResolutionInputs, FinalizeApplyInput, PostApplyStates,
+    ResolveExportValuesPostApplyInput, SkippedExports, materialize_exports,
+    resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -891,26 +892,20 @@ pub(crate) async fn finalize_apply<S: Clone>(
         .state_save_inputs
         .build_state(input.state_base.into_state(), input.result)?;
 
-    // `Some([])` is meaningful: the user removed the `exports {}` block,
+    // `Some` with empty export params is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
     // (#2932). `None` preserves `state.exports` because the caller has
     // no source-side view of which exports the user intends — see the
-    // `FinalizeApplyInput::export_params` doc-comment.
-    let export_resolution = if let Some(params) = input.export_params {
-        let data_source_values = input.data_source_values.ok_or_else(|| {
-            AppError::Validation("export resolution requires live data-source values".to_string())
-        })?;
-        let export_resources = input.export_resources.ok_or_else(|| {
-            AppError::Validation("export resolution requires live resources".to_string())
-        })?;
+    // `FinalizeApplyInput::export_resolution_inputs` doc-comment.
+    let export_resolution = if let Some(export_inputs) = input.export_resolution_inputs {
         let post_apply_states = PostApplyStates::from_current_and_state(
             &input.result.managed_current,
-            data_source_values,
+            export_inputs.data_source_values,
             &state,
         );
         resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
-            export_params: params,
-            sorted_resources: export_resources,
+            export_params: export_inputs.export_params,
+            sorted_resources: export_inputs.resources,
             pre_resolve_compositions: input.pre_resolve_compositions,
             post_apply_states: &post_apply_states,
             schemas: input.state_save_inputs.schemas(),
@@ -2576,11 +2571,13 @@ async fn run_apply_locked_owned(
                                 result: &result,
                                 state_base,
                                 state_save_inputs,
-                                data_source_values: Some(&data_source_values),
-                                export_resources: Some(&export_resources),
+                                export_resolution_inputs: Some(ExportResolutionInputs {
+                                    export_params: &checked_exports,
+                                    data_source_values: &data_source_values,
+                                    resources: &export_resources,
+                                }),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                export_params: Some(&checked_exports),
                                 provider_context,
                                 wait_aliases: &wait_aliases,
                                 pre_resolve_compositions: &pre_resolve_compositions,
@@ -3765,23 +3762,20 @@ async fn run_apply_from_plan_locked_owned(
                                 result: &result,
                                 state_base,
                                 state_save_inputs,
-                                data_source_values: None,
-                                export_resources: None,
+                                // Saved plan files do not persist export parameters today, so
+                                // preserve `state.exports` rather than wiping it. Source-driven
+                                // `carina apply` reconciles exports from the `.crn` directly
+                                // (#2932).
+                                export_resolution_inputs: None,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                // Saved plan files do not persist `export_params` today, so
-                                // pass `None` to preserve `state.exports` rather than wipe it.
-                                // Source-driven `carina apply` reconciles exports from the
-                                // `.crn` directly (#2932).
-                                export_params: None,
                                 provider_context: &provider_context,
-                                // No export resolution runs here (export_params is None), but
-                                // the field is required; pass the reconstructed aliases so the
-                                // value is correct if a future plan file persists export_params.
+                                // No export resolution runs here, but pass the reconstructed
+                                // aliases so the value is correct if a future plan file persists
+                                // export parameters.
                                 wait_aliases: &wait_aliases,
-                                // Same rationale as `export_params: None`: no export
-                                // resolution runs from the `apply --plan` path, so no
-                                // pre-resolve composition snapshot is needed.
+                                // No pre-resolve composition snapshot is needed without export
+                                // resolution in the `apply --plan` path.
                                 pre_resolve_compositions: &[],
                             },
                             persistence,
