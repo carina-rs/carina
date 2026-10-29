@@ -37,3 +37,57 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# The CI Test job spends ~80% of its nextest time in mock-provider WASM
+# compilation with unoptimized wasmtime/Cranelift and secret e2e tests with
+# unoptimized Argon2. Optimize only these hot dependency crates: measured
+# carina-plugin-host's 328 tests at 169s -> 54s and the CLI secret e2e tests
+# at 18.3s -> 3.2s. This changes no test or program behavior; [profile.test]
+# inherits these package overrides from [profile.dev], and release is unaffected.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+
+[profile.dev.package.cranelift-control]
+opt-level = 3
+
+[profile.dev.package.cranelift-assembler-x64]
+opt-level = 3
+
+[profile.dev.package.cranelift-native]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-core]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
