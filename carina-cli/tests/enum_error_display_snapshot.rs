@@ -17,7 +17,7 @@
 //! provider plugin binary — the goal is to lock the renderer, not to
 //! exercise the CLI driver.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
@@ -28,7 +28,7 @@ use carina_core::schema::{
 };
 
 fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
-    ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+    ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
         .expect("test config type must be valid")
         .rootless_type("value")
         .expect("test config type must exist")

@@ -168,6 +168,320 @@ fn read_saved_plan(path: &Path) -> (Value, PlanFile) {
     (json, plan)
 }
 
+fn write_nested_secret_tree(checkout: &Path) -> PathBuf {
+    let config = checkout.join("infra/env");
+    let outer = checkout.join("modules/outer");
+    let inner = checkout.join("modules/inner");
+    for directory in [&config, &outer, &inner] {
+        fs::create_dir_all(directory).expect("create copied-tree fixture directory");
+    }
+    fs::write(
+        config.join("main.crn"),
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let outer = use { source = '../../modules/outer' }
+let wrapper = outer { label = "public" }
+"#,
+    )
+    .expect("write copied-tree root configuration");
+    fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  label: String
+}
+
+let inner = use { source = '../inner' }
+
+let nested = inner {
+  value = secret("PORTABLE_NESTED_SECRET_4041")
+}
+"#,
+    )
+    .expect("write copied-tree outer module");
+    fs::write(
+        inner.join("main.crn"),
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "portable-nested"
+  comment = value
+}
+"#,
+    )
+    .expect("write copied-tree inner module");
+    config
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create copied checkout directory");
+    for entry in fs::read_dir(source).expect("read source checkout") {
+        let entry = entry.expect("read source checkout entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("read entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy checkout file");
+        }
+    }
+}
+
+fn run_in_checkout(checkout: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(checkout)
+        .env("NO_COLOR", "1")
+        .env(
+            "CARINA_MOCK_STATE_FILE",
+            checkout.join("mock-provider-state.json"),
+        )
+        .env_remove("CLICOLOR_FORCE")
+        .args(args)
+        .output()
+        .expect("run carina in copied-tree checkout")
+}
+
+fn saved_call_location(call: &Value) -> String {
+    format!(
+        "{}:{}:{}",
+        call["source_file"]["path"]
+            .as_str()
+            .expect("saved call source path"),
+        call["call_span"]["start_line"]
+            .as_u64()
+            .expect("saved call start line"),
+        call["call_span"]["start_column"]
+            .as_u64()
+            .expect("saved call start column"),
+    )
+}
+
+#[test]
+fn saved_nested_secret_plan_with_parent_module_path_applies_after_tree_copy() {
+    let source_temp = tempfile::tempdir().expect("source checkout tempdir");
+    let source_checkout = source_temp.path().join("checkout");
+    let source_config = write_nested_secret_tree(&source_checkout);
+    assert_success(
+        "carina init source checkout",
+        &run_in_checkout(&source_checkout, &["init", "infra/env"]),
+    );
+    assert_success(
+        "carina plan source checkout",
+        &run_in_checkout(
+            &source_checkout,
+            &["plan", "--out", "infra/env/plan.json", "infra/env"],
+        ),
+    );
+
+    let source_plan_path = source_config.join("plan.json");
+    let source_plan_text = fs::read_to_string(&source_plan_path).expect("read source saved plan");
+    let source_plan_json: Value =
+        serde_json::from_str(&source_plan_text).expect("parse source saved plan");
+    let source_modules = source_checkout
+        .join("modules")
+        .canonicalize()
+        .expect("canonical source modules");
+    assert!(
+        !source_plan_text.contains(&source_modules.display().to_string()),
+        "saved plan JSON leaked an absolute module path {}:\n{source_plan_text}",
+        source_modules.display(),
+    );
+    for composition in source_plan_json["compositions"]
+        .as_array()
+        .expect("saved compositions")
+    {
+        let origin = &composition["origin_id"];
+        let mut calls = vec![&origin["root"]];
+        calls.extend(
+            origin["descendants"]
+                .as_array()
+                .expect("saved origin descendants"),
+        );
+        for call in calls {
+            let path = call["source_file"]["path"]
+                .as_str()
+                .expect("saved call source path");
+            assert!(
+                !Path::new(path).is_absolute(),
+                "saved plan JSON contains an absolute composition source path {path:?}",
+            );
+        }
+    }
+    let nested = source_plan_json["compositions"]
+        .as_array()
+        .expect("saved compositions")
+        .iter()
+        .find(|composition| composition["binding"] == "wrapper.nested")
+        .expect("saved nested composition");
+    assert_eq!(
+        nested["origin_id"]["descendants"][0]["source_file"]["path"],
+        "../../modules/outer/main.crn",
+        "the external module file must be normalized relative to the source root",
+    );
+
+    let destination_temp = tempfile::tempdir().expect("destination checkout tempdir");
+    let destination_checkout = destination_temp.path().join("checkout");
+    copy_tree(&source_checkout, &destination_checkout);
+    let destination_config = destination_checkout.join("infra/env");
+    let destination_plan_path = destination_config.join("plan.json");
+
+    // Saved plans record the selected project separately from composition
+    // identity. Rebind that existing field to the copied checkout so this
+    // regression isolates whether nested call identities are portable.
+    let mut copied_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&destination_plan_path).expect("read copied saved plan"),
+    )
+    .expect("parse copied saved plan");
+    copied_plan["source_path"] = Value::String(destination_config.display().to_string());
+    fs::write(
+        &destination_plan_path,
+        serde_json::to_vec_pretty(&copied_plan).expect("serialize rebound copied plan"),
+    )
+    .expect("write rebound copied plan");
+
+    assert_success(
+        "carina apply copied saved plan",
+        &run_in_checkout(
+            &destination_checkout,
+            &["apply", "--auto-approve", "infra/env/plan.json"],
+        ),
+    );
+}
+
+#[test]
+fn moved_root_call_error_lists_saved_root_to_immediate_chain() {
+    let temp = tempfile::tempdir().expect("moved-call fixture tempdir");
+    let checkout = temp.path().join("checkout");
+    let config = write_nested_secret_tree(&checkout);
+    assert_success(
+        "carina init moved-call fixture",
+        &run_in_checkout(&checkout, &["init", "infra/env"]),
+    );
+    assert_success(
+        "carina plan moved-call fixture",
+        &run_in_checkout(
+            &checkout,
+            &["plan", "--out", "infra/env/plan.json", "infra/env"],
+        ),
+    );
+
+    let (saved_json, _) = read_saved_plan(&config.join("plan.json"));
+    let nested = saved_json["compositions"]
+        .as_array()
+        .expect("saved compositions")
+        .iter()
+        .find(|composition| composition["binding"] == "wrapper.nested")
+        .expect("saved nested secret composition");
+    let root_location = saved_call_location(&nested["origin_id"]["root"]);
+    let immediate_location = saved_call_location(
+        nested["origin_id"]["descendants"]
+            .as_array()
+            .expect("saved descendants")
+            .last()
+            .expect("saved immediate call"),
+    );
+
+    let root_path = config.join("main.crn");
+    let original = fs::read_to_string(&root_path).expect("read root configuration");
+    fs::write(&root_path, format!("# root call moved\n{original}")).expect("move root call span");
+
+    let apply = run_in_checkout(
+        &checkout,
+        &["apply", "--auto-approve", "infra/env/plan.json"],
+    );
+    assert!(
+        !apply.status.success(),
+        "a moved root call must invalidate secret rehydration"
+    );
+    let message = output_text(&apply);
+    let expected_chain = format!("{root_location} -> {immediate_location}");
+    for expected in [&expected_chain, "carina plan"] {
+        assert!(
+            message.contains(expected),
+            "moved-call diagnostic must contain {expected:?}:\n{message}",
+        );
+    }
+}
+
+fn assert_relative_project_path_saved_plan_applies(project_arg: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("infra/foo");
+    let module = project.join("module");
+    fs::create_dir_all(&module).expect("create nested project");
+    fs::write(
+        project.join("main.crn"),
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let component = use { source = "./module" }
+let instance = component {
+  value = secret("RELATIVE_PROJECT_SECRET_4041")
+}
+"#,
+    )
+    .expect("write root configuration");
+    fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "relative-project"
+  comment = value
+}
+"#,
+    )
+    .expect("write module configuration");
+
+    let mock_state = temp.path().join("mock-provider-state.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(temp.path())
+            .env("NO_COLOR", "1")
+            .env("CARINA_MOCK_STATE_FILE", &mock_state)
+            .env_remove("CLICOLOR_FORCE")
+            .args(args)
+            .output()
+            .expect("run carina from project parent")
+    };
+
+    assert_success("carina init relative project", &run(&["init", project_arg]));
+    assert_success(
+        "carina plan relative project",
+        &run(&["plan", "--out", "plan.json", project_arg]),
+    );
+
+    let (_, saved_plan) = read_saved_plan(&temp.path().join("plan.json"));
+    let origin = saved_plan
+        .compositions
+        .first()
+        .expect("module call must produce a saved composition")
+        .origin_id
+        .root();
+    assert_eq!(
+        origin.source_file(),
+        Path::new("main.crn"),
+        "a relative project argument must not be duplicated inside its saved origin",
+    );
+
+    assert_success(
+        "carina apply relative-project saved plan",
+        &run(&["apply", "--auto-approve", "plan.json"]),
+    );
+}
+
+#[test]
+fn saved_plan_from_parent_non_dot_relative_project_path_applies() {
+    assert_relative_project_path_saved_plan_applies("infra/foo");
+}
+
+#[test]
+fn saved_plan_from_parent_dot_relative_project_path_applies() {
+    assert_relative_project_path_saved_plan_applies("./infra/foo");
+}
+
 #[test]
 fn saved_plan_round_trips_and_applies_every_composition_shape() {
     let scenario = Scenario::new();
@@ -192,6 +506,20 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
         bindings,
         BTreeSet::from(["published", "silent", "wrapper", "wrapper.nested"]),
         "saved compositions must retain all authored and nested bindings",
+    );
+    let nested_wire = saved_json["compositions"]
+        .as_array()
+        .expect("serialized compositions")
+        .iter()
+        .find(|composition| composition["binding"] == "wrapper.nested")
+        .expect("nested composition wire entry");
+    assert_eq!(
+        nested_wire["origin_id"]["descendants"]
+            .as_array()
+            .expect("saved origin descendants")
+            .len(),
+        1,
+        "saved origin identity must retain the complete root-to-inner call path",
     );
     assert_eq!(
         saved_plan
@@ -231,24 +559,29 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
         "the output-less bound call must still serialize as a composition",
     );
 
-    for composition in &saved_plan.compositions {
+    for composition in saved_json["compositions"]
+        .as_array()
+        .expect("serialized compositions")
+    {
         assert!(
-            composition.diagnostic_call().is_none() && composition.diagnostic_root_call().is_none(),
-            "saved composition {} must deserialize with Deserialized provenance",
-            composition.instance,
+            composition.get("origin_id").is_some(),
+            "every saved composition must carry its required origin path: {composition}"
         );
-        for (name, argument) in &composition.signature.arguments {
+        assert_eq!(
+            composition["origin_id"]["root"]["source_file"]["location"], "source_root_relative",
+            "project-local call identities must be normalized to the canonical plan root",
+        );
+        let serialized = composition.to_string();
+        for forbidden in [
+            "declared_type",
+            "source_argument",
+            "call_path",
+            "quoted_string_attrs",
+            "structural_operand",
+        ] {
             assert!(
-                argument.declared_type().is_none(),
-                "saved composition {} argument {name} must omit its declared type",
-                composition.instance,
-            );
-        }
-        for (name, attribute) in &composition.signature.attributes {
-            assert!(
-                attribute.declared_type().is_none(),
-                "saved composition {} attribute {name} must omit its declared type",
-                composition.instance,
+                !serialized.contains(forbidden),
+                "saved composition must omit live-only field {forbidden:?}: {serialized}",
             );
         }
     }
@@ -266,7 +599,7 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     for diagnostic_marker in ["module call '", "type mismatch", "cannot assign"] {
         assert!(
             !apply_text.contains(diagnostic_marker),
-            "saved-plan apply must not re-check a Deserialized composition without its serde-skipped declared types; found {diagnostic_marker:?} in:\n{apply_text}",
+            "saved-plan apply must not enter live composition validation; found {diagnostic_marker:?} in:\n{apply_text}",
         );
     }
 

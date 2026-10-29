@@ -5841,7 +5841,7 @@ struct StrippedAttributes(Vec<Vec<StrippedAttribute>>);
 
 /// Strip every resource attribute that the WASM provider boundary refuses to
 /// serialize, retaining the original `IndexMap` positions for restoration.
-fn strip_provider_boundary_attributes(resources: &mut [Resource]) -> StrippedAttributes {
+fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> StrippedAttributes {
     let mut out = Vec::with_capacity(resources.len());
     for resource in resources.iter_mut() {
         let mut stripped = Vec::new();
@@ -5871,7 +5871,7 @@ fn strip_provider_boundary_attributes(resources: &mut [Resource]) -> StrippedAtt
 
 /// Reinsert attributes removed by [`strip_provider_boundary_attributes`] at
 /// their original positions.
-fn restore_stripped_attributes(resources: &mut [Resource], stripped: StrippedAttributes) {
+fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: StrippedAttributes) {
     for (resource, entries) in resources.iter_mut().zip(stripped.0) {
         for entry in entries {
             let target = entry.insert_index.min(resource.attributes.len());
@@ -5888,12 +5888,12 @@ fn restore_stripped_attributes(resources: &mut [Resource], stripped: StrippedAtt
 /// The higher-ranked callback keeps the stripped slice scoped to this one
 /// operation. Attributes are restored before returning on both success and
 /// error.
-async fn with_wasm_serializable_resources<F>(
-    resources: &mut [Resource],
+async fn with_wasm_serializable_resources<S, F>(
+    resources: &mut [Resource<S>],
     operation: F,
 ) -> ProviderResult<()>
 where
-    F: for<'a> FnOnce(&'a mut [Resource]) -> BoxFuture<'a, ProviderResult<()>>,
+    F: for<'a> FnOnce(&'a mut [Resource<S>]) -> BoxFuture<'a, ProviderResult<()>>,
 {
     let stripped = strip_provider_boundary_attributes(resources);
     let result = operation(resources).await;
@@ -5904,7 +5904,7 @@ where
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [carina_core::resource::ProviderResource],
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         let instance = Arc::clone(&self.instance);
         Box::pin(async move {
@@ -6439,7 +6439,7 @@ mod tests {
         let mut resource = Resource::from_id(id.clone());
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
@@ -6522,7 +6522,7 @@ mod tests {
         let mut resource = Resource::from_id(pending.id().clone());
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let provider_configs = [];
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];
@@ -7398,11 +7398,8 @@ mod tests {
         );
 
         let normalizer = WasmProviderNormalizer { instance };
-        let mut resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "after-boundary-error",
-            None,
+        let mut resources = vec![carina_core::resource::ProviderResource::from(
+            Resource::with_provider("mock", "test.resource", "after-boundary-error", None),
         )];
         normalizer
             .normalize_desired(&mut resources)

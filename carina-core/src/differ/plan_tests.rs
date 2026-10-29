@@ -278,7 +278,7 @@ fn changed_provider_instance_rejects_resume() {
 
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
-    let gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = crate::schema::SchemaRegistry::new();
     let context = crate::executor::ProviderPreparationContext::new(
         &bindings,
@@ -1855,7 +1855,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     );
     let mut orphans: Orphans = [orphan].into_iter().collect();
 
-    let move_effect = Effect::Move {
+    let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
         to: ResolvedResourceId::new(new_id.clone()),
     };
@@ -3001,7 +3001,7 @@ fn prevent_destroy_collects_multiple_errors() {
 
 // carina#3181: the former `virtual_resources_are_skipped_in_plan` test
 // is obsolete — `create_plan` now takes a `&[Resource]` /
-// `&[DataSource]` pair, so a `Composition` cannot be passed into the
+// `&[DataSource]` pair, so a `LiveComposition` cannot be passed into the
 // plan input at all. The "compositions produce no effect" invariant is now
 // enforced by the type system rather than a runtime skip.
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
 use carina_core::provider::PartialReadDiagnostic;
+use carina_core::resource::ModuleSource;
 use carina_core::value::format_value_user_facing;
 use carina_core::wait::WaitObservation;
 use colored::Colorize;
@@ -31,26 +32,29 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
 }
 
 /// CLI observer that prints colored progress output.
-pub(crate) struct CliObserver {
-    progress: ProgressBackend<EffectProgressKey>,
+pub(crate) struct CliObserver<S = ModuleSource> {
+    progress: ProgressBackend<EffectProgressKey<S>>,
 }
 
-impl CliObserver {
+impl<S> CliObserver<S> {
     /// Create a new observer using stderr's terminal state.
-    pub(crate) fn new(_plan: &Plan) -> Self {
+    pub(crate) fn new(_plan: &Plan<S>) -> Self {
         Self {
             progress: ProgressBackend::new(ProgressSink::Human),
         }
     }
 }
 
-impl ExecutionObserver for CliObserver {
-    fn on_event(&self, event: &ExecutionEvent) {
+impl<S> ExecutionObserver<S> for CliObserver<S> {
+    fn on_event(&self, event: &ExecutionEvent<S>) {
         handle_event(&self.progress, event);
     }
 }
 
-fn handle_event(progress_backend: &ProgressBackend<EffectProgressKey>, event: &ExecutionEvent) {
+fn handle_event<S>(
+    progress_backend: &ProgressBackend<EffectProgressKey<S>>,
+    event: &ExecutionEvent<S>,
+) {
     match event {
         ExecutionEvent::Waiting { .. } => {
             // Dynamic display: don't show waiting resources.

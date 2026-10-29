@@ -1,19 +1,18 @@
 //! Module resolution error type.
 
-use crate::parser::ParseError;
+use crate::parser::{ModuleCallId, ParseError};
 use crate::validation::typecheck::TypeExprValueError;
 use std::path::{Path, PathBuf};
 
-use super::resolver::ModuleCallSystemIdentity;
 use super::validation::ModuleConstraintDiagnostic;
 
 /// Source ownership attached to a resolver error.
 #[derive(Debug, Clone, Copy)]
 pub enum ModuleErrorCallSource<'a> {
     /// One concrete expansion failed.
-    Failing(&'a ModuleCallSystemIdentity),
+    Failing(&'a ModuleCallId),
     /// An imported graph failed before one of its calls could be singled out.
-    Owners(&'a [ModuleCallSystemIdentity]),
+    Owners(&'a [ModuleCallId]),
     /// The error has no meaningful source-local module-call anchor.
     Unavailable,
 }
@@ -26,14 +25,14 @@ pub enum ModuleError {
     /// diagnostics anchor at the outermost source identities.
     #[error("{error}")]
     OwnedByCalls {
-        calls: Vec<ModuleCallSystemIdentity>,
+        calls: Vec<ModuleCallId>,
         error: Box<ModuleError>,
     },
 
     /// Failure raised while expanding one concrete call site.
     #[error("{error}")]
     AtCall {
-        call: ModuleCallSystemIdentity,
+        call: ModuleCallId,
         error: Box<ModuleError>,
     },
 
@@ -142,7 +141,7 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
-    pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallSystemIdentity>) -> Self {
+    pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallId>) -> Self {
         if calls.is_empty() {
             self
         } else {
@@ -153,7 +152,7 @@ impl ModuleError {
         }
     }
 
-    pub(crate) fn with_failing_call(self, call: ModuleCallSystemIdentity) -> Self {
+    pub(crate) fn with_failing_call(self, call: ModuleCallId) -> Self {
         Self::AtCall {
             call,
             error: Box::new(self),

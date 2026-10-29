@@ -434,7 +434,7 @@ pub enum ProviderConfigResolutionError {
 /// `dependency_bindings` of every resource whose references are resolved
 /// **before** apply: managed [`Resource`]s and [`DataSource`]s.
 ///
-/// `Composition` is excluded on purpose — a composition resource's
+/// `LiveComposition` is excluded on purpose — a composition resource's
 /// attributes may carry refs whose resolution is deferred to the
 /// post-apply path, so the pre-apply resolver must never rewrite them
 /// (carina#3181; see the `composition.rs` module doc).
@@ -730,7 +730,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // the user's source order through resolution (#2222).
     //
     // carina#3181: managed resources and data sources both go through
-    // pre-apply ref resolution; `Composition` is excluded — its refs
+    // pre-apply ref resolution; `LiveComposition` is excluded — its refs
     // are resolved on the post-apply path.
     for resource in iter_pre_apply_resources_mut(parsed) {
         let source_file = resource_source_files.get(resource.id()).cloned();

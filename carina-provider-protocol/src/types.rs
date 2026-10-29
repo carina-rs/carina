@@ -6,7 +6,7 @@ use serde::de::Error as DeError;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::PERSISTED_SECRET_KEY;
 
@@ -60,7 +60,7 @@ pub enum Value {
     String(String),
     StringList(Vec<String>),
     List(Vec<Value>),
-    Map(HashMap<String, Value>),
+    Map(BTreeMap<String, Value>),
 }
 
 impl Serialize for Value {
@@ -145,7 +145,7 @@ pub enum PersistedValue {
     RedactedSecret(String),
     StringList(Vec<String>),
     List(Vec<PersistedValue>),
-    Map(HashMap<String, PersistedValue>),
+    Map(BTreeMap<String, PersistedValue>),
 }
 
 impl Serialize for PersistedValue {
@@ -235,7 +235,7 @@ impl PersistedValue {
                         let key = key.strip_prefix('$').unwrap_or(&key).to_string();
                         Self::from_json(value).map(|value| (key, value))
                     })
-                    .collect::<Result<HashMap<_, _>, _>>()
+                    .collect::<Result<BTreeMap<_, _>, _>>()
                     .map(Self::Map)
             }
             serde_json::Value::Null => Ok(Self::String(String::new())),
@@ -307,7 +307,7 @@ impl TryFrom<PersistedValue> for Value {
             PersistedValue::Map(values) => values
                 .into_iter()
                 .map(|(key, value)| Self::try_from(value).map(|value| (key, value)))
-                .collect::<Result<HashMap<_, _>, _>>()
+                .collect::<Result<BTreeMap<_, _>, _>>()
                 .map(Self::Map),
         }
     }
@@ -326,7 +326,7 @@ impl TryFrom<&PersistedValue> for Value {
 pub struct State {
     pub id: ResourceId,
     pub identifier: Option<String>,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: BTreeMap<String, Value>,
     pub exists: bool,
 }
 
@@ -335,7 +335,7 @@ pub struct State {
 pub struct PersistedState {
     pub id: ResourceId,
     pub identifier: Option<String>,
-    pub attributes: HashMap<String, PersistedValue>,
+    pub attributes: BTreeMap<String, PersistedValue>,
     pub exists: bool,
 }
 
@@ -409,11 +409,11 @@ pub struct AppliedState {
     /// request resource id.
     pub id: ResourceId,
     pub identifier: AppliedIdentifier,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: BTreeMap<String, Value>,
 }
 
 impl AppliedState {
-    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, Value>) {
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, BTreeMap<String, Value>) {
         (self.id, self.identifier, self.attributes)
     }
 }
@@ -426,7 +426,7 @@ pub struct AppliedPersistedState {
     /// request resource id.
     pub id: ResourceId,
     pub identifier: AppliedIdentifier,
-    pub attributes: HashMap<String, PersistedValue>,
+    pub attributes: BTreeMap<String, PersistedValue>,
 }
 
 /// Result of reading a managed resource by its provider identifier.
@@ -894,7 +894,7 @@ pub struct Directives {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
     pub id: ResourceId,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: BTreeMap<String, Value>,
     #[serde(default)]
     pub directives: Directives,
 }
@@ -1104,7 +1104,7 @@ impl<'de> Deserialize<'de> for UniqueNameSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSchema {
     pub resource_type: String,
-    pub attributes: HashMap<String, AttributeSchema>,
+    pub attributes: BTreeMap<String, AttributeSchema>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -1459,7 +1459,10 @@ mod tests {
             Value::Float(2.71),
             Value::Bool(true),
             Value::List(vec![Value::Int(1), Value::Int(2)]),
-            Value::Map(HashMap::from([("key".into(), Value::String("val".into()))])),
+            Value::Map(BTreeMap::from([(
+                "key".into(),
+                Value::String("val".into()),
+            )])),
         ];
 
         for value in values {
@@ -1467,6 +1470,35 @@ mod tests {
             let back: Value = serde_json::from_str(&json).unwrap();
             assert_eq!(value, back);
         }
+    }
+
+    #[test]
+    fn ordered_maps_preserve_v12_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 12);
+        let state = State {
+            id: ResourceId {
+                provider: "mock".into(),
+                resource_type: "test.Widget".into(),
+                identity: "example".into(),
+            },
+            identifier: Some("widget-123".into()),
+            attributes: BTreeMap::from([
+                ("z_name".into(), Value::String("example".into())),
+                (
+                    "a_settings".into(),
+                    Value::Map(BTreeMap::from([
+                        ("z_enabled".into(), Value::Bool(true)),
+                        ("a_count".into(), Value::Int(2)),
+                    ])),
+                ),
+            ]),
+            exists: true,
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&state).expect("state must serialize"),
+            br#"{"id":{"provider":"mock","resource_type":"test.Widget","identity":"example"},"identifier":"widget-123","attributes":{"a_settings":{"a_count":2,"z_enabled":true},"z_name":"example"},"exists":true}"#
+        );
     }
 
     #[test]
@@ -1537,7 +1569,7 @@ mod tests {
 
     #[test]
     fn persisted_value_maps_escape_dollar_keys_around_structural_secret_tags() {
-        let value = PersistedValue::Map(HashMap::from([
+        let value = PersistedValue::Map(BTreeMap::from([
             (
                 "$secret".to_string(),
                 PersistedValue::String("user".to_string()),
@@ -1562,7 +1594,7 @@ mod tests {
 
     #[test]
     fn persisted_to_ordinary_conversion_is_recursive_and_rejects_redacted_secrets() {
-        let ordinary = Value::Map(HashMap::from([(
+        let ordinary = Value::Map(BTreeMap::from([(
             "$secret".to_string(),
             Value::List(vec![Value::String("user".to_string())]),
         )]));
@@ -1586,7 +1618,7 @@ mod tests {
                 id: id.clone(),
                 identifier: AppliedIdentifier::new("created-id")
                     .expect("fixture identifier is non-empty"),
-                attributes: HashMap::new(),
+                attributes: BTreeMap::new(),
             },
         };
         let read = ReadOutcome::Found {
@@ -1594,7 +1626,7 @@ mod tests {
                 id: id.clone(),
                 identifier: AppliedIdentifier::new("read-id")
                     .expect("fixture identifier is non-empty"),
-                attributes: HashMap::new(),
+                attributes: BTreeMap::new(),
             },
         };
         let update = UpdateOutcome::Success {
@@ -1602,7 +1634,7 @@ mod tests {
                 id,
                 identifier: AppliedIdentifier::new("updated-id")
                     .expect("fixture identifier is non-empty"),
-                attributes: HashMap::new(),
+                attributes: BTreeMap::new(),
             },
         };
 
@@ -1635,7 +1667,7 @@ mod tests {
             from: PersistedState {
                 id,
                 identifier: Some("mock-id".into()),
-                attributes: HashMap::from([
+                attributes: BTreeMap::from([
                     (
                         "token".into(),
                         PersistedValue::RedactedSecret("digest".into()),
@@ -1672,7 +1704,7 @@ mod tests {
                 identity: "example".into(),
             },
             identifier: Some("mock-id".into()),
-            attributes: HashMap::from([
+            attributes: BTreeMap::from([
                 (
                     "replace-target".into(),
                     PersistedValue::String("old".into()),
@@ -1756,7 +1788,7 @@ mod tests {
                 identity: "my-resource".into(),
             },
             identifier: Some("mock-id".into()),
-            attributes: HashMap::from([("name".into(), Value::String("test".into()))]),
+            attributes: BTreeMap::from([("name".into(), Value::String("test".into()))]),
             exists: true,
         };
 
@@ -2071,7 +2103,7 @@ mod tests {
         for (unique_name, expected) in cases {
             let schema = ResourceSchema {
                 resource_type: "s3.Bucket".into(),
-                attributes: HashMap::new(),
+                attributes: BTreeMap::new(),
                 description: None,
                 kind: SchemaKind::Managed,
                 unique_name,
@@ -2134,7 +2166,7 @@ mod tests {
         // lose recursion-target schema information.
         let schema = ResourceSchema {
             resource_type: "awscc.wafv2.WebACL".into(),
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             description: None,
             kind: SchemaKind::Managed,
             unique_name: UniqueNameSpec::Conflicting,

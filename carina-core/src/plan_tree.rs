@@ -22,7 +22,10 @@ pub enum ChildRenderItem {
     Normal(usize),
 }
 
-pub fn child_render_items(effects: &[Effect], child_indices: &[usize]) -> Vec<ChildRenderItem> {
+pub fn child_render_items<S>(
+    effects: &[Effect<S>],
+    child_indices: &[usize],
+) -> Vec<ChildRenderItem> {
     child_indices
         .iter()
         .copied()
@@ -36,7 +39,7 @@ pub struct DeferredSummaryForPlan {
     pub entries: Vec<DeferredSummaryEntry>,
 }
 
-pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
+pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
     let entries = plan
         .effects()
         .iter()
@@ -65,13 +68,13 @@ pub fn is_synthetic_deferred_binding(binding_name: &str) -> bool {
         .is_none_or(|segment| segment.is_empty() || segment.starts_with('_'))
 }
 
-pub fn deferred_for_source(template: &crate::parser::DeferredForExpression) -> String {
+pub fn deferred_for_source<S>(template: &crate::parser::DeferredForExpression<S>) -> String {
     crate::value::format_value(&template.iterable)
 }
 
-pub fn deferred_for_verb(
-    plan: &Plan,
-    template: &crate::parser::DeferredForExpression,
+pub fn deferred_for_verb<S>(
+    plan: &Plan<S>,
+    template: &crate::parser::DeferredForExpression<S>,
 ) -> &'static str {
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
@@ -85,8 +88,8 @@ pub fn deferred_for_verb(
     }
 }
 
-pub fn deferred_for_display_name(
-    template: &crate::parser::DeferredForExpression,
+pub fn deferred_for_display_name<S>(
+    template: &crate::parser::DeferredForExpression<S>,
     verb: &str,
 ) -> String {
     let upstream_binding = template.binding_description();
@@ -98,8 +101,8 @@ pub fn deferred_for_display_name(
     }
 }
 
-pub fn deferred_for_detail_rows(
-    template: &crate::parser::DeferredForExpression,
+pub fn deferred_for_detail_rows<S>(
+    template: &crate::parser::DeferredForExpression<S>,
     upstream_binding: &str,
     verb: &str,
 ) -> Vec<DetailRow> {
@@ -141,7 +144,7 @@ pub struct DependencyGraph {
 }
 
 /// Build the dependency graph maps from a plan's effects.
-pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
+pub fn build_dependency_graph<S>(plan: &Plan<S>) -> DependencyGraph {
     build_dependency_graph_from_effects(plan.effects(), plan.replace_display_info())
 }
 
@@ -150,12 +153,12 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
 /// This is the same analysis as [`build_dependency_graph`], but permits
 /// display-only callers to append lightweight synthetic effects without
 /// cloning the plan or the values carried by its real effects.
-pub fn build_dependency_graph_from_effects<'a, E>(
+pub fn build_dependency_graph_from_effects<'a, E, S>(
     effects: &[E],
     replacement_display: impl IntoIterator<Item = ReplaceDisplayInfo<'a>>,
 ) -> DependencyGraph
 where
-    E: AsRef<Effect>,
+    E: AsRef<Effect<S>>,
 {
     let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
     let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
@@ -177,7 +180,7 @@ where
             continue;
         }
 
-        let (resource, mut deps): (Option<crate::parser::ResourceRef<'_>>, HashSet<String>) =
+        let (resource, mut deps): (Option<crate::parser::ResourceRef<'_, S>>, HashSet<String>) =
             match effect {
                 // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
                 // all carry a typestate struct — reach them through the
@@ -334,8 +337,8 @@ where
 ///
 /// Returns (roots, dependents) where roots are sorted and each parent's
 /// children are sorted by (resource_type, binding_name).
-pub fn build_single_parent_tree(
-    plan: &Plan,
+pub fn build_single_parent_tree<S>(
+    plan: &Plan<S>,
     graph: &DependencyGraph,
 ) -> (Vec<usize>, HashMap<usize, Vec<usize>>) {
     let binding_to_effect = &graph.binding_to_effect;
@@ -492,8 +495,8 @@ pub fn build_single_parent_tree(
 ///
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
-pub fn extract_compact_hint(
-    resource: crate::parser::ResourceRef<'_>,
+pub fn extract_compact_hint<S>(
+    resource: crate::parser::ResourceRef<'_, S>,
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let attrs = resource.attributes();

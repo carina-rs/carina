@@ -204,11 +204,11 @@ mod tests {
         AttributeSchema, AttributeType, ResourceSchema, RootlessType, SchemaKind, SchemaRegistry,
         TypeError, ValidatedConfigSchema, enum_identity,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use tower_lsp::lsp_types::{Position, Range};
 
     fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
-        ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+        ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
             .expect("test config type must be valid")
             .rootless_type("value")
             .expect("test config type must exist")

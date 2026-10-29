@@ -143,8 +143,8 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// Desired lists without a concrete stored-list counterpart fall back
 /// to the legacy union [`ExplicitFields::List`] representation rather
 /// than recording indices that cannot be justified.
-pub fn build_from_resource_for_stored_values(
-    resource: &Resource,
+pub fn build_from_resource_for_stored_values<S>(
+    resource: &Resource<S>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
 ) -> ExplicitFields {
@@ -181,8 +181,8 @@ pub fn build_from_resource_for_stored_values(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values(
-    resource: &Resource,
+pub fn build_carried_from_resource_for_stored_values<S>(
+    resource: &Resource<S>,
     prior_stored_attributes: &HashMap<String, Value>,
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,

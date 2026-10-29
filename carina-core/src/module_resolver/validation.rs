@@ -5,10 +5,10 @@ use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
 use crate::parser::{
-    ArgumentParameter, CompareOp, RequireBlock, ValidateExpr, display_string_literal,
+    ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
 use crate::resource::{
-    AccessMissPolicy, Composition, ConcreteValue, DeferredValue, ModuleConstraintId,
+    AccessMissPolicy, ConcreteValue, DeferredValue, LiveComposition, ModuleConstraintId,
     PendingModuleConstraint, ResourceId, Value, apply_value_path_segment,
 };
 
@@ -34,6 +34,16 @@ pub struct ModuleConstraintFailure {
     pub diagnostic: ModuleConstraintDiagnostic,
 }
 
+/// Lifecycle of the composition call that produced a constraint diagnostic.
+/// Live diagnostics retain their parser identity for editor routing; saved
+/// diagnostics deliberately name the absence of live parser state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum ConstraintOrigin {
+    LiveCall(ModuleCallId),
+    #[default]
+    Saved,
+}
+
 impl fmt::Display for ModuleConstraintFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.diagnostic.fmt(f)
@@ -52,6 +62,10 @@ pub struct ModuleConstraintDiagnostic {
     /// Internal call identity used to correlate diagnostics with expansion.
     /// Display must use `call` so anonymous content hashes never leak.
     pub instance: String,
+    /// Parser-minted identity for live resolver diagnostics, or an explicit
+    /// saved-plan lifecycle marker.
+    #[serde(skip)]
+    pub origin: ConstraintOrigin,
     pub call: ModuleConstraintCall,
     pub kind: ModuleConstraintKind,
     pub arguments: Vec<String>,
@@ -219,8 +233,9 @@ impl EvaluatedModuleConstraint {
         module: &str,
         instance: &str,
         binding: Option<&str>,
+        call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleError> {
-        self.module_diagnostic(module, instance, binding)
+        self.module_diagnostic(module, instance, binding, call_id)
             .map(|diagnostic| ModuleError::Constraint(Box::new(diagnostic)))
     }
 
@@ -231,6 +246,7 @@ impl EvaluatedModuleConstraint {
         module: &str,
         instance: &str,
         binding: Option<&str>,
+        call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleConstraintDiagnostic> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
@@ -246,6 +262,10 @@ impl EvaluatedModuleConstraint {
         Some(ModuleConstraintDiagnostic {
             module: module.to_string(),
             instance: instance.to_string(),
+            origin: call_id
+                .cloned()
+                .map(ConstraintOrigin::LiveCall)
+                .unwrap_or(ConstraintOrigin::Saved),
             call: ModuleConstraintCall::from_binding(binding),
             kind: self.kind.clone(),
             arguments: self.arguments.clone(),
@@ -475,7 +495,7 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
 /// Resolve and evaluate every constraint pending on the supplied compositions.
 ///
 /// Argument resolution is deliberately temporary: the authored source values
-/// stored in [`Composition::signature`] remain untouched so apply can resolve
+/// stored in [`LiveComposition::signature`] remain untouched so apply can resolve
 /// them again against newer bindings. Evaluation never removes constraints,
 /// so apply can re-evaluate constraints that planning found satisfied against
 /// values published by upstream effects. A replacement or update may publish
@@ -484,8 +504,36 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
 /// When `terminal` is false, constraints with unresolved inputs remain pending.
 /// When it is true, unresolved inputs become failures because no later effect
 /// can make them decidable.
-pub fn evaluate_pending_constraints(
-    compositions: &[Composition],
+pub fn evaluate_live_pending_constraints(
+    compositions: &[LiveComposition],
+    bindings: &ResolvedBindings,
+    terminal: bool,
+) -> Vec<ModuleConstraintFailure> {
+    evaluate_pending_constraint_views(
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Live),
+        bindings,
+        terminal,
+    )
+}
+
+pub fn evaluate_saved_pending_constraints(
+    compositions: &[crate::resource::SavedComposition],
+    bindings: &ResolvedBindings,
+    terminal: bool,
+) -> Vec<ModuleConstraintFailure> {
+    evaluate_pending_constraint_views(
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Saved),
+        bindings,
+        terminal,
+    )
+}
+
+fn evaluate_pending_constraint_views<'a>(
+    compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
     bindings: &ResolvedBindings,
     terminal: bool,
 ) -> Vec<ModuleConstraintFailure> {
@@ -494,8 +542,7 @@ pub fn evaluate_pending_constraints(
     for composition in compositions {
         let mut resolution_errors = HashMap::new();
         let resolved_constraints = composition
-            .signature
-            .pending_constraints
+            .pending_constraints()
             .iter()
             .map(|constraint| PendingModuleConstraint {
                 id: constraint.id.clone(),
@@ -512,19 +559,19 @@ pub fn evaluate_pending_constraints(
             .flat_map(|constraint| raw_constraint_arguments(constraint.expression()))
             .collect::<BTreeSet<_>>();
         let mut resolved_arguments = HashMap::new();
-        for (name, argument) in &composition.signature.arguments {
+        for (name, argument) in composition.arguments() {
             if raw_arguments.contains(name) {
-                match crate::resolver::resolve_ref_value(argument.value(), bindings) {
+                match crate::resolver::resolve_ref_value(argument, bindings) {
                     Ok(value) => {
                         resolved_arguments.insert(name.clone(), value);
                     }
                     Err(error) => {
                         resolution_errors.insert(name.clone(), error);
-                        resolved_arguments.insert(name.clone(), argument.value().clone());
+                        resolved_arguments.insert(name.clone(), argument.clone());
                     }
                 }
             } else {
-                resolved_arguments.insert(name.clone(), argument.value().clone());
+                resolved_arguments.insert(name.clone(), argument.clone());
             }
         }
 
@@ -534,24 +581,28 @@ pub fn evaluate_pending_constraints(
         ) {
             let constraint = evaluated.constraint();
             let arguments = evaluated.arguments().to_vec();
-            let failure = |message: String,
-                           actuals: Vec<(String, String)>,
-                           detail: Option<String>| {
-                ModuleConstraintFailure {
-                    composition_id: composition.id.as_inner().clone(),
-                    constraint_id: constraint.id().clone(),
-                    diagnostic: ModuleConstraintDiagnostic {
-                        module: composition.module_name.clone(),
-                        instance: composition.instance.clone(),
-                        call: ModuleConstraintCall::from_binding(composition.binding.as_deref()),
-                        kind: evaluated.kind().clone(),
-                        arguments: arguments.clone(),
-                        message,
-                        actuals,
-                        detail,
-                    },
-                }
-            };
+            let failure =
+                |message: String, actuals: Vec<(String, String)>, detail: Option<String>| {
+                    ModuleConstraintFailure {
+                        composition_id: composition.id().as_inner().clone(),
+                        constraint_id: constraint.id().clone(),
+                        diagnostic: ModuleConstraintDiagnostic {
+                            module: composition.module_name().to_string(),
+                            instance: composition.instance().to_string(),
+                            origin: composition
+                                .call_id()
+                                .cloned()
+                                .map(ConstraintOrigin::LiveCall)
+                                .unwrap_or(ConstraintOrigin::Saved),
+                            call: ModuleConstraintCall::from_binding(composition.binding()),
+                            kind: evaluated.kind().clone(),
+                            arguments: arguments.clone(),
+                            message,
+                            actuals,
+                            detail,
+                        },
+                    }
+                };
             let actuals = || evaluated.actuals().to_vec();
             let resolution_error = arguments
                 .iter()
@@ -1339,15 +1390,30 @@ mod tests {
         let detail = format!("error evaluating constraint: {detail}");
         let actuals = evaluated.actuals().to_vec();
         assert_eq!(actuals, [("name".to_string(), "'abc'".to_string())]);
+        let parsed = crate::parser::parse_file(
+            "let mod = use { source = './mod' }\nmod {}\n",
+            std::path::Path::new("constraint-test.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("parse module call identity");
+        let call_id = parsed.module_calls[0].id();
         let resolver_error = evaluated
-            .module_error("mod", "c", Some("c"))
+            .module_error("mod", "c", Some("c"), Some(call_id))
             .expect("evaluation error must render");
+        let ModuleError::Constraint(diagnostic) = &resolver_error else {
+            panic!("constraint evaluation must produce a constraint error");
+        };
+        assert_eq!(
+            diagnostic.origin,
+            ConstraintOrigin::LiveCall(call_id.clone())
+        );
         let apply_failure = ModuleConstraintFailure {
             composition_id: ResourceId::with_identity("_virtual", "c"),
             constraint_id: ModuleConstraintId::argument_validation("name", 0),
             diagnostic: ModuleConstraintDiagnostic {
                 module: "mod".to_string(),
                 instance: "c".to_string(),
+                origin: ConstraintOrigin::Saved,
                 call: ModuleConstraintCall::Named("c".to_string()),
                 kind: ModuleConstraintKind::ArgumentValidation {
                     argument: "name".to_string(),
@@ -1361,6 +1427,7 @@ mod tests {
         let plan_error = PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
+            origin: ConstraintOrigin::Saved,
             call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),

@@ -13,15 +13,15 @@ use crate::commands::shared::cancellation_test_support::{
 };
 use crate::commands::shared::observer::CliObserver;
 
-struct CancellingObserver {
-    inner: CliObserver,
+struct CancellingObserver<S> {
+    inner: CliObserver<S>,
     success_count: Arc<AtomicUsize>,
     threshold: usize,
     shutdown_trigger: TestShutdownTrigger,
 }
 
-impl ExecutionObserver for CancellingObserver {
-    fn on_event(&self, event: &ExecutionEvent) {
+impl<S: Send + Sync + 'static> ExecutionObserver<S> for CancellingObserver<S> {
+    fn on_event(&self, event: &ExecutionEvent<S>) {
         self.inner.on_event(event);
         if matches!(event, ExecutionEvent::EffectSucceeded { .. }) {
             let successes = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -174,7 +174,9 @@ impl ApplyCancellationFixture {
         self.base.lock_loss_backend_handle()
     }
 
-    pub(super) fn observer_factory(&self) -> impl Fn(&Plan) -> Box<dyn ExecutionObserver> + '_ {
+    pub(super) fn observer_factory<S: Send + Sync + 'static>(
+        &self,
+    ) -> impl Fn(&Plan<S>) -> Box<dyn ExecutionObserver<S>> + '_ {
         move |plan| {
             if let Some(threshold) = self.cancel_after_successes {
                 Box::new(CancellingObserver {

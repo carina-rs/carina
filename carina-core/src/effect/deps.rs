@@ -6,16 +6,16 @@ use crate::parser::ResourceRef;
 use crate::resource::{Resource, ResourceId, ResourceIdentity};
 
 #[derive(Debug, Clone)]
-pub struct UnresolvedResource(Resource);
+pub struct UnresolvedResource<S = crate::resource::ModuleSource>(Resource<S>);
 
-impl UnresolvedResource {
+impl<S> UnresolvedResource<S> {
     /// Pre-resolution snapshot used by dependency analysis and apply-time
     /// reference re-resolution.
-    pub fn from_pre_resolve(resource: Resource) -> Self {
+    pub fn from_pre_resolve(resource: Resource<S>) -> Self {
         Self(resource)
     }
 
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &Resource<S> {
         &self.0
     }
 }
@@ -92,7 +92,7 @@ pub(crate) struct WritesSet {
 }
 
 impl WritesSet {
-    pub(crate) fn from_update(effect: &Effect) -> Option<Self> {
+    pub(crate) fn from_update<S>(effect: &Effect<S>) -> Option<Self> {
         let Effect::Update {
             changed_attributes, ..
         } = effect
@@ -336,25 +336,24 @@ impl IdentityTargets {
     }
 }
 
-struct DependencyAnalyzer {
+struct DependencyAnalyzer<'a> {
     instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
     delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
-    compositions_by_binding: HashMap<String, crate::resource::Composition>,
+    compositions_by_binding: HashMap<String, crate::resource::CompositionRuntimeRef<'a>>,
 }
 
-impl DependencyAnalyzer {
+impl<'a> DependencyAnalyzer<'a> {
     fn new(
         instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
         delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
-        compositions: &[crate::resource::Composition],
+        compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
     ) -> Self {
         let compositions_by_binding = compositions
-            .iter()
+            .into_iter()
             .filter_map(|composition| {
                 composition
-                    .binding
-                    .clone()
-                    .map(|binding| (binding, composition.clone()))
+                    .binding()
+                    .map(|binding| (binding.to_string(), composition))
             })
             .collect();
         Self {
@@ -381,7 +380,7 @@ impl DependencyAnalyzer {
         self.lookup_by_identity(&ResourceIdentity::new(binding))
     }
 
-    fn collect_from_schedule_edges<E: AsRef<Effect>>(
+    fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
         &self,
         effects: &[E],
         edges: Vec<ScheduleEdge>,
@@ -434,9 +433,9 @@ impl DependencyAnalyzer {
         }
     }
 
-    fn collect_from_resource_ref(
+    fn collect_from_resource_ref<S>(
         &self,
-        resource: ResourceRef<'_>,
+        resource: ResourceRef<'_, S>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -469,9 +468,9 @@ impl DependencyAnalyzer {
         }
     }
 
-    fn collect_from_resource(
+    fn collect_from_resource<S>(
         &self,
-        resource: &Resource,
+        resource: &Resource<S>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -507,7 +506,7 @@ impl DependencyAnalyzer {
         let Some(composition) = self.compositions_by_binding.get(binding) else {
             return;
         };
-        for inner in crate::deps::get_composition_dependencies(composition) {
+        for inner in crate::deps::get_composition_runtime_dependencies(*composition) {
             if self.compositions_by_binding.contains_key(inner.as_str())
                 || self.lookup_by_string_ref(inner.as_str()).is_some()
             {
@@ -531,17 +530,44 @@ impl DependencyAnalyzer {
 /// resulting [`DependencyAnalysis`] is indexed by effect position, with
 /// any destroy `aliases` appearing at indices `effects.len()..` so callers
 /// can distinguish real effects from wait-binding bridges.
-pub fn build_effect_dependency_analysis(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+pub fn build_effect_dependency_analysis<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
+    compositions: &[crate::resource::LiveComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
-        unresolved_resources
-            .get(id)
-            .map(UnresolvedResource::as_resource)
-    })
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Live),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(UnresolvedResource::as_resource)
+        },
+    )
+}
+
+pub fn build_saved_effect_dependency_analysis<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
+    compositions: &[crate::resource::SavedComposition],
+    inputs: ScheduleInputs<'_>,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Saved),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(UnresolvedResource::as_resource)
+        },
+    )
 }
 
 /// Borrowed-resource form of [`build_effect_dependency_analysis`].
@@ -551,25 +577,32 @@ pub fn build_effect_dependency_analysis(
 pub(crate) fn build_effect_dependency_analysis_from_resources(
     effects: &[&Effect],
     unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(effects, compositions, inputs, |id| {
-        unresolved_resources
-            .get(id)
-            .map(|resource| resource.as_resource())
-    })
+    build_effect_dependency_analysis_with_lookup(
+        effects,
+        compositions
+            .iter()
+            .map(crate::resource::CompositionRuntimeRef::Live),
+        inputs,
+        |id| {
+            unresolved_resources
+                .get(id)
+                .map(|resource| resource.as_resource())
+        },
+    )
 }
 
-fn build_effect_dependency_analysis_with_lookup<'a, E, F>(
+fn build_effect_dependency_analysis_with_lookup<'a, 'composition, E, F, S: 'a>(
     effects: &[E],
-    compositions: &[crate::resource::Composition],
+    compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'composition>>,
     inputs: ScheduleInputs<'_>,
     unresolved_resource: F,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
-    E: AsRef<Effect>,
-    F: Fn(&ResourceId) -> Option<&'a Resource>,
+    E: AsRef<Effect<S>>,
+    F: Fn(&ResourceId) -> Option<&'a Resource<S>>,
 {
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
@@ -670,7 +703,7 @@ where
     }
 }
 
-fn add_same_identity_replacement_order_edges<E: AsRef<Effect>>(
+fn add_same_identity_replacement_order_edges<S, E: AsRef<Effect<S>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
@@ -688,7 +721,7 @@ fn add_same_identity_replacement_order_edges<E: AsRef<Effect>>(
     }
 }
 
-pub fn relax_update_update_edges<E: AsRef<Effect>>(
+pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
@@ -783,7 +816,7 @@ mod tests {
 
     fn analyzer_from_instance_to_idx(
         instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
-    ) -> DependencyAnalyzer {
+    ) -> DependencyAnalyzer<'static> {
         let mut delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>> = HashMap::new();
         for (key, targets) in &instance_to_idx {
             let blockers = targets.lookup_delete_blockers();
@@ -798,7 +831,11 @@ mod tests {
             blockers.sort_unstable();
             blockers.dedup();
         }
-        DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_identity, &[])
+        DependencyAnalyzer::new(
+            instance_to_idx,
+            delete_blockers_by_identity,
+            std::iter::empty(),
+        )
     }
 
     fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {
@@ -816,7 +853,7 @@ mod tests {
 
     #[test]
     fn effect_identity_returns_system_hash_for_anonymous_effect() {
-        let anonymous = Effect::Delete {
+        let anonymous: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "anon_1234")),
             identifier: crate::effect::fixture_applied_identifier("anonymous-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1099,7 +1136,7 @@ mod tests {
 
     #[test]
     fn destroy_delete_edges_block_dependencies_by_consumers() {
-        let parent = Effect::Delete {
+        let parent: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "parent",
             )),
@@ -1139,7 +1176,7 @@ mod tests {
 
     #[test]
     fn destroy_wait_alias_bridges_target_to_consumers() {
-        let cert = Effect::Delete {
+        let cert: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "cert")),
             identifier: crate::effect::fixture_applied_identifier("cert-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1251,7 +1288,7 @@ mod tests {
 
     #[test]
     fn unknown_destroy_dependency_names_are_dropped() {
-        let orphan = Effect::Delete {
+        let orphan: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "listener",
             )),

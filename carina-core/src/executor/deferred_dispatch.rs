@@ -75,10 +75,10 @@ impl DeferredCreateFailure {
 
 /// Materialize `Effect::Create` children for a deferred-for template using the
 /// runtime values published under every binding referenced by the iterable.
-pub(super) fn materialize_deferred_create(
-    template: &DeferredForExpression,
+pub(super) fn materialize_deferred_create<S: Clone>(
+    template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
-) -> Result<Vec<Effect>, DeferredCreateFailure> {
+) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
     let expression = crate::value::format_value(&template.iterable);
     let candidates = template
         .reference_candidates()
@@ -138,31 +138,31 @@ pub(super) fn materialize_deferred_create(
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
-pub(super) enum DeferredDispatchResult {
+pub(super) enum DeferredDispatchResult<S> {
     /// DeferredCreate or DeferredReplace create children were materialized and
     /// should be appended to the scheduler queue.
-    Materialized(Vec<Effect>),
+    Materialized(Vec<Effect<S>>),
     /// Deferred-for materialization failed before any child effects existed.
     /// Callers must increment `failure_count` for this meta-effect failure.
     MaterializeFailed,
 }
 
 /// Shared inputs required to materialize deferred scheduler-meta effects.
-pub(super) struct PureMetaCtx<'a> {
+pub(super) struct PureMetaCtx<'a, S> {
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
-    pub(super) observer: &'a dyn ExecutionObserver,
+    pub(super) observer: &'a dyn ExecutionObserver<S>,
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
 /// `Effect::Create` children, or emitting the meta-effect failure event when
 /// upstream state is missing or has the wrong shape.
-pub(super) fn dispatch_deferred_create(
-    effect: &Effect,
-    template: &DeferredForExpression,
+pub(super) fn dispatch_deferred_create<S: Clone>(
+    effect: &Effect<S>,
+    template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_>,
-) -> DeferredDispatchResult {
+    ctx: &PureMetaCtx<'_, S>,
+) -> DeferredDispatchResult<S> {
     match materialize_deferred_create(template, bindings) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {

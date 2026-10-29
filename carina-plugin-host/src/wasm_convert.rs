@@ -1,6 +1,6 @@
 //! Conversions between carina-core types and Wasmtime-generated WIT types.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
@@ -1573,8 +1573,8 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
 
 // -- Resource --
 
-pub(crate) fn core_to_wit_resource(
-    resource: &CoreResource,
+pub(crate) fn core_to_wit_resource<S>(
+    resource: &CoreResource<S>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&resource.id),
@@ -1586,8 +1586,8 @@ pub(crate) fn core_to_wit_resource(
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub(crate) fn core_data_source_to_wit_resource(
-    data_source: &CoreDataSource,
+pub(crate) fn core_data_source_to_wit_resource<S>(
+    data_source: &CoreDataSource<S>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&data_source.id),
@@ -1844,10 +1844,10 @@ pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, S
         .map_err(SchemaDecodeError::protocol_conversion)
 }
 
-/// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
+/// Deserialize a JSON-encoded `BTreeMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
 pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
-    let proto_types: HashMap<String, proto::AttributeType> =
+    let proto_types: BTreeMap<String, proto::AttributeType> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     carina_core::protocol_convert::protocol_to_config_schema(proto_types)
         .map_err(SchemaDecodeError::protocol_conversion)
@@ -2260,7 +2260,7 @@ mod tests {
         assert!(resource_record.is_read_only());
         assert!(resource_record.is_deferred_populate());
 
-        let config = ValidatedConfigSchema::validate(HashMap::from([(
+        let config = ValidatedConfigSchema::validate(BTreeMap::from([(
             "assume_role".to_string(),
             AttributeType::struct_(
                 "AssumeRole",
@@ -2604,27 +2604,18 @@ mod tests {
             attribute
         };
 
-        // Select exactly two names whose randomized HashMap iteration order
-        // disagrees with lexical order, so the assertion cannot pass by chance.
-        let hash_builder = std::collections::hash_map::RandomState::new();
-        let mut selected = None;
-        'pairs: for left in 0..32 {
-            for right in (left + 1)..32 {
-                let left = format!("conflict_{left:02}");
-                let right = format!("conflict_{right:02}");
-                let mut attributes = HashMap::with_hasher(hash_builder.clone());
-                attributes.insert(left.clone(), conflicting_attribute(&left));
-                attributes.insert(right.clone(), conflicting_attribute(&right));
-                let iteration_first = attributes.keys().next().expect("two attributes");
-                let lexical_first = attributes.keys().min().expect("two attributes").clone();
-                if iteration_first != &lexical_first {
-                    selected = Some((attributes, lexical_first));
-                    break 'pairs;
-                }
-            }
-        }
-        let (attributes, lexical_first) =
-            selected.expect("find a pair whose hash order differs from lexical order");
+        // Insert in reverse lexical order. The protocol container itself must
+        // canonicalize the walk; the decoder must not repair ordering later.
+        let attributes = BTreeMap::from([
+            (
+                "z_conflict".to_string(),
+                conflicting_attribute("z_conflict"),
+            ),
+            (
+                "a_conflict".to_string(),
+                conflicting_attribute("a_conflict"),
+            ),
+        ]);
         let mut schema = proto_resource("test.Resource", std::iter::empty());
         schema.attributes = attributes;
 
@@ -2633,9 +2624,9 @@ mod tests {
 
         let rendered = render_error_chain(&error);
         assert!(
-            rendered.contains(&format!(
-                "resource 'test.Resource' attribute '{lexical_first}': resource schema is invalid"
-            )),
+            rendered.contains(
+                "resource 'test.Resource' attribute 'a_conflict': resource schema is invalid"
+            ),
             "{rendered}"
         );
         let source =
@@ -2644,7 +2635,7 @@ mod tests {
         assert_eq!(
             source.issues().next(),
             Some((
-                lexical_first.as_str(),
+                "a_conflict",
                 "top-level attribute cannot be both write-only and write-only-bearing"
             ))
         );
@@ -4101,7 +4092,7 @@ mod tests {
             ]),
         );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",
@@ -5066,7 +5057,7 @@ mod tests {
     fn test_proto_schema_with_tags_validator_reconstructed() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.s3.Bucket".to_string(),
-            attributes: HashMap::from([(
+            attributes: BTreeMap::from([(
                 "tags".to_string(),
                 proto_attr(
                     "tags",
@@ -5096,7 +5087,7 @@ mod tests {
     fn test_proto_schema_without_validators_has_no_validator() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.s3.Bucket".to_string(),
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
             unique_name: proto::UniqueNameSpec::Conflicting,
@@ -5920,7 +5911,7 @@ mod tests {
     fn test_tags_validator_detects_key_value_pattern() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.s3.Bucket".to_string(),
-            attributes: HashMap::from([(
+            attributes: BTreeMap::from([(
                 "tags".to_string(),
                 proto_attr(
                     "tags",

@@ -1,7 +1,7 @@
 //! End-to-end regression for carina#3246.
 //!
 //! A managed-resource attribute that references `<module_instance>.<attr>`
-//! (where `<module_instance>` is a `Composition` produced by module
+//! (where `<module_instance>` is a `LiveComposition` produced by module
 //! expansion) must resolve to the concrete managed-sibling literal that
 //! backs it. Pre-carina#3248, the plan-path resolver built bindings from
 //! the managed slice only, so the composition-rooted ref survived as
@@ -348,8 +348,8 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     // lays compositions into the binding map so the composition-rooted ref
     // chains through to the managed sibling literal.
     let mut resources = parsed.resources.clone();
-    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
             managed_current: &HashMap::new(),

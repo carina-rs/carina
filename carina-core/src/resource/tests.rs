@@ -461,8 +461,8 @@ fn resolved_resource_serde_round_trips_as_resource() {
         Some("primary".to_string()),
     ));
     let json = serde_json::to_string(&resolved).unwrap();
-    let decoded: ResolvedResource = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded, resolved);
+    let decoded = serde_json::from_str::<SavedResolvedResource>(&json).unwrap();
+    assert_eq!(decoded, SavedResolvedResource::from(resolved));
     assert_eq!(decoded.id.identity_str(), Some("logs"));
 }
 
@@ -470,7 +470,7 @@ fn resolved_resource_serde_round_trips_as_resource() {
 fn resolved_resource_deserialize_rejects_absent_identity() {
     let mut value = serde_json::to_value(Resource::new("s3.Bucket", "logs")).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
-    let err = serde_json::from_value::<ResolvedResource>(value).unwrap_err();
+    let err = serde_json::from_value::<SavedResolvedResource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
 }
 
@@ -506,8 +506,8 @@ fn resolved_data_source_serde_round_trips_as_data_source() {
         Some("primary".to_string()),
     ));
     let json = serde_json::to_string(&resolved).unwrap();
-    let decoded: ResolvedDataSource = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded, resolved);
+    let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json).unwrap();
+    assert_eq!(decoded, SavedResolvedDataSource::from(resolved));
     assert_eq!(decoded.id.identity_str(), Some("ubuntu"));
 }
 
@@ -515,7 +515,7 @@ fn resolved_data_source_serde_round_trips_as_data_source() {
 fn resolved_data_source_deserialize_rejects_absent_identity() {
     let mut value = serde_json::to_value(DataSource::new("aws_ami", "ubuntu")).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
-    let err = serde_json::from_value::<ResolvedDataSource>(value).unwrap_err();
+    let err = serde_json::from_value::<SavedResolvedDataSource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
 }
 
@@ -2399,26 +2399,130 @@ fn attrs_to_hashmap_clones_values() {
 fn resource_module_source_typed_field() {
     // Real resources that belong to modules should use the typed module_source field
     // instead of storing _module/_module_instance as hidden attributes
-    let resource =
-        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
-            name: "web_tier".to_string(),
+    let module_source = ModuleSource::expanded_module(
+        "web_tier",
+        "web",
+        ModuleInstanceScope::for_call("web_tier", Some("web"), "web"),
+        CompositionCallPath::direct(CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in("web.crn"),
+            module_name: "web_tier".to_string(),
+            binding: Some("web".to_string()),
             instance: "web".to_string(),
-            scope: None,
-        });
+            module_source: Some("./web".to_string()),
+            module_directory: None,
+        }),
+    );
+    let resource =
+        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(module_source.clone());
 
     // Module source info should be in the typed field
-    assert_eq!(
-        resource.module_source,
-        Some(ModuleSource::Module {
-            name: "web_tier".to_string(),
-            instance: "web".to_string(),
-            scope: None,
-        })
-    );
+    assert_eq!(resource.module_source, Some(module_source));
 
     // Module source info should NOT be in attributes
     assert!(!resource.attributes.contains_key("_module"));
     assert!(!resource.attributes.contains_key("_module_instance"));
+}
+
+#[test]
+fn live_module_source_equality_and_hash_use_call_path_identity() {
+    let source = |source_file: &str| {
+        let call = CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(source_file),
+            module_name: "fixture".to_string(),
+            binding: None,
+            instance: "fixture_0000000000000000".to_string(),
+            module_source: Some("./fixture".to_string()),
+            module_directory: None,
+        };
+        ModuleSource::expanded_module(
+            "fixture",
+            "fixture_0000000000000000",
+            ModuleInstanceScope::for_call("fixture", None, "fixture_0000000000000000"),
+            CompositionCallPath::direct(call),
+        )
+    };
+    let first = source("first.crn");
+    let second = source("second.crn");
+
+    assert_ne!(first, second);
+    assert_eq!(
+        std::collections::HashSet::from([first, second]).len(),
+        2,
+        "identical anonymous module display names must not collapse distinct calls",
+    );
+}
+
+#[test]
+fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_types() {
+    let call = CompositionCall {
+        id: crate::parser::ModuleCallId::test_dummy_in("live.crn"),
+        module_name: "fixture".to_string(),
+        binding: Some("instance".to_string()),
+        instance: "instance".to_string(),
+        module_source: Some("./fixture".to_string()),
+        module_directory: None,
+    };
+    let live = ModuleSource::expanded_module(
+        "fixture",
+        "instance",
+        ModuleInstanceScope::for_call("fixture", Some("instance"), "instance"),
+        CompositionCallPath::direct(call),
+    );
+    let resource =
+        Resource::new("fixture.Resource", "instance.resource").with_module_source(live.clone());
+    let encoded = serde_json::to_value(&resource).expect("serialize live resource metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!({
+            "Module": { "name": "fixture", "instance": "instance" }
+        }),
+        "the live module variant must retain the historical saved-plan wire shape",
+    );
+    let decoded: SavedResource =
+        serde_json::from_value(encoded.clone()).expect("deserialize saved resource metadata");
+
+    assert!(matches!(
+        &decoded.module_source,
+        Some(SavedModuleSource::Module { name, instance })
+            if name == "fixture" && instance == "instance"
+    ));
+    assert_eq!(
+        serde_json::to_value(decoded).expect("re-serialize saved resource metadata"),
+        encoded,
+    );
+
+    let mut data_source = DataSource::new("fixture.Lookup", "instance.lookup");
+    data_source.module_source = Some(live);
+    let encoded = serde_json::to_value(&data_source).expect("serialize live data-source metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!({
+            "Module": { "name": "fixture", "instance": "instance" }
+        }),
+        "data sources must use the same literal module wire variant",
+    );
+    let decoded: SavedDataSource =
+        serde_json::from_value(encoded.clone()).expect("deserialize saved data-source metadata");
+    assert!(matches!(
+        &decoded.module_source,
+        Some(SavedModuleSource::Module { name, instance })
+            if name == "fixture" && instance == "instance"
+    ));
+    assert_eq!(
+        serde_json::to_value(decoded).expect("re-serialize saved data-source metadata"),
+        encoded,
+    );
+
+    let root = Resource::new("fixture.Resource", "root").with_module_source(ModuleSource::Root);
+    let encoded = serde_json::to_value(&root).expect("serialize live root metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!("Root"),
+        "the live root variant must retain the literal saved-plan wire shape",
+    );
+    let decoded: SavedResource =
+        serde_json::from_value(encoded.clone()).expect("deserialize saved root metadata");
+    assert_eq!(decoded.module_source, Some(SavedModuleSource::Root));
 }
 
 #[test]

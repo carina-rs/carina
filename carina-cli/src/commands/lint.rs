@@ -124,7 +124,7 @@ pub fn run_lint(
         let schema = match rref {
             carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
             carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
-            carina_core::parser::ResourceRef::Composition(_) => None,
+            carina_core::parser::ResourceRef::LiveComposition(_) => None,
             carina_core::parser::ResourceRef::Deferred { resource, .. } => {
                 schemas.get_for(resource)
             }

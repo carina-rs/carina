@@ -4053,11 +4053,12 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
             carina_core::resource::Current::MissingIdentifier(state)
         }
     };
-    let plan_input_states = carina_core::resource::into_plan_input_current_map(
-        HashMap::from([(id.clone(), current)]),
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    );
+    let plan_input_states =
+        carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
+            HashMap::from([(id.clone(), current)]),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        );
     let plan = carina_core::differ::create_plan(
         &[resolved],
         &[],

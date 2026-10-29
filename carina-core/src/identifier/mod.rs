@@ -1037,12 +1037,14 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         // still sees them; without the prefix, a `Pending` module-internal
         // resource would land at the same address as a top-level
         // `Pending` resource with matching create-only attrs (#2516).
-        let identifier = match &resource.module_source {
-            Some(crate::resource::ModuleSource::Module { instance, .. }) => {
-                format!("{}.{}", instance, bare_identifier)
-            }
-            _ => bare_identifier,
-        };
+        let identifier = resource
+            .module_source
+            .as_ref()
+            .and_then(crate::resource::ModuleSource::outer_instance_identity)
+            .map_or_else(
+                || bare_identifier.clone(),
+                |instance| format!("{}.{}", instance, bare_identifier),
+            );
 
         computed.push((idx, identifier));
     }

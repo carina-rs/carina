@@ -151,10 +151,7 @@ fn value_depends_on_module_output(
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
     Standalone(&'a ParsedFile),
-    Directory {
-        merged: &'a ParsedFile,
-        file: &'a std::path::Path,
-    },
+    Directory { merged: &'a ParsedFile },
     DirectoryUnavailable,
 }
 
@@ -162,15 +159,14 @@ impl<'a> SemanticView<'a> {
     pub(super) fn for_analysis(
         authored: &'a ParsedFile,
         merged: Option<&'a ParsedFile>,
-        file: Option<&'a std::path::Path>,
         directory_backed: bool,
     ) -> Self {
         if !directory_backed {
             return Self::Standalone(authored);
         }
-        match (merged, file) {
-            (Some(merged), Some(file)) => Self::Directory { merged, file },
-            _ => Self::DirectoryUnavailable,
+        match merged {
+            Some(merged) => Self::Directory { merged },
+            None => Self::DirectoryUnavailable,
         }
     }
 
@@ -180,7 +176,7 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) => Some(authored),
-            Self::Directory { merged, file } => authored.lookup_in(merged, file),
+            Self::Directory { merged } => authored.lookup_in(merged),
             Self::DirectoryUnavailable => None,
         }
     }
@@ -196,7 +192,7 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) | Self::DirectoryUnavailable => Some(authored),
-            Self::Directory { merged, file } => authored.lookup_in(merged, file),
+            Self::Directory { merged } => authored.lookup_in(merged),
         }
     }
 
@@ -215,8 +211,8 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) => authored.value_at(slot),
-            Self::Directory { merged, file } => authored
-                .lookup_in(merged, file)
+            Self::Directory { merged } => authored
+                .lookup_in(merged)
                 .and_then(|semantic| semantic.value_at(slot)),
             Self::DirectoryUnavailable => authored
                 .value_at(slot)
@@ -228,7 +224,7 @@ impl<'a> SemanticView<'a> {
     fn parsed(&self) -> Option<&ParsedFile> {
         match self {
             Self::Standalone(parsed) => Some(parsed),
-            Self::Directory { merged, .. } => Some(merged),
+            Self::Directory { merged } => Some(merged),
             Self::DirectoryUnavailable => None,
         }
     }
@@ -294,27 +290,17 @@ impl<'a> ContextFreeValue<'a> {
 }
 
 trait SemanticLookup: Sized {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self>;
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self>;
 
     fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value>;
 }
 
 impl SemanticLookup for ModuleCall {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
-        let authored_span = self.source_span();
-        merged.module_calls.iter().find(|candidate| {
-            candidate.source_file() == current_file
-                && candidate.source_span() == authored_span
-                && candidate.expansion_key().is_none()
-        })
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
+        merged
+            .module_calls
+            .iter()
+            .find(|candidate| candidate.id() == self.id())
     }
 
     fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value> {
@@ -327,14 +313,11 @@ impl SemanticLookup for ModuleCall {
 }
 
 impl SemanticLookup for AttributeParameter {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
         let authored_span = self.source_span();
+        let authored_file = self.source_file();
         merged.attribute_params.iter().find(|candidate| {
-            candidate.source_file() == current_file && candidate.source_span() == authored_span
+            candidate.source_file() == authored_file && candidate.source_span() == authored_span
         })
     }
 
@@ -346,14 +329,11 @@ impl SemanticLookup for AttributeParameter {
 }
 
 impl SemanticLookup for ParsedExportParam {
-    fn lookup_in<'a>(
-        &self,
-        merged: &'a ParsedFile,
-        current_file: &std::path::Path,
-    ) -> Option<&'a Self> {
+    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
         let authored_span = self.source_span();
+        let authored_file = self.source_file();
         merged.export_params.iter().find(|candidate| {
-            candidate.source_file() == current_file && candidate.source_span() == authored_span
+            candidate.source_file() == authored_file && candidate.source_span() == authored_span
         })
     }
 
@@ -361,27 +341,6 @@ impl SemanticLookup for ParsedExportParam {
         matches!(slot, TypecheckValueSlot::Parameter)
             .then_some(self.value.as_ref())
             .flatten()
-    }
-}
-
-/// Match an expanded call site back to an authored call without interpreting
-/// its dot-separated instance path. Named calls match their structural
-/// binding; anonymous calls match the deterministic instance identity that
-/// was recorded during expansion.
-fn composition_call_matches(
-    expanded: &carina_core::resource::CompositionCall,
-    authored: &ModuleCall,
-) -> bool {
-    if expanded.module_name != authored.module_name {
-        return false;
-    }
-
-    match (&expanded.binding, &authored.binding_name) {
-        (Some(expanded), Some(authored)) => expanded == authored,
-        (None, None) => {
-            expanded.instance == carina_core::module_resolver::instance_prefix_for_call(authored)
-        }
-        _ => false,
     }
 }
 
@@ -1258,18 +1217,20 @@ impl DiagnosticEngine {
     /// Anchor a nested resolver failure at the authored root call that owns
     /// the imported module. Direct-call failures are emitted by the
     /// source-local checks; this fallback owns failures below that call.
-    pub(super) fn module_resolver_error_diagnostic(
+    pub(super) fn module_resolver_error_diagnostics(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
         error: &carina_core::module_resolver::ModuleError,
         base_path: &std::path::Path,
         current_source: Option<&std::path::Path>,
-    ) -> Option<Diagnostic> {
+    ) -> Vec<Diagnostic> {
         // Resolver identities are always file-backed. Without a current-file
         // identity there is no safe way to distinguish coincidentally equal
         // spans from different directory members.
-        let current_source = current_source?;
+        let Some(current_source) = current_source else {
+            return Vec::new();
+        };
         let call_source = error.call_source();
         let error = error.root_cause();
 
@@ -1285,13 +1246,13 @@ impl DiagnosticEngine {
         } {
             // `check_module_calls` runs the same shared handle-sink check and
             // can underline the exact argument expression in this document.
-            return None;
+            return Vec::new();
         }
 
         let relative_message = error.display_relative_to(base_path);
-        let (constraint_instance, direct_error_location, severity, message) = match error {
+        let (constraint_origin, direct_error_location, severity, message) = match error {
             carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
-                Some(diagnostic.instance.as_str()),
+                Some(&diagnostic.origin),
                 None,
                 DiagnosticSeverity::ERROR,
                 relative_message,
@@ -1305,7 +1266,7 @@ impl DiagnosticEngine {
                     .filter(|line| line.starts_with("module call '"))
                     .collect::<Vec<_>>();
                 if nested_calls.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 (
                     None,
@@ -1350,31 +1311,37 @@ impl DiagnosticEngine {
             | carina_core::module_resolver::ModuleError::BackendInModule
             | carina_core::module_resolver::ModuleError::UpstreamStateInModule
             | carina_core::module_resolver::ModuleError::ExportsInModule
-            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => return None,
+            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => {
+                return Vec::new();
+            }
         };
 
-        let call = parsed.module_calls.iter().find(|call| {
-            let matches_identity =
-                |identity: &carina_core::module_resolver::ModuleCallSystemIdentity| {
-                    identity
-                        == &carina_core::module_resolver::ModuleCallSystemIdentity::for_authored_call(
-                            current_source.to_path_buf(),
-                            call,
-                        )
-                };
-            match call_source {
-                carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
-                    matches_identity(failing)
+        let calls = parsed
+            .module_calls
+            .iter()
+            .filter(|call| {
+                let matches_identity =
+                    |identity: &carina_core::parser::ModuleCallId| identity == call.id();
+                match call_source {
+                    carina_core::module_resolver::ModuleErrorCallSource::Failing(failing) => {
+                        matches_identity(failing)
+                    }
+                    carina_core::module_resolver::ModuleErrorCallSource::Owners(owners) => {
+                        owners.iter().any(matches_identity)
+                    }
+                    carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
                 }
-                carina_core::module_resolver::ModuleErrorCallSource::Owners(owners) => {
-                    owners.iter().any(matches_identity)
-                }
-                carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
-            }
-        })?;
-        let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
-        if constraint_instance.is_some_and(|instance| instance == root_instance) {
-            return None;
+            })
+            .filter(|call| {
+                !matches!(
+                    constraint_origin,
+                    Some(carina_core::module_resolver::ConstraintOrigin::LiveCall(call_id))
+                        if call_id == call.id()
+                )
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return Vec::new();
         }
 
         if let Some((line, error_source)) = direct_error_location.filter(|(line, _)| *line > 0) {
@@ -1392,13 +1359,18 @@ impl DiagnosticEngine {
                     .nth(line as usize)
                     .map_or(1, |source| source.chars().count().max(1))
                     as u32;
-                return Some(carina_diagnostic(line, 0, width, severity, message));
+                return vec![carina_diagnostic(line, 0, width, severity, message)];
             }
         }
 
-        let (line, col) = module_call_position(call);
-        let width = call.module_name.chars().count() as u32;
-        Some(carina_diagnostic(line, col, col + width, severity, message))
+        calls
+            .into_iter()
+            .map(|call| {
+                let (line, col) = module_call_position(call);
+                let width = call.module_name.chars().count() as u32;
+                carina_diagnostic(line, col, col + width, severity, message.clone())
+            })
+            .collect()
     }
 
     /// Check tag-key casing against the directory-wide CLI population while
@@ -2076,7 +2048,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         for report in reports.values() {
-            if report.source.file != current_file {
+            if report.source.file() != current_file {
                 continue;
             }
             for outcome in &report.outcomes {
@@ -2095,7 +2067,7 @@ impl DiagnosticEngine {
                         carina_core::parser::ArgumentOrigin::Defaulted,
                     )
                     | carina_core::module_resolver::ResolvedModuleConstraintOrigin::Call => {
-                        report.source.call_span
+                        report.source.call_span()
                     }
                 };
                 let (line, col) = source_span_position(span);
@@ -2215,7 +2187,7 @@ impl DiagnosticEngine {
         &self,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
-        compositions: &[carina_core::resource::Composition],
+        compositions: &[carina_core::resource::LiveComposition],
         binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
         carina_core::validation::validate_composition_ref_types_with_bindings(
@@ -2233,18 +2205,20 @@ impl DiagnosticEngine {
                 return None;
             };
 
+            let immediate_id = &expanded_error.call_path.immediate().id;
             let immediate_call = parsed.module_calls.iter().find(|call| {
-                semantic_view.lookup(*call).is_some_and(|semantic| {
-                    composition_call_matches(&expanded_error.call, semantic)
-                })
+                semantic_view
+                    .lookup(*call)
+                    .is_some_and(|semantic| semantic.id() == immediate_id)
             });
             let (authored_call, anchor_argument) = match immediate_call {
                 Some(call) => (call, true),
                 None => {
+                    let root_id = &expanded_error.call_path.root().id;
                     let call = parsed.module_calls.iter().find(|call| {
-                        semantic_view.lookup(*call).is_some_and(|semantic| {
-                            composition_call_matches(&expanded_error.root_call, semantic)
-                        })
+                        semantic_view
+                            .lookup(*call)
+                            .is_some_and(|semantic| semantic.id() == root_id)
                     })?;
                     (call, false)
                 }
@@ -2941,7 +2915,7 @@ impl DiagnosticEngine {
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
                     known_attributes,
-                    target: RefTargetKind::Composition,
+                    target: RefTargetKind::LiveComposition,
                     ..
                 }) => {
                     let known_attrs: Vec<&str> =

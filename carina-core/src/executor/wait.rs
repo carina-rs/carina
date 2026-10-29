@@ -211,10 +211,10 @@ pub(super) fn cancel_waits_if_terminal(
 /// without producing work; treating it as still "undispatched" for the
 /// terminal-with-pending-waits check would keep waits polling forever when
 /// their consumer downstream is blocked on a failing sibling. (carina#3544)
-pub(super) fn count_effectively_undispatched(
+pub(super) fn count_effectively_undispatched<S>(
     actionable_indices: &[usize],
     dispatched: &HashSet<usize>,
-    view: &FailureView<'_>,
+    view: &FailureView<'_, S>,
 ) -> usize {
     actionable_indices
         .iter()
@@ -350,7 +350,7 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 /// A missing target or provider read error returns immediately rather than
 /// waiting for another interval.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_wait_effect(
+pub async fn execute_wait_effect<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
     target: &ManagedWaitTarget,
@@ -359,7 +359,7 @@ pub async fn execute_wait_effect(
     timeout: Duration,
     interval: Duration,
     cancel: tokio::sync::watch::Receiver<WaitSignal>,
-    observer: &dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver<S>,
 ) -> WaitOutcome {
     let target_id = target.id();
     execute_wait_effect_with_heartbeat_cadence(
@@ -379,7 +379,7 @@ pub async fn execute_wait_effect(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
+pub(crate) async fn execute_wait_effect_with_heartbeat_cadence<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
     binding: &str,
@@ -389,7 +389,7 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
     timeout: Duration,
     interval: Duration,
     mut cancel: tokio::sync::watch::Receiver<WaitSignal>,
-    observer: &dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver<S>,
     heartbeat_cadence: Duration,
 ) -> WaitOutcome {
     let start = Instant::now();

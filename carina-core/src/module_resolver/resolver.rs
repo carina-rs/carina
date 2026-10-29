@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 
 use crate::parser::{
-    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, UseStatement,
+    ModuleCallDiagnosticSource, ModuleCallId, ParseError, ParsedFile, ProviderContext, UseStatement,
 };
 use crate::resource::ModuleConstraintId;
 use crate::schema::SchemaRegistry;
@@ -18,40 +18,6 @@ use super::error::ModuleError;
 use super::expander::instance_prefix_for_call;
 use super::loader::sorted_crn_paths_in;
 use super::validation::ModuleConstraintDiagnostic;
-
-/// Parser-assigned identity of one concrete module call expansion.
-///
-/// The source path and byte offset identify the authored call independently
-/// of its user-visible binding or argument values. `expansion_key`
-/// distinguishes iterations produced from one authored `for` body.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ModuleCallSystemIdentity {
-    source_file: PathBuf,
-    call_span: crate::parser::SourceSpan,
-    expansion_key: Option<String>,
-}
-
-impl ModuleCallSystemIdentity {
-    pub fn for_authored_call(source_file: PathBuf, call: &crate::parser::ModuleCall) -> Self {
-        Self {
-            source_file,
-            call_span: call.source_span(),
-            expansion_key: call.expansion_key().map(str::to_string),
-        }
-    }
-
-    pub fn source_file(&self) -> &Path {
-        &self.source_file
-    }
-
-    pub fn call_span(&self) -> crate::parser::SourceSpan {
-        self.call_span
-    }
-
-    pub fn expansion_key(&self) -> Option<&str> {
-        self.expansion_key.as_deref()
-    }
-}
 
 /// Resolver-owned result of evaluating one authored module constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,18 +55,12 @@ impl ModuleCallConstraintReport {
     pub(crate) fn new(
         source: ModuleCallDiagnosticSource,
         outcomes: Vec<ResolvedModuleConstraintOutcome>,
-    ) -> (ModuleCallSystemIdentity, Self) {
-        let identity = ModuleCallSystemIdentity {
-            source_file: source.file.clone(),
-            call_span: source.call_span,
-            expansion_key: source.expansion_key.clone(),
-        };
-        (identity, Self { source, outcomes })
+    ) -> (ModuleCallId, Self) {
+        (source.id.clone(), Self { source, outcomes })
     }
 }
 
-pub type ModuleCallConstraintReports =
-    IndexMap<ModuleCallSystemIdentity, ModuleCallConstraintReport>;
+pub type ModuleCallConstraintReports = IndexMap<ModuleCallId, ModuleCallConstraintReport>;
 
 /// Module resolution result for editor diagnostics.
 ///
@@ -302,7 +262,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
     pub(super) fn record_constraint_report(
         &self,
-        identity: ModuleCallSystemIdentity,
+        identity: ModuleCallId,
         report: ModuleCallConstraintReport,
     ) {
         if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
@@ -504,12 +464,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                 let owning_calls = module_calls
                     .iter()
                     .filter(|call| call.module_name == import.alias)
-                    .map(|call| {
-                        ModuleCallSystemIdentity::for_authored_call(
-                            call.source_file().to_path_buf(),
-                            call,
-                        )
-                    })
+                    .map(|call| call.id().clone())
                     .collect();
                 error.with_owning_calls(owning_calls)
             })?;

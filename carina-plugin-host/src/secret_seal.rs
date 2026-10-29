@@ -117,7 +117,7 @@ struct RestoredResource {
 }
 
 impl RestoredDesired {
-    pub(crate) fn apply_to(self, resources: &mut [Resource]) {
+    pub(crate) fn apply_to<S>(self, resources: &mut [Resource<S>]) {
         for (resource, restored) in resources.iter_mut().zip(self.resources) {
             for key in restored.skipped_attributes {
                 log::error!(
@@ -132,7 +132,9 @@ impl RestoredDesired {
     }
 }
 
-pub(crate) fn seal(resources: &[Resource]) -> Result<(SealedDesired, Unsealer), SealError> {
+pub(crate) fn seal<S: Clone>(
+    resources: &[Resource<S>],
+) -> Result<(SealedDesired, Unsealer), SealError> {
     let nonce_prefix = format!("{TOKEN_NAMESPACE}:{}:", uuid::Uuid::new_v4().simple());
     let host_attributes = resources
         .iter()

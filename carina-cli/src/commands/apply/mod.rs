@@ -11,7 +11,9 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{PreDataSourceReadInputs, ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{
+    LivePreDataSourceReadInputs, ResolvedBindings, SavedPreApplyInputs, WaitAliasSpec,
+};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::{
@@ -19,8 +21,8 @@ use carina_core::differ::{
     into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::{
-    ExecutionCheckpointSink, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource,
+    ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
@@ -28,7 +30,8 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
-    Current, DataSource, ResolvedResource, Resource, ResourceId, State, Value,
+    CompositionSourceIdentityResolver, Current, DataSource, ModuleSource, ResolvedResource,
+    Resource, ResourceId, SavedDataSource, SavedModuleSource, State, Value,
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
@@ -40,9 +43,9 @@ use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
     CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityData, ProviderUpstreamScope,
-    ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
-    collect_historical_display_attributes, load_and_resolve_provider_configs,
-    prepare_plan_identity_and_provider_inputs,
+    ReloadedCompositionRehydrationError, ReloadedPlanFile, ResolvedProviderInputs,
+    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -62,8 +65,9 @@ use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt, format_duration,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSaveInputs, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
-    SkippedExports, materialize_exports, resolve_export_values_post_apply,
+    ApplyStateSaveInputs, ExportResolutionInputs, FinalizeApplyInput, PostApplyStates,
+    ResolveExportValuesPostApplyInput, SkippedExports, materialize_exports,
+    resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -90,7 +94,8 @@ use saved_plan::{
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
 
-type ObserverFactory<'a> = dyn Fn(&Plan) -> Box<dyn ExecutionObserver> + 'a;
+type ObserverFactory<'a, S = ModuleSource> =
+    dyn Fn(&carina_core::plan::Plan<S>) -> Box<dyn ExecutionObserver<S>> + 'a;
 
 #[derive(serde::Deserialize)]
 struct PlanFileHeader {
@@ -170,7 +175,9 @@ fn saved_plan_secret_orphan_vanished_error(
     )
 }
 
-fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
+fn cli_observer_factory<S: Send + Sync + 'static>(
+    plan: &carina_core::plan::Plan<S>,
+) -> Box<dyn ExecutionObserver<S>> {
     Box::new(CliObserver::new(plan))
 }
 
@@ -202,7 +209,8 @@ async fn create_checked_bootstrap_resource(
     } = context;
     let id = resource.id.clone();
     let bindings = bootstrap_resolved_bindings(parsed);
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&parsed.compositions);
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
@@ -332,7 +340,7 @@ fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> Re
         .iter()
         .map(WaitAliasSpec::from)
         .collect();
-    ResolvedBindings::pre_data_source_read(PreDataSourceReadInputs {
+    ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
         managed: &parsed.resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
@@ -342,38 +350,47 @@ fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> Re
     })
 }
 
-fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {
+fn split_execution_outcome<S>(outcome: ExecutionOutcome<S>) -> (ExecutionResult<S>, bool) {
     match outcome {
         ExecutionOutcome::Completed(result) => (result, false),
         ExecutionOutcome::Cancelled(result) => (result, true),
     }
 }
 
-fn start_apply_state_saver(
+fn start_apply_state_saver<S: Clone + Send + Sync + 'static>(
     state_file: Option<StateFile>,
     writer: MidRunStateWriter,
-    state_save_inputs: Arc<ApplyStateSaveInputs>,
-) -> IncrementalStateSaver<ExecutionResult> {
+    state_save_inputs: Arc<ApplyStateSaveInputs<S>>,
+) -> IncrementalStateSaver<ExecutionResult<S>> {
     IncrementalStateSaver::start(
         state_file.unwrap_or_default(),
         writer,
-        move |state, result: &ExecutionResult| state_save_inputs.build_state(state, result),
+        move |state, result: &ExecutionResult<S>| state_save_inputs.build_state(state, result),
     )
 }
 
 fn finalize_module_constraints(
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     bindings: &ResolvedBindings,
 ) -> Result<(), AppError> {
-    carina_core::executor::ModuleConstraintGate::new(compositions)
+    carina_core::executor::ModuleConstraintGate::from_live_compositions(compositions)
         .finish(bindings, true)
         .map_err(AppError::from)
 }
 
-fn data_source_values_from_saved_plan(
-    data_sources: &[DataSource],
+fn finalize_saved_module_constraints(
+    compositions: &[carina_core::resource::SavedComposition],
+    bindings: &ResolvedBindings,
+) -> Result<(), AppError> {
+    carina_core::executor::ModuleConstraintGate::from_saved_compositions(compositions)
+        .finish(bindings, true)
+        .map_err(AppError::from)
+}
+
+fn data_source_values_from_saved_plan<S: Clone>(
+    data_sources: &[carina_core::resource::DataSource<S>],
     saved_values: &[SavedDataSourceValue],
-) -> Result<DataSourceValues, AppError> {
+) -> Result<DataSourceValues<S>, AppError> {
     let mut by_id = HashMap::with_capacity(saved_values.len());
     for saved in saved_values {
         if by_id
@@ -402,11 +419,11 @@ fn data_source_values_from_saved_plan(
     Ok(values)
 }
 
-fn saved_plan_unresolved_by_resolved_id(
-    sorted_resources: &[Resource],
-    unresolved_resources: &[Resource],
+fn saved_plan_unresolved_by_resolved_id<S: Clone>(
+    sorted_resources: &[carina_core::resource::Resource<S>],
+    unresolved_resources: &[carina_core::resource::Resource<S>],
     apply_target: ApplyTarget<'_>,
-) -> Result<HashMap<ResourceId, UnresolvedResource>, AppError> {
+) -> Result<HashMap<ResourceId, UnresolvedResource<S>>, AppError> {
     if sorted_resources.len() != unresolved_resources.len() {
         return Err(AppError::Config(format!(
             "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `{}`.",
@@ -450,9 +467,9 @@ fn saved_plan_unresolved_by_resolved_id(
     Ok(by_id)
 }
 
-fn can_use_export_only_fast_path(
-    plan: &Plan,
-    data_source_values: &ExecutableDataSourceValues,
+fn can_use_export_only_fast_path<S: Clone>(
+    plan: &carina_core::plan::Plan<S>,
+    data_source_values: &ExecutableDataSourceValues<S>,
 ) -> bool {
     !plan.has_mutations() && !data_source_values.has_deferred_reads()
 }
@@ -560,14 +577,14 @@ async fn execute_effects_with_observer(
     data_source_values: ExecutableDataSourceValues,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     precompleted_success_count: usize,
     checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
 ) -> ExecutionOutcome {
-    let input = ExecutionInput {
+    let input = LiveExecutionInput {
         plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: unresolved_resources,
@@ -586,7 +603,8 @@ async fn execute_effects_with_observer(
         checkpoint_sink,
     };
 
-    let outcome = carina_core::executor::execute_plan(provider, input, &*observer, cancel).await;
+    let outcome =
+        carina_core::executor::execute_live_plan(provider, input, &*observer, cancel).await;
 
     // Write back the updated current views so callers see refreshes.
     let result = match &outcome {
@@ -611,36 +629,42 @@ async fn execute_rehydrated_saved_plan(
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
     managed_current: &mut HashMap<ResourceId, Current>,
-    data_source_values: ExecutableDataSourceValues,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::Composition],
+    data_source_values: ExecutableDataSourceValues<SavedModuleSource>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<SavedModuleSource>>,
+    data_source_origins: &[SavedDataSource],
+    compositions: &[carina_core::resource::SavedComposition],
     precompleted_success_count: usize,
-    checkpoint_sink: ExecutionCheckpointSink,
+    checkpoint_sink: ExecutionCheckpointSink<SavedModuleSource>,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
-    observer: Box<dyn ExecutionObserver>,
-) -> ExecutionOutcome {
-    execute_effects_with_observer(
-        plan_file.plan(),
-        provider,
+    observer: Box<dyn ExecutionObserver<SavedModuleSource>>,
+) -> ExecutionOutcome<SavedModuleSource> {
+    let input = SavedExecutionInput {
+        plan: plan_file.plan(),
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: unresolved_resources,
+            data_source_origins,
+        },
+        compositions,
+        bindings: bindings.clone(),
+        managed_current: std::mem::take(managed_current),
+        data_source_values,
         normalizer,
         provider_configs,
         factories,
         schemas,
-        bindings,
-        managed_current,
-        data_source_values,
-        unresolved_resources,
-        data_source_origins,
-        compositions,
+        parallelism,
         precompleted_success_count,
         checkpoint_sink,
-        cancel,
-        parallelism,
-        observer,
-    )
-    .await
+    };
+    let outcome =
+        carina_core::executor::execute_saved_plan(provider, input, &*observer, cancel).await;
+    let result = match &outcome {
+        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
+    };
+    *managed_current = result.managed_current.clone();
+    *bindings = result.bindings.clone();
+    outcome
 }
 
 /// Re-load each upstream declared in the saved plan and verify its
@@ -851,8 +875,8 @@ pub async fn refresh_pending_states(
 ///
 /// Returns the [`SkippedExports`] summary after state is saved. Callers must fold
 /// unresolved exports into the command's exit status (carina#3710).
-pub(crate) async fn finalize_apply(
-    input: FinalizeApplyInput<'_>,
+pub(crate) async fn finalize_apply<S: Clone>(
+    input: FinalizeApplyInput<'_, S>,
     persistence: StatePersistence,
 ) -> Result<SkippedExports, AppError> {
     println!();
@@ -862,26 +886,20 @@ pub(crate) async fn finalize_apply(
         .state_save_inputs
         .build_state(input.state_base.into_state(), input.result)?;
 
-    // `Some([])` is meaningful: the user removed the `exports {}` block,
+    // `Some` with empty export params is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
     // (#2932). `None` preserves `state.exports` because the caller has
     // no source-side view of which exports the user intends — see the
-    // `FinalizeApplyInput::export_params` doc-comment.
-    let export_resolution = if let Some(params) = input.export_params {
+    // `FinalizeApplyInput::export_resolution_inputs` doc-comment.
+    let export_resolution = if let Some(export_inputs) = input.export_resolution_inputs {
         let post_apply_states = PostApplyStates::from_current_and_state(
             &input.result.managed_current,
-            input.data_source_values,
+            export_inputs.data_source_values,
             &state,
         );
-        let export_resources: Vec<Resource> = input
-            .state_save_inputs
-            .sorted_resources()
-            .iter()
-            .map(|resource| resource.as_resource().clone())
-            .collect();
         resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
-            export_params: params,
-            sorted_resources: &export_resources,
+            export_params: export_inputs.export_params,
+            sorted_resources: export_inputs.resources,
             pre_resolve_compositions: input.pre_resolve_compositions,
             post_apply_states: &post_apply_states,
             schemas: input.state_save_inputs.schemas(),
@@ -1063,7 +1081,7 @@ pub(crate) async fn persist_exports_only(
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     data_source_values: &DataSourceValues,
-    pre_resolve_compositions: &[carina_core::resource::Composition],
+    pre_resolve_compositions: &[carina_core::resource::LiveComposition],
     export_params: &carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::InferredExportParam,
     >,
@@ -1128,8 +1146,8 @@ impl DriftCheckResult {
 
 /// Detect infrastructure drift and retain the single historical-secret
 /// verification pass for the saved-plan gate.
-pub(crate) async fn detect_drift(
-    sorted_resources: &[Resource],
+pub(crate) async fn detect_drift<S>(
+    sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     provider: &dyn Provider,
@@ -1680,7 +1698,7 @@ struct SourceApplyPersistExports {
     >,
     state_file: Option<StateFile>,
     resources: Vec<Resource>,
-    compositions: Vec<carina_core::resource::Composition>,
+    compositions: Vec<carina_core::resource::LiveComposition>,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
     managed_current: HashMap<ResourceId, Current>,
@@ -1697,7 +1715,7 @@ struct SourceApplyExecuted {
     data_source_values: DataSourceValues,
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
-    pre_resolve_compositions: Vec<carina_core::resource::Composition>,
+    pre_resolve_compositions: Vec<carina_core::resource::LiveComposition>,
     cancel: ShutdownToken,
 }
 
@@ -1707,13 +1725,12 @@ enum SavedPlanApplyAfterHeartbeat {
 }
 
 struct SavedPlanApplyExecuted {
-    result: ExecutionResult,
+    result: ExecutionResult<SavedModuleSource>,
     cancelled: bool,
     resources_finished: Instant,
     apply_phase_started: Instant,
     state_base: FinalStateBase,
-    state_save_inputs: Arc<ApplyStateSaveInputs>,
-    data_source_values: DataSourceValues,
+    state_save_inputs: Arc<ApplyStateSaveInputs<SavedModuleSource>>,
     wait_aliases: Vec<WaitAliasSpec>,
     cancel: ShutdownToken,
 }
@@ -2039,7 +2056,7 @@ async fn run_apply_locked_owned(
             // after any Replace on a referenced managed resource.
             // carina#3181: composition resources live in `parsed.compositions`
             // as their own typed slice.
-            let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+            let pre_resolve_compositions: Vec<carina_core::resource::LiveComposition> =
                 parsed.compositions.clone();
 
             let pre_apply_current = carina_core::resource::into_plan_input_current_map(
@@ -2062,7 +2079,7 @@ async fn run_apply_locked_owned(
                 OverrideAwareResources::build_pair_with_stability(
                     expanded_canonical_resources.as_pair(),
                     state_file.as_ref(),
-                    carina_core::binding_index::PreApplyInputs {
+                    carina_core::binding_index::LivePreApplyInputs {
                         managed: &[],
                         compositions: &pre_resolve_compositions,
                         managed_current: &pre_apply_current,
@@ -2092,8 +2109,9 @@ async fn run_apply_locked_owned(
             // Run the normalization pipeline (same as plan path in wiring.rs).
             // `create_plan` resolves typed wait RHS values against target schemas.
             let wait_bindings = parsed.wait_bindings.clone();
-            let module_gate =
-                carina_core::executor::ModuleConstraintGate::new(&pre_resolve_compositions);
+            let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
+                &pre_resolve_compositions,
+            );
             let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
             let preparation = if let Some(errors) = refresh_module_constraint_errors {
                 Err(crate::wiring::PlanPreparationError::Plan(errors))
@@ -2323,7 +2341,7 @@ async fn run_apply_locked_owned(
                 // `parsed.compositions` and still carry the authored
                 // `ResourceRef` snapshots — the shape post-apply export resolution expects
                 // from the post-apply path.
-                let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
+                let pre_resolve_compositions_noop: Vec<carina_core::resource::LiveComposition> =
                     parsed.compositions.clone();
                 return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
                     SourceApplyPersistExports {
@@ -2518,6 +2536,11 @@ async fn run_apply_locked_owned(
                     pre_resolve_compositions,
                     cancel,
                 } = *context;
+                let export_resources: Vec<Resource> = state_save_inputs
+                    .sorted_resources()
+                    .iter()
+                    .map(|resource| resource.as_resource().clone())
+                    .collect();
                 // Use override-aware resources (post-default_tags merge, post-canonicalize)
                 // for state writeback so the per-resource `explicit` tree includes
                 // provider-level default tags. Otherwise the next plan projects the
@@ -2530,10 +2553,13 @@ async fn run_apply_locked_owned(
                                 result: &result,
                                 state_base,
                                 state_save_inputs,
-                                data_source_values: &data_source_values,
+                                export_resolution_inputs: Some(ExportResolutionInputs {
+                                    export_params: &checked_exports,
+                                    data_source_values: &data_source_values,
+                                    resources: &export_resources,
+                                }),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                export_params: Some(&checked_exports),
                                 provider_context,
                                 wait_aliases: &wait_aliases,
                                 pre_resolve_compositions: &pre_resolve_compositions,
@@ -2648,7 +2674,7 @@ trait SavedPlanResourceLike {
     fn attributes(&self) -> &indexmap::IndexMap<String, Value>;
 }
 
-impl SavedPlanResourceLike for Resource {
+impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2662,7 +2688,7 @@ impl SavedPlanResourceLike for Resource {
     }
 }
 
-impl SavedPlanResourceLike for DataSource {
+impl<S> SavedPlanResourceLike for carina_core::resource::DataSource<S> {
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2676,15 +2702,15 @@ impl SavedPlanResourceLike for DataSource {
     }
 }
 
-fn rehydrate_saved_resource_like<T, Rehydrate>(
+fn rehydrate_saved_resource_like<T, U, Rehydrate>(
     saved: &mut [T],
-    candidates: &HashMap<ResourceId, T>,
+    candidates: &HashMap<ResourceId, U>,
     apply_target: ApplyTarget<'_>,
     rehydrate: Rehydrate,
 ) -> Result<(), AppError>
 where
     T: SavedPlanResourceLike,
-    Rehydrate: Fn(&T, &T) -> Result<T, carina_core::value::SecretRehydrationSiteError>,
+    Rehydrate: Fn(&T, &U) -> Result<T, carina_core::value::SecretRehydrationSiteError>,
 {
     for entry in saved {
         if !entry
@@ -2703,9 +2729,10 @@ where
     Ok(())
 }
 
-fn matching_resource_like<'a, T>(saved: &T, fresh: &'a [T]) -> Option<&'a T>
+fn matching_resource_like<'a, T, U>(saved: &T, fresh: &'a [U]) -> Option<&'a U>
 where
     T: SavedPlanResourceLike,
+    U: SavedPlanResourceLike,
 {
     fresh
         .iter()
@@ -2721,8 +2748,8 @@ where
         })
 }
 
-fn import_identifiers_from_current_config(
-    plan: &Plan,
+fn import_identifiers_from_current_config<S>(
+    plan: &carina_core::plan::Plan<S>,
     parsed: &carina_core::parser::InferredFile,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
@@ -2786,7 +2813,7 @@ async fn prepare_saved_plan_secret_candidates(
         wiring.schemas(),
     )?;
     let prior_states = pending_plan.expansion_prior_states(expansion_prelude.sorted_resources());
-    let data_source_values = pending_plan.data_source_values()?;
+    let data_source_values = pending_plan.data_source_values(&parsed.data_sources)?;
     let prepared_expansion = expansion_prelude
         .reconcile_addresses(
             crate::wiring::ReconcileDeferredForExpansionInputs {
@@ -2882,35 +2909,42 @@ fn rehydrate_desired_plan_file_from_parts(
         carina_core::value::rehydrate_resource_secrets,
     )?;
 
-    for composition in plan_file.compositions_mut() {
-        let has_placeholder = composition
-            .signature
-            .arguments
-            .values()
-            .any(|argument| carina_core::value::contains_redacted_secret(argument.value()))
-            || composition.signature.attributes.values().any(|attribute| {
-                carina_core::value::contains_redacted_secret(&attribute.to_value())
-            });
-        if !has_placeholder {
-            continue;
-        }
-        let candidate = parsed
-            .compositions
-            .iter()
-            .find(|candidate| candidate.id == composition.id)
-            .or_else(|| {
-                let binding = composition.binding.as_deref()?;
-                parsed
-                    .compositions
-                    .iter()
-                    .find(|candidate| candidate.binding.as_deref() == Some(binding))
-            })
-            .ok_or_else(|| {
-                saved_plan_secret_shape_error(composition.id.to_string(), apply_target)
-            })?;
-        *composition = carina_core::value::rehydrate_composition_secrets(composition, candidate)
-            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    }
+    let mut composition_source_identities = CompositionSourceIdentityResolver::new(
+        carina_core::config_loader::get_base_dir(apply_target.source_dir()),
+    )
+    .map_err(AppError::from)?;
+    plan_file
+        .rehydrate_composition_secrets(
+            &parsed.compositions,
+            &mut composition_source_identities,
+        )
+        .map_err(|error| match error {
+            ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
+                let call_chain = origin_id
+                    .calls()
+                    .map(|call| {
+                        let source_file = call.source_file().to_string_lossy();
+                        format!(
+                            "{}:{}:{}",
+                            source_file.escape_debug(),
+                            call.start_line(),
+                            call.start_column(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                saved_plan_secret_shape_error(
+                    format!(
+                        "composition call id chain {call_chain} disagreed with the saved plan",
+                    ),
+                    apply_target,
+                )
+            }
+            ReloadedCompositionRehydrationError::Secret(error) => {
+                saved_plan_secret_rehydration_error(error, apply_target)
+            }
+            ReloadedCompositionRehydrationError::SourceIdentity(error) => AppError::from(error),
+        })?;
 
     rehydrate_saved_resource_like(
         plan_file.data_sources_mut(),
@@ -2983,7 +3017,7 @@ async fn run_apply_from_plan_with_observer_factory(
     accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_>,
+    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
 ) -> Result<(), AppError> {
     let bytes = fs::read(plan_path).map_err(|error| AppError::PlanFileRead {
         path: plan_path.to_path_buf(),
@@ -3021,10 +3055,11 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 26 persists the exact
-    // provider artifacts used to compute the plan. Plan-file version 25
-    // persists every data-source outcome so apply never re-derives it from a
-    // partial graph.
+    // Validate version compatibility before decoding the payload. Format 27
+    // requires normalized composition call origins. Plan-file version 26
+    // persists the exact provider artifacts used to compute the plan. Plan-file
+    // version 25 persists every data-source outcome so apply never re-derives
+    // it from a partial graph.
     // Plan-file version 24 removes the
     // redundant wait target schema kind now that waits are managed-only.
     // Version 23 persists the provider-schema fingerprints checked before
@@ -3269,7 +3304,7 @@ async fn run_apply_from_plan_locked_owned(
     lock: StateLock,
     apply_target: ApplyTarget<'_>,
     cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_>,
+    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
@@ -3461,7 +3496,7 @@ async fn run_apply_from_plan_locked_owned(
                 ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
-            let plan_data_source_origins: &[carina_core::resource::DataSource] =
+            let plan_data_source_origins: &[SavedDataSource] =
                 rehydrated_plan_file.data_source_origins();
 
             let mut managed_current = HashMap::new();
@@ -3501,16 +3536,15 @@ async fn run_apply_from_plan_locked_owned(
                     wiring.schemas(),
                     sorted_resources,
                 );
-                let terminal_bindings =
-                    ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-                        managed: sorted_resources,
-                        compositions: plan_compositions,
-                        managed_current: &terminal_input_current,
-                        data_source_values: &data_source_values,
-                        remote_bindings: rehydrated_plan_file.upstream_snapshot(),
-                        wait_aliases: &terminal_wait_aliases,
-                    });
-                finalize_module_constraints(plan_compositions, &terminal_bindings)?;
+                let terminal_bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
+                    managed: sorted_resources,
+                    compositions: plan_compositions,
+                    managed_current: &terminal_input_current,
+                    data_source_values: &data_source_values,
+                    remote_bindings: rehydrated_plan_file.upstream_snapshot(),
+                    wait_aliases: &terminal_wait_aliases,
+                });
+                finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
                 println!("{}", "No changes needed.".green());
                 return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
             }
@@ -3579,15 +3613,14 @@ async fn run_apply_from_plan_locked_owned(
                 wiring.schemas(),
                 sorted_resources,
             );
-            let mut bindings =
-                ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-                    managed: sorted_resources,
-                    compositions: plan_compositions,
-                    managed_current: &pre_apply_input_current,
-                    data_source_values: &data_source_values,
-                    remote_bindings: &upstream_snapshot,
-                    wait_aliases: &wait_aliases,
-                });
+            let mut bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
+                managed: sorted_resources,
+                compositions: plan_compositions,
+                managed_current: &pre_apply_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &upstream_snapshot,
+                wait_aliases: &wait_aliases,
+            });
             bindings.apply_plan_stability(
                 sorted_resources,
                 &pre_apply_input_current,
@@ -3663,7 +3696,6 @@ async fn run_apply_from_plan_locked_owned(
                     apply_phase_started,
                     state_base,
                     state_save_inputs,
-                    data_source_values,
                     wait_aliases,
                     cancel,
                 },
@@ -3694,7 +3726,6 @@ async fn run_apply_from_plan_locked_owned(
                     apply_phase_started,
                     state_base,
                     state_save_inputs,
-                    data_source_values,
                     wait_aliases,
                     cancel,
                 } = *context;
@@ -3709,22 +3740,20 @@ async fn run_apply_from_plan_locked_owned(
                                 result: &result,
                                 state_base,
                                 state_save_inputs,
-                                data_source_values: &data_source_values,
+                                // Saved plan files do not persist export parameters today, so
+                                // preserve `state.exports` rather than wiping it. Source-driven
+                                // `carina apply` reconciles exports from the `.crn` directly
+                                // (#2932).
+                                export_resolution_inputs: None,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                // Saved plan files do not persist `export_params` today, so
-                                // pass `None` to preserve `state.exports` rather than wipe it.
-                                // Source-driven `carina apply` reconciles exports from the
-                                // `.crn` directly (#2932).
-                                export_params: None,
                                 provider_context: &provider_context,
-                                // No export resolution runs here (export_params is None), but
-                                // the field is required; pass the reconstructed aliases so the
-                                // value is correct if a future plan file persists export_params.
+                                // No export resolution runs here, but pass the reconstructed
+                                // aliases so the value is correct if a future plan file persists
+                                // export parameters.
                                 wait_aliases: &wait_aliases,
-                                // Same rationale as `export_params: None`: no export
-                                // resolution runs from the `apply --plan` path, so no
-                                // pre-resolve composition snapshot is needed.
+                                // No pre-resolve composition snapshot is needed without export
+                                // resolution in the `apply --plan` path.
                                 pre_resolve_compositions: &[],
                             },
                             persistence,
@@ -3762,7 +3791,7 @@ async fn run_apply_from_plan_locked(
     lock: StateLock,
     apply_target: ApplyTarget<'_>,
     cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_>,
+    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
@@ -3830,8 +3859,8 @@ pub(crate) fn apply_exit_code_for_counts(
     }
 }
 
-fn finish_apply(
-    result: &ExecutionResult,
+fn finish_apply<S>(
+    result: &ExecutionResult<S>,
     skipped_exports: SkippedExports,
     elapsed: Duration,
 ) -> Result<Option<Duration>, AppError> {

@@ -1083,7 +1083,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 
 #[test]
 fn format_effect_delete_uses_binding_name() {
-    let effect = Effect::Delete {
+    let effect: Effect = Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "awscc",
             "ec2.Vpc",
@@ -1103,7 +1103,7 @@ fn format_effect_delete_uses_binding_name() {
 
 #[test]
 fn format_effect_delete_falls_back_to_id_name() {
-    let effect = Effect::Delete {
+    let effect: Effect = Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "awscc",
             "ec2.Vpc",
@@ -1154,7 +1154,7 @@ fn format_effect_update_separates_type_and_name_with_space() {
 
 #[test]
 fn format_effect_import_separates_type_and_name_with_space() {
-    let effect = Effect::Import {
+    let effect: Effect = Effect::Import {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "aws",
             "s3.Bucket",
@@ -1173,7 +1173,7 @@ fn format_effect_import_separates_type_and_name_with_space() {
 
 #[test]
 fn format_effect_remove_separates_type_and_name_with_space() {
-    let effect = Effect::Remove {
+    let effect: Effect = Effect::Remove {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "awscc", "ec2.Vpc", "old_vpc", None,
         )),
@@ -1186,7 +1186,7 @@ fn format_effect_remove_separates_type_and_name_with_space() {
 
 #[test]
 fn format_effect_move_separates_type_and_name_with_space() {
-    let effect = Effect::Move {
+    let effect: Effect = Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "awscc", "ec2.Vpc", "vpc_a", None,
         )),
@@ -1699,7 +1699,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
         key: "default_cache_behavior".to_string(),
         value: PrettyValue::new(Value::Concrete(ConcreteValue::Map(cache_behavior))),
     };
-    let effect = Effect::Delete {
+    let effect: Effect = Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(
             carina_core::resource::ResourceId::with_identity("cloudfront.Distribution", "dist"),
         ),
@@ -1876,7 +1876,7 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
 
 /// carina#3322: the composition group header reads
 /// `▾ module "<binding>" (<source_path>)`. The keyword is `module`,
-/// not the internal `Composition`; the binding name is the user's
+/// not the internal `LiveComposition`; the binding name is the user's
 /// `let` LHS, and the parenthesized suffix surfaces the DSL `use`
 /// path so the operator can trace the group back to a real `.crn`
 /// file.

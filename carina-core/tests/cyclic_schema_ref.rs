@@ -407,10 +407,11 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
-    let schema = ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
-        .expect("test config type must be valid")
-        .rootless_type("value")
-        .expect("test config type must exist");
+    let schema =
+        ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
+            .expect("test config type must be valid")
+            .rootless_type("value")
+            .expect("test config type must exist");
     schema
         .validate(&value)
         .expect("a bare-identifier Map key for a Enum key type must validate");

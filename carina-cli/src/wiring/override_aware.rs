@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use carina_core::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, ResolvedBindings};
 use carina_core::config_loader::UnresolvedConfigSnapshot;
 use carina_core::data_source_value::DataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
@@ -278,11 +278,11 @@ pub enum OverrideAwareBuildMode<'a> {
 ///
 /// ```compile_fail,E0308
 /// # use std::collections::HashMap;
-/// # use carina_core::binding_index::PreApplyInputs;
+/// # use carina_core::binding_index::LivePreApplyInputs;
 /// # use carina_core::name_override::NameOverride;
 /// # use carina_cli::wiring::{OverrideAwareBuildMode, OverrideAwareResources};
 /// # use carina_core::resource::{Resource, ResourceId};
-/// # fn bypass(raw: Vec<Resource>, inputs: PreApplyInputs<'_>) {
+/// # fn bypass(raw: Vec<Resource>, inputs: LivePreApplyInputs<'_>) {
 /// let _ = OverrideAwareResources::build_pair_with_stability::<
 ///     (),
 ///     HashMap<ResourceId, HashMap<String, NameOverride>>,
@@ -311,7 +311,7 @@ pub struct OverrideAwareResources {
 /// late identity reconciliation. The managed set is deliberately absent: the
 /// rebuilt view always uses the resource set owned by the receiver.
 pub struct RebuildBindingsInputs<'a> {
-    pub compositions: &'a [carina_core::resource::Composition],
+    pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -324,7 +324,7 @@ impl OverrideAwareResources {
     pub fn build_pair_with_stability<E, S>(
         resources: &CanonicalResourcePair<E>,
         state_file: Option<&S>,
-        inputs: PreApplyInputs<'_>,
+        inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
     ) -> Result<(Self, Self), String>
@@ -341,7 +341,7 @@ impl OverrideAwareResources {
     fn build_inner<S>(
         unresolved: Vec<Resource>,
         state_file: Option<&S>,
-        inputs: &PreApplyInputs<'_>,
+        inputs: &LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
     ) -> Result<Self, String>
@@ -349,8 +349,8 @@ impl OverrideAwareResources {
         S: NameOverrideSource + ?Sized,
     {
         let mut resources = unresolved.clone();
-        let mut bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
                 managed_current: inputs.managed_current,
@@ -397,8 +397,8 @@ impl OverrideAwareResources {
             }
         }
 
-        bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &resources,
                 compositions: inputs.compositions,
                 managed_current: inputs.managed_current,
@@ -549,8 +549,8 @@ impl OverrideAwareResources {
             remote_bindings,
             wait_aliases,
         } = inputs;
-        self.bindings = ResolvedBindings::pre_apply_with_stability(
-            PreApplyInputs {
+        self.bindings = ResolvedBindings::pre_apply_live_with_stability(
+            LivePreApplyInputs {
                 managed: &self.resources,
                 compositions,
                 managed_current,
@@ -720,7 +720,7 @@ mod tests {
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
             Some(overrides),
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions: &compositions,
                 managed_current: &managed_current,

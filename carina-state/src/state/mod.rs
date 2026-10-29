@@ -245,9 +245,9 @@ impl SelectedStateAttributes {
         }
     }
 
-    fn protect_for_resource(
+    fn protect_for_resource<S>(
         mut self,
-        resource: &ResolvedResource,
+        resource: &ResolvedResource<S>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
         strict_desired: bool,
@@ -296,9 +296,9 @@ impl SelectedStateAttributes {
         Ok(self)
     }
 
-    fn protect_observation(
+    fn protect_observation<S>(
         mut self,
-        resource: &ResolvedResource,
+        resource: &ResolvedResource<S>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, SerializationError> {
@@ -1117,7 +1117,7 @@ impl StateFile {
     /// resource table. Match both the complete typed address supplied by the
     /// parser and the legacy row shape. An identifier-bearing row is managed
     /// state even when a new data source now occupies the same address.
-    pub fn remove_legacy_data_source_rows(&mut self, data_sources: &[DataSource]) -> usize {
+    pub fn remove_legacy_data_source_rows<S>(&mut self, data_sources: &[DataSource<S>]) -> usize {
         let data_source_ids: HashSet<_> = data_sources.iter().map(|source| &source.id).collect();
         let original_len = self.resources.len();
         self.resources.retain(|row| {
@@ -2006,9 +2006,9 @@ impl DeposedInstance {
     /// Rebuild this generation from a provider read while carrying write-only
     /// values only from this persisted generation. Provider echoes never
     /// become provenance for a deposed row.
-    pub fn refreshed_attributes_for_resource_and_schema(
+    pub fn refreshed_attributes_for_resource_and_schema<S>(
         &self,
-        resource: &ResolvedResource,
+        resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         fresh_attributes: &HashMap<String, Value>,
     ) -> DeposedAttributes {
@@ -2389,10 +2389,10 @@ impl RefreshableResourceState<'_> {
 /// while explicit authored `Secret` markers at concrete positions are unioned
 /// into it. If neither shape can be projected, only that unprojectable child
 /// fails closed; its container and siblings retain their own shapes.
-fn resource_with_secret_shape_union(
-    resource: &ResolvedResource,
+fn resource_with_secret_shape_union<S: Clone>(
+    resource: &ResolvedResource<S>,
     applied: &SecretPreservingAttributes,
-) -> ResolvedResource {
+) -> ResolvedResource<S> {
     let mut resolved = resource.as_inner().clone();
     resolved.attributes = applied
         .values()
@@ -2808,8 +2808,8 @@ impl ResourceState {
 
     /// Encode a provider/history fallback that has no persisted generation to
     /// carry from. All schema write-only values are excluded.
-    pub fn deposed_attributes_without_previous(
-        resource: &ResolvedResource,
+    pub fn deposed_attributes_without_previous<S>(
+        resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
@@ -2825,8 +2825,8 @@ impl ResourceState {
 
     /// Encode plan-time replacement history when no persisted generation
     /// exists. Provider-read write-only values are deliberately excluded.
-    pub fn deposed_attributes_from_replacement_history(
-        resource: &ResolvedResource,
+    pub fn deposed_attributes_from_replacement_history<S>(
+        resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         previous: ReplacementPreviousAttributesForStateWriteback<'_>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
@@ -2846,9 +2846,9 @@ impl ResourceState {
 
     /// Carry values from this persisted current generation into a deposed
     /// generation. The receiver is the type-level source of provenance.
-    pub fn deposed_attributes_from_current_generation(
+    pub fn deposed_attributes_from_current_generation<S>(
         &self,
-        resource: &ResolvedResource,
+        resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
     ) -> DeposedAttributes {
         let previous = self.persisted_attributes().cloned().unwrap_or_default();
@@ -2866,8 +2866,8 @@ impl ResourceState {
         DeposedAttributes(selected)
     }
 
-    fn selected_sent_attributes(
-        resource: &ResolvedResource,
+    fn selected_sent_attributes<S>(
+        resource: &ResolvedResource<S>,
         sent: &Sent,
         existing: Option<&ResourceState>,
         preferred_hashes: Option<&PersistedAttributes>,
@@ -2908,9 +2908,9 @@ impl ResourceState {
         recorded_write_only_keys(schema, attributes, &[])
     }
 
-    fn populate_desired_metadata(
+    fn populate_desired_metadata<S>(
         &mut self,
-        resource: &ResolvedResource,
+        resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
@@ -2945,8 +2945,8 @@ impl ResourceState {
         }
     }
 
-    fn carried_explicit_for_stored_values(
-        resource: &ResolvedResource,
+    fn carried_explicit_for_stored_values<S>(
+        resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
@@ -2977,8 +2977,8 @@ impl ResourceState {
     /// then absent. Desired state controls masking but cannot introduce an
     /// unsent value. The create establishes the current desired resource as the
     /// authoring baseline.
-    pub fn from_observation(
-        resource: &ResolvedResource,
+    pub fn from_observation<S: Clone>(
+        resource: &ResolvedResource<S>,
         created: &ObservedCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
@@ -3088,8 +3088,8 @@ impl ResourceState {
     /// known authoring record. A legacy `Unrecorded` authoring record is seeded
     /// from desired keys. A freshly sent create encodes sent write-only and
     /// secret values and establishes the current desired authoring baseline.
-    pub fn from_in_flight(
-        resource: &ResolvedResource,
+    pub fn from_in_flight<S>(
+        resource: &ResolvedResource<S>,
         pending: &InFlightCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
@@ -3179,8 +3179,8 @@ impl ResourceState {
     ///
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
-    pub fn from_provider_state_for_resource_and_schema(
-        resource: &ResolvedResource,
+    pub fn from_provider_state_for_resource_and_schema<S: Clone>(
+        resource: &ResolvedResource<S>,
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,

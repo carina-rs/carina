@@ -13,6 +13,14 @@ pub(super) fn create_document(content: &str) -> Document {
     Document::new(content.to_string(), Arc::new(ProviderContext::default()))
 }
 
+pub(super) fn create_document_at(content: &str, path: std::path::PathBuf) -> Document {
+    Document::new_with_path(
+        content.to_string(),
+        path,
+        Arc::new(ProviderContext::default()),
+    )
+}
+
 pub(super) fn test_engine() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(provider_mod::collect_schemas(&factories));
@@ -34,7 +42,7 @@ impl ProviderFactory for RegionConfigFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -125,7 +133,7 @@ impl ProviderFactory for SuspendedValidationFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::string(),
         )]))

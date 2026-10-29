@@ -1424,6 +1424,224 @@ let item = mock.test.resource {
 }
 
 #[test]
+fn saved_plan_composition_secret_uses_call_id_after_equal_width_binding_rename() {
+    const ORIGINAL: &str = "ORIGIN_CALL_SECRET_PLAIN_4041";
+    const DECOY: &str = "DECOY_CALL_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let alpha = tokens {{
+  value = secret("{ORIGINAL}")
+}}
+"#,
+    ));
+    scenario.write_module(
+        "tokens",
+        r#"arguments {
+  value: String
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[ORIGINAL]);
+
+    // `alpha` and `bravo` have equal width, so the authored call retains the
+    // same file/span identity. The later `alpha` is a decoy that the removed
+    // binding-based join would have selected.
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let bravo = tokens {{
+  value = secret("{ORIGINAL}")
+}}
+
+let alpha = tokens {{
+  value = secret("{DECOY}")
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert_success("carina apply saved plan after call rename", &apply);
+    assert_output_has_no_plaintext("saved-plan renamed-call apply", &apply, &[ORIGINAL, DECOY]);
+}
+
+#[test]
+fn saved_plan_composition_secret_rejects_moved_call_without_name_fallback() {
+    const ORIGINAL: &str = "MOVED_ORIGIN_SECRET_PLAIN_4041";
+    const DECOY: &str = "MOVED_DECOY_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let alpha = tokens {{
+  value = secret("{ORIGINAL}")
+}}
+"#,
+    ));
+    scenario.write_module(
+        "tokens",
+        r#"arguments {
+  value: String
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[ORIGINAL]);
+
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+
+
+let bravo = tokens {{
+  value = secret("{ORIGINAL}")
+}}
+
+let alpha = tokens {{
+  value = secret("{DECOY}")
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert!(
+        !apply.status.success(),
+        "moved call must invalidate the saved plan"
+    );
+    let rendered = output_text(&apply);
+    assert!(
+        rendered.contains("composition call id chain main.crn:")
+            && rendered.contains("disagreed with the saved plan")
+            && rendered.contains("re-run `carina plan --out plan.json "),
+        "stale composition error must name the call location and replan command:\n{rendered}",
+    );
+    assert_output_has_no_plaintext("saved-plan stale-call apply", &apply, &[ORIGINAL, DECOY]);
+}
+
+#[test]
+fn unrelated_secret_does_not_join_a_moved_secret_free_composition() {
+    const SECRET: &str = "UNRELATED_RESOURCE_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let unrelated = mock.test.resource {{
+  name    = "unrelated-secret"
+  comment = secret("{SECRET}")
+}}
+
+let plain = use {{ source = "./plain" }}
+let instance = plain {{
+  value = "not-secret"
+}}
+"#,
+    ));
+    scenario.write_module(
+        "plain",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "plain-module"
+  comment = value
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[SECRET]);
+
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let unrelated = mock.test.resource {{
+  name    = "unrelated-secret"
+  comment = secret("{SECRET}")
+}}
+
+let plain = use {{ source = "./plain" }}
+// Moving this secret-free call must not require a saved-origin join.
+let instance = plain {{
+  value = "not-secret"
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert_success("saved-plan apply after moving secret-free call", &apply);
+    assert_output_has_no_plaintext("saved-plan moved secret-free call", &apply, &[SECRET]);
+}
+
+#[test]
+fn moved_secret_free_composition_skips_join_after_secret_composition_rehydrates() {
+    const SECRET: &str = "PER_COMPOSITION_SKIP_SECRET_PLAIN_4041";
+    let scenario = Scenario::new(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let secure = tokens {{
+  value = secret("{SECRET}")
+}}
+
+let plain = tokens {{
+  value = "not-secret"
+}}
+"#,
+    ));
+    scenario.write_module(
+        "tokens",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "module-item"
+  comment = value
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &[SECRET]);
+
+    scenario.write_main(&format!(
+        r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let tokens = use {{ source = "./tokens" }}
+let secure = tokens {{
+  value = secret("{SECRET}")
+}}
+
+// Only this secret-free call moves; the secret-bearing call stays put.
+let plain = tokens {{
+  value = "not-secret"
+}}
+"#,
+    ));
+
+    let apply = scenario.apply_plan();
+    assert_success(
+        "saved-plan apply after moving only the secret-free composition",
+        &apply,
+    );
+    assert_output_has_no_plaintext("per-composition saved-plan rehydration", &apply, &[SECRET]);
+}
+
+#[test]
 fn saved_plan_module_repeated_block_secret_is_canonical_masked_and_converges() {
     const ENV: &[(&str, &str)] = &[("MODULE_RULE_SECRET", "module-rule-plain-3973")];
     const PLAINTEXT: &str = "module-rule-plain-3973";
