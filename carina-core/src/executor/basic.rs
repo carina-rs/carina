@@ -742,7 +742,7 @@ pub(super) struct BasicEffectCtx<'a, S> {
 pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
     basic: BasicEffect<'effect, S>,
     ctx: &BasicEffectCtx<'_, S>,
-    in_flight_start: InFlightStart,
+    in_flight_start: InFlightStart<S>,
     observer: &'observer dyn ExecutionObserver<S>,
 ) -> StartedBasicEffectResult<'observer, S> {
     let provider = ctx.provider;

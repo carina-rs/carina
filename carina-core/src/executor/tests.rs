@@ -5044,8 +5044,9 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
 #[tokio::test]
 async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_effects() {
     let provider = DelayedCountingProvider::new(std::time::Duration::ZERO)
-        .with_delay("r2", std::time::Duration::from_secs(60));
-    let observer = CancelsWhenStarted::with_cleanup_priority("r2");
+        .with_delay("r2", std::time::Duration::from_secs(60))
+        .with_delay("r3", std::time::Duration::from_secs(60));
+    let observer = CancelsWhenStarted::with_cleanup_priority("r3");
     let shutdown = observer.token();
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
@@ -5059,7 +5060,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
-        parallelism: NonZeroUsize::new(1).unwrap(),
+        parallelism: NonZeroUsize::new(2).unwrap(),
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
@@ -5082,8 +5083,14 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
             .contains_key(&ResourceId::with_identity("test", "r2")),
         "the abandoned in-flight effect has no trustworthy completion result"
     );
-    assert_eq!(provider.started_names(), vec!["r1", "r2"]);
-    assert_eq!(result.interrupted_count, 1);
+    assert!(
+        !result
+            .applied_states
+            .contains_key(&ResourceId::with_identity("test", "r3")),
+        "the second abandoned in-flight effect has no trustworthy completion result"
+    );
+    assert_eq!(provider.started_names(), vec!["r1", "r2", "r3"]);
+    assert_eq!(result.interrupted_count, 2);
     let interrupted: Vec<_> = observer
         .events()
         .into_iter()
@@ -5091,8 +5098,8 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         .collect();
     assert_eq!(
         interrupted,
-        ["interrupted:test.r2:2/3"],
-        "only the started, abandoned r2 effect should be interrupted"
+        ["interrupted:test.r2:2/3", "interrupted:test.r3:3/3"],
+        "started, abandoned effects must be interrupted in effect-index order"
     );
 }
 

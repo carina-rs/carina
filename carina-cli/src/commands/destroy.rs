@@ -1024,10 +1024,7 @@ async fn run_destroy_locked_owned(
                     effect,
                     timing,
                 ));
-                active_progress
-                    .remove(&finished_idx)
-                    .expect("completed destroy effect must own progress")
-                    .finish(outcome);
+                finish_destroy_progress(&progress, &mut active_progress, finished_idx, outcome);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
@@ -1057,10 +1054,7 @@ async fn run_destroy_locked_owned(
                         retry_num,
                         max_retries
                     ));
-                    active_progress
-                        .remove(&finished_idx)
-                        .expect("retrying destroy effect must own progress")
-                        .finish(outcome);
+                    finish_destroy_progress(&progress, &mut active_progress, finished_idx, outcome);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     let outcome = FailedOutcome::new(
@@ -1072,10 +1066,12 @@ async fn run_destroy_locked_owned(
                         ),
                         [e.to_string()],
                     );
-                    active_progress
-                        .remove(&finished_idx)
-                        .expect("failed destroy effect must own progress")
-                        .finish_failed(outcome);
+                    finish_failed_destroy_progress(
+                        &progress,
+                        &mut active_progress,
+                        finished_idx,
+                        outcome,
+                    );
                     failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
@@ -1674,6 +1670,32 @@ struct InterruptedDestroyCounts {
     unknown: usize,
 }
 
+fn finish_destroy_progress(
+    progress: &ProgressBackend<usize>,
+    active_progress: &mut HashMap<usize, ProgressGuard<'_, usize>>,
+    idx: usize,
+    outcome: NonFailureOutcome,
+) {
+    if let Some(active) = active_progress.remove(&idx) {
+        active.finish(outcome);
+    } else {
+        progress.outcome_line(outcome);
+    }
+}
+
+fn finish_failed_destroy_progress(
+    progress: &ProgressBackend<usize>,
+    active_progress: &mut HashMap<usize, ProgressGuard<'_, usize>>,
+    idx: usize,
+    outcome: FailedOutcome,
+) {
+    if let Some(active) = active_progress.remove(&idx) {
+        active.finish_failed(outcome);
+    } else {
+        progress.failed_line(outcome);
+    }
+}
+
 fn finish_interrupted_destroy_outcomes(
     progress: &ProgressBackend<usize>,
     active_progress: &mut HashMap<usize, ProgressGuard<'_, usize>>,
@@ -1696,10 +1718,7 @@ fn finish_interrupted_destroy_outcomes(
         };
         let outcome = outcome_for(idx, kind);
         if kind == InterruptedDestroyOutcome::Unknown {
-            active_progress
-                .remove(&idx)
-                .expect("dispatched destroy effect must own progress")
-                .finish(outcome);
+            finish_destroy_progress(progress, active_progress, idx, outcome);
         } else {
             progress.outcome_line(outcome);
         }

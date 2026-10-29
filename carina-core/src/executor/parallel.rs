@@ -25,9 +25,9 @@ use super::scheduler::{
     try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
-    InFlightStart, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome,
-    WaitSignal, count_effectively_undispatched, resolve_wait_identifier,
-    unsatisfiable_reason_message, wait_failure_message,
+    SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome, WaitSignal,
+    count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
+    wait_failure_message,
 };
 use super::{
     ExecutionAccumulator, ExecutionEvent, ExecutionObserver, ExecutionResult, ProgressInfo,
@@ -336,7 +336,8 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
         }
     }
 
-    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<'_, S>> = WaitAwareInFlight::new();
+    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<'_, S>, S> =
+        WaitAwareInFlight::new();
     let mut cancelled = false;
     let cleanup_loop = shutdown.cleanup_aware_loop();
 
@@ -528,7 +529,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
             >,
-                                    in_flight_start: InFlightStart| async move {
+                                    in_flight_start| async move {
                 let preparation = ProviderPreparationContext::new(
                     &binding_snapshot,
                     module_gate,
@@ -928,7 +929,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
     // the caller can persist the results already folded into `applied_states`.
     // Every effect that reached EffectStarted receives a terminal event before
     // state persistence; queued but never-polled futures are omitted.
-    let interrupted_count = in_flight.abandon();
+    let interrupted_count = in_flight.abandon(observer);
     if interrupted_count > 0 {
         accumulated.mutate(|result| result.interrupted_count += interrupted_count);
     }

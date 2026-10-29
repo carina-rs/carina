@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -132,11 +131,15 @@ enum ProgressBackendInner<K> {
 }
 
 struct PlainState<K> {
-    active: Mutex<HashMap<K, PlainInFlight>>,
+    active: Mutex<PlainActive<K>>,
     interval: Duration,
-    next_sequence: AtomicU64,
     writer: Mutex<Box<dyn Write + Send>>,
     failure_writer: Option<Mutex<Box<dyn Write + Send>>>,
+}
+
+struct PlainActive<K> {
+    entries: HashMap<K, PlainInFlight>,
+    next_sequence: u64,
 }
 
 struct PlainInFlight {
@@ -168,6 +171,7 @@ const PLAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 fn emit_heartbeats<K>(state: &PlainState<K>, now: Instant) {
     let mut active = state.active.lock().unwrap();
     let mut entries: Vec<_> = active
+        .entries
         .values_mut()
         .filter(|entry| {
             let silence_limit = if entry.self_reporting {
@@ -459,9 +463,11 @@ where
         interval: Duration,
     ) -> Self {
         let state = Arc::new(PlainState {
-            active: Mutex::new(HashMap::new()),
+            active: Mutex::new(PlainActive {
+                entries: HashMap::new(),
+                next_sequence: 0,
+            }),
             interval,
-            next_sequence: AtomicU64::new(0),
             writer: Mutex::new(Box::new(writer)),
             failure_writer: failure_writer
                 .map(|writer| Mutex::new(Box::new(writer) as Box<dyn Write + Send>)),
@@ -512,7 +518,7 @@ where
     pub(crate) fn active_count(&self) -> usize {
         match &self.inner {
             ProgressBackendInner::Tty { bars, .. } => bars.lock().unwrap().active.len(),
-            ProgressBackendInner::Plain { state, .. } => state.active.lock().unwrap().len(),
+            ProgressBackendInner::Plain { state, .. } => state.active.lock().unwrap().entries.len(),
         }
     }
 
@@ -525,6 +531,7 @@ where
             .active
             .lock()
             .unwrap()
+            .entries
             .get(key)
             .map(|entry| entry.last_reported)
     }
@@ -555,28 +562,21 @@ where
             }
             ProgressBackendInner::Plain { state, .. } => {
                 let started = Instant::now();
-                state.active.lock().unwrap().insert(
+                let mut active = state.active.lock().unwrap();
+                let sequence = active.next_sequence;
+                active.next_sequence = active.next_sequence.wrapping_add(1);
+                active.entries.insert(
                     key,
                     PlainInFlight {
                         label,
                         started,
                         last_reported: started,
                         self_reporting: false,
-                        sequence: state.next_sequence.fetch_add(1, Ordering::Relaxed),
+                        sequence,
                     },
                 );
             }
         }
-    }
-
-    /// Finish the spinner for `key` with a non-failure outcome.
-    pub(crate) fn finish(&self, key: K, outcome: NonFailureOutcome) {
-        self.finish_rendered(key, outcome.rendered(), OutputRoute::Ordinary);
-    }
-
-    /// Finish the spinner for `key` with a failure routed to stderr.
-    pub(crate) fn finish_failed(&self, key: K, outcome: FailedOutcome) {
-        self.finish_rendered(key, outcome.rendered(), OutputRoute::Failure);
     }
 
     fn finish_rendered(&self, key: K, line: String, route: OutputRoute) {
@@ -592,7 +592,7 @@ where
             }
             ProgressBackendInner::Plain { state, .. } => {
                 let mut active = state.active.lock().unwrap();
-                active.remove(&key);
+                active.entries.remove(&key);
                 let target = match route {
                     OutputRoute::Ordinary => &state.writer,
                     OutputRoute::Failure => state.failure_writer.as_ref().unwrap_or(&state.writer),
@@ -613,7 +613,7 @@ where
                 }
             }
             ProgressBackendInner::Plain { state, .. } => {
-                state.active.lock().unwrap().remove(key);
+                state.active.lock().unwrap().entries.remove(key);
             }
         }
     }
@@ -635,7 +635,7 @@ where
             }
             ProgressBackendInner::Plain { state, .. } => {
                 let mut active = state.active.lock().unwrap();
-                if let Some(entry) = active.get_mut(key) {
+                if let Some(entry) = active.entries.get_mut(key) {
                     entry.last_reported = now;
                     entry.self_reporting = true;
                 }
@@ -764,6 +764,16 @@ impl<S> ProgressBackend<EffectProgressKey<S>> {
     pub(super) fn start_effect(&self, key: EffectProgressKey<S>, label: impl Into<String>) {
         self.start(key, label);
     }
+
+    /// Finish an observer effect with a non-failure outcome.
+    pub(super) fn finish(&self, key: EffectProgressKey<S>, outcome: NonFailureOutcome) {
+        self.finish_rendered(key, outcome.rendered(), OutputRoute::Ordinary);
+    }
+
+    /// Finish an observer effect with a failure routed to stderr.
+    pub(super) fn finish_failed(&self, key: EffectProgressKey<S>, outcome: FailedOutcome) {
+        self.finish_rendered(key, outcome.rendered(), OutputRoute::Failure);
+    }
 }
 
 impl ProgressBackend<usize> {
@@ -797,12 +807,14 @@ where
 {
     pub(crate) fn finish(mut self, outcome: NonFailureOutcome) {
         let key = self.key.take().expect("progress key already taken");
-        self.backend.finish(key, outcome);
+        self.backend
+            .finish_rendered(key, outcome.rendered(), OutputRoute::Ordinary);
     }
 
     pub(crate) fn finish_failed(mut self, outcome: FailedOutcome) {
         let key = self.key.take().expect("progress key already taken");
-        self.backend.finish_failed(key, outcome);
+        self.backend
+            .finish_rendered(key, outcome.rendered(), OutputRoute::Failure);
     }
 }
 
@@ -1033,9 +1045,9 @@ mod tests {
             io::sink(),
         );
 
-        backend.start(1, "running");
-        backend.finish(1, NonFailureOutcome::success("finished after start"));
-        backend.finish(2, NonFailureOutcome::success("finished without start"));
+        let progress = backend.start_indexed(1, "running");
+        progress.finish(NonFailureOutcome::success("finished after start"));
+        backend.outcome_line(NonFailureOutcome::success("finished without start"));
         backend.info_line("standalone event");
 
         let raw = String::from_utf8(terminal.bytes()).unwrap();
@@ -1063,8 +1075,8 @@ mod tests {
             stderr.clone(),
         );
 
-        backend.start(1, "running");
-        backend.finish(1, NonFailureOutcome::success("finished"));
+        let progress = backend.start_indexed(1, "running");
+        progress.finish(NonFailureOutcome::success("finished"));
         backend.close_refresh_phase();
 
         assert_eq!(stdout.0.lock().unwrap().as_slice(), b"\n");
@@ -1091,8 +1103,8 @@ mod tests {
         let backend: ProgressBackend<usize> =
             ProgressBackend::tty(ProgressDrawTarget::hidden(), stdout.clone(), stderr.clone());
 
-        backend.start(1, "running");
-        backend.finish(1, NonFailureOutcome::success("finished"));
+        let progress = backend.start_indexed(1, "running");
+        progress.finish(NonFailureOutcome::success("finished"));
         backend.note_external_line();
         backend.close_refresh_phase();
 
@@ -1183,9 +1195,9 @@ mod tests {
         let output = SharedWriter::default();
         let backend = ProgressBackend::plain(output.clone());
 
-        backend.start(1, "started but not emitted");
-        backend.finish(1, NonFailureOutcome::success("finished after start"));
-        backend.finish(2, NonFailureOutcome::success("finished without start"));
+        let progress = backend.start_indexed(1, "started but not emitted");
+        progress.finish(NonFailureOutcome::success("finished after start"));
+        backend.outcome_line(NonFailureOutcome::success("finished without start"));
         backend.info_line("standalone event");
 
         assert_eq!(
@@ -1203,8 +1215,8 @@ mod tests {
         let output = SharedWriter::default();
         let backend = ProgressBackend::plain(output.clone());
 
-        backend.start(1, "Create r.a");
-        backend.start(2, "Create r.b");
+        let first = backend.start_indexed(1, "Create r.a");
+        let second = backend.start_indexed(2, "Create r.b");
         let now = std::time::Instant::now() + Duration::from_secs(90);
         let ProgressBackendInner::Plain { state, .. } = &backend.inner else {
             panic!("expected plain progress backend");
@@ -1221,7 +1233,7 @@ mod tests {
             .as_bytes()
         );
 
-        backend.finish(1, NonFailureOutcome::success("Create r.a"));
+        first.finish(NonFailureOutcome::success("Create r.a"));
         emit_heartbeats(state, now + PLAIN_HEARTBEAT_INTERVAL);
         assert_eq!(
             &output.0.lock().unwrap()[first_tick_len..],
@@ -1232,7 +1244,7 @@ mod tests {
             .as_bytes()
         );
 
-        backend.finish(2, NonFailureOutcome::success("Create r.b"));
+        second.finish(NonFailureOutcome::success("Create r.b"));
         let before_empty_tick = output.0.lock().unwrap().clone();
         emit_heartbeats(state, now);
         assert_eq!(*output.0.lock().unwrap(), before_empty_tick);
@@ -1243,11 +1255,18 @@ mod tests {
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
         let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
-        backend.start(1, "Create r.short");
+        let _progress = backend.start_indexed(1, "Create r.short");
         let ProgressBackendInner::Plain { state, .. } = &backend.inner else {
             panic!("expected plain progress backend");
         };
-        let started = state.active.lock().unwrap().get(&1).unwrap().started;
+        let started = state
+            .active
+            .lock()
+            .unwrap()
+            .entries
+            .get(&1)
+            .unwrap()
+            .started;
 
         emit_heartbeats(state, started + interval - Duration::from_millis(1));
         assert!(output.0.lock().unwrap().is_empty());
@@ -1268,7 +1287,7 @@ mod tests {
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
         let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
-        backend.start(1, "Wait certificate");
+        let _progress = backend.start_indexed(1, "Wait certificate");
         let previous_poll = backend.plain_last_reported(&1).unwrap();
         backend.in_flight_line_at(&1, "~ certificate: still pending", previous_poll);
 
@@ -1291,15 +1310,40 @@ mod tests {
     }
 
     #[test]
+    fn poll_line_pushes_back_next_generic_heartbeat() {
+        let output = SharedWriter::default();
+        let interval = Duration::from_secs(30);
+        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let _progress = backend.start_indexed(1, "Wait certificate");
+        let started = backend.plain_last_reported(&1).unwrap();
+
+        backend.in_flight_line_at(
+            &1,
+            "~ certificate: still pending",
+            started + Duration::from_secs(50),
+        );
+        output.0.lock().unwrap().clear();
+
+        backend.emit_heartbeats_at(started + Duration::from_secs(61));
+        assert!(output.0.lock().unwrap().is_empty());
+
+        backend.emit_heartbeats_at(started + Duration::from_secs(110));
+        assert_eq!(
+            output.0.lock().unwrap().as_slice(),
+            "  … Still running: Wait certificate [1m 50s elapsed]\n".as_bytes(),
+        );
+    }
+
+    #[test]
     fn plain_heartbeat_thread_emits_before_outcome_without_ansi() {
         let output = SharedWriter::default();
         let backend =
             ProgressBackend::plain_with_interval(output.clone(), Duration::from_millis(10));
 
-        backend.start(1, "Create r.slow");
+        let progress = backend.start_indexed(1, "Create r.slow");
         wait_for_output_contains(&output.0, "Still running: Create r.slow");
 
-        backend.finish(1, NonFailureOutcome::success("Create r.slow"));
+        progress.finish(NonFailureOutcome::success("Create r.slow"));
         drop(backend);
         let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
         let last_heartbeat = rendered.rfind("Still running: Create r.slow").unwrap();
@@ -1324,8 +1368,10 @@ mod tests {
             PLAIN_HEARTBEAT_INTERVAL,
         );
 
-        backend.finish(1, NonFailureOutcome::success("finished"));
-        backend.finish_failed(2, FailedOutcome::new("failed resource", ["provider error"]));
+        let successful = backend.start_indexed(1, "successful resource");
+        let failed = backend.start_indexed(2, "failed resource");
+        successful.finish(NonFailureOutcome::success("finished"));
+        failed.finish_failed(FailedOutcome::new("failed resource", ["provider error"]));
         backend.failed_line(FailedOutcome::summary("untied failure"));
 
         assert_eq!(
@@ -1347,7 +1393,8 @@ mod tests {
         let output = SharedWriter::default();
         let backend = ProgressBackend::plain(output.clone());
 
-        backend.finish(1, NonFailureOutcome::success("\x1b[31mfinished\x1b[0m"));
+        let progress = backend.start_indexed(1, "running");
+        progress.finish(NonFailureOutcome::success("\x1b[31mfinished\x1b[0m"));
         backend.info_line("\x1b[32mstandalone\x1b[0m");
 
         assert_eq!(

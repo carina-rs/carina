@@ -298,22 +298,42 @@ pub(super) fn count_effectively_undispatched<S>(
 /// completed future is through `cancel_if_terminal().next_completed()`, so the
 /// terminal wait cancellation check cannot be skipped.
 #[allow(clippy::type_complexity)]
-pub(super) struct WaitAwareInFlight<'fut, R> {
+pub(super) struct WaitAwareInFlight<'fut, R, S> {
     inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
     kinds: HashMap<usize, InFlightKind>,
     cancellers: HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
-    interrupted: Arc<Mutex<Vec<usize>>>,
+    interrupted: Arc<Mutex<InterruptedRegistry<S>>>,
 }
 
-/// Records the progress value at the same point an in-flight effect emits its
-/// `EffectStarted` event.
-pub(super) struct InFlightStart {
+struct InterruptedEffect<S> {
     idx: usize,
-    interrupted: Arc<Mutex<Vec<usize>>>,
+    effect: Effect<S>,
+    progress: ProgressInfo,
 }
 
-impl InFlightStart {
-    pub(super) fn emit_started<'a, S: Clone>(
+struct InterruptedRegistry<S> {
+    abandoning: bool,
+    effects: Vec<InterruptedEffect<S>>,
+}
+
+impl<S> Default for InterruptedRegistry<S> {
+    fn default() -> Self {
+        Self {
+            abandoning: false,
+            effects: Vec::new(),
+        }
+    }
+}
+
+/// Creates the started-effect token at the same point an in-flight effect
+/// emits its `EffectStarted` event.
+pub(super) struct InFlightStart<S> {
+    idx: usize,
+    interrupted: Arc<Mutex<InterruptedRegistry<S>>>,
+}
+
+impl<S: Clone> InFlightStart<S> {
+    pub(super) fn emit_started<'a>(
         self,
         observer: &'a dyn ExecutionObserver<S>,
         effect: &Effect<S>,
@@ -328,7 +348,7 @@ impl InFlightStart {
             progress,
             interrupted: self.interrupted,
             observer,
-            effect: effect.clone(),
+            effect: Some(effect.clone()),
             terminal_emitted: false,
         }
     }
@@ -339,9 +359,9 @@ impl InFlightStart {
 pub(super) struct StartedEffect<'a, S> {
     idx: usize,
     progress: ProgressInfo,
-    interrupted: Arc<Mutex<Vec<usize>>>,
+    interrupted: Arc<Mutex<InterruptedRegistry<S>>>,
     observer: &'a dyn ExecutionObserver<S>,
-    effect: Effect<S>,
+    effect: Option<Effect<S>>,
     terminal_emitted: bool,
 }
 
@@ -351,10 +371,16 @@ impl<S> StartedEffect<'_, S> {
         self.progress
     }
 
+    fn effect(&self) -> &Effect<S> {
+        self.effect
+            .as_ref()
+            .expect("started effect must own its effect")
+    }
+
     pub(super) fn succeeded(mut self, state: Option<&State>, duration: Duration) {
         let progress = self.finish();
         self.observer.on_event(&ExecutionEvent::EffectSucceeded {
-            effect: &self.effect,
+            effect: self.effect(),
             state,
             duration,
             progress,
@@ -370,7 +396,7 @@ impl<S> StartedEffect<'_, S> {
         let progress = self.finish();
         self.observer
             .on_event(&ExecutionEvent::EffectPartiallySucceeded {
-                effect: &self.effect,
+                effect: self.effect(),
                 state,
                 diagnostic,
                 duration,
@@ -381,7 +407,7 @@ impl<S> StartedEffect<'_, S> {
     pub(super) fn failed(mut self, error: &str, duration: Duration) {
         let progress = self.finish();
         self.observer.on_event(&ExecutionEvent::EffectFailed {
-            effect: &self.effect,
+            effect: self.effect(),
             error,
             duration,
             progress,
@@ -391,7 +417,7 @@ impl<S> StartedEffect<'_, S> {
     pub(super) fn skipped(mut self, reason: &str) {
         let progress = self.finish();
         self.observer.on_event(&ExecutionEvent::EffectSkipped {
-            effect: &self.effect,
+            effect: self.effect(),
             reason,
             progress,
         });
@@ -400,29 +426,48 @@ impl<S> StartedEffect<'_, S> {
 
 impl<S> Drop for StartedEffect<'_, S> {
     fn drop(&mut self) {
-        if self.terminal_emitted {
+        if std::thread::panicking() || self.terminal_emitted {
             return;
         }
-        let progress = self.finish();
-        self.observer.on_event(&ExecutionEvent::EffectInterrupted {
-            effect: &self.effect,
-            progress,
-        });
-        self.interrupted
+
+        let interrupted = Arc::clone(&self.interrupted);
+        let mut registry = interrupted
             .lock()
-            .expect("interrupted effect registry poisoned")
-            .push(self.idx);
+            .expect("interrupted effect registry poisoned");
+        if registry.abandoning {
+            self.terminal_emitted = true;
+            registry.effects.push(InterruptedEffect {
+                idx: self.idx,
+                effect: self
+                    .effect
+                    .take()
+                    .expect("started effect must own its effect"),
+                progress: self.progress,
+            });
+            return;
+        }
+        drop(registry);
+
+        debug_assert!(
+            false,
+            "started effect token dropped outside WaitAwareInFlight::abandon"
+        );
+        self.terminal_emitted = true;
+        self.observer.on_event(&ExecutionEvent::EffectInterrupted {
+            effect: self.effect(),
+            progress: self.progress,
+        });
     }
 }
 
-impl<'fut, R> WaitAwareInFlight<'fut, R> {
+impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
     /// Create an empty wait-aware in-flight set.
     pub(super) fn new() -> Self {
         Self {
             inner: FuturesUnordered::new(),
             kinds: HashMap::new(),
             cancellers: HashMap::new(),
-            interrupted: Arc::new(Mutex::new(Vec::new())),
+            interrupted: Arc::new(Mutex::new(InterruptedRegistry::default())),
         }
     }
 
@@ -444,7 +489,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     /// Dispatch a non-wait future and record its in-flight kind.
     pub(super) fn push_non_wait<MkFut, F>(&mut self, idx: usize, make_future: MkFut)
     where
-        MkFut: FnOnce(InFlightStart) -> F,
+        MkFut: FnOnce(InFlightStart<S>) -> F,
         F: Future<Output = (usize, R)> + 'fut,
     {
         let start = InFlightStart {
@@ -460,7 +505,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     where
         MkFut: FnOnce(
             tokio::sync::watch::Receiver<WaitSignal>,
-            InFlightStart,
+            InFlightStart<S>,
         ) -> Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>,
     {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(WaitSignal::Continue);
@@ -473,17 +518,33 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
         self.inner.push(mk_fut(cancel_rx, start));
     }
 
-    /// Drop every unresolved future and return how many started tokens emitted
-    /// `EffectInterrupted` while being dropped.
-    pub(super) fn abandon(self) -> usize {
+    /// Drop every unresolved future, emit its interruptions in effect-index
+    /// order, and return the number emitted.
+    pub(super) fn abandon(self, observer: &dyn ExecutionObserver<S>) -> usize {
         let interrupted_registry = Arc::clone(&self.interrupted);
+        interrupted_registry
+            .lock()
+            .expect("interrupted effect registry poisoned")
+            .abandoning = true;
         drop(self);
-        std::mem::take(
-            &mut *interrupted_registry
+        let mut interrupted = std::mem::take(
+            &mut interrupted_registry
                 .lock()
-                .expect("interrupted effect registry poisoned"),
-        )
-        .len()
+                .expect("interrupted effect registry poisoned")
+                .effects,
+        );
+        interrupted.sort_by_key(|entry| entry.idx);
+        let count = interrupted.len();
+        for InterruptedEffect {
+            effect, progress, ..
+        } in interrupted
+        {
+            observer.on_event(&ExecutionEvent::EffectInterrupted {
+                effect: &effect,
+                progress,
+            });
+        }
+        count
     }
 
     /// Begin the required terminal wait cancellation check before awaiting.
@@ -491,7 +552,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     pub(super) fn check_terminal(
         &mut self,
         undispatched_count: usize,
-    ) -> TerminalCheck<'_, 'fut, R> {
+    ) -> TerminalCheck<'_, 'fut, R, S> {
         TerminalCheck {
             parent: self,
             undispatched_count,
@@ -501,14 +562,14 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
 
 /// Terminal-check typestate handle that blocks further pushes while alive.
 #[must_use = "TerminalCheck must be consumed via cancel_if_terminal()"]
-pub(super) struct TerminalCheck<'a, 'fut, R> {
-    parent: &'a mut WaitAwareInFlight<'fut, R>,
+pub(super) struct TerminalCheck<'a, 'fut, R, S> {
+    parent: &'a mut WaitAwareInFlight<'fut, R, S>,
     undispatched_count: usize,
 }
 
-impl<'a, 'fut, R> TerminalCheck<'a, 'fut, R> {
+impl<'a, 'fut, R, S> TerminalCheck<'a, 'fut, R, S> {
     /// Cancel waits if only waits remain and no undispatched effects exist.
-    pub(super) fn cancel_if_terminal(self) -> NextReady<'a, 'fut, R> {
+    pub(super) fn cancel_if_terminal(self) -> NextReady<'a, 'fut, R, S> {
         cancel_waits_if_terminal(
             &self.parent.kinds,
             self.undispatched_count,
@@ -522,11 +583,11 @@ impl<'a, 'fut, R> TerminalCheck<'a, 'fut, R> {
 
 /// Ready-to-await typestate handle produced after terminal checking.
 #[must_use = "NextReady must be awaited or explicitly dropped"]
-pub(super) struct NextReady<'a, 'fut, R> {
-    parent: &'a mut WaitAwareInFlight<'fut, R>,
+pub(super) struct NextReady<'a, 'fut, R, S> {
+    parent: &'a mut WaitAwareInFlight<'fut, R, S>,
 }
 
-impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
+impl<'a, 'fut, R, S> NextReady<'a, 'fut, R, S> {
     /// Await the next completion and clean up its wait-aware bookkeeping.
     pub(super) async fn next_completed(self) -> Option<(usize, R)> {
         let (idx, result) = self.parent.inner.next().await?;
