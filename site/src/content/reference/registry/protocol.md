@@ -572,29 +572,9 @@ Nor would keeping the promise remedy the cases it was written for. Deletion does
 
 ## API Call Flow
 
-```
-Client                          Registry                        GitHub Releases
-  |                                |                                |
-  |  GET /.well-known/carina.json  |                                |
-  |------------------------------->|                                |
-  |  {"providers.v1": "/v1/..."}   |                                |
-  |<-------------------------------|                                |
-  |                                |                                |
-  |  GET /v1/providers/ns/name/versions                             |
-  |------------------------------->|                                |
-  |  {"versions": [...]}           |                                |
-  |<-------------------------------|                                |
-  |                                |                                |
-  |  GET /v1/providers/ns/name/0.3.0/download                      |
-  |------------------------------->|                                |
-  |  {"download_url": "..."}       |                                |
-  |<-------------------------------|                                |
-  |                                                                 |
-  |  GET (download_url)                                             |
-  |---------------------------------------------------------------->|
-  |  <WASM binary>                                                  |
-  |<----------------------------------------------------------------|
-```
+A client resolves and downloads a provider with three registry calls, then fetches the binary directly from the release host. Solid arrows are requests; dashed arrows are responses.
+
+<img src="/images/registry-api-call-flow.svg" alt="Sequence diagram: the client requests /.well-known/carina.json, the version list and the download endpoint from the registry, then downloads the WASM binary from download_url on GitHub Releases" width="780" height="488" style="width:100%;height:auto">
 
 ## Provider Metadata (Registry-side)
 
