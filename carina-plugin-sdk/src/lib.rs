@@ -61,12 +61,12 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
 use carina_core::schema::{ValidatedConfigSchema, ValidatedResourceSchema};
 use carina_provider_protocol::types::{
     AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
-    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId,
-    State, TypeIdentity, UpdateRequest, Value,
+    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, ReferenceScope,
+    Resource, ResourceId, State, TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-12 JSON.
+/// Failure while projecting validated SDK schemas onto version-13 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -165,7 +165,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-12
+/// The validated provider schemas determine the scalar kind. The version-13
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -230,7 +230,7 @@ pub use carina_provider_protocol::types::{PendingToken, Sent};
 ///     attempt: CreateAttempt,
 ///     identifier: AppliedIdentifier,
 ///     error: ProviderError,
-/// ) -> CreateVerdict {
+/// ) -> CreateVerdict<()> {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
 ///     CreateAttempt::new().untracked(error)
 /// }
@@ -243,7 +243,7 @@ impl CreateAttempt {
         Self(())
     }
 
-    pub fn untracked(self, error: ProviderError) -> CreateVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Untracked(
             error,
         ))
@@ -263,6 +263,26 @@ impl CreateAttempt {
             },
         ))
     }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        sent: Sent,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: None,
+                    sent,
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
 }
 
 /// Poll typestate for a create that has not issued an identifier.
@@ -271,6 +291,17 @@ impl CreateAttempt {
 /// use carina_plugin_sdk::{PollAttempt, Sent};
 ///
 /// let _ = PollAttempt::from_sent(Sent::AllRequestAttributes);
+/// ```
+///
+/// Transport decode failures are classified by guest glue, not provider code:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PollAttempt, PollVerdict};
+/// use carina_plugin_sdk::types::ProviderError;
+///
+/// fn classify(attempt: PollAttempt, error: ProviderError) -> PollVerdict<()> {
+///     attempt.undetermined(error)
+/// }
 /// ```
 #[derive(Debug)]
 pub struct PollAttempt {
@@ -282,14 +313,8 @@ impl PollAttempt {
         Self { sent }
     }
 
-    pub fn untracked(self, error: ProviderError) -> PollVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> PollVerdict<T> {
         PollVerdict(carina_provider_protocol::types::PollVerdict::Untracked(
-            error,
-        ))
-    }
-
-    pub fn undetermined(self, error: ProviderError) -> PollVerdict {
-        PollVerdict(carina_provider_protocol::types::PollVerdict::Undetermined(
             error,
         ))
     }
@@ -308,6 +333,25 @@ impl PollAttempt {
                 identifier: None,
                 sent: self.sent,
                 poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> PollVerdict<T> {
+        PollVerdict(carina_provider_protocol::types::PollVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: None,
+                    sent: self.sent,
+                    poll_after_secs,
+                },
+                error,
             },
         ))
     }
@@ -347,6 +391,25 @@ impl IssuedCreate {
         ))
     }
 
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: Some(self.identifier),
+                    sent: self.sent,
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
+
     pub fn succeeded<T>(self, attributes: BTreeMap<String, Value>) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Success {
             identifier: self.identifier,
@@ -368,11 +431,11 @@ impl IssuedCreate {
         )
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> CreateVerdict {
+    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
             carina_provider_protocol::types::CreatedFailure {
                 identifier: self.identifier,
@@ -383,7 +446,7 @@ impl IssuedCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
             error,
         ))
@@ -420,11 +483,11 @@ impl FinishingCreate {
         )
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> CreateVerdict {
+    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
             carina_provider_protocol::types::CreatedFailure {
                 identifier: self.identifier,
@@ -435,7 +498,7 @@ impl FinishingCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
             error,
         ))
@@ -457,14 +520,10 @@ impl ResumeAttempt {
         Self(())
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Untracked(
             error,
         ))
-    }
-
-    pub fn undetermined(self, error: ProviderError) -> ResumeVerdict {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Undetermined(error))
     }
 
     pub fn issued(self, identifier: AppliedIdentifier) -> ResumedCreate {
@@ -477,6 +536,24 @@ impl ResumeAttempt {
                 token,
                 identifier: None,
                 poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
+            carina_provider_protocol::types::ResumeInFlight {
+                pending: carina_provider_protocol::types::ResumePending {
+                    token,
+                    identifier: None,
+                    poll_after_secs,
+                },
+                error,
             },
         ))
     }
@@ -549,6 +626,24 @@ impl ResumedCreate {
         ))
     }
 
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
+            carina_provider_protocol::types::ResumeInFlight {
+                pending: carina_provider_protocol::types::ResumePending {
+                    token,
+                    identifier: Some(self.identifier),
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
+
     pub fn completed<T>(self, read: FoundRead) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Completed {
             identifier: self.identifier,
@@ -556,11 +651,11 @@ impl ResumedCreate {
         })
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> ResumeVerdict {
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
             carina_provider_protocol::types::ResumedFailure {
                 identifier: self.identifier,
@@ -570,7 +665,7 @@ impl ResumedCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
             error,
         ))
@@ -591,11 +686,11 @@ impl FinishingResume {
         })
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> ResumeVerdict {
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
             carina_provider_protocol::types::ResumedFailure {
                 identifier: self.identifier,
@@ -605,7 +700,7 @@ impl FinishingResume {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
             error,
         ))
@@ -655,12 +750,12 @@ impl<T> CreateStep<T> {
     }
 }
 
-pub type ProtocolCreateVerdict =
-    carina_provider_protocol::types::CreateVerdict<ReadOutcome, ProviderError>;
-pub type ProtocolPollVerdict =
-    carina_provider_protocol::types::PollVerdict<ReadOutcome, ProviderError>;
-pub type ProtocolResumeVerdict =
-    carina_provider_protocol::types::ResumeVerdict<ReadOutcome, ProviderError>;
+pub type ProtocolCreateVerdict<T> =
+    carina_provider_protocol::types::CreateVerdict<ReadOutcome, T, ProviderError>;
+pub type ProtocolPollVerdict<T> =
+    carina_provider_protocol::types::PollVerdict<ReadOutcome, T, ProviderError>;
+pub type ProtocolResumeVerdict<T> =
+    carina_provider_protocol::types::ResumeVerdict<ReadOutcome, T, ProviderError>;
 
 /// SDK verdict from the initial create call.
 ///
@@ -670,7 +765,7 @@ pub type ProtocolResumeVerdict =
 /// ```compile_fail
 /// use carina_plugin_sdk::{CreateVerdict, types::{ProviderError, ProviderErrorKind}};
 ///
-/// fn classify() -> Result<(), CreateVerdict> {
+/// fn classify() -> Result<(), CreateVerdict<()>> {
 ///     Err::<(), ProviderError>(ProviderError {
 ///         kind: ProviderErrorKind::Internal,
 ///         message: "failed".to_string(),
@@ -691,15 +786,15 @@ pub type ProtocolResumeVerdict =
 /// ```compile_fail
 /// use carina_plugin_sdk::{CreateVerdict, types::ProviderError};
 ///
-/// fn bypass(error: ProviderError) -> CreateVerdict {
+/// fn bypass(error: ProviderError) -> CreateVerdict<()> {
 ///     CreateVerdict::Untracked(error)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CreateVerdict(ProtocolCreateVerdict);
+pub struct CreateVerdict<T>(ProtocolCreateVerdict<T>);
 
-impl CreateVerdict {
-    fn into_protocol(self) -> ProtocolCreateVerdict {
+impl<T> CreateVerdict<T> {
+    fn into_protocol(self) -> ProtocolCreateVerdict<T> {
         self.0
     }
 }
@@ -709,21 +804,21 @@ impl CreateVerdict {
 /// ```compile_fail
 /// use carina_plugin_sdk::{PollVerdict, ProtocolPollVerdict};
 ///
-/// fn bypass(raw: ProtocolPollVerdict) -> PollVerdict {
+/// fn bypass(raw: ProtocolPollVerdict<()>) -> PollVerdict<()> {
 ///     PollVerdict(raw)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct PollVerdict(ProtocolPollVerdict);
+pub struct PollVerdict<T>(ProtocolPollVerdict<T>);
 
-impl PollVerdict {
-    fn into_protocol(self) -> ProtocolPollVerdict {
+impl<T> PollVerdict<T> {
+    fn into_protocol(self) -> ProtocolPollVerdict<T> {
         self.0
     }
 }
 
-impl From<CreateVerdict> for PollVerdict {
-    fn from(verdict: CreateVerdict) -> Self {
+impl<T> From<CreateVerdict<T>> for PollVerdict<T> {
+    fn from(verdict: CreateVerdict<T>) -> Self {
         Self(verdict.0.into())
     }
 }
@@ -763,21 +858,21 @@ impl<T> From<CreateStep<T>> for ResumeStep<T> {
 /// ```compile_fail
 /// use carina_plugin_sdk::{ProtocolResumeVerdict, ResumeVerdict};
 ///
-/// fn bypass(raw: ProtocolResumeVerdict) -> ResumeVerdict {
+/// fn bypass(raw: ProtocolResumeVerdict<()>) -> ResumeVerdict<()> {
 ///     ResumeVerdict(raw)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeVerdict(ProtocolResumeVerdict);
+pub struct ResumeVerdict<T>(ProtocolResumeVerdict<T>);
 
-impl ResumeVerdict {
-    fn into_protocol(self) -> ProtocolResumeVerdict {
+impl<T> ResumeVerdict<T> {
+    fn into_protocol(self) -> ProtocolResumeVerdict<T> {
         self.0
     }
 }
 
-impl From<CreateVerdict> for ResumeVerdict {
-    fn from(verdict: CreateVerdict) -> Self {
+impl<T> From<CreateVerdict<T>> for ResumeVerdict<T> {
+    fn from(verdict: CreateVerdict<T>) -> Self {
         Self(verdict.0.into())
     }
 }
@@ -854,10 +949,7 @@ pub trait CarinaProvider {
 
     /// Initialize the provider with configuration.
     /// Called once before any CRUD operations.
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
-        let _ = attrs;
-        Ok(())
-    }
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String>;
 
     /// Read current state of a resource.
     ///
@@ -892,7 +984,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict>;
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>>;
 
     /// Perform one short poll step for a pending create operation.
     ///
@@ -903,7 +995,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
-    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict>;
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>>;
 
     /// Continue a create operation loaded from state.
     fn resume_create(
@@ -911,7 +1003,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
-    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict>;
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>>;
 
     /// Perform one short update step.
     ///
@@ -1026,7 +1118,7 @@ pub fn dispatch_create<P: CarinaProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
-) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolCreateVerdict>> {
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolCreateVerdict<P::CreateToken>>> {
     provider
         .create(id, request, CreateAttempt::new())
         .map(CreateStep::into_protocol)
@@ -1041,7 +1133,7 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     identifier: Option<AppliedIdentifier>,
     sent: Sent,
     token: P::CreateToken,
-) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict>> {
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     let poll = match identifier {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
         None => Poll::Unissued(PollAttempt::from_sent(sent), token),
@@ -1059,7 +1151,7 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     request: CreateRequest,
     identifier: Option<AppliedIdentifier>,
     token: P::CreateToken,
-) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict>> {
+) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     let resume = match identifier {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
         None => Resume::Unissued(ResumeAttempt::new(), token),
@@ -1091,9 +1183,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v12");
+            .expect_err("a validated schema must always be projectable to protocol v13");
 
-        assert!(error.to_string().contains("protocol v12"), "{error}");
+        assert!(error.to_string().contains("protocol v13"), "{error}");
     }
 
     #[test]

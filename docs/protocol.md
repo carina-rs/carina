@@ -1,5 +1,28 @@
 # Provider protocol versions
 
+## Version 13
+
+Protocol v13 makes initialized reference scope and recoverable create failures
+explicit transport data.
+
+`initialize` now returns an `initialize-result` containing a closed
+`reference-scope`: either the provider instance's `partition`, `region`, and
+`account`, or `unavailable`. The scope belongs to the initialized instance, so
+two named instances of one provider kind may report different values.
+
+Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
+continuation together with the error that stopped the current step. The host
+validates and preserves that continuation through the same typestate path as
+an ordinary `pending` result, including any identifier learned during the
+call. Provider-facing SDK handles use `preserve`; `undetermined` remains a wire
+classification used by guest glue when it cannot decode the request or token
+and therefore has no newer continuation.
+
+Hosts and providers must both use protocol v13. The minimum supported protocol
+version is 13. Rejecting v12 at provider load is intentional because v12 has no
+way to carry either initialized scope or an error-bearing replacement
+continuation.
+
 ## Version 12
 
 Protocol v12 adds the required `write_only` boolean to every nested
@@ -23,10 +46,10 @@ unobservable leaves against accepted-request provenance. State format v18 adds
 that typed per-instance leaf record; the v17 migration initializes it empty so
 the first plan performs one reconciling update.
 
-Hosts and providers must both use protocol v12. The minimum supported protocol
-version is 12. Rejecting v11 at provider load is intentional: either direction
-of host/provider skew would otherwise discard the nested `write_only` marker
-and silently restore the non-converging and incomplete-update behavior.
+Version 12 hosts and providers required an exact v12 match. Rejecting v11 at
+provider load was intentional: either direction of host/provider skew would
+otherwise discard the nested `write_only` marker and silently restore the
+non-converging and incomplete-update behavior.
 
 ## Version 11
 

@@ -66,7 +66,7 @@ A pending create is also saved in state. If Carina is interrupted, the next appl
 Create results go through a typestate in the SDK, so a provider must say what it knows. There is no conversion from a plain error into a create result; every failure has to be classified:
 
 - `untracked` means nothing was created. Use it only when you know the API never accepted the request, for example when local validation failed or the API rejected it outright. Carina keeps no record of the resource.
-- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `attempt.pending(token, sent, poll_after_secs)`, which carries no identifier, and settle it in `poll_create`, where an outcome you cannot determine is `undetermined`. Carina then keeps the attempt instead of forgetting a resource that may exist.
+- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `attempt.pending(token, sent, poll_after_secs)`, which carries no identifier, and settle it in `poll_create`. If a later call has a usable continuation but stops with an error, return `attempt.preserve(token, poll_after_secs, error)`. Carina then keeps the attempt and the error instead of forgetting a resource that may exist.
 - Call `issued` as soon as you see the resource's identifier. From then on the attempt can only finish as `succeeded`, `partial`, `failed`, `discarded` or `pending`, so the only way to leave no record is an explicit `discarded`.
 - `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it with `failed` instead.
 
@@ -86,7 +86,7 @@ The same user trust record controls metadata access. Only a recorded artifact fr
 
 ## Protocol version
 
-The provider protocol is versioned. The current version is 12, and the host also requires at least 12. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.7.0 speaks version 12.
+The provider protocol is versioned. The current version is 13, and the host also requires at least 13. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.7.1 speaks version 13.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

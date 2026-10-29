@@ -1142,11 +1142,14 @@ impl DeletePendingOperation {
 
 pub(crate) type DecodedCreateStep =
     proto::CreateStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
-pub(crate) type DecodedCreateVerdict = proto::CreateVerdict<CoreReadOutcome, CoreProviderError>;
-pub(crate) type DecodedPollVerdict = proto::PollVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedCreateVerdict =
+    proto::CreateVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
+pub(crate) type DecodedPollVerdict =
+    proto::PollVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
 pub(crate) type DecodedResumeStep =
     proto::ResumeStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
-pub(crate) type DecodedResumeVerdict = proto::ResumeVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedResumeVerdict =
+    proto::ResumeVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
 type DecodedCreatedState = DecodedIssued<(proto::AppliedIdentifier, HashMap<String, CoreValue>)>;
 
 /// Result of decoding a create-bearing WIT value after its provider
@@ -1317,6 +1320,46 @@ fn wit_to_core_pending_create(
     })
 }
 
+fn wit_to_core_resume_pending(
+    pending: wit::ResumePending,
+    id: &CoreResourceId,
+) -> Result<proto::ResumePending<proto::PendingToken>, WasmAppliedStateDecodeError> {
+    let wit::ResumePending {
+        operation,
+        identifier,
+    } = pending;
+    let wit::PendingOperation {
+        token,
+        poll_after_secs,
+    } = operation;
+    let identifier = identifier
+        .map(|identifier| decode_create_identifier(identifier, id))
+        .transpose()?;
+    Ok(proto::ResumePending {
+        token: proto::PendingToken::new(token),
+        identifier,
+        poll_after_secs,
+    })
+}
+
+pub(crate) fn wit_to_core_reference_scope(scope: wit::ReferenceScope) -> proto::ReferenceScope {
+    match scope {
+        wit::ReferenceScope::Available(values) => {
+            let wit::ReferenceScopeValues {
+                partition,
+                region,
+                account,
+            } = values;
+            proto::ReferenceScope::Available {
+                partition,
+                region,
+                account,
+            }
+        }
+        wit::ReferenceScope::Unavailable => proto::ReferenceScope::Unavailable,
+    }
+}
+
 fn wit_to_core_observation(
     observation: wit::Observation,
     id: &CoreResourceId,
@@ -1421,6 +1464,16 @@ pub(crate) fn wit_to_core_create_verdict(
         wit::CreateVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
             proto::CreateVerdict::Discarded(wit_to_core_provider_error(error)),
         )),
+        wit::CreateVerdict::InFlight(in_flight) => {
+            let wit::CreateInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_pending_create(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::CreateVerdict::InFlight(
+                proto::CreateInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
     }
 }
 
@@ -1440,6 +1493,16 @@ pub(crate) fn wit_to_core_poll_verdict(
         wit::PollVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
             proto::PollVerdict::Undetermined(wit_to_core_provider_error(error)),
         )),
+        wit::PollVerdict::InFlight(in_flight) => {
+            let wit::CreateInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_pending_create(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::PollVerdict::InFlight(
+                proto::CreateInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
     }
 }
 
@@ -1456,26 +1519,9 @@ pub(crate) fn wit_to_core_resume_step(
                 })
             })
         }
-        wit::ResumeStep::Pending(pending) => {
-            let wit::ResumePending {
-                operation,
-                identifier,
-            } = pending;
-            let wit::PendingOperation {
-                token,
-                poll_after_secs,
-            } = operation;
-            let identifier = identifier
-                .map(|identifier| decode_create_identifier(identifier, id))
-                .transpose()?;
-            Ok(DecodedIssued::Decoded(proto::ResumeStep::Pending(
-                proto::ResumePending {
-                    token: proto::PendingToken::new(token),
-                    identifier,
-                    poll_after_secs,
-                },
-            )))
-        }
+        wit::ResumeStep::Pending(pending) => wit_to_core_resume_pending(pending, id)
+            .map(proto::ResumeStep::Pending)
+            .map(DecodedIssued::Decoded),
         wit::ResumeStep::Resent(step) => {
             wit_to_core_create_step(step, id).map(|decoded| decoded.map(proto::ResumeStep::Resent))
         }
@@ -1527,6 +1573,16 @@ pub(crate) fn wit_to_core_resume_verdict(
         wit::ResumeVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
             proto::ResumeVerdict::Undetermined(wit_to_core_provider_error(error)),
         )),
+        wit::ResumeVerdict::InFlight(in_flight) => {
+            let wit::ResumeInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_resume_pending(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::ResumeVerdict::InFlight(
+                proto::ResumeInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
         wit::ResumeVerdict::Resent(verdict) => wit_to_core_create_verdict(verdict, id)
             .map(|decoded| decoded.map(proto::ResumeVerdict::Resent)),
     }
@@ -1910,6 +1966,162 @@ mod tests {
             current = source.source();
         }
         rendered.join(" -> ")
+    }
+
+    #[test]
+    fn reference_scope_transport_preserves_both_closed_variants() {
+        let available = wit::ReferenceScope::Available(wit::ReferenceScopeValues {
+            partition: "aws".to_string(),
+            region: "ap-northeast-1".to_string(),
+            account: "123456789012".to_string(),
+        });
+        assert_eq!(
+            wit_to_core_reference_scope(available),
+            proto::ReferenceScope::Available {
+                partition: "aws".to_string(),
+                region: "ap-northeast-1".to_string(),
+                account: "123456789012".to_string(),
+            }
+        );
+        assert_eq!(
+            wit_to_core_reference_scope(wit::ReferenceScope::Unavailable),
+            proto::ReferenceScope::Unavailable
+        );
+    }
+
+    #[test]
+    fn in_flight_verdict_arms_cross_the_wit_protocol_boundary() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let pending_create = |token: &str| wit::PendingCreate {
+            operation: wit::PendingOperation {
+                token: token.to_string(),
+                poll_after_secs: 7,
+            },
+            identifier: Some("resource-123".to_string()),
+            sent: wit::SentAttributes::Only(vec!["name".to_string()]),
+        };
+
+        let create = wit_to_core_create_verdict(
+            wit::CreateVerdict::InFlight(wit::CreateInFlight {
+                pending: pending_create("create-token"),
+                error: wit_internal_error("create interrupted"),
+            }),
+            &id,
+        )
+        .expect("create in-flight payload must decode");
+        let create = match create {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight create became a created-read failure: {failure:?}")
+            }
+        };
+        let create = match create {
+            proto::CreateVerdict::InFlight(in_flight) => in_flight,
+            proto::CreateVerdict::Untracked(error) => {
+                panic!("in-flight create became untracked: {error}")
+            }
+            proto::CreateVerdict::Created(created) => {
+                panic!("in-flight create became created: {created:?}")
+            }
+            proto::CreateVerdict::Discarded(error) => {
+                panic!("in-flight create became discarded: {error}")
+            }
+        };
+        let proto::CreateInFlight { pending, error } = create;
+        assert_eq!(pending.token.expose_for_provider_call(), "create-token");
+        assert_eq!(
+            pending
+                .identifier
+                .as_ref()
+                .map(proto::AppliedIdentifier::as_str),
+            Some("resource-123")
+        );
+        assert_eq!(pending.sent, proto::Sent::only(["name"]));
+        assert_eq!(pending.poll_after_secs, 7);
+        assert!(error.to_string().contains("create interrupted"));
+
+        let poll = wit_to_core_poll_verdict(
+            wit::PollVerdict::InFlight(wit::CreateInFlight {
+                pending: pending_create("poll-token"),
+                error: wit_internal_error("poll interrupted"),
+            }),
+            &id,
+        )
+        .expect("poll in-flight payload must decode");
+        let poll = match poll {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight poll became a created-read failure: {failure:?}")
+            }
+        };
+        let poll = match poll {
+            proto::PollVerdict::InFlight(in_flight) => in_flight,
+            proto::PollVerdict::Untracked(error) => {
+                panic!("in-flight poll became untracked: {error}")
+            }
+            proto::PollVerdict::Created(created) => {
+                panic!("in-flight poll became created: {created:?}")
+            }
+            proto::PollVerdict::Discarded(error) => {
+                panic!("in-flight poll became discarded: {error}")
+            }
+            proto::PollVerdict::Undetermined(error) => {
+                panic!("in-flight poll became undetermined: {error}")
+            }
+        };
+        let proto::CreateInFlight { pending, error } = poll;
+        assert_eq!(pending.token.expose_for_provider_call(), "poll-token");
+        assert!(error.to_string().contains("poll interrupted"));
+
+        let resume = wit_to_core_resume_verdict(
+            wit::ResumeVerdict::InFlight(wit::ResumeInFlight {
+                pending: wit::ResumePending {
+                    operation: wit::PendingOperation {
+                        token: "resume-token".to_string(),
+                        poll_after_secs: 11,
+                    },
+                    identifier: Some("resource-456".to_string()),
+                },
+                error: wit_internal_error("resume interrupted"),
+            }),
+            &id,
+        )
+        .expect("resume in-flight payload must decode");
+        let resume = match resume {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight resume became a created-read failure: {failure:?}")
+            }
+        };
+        let resume = match resume {
+            proto::ResumeVerdict::InFlight(in_flight) => in_flight,
+            proto::ResumeVerdict::Untracked(error) => {
+                panic!("in-flight resume became untracked: {error}")
+            }
+            proto::ResumeVerdict::Created(created) => {
+                panic!("in-flight resume became created: {created:?}")
+            }
+            proto::ResumeVerdict::Discarded(error) => {
+                panic!("in-flight resume became discarded: {error}")
+            }
+            proto::ResumeVerdict::Undetermined(error) => {
+                panic!("in-flight resume became undetermined: {error}")
+            }
+            proto::ResumeVerdict::Resent(verdict) => {
+                panic!("in-flight resume became resent: {verdict:?}")
+            }
+        };
+        let proto::ResumeInFlight { pending, error } = resume;
+        assert_eq!(pending.token.expose_for_provider_call(), "resume-token");
+        assert_eq!(
+            pending
+                .identifier
+                .as_ref()
+                .map(proto::AppliedIdentifier::as_str),
+            Some("resource-456")
+        );
+        assert_eq!(pending.poll_after_secs, 11);
+        assert!(error.to_string().contains("resume interrupted"));
     }
 
     #[test]
@@ -4187,21 +4399,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v12_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 12);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+    fn test_protocol_version_range_is_v13_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 13);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 13);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v11_provider() {
+    fn test_check_protocol_version_rejects_v12_provider() {
         let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":11}"#,
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#,
         )
-        .expect_err("a v12 host must reject a v11 provider");
+        .expect_err("a v13 host must reject a v12 provider");
 
         assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 11"));
-        assert!(error.contains("requires at least version 12"));
+        assert!(error.contains("protocol version 12"));
+        assert!(error.contains("requires at least version 13"));
     }
 
     #[test]
@@ -4574,7 +4786,7 @@ mod tests {
                 }
             }]"#,
         )
-        .expect_err("protocol v12 schema JSON must declare nested write_only");
+        .expect_err("protocol v13 schema JSON must declare nested write_only");
 
         let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));

@@ -36,6 +36,19 @@ pub struct TypeIdentity {
     pub kind: String,
 }
 
+/// Values an initialized provider instance exposes for expanding short
+/// provider references into their long form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ReferenceScope {
+    Available {
+        partition: String,
+        region: String,
+        account: String,
+    },
+    Unavailable,
+}
+
 /// Mirrors `carina_core::resource::Value`.
 ///
 /// Only includes variants that can cross the process boundary.
@@ -568,6 +581,13 @@ impl<T> PendingCreate<T> {
     }
 }
 
+/// A create continuation retained after an error stopped the current step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateInFlight<T, E> {
+    pub pending: PendingCreate<T>,
+    pub error: E,
+}
+
 /// An unfinished resumed create. Sent values stay in the persisted envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending<T> {
@@ -592,6 +612,13 @@ impl<T> ResumePending<T> {
     pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32) {
         (self.token, self.identifier, self.poll_after_secs)
     }
+}
+
+/// A resume continuation retained after an error stopped the current step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeInFlight<T, E> {
+    pub pending: ResumePending<T>,
+    pub error: E,
 }
 
 /// One provider step for an ordinary create.
@@ -631,28 +658,31 @@ impl<R, E> CreatedFailure<R, E> {
 /// and native core adapters enforce create classification before converting
 /// their opaque verdict types into this wire representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreateVerdict<R, E> {
+pub enum CreateVerdict<R, T, E> {
     Untracked(E),
     Created(CreatedFailure<R, E>),
     Discarded(E),
+    InFlight(CreateInFlight<T, E>),
 }
 
 /// Plain wire verdict from polling a create. Classification is enforced by
 /// the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PollVerdict<R, E> {
+pub enum PollVerdict<R, T, E> {
     Untracked(E),
     Created(CreatedFailure<R, E>),
     Discarded(E),
     Undetermined(E),
+    InFlight(CreateInFlight<T, E>),
 }
 
-impl<R, E> From<CreateVerdict<R, E>> for PollVerdict<R, E> {
-    fn from(verdict: CreateVerdict<R, E>) -> Self {
+impl<R, T, E> From<CreateVerdict<R, T, E>> for PollVerdict<R, T, E> {
+    fn from(verdict: CreateVerdict<R, T, E>) -> Self {
         match verdict {
             CreateVerdict::Untracked(error) => Self::Untracked(error),
             CreateVerdict::Created(created) => Self::Created(created),
             CreateVerdict::Discarded(error) => Self::Discarded(error),
+            CreateVerdict::InFlight(in_flight) => Self::InFlight(in_flight),
         }
     }
 }
@@ -687,12 +717,13 @@ pub enum ResumeStep<A, D, T> {
 /// Plain wire verdict while resuming a persisted create. Classification is
 /// enforced by the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResumeVerdict<R, E> {
+pub enum ResumeVerdict<R, T, E> {
     Untracked(E),
     Created(ResumedFailure<R, E>),
     Discarded(E),
     Undetermined(E),
-    Resent(CreateVerdict<R, E>),
+    InFlight(ResumeInFlight<T, E>),
+    Resent(CreateVerdict<R, T, E>),
 }
 
 impl<A, D, T> From<CreateStep<A, D, T>> for ResumeStep<A, D, T> {
@@ -701,8 +732,8 @@ impl<A, D, T> From<CreateStep<A, D, T>> for ResumeStep<A, D, T> {
     }
 }
 
-impl<R, E> From<CreateVerdict<R, E>> for ResumeVerdict<R, E> {
-    fn from(verdict: CreateVerdict<R, E>) -> Self {
+impl<R, T, E> From<CreateVerdict<R, T, E>> for ResumeVerdict<R, T, E> {
+    fn from(verdict: CreateVerdict<R, T, E>) -> Self {
         Self::Resent(verdict)
     }
 }
@@ -1430,7 +1461,7 @@ pub struct StructField {
     #[serde(default)]
     pub read_only: bool,
     /// Whether this nested field is accepted on write but omitted from reads.
-    /// Required in protocol v12 so host/provider skew fails loudly.
+    /// Required in protocol v13 so host/provider skew fails loudly.
     pub write_only: bool,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
@@ -1449,6 +1480,75 @@ mod tests {
             to_dsl: None,
             identity: None,
         }
+    }
+
+    #[test]
+    fn reference_scope_roundtrips_without_losing_the_closed_variant() {
+        let scopes = [
+            ReferenceScope::Available {
+                partition: "aws".to_string(),
+                region: "ap-northeast-1".to_string(),
+                account: "123456789012".to_string(),
+            },
+            ReferenceScope::Unavailable,
+        ];
+
+        for scope in scopes {
+            let encoded = serde_json::to_string(&scope).expect("scope must serialize");
+            let decoded: ReferenceScope =
+                serde_json::from_str(&encoded).expect("scope must deserialize");
+            assert_eq!(decoded, scope);
+        }
+    }
+
+    #[test]
+    fn in_flight_verdict_conversions_preserve_the_continuation() {
+        let pending = PendingCreate {
+            token: "next-token".to_string(),
+            identifier: Some(AppliedIdentifier::new("resource-123").unwrap()),
+            sent: Sent::only(["name"]),
+            poll_after_secs: 7,
+        };
+        let create: CreateVerdict<String, String, String> =
+            CreateVerdict::InFlight(CreateInFlight {
+                pending: pending.clone(),
+                error: "interrupted".to_string(),
+            });
+
+        let poll: PollVerdict<String, String, String> = create.clone().into();
+        assert_eq!(
+            poll,
+            PollVerdict::InFlight(CreateInFlight {
+                pending: pending.clone(),
+                error: "interrupted".to_string(),
+            })
+        );
+
+        let resume: ResumeVerdict<String, String, String> = create.into();
+        assert_eq!(
+            resume,
+            ResumeVerdict::Resent(CreateVerdict::InFlight(CreateInFlight {
+                pending,
+                error: "interrupted".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn resume_in_flight_payload_roundtrips() {
+        let in_flight = ResumeInFlight {
+            pending: ResumePending {
+                token: "resume-token".to_string(),
+                identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                poll_after_secs: 11,
+            },
+            error: "resume interrupted".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&in_flight).expect("in-flight resume must serialize");
+        let decoded: ResumeInFlight<String, String> =
+            serde_json::from_str(&encoded).expect("in-flight resume must deserialize");
+        assert_eq!(decoded, in_flight);
     }
 
     #[test]
@@ -1473,8 +1573,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v12_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 12);
+    fn ordered_maps_preserve_v13_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 13);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -1843,7 +1943,7 @@ mod tests {
                 "required":false
             }"#,
         )
-        .expect_err("protocol v12 requires write_only on every struct field");
+        .expect_err("protocol v13 requires write_only on every struct field");
 
         assert!(error.to_string().contains("missing field `write_only`"));
     }

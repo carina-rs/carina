@@ -79,7 +79,7 @@ The SDK is not on crates.io; depend on it from git and pin `rev`. `serde`, `serd
 // nothing calls it.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
@@ -182,6 +182,13 @@ impl CarinaProvider for HelloProvider {
         Ok(())
     }
 
+    fn initialize(
+        &mut self,
+        _attrs: &BTreeMap<String, Value>,
+    ) -> Result<ReferenceScope, String> {
+        Ok(ReferenceScope::Unavailable)
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -206,7 +213,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Never>, CreateVerdict> {
+    ) -> Result<CreateStep<Never>, CreateVerdict<Never>> {
         let name = match request.resource.attributes.get("name") {
             Some(Value::String(name)) if !name.is_empty() => name.clone(),
             _ => {
@@ -227,7 +234,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         poll: Poll<Never>,
-    ) -> Result<CreateStep<Never>, PollVerdict> {
+    ) -> Result<CreateStep<Never>, PollVerdict<Never>> {
         match poll {
             Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
         }
@@ -238,7 +245,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         resume: Resume<Never>,
-    ) -> Result<ResumeStep<Never>, ResumeVerdict> {
+    ) -> Result<ResumeStep<Never>, ResumeVerdict<Never>> {
         match resume {
             Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
         }

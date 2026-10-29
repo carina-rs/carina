@@ -175,6 +175,10 @@ impl CarinaProvider for MockHttpProvider {
         Ok(())
     }
 
+    fn initialize(&mut self, _attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
+        Ok(ReferenceScope::Unavailable)
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -197,7 +201,7 @@ impl CarinaProvider for MockHttpProvider {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
         let Some(Value::String(url)) = request.resource.attributes.get(URL_ATTRIBUTE) else {
             return Err(attempt.untracked(Self::error(
                 id,
@@ -235,7 +239,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         poll: Poll<Self::CreateToken>,
-    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         match poll {
             Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
         }
@@ -246,7 +250,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         resume: Resume<Self::CreateToken>,
-    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict> {
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         match resume {
             Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
         }

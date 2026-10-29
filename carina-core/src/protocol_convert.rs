@@ -381,7 +381,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-12 protocol record.
+/// Convert a validated resource schema into its version-13 protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -398,10 +398,10 @@ pub fn resource_schema_to_protocol(
         default_wait_interval,
         defs,
     } = schema.parts();
-    // Protocol v12 has no resource wait-default fields. These are host-side
+    // Protocol v13 has no resource wait-default fields. These are host-side
     // execution policy, not provider metadata; projection intentionally omits
     // them and round-trip tests pin that one-way behavior.
-    let _v12_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
+    let _v13_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
 
     let attributes = attributes
         .iter()
@@ -491,9 +491,9 @@ pub fn attribute_schema_to_protocol(
         identity,
         deferred_populate,
     } = attribute.parts();
-    // Protocol v12 has no completion field. Completions are an in-process
+    // Protocol v13 has no completion field. Completions are an in-process
     // authoring aid, so JSON metadata projection intentionally omits them.
-    let _v12_omits_host_completions = completions;
+    let _v13_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     let default = default
         .map(try_core_to_protocol_value)
@@ -1774,7 +1774,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-12 protocol deliberately has no corresponding field.
+/// version-13 protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -1793,7 +1793,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-12 resource id. The wire's empty identity is the pending
+/// Decode a version-13 resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {
@@ -2766,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn v12_json_decode_rejects_an_empty_custom_enum_namespace() {
+    fn v13_json_decode_rejects_an_empty_custom_enum_namespace() {
         let wire = protocol::AttributeType::CustomEnum {
             name: "Mode".to_string(),
             base: Box::new(protocol::AttributeType::String {
@@ -2779,9 +2779,9 @@ mod tests {
             namespace: String::new(),
             dsl_transform: None,
         };
-        let json = serde_json::to_string(&wire).expect("v12 CustomEnum must serialize");
+        let json = serde_json::to_string(&wire).expect("v13 CustomEnum must serialize");
         let decoded_wire: protocol::AttributeType =
-            serde_json::from_str(&json).expect("v12 CustomEnum JSON must decode");
+            serde_json::from_str(&json).expect("v13 CustomEnum JSON must decode");
 
         let error = protocol_to_attribute_type(&decoded_wire)
             .expect_err("an empty namespace cannot identify a provider custom enum");
@@ -3007,7 +3007,7 @@ mod tests {
             }) if identity == "test.IdentifiedList"
         ));
         let decoded = protocol_to_attribute_type(&duplicate_wire)
-            .expect("v12 defines the enclosing Custom refinement as authoritative");
+            .expect("v13 defines the enclosing Custom refinement as authoritative");
         assert!(matches!(
             decoded.raw_shape(),
             RawShape::String {

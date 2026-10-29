@@ -449,6 +449,51 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn initialized_reference_scope_is_kept_per_provider_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let tokyo_attributes = indexmap::IndexMap::from([(
+        "__mock_reference_scope_region__".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+    )]);
+    let virginia_attributes = indexmap::IndexMap::from([(
+        "__mock_reference_scope_region__".to_string(),
+        Value::Concrete(ConcreteValue::String("us-east-1".into())),
+    )]);
+
+    let _tokyo = factory
+        .create_provider(None, &ready_config(&factory, &tokyo_attributes))
+        .await
+        .expect("default provider should initialize");
+    let _virginia = factory
+        .create_provider(
+            Some("virginia"),
+            &ready_config(&factory, &virginia_attributes),
+        )
+        .await
+        .expect("named provider should initialize");
+
+    assert_eq!(
+        factory.initialized_reference_scope_for_test(None).await,
+        Some(carina_provider_protocol::types::ReferenceScope::Available {
+            partition: "mock".to_string(),
+            region: "ap-northeast-1".to_string(),
+            account: "test-account".to_string(),
+        })
+    );
+    assert_eq!(
+        factory
+            .initialized_reference_scope_for_test(Some("virginia"))
+            .await,
+        Some(carina_provider_protocol::types::ReferenceScope::Available {
+            partition: "mock".to_string(),
+            region: "us-east-1".to_string(),
+            account: "test-account".to_string(),
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;

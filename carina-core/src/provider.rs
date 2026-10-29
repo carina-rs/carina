@@ -6089,7 +6089,7 @@ mod tests {
 
             let table =
                 CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
-                    .expect("v12 dispatch combines every callback attached to one identity");
+                    .expect("v13 dispatch combines every callback attached to one identity");
             let error = table
                 .dispatch(&identity, "value")
                 .expect_err("the first rejecting callback must stop dispatch");
@@ -6315,7 +6315,7 @@ mod tests {
             .expect("same-kind declarations remain a valid resource schema");
 
         let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
-            .expect("pointer-identical validators are one v12 dispatch binding");
+            .expect("pointer-identical validators are one v13 dispatch binding");
         table
             .dispatch(&identity, "value")
             .expect("the shared callback accepts the value");

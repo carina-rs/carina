@@ -1980,7 +1980,8 @@ pub(crate) mod version_checked_bindings {
             &self,
             store: &mut Store<HostState>,
             attrs: &[(String, wit_types::Value)],
-        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+        ) -> wasmtime::Result<Result<wit_types::InitializeResult, wit_types::ProviderError>>
+        {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
                     b.carina_provider_provider()
@@ -2952,6 +2953,11 @@ struct LiveInstance {
     world: InstantiationWorld,
 }
 
+struct InitializedWasmInstance {
+    instance: LiveInstance,
+    reference_scope: proto::ReferenceScope,
+}
+
 impl LiveInstance {
     fn new(store: GuestStore, bindings: WasmBindings, world: InstantiationWorld) -> Self {
         Self {
@@ -3074,13 +3080,23 @@ impl Drop for LiveInstanceGuard<'_> {
 /// reason and never continue on a freshly configured instance (carina#3106).
 struct FailFastInstance {
     slot: Mutex<FailFastSlot>,
+    reference_scope: proto::ReferenceScope,
 }
 
 impl FailFastInstance {
-    fn new(live: LiveInstance) -> Self {
+    fn new(initialized: InitializedWasmInstance) -> Self {
+        let InitializedWasmInstance {
+            instance,
+            reference_scope,
+        } = initialized;
         Self {
-            slot: Mutex::new(FailFastSlot::Live(Box::new(live))),
+            slot: Mutex::new(FailFastSlot::Live(Box::new(instance))),
+            reference_scope,
         }
+    }
+
+    fn reference_scope(&self) -> &proto::ReferenceScope {
+        &self.reference_scope
     }
 
     async fn acquire(&self, operation: &'static str) -> ProviderResult<LiveInstanceGuard<'_>> {
@@ -3972,7 +3988,7 @@ impl WasmProviderFactory {
     async fn create_initialized_instance(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<LiveInstance, WasmProviderInstanceError> {
+    ) -> Result<InitializedWasmInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
@@ -3994,7 +4010,8 @@ impl WasmProviderFactory {
         .await?;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
             .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
-        live.store
+        let initialize_result = live
+            .store
             .call(|store| live.bindings.call_initialize(store, &wit_attrs))
             .await
             .map_err(|source| WasmProviderInstanceError::WallBudgetExceeded {
@@ -4009,8 +4026,12 @@ impl WasmProviderFactory {
                     ),
                 )
             })?;
+        let wit_types::InitializeResult { reference_scope } = initialize_result;
 
-        Ok(live)
+        Ok(InitializedWasmInstance {
+            instance: live,
+            reference_scope: wasm_convert::wit_to_core_reference_scope(reference_scope),
+        })
     }
 
     /// Get or create the shared WASM instance for the given binding's
@@ -4032,10 +4053,22 @@ impl WasmProviderFactory {
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let live = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(FailFastInstance::new(live));
+        let initialized = self.create_initialized_instance(attributes).await?;
+        let instance = Arc::new(FailFastInstance::new(initialized));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn initialized_reference_scope_for_test(
+        &self,
+        binding: Option<&str>,
+    ) -> Option<proto::ReferenceScope> {
+        let key = binding.map(str::to_owned);
+        let guard = self.shared_instances.lock().await;
+        guard
+            .get(&key)
+            .map(|instance| instance.reference_scope().clone())
     }
 }
 
@@ -4213,10 +4246,12 @@ impl ProviderFactory for WasmProviderFactory {
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
                 })?;
+            let reference_scope = instance.reference_scope().clone();
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.configured.label.name.clone(),
                 schemas: Arc::clone(&self.schemas),
+                _reference_scope: reference_scope,
             }) as Box<dyn Provider>)
         })
     }
@@ -4250,6 +4285,7 @@ pub struct WasmProvider {
     instance: Arc<FailFastInstance>,
     name: String,
     schemas: Arc<Vec<ValidatedResourceSchema>>,
+    _reference_scope: proto::ReferenceScope,
 }
 
 struct PendingCreate {
@@ -4659,6 +4695,33 @@ impl WasmProvider {
         }
     }
 
+    fn map_initial_pending_create(
+        id: &ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        attempt: CreateAttempt,
+        pending: proto::PendingCreate<proto::PendingToken>,
+    ) -> Result<CorePendingCreate, CreateFailure> {
+        let request_names = Self::create_request_attribute_names(wit_request);
+        let (token, identifier, mut sent, poll_after_secs) = pending.into_parts();
+        let invalid_sent = !sent.is_valid_for(&request_names);
+        if invalid_sent {
+            sent.clip_to(&request_names);
+        }
+        let pending = match identifier {
+            Some(identifier) => attempt
+                .issued(identifier, sent)
+                .pending(token, poll_after_secs),
+            None => attempt.pending(token, sent, poll_after_secs),
+        };
+        if invalid_sent {
+            return Err(pending.preserve(Self::create_boundary_error(
+                id,
+                "pending sent attributes are not a subset of the request",
+            )));
+        }
+        Ok(pending)
+    }
+
     fn initial_create_step(
         id: ResourceId,
         wit_id: wit_types::ResourceId,
@@ -4685,32 +4748,15 @@ impl WasmProvider {
                     .partial(attributes, diagnostic),
             )),
             proto::CreateStep::Pending(pending) => {
-                let request_names = Self::create_request_attribute_names(&wit_request);
-                let (token, identifier, mut sent, poll_after_secs) = pending.into_parts();
-                let invalid_sent = !sent.is_valid_for(&request_names);
-                if invalid_sent {
-                    sent.clip_to(&request_names);
+                match Self::map_initial_pending_create(&id, &wit_request, attempt, pending) {
+                    Ok(pending) => CreateProgress::Pending(Box::new(PendingCreate {
+                        id,
+                        wit_id,
+                        wit_request,
+                        pending,
+                    })),
+                    Err(failure) => CreateProgress::Verdict(Box::new(failure)),
                 }
-                let pending = match identifier {
-                    Some(identifier) => attempt
-                        .issued(identifier, sent)
-                        .pending(token, poll_after_secs),
-                    None => attempt.pending(token, sent, poll_after_secs),
-                };
-                if invalid_sent {
-                    return CreateProgress::Verdict(Box::new(pending.preserve(
-                        Self::create_boundary_error(
-                            &id,
-                            "pending sent attributes are not a subset of the request",
-                        ),
-                    )));
-                }
-                CreateProgress::Pending(Box::new(PendingCreate {
-                    id,
-                    wit_id,
-                    wit_request,
-                    pending,
-                }))
             }
         }
     }
@@ -4740,11 +4786,50 @@ impl WasmProvider {
                     attempt.issued(identifier, sent).failed(observation, error),
                 ))
             }
+            proto::CreateVerdict::InFlight(in_flight) => {
+                let proto::CreateInFlight { pending, error } = in_flight;
+                match Self::map_initial_pending_create(&id, wit_request, attempt, pending) {
+                    Ok(pending) => CreateProgress::Verdict(Box::new(pending.preserve(error))),
+                    Err(failure) => CreateProgress::Verdict(Box::new(failure)),
+                }
+            }
         }
     }
 
     fn preserve_polled_create(pending: PendingCreate, error: ProviderError) -> CreateProgress {
         CreateProgress::Verdict(Box::new(pending.pending.preserve(error)))
+    }
+
+    fn map_polled_pending_create(
+        starting: PendingCreate,
+        next: proto::PendingCreate<proto::PendingToken>,
+    ) -> Result<PendingCreate, CreateFailure> {
+        let request_names = Self::create_request_attribute_names(&starting.wit_request);
+        let same_sent = next.sent() == starting.pending.sent();
+        if !same_sent || !next.sent().is_valid_for(&request_names) {
+            let error =
+                Self::create_boundary_error(&starting.id, "pending changed its sent attributes");
+            return Err(starting.pending.preserve(error));
+        }
+        let poll = starting.pending.into_poll();
+        let (token, identifier, sent, poll_after_secs) = next.into_parts();
+        let pending = match poll {
+            CorePoll::Unissued(attempt) => match identifier {
+                Some(identifier) => attempt.issued(identifier).pending(token, poll_after_secs),
+                None => attempt.pending(token, poll_after_secs),
+            },
+            CorePoll::Issued(issued) => {
+                drop(identifier);
+                drop(sent);
+                issued.pending(token, poll_after_secs)
+            }
+        };
+        Ok(PendingCreate {
+            id: starting.id,
+            wit_id: starting.wit_id,
+            wit_request: starting.wit_request,
+            pending,
+        })
     }
 
     fn polled_create_step(
@@ -4780,36 +4865,10 @@ impl WasmProvider {
                 }))
             }
             proto::CreateStep::Pending(next) => {
-                let request_names = Self::create_request_attribute_names(&starting.wit_request);
-                let same_sent = next.sent() == starting.pending.sent();
-                if !same_sent || !next.sent().is_valid_for(&request_names) {
-                    let error = Self::create_boundary_error(
-                        &starting.id,
-                        "pending changed its sent attributes",
-                    );
-                    return Self::preserve_polled_create(starting, error);
+                match Self::map_polled_pending_create(starting, next) {
+                    Ok(pending) => CreateProgress::Pending(Box::new(pending)),
+                    Err(failure) => CreateProgress::Verdict(Box::new(failure)),
                 }
-                let poll = starting.pending.into_poll();
-                let (token, identifier, sent, poll_after_secs) = next.into_parts();
-                let pending = match poll {
-                    CorePoll::Unissued(attempt) => match identifier {
-                        Some(identifier) => {
-                            attempt.issued(identifier).pending(token, poll_after_secs)
-                        }
-                        None => attempt.pending(token, poll_after_secs),
-                    },
-                    CorePoll::Issued(issued) => {
-                        drop(identifier);
-                        drop(sent);
-                        issued.pending(token, poll_after_secs)
-                    }
-                };
-                CreateProgress::Pending(Box::new(PendingCreate {
-                    id: starting.id,
-                    wit_id: starting.wit_id,
-                    wit_request: starting.wit_request,
-                    pending,
-                }))
             }
         }
     }
@@ -4851,6 +4910,15 @@ impl WasmProvider {
             proto::PollVerdict::Undetermined(error) => {
                 Self::preserve_polled_create(starting, error)
             }
+            proto::PollVerdict::InFlight(in_flight) => {
+                let proto::CreateInFlight { pending, error } = in_flight;
+                match Self::map_polled_pending_create(starting, pending) {
+                    Ok(pending) => {
+                        CreateProgress::Verdict(Box::new(pending.pending.preserve(error)))
+                    }
+                    Err(failure) => CreateProgress::Verdict(Box::new(failure)),
+                }
+            }
         }
     }
 
@@ -4859,6 +4927,40 @@ impl WasmProvider {
         error: ProviderError,
     ) -> ResumeProgress {
         ResumeProgress::Verdict(Box::new(starting.pending.preserve(error)))
+    }
+
+    fn map_polled_resent_pending_create(
+        starting: PendingResentCreate,
+        next: proto::PendingCreate<proto::PendingToken>,
+    ) -> Result<PendingResentCreate, ResumeFailure> {
+        let request_names = Self::create_request_attribute_names(&starting.wit_request);
+        let same_sent = next.sent() == starting.pending.sent();
+        if !same_sent || !next.sent().is_valid_for(&request_names) {
+            let error = Self::create_boundary_error(
+                &starting.id,
+                "resent pending changed its sent attributes",
+            );
+            return Err(starting.pending.preserve(error));
+        }
+        let poll = starting.pending.into_poll();
+        let (token, identifier, sent, poll_after_secs) = next.into_parts();
+        let pending = match poll {
+            CoreResentPoll::Unissued(attempt) => match identifier {
+                Some(identifier) => attempt.issued(identifier).pending(token, poll_after_secs),
+                None => attempt.pending(token, poll_after_secs),
+            },
+            CoreResentPoll::Issued(issued) => {
+                drop(identifier);
+                drop(sent);
+                issued.pending(token, poll_after_secs)
+            }
+        };
+        Ok(PendingResentCreate {
+            id: starting.id,
+            wit_id: starting.wit_id,
+            wit_request: starting.wit_request,
+            pending,
+        })
     }
 
     fn polled_resent_step(
@@ -4896,36 +4998,12 @@ impl WasmProvider {
                 })
             }
             proto::CreateStep::Pending(next) => {
-                let request_names = Self::create_request_attribute_names(&starting.wit_request);
-                let same_sent = next.sent() == starting.pending.sent();
-                if !same_sent || !next.sent().is_valid_for(&request_names) {
-                    let error = Self::create_boundary_error(
-                        &starting.id,
-                        "resent pending changed its sent attributes",
-                    );
-                    return Self::preserve_resent_create(starting, error);
-                }
-                let poll = starting.pending.into_poll();
-                let (token, identifier, sent, poll_after_secs) = next.into_parts();
-                let pending = match poll {
-                    CoreResentPoll::Unissued(attempt) => match identifier {
-                        Some(identifier) => {
-                            attempt.issued(identifier).pending(token, poll_after_secs)
-                        }
-                        None => attempt.pending(token, poll_after_secs),
-                    },
-                    CoreResentPoll::Issued(issued) => {
-                        drop(identifier);
-                        drop(sent);
-                        issued.pending(token, poll_after_secs)
+                match Self::map_polled_resent_pending_create(starting, next) {
+                    Ok(pending) => {
+                        ResumeProgress::Pending(Box::new(PendingResume::Resent(pending)))
                     }
-                };
-                ResumeProgress::Pending(Box::new(PendingResume::Resent(PendingResentCreate {
-                    id: starting.id,
-                    wit_id: starting.wit_id,
-                    wit_request: starting.wit_request,
-                    pending,
-                })))
+                    Err(failure) => ResumeProgress::Verdict(Box::new(failure)),
+                }
             }
         }
     }
@@ -4967,6 +5045,15 @@ impl WasmProvider {
             proto::PollVerdict::Undetermined(error) => {
                 Self::preserve_resent_create(starting, error)
             }
+            proto::PollVerdict::InFlight(in_flight) => {
+                let proto::CreateInFlight { pending, error } = in_flight;
+                match Self::map_polled_resent_pending_create(starting, pending) {
+                    Ok(pending) => {
+                        ResumeProgress::Verdict(Box::new(pending.pending.preserve(error)))
+                    }
+                    Err(failure) => ResumeProgress::Verdict(Box::new(failure)),
+                }
+            }
         }
     }
 
@@ -5007,6 +5094,24 @@ impl WasmProvider {
         ResumeProgress::Verdict(Box::new(failure))
     }
 
+    fn map_resumed_pending_create(
+        starting: CoreResume,
+        next: proto::ResumePending<proto::PendingToken>,
+    ) -> (CoreResume, u32) {
+        let (token, identifier, poll_after_secs) = next.into_parts();
+        let resume = match starting {
+            CoreResume::Unissued(attempt) => match identifier {
+                Some(identifier) => attempt.issued(identifier).repend(token),
+                None => attempt.repend(token),
+            },
+            CoreResume::Issued(resumed) => {
+                drop(identifier);
+                resumed.repend(token)
+            }
+        };
+        (resume, poll_after_secs)
+    }
+
     fn resumed_create_step(
         id: ResourceId,
         wit_id: wit_types::ResourceId,
@@ -5029,17 +5134,7 @@ impl WasmProvider {
                 ResumeProgress::Done(outcome)
             }
             proto::ResumeStep::Pending(next) => {
-                let (token, identifier, poll_after_secs) = next.into_parts();
-                let resume = match starting {
-                    CoreResume::Unissued(attempt) => match identifier {
-                        Some(identifier) => attempt.issued(identifier).repend(token),
-                        None => attempt.repend(token),
-                    },
-                    CoreResume::Issued(resumed) => {
-                        drop(identifier);
-                        resumed.repend(token)
-                    }
-                };
+                let (resume, poll_after_secs) = Self::map_resumed_pending_create(starting, next);
                 ResumeProgress::Pending(Box::new(PendingResume::Resume {
                     id,
                     wit_id,
@@ -5054,6 +5149,37 @@ impl WasmProvider {
         }
     }
 
+    fn map_resent_pending_create(
+        id: &ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        starting: CoreResume,
+        pending: proto::PendingCreate<proto::PendingToken>,
+    ) -> Result<ResentPendingCreate, ResumeFailure> {
+        let attempt = match starting {
+            CoreResume::Unissued(attempt) => attempt.resend(),
+            CoreResume::Issued(resumed) => {
+                return Err(resumed.preserve(Self::create_boundary_error(
+                    id,
+                    "an issued resume attempted to resend the create",
+                )));
+            }
+        };
+        let request_names = Self::create_request_attribute_names(wit_request);
+        if !pending.sent().is_valid_for(&request_names) {
+            return Err(attempt.preserve(Self::create_boundary_error(
+                id,
+                "resent pending attributes are not a subset of the request",
+            )));
+        }
+        let (token, identifier, sent, poll_after_secs) = pending.into_parts();
+        Ok(match identifier {
+            Some(identifier) => attempt
+                .issued(identifier, sent)
+                .pending(token, poll_after_secs),
+            None => attempt.pending(token, sent, poll_after_secs),
+        })
+    }
+
     fn resent_create_step(
         id: ResourceId,
         wit_id: wit_types::ResourceId,
@@ -5061,59 +5187,64 @@ impl WasmProvider {
         starting: CoreResume,
         step: wasm_convert::DecodedCreateStep,
     ) -> ResumeProgress {
-        let attempt = match starting {
-            CoreResume::Unissued(attempt) => attempt.resend(),
-            CoreResume::Issued(resumed) => {
-                return Self::preserve_resumed_create(
-                    CoreResume::Issued(resumed),
-                    Self::create_boundary_error(
-                        &id,
-                        "an issued resume attempted to resend the create",
-                    ),
-                );
-            }
-        };
         match step {
             proto::CreateStep::Success {
                 identifier,
                 attributes,
-            } => ResumeProgress::Done(
-                attempt
-                    .issued(identifier, Sent::AllRequestAttributes)
-                    .succeeded(attributes),
-            ),
+            } => {
+                let attempt = match starting {
+                    CoreResume::Unissued(attempt) => attempt.resend(),
+                    CoreResume::Issued(resumed) => {
+                        return Self::preserve_resumed_create(
+                            CoreResume::Issued(resumed),
+                            Self::create_boundary_error(
+                                &id,
+                                "an issued resume attempted to resend the create",
+                            ),
+                        );
+                    }
+                };
+                ResumeProgress::Done(
+                    attempt
+                        .issued(identifier, Sent::AllRequestAttributes)
+                        .succeeded(attributes),
+                )
+            }
             proto::CreateStep::PartialSuccess {
                 identifier,
                 attributes,
                 diagnostic,
-            } => ResumeProgress::Done(
-                attempt
-                    .issued(identifier, Sent::AllRequestAttributes)
-                    .partial(attributes, diagnostic),
-            ),
-            proto::CreateStep::Pending(pending) => {
-                let request_names = Self::create_request_attribute_names(&wit_request);
-                if !pending.sent().is_valid_for(&request_names) {
-                    return ResumeProgress::Verdict(Box::new(attempt.preserve(
-                        Self::create_boundary_error(
-                            &id,
-                            "resent pending attributes are not a subset of the request",
-                        ),
-                    )));
-                }
-                let (token, identifier, sent, poll_after_secs) = pending.into_parts();
-                let pending = match identifier {
-                    Some(identifier) => attempt
-                        .issued(identifier, sent)
-                        .pending(token, poll_after_secs),
-                    None => attempt.pending(token, sent, poll_after_secs),
+            } => {
+                let attempt = match starting {
+                    CoreResume::Unissued(attempt) => attempt.resend(),
+                    CoreResume::Issued(resumed) => {
+                        return Self::preserve_resumed_create(
+                            CoreResume::Issued(resumed),
+                            Self::create_boundary_error(
+                                &id,
+                                "an issued resume attempted to resend the create",
+                            ),
+                        );
+                    }
                 };
-                ResumeProgress::Pending(Box::new(PendingResume::Resent(PendingResentCreate {
-                    id,
-                    wit_id,
-                    wit_request,
-                    pending,
-                })))
+                ResumeProgress::Done(
+                    attempt
+                        .issued(identifier, Sent::AllRequestAttributes)
+                        .partial(attributes, diagnostic),
+                )
+            }
+            proto::CreateStep::Pending(pending) => {
+                match Self::map_resent_pending_create(&id, &wit_request, starting, pending) {
+                    Ok(pending) => ResumeProgress::Pending(Box::new(PendingResume::Resent(
+                        PendingResentCreate {
+                            id,
+                            wit_id,
+                            wit_request,
+                            pending,
+                        },
+                    ))),
+                    Err(failure) => ResumeProgress::Verdict(Box::new(failure)),
+                }
             }
         }
     }
@@ -5138,41 +5269,63 @@ impl WasmProvider {
             proto::ResumeVerdict::Undetermined(error) => {
                 Self::preserve_resumed_create(starting, error)
             }
-            proto::ResumeVerdict::Resent(verdict) => {
-                let attempt = match starting {
-                    CoreResume::Unissued(attempt) => attempt.resend(),
-                    CoreResume::Issued(resumed) => {
-                        return Self::preserve_resumed_create(
-                            CoreResume::Issued(resumed),
-                            Self::create_boundary_error(
-                                &id,
-                                "an issued resume attempted to resend the create",
-                            ),
-                        );
-                    }
-                };
-                match verdict {
-                    proto::CreateVerdict::Untracked(error)
-                    | proto::CreateVerdict::Discarded(error) => {
-                        ResumeProgress::Verdict(Box::new(attempt.untracked(error)))
-                    }
-                    proto::CreateVerdict::Created(created) => {
-                        let (identifier, observation, sent, error) = created.into_parts();
-                        let request_names = Self::create_request_attribute_names(wit_request);
-                        if !sent.is_valid_for(&request_names) {
-                            return ResumeProgress::Verdict(Box::new(attempt.preserve(
+            proto::ResumeVerdict::InFlight(in_flight) => {
+                let proto::ResumeInFlight { pending, error } = in_flight;
+                let (resume, _poll_after_secs) =
+                    Self::map_resumed_pending_create(starting, pending);
+                ResumeProgress::Verdict(Box::new(resume.preserve(error)))
+            }
+            proto::ResumeVerdict::Resent(verdict) => match verdict {
+                proto::CreateVerdict::Untracked(error) | proto::CreateVerdict::Discarded(error) => {
+                    let attempt = match starting {
+                        CoreResume::Unissued(attempt) => attempt.resend(),
+                        CoreResume::Issued(resumed) => {
+                            return Self::preserve_resumed_create(
+                                CoreResume::Issued(resumed),
                                 Self::create_boundary_error(
                                     &id,
-                                    "resent verdict attributes are not a subset of the request",
+                                    "an issued resume attempted to resend the create",
                                 ),
-                            )));
+                            );
                         }
-                        ResumeProgress::Verdict(Box::new(
-                            attempt.issued(identifier, sent).failed(observation, error),
-                        ))
+                    };
+                    ResumeProgress::Verdict(Box::new(attempt.untracked(error)))
+                }
+                proto::CreateVerdict::Created(created) => {
+                    let attempt = match starting {
+                        CoreResume::Unissued(attempt) => attempt.resend(),
+                        CoreResume::Issued(resumed) => {
+                            return Self::preserve_resumed_create(
+                                CoreResume::Issued(resumed),
+                                Self::create_boundary_error(
+                                    &id,
+                                    "an issued resume attempted to resend the create",
+                                ),
+                            );
+                        }
+                    };
+                    let (identifier, observation, sent, error) = created.into_parts();
+                    let request_names = Self::create_request_attribute_names(wit_request);
+                    if !sent.is_valid_for(&request_names) {
+                        return ResumeProgress::Verdict(Box::new(attempt.preserve(
+                            Self::create_boundary_error(
+                                &id,
+                                "resent verdict attributes are not a subset of the request",
+                            ),
+                        )));
+                    }
+                    ResumeProgress::Verdict(Box::new(
+                        attempt.issued(identifier, sent).failed(observation, error),
+                    ))
+                }
+                proto::CreateVerdict::InFlight(in_flight) => {
+                    let proto::CreateInFlight { pending, error } = in_flight;
+                    match Self::map_resent_pending_create(&id, wit_request, starting, pending) {
+                        Ok(pending) => ResumeProgress::Verdict(Box::new(pending.preserve(error))),
+                        Err(failure) => ResumeProgress::Verdict(Box::new(failure)),
                     }
                 }
-            }
+            },
         }
     }
 
@@ -6411,16 +6564,21 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v12_wit_surface_compiles() {
+    fn protocol_v13_wit_surface_compiles() {
         fn assert_type<T>() {}
 
+        assert_type::<wit_types::ReferenceScopeValues>();
+        assert_type::<wit_types::ReferenceScope>();
+        assert_type::<wit_types::InitializeResult>();
         assert_type::<wit_types::Observation>();
         assert_type::<wit_types::SentAttributes>();
         assert_type::<wit_types::PendingCreate>();
+        assert_type::<wit_types::CreateInFlight>();
         assert_type::<wit_types::CreateStep>();
         assert_type::<wit_types::CreateVerdict>();
         assert_type::<wit_types::PollVerdict>();
         assert_type::<wit_types::ResumePending>();
+        assert_type::<wit_types::ResumeInFlight>();
         assert_type::<wit_types::ResumeStep>();
         assert_type::<wit_types::ResumeVerdict>();
     }
@@ -6686,7 +6844,22 @@ mod tests {
         }
     }
 
-    fn persisted_resume_with_issued_identifier() -> InFlightCreate {
+    fn pending_create_without_identifier() -> PendingCreate {
+        let (id, wit_id, wit_request) = boundary_resource();
+        let pending = CreateAttempt::for_test(id.clone()).pending(
+            proto::PendingToken::new("original-token"),
+            sent_name_only(),
+            1,
+        );
+        PendingCreate {
+            id,
+            wit_id,
+            wit_request,
+            pending,
+        }
+    }
+
+    fn persisted_resume_with_identifier(identifier: Option<&str>) -> InFlightCreate {
         let (id, _wit_id, _wit_request) = boundary_resource();
         let identity = id
             .identity()
@@ -6702,7 +6875,7 @@ mod tests {
             "kind": "create_in_flight",
             "envelope": {
                 "token": "original-token",
-                "identifier": "issued-id",
+                "identifier": identifier,
                 "write_only": {},
                 "secrets": {},
             },
@@ -6722,6 +6895,14 @@ mod tests {
                 panic!("resume fixture loaded without an identifier: {state:?}")
             }
         }
+    }
+
+    fn persisted_resume_with_issued_identifier() -> InFlightCreate {
+        persisted_resume_with_identifier(Some("issued-id"))
+    }
+
+    fn persisted_resume_without_identifier() -> InFlightCreate {
+        persisted_resume_with_identifier(None)
     }
 
     async fn resume_witness(pending: InFlightCreate) -> CoreResume {
@@ -6881,6 +7062,195 @@ mod tests {
         assert_eq!(
             resume.token().expose_for_provider_call(),
             "replacement-token"
+        );
+    }
+
+    fn assert_fresh_create_in_flight(
+        progress: CreateProgress,
+        expected_token: &str,
+        expected_identifier: Option<&str>,
+        expected_sent: &Sent,
+    ) -> String {
+        let CreateProgress::Verdict(failure) = progress else {
+            panic!("create in-flight verdict must preserve a continuation")
+        };
+        let CreateFailureKind::InFlight { pending, error } = failure.into_kind() else {
+            panic!("create in-flight verdict changed failure classification")
+        };
+        let InFlightPersistence::Fresh(fresh) = pending.persistence() else {
+            panic!("a boundary continuation must remain fresh until state persistence")
+        };
+        assert_eq!(fresh.token().expose_for_provider_call(), expected_token);
+        assert_eq!(
+            fresh.identifier().map(AppliedIdentifier::as_str),
+            expected_identifier
+        );
+        assert_eq!(fresh.sent(), expected_sent);
+        error.to_string()
+    }
+
+    #[test]
+    fn initial_create_in_flight_keeps_the_continuation() {
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let attempt = CreateAttempt::for_test(id.clone());
+        let verdict: wasm_convert::DecodedCreateVerdict =
+            proto::CreateVerdict::InFlight(proto::CreateInFlight {
+                pending: proto::PendingCreate {
+                    token: proto::PendingToken::new("initial-next-token"),
+                    identifier: Some(
+                        AppliedIdentifier::new("initial-learned-id").expect("valid identifier"),
+                    ),
+                    sent: sent_name_only(),
+                    poll_after_secs: 3,
+                },
+                error: ProviderError::timeout("initial create interrupted"),
+            });
+
+        assert_fresh_create_in_flight(
+            WasmProvider::initial_create_verdict(id, &wit_request, attempt, verdict),
+            "initial-next-token",
+            Some("initial-learned-id"),
+            &sent_name_only(),
+        );
+    }
+
+    #[test]
+    fn poll_in_flight_keeps_an_identifier_learned_during_the_call() {
+        let starting = pending_create_without_identifier();
+        let verdict: wasm_convert::DecodedPollVerdict =
+            proto::PollVerdict::InFlight(proto::CreateInFlight {
+                pending: proto::PendingCreate {
+                    token: proto::PendingToken::new("poll-next-token"),
+                    identifier: Some(
+                        AppliedIdentifier::new("poll-learned-id").expect("valid identifier"),
+                    ),
+                    sent: sent_name_only(),
+                    poll_after_secs: 5,
+                },
+                error: ProviderError::timeout("poll interrupted"),
+            });
+
+        assert_fresh_create_in_flight(
+            WasmProvider::polled_create_verdict(starting, verdict),
+            "poll-next-token",
+            Some("poll-learned-id"),
+            &sent_name_only(),
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_in_flight_keeps_an_identifier_learned_during_the_call() {
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let resume = resume_witness(persisted_resume_without_identifier()).await;
+        let verdict: wasm_convert::DecodedResumeVerdict =
+            proto::ResumeVerdict::InFlight(proto::ResumeInFlight {
+                pending: proto::ResumePending {
+                    token: proto::PendingToken::new("resume-next-token"),
+                    identifier: Some(
+                        AppliedIdentifier::new("resume-learned-id").expect("valid identifier"),
+                    ),
+                    poll_after_secs: 7,
+                },
+                error: ProviderError::timeout("resume interrupted"),
+            });
+
+        let ResumeProgress::Verdict(failure) =
+            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict)
+        else {
+            panic!("resume in-flight verdict must preserve a continuation")
+        };
+        let ResumeFailureKind::InFlight { pending, error: _ } = failure.into_kind() else {
+            panic!("resume in-flight verdict changed failure classification")
+        };
+        assert_eq!(
+            pending.token().expose_for_provider_call(),
+            "resume-next-token"
+        );
+        assert_eq!(
+            pending.identifier().map(AppliedIdentifier::as_str),
+            Some("resume-learned-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn resent_create_in_flight_is_preserved() {
+        let (id, _wit_id, wit_request) = boundary_resource();
+        let resume = resume_witness(persisted_resume_without_identifier()).await;
+        let verdict: wasm_convert::DecodedResumeVerdict =
+            proto::ResumeVerdict::Resent(proto::CreateVerdict::InFlight(proto::CreateInFlight {
+                pending: proto::PendingCreate {
+                    token: proto::PendingToken::new("resent-next-token"),
+                    identifier: Some(
+                        AppliedIdentifier::new("resent-learned-id").expect("valid identifier"),
+                    ),
+                    sent: sent_name_only(),
+                    poll_after_secs: 9,
+                },
+                error: ProviderError::timeout("resent create interrupted"),
+            }));
+
+        let ResumeProgress::Verdict(failure) =
+            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict)
+        else {
+            panic!("resent in-flight verdict must preserve a continuation")
+        };
+        let ResumeFailureKind::InFlight { pending, error: _ } = failure.into_kind() else {
+            panic!("resent in-flight verdict changed failure classification")
+        };
+        assert_eq!(
+            pending.token().expose_for_provider_call(),
+            "resent-next-token"
+        );
+        assert_eq!(
+            pending.identifier().map(AppliedIdentifier::as_str),
+            Some("resent-learned-id")
+        );
+    }
+
+    #[test]
+    fn in_flight_invalid_sent_attributes_follow_the_pending_boundary_error() {
+        let invalid_sent = Sent::only(["not-in-request"]);
+        let pending_payload = proto::PendingCreate {
+            token: proto::PendingToken::new("invalid-sent-token"),
+            identifier: None,
+            sent: invalid_sent,
+            poll_after_secs: 2,
+        };
+
+        let (pending_id, pending_wit_id, pending_wit_request) = boundary_resource();
+        let pending_error = assert_fresh_create_in_flight(
+            WasmProvider::initial_create_step(
+                pending_id.clone(),
+                pending_wit_id,
+                pending_wit_request,
+                CreateAttempt::for_test(pending_id),
+                proto::CreateStep::Pending(pending_payload.clone()),
+            ),
+            "invalid-sent-token",
+            None,
+            &Sent::Only(BTreeSet::new()),
+        );
+
+        let (verdict_id, _verdict_wit_id, verdict_wit_request) = boundary_resource();
+        let in_flight_error = assert_fresh_create_in_flight(
+            WasmProvider::initial_create_verdict(
+                verdict_id.clone(),
+                &verdict_wit_request,
+                CreateAttempt::for_test(verdict_id),
+                proto::CreateVerdict::InFlight(proto::CreateInFlight {
+                    pending: pending_payload,
+                    error: ProviderError::timeout("provider error must not hide boundary error"),
+                }),
+            ),
+            "invalid-sent-token",
+            None,
+            &Sent::Only(BTreeSet::new()),
+        );
+
+        assert_eq!(in_flight_error, pending_error);
+        assert!(
+            in_flight_error.contains("not a subset of the request"),
+            "{in_flight_error}"
         );
     }
 

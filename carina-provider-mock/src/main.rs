@@ -541,11 +541,18 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
         if attrs.contains_key("__mock_initialize_error__") {
             return Err("intentional mock initialization failure".to_string());
         }
-        Ok(())
+        match attrs.get("__mock_reference_scope_region__") {
+            Some(Value::String(region)) => Ok(ReferenceScope::Available {
+                partition: "mock".to_string(),
+                region: region.clone(),
+                account: "test-account".to_string(),
+            }),
+            Some(_) | None => Ok(ReferenceScope::Unavailable),
+        }
     }
 
     fn read(
@@ -606,7 +613,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
         if id.identity == "__mock_create_trap__" {
             panic!("intentional mock create trap");
         }
@@ -786,7 +793,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
-    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         let unencodable_poll = matches!(
             request.resource.attributes.get("create_mode"),
             Some(Value::String(mode))
@@ -838,10 +845,11 @@ impl CarinaProvider for MockProcessProvider {
                     },
                     1,
                 )),
-                CreateMode::MalformedPending => {
-                    Err(attempt
-                        .undetermined(Self::create_mode_error(id, CreateMode::MalformedPending)))
-                }
+                CreateMode::MalformedPending => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::MalformedPending),
+                )),
                 CreateMode::Untracked => {
                     Err(attempt.untracked(Self::create_mode_error(id, CreateMode::Untracked)))
                 }
@@ -927,7 +935,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
-    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict> {
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         let unencodable_repending = matches!(
             request.resource.attributes.get("create_mode"),
             Some(Value::String(mode)) if mode == "unencodable_repending"
@@ -991,9 +999,16 @@ impl CarinaProvider for MockProcessProvider {
                 CreateMode::Discarded | CreateMode::Untracked => {
                     Err(attempt.untracked(Self::create_mode_error(id, token.mode)))
                 }
-                CreateMode::Undetermined | CreateMode::MalformedPending => {
-                    Err(attempt.undetermined(Self::create_mode_error(id, token.mode)))
-                }
+                CreateMode::Undetermined => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::Undetermined),
+                )),
+                CreateMode::MalformedPending => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::MalformedPending),
+                )),
                 CreateMode::Resend => {
                     let attributes = self.create_done(id, request, Some(token.polls_served + 1));
                     let identifier = AppliedIdentifier::new("mock-id")
