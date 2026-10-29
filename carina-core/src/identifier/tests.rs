@@ -1,8 +1,8 @@
 use super::*;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, CompositionCall, CompositionCallPath, ModuleInstanceScope, ModuleSource, Resource,
-    Subscript, UnknownReason, ValueString,
+    AccessPath, CompositionCall, CompositionCallPath, ModuleInstanceScope, ModuleSource,
+    PendingReRead, ReReadReason, Resource, Subscript, UnknownReason, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry,
@@ -37,6 +37,34 @@ fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
         deterministic_value_string(&value).as_bytes(),
         format!("RedactedSecret(_secret:{digest})").as_bytes(),
     );
+}
+
+#[test]
+fn pending_reread_identifier_material_has_stable_typed_bytes() {
+    let cases = [
+        (
+            PendingReRead::incomplete("omitted \"name\""),
+            r#"Unknown(PendingReRead(Incomplete("omitted \"name\"")))"#,
+        ),
+        (
+            PendingReRead::read_failed("AccessDenied"),
+            r#"Unknown(PendingReRead(ReadFailed("AccessDenied")))"#,
+        ),
+        (
+            PendingReRead::new(ReReadReason::NotFound),
+            "Unknown(PendingReRead(NotFound))",
+        ),
+    ];
+
+    for (pending, expected) in cases {
+        let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+            pending,
+        )));
+        assert_eq!(
+            deterministic_value_string(&value).as_bytes(),
+            expected.as_bytes()
+        );
+    }
 }
 
 #[test]

@@ -66,6 +66,29 @@ fn deferred_function_call_deserialization_rejects_non_builtin_names() {
 }
 
 #[test]
+fn partial_read_marker_deserialization_rejects_empty_missing_attributes() {
+    let json = r#"{
+        "pending": {
+            "reason": {
+                "kind": "incomplete",
+                "detail": "provider omitted every computed attribute"
+            }
+        },
+        "missing_attributes": []
+    }"#;
+
+    let error = serde_json::from_str::<PartialReadMarker>(json)
+        .expect_err("an empty partial-read marker must not be representable");
+
+    assert!(
+        error
+            .to_string()
+            .contains("partial-read marker must contain at least one missing attribute"),
+        "unexpected deserialization error: {error}",
+    );
+}
+
+#[test]
 fn deferred_access_serde_round_trips() {
     let original = apply_postfix_access(
         Value::Deferred(DeferredValue::FunctionCall {

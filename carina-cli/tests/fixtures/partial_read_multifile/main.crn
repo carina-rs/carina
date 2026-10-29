@@ -1,0 +1,3 @@
+let source = mock.test.resource {
+  name = 'partial-source'
+}

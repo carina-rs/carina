@@ -97,6 +97,21 @@ impl Scenario {
         )
         .expect("write local state");
     }
+
+    fn mock_state_json(&self) -> Value {
+        serde_json::from_str(
+            &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
+        )
+        .expect("decode mock provider state")
+    }
+
+    fn write_mock_state_json(&self, state: &Value) {
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(state).expect("encode mock provider state"),
+        )
+        .expect("write mock provider state");
+    }
 }
 
 fn wasm_mock_path() -> Option<PathBuf> {
@@ -1008,10 +1023,19 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         cached_plan.sorted_resources[0].attributes.get("name"),
         Some(carina_core::resource::Value::Deferred(
             carina_core::resource::DeferredValue::Unknown(
-                carina_core::resource::UnknownReason::PostCreateReadIncomplete { .. }
+                carina_core::resource::UnknownReason::PendingReRead(_)
             )
         ))
     ));
+
+    // Make the next provider observation impossible to confuse with a newly
+    // generated fallback. The exact observed value must replace the stale
+    // pending re-read unknown in the refreshed desired resource.
+    let provider_returned_name = "provider-returned-exact-name";
+    let mut provider_state = scenario.mock_state_json();
+    provider_state["states"]["test.resource.pending"]["name"] =
+        Value::String(provider_returned_name.to_string());
+    scenario.write_mock_state_json(&provider_state);
 
     let read_outcome = scenario.project.join("read-outcome.txt");
     let live_output = scenario
@@ -1047,4 +1071,91 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         "the refreshed resource must not be replaced: {:#?}",
         live_plan.plan.effects()
     );
+    let refreshed_name = live_plan.sorted_resources[0]
+        .attributes
+        .get("name")
+        .expect("the refreshed desired resource keeps its generated name");
+    assert!(
+        matches!(
+            refreshed_name,
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(name)
+            ) if name.expose_plaintext() == provider_returned_name
+        ),
+        "a successful refresh must use the exact provider-returned name {provider_returned_name:?}, got {refreshed_name:?}"
+    );
+}
+
+fn applied_prefixed_name(scenario: &Scenario) -> String {
+    let state = scenario.state_json();
+    only_current(&state)["attributes"]["name"]
+        .as_str()
+        .expect("applied prefix fixture stores its generated name")
+        .to_string()
+}
+
+fn assert_plan_keeps_prefixed_name(plan: &PlanFile, expected: &str) {
+    assert!(
+        matches!(
+            plan.sorted_resources[0].attributes.get("name"),
+            Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(name)
+            )) if name.expose_plaintext() == expected
+        ),
+        "refreshed desired name must stay equal to the persisted generated name {expected:?}, got {:?}",
+        plan.sorted_resources[0].attributes.get("name")
+    );
+}
+
+#[test]
+fn absent_refresh_recreates_with_the_stored_prefixed_name() {
+    let scenario = Scenario::new(
+        r#"let prefixed = mock.test.resource {
+  name_prefix = "absent-refresh-"
+}"#,
+    );
+    scenario.init();
+    let apply = scenario.apply_with_modes("success", "resumed");
+    assert_success("initial prefixed apply", &apply);
+    let stored_name = applied_prefixed_name(&scenario);
+
+    let mut provider_state = scenario.mock_state_json();
+    provider_state["states"] = serde_json::json!({});
+    scenario.write_mock_state_json(&provider_state);
+
+    let (output, plan, _raw) = scenario.save_plan(true, "absent-prefix-plan.json");
+    assert_success("plan after out-of-band deletion", &output);
+    assert_plan_keeps_prefixed_name(&plan, &stored_name);
+    assert!(
+        plan.plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Create(_))),
+        "the absent resource must be recreated: {:#?}",
+        plan.plan.effects()
+    );
+}
+
+#[test]
+fn refresh_omitting_prefixed_name_keeps_stored_desired_name() {
+    let scenario = Scenario::new(
+        r#"let prefixed = mock.test.resource {
+  name_prefix = "omitted-refresh-"
+}"#,
+    );
+    scenario.init();
+    let apply = scenario.apply_with_modes("success", "resumed");
+    assert_success("initial prefixed apply", &apply);
+    let stored_name = applied_prefixed_name(&scenario);
+
+    let mut provider_state = scenario.mock_state_json();
+    provider_state["states"]["test.resource.prefixed"]
+        .as_object_mut()
+        .expect("mock resource attributes are an object")
+        .remove("name");
+    scenario.write_mock_state_json(&provider_state);
+
+    let (output, plan, _raw) = scenario.save_plan(true, "omitted-prefix-plan.json");
+    assert_success("plan after provider omitted prefixed name", &output);
+    assert_plan_keeps_prefixed_name(&plan, &stored_name);
 }

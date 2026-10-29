@@ -23,7 +23,7 @@ use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
     ProviderResource, Resource, ResourceId, State, Value, ValueString,
 };
 #[cfg(test)]
@@ -3721,10 +3721,10 @@ impl PartialReadDiagnostic {
     }
 
     pub fn into_state_for_writeback(self, mut state: State) -> State {
-        state.partial_read = Some(PartialReadMarker {
-            detail: self.reason,
-            missing_attributes: self.missing_attributes.into_iter().collect(),
-        });
+        state.partial_read = PartialReadMarker::new(
+            PendingReRead::incomplete(self.reason),
+            self.missing_attributes.into_iter().collect(),
+        );
         state
     }
 }
@@ -7488,7 +7488,76 @@ mod tests {
         assert_eq!(partial.diagnostic(), Some(&diagnostic));
         assert_eq!(partial.identifier().as_str(), "mock-id");
         let state = partial.into_state_for_writeback();
-        assert_eq!(state.partial_read.unwrap().missing_attributes.len(), 1);
+        assert_eq!(
+            state
+                .partial_read
+                .expect("partial outcome records a marker")
+                .missing_attributes()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_create_and_update_share_the_canonical_pending_reread_value() {
+        use crate::resource::{PendingReRead, ReReadReason, UnknownReason};
+
+        fn assert_materialized(mut state: State, expected: &PendingReRead) {
+            let marker = state
+                .partial_read
+                .as_ref()
+                .expect("partial outcome records a marker");
+            assert_eq!(marker.pending(), expected);
+            assert_eq!(
+                marker.missing_attributes(),
+                &BTreeSet::from(["computed".to_string()])
+            );
+
+            state.materialize_partial_read_unknowns();
+            let unknown = state
+                .attributes
+                .get("computed")
+                .expect("missing attribute is materialized");
+            let Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending))) =
+                unknown
+            else {
+                panic!(
+                    "expected the marker to materialize a pending re-read unknown, got {unknown:?}"
+                );
+            };
+            assert_eq!(pending, expected);
+            let rendered =
+                crate::value::render_unknown(&UnknownReason::PendingReRead(pending.clone()));
+            assert_eq!(
+                rendered,
+                "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
+            );
+            assert!(!rendered.contains("known after next apply"), "{rendered}");
+            assert!(!rendered.contains("post-create"), "{rendered}");
+        }
+
+        let id = ResourceId::with_identity("test", "example");
+        let applied = || {
+            AppliedState::new(id.clone(), "mock-id", HashMap::new())
+                .expect("fixture identifier is non-empty")
+        };
+        let expected = PendingReRead::new(ReReadReason::Incomplete {
+            detail: "provider returned a partial read".to_string(),
+        });
+
+        let created = CreateOutcome::partial_success(
+            applied(),
+            "provider returned a partial read".to_string(),
+            vec!["computed".to_string()],
+        );
+        assert_materialized(created.into_state_for_writeback(), &expected);
+
+        let updated = UpdateOutcome::partial_success(
+            applied(),
+            "provider returned a partial read".to_string(),
+            vec!["computed".to_string()],
+        );
+        assert_materialized(updated.into_state_for_writeback(), &expected);
     }
 
     #[test]

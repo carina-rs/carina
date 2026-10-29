@@ -1225,7 +1225,7 @@ impl Provider for MockProvider {
             if mode == "created_read_failed" {
                 return Err(resumed.failed(
                     Observation::ReadFailed(ProviderError::api_error(
-                        "builtin mock post-create read failed",
+                        "builtin mock post-apply read failed",
                     )),
                     ProviderError::api_error(
                         "builtin mock resume finished after creating the resource",

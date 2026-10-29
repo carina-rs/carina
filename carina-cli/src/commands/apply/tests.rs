@@ -5923,10 +5923,13 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
     let partial = row
         .partial_read()
         .expect("normal create writeback must preserve the partial-read marker");
-    assert_eq!(partial.detail, "bootstrap read incomplete");
     assert_eq!(
-        partial.missing_attributes,
-        BTreeSet::from(["versioning".to_string()])
+        partial.pending(),
+        &carina_core::resource::PendingReRead::incomplete("bootstrap read incomplete")
+    );
+    assert_eq!(
+        partial.missing_attributes(),
+        &BTreeSet::from(["versioning".to_string()])
     );
 }
 
@@ -6424,10 +6427,10 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     assert!(attributes.is_empty());
     assert_eq!(
         partial_read,
-        &Some(carina_core::resource::PartialReadMarker {
-            detail: "provider read after create returned not found".to_string(),
-            missing_attributes: BTreeSet::from(["bucket".to_string()]),
-        })
+        &carina_core::resource::PartialReadMarker::new(
+            carina_core::resource::PendingReRead::not_found(),
+            BTreeSet::from(["bucket".to_string()]),
+        )
     );
 }
 
