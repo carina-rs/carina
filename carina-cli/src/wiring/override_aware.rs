@@ -200,8 +200,9 @@ impl<E> CanonicalResourcePair<E> {
 
     /// Rebuild prefix-owned desired values from the post-hydration current
     /// snapshot. Restoring the generated fallback before overlaying current
-    /// state guarantees that clearing a marker cannot retain an unknown that
-    /// came from the earlier identity pass.
+    /// or persisted state guarantees that clearing a marker cannot retain an
+    /// unknown that came from the earlier identity pass, while an omitted
+    /// readback still reuses the stored generated name.
     pub fn reconcile_refreshed_prefixed_names(
         &mut self,
         find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,

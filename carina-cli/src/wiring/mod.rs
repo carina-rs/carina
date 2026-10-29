@@ -139,7 +139,7 @@ use carina_core::schema::{
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
-use carina_state::{LoadedOrphans, StateFile};
+use carina_state::{LoadedOrphans, ResourceState, StateFile};
 
 #[cfg(test)]
 use crate::commands::shared::progress::RecordedProgressLines;
@@ -1507,7 +1507,12 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
     /// keeping the mutated file bound to its validating wiring.
     pub(crate) async fn expand_refresh_and_lift_states<P: Provider + ProviderNormalizer>(
         &mut self,
-        inputs: ValidatedExpandRefreshAndLiftInputs<'_, '_, P>,
+        inputs: ValidatedExpandRefreshAndLiftInputs<
+            '_,
+            '_,
+            P,
+            PreparedAddressPreservingDeferredForExpansion,
+        >,
     ) -> Result<ExpandedRefreshState<()>, AppError> {
         let Self { wiring, resources } = self;
         let ValidatedExpandRefreshAndLiftInputs {
@@ -2263,26 +2268,8 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
     };
 
     identifier::reconcile_prefixed_names(resources, &|provider, resource_type, name| {
-        let sr = state_file.find_resource(provider, resource_type, name)?;
-        let persisted = sr.persisted_attributes()?;
-        let mut attribute_values = persisted
-            .plain_string_values()
-            .into_iter()
-            .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value)))
-            .collect::<HashMap<_, _>>();
-        if let Some(marker) = sr.partial_read() {
-            for attribute in marker.missing_attributes() {
-                attribute_values
-                    .entry(attribute.clone())
-                    .or_insert_with(|| {
-                        identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
-                    });
-            }
-        }
-        Some(PrefixStateInfo {
-            prefixes: sr.prefixes.clone(),
-            attribute_values,
-        })
+        let persisted = state_file.find_resource(provider, resource_type, name)?;
+        prefix_state_info(persisted, None)
     });
 }
 
@@ -2295,14 +2282,37 @@ pub(crate) fn reconcile_canonical_prefixed_names<E>(
     };
 
     resources.reconcile_prefixed_names(&|provider, resource_type, name| {
-        let sr = state_file.find_resource(provider, resource_type, name)?;
-        let persisted = sr.persisted_attributes()?;
-        let mut attribute_values = persisted
-            .plain_string_values()
-            .into_iter()
-            .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value)))
-            .collect::<HashMap<_, _>>();
-        if let Some(marker) = sr.partial_read() {
+        let persisted = state_file.find_resource(provider, resource_type, name)?;
+        prefix_state_info(persisted, None)
+    });
+}
+
+/// Build the one prefix-reconciliation view used before and after refresh.
+///
+/// `current == None` means no refresh has run yet, so both persisted values
+/// and its pending re-read marker are authoritative. Once a refreshed state
+/// is supplied, its concrete strings and marker take precedence; persisted
+/// concrete strings remain only as the read-omission/out-of-band-deletion
+/// fallback, and a persisted marker is deliberately ignored.
+fn prefix_state_info(
+    persisted: &ResourceState,
+    current: Option<&State>,
+) -> Option<PrefixStateInfo> {
+    let persisted_attributes = persisted.persisted_attributes()?;
+    let persisted_values = persisted_attributes.plain_string_values();
+    let mut attribute_values = HashMap::new();
+
+    if let Some(current) = current {
+        attribute_values.extend(current.attributes.iter().filter_map(|(name, value)| {
+            let Value::Concrete(ConcreteValue::String(value)) = value else {
+                return None;
+            };
+            Some((
+                name.clone(),
+                identifier::PrefixStateValue::Known(value.expose_plaintext().to_string()),
+            ))
+        }));
+        if let Some(marker) = current.partial_read.as_ref() {
             for attribute in marker.missing_attributes() {
                 attribute_values
                     .entry(attribute.clone())
@@ -2311,11 +2321,32 @@ pub(crate) fn reconcile_canonical_prefixed_names<E>(
                     });
             }
         }
-        Some(identifier::PrefixStateInfo {
-            prefixes: sr.prefixes.clone(),
-            attribute_values,
-        })
-    });
+        for (name, value) in persisted_values {
+            attribute_values
+                .entry(name)
+                .or_insert(identifier::PrefixStateValue::Known(value));
+        }
+    } else {
+        attribute_values.extend(
+            persisted_values
+                .into_iter()
+                .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value))),
+        );
+        if let Some(marker) = persisted.partial_read() {
+            for attribute in marker.missing_attributes() {
+                attribute_values
+                    .entry(attribute.clone())
+                    .or_insert_with(|| {
+                        identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
+                    });
+            }
+        }
+    }
+
+    Some(PrefixStateInfo {
+        prefixes: persisted.prefixes.clone(),
+        attribute_values,
+    })
 }
 
 type PrefixStateKey = (String, String, String);
@@ -2328,66 +2359,62 @@ fn prefix_state_key(provider: &str, resource_type: &str, identity: &str) -> Pref
     )
 }
 
+/// Prefix inputs proven to have been computed after managed refresh/hydration.
+/// The private variants distinguish a legitimate no-state-file path from a
+/// computed map and prevent an empty "not computed" map from reaching
+/// canonical deferred-for expansion.
+enum RefreshedPrefixStateInfo {
+    NoStateFile,
+    Computed(HashMap<PrefixStateKey, PrefixStateInfo>),
+}
+
+impl RefreshedPrefixStateInfo {
+    fn get(&self, key: &PrefixStateKey) -> Option<&PrefixStateInfo> {
+        match self {
+            Self::NoStateFile => None,
+            Self::Computed(values) => values.get(key),
+        }
+    }
+}
+
 /// Build prefix reconciliation inputs from the hydrated current snapshot.
-/// Persisted rows remain the authority for which prefix was originally used;
-/// current state is the sole authority for the value and pending re-read
-/// marker after refresh.
+/// Refreshed values and markers take precedence, while a persisted generated
+/// value remains a fallback for keeping the desired name stable. This never
+/// writes the fallback into provider-read current state, so an omitted
+/// attribute remains observable as drift.
 fn refreshed_prefix_state_info(
     resources: &[Resource],
     state_file: &Option<StateFile>,
     managed_current: &HashMap<ResourceId, Current>,
-) -> HashMap<PrefixStateKey, PrefixStateInfo> {
+) -> RefreshedPrefixStateInfo {
     let Some(state_file) = state_file.as_ref() else {
-        return HashMap::new();
+        return RefreshedPrefixStateInfo::NoStateFile;
     };
-    resources
-        .iter()
-        .filter(|resource| !resource.prefixes.is_empty())
-        .filter_map(|resource| {
-            let identity = resource.id.identity_str()?;
-            let persisted = state_file.find_resource(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                identity,
-            )?;
-            let current_state =
-                managed_current
-                    .get(&resource.id)
-                    .and_then(|current| match current {
-                        Current::Absent(state) => Some(state.state()),
-                        Current::Present(present) => Some(present.state()),
-                        Current::CreateInFlight(_pending) => None,
-                        Current::MissingIdentifier(state) => Some(state.state()),
-                    });
-            let mut attribute_values = current_state
-                .into_iter()
-                .flat_map(|state| &state.attributes)
-                .filter_map(|(name, value)| match value {
-                    Value::Concrete(ConcreteValue::String(value)) => Some((
-                        name.clone(),
-                        identifier::PrefixStateValue::Known(value.expose_plaintext().to_string()),
-                    )),
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>();
-            if let Some(marker) = current_state.and_then(|state| state.partial_read.as_ref()) {
-                for attribute in marker.missing_attributes() {
-                    attribute_values
-                        .entry(attribute.clone())
-                        .or_insert_with(|| {
-                            identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
-                        });
-                }
-            }
-            Some((
-                prefix_state_key(&resource.id.provider, &resource.id.resource_type, identity),
-                PrefixStateInfo {
-                    prefixes: persisted.prefixes.clone(),
-                    attribute_values,
-                },
-            ))
-        })
-        .collect()
+    RefreshedPrefixStateInfo::Computed(
+        resources
+            .iter()
+            .filter(|resource| !resource.prefixes.is_empty())
+            .filter_map(|resource| {
+                let identity = resource.id.identity_str()?;
+                let persisted = state_file.find_resource(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    identity,
+                )?;
+                let current_state = match managed_current.get(&resource.id)? {
+                    Current::Absent(state) => state.state(),
+                    Current::Present(present) => present.state(),
+                    Current::CreateInFlight(_pending) => return None,
+                    Current::MissingIdentifier(state) => state.state(),
+                };
+                let state_info = prefix_state_info(persisted, Some(current_state))?;
+                Some((
+                    prefix_state_key(&resource.id.provider, &resource.id.resource_type, identity),
+                    state_info,
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Look up a provider's identity attributes through its factory.
@@ -4122,7 +4149,7 @@ impl DetectedAutomaticMoves {
 /// view before managed and data-source refreshes run.
 ///
 /// A caller must choose one of two typed transitions before it can obtain a
-/// [`PreparedDeferredForExpansion`]:
+/// prepared expansion value:
 ///
 /// - [`DeferredForExpansionPrelude::detect_moves`] followed by
 ///   [`ProjectedDeferredForExpansionPrelude::reconcile_addresses`] for
@@ -4132,9 +4159,10 @@ impl DetectedAutomaticMoves {
 ///   which must refresh the rows at their persisted addresses without applying
 ///   pending configuration transitions.
 ///
-/// Both transitions own the exact state/metadata view accepted by expansion,
-/// so a future caller cannot silently choose the wrong behavior with a flag or
-/// substitute independently keyed maps.
+/// The transitions produce distinct prepared types: canonical plan/apply
+/// expansion requires refreshed prefix information, while address-preserving
+/// state refresh can expand only its raw parsed file. A future caller cannot
+/// silently choose the wrong behavior with a flag or an empty metadata map.
 pub struct DeferredForExpansionPrelude<'state> {
     state_file: &'state Option<StateFile>,
     sorted_resources: Vec<Resource>,
@@ -4343,7 +4371,6 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 prev_explicit: self.prev_explicit,
                 moved_pairs: Vec::new(),
             },
-            prefix_state_info: HashMap::new(),
         })
     }
 }
@@ -4546,8 +4573,8 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
                 wait_aliases: prelude.wait_aliases,
                 already_refreshed,
                 state: addressed,
-                prefix_state_info,
             },
+            prefix_state_info,
         ))
     }
 }
@@ -4557,7 +4584,6 @@ struct AddressedDeferredForExpansionInputs {
     wait_aliases: Vec<WaitAliasSpec>,
     already_refreshed: HashSet<ResourceId>,
     state: AddressedState,
-    prefix_state_info: HashMap<PrefixStateKey, PrefixStateInfo>,
 }
 
 struct DeferredForExpansionInputs {
@@ -4568,7 +4594,10 @@ struct DeferredForExpansionInputs {
 /// Address-reconciled state before the plan path's data-source I/O phase has
 /// finished. This type deliberately has no expansion method: callers must
 /// populate its owned data-source snapshot and seal the complete view first.
-pub struct ReconciledDeferredForExpansion(AddressedDeferredForExpansionInputs);
+pub struct ReconciledDeferredForExpansion(
+    AddressedDeferredForExpansionInputs,
+    RefreshedPrefixStateInfo,
+);
 
 /// Inputs shared by plan, live apply, and state refresh after each path has
 /// completed its address transition and before deferred-`for` expansion.
@@ -4714,10 +4743,13 @@ impl ReconciledDeferredForExpansion {
     /// Seal the reconciled managed/data-source/orphan snapshots into the only
     /// state accepted by deferred `for` expansion.
     pub fn seal(self, data_source_values: DataSourceValues) -> PreparedDeferredForExpansion {
-        PreparedDeferredForExpansion(DeferredForExpansionInputs {
-            addressed: self.0,
-            data_source_values,
-        })
+        PreparedDeferredForExpansion(
+            DeferredForExpansionInputs {
+                addressed: self.0,
+                data_source_values,
+            },
+            self.1,
+        )
     }
 }
 
@@ -4744,19 +4776,50 @@ impl AddressPreservingDeferredForExpansion {
         read_addressed_data_sources_phase2(&self.0, inputs).await
     }
 
-    pub fn seal(self, data_source_values: DataSourceValues) -> PreparedDeferredForExpansion {
-        PreparedDeferredForExpansion(DeferredForExpansionInputs {
+    pub fn seal(
+        self,
+        data_source_values: DataSourceValues,
+    ) -> PreparedAddressPreservingDeferredForExpansion {
+        PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
             addressed: self.0,
             data_source_values,
         })
     }
 }
 
-/// The single addressed/configured/current-state view accepted by deferred
-/// `for` expansion. Its fields are private and it owns the exact snapshots
-/// that were reconciled with the persisted metadata, so expansion cannot be
-/// invoked with a different state map.
-pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs);
+/// Canonical expansion inputs paired with prefix information computed from the
+/// refreshed current snapshot. Only this type exposes canonical `expand`.
+pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs, RefreshedPrefixStateInfo);
+
+/// Address-preserving state-refresh inputs. This distinct type exposes only
+/// raw-file expansion, so a preparation without refreshed prefix information
+/// cannot reach canonical [`PreparedDeferredForExpansion::expand`].
+pub struct PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs);
+
+trait PreparedExpansionInputs {
+    fn inputs(&self) -> &DeferredForExpansionInputs;
+    fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs;
+}
+
+impl PreparedExpansionInputs for PreparedDeferredForExpansion {
+    fn inputs(&self) -> &DeferredForExpansionInputs {
+        &self.0
+    }
+
+    fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs {
+        &mut self.0
+    }
+}
+
+impl PreparedExpansionInputs for PreparedAddressPreservingDeferredForExpansion {
+    fn inputs(&self) -> &DeferredForExpansionInputs {
+        &self.0
+    }
+
+    fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs {
+        &mut self.0
+    }
+}
 
 /// Planning metadata released only after the prepared value has been
 /// consumed. This type cannot be converted back into an expansion witness;
@@ -4768,6 +4831,16 @@ pub(crate) struct PreparedDeferredForExpansionParts {
 }
 
 impl PreparedDeferredForExpansion {
+    pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
+        PreparedDeferredForExpansionParts {
+            addressed: self.0.addressed.state,
+            data_source_values: self.0.data_source_values,
+            wait_aliases: self.0.addressed.wait_aliases,
+        }
+    }
+}
+
+impl PreparedAddressPreservingDeferredForExpansion {
     pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
         PreparedDeferredForExpansionParts {
             addressed: self.0.addressed.state,
@@ -4953,9 +5026,7 @@ impl PreparedDeferredForExpansion {
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
         resources.reconcile_refreshed_prefixed_names(&|provider, resource_type, identity| {
-            self.0
-                .addressed
-                .prefix_state_info
+            self.1
                 .get(&prefix_state_key(provider, resource_type, identity))
                 .cloned()
         });
@@ -4976,10 +5047,11 @@ impl PreparedDeferredForExpansion {
         )?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
     }
+}
 
-    /// Raw-file expansion is reserved for address-preserving state refresh
-    /// and focused tests. Production plan/apply paths must use [`Self::expand`]
-    /// so the canonical pair is consumed into an owned witness.
+impl PreparedAddressPreservingDeferredForExpansion {
+    /// Raw-file expansion is reserved for address-preserving state refresh and
+    /// focused tests; this type cannot invoke canonical prefix reconciliation.
     pub(crate) fn expand_parsed<E: Clone>(
         &self,
         parsed: &mut carina_core::parser::File<E>,
@@ -5288,7 +5360,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
             (target.clone(), target)
         })
         .collect();
-    let prepared = PreparedDeferredForExpansion(DeferredForExpansionInputs {
+    let prepared = PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
         addressed: AddressedDeferredForExpansionInputs {
             sorted_resources: sorted_resources.to_vec(),
             wait_aliases: wait_aliases.to_vec(),
@@ -5300,7 +5372,6 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
                 prev_explicit: prev_explicit.clone(),
                 moved_pairs,
             },
-            prefix_state_info: HashMap::new(),
         },
         data_source_values: data_source_values.clone(),
     });
@@ -5357,12 +5428,12 @@ pub struct ExpandedRefreshState<R> {
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
-pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + ProviderNormalizer> {
+pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + ProviderNormalizer, E> {
     pub provider: &'a P,
     /// Address/metadata parity witness produced by the shared I/O-free
     /// prelude. Expansion cannot be invoked with independently assembled
     /// saved attributes, aliases, or exclusion sets.
-    pub expansion: &'a mut PreparedDeferredForExpansion,
+    pub expansion: &'a mut E,
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
@@ -5377,9 +5448,10 @@ pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
     'a,
     'backend,
     P: Provider + ProviderNormalizer,
+    E,
 > {
     pub provider: &'a P,
-    pub expansion: &'a mut PreparedDeferredForExpansion,
+    pub expansion: &'a mut E,
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
@@ -5403,7 +5475,7 @@ pub(crate) struct ValidatedExpandedRefreshState<E> {
 /// canonical plan/apply result at the type level.
 async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
     parsed: &mut carina_core::parser::File<E>,
-    inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
+    inputs: ExpandRefreshAndLiftInputs<'_, '_, P, PreparedAddressPreservingDeferredForExpansion>,
 ) -> Result<ExpandedRefreshState<()>, AppError> {
     let expansion = inputs.expansion.expand_parsed(
         parsed,
@@ -5424,7 +5496,7 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     P: Provider + ProviderNormalizer,
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
-    inputs: ValidatedExpandRefreshAndLiftInputs<'_, '_, P>,
+    inputs: ValidatedExpandRefreshAndLiftInputs<'_, '_, P, PreparedDeferredForExpansion>,
 ) -> Result<ValidatedExpandedRefreshState<E>, AppError> {
     let ValidatedConfig {
         wiring,
@@ -5485,10 +5557,14 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     })
 }
 
-async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
+async fn finish_expanded_refresh_state<
+    R,
+    P: Provider + ProviderNormalizer,
+    E: PreparedExpansionInputs,
+>(
     canonical_resources: R,
     expansion: DeferredForExpansion,
-    inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
+    inputs: ExpandRefreshAndLiftInputs<'_, '_, P, E>,
 ) -> Result<ExpandedRefreshState<R>, AppError> {
     let DeferredForExpansion {
         sorted_resources,
@@ -5515,7 +5591,7 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
     // the next caller from forgetting it.
     let projected_state = inputs
         .expansion
-        .0
+        .inputs()
         .addressed
         .state
         .projected_state(inputs.state_file.as_ref());
@@ -5532,7 +5608,7 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
                 ..
             },
         data_source_values,
-    } = &mut inputs.expansion.0;
+    } = inputs.expansion.inputs_mut();
     if !new_child_ids.is_empty() {
         let children = refreshable_child_ids.select(&sorted_resources, orphans);
         refresh_resource_set(

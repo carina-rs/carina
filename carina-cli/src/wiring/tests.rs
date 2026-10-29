@@ -6642,6 +6642,212 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     ));
 }
 
+fn prefix_reconciliation_resource(attributes: &[&str]) -> Resource {
+    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
+    for attribute in attributes {
+        resource
+            .prefixes
+            .insert((*attribute).to_string(), format!("{attribute}-prefix-"));
+        resource.set_attr(
+            (*attribute).to_string(),
+            Value::Concrete(ConcreteValue::String(
+                format!("generated-{attribute}-fallback").into(),
+            )),
+        );
+    }
+    resource
+}
+
+fn prefix_reconciliation_state_file(
+    attributes: HashMap<String, Value>,
+    partial_read: Option<carina_core::resource::PartialReadMarker>,
+    prefixes: &[&str],
+) -> StateFile {
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
+    let mut provider_state = State::existing(id, attributes).with_identifier("provider-id");
+    provider_state.partial_read = partial_read;
+    let mut row = carina_state::ResourceState::from_provider_state(
+        "test.resource",
+        "example",
+        "mock",
+        &provider_state,
+    )
+    .expect("prefix fixture state is persistable");
+    for attribute in prefixes {
+        row.prefixes
+            .insert((*attribute).to_string(), format!("{attribute}-prefix-"));
+    }
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("prefix fixture row is unique");
+    state_file
+}
+
+fn reconcile_prefixes_from_refreshed_current(
+    resource: &mut Resource,
+    state_file: &StateFile,
+    current: Current,
+) {
+    let managed_current = HashMap::from([(resource.id.clone(), current)]);
+    let prefix_state_info = refreshed_prefix_state_info(
+        std::slice::from_ref(resource),
+        &Some(state_file.clone()),
+        &managed_current,
+    );
+    identifier::reconcile_prefixed_names(
+        std::slice::from_mut(resource),
+        &|provider, resource_type, identity| {
+            prefix_state_info
+                .get(&prefix_state_key(provider, resource_type, identity))
+                .cloned()
+        },
+    );
+}
+
+fn assert_plain_prefix_value(resource: &Resource, attribute: &str, expected: &str) {
+    assert!(
+        matches!(
+            resource.attributes.get(attribute),
+            Some(Value::Concrete(ConcreteValue::String(value)))
+                if value.expose_plaintext() == expected
+        ),
+        "expected {attribute:?} to be {expected:?}, got {:?}",
+        resource.attributes.get(attribute),
+    );
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_keeps_stored_name_when_current_is_absent() {
+    let mut resource = prefix_reconciliation_resource(&["name"]);
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut resource,
+        &state_file,
+        Current::absent(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "example",
+            None,
+        )),
+    );
+
+    assert_plain_prefix_value(&resource, "name", "stored-name");
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_keeps_stored_name_when_current_omits_it() {
+    let mut resource = prefix_reconciliation_resource(&["name"]);
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+    let id = resource.id.clone();
+    let current =
+        Current::from_state(State::existing(id, HashMap::new()).with_identifier("provider-id"));
+
+    reconcile_prefixes_from_refreshed_current(&mut resource, &state_file, current);
+
+    assert_plain_prefix_value(&resource, "name", "stored-name");
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_prefers_current_marker_then_current_value() {
+    let pending = carina_core::resource::PendingReRead::incomplete("provider omitted name");
+    let marker = carina_core::resource::PartialReadMarker::new(
+        pending.clone(),
+        BTreeSet::from(["name".to_string()]),
+    )
+    .expect("fixture marker covers one attribute");
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
+    let mut current_state =
+        State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+    current_state.partial_read = Some(marker);
+    let mut marked_resource = prefix_reconciliation_resource(&["name"]);
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut marked_resource,
+        &state_file,
+        Current::from_state(current_state),
+    );
+
+    assert!(matches!(
+        marked_resource.attributes.get("name"),
+        Some(Value::Deferred(DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::PendingReRead(actual)
+        ))) if actual == &pending
+    ));
+
+    let mut valued_resource = prefix_reconciliation_resource(&["name"]);
+    let current_with_value = Current::from_state(
+        State::existing(
+            id,
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("refreshed-name".into())),
+            )]),
+        )
+        .with_identifier("provider-id"),
+    );
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut valued_resource,
+        &state_file,
+        current_with_value,
+    );
+
+    assert_plain_prefix_value(&valued_resource, "name", "refreshed-name");
+}
+
+#[test]
+fn pre_refresh_prefix_reconciliation_uses_persisted_value_and_marker() {
+    let pending = carina_core::resource::PendingReRead::read_failed("read failed");
+    let marker = carina_core::resource::PartialReadMarker::new(
+        pending.clone(),
+        BTreeSet::from(["alias".to_string()]),
+    )
+    .expect("fixture marker covers one attribute");
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        Some(marker),
+        &["name", "alias"],
+    );
+    let mut resources = vec![prefix_reconciliation_resource(&["name", "alias"])];
+
+    reconcile_prefixed_names(&mut resources, &Some(state_file));
+
+    assert_plain_prefix_value(&resources[0], "name", "stored-name");
+    assert!(matches!(
+        resources[0].attributes.get("alias"),
+        Some(Value::Deferred(DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::PendingReRead(actual)
+        ))) if actual == &pending
+    ));
+}
+
 struct RegionIdentityFactory;
 
 impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
@@ -7848,21 +8054,14 @@ mod expand_same_config_deferred_for_tests {
         let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
-        let wiring = WiringContext::new_for_test(Vec::new(), &[]);
-        let claims = resolve_state_block_claims(
-            &parsed.state_blocks,
-            &state_file,
-            &parsed.resources,
-            &schemas,
-        );
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
-            .expect("build expansion prelude")
-            .detect_moves(&wiring, &parsed.data_sources, &[], &claims)
-            .expect("detect automatic moves");
+            .expect("build expansion prelude");
         let prepared = prelude
-            .bind_projected_phase1_state(HashMap::new(), Orphans::new(), HashSet::new())
-            .reconcile_addresses(&parsed, DeferredForWarningPolicy::Suppress)
-            .expect("prepare expansion")
+            .preserve_addresses(PreserveDeferredForExpansionInputs {
+                managed_current: HashMap::new(),
+                orphans: Orphans::new(),
+                already_refreshed: HashSet::new(),
+            })
             .seal(DataSourceValues::empty());
 
         let out = prepared
