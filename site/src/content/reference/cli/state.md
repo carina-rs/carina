@@ -121,7 +121,7 @@ Shell completions are supported for both resource names and attribute names.
 
 ### `refresh`
 
-Refresh state from cloud providers without planning or applying. Reads the current state of all managed resources from the providers and updates the state file.
+Refresh state from cloud providers without planning or applying. Reads the current state of all managed resources from the providers and updates the state file. Every provider must load before the refresh starts. Progress is shown the same way as for `carina apply` (see [Progress output](/reference/cli/apply/#progress-output)).
 
 ```bash
 carina state refresh [OPTIONS] [PATH]
@@ -141,7 +141,7 @@ Delete the state bucket. This is a destructive operation that removes the bucket
 carina state bucket-delete [OPTIONS] <BUCKET_NAME> [PATH]
 ```
 
-The bucket name must match the `bucket` attribute in the backend configuration. Without `--force`, Carina prompts for confirmation by requiring the user to type the bucket name.
+The bucket name must match the `bucket` attribute in the backend configuration. The configuration and its providers must load successfully; Carina checks this before asking for confirmation. Without `--force`, Carina prompts for confirmation by requiring the user to type the bucket name.
 
 During a pending backend migration, `bucket-delete` targets the configured NEW backend, not the OLD backend recorded in `carina-backend.lock`.
 
