@@ -17,6 +17,10 @@ Concrete/Deferred 軸は既に enum で分離されているので、Value 軸�
 
 ### 1.1 形態の正確な分類
 
+> 2026-10-29追記: この表は書かれた時点のもので、今のコードとは一部が合いません。
+> 6行目の`AttributeType::Custom`はなくなり、`TypeExpr::Unknown`を作る場所も増えています。
+> 今の状態は[「未確定」の形の現状](./2026-10-29-unknown-forms-current-state.md)（#3212）を見てください。
+
 | # | 形 | 階層 | 意味 | 解決時期 |
 | - | --- | ---- | ---- | -------- |
 | 1 | `Value::Deferred(DeferredValue::ResourceRef / BindingRef / Interpolation / FunctionCall)` | 値 (式) | 参照や式 — 評価すれば concrete | **reference resolution 時** |
@@ -268,7 +272,18 @@ pub fn write_state(v: &StagedValue<Applied>) { ... }
 影響: `carina-core/src/parser/`, `validation/`, `config_loader.rs` の
 ~10 箇所。
 
+2026-10-29追記: carina#4093で扱う。`TypeExpr::Unknown`は今、推論の失敗のほかに、
+読む側では名前を解決できない型と、要素の型の置き場所としても作られる。そのため、
+戻り値を`Result`にするだけでは足りず、3つの意味それぞれに型付きの置き場所が要る。
+
 **Phase 2.b — `Custom { origin: CustomTypeOrigin }` (不変条件 3)**
+
+2026-10-29追記: 取り下げ。前提がなくなった。`AttributeType::Custom`はなくなり、
+名前の有無は絞り込みの型が持つ`RefinementBinding`（`MetadataOnly(Option<TypeIdentity>)`
+か、名前が必須の`Validator`）が表している。組み込みの型も`TypeIdentity::bare`で名前を
+持つので、3つの`None`の意味のうち組み込みの型はもう`None`ではない。carina#3218の
+健全性の修正は、軸ごとの代入（`TypeIdentity::assignable_to`）として入り、名前のない
+絞り込みから名前のある型への代入は拒まれる。以下は当時の案として残す。
 
 - `AttributeType::Custom.identity: Option<TypeIdentity>` を
   `origin: CustomTypeOrigin` に置き換え
@@ -282,6 +297,11 @@ pub fn write_state(v: &StagedValue<Applied>) { ... }
 影響: 既存の `identity: None` 使用 ~15 箇所 + provider 側コード。
 
 **Phase 2.c — `DeferredValue` 二階層化 (不変条件 1)**
+
+2026-10-29追記: carina#4094で扱う。今の`UnknownReason`には、パーサーの中でしか存在しては
+いけない置き場所（`FnParam`、`FnLocal`、`ModuleArgument`、`EmptyInterpolation`）と、
+planやapplyまで残る印（upstream、#4084の`PostCreateReadIncomplete`）が混ざっているので、
+分け方はその区別も含めて設計し直す。
 
 - `Value::Deferred(DeferredValue)` を
   `Value::Reference(ReferenceExpr) | Value::ApplyTime(ApplyTimeUnknown) | Value::Secret(Box<Value>)`
