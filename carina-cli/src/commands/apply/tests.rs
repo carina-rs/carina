@@ -5569,6 +5569,7 @@ enum BootstrapCreateBehavior {
     PartialSuccess,
     Untracked,
     Created,
+    CreatedNotFound,
     InFlight,
 }
 
@@ -5673,6 +5674,20 @@ impl Provider for BootstrapRecordingProvider {
                     Err(issued.failed(
                         carina_core::provider::Observation::Read(ReadOutcome::found(observed)),
                         ProviderError::internal("bootstrap created then failed"),
+                    ))
+                })
+            }
+            BootstrapCreateBehavior::CreatedNotFound => {
+                let identifier = AppliedIdentifier::new("missing-bucket-id")
+                    .expect("fixture identifier is non-empty");
+                let issued = attempt.issued(
+                    identifier,
+                    carina_core::provider::Sent::only(Vec::<String>::new()),
+                );
+                Box::pin(async move {
+                    Err(issued.failed(
+                        carina_core::provider::Observation::Read(ReadOutcome::not_found(id)),
+                        ProviderError::internal("bootstrap identifier could not be observed"),
                     ))
                 })
             }
@@ -6259,17 +6274,29 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     .await
     .expect_err("created failure must still be reported");
 
-    assert!(matches!(
-        &error,
-        AppError::StateBucketCreate(error)
-            if matches!(
-                error.create_failure().kind(),
-                carina_core::provider::CreateFailureKind::Created {
-                    created: _created,
-                    error: _provider_error,
-                }
-            )
-    ));
+    let AppError::StateBucketCreate(error) = &error else {
+        panic!("created bootstrap failure lost its classification: {error:?}")
+    };
+    let carina_core::provider::CreateFailureKind::Created {
+        created,
+        error: _provider_error,
+    } = error.create_failure().kind()
+    else {
+        panic!("created bootstrap failure returned another verdict: {error:?}")
+    };
+    match created.observation() {
+        carina_core::provider::CreateObservation::Observed(state) => {
+            assert_eq!(state.identifier().as_str(), "bucket-id")
+        }
+        carina_core::provider::CreateObservation::Unobserved(reason) => match reason {
+            carina_core::provider::UnobservedReason::NotFound => {
+                panic!("found bootstrap observation became not found")
+            }
+            carina_core::provider::UnobservedReason::ReadFailed(read_error) => {
+                panic!("found bootstrap observation became a read failure: {read_error}")
+            }
+        },
+    }
     let state = backend
         .read_state()
         .await
@@ -6292,6 +6319,95 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     assert_eq!(
         attributes.decoded_json_value("observed"),
         Some(serde_json::json!("yes"))
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_before_error() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::CreatedNotFound,
+    };
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    let id = resource.id.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            backend: backend.as_ref(),
+            parsed: &carina_core::parser::InferredFile::default(),
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("unobserved created failure must still be reported");
+
+    let AppError::StateBucketCreate(error) = &error else {
+        panic!("unobserved bootstrap failure lost its classification: {error:?}")
+    };
+    let carina_core::provider::CreateFailureKind::Created {
+        created,
+        error: _provider_error,
+    } = error.create_failure().kind()
+    else {
+        panic!("unobserved bootstrap failure returned another verdict: {error:?}")
+    };
+    match created.observation() {
+        carina_core::provider::CreateObservation::Observed(state) => {
+            panic!("not-found bootstrap observation became found: {state:?}")
+        }
+        carina_core::provider::CreateObservation::Unobserved(reason) => match reason {
+            carina_core::provider::UnobservedReason::NotFound => {}
+            carina_core::provider::UnobservedReason::ReadFailed(read_error) => {
+                panic!("not-found bootstrap observation became a read failure: {read_error}")
+            }
+        },
+    }
+
+    let state = backend
+        .read_state()
+        .await
+        .expect("seed state read")
+        .expect("seed state exists")
+        .into_state();
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("unobserved row must be seeded before the error returns");
+    assert!(row.protected);
+    let carina_state::CurrentInstance::Applied {
+        identifier,
+        attributes,
+        partial_read,
+        ..
+    } = row.current()
+    else {
+        panic!("unobserved bootstrap failure must seed an applied row");
+    };
+    assert_eq!(identifier.as_str(), "missing-bucket-id");
+    assert!(attributes.is_empty());
+    assert_eq!(
+        partial_read,
+        &Some(carina_core::resource::PartialReadMarker {
+            detail: "provider read after create returned not found".to_string(),
+            missing_attributes: BTreeSet::from(["bucket".to_string()]),
+        })
     );
 }
 
@@ -9681,6 +9797,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
         partial_count: 1,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
+        interrupted_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
@@ -9705,4 +9822,32 @@ fn skipped_export_does_not_downgrade_partial_success() {
     let message = err.to_string();
     assert!(message.contains("1 partial"), "error: {message}");
     assert!(message.contains("1 export not written"), "error: {message}",);
+}
+
+#[test]
+fn interrupted_apply_summary_counts_unknown_outcome() {
+    let result: ExecutionResult = ExecutionResult {
+        success_count: 1,
+        failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        interrupted_count: 1,
+        applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
+        successfully_deleted: HashSet::new(),
+        permanent_name_overrides: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        bindings: Default::default(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let err = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+
+    assert!(matches!(&err, AppError::Config(_)));
+    assert_eq!(
+        err.to_string(),
+        "Apply failed. 1 succeeded, 1 outcome unknown."
+    );
 }

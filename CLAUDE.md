@@ -276,9 +276,16 @@ example-based tests already provide sufficient coverage.
 ## Commands
 
 Tests run under nextest (`cargo nextest run`, install once with
-`cargo install cargo-nextest --locked`). Two things nextest does *not*
+`cargo install cargo-nextest --locked`; version 0.9.133 or newer, which
+`.config/nextest.toml` requires). Two things nextest does *not*
 give you: doctests need a separate `cargo test --workspace --doc` before
 opening a PR, and it is process-per-test.
+
+Run tests through nextest, not plain `cargo test`. The setup script in
+`.config/nextest.toml` points `HOME`, `TMPDIR` and `CARINA_*` at a per-run
+temporary home, so tests never write to the developer's real `~/.carina`
+(carina#4055). Plain `cargo test` skips that isolation; use it only for
+`--doc`.
 
 ```bash
 # CLI commands — path defaults to cwd; if given, it must be a DIRECTORY, not a file
@@ -337,11 +344,13 @@ cheap once nextest has compiled the crates — public API doctests in
 `carina-core/src/utils.rs` and elsewhere are not covered by nextest, so
 always run it before declaring verify done.
 
-> CI's `Test` job runs `cargo build -p carina-provider-mock --target
-> wasm32-wasip2` *before* the test step, but that build targets a
-> different platform than the test step (host), so it is not redundant —
-> it produces the WASM fixture that `carina-plugin-host`'s integration
-> tests load. Do not generalize from that step to local development.
+> CI's `Test` job runs `cargo build -p carina-provider-mock -p
+> carina-provider-mock-http --target wasm32-wasip2` *before* the test step,
+> but that build targets a different platform than the test step (host), so
+> it is not redundant — it produces the WASM fixtures that
+> `carina-plugin-host`'s integration tests load (`carina-provider-mock-http`
+> is the wasi:http guest used by the send-phase tests, carina#4057). Do not
+> generalize from that step to local development.
 
 ## Incremental Build Strategy
 

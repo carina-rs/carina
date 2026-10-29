@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 use carina_core::effect::PlanOp;
 use carina_core::executor::complete_create_for_writeback;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateOutcome,
-    CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Observation, Provider,
+    AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
+    CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
     ProviderError, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
     ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
-    ResumeOutcomeKind, SavedAttrs, Sent, SentRecord, UpdateRequest, hydrate_provider_states,
-    normalize_provider_states,
+    ResumeOutcomeKind, SavedAttrs, Sent, SentRecord, UnobservedReason, UpdateRequest,
+    hydrate_provider_states, normalize_provider_states,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, ProviderResource,
@@ -1156,8 +1156,16 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
     {
         CreateFailureKind::Created { created, error } => {
             assert_eq!(created.identifier().as_str(), "mock-id");
-            let Observation::ReadFailed(read_error) = created.observation() else {
-                panic!("token encoding failure must be recorded as a failed observation")
+            let read_error = match created.observation() {
+                CreateObservation::Observed(state) => {
+                    panic!("token encoding failure became an observed create: {state:?}")
+                }
+                CreateObservation::Unobserved(reason) => match reason {
+                    UnobservedReason::NotFound => {
+                        panic!("token encoding failure became a not-found observation")
+                    }
+                    UnobservedReason::ReadFailed(read_error) => read_error,
+                },
             };
             assert!(read_error.to_string().contains("pending token"));
             assert!(matches!(

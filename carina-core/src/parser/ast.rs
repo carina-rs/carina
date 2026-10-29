@@ -1,6 +1,10 @@
 //! Parser AST types and the public `ParsedFile` result.
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
+//!
+//! `TypeExpr::Unknown` is one of several "not determined yet" forms.
+//! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
+//! which stage produces and consumes it, and how validation treats it.
 
 use super::display_string_literal;
 use super::error::{ParseWarning, WarningKind};
@@ -427,14 +431,24 @@ pub enum TypeExpr {
     /// additions (`String | Int`, nullable types via `T | none`) drop
     /// in without another structural change. See carina-rs/carina#2611.
     Union(Vec<TypeExpr>),
-    /// Sentinel for inference failure: an unannotated export whose
-    /// rhs could not be statically typed. Produced *only* by
-    /// `apply_inference`, never by the parser. Type-comparison
-    /// predicates reject `Unknown` against any concrete receiver. When
-    /// inference has a concrete failure reason, the `inference_errors`
-    /// channel surfaces the actionable "type annotation required"
-    /// message; non-inferable values remain `Unknown` for later
-    /// existence-only validation. See #2360 stage 2.
+    /// Sentinel used when no sound static type is available.
+    ///
+    /// Export type inference in `infer_export_params` produces this for both
+    /// non-inferable exports and failed inferences. Failures are reported
+    /// separately with the export's index, while non-inferable values retain
+    /// this sentinel for later existence-only validation.
+    /// `resolve_file_type_exprs_or_unknown` also produces it when upstream
+    /// export discovery encounters a type the consumer's provider context
+    /// cannot name. Deferred-iterable validation uses `List(Unknown)` /
+    /// `Map(Unknown)` as an element-type placeholder.
+    ///
+    /// Consumers treat it as "do not type-check": value type checking accepts
+    /// any value when `Unknown` is expected, `inferred_type_fits` treats it as
+    /// a wildcard in the expected position, and export-reference validation
+    /// checks existence without comparing types. It does not satisfy a
+    /// concrete expectation when it is the inferred actual type. Accessing
+    /// `.` or `[]` on an unknown base is still an inference error. See #2360
+    /// stage 2. #4093 tracks removing this variant.
     Unknown,
 }
 

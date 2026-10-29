@@ -5,11 +5,23 @@ edition = "2024"
 publish.workspace = true
 license = "MIT"
 
+[features]
+test-utils = [
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:http",
+    "dep:wasi",
+]
+
 [dependencies]
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"], optional = true }
+aws-smithy-types = { version = "1", optional = true }
 carina-core = { path = "../carina-core" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
+http = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+wasi = { version = "0.14", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wit-bindgen = { version = "0.54", default-features = false, features = ["macros"] }

@@ -108,8 +108,10 @@ Mitigations, in order to try them:
    multiple worktrees are active. Pick `N` so the total across worktrees stays
    at or below the physical core count (e.g. 16-core / 2 worktrees → `-j 8`
    each). This caps *test execution* only, not compile; rustc/linker contention
-   is unaffected. No `.config/nextest.toml` default — a fixed cap penalizes the
-   common single-worktree case.
+   is unaffected. `.config/nextest.toml` sets no `test-threads` default — a
+   fixed cap penalizes the common single-worktree case. (The file exists for
+   the per-run temporary `HOME` setup script, carina#4055, and requires
+   nextest 0.9.133 or newer.)
 3. **Switch sccache to a Redis backend (opt-in)** — removes the file-storage
    lock contention (source 1) and improves cross-worktree hit rate (reducing
    source 2). Opt-in because Redis is a long-running service and the benefit

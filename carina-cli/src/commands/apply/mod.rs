@@ -3866,7 +3866,7 @@ fn finish_apply<S>(
 ) -> Result<Option<Duration>, AppError> {
     println!();
     let exit_code = apply_exit_code_for_counts(
-        result.failure_count + result.skip_count,
+        result.failure_count + result.skip_count + result.interrupted_count,
         result.partial_count,
     );
     if exit_code == ApplyExitCode::Success && skipped_exports.is_empty() {
@@ -3888,6 +3888,17 @@ fn finish_apply<S>(
     }
     if result.skip_count > 0 {
         parts.push(format!("{} skipped", result.skip_count));
+    }
+    if result.interrupted_count > 0 {
+        parts.push(format!(
+            "{} outcome{} unknown",
+            result.interrupted_count,
+            if result.interrupted_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
     }
     if !skipped_exports.is_empty() {
         parts.push(skipped_exports.write_failure_description());

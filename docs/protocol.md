@@ -86,7 +86,7 @@ or unissued poll is `undetermined`, preserving the previous continuation; and a
 pending-token failure during resume is likewise `undetermined`, preserving the
 starting envelope. If the attributes of a successful or partially successful
 result cannot be encoded, the result is `created` with a failed read because
-its identifier already established existence. The SDK's JSON-RPC/native-binary
+the provider already reported its identifier. The SDK's JSON-RPC/native-binary
 transport has been removed; v10 providers use the component-model export.
 
 State format 15 stores managed current instances as one tagged value:

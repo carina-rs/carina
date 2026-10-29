@@ -6,10 +6,16 @@ pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
+/// The "Schemas" page of the provider guide on carina-rs.dev. Its Rust
+/// examples run as doctests of this crate so they cannot drift from the SDK.
+#[cfg(doctest)]
+#[doc = include_str!("../../site/src/content/providers/writing/schemas.md")]
+pub struct ProviderGuideSchemasPage;
+
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod wasm_guest;
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test, feature = "test-utils"))]
 pub mod wasi_http;
 
 // `wasi_http_body` is compiled for every target so its pure-Rust

@@ -305,8 +305,8 @@ fn poll_create(
                     .pending(CreateToken::Operation(operation), 0)),
                 Err(err) => Err(attempt.undetermined(err)),
             },
-            // Created, then failed: the widget exists and Carina must
-            // keep it so it can be deleted or retried.
+            // The provider reported an identifier, then the operation failed.
+            // The read-back observation says whether the widget exists.
             Ok(CreateStatus::Failed {
                 id: Some(widget_id),
                 reason,
@@ -339,7 +339,7 @@ A rejected retry is `undetermined`, not `untracked`. The first call may have cre
 
 When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails stays pending instead of turning a healthy widget into a failed create.
 
-A create that failed after the widget existed is `failed` with the identifier, so Carina records the widget and the next plan can retry or delete it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error, so Carina can record the widget's state. `failed` returns a `CreateVerdict`, and `.into()` turns it into the `PollVerdict` that `poll_create` returns.
+A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict`, and `.into()` turns it into the `PollVerdict` that `poll_create` returns.
 
 Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. `undetermined` is for the cases where the provider cannot tell what happened, such as the rejected retry or an empty identifier from the API. Carina keeps an undetermined attempt in state, and every later apply resumes and polls it again, so use it when a later poll might settle the create, not as a way to give up.
 

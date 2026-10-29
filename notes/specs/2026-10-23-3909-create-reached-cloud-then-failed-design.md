@@ -97,7 +97,8 @@ it is at every failure site. The value that reaches state has to record
 whether it was observed or only desired. The current-state map has to keep
 three things apart:
 
-- applied: the resource exists and its identifier is known;
+- applied: the provider identifier is known; for rows written from a created
+  failure, the create observation records whether read-back found the resource;
 - create in flight: the create was sent and has not finished;
 - no current instance.
 
@@ -317,16 +318,34 @@ makes these rules hold:
 
 ### Rows built from an observation
 
-A `failed` create and every resumed create produce an `ObservedCreate`:
+A `failed` create or resume produces an `ObservedCreate`. A successful resume
+produces a `CompletedResume`, whose private `ObservedCreate` can only be built
+from an `AppliedState`:
 
 ```rust
 pub struct ObservedCreate {
     id: ResourceId,
     identifier: AppliedIdentifier,
-    observation: Observation,
+    observation: CreateObservation,
     sent: SentRecord,     // the names, or the envelope's encoded values on resume
 }
+
+pub enum CreateObservation {
+    Observed(AppliedState),
+    Unobserved(UnobservedReason),
+}
+
+pub enum UnobservedReason {
+    NotFound,
+    ReadFailed(ProviderError),
+}
+
+pub struct CompletedResume(ObservedCreate); // private field and constructor
 ```
+
+The provider-facing methods still accept the protocol `Observation`; core
+converts it once when constructing `ObservedCreate`, so display and writeback
+cannot classify the same read-back differently.
 
 Writeback builds its row with `ResourceState::from_observation`. Masking and
 recording are two separate decisions:
@@ -379,7 +398,7 @@ pub enum CreateFailure {
 }
 
 pub enum ResumeOutcome {
-    Resumed(ObservedCreate),
+    Resumed(CompletedResume),
     Resent(CreateOutcome),       // after `resend`: an ordinary create
 }
 pub enum ResumeFailure {
@@ -439,9 +458,10 @@ and awscc native impls already do. On over budget it builds `InFlight` with
 `ResumeFailure::Ended` exists only as the conversion of a provider's
 `untracked` or `discarded` resume verdict. A provider `completed` step or
 `created` resume verdict whose attributes fail host-side decoding becomes
-`Created` with `ReadFailed`: the provider's verdict established that the
-resource exists, and only its attributes are unreadable. This is the same rule
-as an initial create result whose identifier decoded before its attributes.
+`Created` with `ReadFailed`: the provider's verdict established an identifier,
+while the failed decode means core cannot say that read-back observed the
+resource. This is the same rule as an initial create result whose identifier
+decoded before its attributes.
 Every other host-side error during a resume becomes `InFlight` with the record
 it started from. That includes:
 
@@ -625,7 +645,10 @@ A missing `Applied` entry for an in-flight address leaves its row unchanged
 in writeback. `Created` and `InFlight` emit `EffectFailed` with an extra line
 saying what was recorded:
 
-- "resource created; recorded in state, the next apply completes it";
+- for an observed resource, "resource created; recorded in state, the next
+  apply completes it";
+- for an unobserved identifier, report the provider, identifier and read-back
+  reason, then say it was "recorded in state so the next plan re-checks it";
 - "create still in progress; the next apply resumes it".
 
 Bindings and `wait` targets are not published for either, because their
@@ -689,7 +712,7 @@ delete-first replacement whose create ends `Created` or `InFlight` would reach
 | Source | Current slot | Old instance (CBD) | Old instance already deleted | Name overrides | Row built by |
 |---|---|---|---|---|---|
 | `Complete`, `Imported` | applied | deposed | current only | recorded (`Complete`) | today's constructor and write-only merge |
-| `Observed` | applied | deposed | current only | recorded: the object exists under that name | `from_observation` |
+| `Observed` | applied | deposed | current only | recorded: the name was reported/sent; the observation says whether the object exists | `from_observation` |
 | `CreateInFlight` from `from_pending` | in flight | deposed | in flight, no cleanup | recorded: the name was sent | a new envelope, encoded from the `sent` names and the request of this run |
 | `CreateInFlight` from `repend` | in flight | unchanged | unchanged | unchanged | the loaded envelope with the new token; its encoded values are not touched |
 | `CreateEnded` | cleared; `deposed` kept | unchanged | cleared | unchanged | — |

@@ -1,0 +1,20 @@
+name: Rust cache
+description: Restore and save the Rust build cache with all build-affecting workspace settings
+
+inputs:
+  shared-key:
+    description: Optional shared cache key passed through to Swatinem/rust-cache
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # rust-cache's shared-key replaces key, so include the root Cargo.toml hash in
+    # whichever one applies. The hash is in rust-cache's restore prefix, so each
+    # root manifest change forces one full rebuild; rust-cache has no input for
+    # hashing extra files outside that prefix.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.shared-key == '' && hashFiles('Cargo.toml') || '' }}
+        shared-key: ${{ inputs.shared-key != '' && format('{0}-{1}', inputs.shared-key, hashFiles('Cargo.toml')) || '' }}

@@ -1848,8 +1848,8 @@ pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
 }
 
 /// Encode a managed resource for the ordinary provider boundary.
-pub fn try_resource_to_protocol(
-    resource: &Resource,
+pub fn try_resource_to_protocol<S>(
+    resource: &Resource<S>,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let Resource {
         id,
@@ -2263,8 +2263,34 @@ pub fn protocol_update_patch_to_core(
 mod tests {
     use super::*;
     use crate::provider::UpdatePatch;
-    use crate::resource::RedactedSecretHash;
+    use crate::resource::{ModuleSource, ProviderResource, RedactedSecretHash};
     use crate::schema::{CompletionValue, ValidatorType};
+
+    #[test]
+    fn provider_resource_encodes_identically_to_live_resource() {
+        let mut resource = Resource::with_provider(
+            "test",
+            "test.Widget",
+            ResourceIdentity::from("example"),
+            None,
+        );
+        resource.attributes.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("widget".into())),
+        );
+        resource.directives.force_delete = true;
+        resource.module_source = Some(ModuleSource::Root);
+        let provider_resource = ProviderResource::from(resource.clone());
+
+        let provider_wire =
+            try_resource_to_protocol(&provider_resource).expect("provider resource must encode");
+        let live_wire = try_resource_to_protocol(&resource).expect("live resource must encode");
+
+        assert_eq!(
+            serde_json::to_value(provider_wire).expect("provider protocol resource must serialize"),
+            serde_json::to_value(live_wire).expect("live protocol resource must serialize")
+        );
+    }
 
     #[test]
     fn persisted_secret_uses_only_the_persisted_conversion_domain() {
