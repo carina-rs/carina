@@ -16,8 +16,9 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::Instant;
 
+use crate::effect::Effect;
 use crate::executor::scheduler::FailureView;
-use crate::executor::{ExecutionEvent, ExecutionObserver};
+use crate::executor::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
@@ -234,6 +235,29 @@ pub(super) struct WaitAwareInFlight<'fut, R> {
     inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
     kinds: HashMap<usize, InFlightKind>,
     cancellers: HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
+    started: Arc<Mutex<HashMap<usize, ProgressInfo>>>,
+}
+
+/// Records the progress value at the same point an in-flight effect emits its
+/// `EffectStarted` event.
+pub(super) struct InFlightStart {
+    idx: usize,
+    started: Arc<Mutex<HashMap<usize, ProgressInfo>>>,
+}
+
+impl InFlightStart {
+    pub(super) fn emit_started<S>(
+        self,
+        observer: &dyn ExecutionObserver<S>,
+        effect: &Effect<S>,
+        progress: ProgressInfo,
+    ) {
+        self.started
+            .lock()
+            .expect("in-flight start registry poisoned")
+            .insert(self.idx, progress);
+        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+    }
 }
 
 impl<'fut, R> WaitAwareInFlight<'fut, R> {
@@ -243,6 +267,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
             inner: FuturesUnordered::new(),
             kinds: HashMap::new(),
             cancellers: HashMap::new(),
+            started: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,11 +287,16 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     }
 
     /// Dispatch a non-wait future and record its in-flight kind.
-    pub(super) fn push_non_wait<F>(&mut self, idx: usize, fut: F)
+    pub(super) fn push_non_wait<MkFut, F>(&mut self, idx: usize, make_future: MkFut)
     where
+        MkFut: FnOnce(InFlightStart) -> F,
         F: Future<Output = (usize, R)> + 'fut,
     {
-        self.inner.push(Box::pin(fut));
+        let start = InFlightStart {
+            idx,
+            started: Arc::clone(&self.started),
+        };
+        self.inner.push(Box::pin(make_future(start)));
         self.kinds.insert(idx, InFlightKind::NonWait);
     }
 
@@ -275,12 +305,35 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     where
         MkFut: FnOnce(
             tokio::sync::watch::Receiver<WaitSignal>,
+            InFlightStart,
         ) -> Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>,
     {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(WaitSignal::Continue);
+        let start = InFlightStart {
+            idx,
+            started: Arc::clone(&self.started),
+        };
         self.cancellers.insert(idx, cancel_tx);
         self.kinds.insert(idx, InFlightKind::Wait);
-        self.inner.push(mk_fut(cancel_rx));
+        self.inner.push(mk_fut(cancel_rx, start));
+    }
+
+    /// Drop every unresolved future and return only effects that had emitted
+    /// `EffectStarted`, paired with the progress value used by their terminal
+    /// event siblings.
+    pub(super) fn abandon(self) -> Vec<(usize, ProgressInfo)> {
+        let mut interrupted = {
+            let started = self
+                .started
+                .lock()
+                .expect("in-flight start registry poisoned");
+            self.kinds
+                .keys()
+                .filter_map(|idx| started.get(idx).copied().map(|progress| (*idx, progress)))
+                .collect::<Vec<_>>()
+        };
+        interrupted.sort_by_key(|(idx, _)| *idx);
+        interrupted
     }
 
     /// Begin the required terminal wait cancellation check before awaiting.
@@ -329,6 +382,11 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
         let (idx, result) = self.parent.inner.next().await?;
         self.parent.kinds.remove(&idx);
         self.parent.cancellers.remove(&idx);
+        self.parent
+            .started
+            .lock()
+            .expect("in-flight start registry poisoned")
+            .remove(&idx);
         Some((idx, result))
     }
 
@@ -353,6 +411,7 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 pub async fn execute_wait_effect<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
+    effect: &Effect<S>,
     target: &ManagedWaitTarget,
     identifier_resolver: &WaitIdentifierResolver<'_>,
     until: &WaitPredicate,
@@ -365,6 +424,7 @@ pub async fn execute_wait_effect<S>(
     execute_wait_effect_with_heartbeat_cadence(
         cleanup_loop,
         provider,
+        effect,
         target_id.identity_str(),
         target_id,
         identifier_resolver,
@@ -382,6 +442,7 @@ pub async fn execute_wait_effect<S>(
 pub(crate) async fn execute_wait_effect_with_heartbeat_cadence<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
+    effect: &Effect<S>,
     binding: &str,
     target_id: &ResourceId,
     identifier_resolver: &WaitIdentifierResolver<'_>,
@@ -443,6 +504,7 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_cadence<S>(
                 let observation =
                     WaitObservation::new(binding, target_id, until, &state.attributes);
                 observer.on_event(&ExecutionEvent::WaitPolling {
+                    effect,
                     observation,
                     elapsed: start.elapsed(),
                 });
@@ -508,6 +570,18 @@ mod tests {
         ManagedWaitTarget::new(&ResolvedResource::from_id(ResolvedResourceId::new(
             ResourceId::with_identity("acm.Certificate", "cert"),
         )))
+    }
+
+    fn wait_effect() -> Effect {
+        Effect::Wait {
+            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            target_id: managed_wait_target(),
+            until: equals_status("ISSUED"),
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(1),
+            explicit_dependencies: HashSet::new(),
+        }
     }
 
     fn provider_identifier(_: &ResourceId) -> Option<AppliedIdentifier> {
@@ -695,7 +769,7 @@ mod tests {
     }
 
     struct HeartbeatObserver {
-        heartbeats: Mutex<Vec<Vec<AttrPath>>>,
+        heartbeats: Mutex<Vec<(ResourceId, Vec<AttrPath>)>>,
     }
 
     impl HeartbeatObserver {
@@ -705,20 +779,28 @@ mod tests {
             }
         }
 
-        fn heartbeats(&self) -> Vec<Vec<AttrPath>> {
+        fn heartbeats(&self) -> Vec<(ResourceId, Vec<AttrPath>)> {
             self.heartbeats.lock().unwrap().clone()
         }
     }
 
     impl ExecutionObserver for HeartbeatObserver {
         fn on_event(&self, event: &ExecutionEvent) {
-            if let ExecutionEvent::WaitPolling { observation, .. } = event {
+            if let ExecutionEvent::WaitPolling {
+                effect,
+                observation,
+                elapsed: _,
+            } = event
+            {
                 let watched_attrs = observation
                     .watched_attrs()
                     .iter()
                     .map(|attr| (*attr).clone())
                     .collect();
-                self.heartbeats.lock().unwrap().push(watched_attrs);
+                self.heartbeats
+                    .lock()
+                    .unwrap()
+                    .push((effect.resource_id().clone(), watched_attrs));
             }
         }
     }
@@ -741,6 +823,7 @@ mod tests {
             let provider = ReadSequenceProvider::pending();
             let pred = equals_status("ISSUED");
             let target = managed_wait_target();
+            let effect = wait_effect();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -749,6 +832,7 @@ mod tests {
             let wait = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
+                &effect,
                 &target,
                 &provider_identifier,
                 &pred,
@@ -796,6 +880,7 @@ mod tests {
             let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING")]);
             let pred = equals_status("ISSUED");
             let target = managed_wait_target();
+            let effect = wait_effect();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -804,6 +889,7 @@ mod tests {
             let wait = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
+                &effect,
                 &target,
                 &provider_identifier,
                 &pred,
@@ -866,6 +952,7 @@ mod tests {
             let result = runtime.block_on(async move {
                 let pred = equals_status("ISSUED");
                 let target = managed_wait_target();
+                let effect = wait_effect();
                 let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
                 let observer = NoopWaitObserver;
                 let cleanup_loop = shutdown.cleanup_aware_loop();
@@ -873,6 +960,7 @@ mod tests {
                 execute_wait_effect(
                     &cleanup_loop,
                     worker_provider.as_ref(),
+                    &effect,
                     &target,
                     &provider_identifier,
                     &pred,
@@ -911,6 +999,7 @@ mod tests {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
             let pred = equals_status("ISSUED");
             let target = managed_wait_target();
+            let effect = wait_effect();
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -925,6 +1014,7 @@ mod tests {
             let result = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
+                &effect,
                 &target,
                 &provider_identifier,
                 &pred,
@@ -954,6 +1044,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
         let target = managed_wait_target();
+        let effect = wait_effect();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -961,6 +1052,7 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
+            &effect,
             &target,
             &provider_identifier,
             &pred,
@@ -989,6 +1081,7 @@ mod tests {
         ]);
         let pred = equals_status("ISSUED");
         let target = managed_wait_target();
+        let effect = wait_effect();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -996,6 +1089,7 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
+            &effect,
             &target,
             &provider_identifier,
             &pred,
@@ -1017,6 +1111,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = managed_wait_target();
+        let effect = wait_effect();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1024,6 +1119,7 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
+            &effect,
             &target,
             &provider_identifier,
             &pred,
@@ -1131,6 +1227,7 @@ mod tests {
         ]);
         let pred = equals_status("ISSUED");
         let target = managed_wait_target();
+        let effect = wait_effect();
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1138,6 +1235,7 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
+            &effect,
             &target,
             &provider_identifier,
             &pred,
@@ -1158,6 +1256,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = managed_wait_target();
+        let effect = wait_effect();
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
@@ -1178,6 +1277,7 @@ mod tests {
             execute_wait_effect(
                 &cleanup_loop,
                 &provider,
+                &effect,
                 &target,
                 &provider_identifier,
                 &pred,
@@ -1211,10 +1311,20 @@ mod tests {
         let observer = HeartbeatObserver::new();
         let shutdown = crate::shutdown::ShutdownToken::running();
         let cleanup_loop = shutdown.cleanup_aware_loop();
+        let effect: crate::effect::Effect = crate::effect::Effect::Wait {
+            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            target_id: managed_wait_target(),
+            until: equals_status("ISSUED"),
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: Duration::from_millis(100),
+            interval: Duration::from_millis(1),
+            explicit_dependencies: HashSet::new(),
+        };
 
         let result = execute_wait_effect_with_heartbeat_cadence(
             &cleanup_loop,
             &provider,
+            &effect,
             "cert_issued",
             &target,
             &provider_identifier,
@@ -1249,6 +1359,7 @@ mod tests {
             "5ms heartbeat cadence over a virtual 100ms timeout should emit \
              exactly {EXPECTED_HEARTBEATS} heartbeats"
         );
-        assert_eq!(heartbeats[0], vec![AttrPath::single("status")]);
+        assert_eq!(heartbeats[0].0, effect.resource_id().clone());
+        assert_eq!(heartbeats[0].1, vec![AttrPath::single("status")]);
     }
 }

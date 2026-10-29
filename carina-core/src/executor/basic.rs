@@ -26,6 +26,7 @@ use crate::resource::{
 };
 use crate::value::{SerializationContext, SerializationError};
 
+use super::wait::InFlightStart;
 use super::{
     AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
     ExecutionObserver, ProgressInfo,
@@ -686,6 +687,7 @@ pub(super) struct BasicEffectCtx<'a, S> {
 pub(super) async fn execute_basic_effect<'a, S: Clone>(
     basic: BasicEffect<'a, S>,
     ctx: &BasicEffectCtx<'a, S>,
+    in_flight_start: InFlightStart,
     observer: &'a dyn ExecutionObserver<S>,
 ) -> BasicEffectResult {
     let provider = ctx.provider;
@@ -699,7 +701,7 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
         total,
     };
     let effect = basic.as_effect();
-    observer.on_event(&ExecutionEvent::EffectStarted { effect });
+    in_flight_start.emit_started(observer, effect, progress);
 
     match basic {
         BasicEffect::Create { resource, .. } => {

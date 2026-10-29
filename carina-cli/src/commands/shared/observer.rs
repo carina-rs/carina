@@ -38,7 +38,10 @@ pub(crate) struct CliObserver<S = ModuleSource> {
 
 impl<S> CliObserver<S> {
     /// Create a new observer using stderr's terminal state.
-    pub(crate) fn new(_plan: &Plan<S>) -> Self {
+    pub(crate) fn new(_plan: &Plan<S>) -> Self
+    where
+        S: 'static,
+    {
         Self {
             progress: ProgressBackend::new(ProgressSink::Human),
         }
@@ -62,6 +65,16 @@ fn handle_event<S>(
         }
         ExecutionEvent::EffectStarted { effect } => {
             progress_backend.start_effect(EffectProgressKey::new(effect), format_effect(effect));
+        }
+        ExecutionEvent::EffectInterrupted { effect, progress } => {
+            let key = EffectProgressKey::new(effect);
+            let counter = format_progress(progress).dimmed();
+            let outcome = NonFailureOutcome::unknown(format!(
+                "{} - interrupted (outcome unknown) {}",
+                format_effect(effect),
+                counter
+            ));
+            progress_backend.finish(key, outcome);
         }
         ExecutionEvent::EffectSucceeded {
             effect,
@@ -129,10 +142,12 @@ fn handle_event<S>(
             progress_backend.finish(key, outcome);
         }
         ExecutionEvent::WaitPolling {
+            effect,
             observation,
             elapsed,
         } => {
-            progress_backend.info_line(format_wait_polling_line(observation, *elapsed));
+            let key = EffectProgressKey::new(effect);
+            progress_backend.in_flight_line(&key, format_wait_polling_line(observation, *elapsed));
         }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
             progress_backend
@@ -205,6 +220,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::commands::shared::progress::wait_for_output_contains;
     use carina_core::effect::Effect;
     use carina_core::effect::EffectGeneration;
     use carina_core::executor::ProgressInfo;
@@ -260,6 +276,20 @@ mod tests {
 
     fn dummy_create_effect() -> Effect {
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
+    }
+
+    fn dummy_wait_effect() -> Effect {
+        let target = resolved(Resource::new("aws.acm.Certificate", "demo"));
+        Effect::Wait {
+            identity: carina_core::resource::ResourceIdentity::try_from("demo_ready".to_string())
+                .unwrap(),
+            target_id: carina_core::wait::ManagedWaitTarget::for_test(&target),
+            until: equals_predicate(AttrPath::single("status"), "issued"),
+            until_surface: "demo.status == issued".to_string(),
+            timeout: Duration::from_secs(300),
+            interval: Duration::from_secs(5),
+            explicit_dependencies: HashSet::new(),
+        }
     }
 
     fn dummy_delete_effect(generation: EffectGeneration) -> Effect {
@@ -406,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_skips_started_and_waiting() {
+    fn plain_started_and_waiting_write_nothing_immediately() {
         let effect = dummy_create_effect();
         assert!(plain_output(&ExecutionEvent::EffectStarted { effect: &effect }).is_empty());
         assert!(
@@ -415,6 +445,106 @@ mod tests {
                 pending_dependencies: vec!["x".into()],
             })
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn plain_observer_heartbeat_precedes_success_outcome() {
+        let output = SharedWriter::default();
+        let backend =
+            ProgressBackend::plain_with_interval(output.clone(), Duration::from_millis(10));
+        let effect = dummy_create_effect();
+        let label = format_effect(&effect);
+
+        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        wait_for_output_contains(&output.0, &format!("Still running: {label}"));
+
+        handle_event(
+            &backend,
+            &ExecutionEvent::EffectSucceeded {
+                effect: &effect,
+                state: None,
+                duration: Duration::from_millis(123),
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 1,
+                },
+            },
+        );
+
+        drop(backend);
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let heartbeat = rendered.rfind(&format!("Still running: {label}")).unwrap();
+        let outcome = rendered.find('✓').unwrap();
+        assert!(
+            heartbeat < outcome,
+            "observer heartbeat must precede the outcome: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn plain_interrupted_finishes_effect_and_stops_heartbeats() {
+        let output = SharedWriter::default();
+        let backend = ProgressBackend::plain(output.clone());
+        let effect = dummy_create_effect();
+
+        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        handle_event(
+            &backend,
+            &ExecutionEvent::EffectInterrupted {
+                effect: &effect,
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 3,
+                },
+            },
+        );
+
+        assert_eq!(backend.active_count(), 0);
+        let after_interrupted = output.0.lock().unwrap().clone();
+        assert_eq!(
+            String::from_utf8(after_interrupted.clone()).unwrap(),
+            "  ? Create aws.s3.Bucket demo - interrupted (outcome unknown) 1/3\n"
+        );
+
+        backend.emit_heartbeats_at(std::time::Instant::now() + Duration::from_secs(3_600));
+        assert_eq!(*output.0.lock().unwrap(), after_interrupted);
+    }
+
+    #[test]
+    fn wait_polling_resets_plain_generic_heartbeat_schedule() {
+        let output = SharedWriter::default();
+        let interval = Duration::from_secs(30);
+        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let effect = dummy_wait_effect();
+        let key = EffectProgressKey::new(&effect);
+        let target_id = ResourceId::with_identity("aws.acm.Certificate", "demo");
+        let predicate = equals_predicate(AttrPath::single("status"), "issued");
+        let attrs = HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("pending".into())),
+        )]);
+        let observation = wait_observation(&target_id, &predicate, &attrs);
+
+        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        handle_event(
+            &backend,
+            &ExecutionEvent::WaitPolling {
+                effect: &effect,
+                observation,
+                elapsed: Duration::from_secs(30),
+            },
+        );
+        let before_generic_heartbeat = output.0.lock().unwrap().clone();
+        let last_reported = backend.plain_last_reported(&key).unwrap();
+
+        backend.emit_heartbeats_at(last_reported + interval - Duration::from_millis(1));
+
+        assert_eq!(*output.0.lock().unwrap(), before_generic_heartbeat);
+        assert!(
+            String::from_utf8(before_generic_heartbeat)
+                .unwrap()
+                .contains("~ demo_ready: waited 30.0s, status=pending")
         );
     }
 

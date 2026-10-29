@@ -25,7 +25,7 @@ use super::scheduler::{
     try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
-    SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
+    InFlightStart, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
     wait_failure_message,
 };
@@ -526,7 +526,8 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
-            >| async move {
+            >,
+                                    in_flight_start: InFlightStart| async move {
                 let preparation = ProviderPreparationContext::new(
                     &binding_snapshot,
                     module_gate,
@@ -555,6 +556,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                                 completed: completed_ref,
                                 total,
                             },
+                            in_flight_start,
                             observer,
                         )
                         .await,
@@ -572,13 +574,11 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                         Effect::Read { resource } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted {
-                                effect: &effect_for_future,
-                            });
                             let progress = ProgressInfo {
                                 completed: c,
                                 total,
                             };
+                            in_flight_start.emit_started(observer, &effect_for_future, progress);
                             let mut resolved = resource.as_inner().clone();
                             let outcome = {
                                 let check_input =
@@ -666,13 +666,11 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                         } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted {
-                                effect: &effect_for_future,
-                            });
                             let progress = ProgressInfo {
                                 completed: c,
                                 total,
                             };
+                            in_flight_start.emit_started(observer, &effect_for_future, progress);
                             let identifier_resolver = |target_id: &ResourceId| {
                                 resolve_wait_identifier(&wait_identifiers, target_id)
                             };
@@ -690,6 +688,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
                                 provider,
+                                &effect_for_future,
                                 target_id,
                                 &identifier_resolver,
                                 until,
@@ -713,9 +712,11 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             };
 
             if effect.is_wait() {
-                in_flight.push_wait(idx, |cancel_rx| Box::pin(make_future(Some(cancel_rx))));
+                in_flight.push_wait(idx, |cancel_rx, start| {
+                    Box::pin(make_future(Some(cancel_rx), start))
+                });
             } else {
-                in_flight.push_non_wait(idx, make_future(None));
+                in_flight.push_non_wait(idx, |start| make_future(None, start));
             }
         }
 
@@ -956,7 +957,14 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
 
     // Cleanup-priority mode deliberately drops unresolved provider futures so
     // the caller can persist the results already folded into `applied_states`.
-    drop(in_flight);
+    // Every effect that reached EffectStarted receives a terminal event before
+    // state persistence; queued but never-polled futures are omitted.
+    for (idx, progress) in in_flight.abandon() {
+        observer.on_event(&ExecutionEvent::EffectInterrupted {
+            effect: &effects[idx],
+            progress,
+        });
+    }
     accumulated.publish_if_dirty(&input.checkpoint_sink);
     let refresh_cancelled = match cleanup_loop.step() {
         LoopStep::Abandon => true,
@@ -1190,9 +1198,17 @@ mod tests {
                 }
                 ExecutionEvent::Waiting { .. }
                 | ExecutionEvent::EffectStarted { .. }
+                | ExecutionEvent::EffectInterrupted {
+                    effect: _,
+                    progress: _,
+                }
                 | ExecutionEvent::EffectSucceeded { .. }
                 | ExecutionEvent::EffectPartiallySucceeded { .. }
-                | ExecutionEvent::WaitPolling { .. }
+                | ExecutionEvent::WaitPolling {
+                    effect: _,
+                    observation: _,
+                    elapsed: _,
+                }
                 | ExecutionEvent::CascadeUpdateSucceeded { .. }
                 | ExecutionEvent::CascadeUpdateFailed { .. }
                 | ExecutionEvent::RenameSucceeded { .. }

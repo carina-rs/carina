@@ -1063,6 +1063,14 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     EffectStarted {
         effect: &'a Effect<S>,
     },
+    /// The effect was started and then abandoned under cleanup priority.
+    ///
+    /// Its provider-side outcome is unknown because its in-flight future was
+    /// dropped before a terminal result could be observed.
+    EffectInterrupted {
+        effect: &'a Effect<S>,
+        progress: ProgressInfo,
+    },
     EffectSucceeded {
         effect: &'a Effect<S>,
         state: Option<&'a State>,
@@ -1092,6 +1100,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     /// Emitted at `max(30s, interval * 5)` cadence with the elapsed time and
     /// last observed attributes so operators can see what the wait is reading.
     WaitPolling {
+        effect: &'a Effect<S>,
         observation: WaitObservation<'a>,
         elapsed: Duration,
     },

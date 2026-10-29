@@ -208,6 +208,13 @@ struct CollectingObserver {
 
 impl ExecutionObserver for CollectingObserver {
     fn on_event(&self, event: &carina_core::executor::ExecutionEvent) {
+        if let carina_core::executor::ExecutionEvent::EffectInterrupted { effect, .. } = event {
+            self.failures
+                .lock()
+                .unwrap()
+                .push(format!("effect interrupted: {}", effect.resource_id()));
+            return;
+        }
         if let carina_core::executor::ExecutionEvent::EffectFailed { error, .. } = event {
             self.failures.lock().unwrap().push(error.to_string());
         }

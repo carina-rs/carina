@@ -717,6 +717,14 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::EffectStarted { effect } => {
             format!("started:{}", effect.resource_id())
         }
+        ExecutionEvent::EffectInterrupted { effect, progress } => {
+            format!(
+                "interrupted:{}:{}/{}",
+                effect.resource_id(),
+                progress.completed,
+                progress.total
+            )
+        }
         ExecutionEvent::EffectSucceeded { effect, .. } => {
             format!("succeeded:{}", effect.resource_id())
         }
@@ -729,7 +737,11 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::EffectSkipped { effect, reason, .. } => {
             format!("skipped:{}:{}", effect.resource_id(), reason)
         }
-        ExecutionEvent::WaitPolling { observation, .. } => {
+        ExecutionEvent::WaitPolling {
+            effect: _,
+            observation,
+            elapsed: _,
+        } => {
             format!(
                 "wait_polling:{}:{}",
                 observation.binding(),
@@ -1501,6 +1513,7 @@ struct CancelsWhenStarted {
     trigger: ShutdownTrigger,
     token: ShutdownToken,
     cleanup_priority: bool,
+    events: Mutex<Vec<String>>,
 }
 
 impl CancelsWhenStarted {
@@ -1511,6 +1524,7 @@ impl CancelsWhenStarted {
             trigger,
             token,
             cleanup_priority: false,
+            events: Mutex::new(Vec::new()),
         }
     }
 
@@ -1521,11 +1535,16 @@ impl CancelsWhenStarted {
             trigger,
             token,
             cleanup_priority: true,
+            events: Mutex::new(Vec::new()),
         }
     }
 
     fn token(&self) -> ShutdownToken {
         self.token.clone()
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
     }
 }
 
@@ -1607,6 +1626,10 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
 
 impl ExecutionObserver for CancelsWhenStarted {
     fn on_event(&self, event: &ExecutionEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format_execution_event(event));
         if let ExecutionEvent::EffectStarted { effect } = event
             && effect
                 .resource_id()
@@ -5057,6 +5080,16 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         "the abandoned in-flight effect has no trustworthy completion result"
     );
     assert_eq!(provider.started_names(), vec!["r1", "r2"]);
+    let interrupted: Vec<_> = observer
+        .events()
+        .into_iter()
+        .filter(|event| event.starts_with("interrupted:"))
+        .collect();
+    assert_eq!(
+        interrupted,
+        ["interrupted:test.r2:2/3"],
+        "only the started, abandoned r2 effect should be interrupted"
+    );
 }
 
 #[tokio::test]
