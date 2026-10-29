@@ -2,6 +2,11 @@
 
 use std::collections::HashMap;
 
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
+    ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedResourceSchema as CoreValidatedResourceSchema,
+};
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
@@ -17,30 +22,6 @@ const SEND_PHASE_ATTRIBUTE: &str = "send_phase";
 struct MockHttpProvider;
 
 impl MockHttpProvider {
-    fn string_attribute(name: &str, required: bool, read_only: bool) -> AttributeSchema {
-        AttributeSchema {
-            name: name.to_string(),
-            attr_type: AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
-            },
-            required,
-            default: None,
-            description: None,
-            create_only: false,
-            read_only,
-            write_only: false,
-            block_name: None,
-            provider_name: None,
-            removable: None,
-            identity: false,
-            deferred_populate: false,
-        }
-    }
-
     fn error(
         id: &ResourceId,
         kind: ProviderErrorKind,
@@ -158,39 +139,36 @@ impl CarinaProvider for MockHttpProvider {
         }
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![ResourceSchema {
-            resource_type: "test.send_phase".to_string(),
-            attributes: HashMap::from([
-                (
-                    URL_ATTRIBUTE.to_string(),
-                    Self::string_attribute(URL_ATTRIBUTE, true, false),
-                ),
-                (
-                    METHOD_ATTRIBUTE.to_string(),
-                    Self::string_attribute(METHOD_ATTRIBUTE, true, false),
-                ),
-                (
-                    BODY_ATTRIBUTE.to_string(),
-                    Self::string_attribute(BODY_ATTRIBUTE, true, false),
-                ),
-                (
-                    SEND_PHASE_ATTRIBUTE.to_string(),
-                    Self::string_attribute(SEND_PHASE_ATTRIBUTE, false, true),
-                ),
-            ]),
-            description: Some("WASI HTTP send-phase probe".to_string()),
-            kind: SchemaKind::Managed,
-            unique_name: UniqueNameSpec::default(),
-            operation_config: None,
-            validators: Vec::new(),
-            exclusive_required: Vec::new(),
-            defs: std::collections::BTreeMap::new(),
-        }]
+    fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
+        vec![
+            CoreResourceSchema::new("test.send_phase")
+                .attribute(
+                    CoreAttributeSchema::required(URL_ATTRIBUTE, CoreAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::required(METHOD_ATTRIBUTE, CoreAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::required(BODY_ATTRIBUTE, CoreAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::provider_populated(
+                        SEND_PHASE_ATTRIBUTE,
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .with_description("WASI HTTP send-phase probe")
+                .validate()
+                .expect("mock HTTP probe schema must be valid"),
+        ]
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
+        CoreValidatedConfigSchema::default()
     }
 
     fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {

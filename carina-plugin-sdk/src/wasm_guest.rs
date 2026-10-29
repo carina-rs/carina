@@ -7,6 +7,26 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Render one error chain for protocol-v12 metadata's string-only failure
+/// channel. Each source is appended at most once even when a legacy outer
+/// display already includes its immediate source text.
+#[doc(hidden)]
+pub fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = Vec::new();
+    let mut current = Some(error);
+    while let Some(error) = current {
+        let text = error.to_string();
+        if rendered
+            .last()
+            .is_none_or(|outer: &String| !outer.ends_with(&text))
+        {
+            rendered.push(text);
+        }
+        current = error.source();
+    }
+    rendered.join(": ")
+}
+
 /// Decode a plain WIT managed-resource identifier into the protocol's
 /// validated representation before a guest provider can observe the request.
 pub fn wit_to_proto_applied_identifier(
@@ -520,6 +540,37 @@ macro_rules! export_provider {
                 static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
                     ::std::sync::OnceLock::new();
                 PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
+            }
+
+            fn get_provider_schema_cache() -> Result<
+                &'static $crate::ProviderSchemaCache,
+                &'static $crate::core::provider::CustomTypeDispatchTableError,
+            > {
+                static CACHE: ::std::sync::OnceLock<Result<
+                    $crate::ProviderSchemaCache,
+                    $crate::core::provider::CustomTypeDispatchTableError,
+                >> = ::std::sync::OnceLock::new();
+                CACHE.get_or_init(|| {
+                    let provider = get_provider().lock().unwrap();
+                    $crate::ProviderSchemaCache::from_provider(&*provider)
+                })
+                .as_ref()
+            }
+
+            fn schema_metadata_error_json(
+                operation: &str,
+                error: &(dyn ::std::error::Error + 'static),
+            ) -> String {
+                // Protocol v12 metadata exports return a bare string rather
+                // than `result`. A JSON string is deliberately the wrong
+                // top-level shape for both schema records and config maps, so
+                // the host reports its normal typed schema-decode failure
+                // without trapping the guest.
+                serde_json::Value::String(format!(
+                    "{operation}: {}",
+                    helpers::render_error_chain(error)
+                ))
+                .to_string()
             }
 
             // -- WIT <-> proto conversion functions --
@@ -1604,19 +1655,40 @@ macro_rules! export_provider {
                 }
 
                 fn schemas() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let schemas = $crate::CarinaProvider::schemas(&*provider);
-                    serde_json::to_string(&schemas)
-                        .expect("provider schemas serialization is infallible")
+                    let cache = match get_provider_schema_cache() {
+                        Ok(cache) => cache,
+                        Err(error) => {
+                            return schema_metadata_error_json(
+                                "schema cache validation failed",
+                                error,
+                            );
+                        }
+                    };
+                    match $crate::schemas_to_json(cache.schemas()) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            schema_metadata_error_json("schema serialization failed", &error)
+                        }
+                    }
                 }
 
                 fn provider_config_attribute_types() -> String {
-                    let provider = get_provider().lock().unwrap();
-                    let types = $crate::CarinaProvider::provider_config_attribute_types(
-                        &*provider,
-                    );
-                    serde_json::to_string(&types)
-                        .expect("provider config attribute type serialization is infallible")
+                    let cache = match get_provider_schema_cache() {
+                        Ok(cache) => cache,
+                        Err(error) => {
+                            return schema_metadata_error_json(
+                                "schema cache validation failed",
+                                error,
+                            );
+                        }
+                    };
+                    match $crate::provider_config_schema_to_json(cache.config()) {
+                        Ok(json) => json,
+                        Err(error) => schema_metadata_error_json(
+                            "provider config schema serialization failed",
+                            &error,
+                        ),
+                    }
                 }
 
                 fn validate_config(
@@ -1939,9 +2011,12 @@ macro_rules! export_provider {
                     ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
-                    $crate::CarinaProvider::validate_custom_type(
-                        &*provider,
+                    let cache = get_provider_schema_cache()
+                        .map_err(|error| {
+                            validate_string_to_provider_error(helpers::render_error_chain(error))
+                        })?;
+                    $crate::dispatch_custom_type_validation(
+                        cache,
                         &wit_to_proto_type_identity(&ty),
                         &value,
                     )
@@ -2072,6 +2147,29 @@ macro_rules! export_provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_metadata_error_chain_keeps_the_typed_conversion_detail_once() {
+        let identity = carina_core::schema::TypeIdentity::new(Some("test"), ["widget"], "Mode");
+        let error = crate::SchemaSerializationError::Convert(
+            carina_core::protocol_convert::ProtocolConvertError::OpenEnumWithoutNamespace {
+                identity,
+            },
+        );
+
+        let rendered = render_error_chain(&error);
+
+        assert!(
+            rendered.contains("schema protocol conversion failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("has no namespace"), "{rendered}");
+        assert_eq!(
+            rendered.matches("test.widget.Mode").count(),
+            1,
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn mutation_identifier_decode_rejects_empty_wit_string() {

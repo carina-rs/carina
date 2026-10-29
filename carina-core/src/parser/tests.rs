@@ -7587,8 +7587,7 @@ fn user_fn_custom_type_ipv6_address_arg_invalid() {
 }
 
 #[test]
-fn user_fn_custom_type_arn_arg_accepts_string() {
-    // arn format varies too much, just accept any string
+fn user_fn_unresolved_custom_type_arn_arg_is_rejected() {
     let input = r#"
         fn f(x: Arn) { x }
 
@@ -7596,8 +7595,12 @@ fn user_fn_custom_type_arn_arg_accepts_string() {
             name = f("arn:aws:s3:::my-bucket")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
-    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("an ownerless, non-built-in Simple annotation must not validate");
+    assert!(
+        error.to_string().contains("owner-qualified schema type"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -7986,16 +7989,11 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
 
 #[test]
 fn parse_decrypt_uses_config_decryptor() {
-    use std::collections::HashMap;
     let config = ProviderContext {
         decryptor: Some(Box::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
-        validators: HashMap::new(),
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        ..ProviderContext::default()
     };
 
     // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -8033,17 +8031,11 @@ fn parse_decrypt_uses_config_decryptor() {
 
 #[test]
 fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
-    use std::collections::HashMap;
-
     let config = ProviderContext {
         decryptor: Some(Box::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
-        validators: HashMap::new(),
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        ..ProviderContext::default()
     };
     let input = r#"
         let my_bucket = aws.s3_bucket {
@@ -8091,85 +8083,350 @@ fn parse_decrypt_without_decryptor_errors() {
 }
 
 #[test]
-fn parse_custom_validator_accepts_valid() {
-    use std::collections::HashMap;
-    // Test validate_custom_type directly with a type name that has no built-in
-    // handler. Built-in types (cidr, ipv4_address, etc.) are matched first in
-    // validate_custom_type, so custom validators only apply to other type names.
-    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
-    validators.insert(
-        TypeIdentity::bare("CustomType"),
-        Box::new(|s: &str| {
-            if s.starts_with("valid-") {
-                Ok(())
-            } else {
-                Err(format!("custom_type must start with 'valid-', got '{s}'"))
-            }
-        }),
-    );
+fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
+    let identity = TypeIdentity::bare("CustomType");
     let config = ProviderContext {
-        decryptor: None,
-        validators,
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+            )]),
+            Box::new(|_target, _value| {
+                panic!("an unresolved Simple node must not enter provider routing")
+            }),
+        ),
+        ..ProviderContext::default()
     };
 
-    let result = validate_custom_type(
+    let error = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
         &Value::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
+    )
+    .expect_err("provider-owned bare types must be represented as SchemaType");
+    assert!(
+        error.to_string().contains("owner-qualified schema type"),
+        "{error}"
     );
-    assert!(result.is_ok());
+}
 
-    // Unknown type with no custom validator should also pass (permissive)
-    let result = validate_custom_type(
-        &TypeIdentity::bare("UnknownType"),
-        &Value::Concrete(ConcreteValue::String("anything".into())),
-        &config,
+#[test]
+fn provider_context_lookup_preserves_typed_custom_validation_errors() {
+    let identity = TypeIdentity::bare("CustomType");
+    let declaration =
+        crate::schema::AttributeType::refined_string(Some(identity.clone()), None, None, None);
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            Default::default(),
+            Box::new(move |_target, _value| {
+                Err(
+                    crate::parser::CustomTypeValidationError::MissingDeclaration {
+                        owner: "missing".to_string(),
+                        identity: identity.clone(),
+                    },
+                )
+            }),
+        ),
+        ..ProviderContext::default()
+    };
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "missing",
+        crate::schema::ResourceSchema::new("test.Missing")
+            .attribute(
+                crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
+            )
+            .validate()
+            .expect("typed-error fixture schema must validate"),
     );
-    assert!(result.is_ok());
+    let schema = registry
+        .get(
+            "missing",
+            "test.Missing",
+            crate::schema::SchemaKind::Resource,
+        )
+        .expect("typed-error fixture schema must be registered");
+    let error = schema
+        .validate_with_resolver(
+            &std::collections::HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String("value".into())),
+            )]),
+            &|_| false,
+            config.custom_type_resolver(),
+        )
+        .expect_err("the resolver's typed error must cross the schema lookup adapter");
+
+    let [
+        crate::schema::TypeError::CustomTypeValidation {
+            error,
+            attribute: Some(attribute),
+        },
+    ] = error.as_slice()
+    else {
+        panic!("expected typed custom-type validation error");
+    };
+    assert_eq!(attribute, "value");
+    assert!(matches!(
+        error.as_ref(),
+        crate::parser::CustomTypeValidationError::MissingDeclaration { owner, .. }
+            if owner == "missing"
+    ));
+}
+
+#[test]
+fn unloaded_provider_custom_types_report_the_typed_state_error() {
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        TypeIdentity::from_dotted("test.Widget.Id"),
+    );
+
+    let error = validate_schema_custom_type(
+        &owned,
+        &Value::Concrete(ConcreteValue::String("widget-1".into())),
+        &ProviderContext::default(),
+    )
+    .expect_err("provider annotations cannot be validated before providers are loaded");
+
+    assert!(matches!(
+        error,
+        crate::parser::CustomTypeValidationError::ProvidersNotLoaded
+    ));
+}
+
+#[test]
+fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
+    let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+            )]),
+            Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
+        ),
+        ..ProviderContext::default()
+    };
+
+    validate_schema_custom_type(
+        &crate::parser::OwnedTypeIdentity::provider("test", identity),
+        &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("do-not-leak".into()),
+        )))),
+        &config,
+    )
+    .expect("a secret value defers custom-type validation");
+}
+
+#[test]
+fn provider_context_validator_receives_canonical_numeric_text() {
+    use std::sync::{Arc, Mutex};
+
+    let identity = TypeIdentity::bare("NumericBridge");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&seen);
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+            )]),
+            Box::new(move |_owned, value| {
+                let observed_value = match value {
+                    Value::Concrete(ConcreteValue::Int(value)) => format!("int:{value}"),
+                    Value::Concrete(ConcreteValue::Float(value)) => format!("float:{value}"),
+                    Value::Concrete(ConcreteValue::String(value)) => {
+                        format!("string:{}", value.expose_plaintext())
+                    }
+                    other => format!("unexpected:{other:?}"),
+                };
+                observed.lock().unwrap().push(observed_value);
+                Ok(())
+            }),
+        ),
+        ..ProviderContext::default()
+    };
+
+    for value in [
+        Value::Concrete(ConcreteValue::Int(-42)),
+        Value::Concrete(ConcreteValue::Float(1.25)),
+        Value::Concrete(ConcreteValue::String("literal".into())),
+    ] {
+        validate_schema_custom_type(
+            &crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+            &value,
+            &config,
+        )
+        .expect("supported scalar must reach the provider-context validator");
+    }
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["int:-42", "float:1.25", "string:literal"]
+    );
+}
+
+#[test]
+fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+
+    fn schema(identity: TypeIdentity, accepted: i64) -> crate::schema::ValidatedResourceSchema {
+        ResourceSchema::new(format!("test.number_{accepted}"))
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_int_with_validator(
+                        identity,
+                        None,
+                        legacy_validator(move |value| match value {
+                            Value::Concrete(ConcreteValue::Int(value)) if *value == accepted => {
+                                Ok(())
+                            }
+                            Value::Concrete(ConcreteValue::Int(value)) => {
+                                Err(format!("expected {accepted}, got {value}"))
+                            }
+                            _ => Err("Expected integer".to_string()),
+                        }),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("test schema must validate")
+    }
+
+    let identity = TypeIdentity::new(Some("shared"), ["number"], "X");
+    let one = schema(identity.clone(), 5);
+    let two = schema(identity.clone(), 7);
+    let one_type = one
+        .parts()
+        .attributes
+        .get("value")
+        .expect("one value")
+        .attr_type()
+        .clone();
+    let two_type = two
+        .parts()
+        .attributes
+        .get("value")
+        .expect("two value")
+        .attr_type()
+        .clone();
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([
+                crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+                crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+            ]),
+            Box::new(move |target, value| {
+                let owner = match target {
+                    crate::parser::CustomTypeValidationTarget::Annotation(owned) => owned
+                        .provider_names()
+                        .next()
+                        .expect("fixture annotation has one provider owner"),
+                    crate::parser::CustomTypeValidationTarget::Declaration { owner, .. } => owner,
+                };
+                match owner {
+                    "one" => one_type
+                        .validate_identified_scalar_value(value)
+                        .map_err(|error| {
+                            crate::parser::fixture_invalid_custom_type_value(target, error)
+                        }),
+                    "two" => two_type
+                        .validate_identified_scalar_value(value)
+                        .map_err(|error| {
+                            crate::parser::fixture_invalid_custom_type_value(target, error)
+                        }),
+                    owner => Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        format!("unexpected owner {owner:?}"),
+                    )),
+                }
+            }),
+        ),
+        ..ProviderContext::default()
+    };
+
+    validate_schema_custom_type(
+        &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+        &Value::Concrete(ConcreteValue::Int(5)),
+        &config,
+    )
+    .expect("owner one must get its own verdict");
+    validate_schema_custom_type(
+        &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+        &Value::Concrete(ConcreteValue::Int(7)),
+        &config,
+    )
+    .expect("owner two must get its own verdict");
+    assert!(
+        validate_schema_custom_type(
+            &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+            &Value::Concrete(ConcreteValue::Int(7)),
+            &config,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_schema_custom_type(
+            &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+            &Value::Concrete(ConcreteValue::Int(5)),
+            &config,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn parse_custom_validator_rejects_invalid() {
-    use std::collections::HashMap;
     // Use a type name that the grammar accepts and has no built-in validator.
     // The "arn" type is accepted by the grammar as identifier. But it fails to parse.
     // Use "cidr" which is known to work in grammar. Register a custom stricter validator.
     // Actually, let's test validate_custom_type directly to avoid grammar issues.
-    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
-    validators.insert(
-        TypeIdentity::bare("CustomType"),
-        Box::new(|s: &str| {
-            if s.starts_with("valid-") {
-                Ok(())
-            } else {
-                Err(format!("custom_type must start with 'valid-', got '{s}'"))
-            }
-        }),
-    );
+    let identity = TypeIdentity::bare("CustomType");
+    let validator_identity = identity.clone();
     let config = ProviderContext {
-        decryptor: None,
-        validators,
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+            )]),
+            Box::new(move |target, value| {
+                if target.identity() != &validator_identity {
+                    return Ok(());
+                }
+                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                    return Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        "Expected string",
+                    ));
+                };
+                let s = s.expose_plaintext();
+                if s.starts_with("valid-") {
+                    Ok(())
+                } else {
+                    Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        format!("custom_type must start with 'valid-', got '{s}'"),
+                    ))
+                }
+            }),
+        ),
+        ..ProviderContext::default()
     };
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
-    let valid_result = validate_custom_type(
-        &TypeIdentity::bare("CustomType"),
+    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
+    let valid_result = validate_schema_custom_type(
+        &owned,
         &Value::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
     );
     assert!(valid_result.is_ok());
 
-    let invalid_result = validate_custom_type(
-        &TypeIdentity::bare("CustomType"),
+    let invalid_result = validate_schema_custom_type(
+        &owned,
         &Value::Concrete(ConcreteValue::String("invalid".into())),
         &config,
     );
@@ -8238,9 +8495,10 @@ arguments {
 fn parse_schema_type_display() {
     let ctx = ProviderContext::default();
     let t = TypeExpr::SchemaType {
-        provider: "awscc".to_string(),
-        path: "ec2".to_string(),
-        type_name: "VpcId".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "awscc",
+            TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+        ),
     };
     assert_eq!(t.to_string(), "awscc.ec2.VpcId");
 

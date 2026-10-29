@@ -38,6 +38,7 @@ pub mod override_aware;
 pub mod parser;
 pub mod plan;
 pub mod plan_tree;
+pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
 pub mod resolver;

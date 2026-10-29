@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
@@ -442,6 +443,37 @@ async fn test_wasm_mock_provider_factory() {
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));
     assert_eq!(short_budget.delete_timeout_secs, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_override() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.sdk_validator",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("mock SDK validator schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    let attributes = HashMap::from([(
+        "guarded".to_string(),
+        Value::Concrete(ConcreteValue::String("rejected".into())),
+    )]);
+
+    let errors = schema
+        .validate_with_resolver(&attributes, &|_| false, &custom_types)
+        .expect_err("the SDK schema callback must reject through the guest bridge");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("intentional SDK schema validator rejection")),
+        "unexpected errors: {errors:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2080,13 +2112,27 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
     carina_core::executor::prepare_provider_ready_config(&factory, &config)
         .expect_err("validate_config should time out before custom-type validation");
 
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
-    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
-    validate(
-        &TypeIdentity::new(Some("mock"), Vec::<String>::new(), "RecoveryProbe"),
-        &Value::Concrete(ConcreteValue::String("clean".into())),
-    )
-    .expect("validate_custom_type should rebuild the timed-out init instance");
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.recovery_probe",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("the recovery probe schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    schema
+        .validate_with_resolver(
+            &HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String("clean".into())),
+            )]),
+            &|_| false,
+            &custom_types,
+        )
+        .expect("validate_custom_type should rebuild the timed-out init instance");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2098,21 +2144,45 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         Duration::from_secs(30),
         Duration::from_secs(2),
     ));
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
-    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
-    let identity = TypeIdentity::new(Some("mock"), Vec::<String>::new(), "TimingProbe");
-    let hanging = Value::Concrete(ConcreteValue::String(
-        "__mock_validate_custom_type_hang__".into(),
-    ));
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.timing_probe",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("the timing probe schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    let validate = |value: &str| {
+        schema.validate_with_resolver(
+            &HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String(value.to_string().into())),
+            )]),
+            &|_| false,
+            &custom_types,
+        )
+    };
 
     for attempt in 1..=2 {
         let started = Instant::now();
-        let error = validate(&identity, &hanging)
-            .expect_err("the mock custom-type hook must exceed the wall-clock budget");
+        let error = validate("__mock_validate_custom_type_hang__")
+            .expect_err("the mock custom-type hook must exceed the wall-clock budget")
+            .into_iter()
+            .next()
+            .expect("custom-type validation must return an error");
         let elapsed = started.elapsed();
 
+        let provider_error = match &error {
+            carina_core::schema::TypeError::CustomTypeValidation { error, .. } => error
+                .provider_error()
+                .expect("WASM validation must retain the typed provider error"),
+            other => panic!("expected a custom-type validation error, got {other:?}"),
+        };
         assert_eq!(
-            error.kind(),
+            provider_error.kind(),
             ProviderErrorKind::Timeout,
             "attempt {attempt}: {error}"
         );
@@ -2127,11 +2197,14 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
     }
 
     let suspended_started = Instant::now();
-    let suspended = validate(&identity, &hanging)
-        .expect_err("the repeatedly timed-out custom-type value must be suspended");
+    let suspended = validate("__mock_validate_custom_type_hang__")
+        .expect_err("the repeatedly timed-out custom-type value must be suspended")
+        .into_iter()
+        .next()
+        .expect("suspended validation must return an error");
     let suspended_elapsed = suspended_started.elapsed();
     assert!(matches!(
-        suspended.detail().host_cause(),
+        suspended.host_cause(),
         Some(carina_core::provider::HostErrorCause::ValidationSuspended(
             _
         ))
@@ -2141,11 +2214,7 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         "the suspended value must fail fast; elapsed {suspended_elapsed:?}"
     );
 
-    validate(
-        &identity,
-        &Value::Concrete(ConcreteValue::String("healthy-value".into())),
-    )
-    .expect("a different custom-type value must still validate");
+    validate("healthy-value").expect("a different custom-type value must still validate");
 }
 
 #[tokio::test(flavor = "multi_thread")]

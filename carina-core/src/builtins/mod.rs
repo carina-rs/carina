@@ -626,7 +626,6 @@ fn value_type_name(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use indexmap::IndexMap;
 
@@ -761,11 +760,8 @@ mod tests {
     fn decrypt_accepts_a_secret_from_another_decrypt_without_double_wrapping() {
         let config = ProviderContext {
             decryptor: Some(Box::new(|ciphertext, _| Ok(format!("plain:{ciphertext}")))),
-            validators: HashMap::new(),
-            custom_type_attribute_types: HashMap::new(),
-            custom_type_validator: None,
             resource_types: Default::default(),
-            customs_loaded: false,
+            ..ProviderContext::default()
         };
         let first =
             evaluate_builtin_with_config_to_value("decrypt", &[string("ciphertext")], &config)

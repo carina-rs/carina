@@ -7,9 +7,9 @@
 //! must fail `carina validate` with a clear "unknown custom type" error
 //! instead of silently degrading into an untyped string.
 //!
-//! The check fires at parse time, gated by
-//! `ProviderContext::customs_loaded`. Production runs through
-//! `enrich_provider_context`, which sets that flag once schemas have
+//! The check fires at parse time, gated by whether provider custom types are
+//! loaded. Production runs through `enrich_provider_context`, which installs
+//! `ProviderCustomTypes::Loaded` once schemas have
 //! been collected; this test exercises the same CLI surface
 //! (`validate_with_factories`) that `carina-cli/tests/nested_module_call_ref_e2e.rs`
 //! does, so the fixture covers the real validate path end-to-end —
@@ -96,8 +96,17 @@ impl ProviderFactory for AwsccTestFactory {
                 None,
             );
 
+            let bare_token = AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("TestToken"),
+                None,
+                None,
+                legacy_validator(|_| Err("bare token rejected by its owner".to_string())),
+                None,
+            );
+
             let mut iam_role = ResourceSchema::new("iam.Role")
-                .attribute(AttributeSchema::optional("policy_arn", iam_policy_arn).build());
+                .attribute(AttributeSchema::optional("policy_arn", iam_policy_arn).build())
+                .attribute(AttributeSchema::optional("bare_token", bare_token).build());
             if self.include_generic_arn {
                 iam_role =
                     iam_role.attribute(AttributeSchema::optional("role_arn", generic_arn).build());
@@ -538,6 +547,27 @@ fn validate_accepts_builtin_custom_type_name() {
     );
 }
 
+#[test]
+fn validate_routes_registered_bare_identity_through_its_provider_owner() {
+    let fixture = write_fixture("TestToken");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        diags
+            .iter()
+            .any(|diagnostic| diagnostic.contains("bare token rejected by its owner")),
+        "a registered bare provider type must not remain a fail-open Simple node; got: {diags:#?}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|diagnostic| diagnostic.contains("Unknown type")),
+        "the registered bare type must resolve before validation; got: {diags:#?}"
+    );
+}
+
 /// `attributes` parameters are the module-callable equivalent of
 /// `arguments` for attribute-level lookups, and they share the same
 /// silent-accept bug if the post-parse walk is restricted to
@@ -615,7 +645,7 @@ exports {
 /// Standalone-module validate: `carina validate ./my_module/` runs
 /// against the module directory directly, with no caller in sight.
 /// The root parse used the bootstrap `ProviderContext`
-/// (`customs_loaded = false`), so the strict parser gate did not fire;
+/// (`ProviderCustomTypes::Unloaded`), so the strict parser gate did not fire;
 /// the post-parse `validate_argument_custom_types` walk in
 /// `validate_and_resolve_errors` with a test `ProviderLoad` is what catches the
 /// unknown name here. Without that walk, the bug-headline shape

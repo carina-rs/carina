@@ -1103,7 +1103,7 @@ fn arguments_dotted_custom_type_suggests_nearest_identity_for_distance1_typo() {
 /// (`provider_names` empty — the LSP's orphaned-file fallback), the
 /// strict check must *not* fire, otherwise every user-defined custom
 /// type in an orphaned file would redline. This pins the
-/// `customs_loaded = !provider_names.is_empty()` guard in
+/// `has_loaded_providers = !provider_names.is_empty()` guard in
 /// `DiagnosticEngine::new`.
 #[test]
 fn arguments_unknown_custom_type_silent_without_providers() {

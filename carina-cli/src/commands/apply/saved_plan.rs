@@ -570,7 +570,7 @@ pub(super) enum DesiredPlanFile {
 }
 
 enum SavedPlanExecutionConfig {
-    WithoutCurrentConfig(ValidatedConfig<()>),
+    WithoutCurrentConfig(Box<ValidatedConfig<()>>),
     WithCurrentConfig(Box<ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>>),
 }
 
@@ -594,7 +594,7 @@ impl ValidatedDesiredPlan {
     fn without_current_config(plan: RehydratedPlanFile, config: ValidatedConfig<()>) -> Self {
         Self {
             plan: DesiredPlanFile::Verified(plan),
-            config: SavedPlanExecutionConfig::WithoutCurrentConfig(config),
+            config: SavedPlanExecutionConfig::WithoutCurrentConfig(Box::new(config)),
         }
     }
 

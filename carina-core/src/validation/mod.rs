@@ -54,12 +54,8 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
             None,
             None,
         )),
-        TypeExpr::SchemaType {
-            provider,
-            path,
-            type_name,
-        } => Some(AttributeType::refined_string(
-            Some(TypeIdentity::from_schema_type(provider, path, type_name)),
+        TypeExpr::SchemaType { owned } => Some(AttributeType::refined_string(
+            Some(owned.identity().clone()),
             None,
             None,
             None,
@@ -1614,8 +1610,6 @@ pub fn validate_resources<E>(
     provider_context: &ProviderContext,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
-    let lookup = crate::parser::provider_context_lookup(provider_context);
-
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
@@ -1667,10 +1661,10 @@ pub fn validate_resources<E>(
         match schema {
             Some(schema) => {
                 let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
-                if let Err(errors) = schema.validate_with_origins_and_lookup(
+                if let Err(errors) = schema.validate_with_resolver(
                     &rref.resolved_attributes(),
                     &is_string_literal,
-                    &lookup,
+                    provider_context.custom_type_resolver(),
                 ) {
                     for error in errors {
                         all_errors.push(format!("{}: {}", id, error));
@@ -2373,17 +2367,17 @@ pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Resu
 ///
 /// Walks every typed parameter `parsed` carries — `arguments`,
 /// `attributes`, `exports` (when typed) — and applies the same
-/// predicate the parser's `customs_loaded` gate uses.
+/// predicate the parser's loaded custom-type state uses.
 ///
 /// The parser already rejects unknown `TypeExpr::Simple` names when
-/// it is handed a `ProviderContext` with `customs_loaded = true`. That
+/// it is handed a `ProviderContext` with `ProviderCustomTypes::Loaded`. That
 /// gate fires for every parse path *after* the provider-registration
 /// phase has populated the context — imported modules re-parsed by
 /// `module_resolver::resolve_modules_with_config` and every LSP
 /// diagnostic pass.
 ///
 /// The root-config parse is the one exception: `load_configuration_with_config`
-/// runs with the bootstrap context (`customs_loaded = false`) because
+/// runs with the bootstrap `ProviderCustomTypes::Unloaded` context because
 /// schemas have not been collected yet, so a standalone-module
 /// validate (`carina validate ./my_module/`) would let an unknown
 /// custom-type name in `arguments { foo: TotallyMadeUpType }` slip
@@ -2420,10 +2414,6 @@ pub fn validate_argument_custom_types<E: crate::parser::ExportParamLike>(
     errors
 }
 
-fn identity_from_dotted_path(path: &ResourceTypePath) -> TypeIdentity {
-    TypeIdentity::from_dotted(&path.to_string())
-}
-
 fn resolve_dotted_unresolved(
     path: &ResourceTypePath,
     config: &ProviderContext,
@@ -2432,21 +2422,33 @@ fn resolve_dotted_unresolved(
         return Ok(TypeExpr::Ref(path.clone()));
     }
 
-    let identity = identity_from_dotted_path(path);
-    // Resolution confirms the written annotation names a registered type.
-    // `same_type` allows wider-axis assignment, which would accept names
-    // that were never registered.
-    if config
-        .validators
-        .keys()
-        .chain(config.custom_type_attribute_types.keys())
-        .any(|registered| registered == &identity)
-    {
-        let schema_path = identity.segments.join(".");
+    let mut authored_parts = path
+        .resource_type
+        .split('.')
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let Some(kind) = authored_parts.pop() else {
+        return Err(crate::parser::unknown_custom_type_message(
+            &path.to_string(),
+            config,
+        ));
+    };
+    let matches = config
+        .known_custom_types()
+        .iter()
+        .filter(|registered| {
+            registered.matches_authored_path(&path.provider, &authored_parts, &kind)
+        })
+        .collect::<Vec<_>>();
+    if let Some(first) = matches.first() {
+        let owners = crate::parser::NonEmptySchemaTypeOwners::try_from_iter(
+            matches
+                .iter()
+                .flat_map(|owned| owned.owners().iter().cloned()),
+        )
+        .expect("at least one matching custom type has at least one owner");
         return Ok(TypeExpr::SchemaType {
-            provider: path.provider.clone(),
-            path: schema_path,
-            type_name: identity.kind,
+            owned: crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners),
         });
     }
 
@@ -2461,6 +2463,8 @@ fn resolve_dotted_unresolved(
 pub fn resolve_type_expr(ty: &TypeExpr, config: &ProviderContext) -> Result<TypeExpr, String> {
     match ty {
         TypeExpr::DottedUnresolved(path) => resolve_dotted_unresolved(path, config),
+        TypeExpr::Simple(snake) => crate::parser::resolve_known_bare_custom_type(snake, config)
+            .map(|resolved| resolved.unwrap_or_else(|| ty.clone())),
         TypeExpr::List(inner) => {
             resolve_type_expr(inner, config).map(|t| TypeExpr::List(Box::new(t)))
         }
@@ -2484,7 +2488,6 @@ pub fn resolve_type_expr(ty: &TypeExpr, config: &ProviderContext) -> Result<Type
         | TypeExpr::Int
         | TypeExpr::Float
         | TypeExpr::Duration
-        | TypeExpr::Simple(_)
         | TypeExpr::Ref(_)
         | TypeExpr::SchemaType { .. }
         | TypeExpr::StringLiteral(_)
@@ -2631,7 +2634,7 @@ pub fn resolve_parameter_type_for_check(
 ) -> Result<Option<ResolvedParameterType>, String> {
     match resolve_parameter_type(ty, config) {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(_) if !config.customs_loaded => Ok(None),
+        Err(_) if !config.custom_types_loaded() => Ok(None),
         Err(message) => Err(message),
     }
 }
@@ -2738,12 +2741,16 @@ fn collect_unknown_simple_types_in(
     use crate::parser::TypeExpr;
     match ty {
         TypeExpr::Simple(snake) => {
-            if !crate::parser::is_known_bare_custom_type(snake, config) {
-                let pascal = crate::parser::snake_to_pascal(snake);
-                errors.push(format!(
-                    "{decl_kind} '{decl_name}': {}",
-                    crate::parser::unknown_custom_type_message(&pascal, config)
-                ));
+            match crate::parser::resolve_known_bare_custom_type(snake, config) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let pascal = crate::parser::snake_to_pascal(snake);
+                    errors.push(format!(
+                        "{decl_kind} '{decl_name}': {}",
+                        crate::parser::unknown_custom_type_message(&pascal, config)
+                    ));
+                }
+                Err(message) => errors.push(format!("{decl_kind} '{decl_name}': {message}")),
             }
         }
         TypeExpr::DottedUnresolved(path) => {
@@ -3375,7 +3382,7 @@ pub(crate) fn narrow_type_expr(
                     })?;
                 let schema = schema.as_schema();
                 let attribute = schema.attributes.get(name)?;
-                inference::attribute_type_to_type_expr(&attribute.attr_type)
+                inference::attribute_type_to_type_expr(&attribute.attr_type, &path.provider)
             }
             (
                 TypeExpr::List(inner),

@@ -50,7 +50,7 @@ pub fn managed_binding_stability(
                 &resource.id.resource_type,
                 SchemaKind::Resource,
             )
-            .map(|schema| schema.as_schema());
+            .map(|schema| schema.schema().as_schema());
         let changed_attributes = match diff_present(
             resource,
             present,

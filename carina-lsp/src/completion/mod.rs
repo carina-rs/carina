@@ -56,7 +56,10 @@ impl CompletionProvider {
         let (provider, resource_type) = match key.split_once('.') {
             Some(parts) => parts,
             None => {
-                return self.schemas.get("", key, SchemaKind::Resource);
+                return self
+                    .schemas
+                    .get("", key, SchemaKind::Resource)
+                    .map(|schema| schema.schema());
             }
         };
         self.schemas
@@ -65,6 +68,7 @@ impl CompletionProvider {
                 self.schemas
                     .get(provider, resource_type, SchemaKind::DataSource)
             })
+            .map(|schema| schema.schema())
     }
 
     pub fn complete(

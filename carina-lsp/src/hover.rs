@@ -902,7 +902,7 @@ mod tests {
             .schemas
             .get("", "ec2.Vpc", carina_core::schema::SchemaKind::Resource)
             .unwrap();
-        let hover = provider.schema_hover("ec2.Vpc", schema).unwrap();
+        let hover = provider.schema_hover("ec2.Vpc", schema.schema()).unwrap();
 
         let content = match &hover.contents {
             HoverContents::Markup(m) => &m.value,

@@ -539,10 +539,10 @@ impl<'a> BindingIndex<'a> {
             let target = match rref {
                 ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => registry
                     .get_for(m)
-                    .map(|schema| BindingTarget::Schema(schema.as_schema())),
+                    .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
                 ResourceRef::DataSource(d) => registry
                     .get_for_data_source(d)
-                    .map(|schema| BindingTarget::Schema(schema.as_schema())),
+                    .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
                 ResourceRef::Composition(c) => Some(BindingTarget::Composition(c)),
             };
             let Some(target) = target else {
@@ -2221,7 +2221,7 @@ pub fn managed_binding_stability_from_plan(
                 let changed_attributes = changed_attributes.iter().cloned().collect();
                 let refreshable_attributes = schemas
                     .get(&to.id.provider, &to.id.resource_type, SchemaKind::Resource)
-                    .map(|schema| schema.as_schema().read_only_attributes())
+                    .map(|schema| schema.schema().as_schema().read_only_attributes())
                     .unwrap_or_default()
                     .into_iter()
                     .map(str::to_string)
@@ -2769,18 +2769,24 @@ let vpc = aws.ec2.Vpc {
                 name: "aws.ec2.Vpc.Id",
                 attr: vpc_id.clone(),
                 declaration: Some(TypeExpr::SchemaType {
-                    provider: "aws".to_string(),
-                    path: "ec2.Vpc".to_string(),
-                    type_name: "Id".to_string(),
+                    owned: crate::parser::OwnedTypeIdentity::provider(
+                        "aws",
+                        crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                    ),
                 }),
             },
             ChainType {
                 name: "aws.ec2.SecurityGroup.Id",
                 attr: security_group_id.clone(),
                 declaration: Some(TypeExpr::SchemaType {
-                    provider: "aws".to_string(),
-                    path: "ec2.SecurityGroup".to_string(),
-                    type_name: "Id".to_string(),
+                    owned: crate::parser::OwnedTypeIdentity::provider(
+                        "aws",
+                        crate::schema::TypeIdentity::from_schema_type(
+                            "aws",
+                            "ec2.SecurityGroup",
+                            "Id",
+                        ),
+                    ),
                 }),
             },
             ChainType {
@@ -2993,9 +2999,10 @@ let vpc = aws.ec2.Vpc {
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
                     type_expr: Some(TypeExpr::SchemaType {
-                        provider: "aws".to_string(),
-                        path: "ec2.Vpc".to_string(),
-                        type_name: "Id".to_string(),
+                        owned: crate::parser::OwnedTypeIdentity::provider(
+                            "aws",
+                            crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                        ),
                     }),
                     has_declared_type: true,
                     value: None,

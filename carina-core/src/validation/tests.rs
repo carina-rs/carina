@@ -8,7 +8,7 @@ use crate::resource::{
     DataSource, Resource, Signature,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
@@ -253,35 +253,92 @@ fn schema_source_is_assignable_to_lifted_sink(
 }
 
 fn context_with_iam_policy_arn_validator() -> ProviderContext {
-    use crate::parser::ValidatorFn;
-
-    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
-    validators.insert(
-        TypeIdentity::bare("IamPolicyArn"),
-        Box::new(|s: &str| {
-            if s.starts_with("arn:aws:iam::") {
-                Ok(())
-            } else {
-                Err(format!("invalid IAM policy ARN: '{s}'"))
-            }
-        }),
-    );
+    let identity = TypeIdentity::bare("IamPolicyArn");
     ProviderContext {
-        decryptor: None,
-        validators,
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+            )]),
+            Box::new(move |target, value| {
+                if target.identity() != &identity {
+                    return Ok(());
+                }
+                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                    return Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        "Expected string",
+                    ));
+                };
+                let s = s.expose_plaintext();
+                if s.starts_with("arn:aws:iam::") {
+                    Ok(())
+                } else {
+                    Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        format!("invalid IAM policy ARN: '{s}'"),
+                    ))
+                }
+            }),
+        ),
+        ..ProviderContext::default()
+    }
+}
+
+fn context_with_known_custom_types(
+    known: HashSet<crate::parser::OwnedTypeIdentity>,
+) -> ProviderContext {
+    ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            known,
+            Box::new(|target, _value| {
+                let owner = match target {
+                    crate::parser::CustomTypeValidationTarget::Annotation(owned) => owned
+                        .provider_names()
+                        .next()
+                        .expect("fixture custom type has an owner"),
+                    crate::parser::CustomTypeValidationTarget::Declaration { owner, .. } => owner,
+                };
+                Err(
+                    crate::parser::CustomTypeValidationError::MissingDeclaration {
+                        owner: owner.to_string(),
+                        identity: target.identity().clone(),
+                    },
+                )
+            }),
+        ),
+        ..ProviderContext::default()
+    }
+}
+
+fn context_with_accepting_custom_type_resolver(
+    known: HashSet<crate::parser::OwnedTypeIdentity>,
+) -> ProviderContext {
+    ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            known,
+            Box::new(|_target, _value| Ok(())),
+        ),
+        ..ProviderContext::default()
+    }
+}
+
+fn iam_policy_arn_type_expr() -> TypeExpr {
+    TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            TypeIdentity::bare("IamPolicyArn"),
+        ),
     }
 }
 
 #[test]
 fn lift_type_expr_maps_schema_identity_directionally() {
     let vpc_id_expr = TypeExpr::SchemaType {
-        provider: "aws".to_string(),
-        path: "ec2.Vpc".to_string(),
-        type_name: "Id".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+        ),
     };
     let vpc_id = AttributeType::refined_string(
         Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
@@ -2767,15 +2824,18 @@ fn rendered_typecheck_result_float_got_int_is_accepted() {
 
 #[test]
 fn rendered_typecheck_result_schema_type_accepts_string() {
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "awscc",
+        TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+    );
     let schema_type = TypeExpr::SchemaType {
-        provider: "awscc".to_string(),
-        path: "ec2".to_string(),
-        type_name: "VpcId".to_string(),
+        owned: owned.clone(),
     };
+    let context = context_with_accepting_custom_type_resolver(HashSet::from([owned]));
     let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::String("vpc-12345678".into())),
-        &ProviderContext::default(),
+        &context,
     );
     assert!(result.is_none());
 }
@@ -2783,9 +2843,10 @@ fn rendered_typecheck_result_schema_type_accepts_string() {
 #[test]
 fn rendered_typecheck_result_schema_type_rejects_bool() {
     let schema_type = TypeExpr::SchemaType {
-        provider: "awscc".to_string(),
-        path: "ec2".to_string(),
-        type_name: "VpcId".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "awscc",
+            TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+        ),
     };
     let result = rendered_typecheck_result(
         &schema_type,
@@ -2799,9 +2860,10 @@ fn rendered_typecheck_result_schema_type_rejects_bool() {
 #[test]
 fn rendered_typecheck_result_schema_type_rejects_int() {
     let schema_type = TypeExpr::SchemaType {
-        provider: "awscc".to_string(),
-        path: "ec2".to_string(),
-        type_name: "VpcId".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "awscc",
+            TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+        ),
     };
     let result = rendered_typecheck_result(
         &schema_type,
@@ -2828,7 +2890,7 @@ fn validate_type_expr_custom_type_rejects_invalid() {
     let config = context_with_iam_policy_arn_validator();
 
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("iam_policy_arn".to_string()),
+        &iam_policy_arn_type_expr(),
         &Value::Concrete(ConcreteValue::String("aaaa".into())),
         &config,
     );
@@ -2836,7 +2898,7 @@ fn validate_type_expr_custom_type_rejects_invalid() {
     assert!(result.unwrap().contains("invalid IAM policy ARN"));
 
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("iam_policy_arn".to_string()),
+        &iam_policy_arn_type_expr(),
         &Value::Concrete(ConcreteValue::String(
             "arn:aws:iam::123456789012:policy/MyPolicy"
                 .to_string()
@@ -2852,7 +2914,7 @@ fn validate_type_expr_list_custom_type_rejects_invalid() {
     let config = context_with_iam_policy_arn_validator();
 
     let result = rendered_typecheck_result(
-        &TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+        &TypeExpr::List(Box::new(iam_policy_arn_type_expr())),
         &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("aaaa".into()),
         )])),
@@ -3297,7 +3359,7 @@ fn validate_module_calls_rejects_custom_type() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "managed_policy_arns".to_string(),
-                type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+                type_expr: TypeExpr::List(Box::new(iam_policy_arn_type_expr())),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3444,9 +3506,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
 
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let schema_type = TypeExpr::SchemaType {
-        provider: "test".to_string(),
-        path: "widget".to_string(),
-        type_name: "Mode".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
     };
     let enum_type = AttributeType::enum_(
         identity.clone(),
@@ -3457,15 +3517,27 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     );
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_by_validator = Arc::clone(&seen);
+    let declaration = enum_type.clone();
     let config = ProviderContext {
-        custom_type_attribute_types: HashMap::from([(identity, enum_type)]),
-        custom_type_validator: Some(Box::new(move |_identity, value| {
-            seen_by_validator
-                .lock()
-                .expect("validator observation lock")
-                .push(value.to_string());
-            Ok(())
-        })),
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider("test", identity)]),
+            Box::new(move |target, value| {
+                let canonical =
+                    crate::provider::canonicalize_custom_type_value(&declaration, value)
+                        .map_err(|error| {
+                            crate::parser::fixture_invalid_custom_type_value(
+                                target,
+                                error.into_type_error(),
+                            )
+                        })?
+                        .expect("concrete enum value must canonicalize");
+                seen_by_validator
+                    .lock()
+                    .expect("validator observation lock")
+                    .push(canonical.to_string());
+                Ok(())
+            }),
+        ),
         resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
         ..ProviderContext::default()
     };
@@ -3754,9 +3826,10 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
 #[test]
 fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let schema_type = |path: &str| TypeExpr::SchemaType {
-        provider: "aws".to_string(),
-        path: path.to_string(),
-        type_name: "Id".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", path, "Id"),
+        ),
     };
     let mut source = make_composition("inner", &[]);
     source.signature.attributes.insert(
@@ -3831,9 +3904,10 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
 #[test]
 fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
     let schema_type = |path: &str| TypeExpr::SchemaType {
-        provider: "aws".to_string(),
-        path: path.to_string(),
-        type_name: "Id".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", path, "Id"),
+        ),
     };
     let mut parsed = empty_parsed();
     for instance in ["one", "two", "three"] {
@@ -3878,9 +3952,10 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
 #[test]
 fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
     let security_group_id = TypeExpr::SchemaType {
-        provider: "aws".to_string(),
-        path: "ec2.SecurityGroup".to_string(),
-        type_name: "Id".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.SecurityGroup", "Id"),
+        ),
     };
     let mut parsed = empty_parsed();
 
@@ -3946,9 +4021,10 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
 #[test]
 fn post_expansion_anonymous_call_error_uses_module_label() {
     let schema_type = |path: &str| TypeExpr::SchemaType {
-        provider: "aws".to_string(),
-        path: path.to_string(),
-        type_name: "Id".to_string(),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", path, "Id"),
+        ),
     };
     let mut source = make_composition("source", &[]);
     source.signature.attributes.insert(
@@ -4052,9 +4128,10 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
             arguments: vec![ArgumentParameter {
                 name: "subnet_ids".to_string(),
                 type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType {
-                    provider: "aws".to_string(),
-                    path: "ec2.Subnet".to_string(),
-                    type_name: "Id".to_string(),
+                    owned: crate::parser::OwnedTypeIdentity::provider(
+                        "aws",
+                        TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
+                    ),
                 })),
                 default: None,
                 description: None,
@@ -4538,7 +4615,7 @@ fn validate_export_params_rejects_invalid_custom_type() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
+        type_expr: iam_policy_arn_type_expr(),
         value: Some(Value::Concrete(ConcreteValue::String("not-an-arn".into()))),
     }];
     let result = resolve_and_validate_export_params(&exports, &config);
@@ -4555,7 +4632,7 @@ fn validate_export_params_rejects_invalid_list_element() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policies".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+        type_expr: TypeExpr::List(Box::new(iam_policy_arn_type_expr())),
         value: Some(Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:policy/valid".into(),
@@ -4577,7 +4654,7 @@ fn validate_export_params_accepts_valid_values() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
+        type_expr: iam_policy_arn_type_expr(),
         value: Some(Value::Concrete(ConcreteValue::String(
             "arn:aws:iam::123456789012:policy/admin".into(),
         ))),
@@ -5834,6 +5911,13 @@ fn mode_known() -> HashSet<String> {
     known
 }
 
+fn mode_context() -> ProviderContext {
+    let identity = crate::schema::enum_identity("Mode", Some("test.r"));
+    context_with_accepting_custom_type_resolver(HashSet::from([
+        crate::parser::OwnedTypeIdentity::provider("test", identity),
+    ]))
+}
+
 fn parse_mode(src: &str) -> ParsedFile {
     crate::parser::parse(src, &ProviderContext::default()).unwrap()
 }
@@ -5910,14 +5994,9 @@ fn bare_valid_enum_value_passes() {
         }
         "#,
     );
+    let context = mode_context();
     assert!(
-        validate_resources(
-            &parsed,
-            &mode_schema(),
-            &mode_known(),
-            &ProviderContext::default()
-        )
-        .is_ok(),
+        validate_resources(&parsed, &mode_schema(), &mode_known(), &context).is_ok(),
         "bare valid identifier must pass"
     );
 }
@@ -5933,14 +6012,9 @@ fn fully_qualified_enum_value_passes() {
         }
         "#,
     );
+    let context = mode_context();
     assert!(
-        validate_resources(
-            &parsed,
-            &mode_schema(),
-            &mode_known(),
-            &ProviderContext::default()
-        )
-        .is_ok(),
+        validate_resources(&parsed, &mode_schema(), &mode_known(), &context).is_ok(),
         "fully-qualified identifier must pass"
     );
 }
@@ -6575,9 +6649,7 @@ fn value_contains_unresolved_ref_unwraps_secret() {
 // ---------------------------------------------------------------------------
 
 fn enriched_context_with_iam_policy_arn() -> ProviderContext {
-    let mut ctx = context_with_iam_policy_arn_validator();
-    ctx.customs_loaded = true;
-    ctx
+    context_with_iam_policy_arn_validator()
 }
 
 #[test]
@@ -6694,7 +6766,7 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
 }
 
 #[test]
-fn validate_argument_custom_types_is_independent_of_customs_loaded_flag() {
+fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -6706,19 +6778,18 @@ fn validate_argument_custom_types_is_independent_of_customs_loaded_flag() {
         validations: Vec::new(),
     });
 
-    // Bootstrap context — `customs_loaded` defaults to `false`. The
-    // walker delegates to `is_known_bare_custom_type`, whose contract
-    // is "true iff snake matches a built-in or a bare-registered
-    // validator"; on an empty validator set the only accepted names
-    // are the BUILTIN_BARE_CUSTOM_TYPES set, so an unknown name still
-    // produces a finding even with the parser gate inactive. This pins
-    // that the walker is *independent* of `customs_loaded` — only the
+    // Bootstrap context — custom types default to `Unloaded`. The
+    // walker delegates to the owner-preserving bare-type resolver; on an
+    // empty identity set the only accepted names are the
+    // BUILTIN_BARE_CUSTOM_TYPES set, so an unknown name still produces a
+    // finding even with the parser gate inactive. This pins
+    // that the walker is *independent* of the load state — only the
     // parser is gated; the post-parse walker always reports. Callers
     // that need the bootstrap-context exemption (e.g. LSP orphaned-file
     // diagnostics) must withhold the call themselves.
-    let mut ctx = ProviderContext::default();
-    assert!(!ctx.customs_loaded);
-    ctx.validators = HashMap::new();
+    let ctx = ProviderContext::default();
+    assert!(!ctx.custom_types_loaded());
+    assert!(ctx.known_custom_types().is_empty());
     let findings = validate_argument_custom_types(&parsed, &ctx);
     assert_eq!(
         findings.len(),
@@ -6746,6 +6817,88 @@ fn resolve_type_expr_accepts_registered_resource_ref() {
         TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
         "registered resource refs such as aws.vpc must keep resolving as Ref"
     );
+}
+
+#[test]
+fn resolve_type_expr_keeps_schema_owner_separate_from_identity_namespace() {
+    use crate::parser::{OwnedTypeIdentity, ResourceTypePath, TypeExpr};
+
+    let identity = TypeIdentity::new(Some("aws"), ["ec2"], "VpcId");
+    let owned = OwnedTypeIdentity::provider("awscc", identity);
+    let ctx = context_with_known_custom_types(HashSet::from([owned.clone()]));
+
+    let resolved = resolve_type_expr(
+        &TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.VpcId")),
+        &ctx,
+    )
+    .expect("the semantic identity's authored path must resolve");
+
+    assert_eq!(resolved, TypeExpr::SchemaType { owned });
+    assert_eq!(resolved.to_string(), "aws.ec2.VpcId");
+}
+
+#[test]
+fn resolve_type_expr_keeps_every_owner_of_the_same_semantic_identity() {
+    use crate::parser::{OwnedTypeIdentity, ResourceTypePath, TypeExpr};
+
+    let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+    let ctx = context_with_known_custom_types(HashSet::from([
+        OwnedTypeIdentity::provider("aws", identity.clone()),
+        OwnedTypeIdentity::provider("awscc", identity),
+    ]));
+
+    let resolved = resolve_type_expr(
+        &TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "iam.Role.Arn")),
+        &ctx,
+    );
+
+    let TypeExpr::SchemaType { owned } =
+        resolved.expect("all owners of one semantic identity must resolve as one annotation")
+    else {
+        panic!("shared identity must resolve as SchemaType")
+    };
+    assert_eq!(owned.provider_names().collect::<Vec<_>>(), ["aws", "awscc"]);
+}
+
+#[test]
+fn best_effort_file_resolution_does_not_degrade_a_multi_owner_identity_to_unknown() {
+    use crate::parser::{OwnedTypeIdentity, TypeExpr};
+
+    let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+    let ctx = context_with_known_custom_types(HashSet::from([
+        OwnedTypeIdentity::provider("aws", identity.clone()),
+        OwnedTypeIdentity::provider("awscc", identity),
+    ]));
+    let mut parsed = crate::parser::parse(
+        "exports {\n  roles: list(aws.iam.Role.Arn) = [\"arn:one\"]\n}\n",
+        &ProviderContext::default(),
+    )
+    .expect("multi-file export fixture syntax must parse");
+
+    resolve_file_type_exprs_or_unknown(&mut parsed, &ctx);
+
+    let resolved = parsed.export_params[0]
+        .type_expr
+        .as_ref()
+        .expect("typed export must retain its declaration");
+    assert!(
+        matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        "a known multi-owner identity must not become Unknown: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolve_type_expr_promotes_a_bare_provider_type_to_an_owned_key() {
+    use crate::parser::{OwnedTypeIdentity, TypeExpr};
+
+    let owned = OwnedTypeIdentity::provider("awscc", TypeIdentity::bare("VpcId"));
+    let ctx = context_with_known_custom_types(HashSet::from([owned.clone()]));
+
+    let resolved = resolve_type_expr(&TypeExpr::Simple("vpc_id".to_string()), &ctx)
+        .expect("the unique bare provider identity must resolve");
+
+    assert_eq!(resolved, TypeExpr::SchemaType { owned });
+    assert_eq!(resolved.to_string(), "VpcId");
 }
 
 #[test]
