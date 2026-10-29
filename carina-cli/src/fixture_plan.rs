@@ -328,7 +328,6 @@ where
         wiring.schemas(),
     )
     .expect("fixture deferred-for prelude must resolve");
-    let sorted_resources = expansion_prelude.sorted_resources();
 
     // Insert every upstream binding — even when the state file is
     // unreadable — so `resolve_refs_for_plan` knows the binding name
@@ -356,24 +355,22 @@ where
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
-    let detected_automatic_moves = crate::wiring::detect_automatic_resource_moves(
-        wiring,
-        sorted_resources,
-        &data_sources,
-        raw_provider_configs,
-        &state_file,
-        &state_block_claims,
-    )
-    .expect("fixture automatic moves must resolve");
-    let state_read_projection = detected_automatic_moves.state_read_projection();
+    let expansion_prelude = expansion_prelude
+        .detect_moves(
+            wiring,
+            &data_sources,
+            raw_provider_configs,
+            &state_block_claims,
+        )
+        .expect("fixture automatic moves must resolve");
+    let sorted_resources = expansion_prelude.sorted_resources();
 
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
     let mut orphans = Orphans::new();
-    if let Some(sf) = state_file.as_ref() {
+    if state_file.is_some() {
         for resource in sorted_resources {
-            let (loaded_id, current) =
-                state_read_projection.build_current(&state_file, &resource.id);
+            let (loaded_id, current) = expansion_prelude.build_current(&resource.id);
             managed_current.insert(loaded_id, current);
         }
         data_source_states.extend(
@@ -382,12 +379,13 @@ where
                 .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
         );
 
-        let desired_ids: HashSet<ResourceId> = state_read_projection
-            .persisted_resource_ids(sorted_resources)
-            .into_iter()
-            .chain(data_sources.iter().map(|d| d.id.clone()))
-            .collect();
-        orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
+        orphans = expansion_prelude
+            .loaded_orphans(
+                data_sources
+                    .iter()
+                    .map(|data_source| data_source.id.clone()),
+            )
+            .into_plan_orphans();
     } else {
         for resource in sorted_resources {
             managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
@@ -584,16 +582,8 @@ where
         .cloned()
         .collect::<Vec<_>>();
     let mut reconciled_expansion = expansion_prelude
-        .reconcile_addresses(
-            crate::wiring::ReconcileDeferredForExpansionInputs {
-                parsed,
-                detected_automatic_moves,
-                managed_current,
-                orphans,
-                already_refreshed: HashSet::new(),
-            },
-            crate::wiring::DeferredForWarningPolicy::Print,
-        )
+        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
+        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
         .expect("fixture move routes must match their loaded current states");
     let resolved_desired_ids = reconciled_expansion
         .reconcile_late_anonymous_identities(

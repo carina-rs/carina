@@ -296,7 +296,7 @@ async fn run_destroy_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-    validated_config.reconcile_for_destroy(&state_file);
+    let state_block_claims = validated_config.reconcile_for_destroy(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
@@ -310,7 +310,18 @@ async fn run_destroy_locked_owned(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
+    let mut all_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
+        parsed,
+        &state_file,
+        ctx.schemas(),
+    )?
+    .detect_moves(
+        ctx,
+        &parsed.data_sources,
+        provider_inputs.configs().as_provider_configs(),
+        &state_block_claims,
+    )?
+    .into_destroy_resources();
 
     if !refresh {
         eprintln!(

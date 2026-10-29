@@ -4163,6 +4163,7 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
     let result = apply_detected_resource_moves(
         &mut addressed,
         vec![test_detected_bucket_move("missing", "target")],
+        None,
     );
 
     assert!(
@@ -4177,6 +4178,102 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
         addressed.moved_pairs.is_empty(),
         "a failed transfer must not record a move"
     );
+}
+
+#[test]
+fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
+    use carina_core::parser::ProviderContext;
+    use carina_state::DeposedKey;
+    use carina_state::state::{DeposedInstance, ResourceState, StateFile};
+
+    let parsed = parse(
+        r#"
+            moved {
+                from = awscc.s3.Bucket 'old_bucket'
+                to   = awscc.s3.Bucket 'new_bucket'
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("same-type moved block must parse");
+    let from = bucket_id("old_bucket");
+    let to = bucket_id("new_bucket");
+    let mut deposed_only = ResourceState::new("s3.Bucket", from.identity().clone(), "awscc");
+    deposed_only
+        .deposed
+        .push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "bucket-deposed".to_string(),
+            None,
+            HashMap::new(),
+            Default::default(),
+        ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(deposed_only)
+        .expect("test state setup must be valid");
+    let mut managed_current = HashMap::from([(
+        to.as_inner().clone(),
+        Current::absent(to.as_inner().clone()),
+    )]);
+    let mut orphans = state_file
+        .build_orphans(&HashSet::from([to.as_inner().clone()]))
+        .into_plan_orphans();
+
+    let moved_pairs = materialize_moved_states(
+        &mut managed_current,
+        &mut orphans,
+        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
+        &parsed.state_blocks,
+        &Some(state_file),
+    )
+    .expect("a persisted deposed-only source is a valid move source");
+
+    assert_eq!(moved_pairs, vec![(from, to.clone())]);
+    assert!(matches!(
+        managed_current.get(to.as_inner()),
+        Some(Current::Absent(state)) if state.state().id == *to.as_inner()
+    ));
+}
+
+#[test]
+fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
+    use carina_state::DeposedKey;
+    use carina_state::state::{DeposedInstance, ResourceState, StateFile};
+
+    let from = bucket_id("old_bucket");
+    let to = bucket_id("new_bucket");
+    let mut deposed_only = ResourceState::new("s3.Bucket", from.identity().clone(), "awscc");
+    deposed_only
+        .deposed
+        .push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "bucket-deposed".to_string(),
+            None,
+            HashMap::new(),
+            Default::default(),
+        ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(deposed_only)
+        .expect("test state setup must be valid");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("old_bucket", "new_bucket")],
+        Some(&state_file),
+    )
+    .expect("a persisted deposed-only source is a valid detected move source");
+
+    assert_eq!(addressed.moved_pairs(), &[(from, to)]);
 }
 
 #[test]
@@ -4201,6 +4298,7 @@ fn resource_move_invariants_chained_moves_are_composed() {
             test_detected_bucket_move("source", "intermediate"),
             test_detected_bucket_move("intermediate", "target"),
         ],
+        None,
     )
     .expect("both links have a loaded source");
 
@@ -4236,7 +4334,7 @@ fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
         "detected_source",
         "explicit_source",
     )]);
-    let result = detected.apply_after_explicit(&mut addressed);
+    let result = detected.apply_after_explicit(&mut addressed, None);
 
     assert!(
         matches!(
@@ -4290,7 +4388,7 @@ fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
         "explicit_target",
         "detected_target",
     )]);
-    let result = detected.apply_after_explicit(&mut addressed);
+    let result = detected.apply_after_explicit(&mut addressed, None);
 
     assert!(
         matches!(
@@ -4343,6 +4441,7 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
     apply_detected_resource_moves(
         &mut addressed,
         vec![test_detected_bucket_move("intermediate", "target")],
+        None,
     )
     .expect("late detection may extend the already-applied early move");
 
@@ -4844,6 +4943,65 @@ fn resource_move_invariants_projected_attribute_less_row_is_not_a_candidate() {
 }
 
 #[test]
+fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
+    use carina_core::provider::Sent;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let target_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let desired = desired_association(target_name, "private_rtb", "subnet-a");
+    let persisted_target = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(target_name),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let resolved_persisted_target = ResolvedResource::new(persisted_target);
+    let pending = crate::fixture_in_flight_create(
+        &desired.id,
+        "opaque-token",
+        None,
+        Sent::AllRequestAttributes,
+    );
+    let in_flight =
+        ResourceState::from_in_flight(&resolved_persisted_target, &pending, None, None, None)
+            .expect("in-flight fixture must encode");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(in_flight)
+        .expect("test state setup must be valid");
+
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+
+    assert!(
+        moves.is_empty(),
+        "the existing in-flight target address must prevent rebinding an orphan onto it"
+    );
+}
+
+#[test]
 fn resource_move_invariants_projected_state_read_preserves_dependency_bindings() {
     use carina_state::state::StateFile;
 
@@ -4862,24 +5020,21 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let desired = desired_association(new_name, "private_rtb", "subnet-a");
     let resources = vec![desired];
     let state = Some(state_file);
-
-    let detected_moves = detect_automatic_resource_moves(
-        &ctx,
-        &resources,
-        &[],
-        &[],
-        &state,
-        &StateBlockClaims::empty(),
-    )
-    .expect("the automatic move projection must resolve");
-    let projection = detected_moves.state_read_projection();
-    let (loaded_id, loaded) = projection.build_current(&state, &resources[0].id);
-    let saved = projection.saved_dependency_bindings(&state, &resources);
+    let parsed = carina_core::parser::InferredFile {
+        resources,
+        ..Default::default()
+    };
+    let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
+        .expect("build expansion prelude")
+        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .expect("the automatic move projection must resolve");
+    let (loaded_id, loaded) = detected.build_current(&parsed.resources[0].id);
+    let saved = detected.saved_dependency_bindings();
 
     assert_eq!(loaded_id.identity_str(), Some(old_name));
     assert_eq!(loaded.id().identity_str(), Some(old_name));
     assert_eq!(
-        saved.get(&resources[0].id),
+        saved.get(&parsed.resources[0].id),
         Some(&["private_rtb".to_string()].into_iter().collect()),
         "phase-1 metadata lookup must read the moved source row"
     );
@@ -6763,7 +6918,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
         )],
         "the unique full match must win over the partial-match orphan",
     );
-    apply_detected_resource_moves(&mut addressed, early_moves)
+    apply_detected_resource_moves(&mut addressed, early_moves, Some(&state_file))
         .expect("early move must re-key its orphan state");
     let early_pair = (early_source_id, desired_id.clone());
     assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
@@ -6877,7 +7032,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         &carina_core::identifier::StateBlockClaims::empty(),
     )
     .unwrap();
-    apply_detected_resource_moves(&mut addressed, moves).unwrap();
+    apply_detected_resource_moves(&mut addressed, moves, Some(&state_file)).unwrap();
 
     assert_eq!(
         addressed.moved_pairs,
@@ -7686,27 +7841,12 @@ mod expand_same_config_deferred_for_tests {
             &schemas,
         );
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
-            .expect("build expansion prelude");
-        let detected_automatic_moves = detect_automatic_resource_moves(
-            &wiring,
-            prelude.sorted_resources(),
-            &parsed.data_sources,
-            &[],
-            &state_file,
-            &claims,
-        )
-        .expect("detect automatic moves");
+            .expect("build expansion prelude")
+            .detect_moves(&wiring, &parsed.data_sources, &[], &claims)
+            .expect("detect automatic moves");
         let prepared = prelude
-            .reconcile_addresses(
-                ReconcileDeferredForExpansionInputs {
-                    parsed: &parsed,
-                    detected_automatic_moves,
-                    managed_current: HashMap::new(),
-                    orphans: Orphans::new(),
-                    already_refreshed: HashSet::new(),
-                },
-                DeferredForWarningPolicy::Suppress,
-            )
+            .bind_projected_phase1_state(HashMap::new(), Orphans::new(), HashSet::new())
+            .reconcile_addresses(&parsed, DeferredForWarningPolicy::Suppress)
             .expect("prepare expansion")
             .seal(DataSourceValues::empty());
 

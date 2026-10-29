@@ -37,6 +37,60 @@ impl Scenario {
     }
 
     fn write_main(&self, cluster_name: &str) {
+        self.write_main_with_ref_directives_and_extra(cluster_name, "name", "", "");
+    }
+
+    fn write_main_with_prevent_destroy(&self, cluster_name: &str) {
+        self.write_main_with_ref_directives_and_extra(
+            cluster_name,
+            "name",
+            "  directives { prevent_destroy = true }\n",
+            "",
+        );
+    }
+
+    fn write_main_with_saved_plan_secret(&self, cluster_name: &str) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"let roles = read mock.iam.Roles {{
+  name_regex = "late"
+}}
+
+mock.test.resource {{
+  name = "${{roles.names[0]}}-{cluster_name}"
+  comment = secret("SAVED_PLAN_ANONYMOUS_MOVE_SECRET_3914")
+}}
+"#,
+            ),
+        )
+        .expect("write saved-plan resource configuration");
+    }
+
+    fn seed_saved_plan_data_source(&self) {
+        fs::write(
+            self.project.join("mock-provider-state.json"),
+            r#"{
+  "version": 2,
+  "states": {
+    "iam.Roles.roles": {
+      "name_regex": "late",
+      "names": ["resolved-role"]
+    }
+  }
+}
+"#,
+        )
+        .expect("seed mock data source");
+    }
+
+    fn write_main_with_ref_directives_and_extra(
+        &self,
+        cluster_name: &str,
+        cluster_attribute: &str,
+        directives: &str,
+        extra: &str,
+    ) {
         fs::write(
             self.project.join("main.crn"),
             format!(
@@ -47,8 +101,9 @@ impl Scenario {
 
 mock.compute.Instance {{
   name = "web"
-  cluster_name = "${{cluster.name}}-{cluster_name}"
-}}
+  cluster_name = "${{cluster.{cluster_attribute}}}-{cluster_name}"
+{directives}}}
+{extra}
 "#,
             ),
         )
@@ -64,6 +119,20 @@ mock.compute.Instance {{
             .args(args)
             .output()
             .expect("run carina")
+    }
+
+    fn carina_with_saved_plan_data_source(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(&self.project)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env(
+                "CARINA_MOCK_STATE_FILE",
+                self.project.join("mock-provider-state.json"),
+            )
+            .args(args)
+            .output()
+            .expect("run carina with saved-plan data source")
     }
 
     fn state(&self) -> StateFile {
@@ -93,6 +162,99 @@ mock.compute.Instance {{
         );
         rows[0].clone()
     }
+
+    fn anonymous_test_resource(&self) -> ResourceState {
+        let state = self.state();
+        let rows: Vec<_> = state
+            .resources()
+            .iter()
+            .filter(|row| {
+                row.provider == "mock"
+                    && row.resource_type == "test.resource"
+                    && row.binding.is_none()
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "state must contain exactly one anonymous mock.test.resource row: {:#?}",
+            state.resources(),
+        );
+        rows[0].clone()
+    }
+}
+
+#[test]
+fn saved_plan_replays_late_anonymous_move_before_secret_verification() {
+    let scenario = Scenario::new("c1");
+    scenario.seed_saved_plan_data_source();
+    scenario.write_main_with_saved_plan_secret("c1");
+    assert_success(
+        "saved late-move fixture init",
+        &scenario.carina_with_saved_plan_data_source(&["init", "."]),
+    );
+    assert_success(
+        "saved late-move fixture apply",
+        &scenario.carina_with_saved_plan_data_source(&["apply", "--auto-approve"]),
+    );
+    let initial_identity = scenario
+        .anonymous_test_resource()
+        .identity
+        .as_str()
+        .to_string();
+
+    scenario.write_main_with_saved_plan_secret("c2");
+    let plan =
+        scenario.carina_with_saved_plan_data_source(&["plan", "--out", "late-move.plan.json", "."]);
+    assert_success("saved late-move plan", &plan);
+    let apply = scenario.carina_with_saved_plan_data_source(&[
+        "apply",
+        "--auto-approve",
+        "--lock=false",
+        "late-move.plan.json",
+    ]);
+    assert_success("saved late-move apply", &apply);
+    assert_ne!(
+        scenario.anonymous_test_resource().identity.as_str(),
+        initial_identity,
+        "saved-plan apply must persist the late-recomputed anonymous identity"
+    );
+}
+
+#[test]
+fn destroy_honors_new_prevent_destroy_on_moved_anonymous_source() {
+    let scenario = Scenario::new("c1");
+    assert_success(
+        "prevent-destroy fixture init",
+        &scenario.carina(&["init", "."]),
+    );
+    assert_success(
+        "prevent-destroy fixture apply",
+        &scenario.carina(&["apply", "--auto-approve"]),
+    );
+    let initial_identity = scenario
+        .anonymous_compute_instance()
+        .identity
+        .as_str()
+        .to_string();
+
+    scenario.write_main_with_prevent_destroy("c2");
+    let destroy = scenario.carina(&["destroy", "--auto-approve", "."]);
+    let rendered = output_text(&destroy);
+
+    assert!(
+        !destroy.status.success(),
+        "prevent_destroy on the desired anonymous resource must refuse destroy\noutput:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("prevent_destroy"),
+        "destroy must report the desired directive\noutput:\n{rendered}"
+    );
+    assert_eq!(
+        scenario.anonymous_compute_instance().identity.as_str(),
+        initial_identity,
+        "the protected persisted source row must remain at its original address"
+    );
 }
 
 fn output_text(output: &Output) -> String {
