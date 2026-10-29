@@ -4485,7 +4485,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
 
     assert!(evaluated.resources[0].attributes.contains_key("rules"));
     assert!(!evaluated.resources[0].attributes.contains_key("rule"));
-    let unresolved = &unresolved.resources[0].attributes;
+    let unresolved = &unresolved[0].attributes;
     assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
 }
@@ -4554,7 +4554,7 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     )
     .expect("paired resolution must use the authored ambiguous-key decision");
 
-    for resource in [&evaluated.resources[0], &unresolved.resources[0]] {
+    for resource in [&evaluated.resources[0], &unresolved[0]] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {
             Some(Value::Concrete(ConcreteValue::Map(map))) => map,
             _ => panic!("expected lifecycle map"),
@@ -4562,7 +4562,7 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         assert!(lifecycle.contains_key("transition"));
         assert!(!lifecycle.contains_key("transitions"));
     }
-    let unresolved_lifecycle = match unresolved.resources[0].get_attr("lifecycle_configuration") {
+    let unresolved_lifecycle = match unresolved[0].get_attr("lifecycle_configuration") {
         Some(Value::Concrete(ConcreteValue::Map(map))) => map,
         _ => panic!("expected unresolved lifecycle map"),
     };

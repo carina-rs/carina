@@ -30,7 +30,9 @@ use crate::commands::plan::PlanFileContents;
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
-use crate::wiring::{CanonicalResourcePair, OverrideAwareResources, resolve_config_names_for_test};
+use crate::wiring::{
+    CanonicalResourcePair, OverrideAwareResources, resolve_config_block_names_for_test,
+};
 
 fn validate_with_test_factories(
     parsed: &mut carina_core::parser::InferredFile,
@@ -79,8 +81,8 @@ fn canonical_unresolved_for_test(
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
-    resolve_config_names_for_test(ctx, parsed.clone(), unresolved.clone()).unwrap_or_else(
-        |errors| {
+    resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
+        .unwrap_or_else(|errors| {
             panic!(
                 "test block-name resolution failed: {}",
                 errors
@@ -89,8 +91,7 @@ fn canonical_unresolved_for_test(
                     .collect::<Vec<_>>()
                     .join("\n")
             )
-        },
-    )
+        })
 }
 
 fn canonical_resources_for_test(
@@ -101,19 +102,10 @@ fn canonical_resources_for_test(
         resources,
         ..Default::default()
     };
-    let ctx = WiringContext::new_for_test_with_additional_schemas(
-        Vec::new(),
-        &[],
-        schemas
-            .iter()
-            .map(|(provider, _resource_type, _kind, schema)| {
-                (provider.to_string(), schema.clone())
-            }),
-    );
-    resolve_config_names_for_test(
-        &ctx,
+    resolve_config_block_names_for_test(
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        schemas,
     )
     .expect("test block-name resolution must succeed")
 }

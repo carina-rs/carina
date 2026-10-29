@@ -10649,14 +10649,14 @@ pub fn resolve_file_block_names_with_schemas<E>(
 /// Resolve block names in an evaluated configuration and its authored
 /// snapshot in one schema-aware operation.
 ///
-/// This raw primitive returns two plain files and carries no pairing
-/// guarantee. Only carina-cli's validated-wiring transition may mint its
-/// canonical resource pair from these values.
+/// This raw primitive returns plain values and carries no pairing guarantee.
+/// Only carina-cli's validated-wiring transition may mint its canonical
+/// resource pair from these values.
 pub fn resolve_config_block_names<E>(
     mut parsed: crate::parser::File<E>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<(crate::parser::File<E>, crate::parser::ParsedFile), Vec<BlockNameConflict>> {
+) -> Result<(crate::parser::File<E>, Vec<Resource>), Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
@@ -10666,7 +10666,7 @@ pub fn resolve_config_block_names<E>(
         }
     }
     if conflicts.is_empty() {
-        Ok((parsed, unresolved))
+        Ok((parsed, unresolved.resources))
     } else {
         Err(conflicts)
     }

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use carina_cli::commands::validate_and_resolve_errors;
 use carina_cli::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
-    resolve_config_names_for_test,
+    resolve_config_block_names_for_test,
 };
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -560,10 +560,10 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ..Default::default()
     };
     let canonical_for_plan = unresolved_for_plan.clone();
-    let canonical_unresolved = resolve_config_names_for_test(
-        ctx,
+    let canonical_unresolved = resolve_config_block_names_for_test(
         canonical_for_plan,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
+        ctx.schemas(),
     )
     .expect("block-name resolution");
     let (mut override_aware_resources, _) = OverrideAwareResources::build_pair_with_stability(

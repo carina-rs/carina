@@ -68,20 +68,6 @@
 //!     let _ = providers.context();
 //! }
 //! ```
-//!
-//! A canonical resource pair cannot be minted outside validation wiring.
-//!
-//! ```compile_fail,E0308
-//! use carina_cli::wiring::CanonicalResourcePair;
-//! use carina_core::config_loader::UnresolvedConfigSnapshot;
-//! use carina_core::parser::ParsedFile;
-//! use carina_core::schema::{SchemaRegistry, resolve_config_block_names};
-//!
-//! let parsed = ParsedFile::default();
-//! let unresolved = UnresolvedConfigSnapshot::from_parsed(ParsedFile::default());
-//! let _: CanonicalResourcePair<_> =
-//!     resolve_config_block_names(parsed, unresolved, &SchemaRegistry::new()).unwrap();
-//! ```
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -146,8 +132,8 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedResourceSchema, resolve_file_block_names_with_schemas,
+    BlockNameConflict, OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry,
+    TypeError, ValidatedResourceSchema, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -2075,23 +2061,21 @@ fn resolve_config_names_with_ctx<E>(
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    let (parsed, unresolved) =
-        carina_core::schema::resolve_config_block_names(parsed, unresolved, ctx.schemas())
-            .map_err(block_name_errors)?;
-    CanonicalResourcePair::new(parsed, unresolved.resources)
+    CanonicalResourcePair::resolve_block_names(parsed, unresolved, ctx.schemas())
+        .map_err(block_name_errors)?
         .resolve_attr_prefixes(ctx.schemas())
         .map_err(|error| split_validation_message(&error))
 }
 
-/// Resolve a canonical pair through the same validated-wiring minting path
-/// used by production validation.
+/// Resolve block names for tests without running later validation-wiring
+/// transformations such as attribute-prefix resolution.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn resolve_config_names_for_test<E>(
-    ctx: &WiringContext,
+pub fn resolve_config_block_names_for_test<E>(
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    resolve_config_names_with_ctx(ctx, parsed, unresolved)
+    registry: &SchemaRegistry,
+) -> Result<CanonicalResourcePair<E>, Vec<BlockNameConflict>> {
+    CanonicalResourcePair::resolve_block_names(parsed, unresolved, registry)
 }
 
 pub fn resolve_attr_prefixes_with_ctx(

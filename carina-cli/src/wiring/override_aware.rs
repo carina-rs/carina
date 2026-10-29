@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use carina_core::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use carina_core::config_loader::UnresolvedConfigSnapshot;
 use carina_core::data_source_value::DataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::effect::deps::UnresolvedResource;
@@ -11,6 +12,7 @@ use carina_core::name_override::{
 };
 use carina_core::parser::File;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
 /// Evaluated and pre-value-resolution resources whose provider-schema block
 /// aliases have been folded into canonical attribute names together.
@@ -67,8 +69,18 @@ pub enum CanonicalResourceIdentityError {
 }
 
 impl<E> CanonicalResourcePair<E> {
-    pub(super) fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
+    fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
         Self { parsed, unresolved }
+    }
+
+    pub(super) fn resolve_block_names(
+        parsed: File<E>,
+        unresolved: UnresolvedConfigSnapshot,
+        registry: &SchemaRegistry,
+    ) -> Result<Self, Vec<BlockNameConflict>> {
+        let (parsed, unresolved) =
+            carina_core::schema::resolve_config_block_names(parsed, unresolved, registry)?;
+        Ok(Self::new(parsed, unresolved))
     }
 
     /// The canonical evaluated configuration. Callers borrow every non-resource
