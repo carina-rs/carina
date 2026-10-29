@@ -2,6 +2,7 @@ pub mod commands;
 pub mod cursor;
 pub mod display;
 pub mod error;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod fixture_plan;
 pub mod kms;
 pub mod plan_image;

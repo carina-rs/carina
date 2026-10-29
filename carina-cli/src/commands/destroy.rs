@@ -55,17 +55,15 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
-    DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, apply_name_overrides,
-    build_orphan_resource,
+    DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, build_orphan_resource,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, get_provider_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
+    ProviderLoad, ValidatedConfig, get_provider_with_ctx, refresh_loaded_orphan_with_retry,
+    refresh_loaded_resource_with_retry,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -87,20 +85,23 @@ pub async fn run_destroy(
     )?;
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    crate::commands::validate_and_resolve_with_config(
-        user_dirs,
-        &mut parsed,
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let validated_config = providers.validate_evaluated_config(
+        parsed,
         base_dir,
         true,
         &inference_errors,
         &duplicate_declarations,
     )?;
 
-    let verified_backend =
-        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Destroy)?;
+    let verified_backend = verify_for_mutation(
+        path,
+        validated_config.resources().backend.as_ref(),
+        DriftCommand::Destroy,
+    )?;
 
     // Don't exit early when resources are empty -- orphaned resources in the
     // state file may still need to be destroyed.
@@ -137,8 +138,7 @@ pub async fn run_destroy(
     };
 
     let outcome = run_destroy_locked_owned(
-        user_dirs,
-        &mut parsed,
+        validated_config,
         auto_approve,
         Arc::clone(&backend),
         protected_bucket,
@@ -154,52 +154,6 @@ pub async fn run_destroy(
     finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_owned(
-    user_dirs: &carina_core::UserDirs,
-    parsed: &mut carina_core::parser::InferredFile,
-    auto_approve: bool,
-    backend: Arc<dyn StateBackend>,
-    protected_bucket: Option<String>,
-    lock: StateLock,
-    refresh: bool,
-    force: bool,
-    base_dir: &std::path::Path,
-    provider_context: &ProviderContext,
-    parallelism: NonZeroUsize,
-    cancel: ShutdownToken,
-) -> LockCommandOutcome<Result<(), AppError>> {
-    // Provider declaration metadata is sufficient for schema/factory wiring;
-    // construction attributes are resolved after state reconciliation below.
-    let (factories, _) =
-        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
-            Ok(factories) => factories,
-            Err(error) => {
-                return LockCommandOutcome::Kept {
-                    result: Err(error),
-                    lock,
-                };
-            }
-        };
-    let ctx = WiringContext::new(factories, &parsed.providers);
-
-    run_destroy_locked_with_ctx_owned(
-        parsed,
-        auto_approve,
-        backend,
-        protected_bucket,
-        lock,
-        refresh,
-        force,
-        base_dir,
-        provider_context,
-        parallelism,
-        cancel,
-        &ctx,
-    )
-    .await
 }
 
 enum DestroyAfterHeartbeat {
@@ -246,8 +200,8 @@ impl DestroyedInstances {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx_owned(
-    parsed: &mut carina_core::parser::InferredFile,
+async fn run_destroy_locked_owned(
+    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -258,7 +212,6 @@ async fn run_destroy_locked_with_ctx_owned(
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-    ctx: &WiringContext,
 ) -> LockCommandOutcome<Result<(), AppError>> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
@@ -282,7 +235,7 @@ async fn run_destroy_locked_with_ctx_owned(
         backend.as_ref(),
         lock.as_ref(),
         &mut state_file,
-        &parsed.data_sources,
+        &validated_config.resources().data_sources,
     )
     .await
     {
@@ -296,43 +249,8 @@ async fn run_destroy_locked_with_ctx_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        ctx.schemas(),
-    );
-    if let Some(sf) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.to_string())
-                    .collect()
-            },
-            &state_block_claims,
-        );
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            &mut parsed.resources,
-            &parsed.data_sources,
-            sf,
-            &state_block_claims,
-        )?;
-    }
-    // destroy operates on the existing state-only resource set and does not run the
-    // differ. The state-side name_overrides are the only thing destroy needs from
-    // this surface; the full resolver -> override -> bindings rebuild ->
-    // second-pass resolver sequence is unnecessary here. Sub-PR B leaves this
-    // call site as-is for that reason. See
-    // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
-    apply_name_overrides(&mut parsed.resources, &state_file);
+    validated_config.reconcile_for_destroy(&mut state_file)?;
+    let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
         parsed,
@@ -1320,7 +1238,7 @@ async fn run_destroy_locked_with_ctx_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -1333,9 +1251,37 @@ async fn run_destroy_locked(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let user_dirs = carina_core::TestUserDirs::new();
+    let providers = match ProviderLoad::load(&user_dirs, &parsed.providers, base_dir) {
+        Ok(providers) => providers,
+        Err(error) => {
+            return finish_lock_command(
+                backend.as_ref(),
+                LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                },
+                &cancel,
+            )
+            .await;
+        }
+    };
+    let validated_config =
+        match providers.validate_evaluated_config(parsed, base_dir, true, &[], &[]) {
+            Ok(validated_config) => validated_config,
+            Err(error) => {
+                return finish_lock_command(
+                    backend.as_ref(),
+                    LockCommandOutcome::Kept {
+                        result: Err(error),
+                        lock,
+                    },
+                    &cancel,
+                )
+                .await;
+            }
+        };
     let outcome = run_destroy_locked_owned(
-        &user_dirs,
-        parsed,
+        validated_config,
         auto_approve,
         Arc::clone(&backend),
         protected_bucket,
@@ -1354,7 +1300,7 @@ async fn run_destroy_locked(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_with_ctx(
-    parsed: &mut carina_core::parser::InferredFile,
+    validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -1365,10 +1311,9 @@ async fn run_destroy_locked_with_ctx(
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
-    ctx: &WiringContext,
 ) -> Result<(), AppError> {
-    let outcome = run_destroy_locked_with_ctx_owned(
-        parsed,
+    let outcome = run_destroy_locked_owned(
+        validated_config,
         auto_approve,
         Arc::clone(&backend),
         protected_bucket,
@@ -1379,7 +1324,6 @@ async fn run_destroy_locked_with_ctx(
         provider_context,
         parallelism,
         cancel.clone(),
-        ctx,
     )
     .await;
     finish_lock_command(backend.as_ref(), outcome, &cancel).await
@@ -2118,13 +2062,15 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = WiringContext::new_for_test(
+        let provider_configs = parsed.providers.clone();
+        let validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            &parsed.providers,
+            &provider_configs,
         );
         let mut state = StateFile::new();
         state
@@ -2142,7 +2088,7 @@ mod tests {
         let backend = crate::commands::local_backend_for_test(state_path);
 
         run_destroy_locked_with_ctx(
-            &mut parsed,
+            validated_config,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2153,7 +2099,6 @@ mod tests {
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
-            &ctx,
         )
         .await
         .expect("destroy must construct the provider from resolved upstream attributes");
@@ -2186,7 +2131,7 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2202,9 +2147,62 @@ mod tests {
         .expect("destroy must not load an upstream unused by provider configuration");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destroy_helper_releases_passed_lock_when_provider_load_hard_fails() {
+        let project = tempfile::tempdir().unwrap();
+        let source = format!(
+            "file://{}",
+            project.path().join("missing-provider.wasm").display()
+        )
+        .parse()
+        .unwrap();
+        let provider_config = carina_core::parser::ProviderConfig {
+            name: "mock".to_string(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
+            source: Some(source),
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let parsed = carina_core::parser::InferredFile {
+            providers: vec![provider_config.clone(), provider_config],
+            ..Default::default()
+        };
+        let state_path = project.path().join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let backend: Arc<dyn StateBackend> =
+            Arc::from(crate::commands::local_backend_for_test(state_path));
+        let lock = backend.acquire_lock("destroy").await.unwrap();
+        assert!(lock_path.exists(), "fixture must hold the lock");
+
+        let error = run_destroy_locked(
+            parsed,
+            true,
+            Arc::clone(&backend),
+            None,
+            StateLock::held(lock),
+            false,
+            true,
+            project.path(),
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("duplicate sourced providers must hard-fail loading");
+
+        assert!(
+            error.to_string().contains("declared more than once"),
+            "unexpected loader error: {error}"
+        );
+        assert!(!lock_path.exists(), "load failure must release the lock");
+    }
+
     #[tokio::test]
     async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
                 .parent()
@@ -2217,7 +2215,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         let error = match run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2245,11 +2243,11 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2267,11 +2265,11 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2354,6 +2352,7 @@ mod tests {
             .with_existing_resources(["first", "second"])
             .cancel_after_successes(1);
         let token = fixture.cancel_token();
+        let load_count = crate::wiring::track_provider_loads_for_test();
 
         let err = run_destroy(
             &user_dirs,
@@ -2373,6 +2372,7 @@ mod tests {
             matches!(err, AppError::Interrupted),
             "expected Interrupted, got {err:?}"
         );
+        assert_eq!(load_count.count(), 1, "destroy must load providers once");
         let state = fixture.read_state().await;
         assert!(fixture.state_path().exists());
         assert!(
@@ -2411,26 +2411,24 @@ mod tests {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("fixture must load");
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
-        crate::commands::validate_and_resolve_with_config(
-            &user_dirs,
-            &mut parsed,
-            base_dir,
-            true,
-            &loaded.inference_errors,
-            &loaded.duplicate_declarations,
-        )
-        .expect("fixture must validate");
-        let (factories, _) =
-            build_factories_from_providers(&user_dirs, &parsed.providers, base_dir)
-                .expect("mock factory must load");
-        let ctx = WiringContext::new(factories, &parsed.providers);
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
+            .expect("mock provider must load");
+        let validated_config = providers
+            .validate_evaluated_config(
+                parsed,
+                base_dir,
+                true,
+                &loaded.inference_errors,
+                &loaded.duplicate_declarations,
+            )
+            .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
 
         let error = run_destroy_locked_with_ctx(
-            &mut parsed,
+            validated_config,
             true,
             backend.clone(),
             None,
@@ -2441,7 +2439,6 @@ mod tests {
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),
-            &ctx,
         )
         .await
         .expect_err("heartbeat lock loss must fail destroy");

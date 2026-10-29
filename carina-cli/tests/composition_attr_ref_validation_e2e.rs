@@ -652,12 +652,12 @@ fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() 
     );
     let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
-    let retry_errors = carina_cli::commands::validate_and_resolve_errors_with_factories(
+    let providers = carina_cli::wiring::ProviderLoad::for_test(factories(), &parsed.providers);
+    let retry_errors = carina_cli::commands::validate_and_resolve_errors(
         &mut parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
+        &providers,
         false,
-        factories(),
-        HashMap::new(),
         &inference_errors,
         &[],
     );

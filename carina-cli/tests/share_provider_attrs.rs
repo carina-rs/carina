@@ -28,11 +28,10 @@ fn share_provider_attrs_resolves_default_tags() {
     let user_dirs = carina_core::UserDirs::under(user_root.path());
 
     // Run the CLI's full validate-and-resolve pipeline so module
-    // expansion + finalize happen. `skip_resource_validation = true`
-    // bypasses provider-plugin loading; the mock provider's WASM is not
-    // available in the test environment, but we only need pipeline
-    // semantics here.
-    carina_cli::commands::validate_and_resolve_with_config(
+    // expansion + finalize happen. The test-support boundary still exercises
+    // the real command-scoped load; this source-less mock configuration uses
+    // the built-in provider catalog.
+    carina_cli::commands::validate_and_resolve_with_provider_load_for_test(
         &user_dirs,
         &mut config.parsed,
         &fixture,

@@ -170,6 +170,151 @@ outer {{}}
     );
 }
 
+#[test]
+fn execution_minting_checks_load_completeness_after_skipped_validation_in_provider_name_order() {
+    let provider_configs = || {
+        ["zeta", "alpha"]
+            .into_iter()
+            .map(|name| ProviderConfig {
+                name: name.to_string(),
+                source: Some(
+                    format!("file:///definitely-missing/{name}.wasm")
+                        .parse()
+                        .unwrap(),
+                ),
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let incomplete_load = || {
+        let provider_configs = provider_configs();
+        ProviderLoad::for_test_with_load_errors(
+            Vec::new(),
+            &provider_configs,
+            HashMap::from([
+                ("zeta".to_string(), "zeta failed".to_string()),
+                ("alpha".to_string(), "alpha failed".to_string()),
+            ]),
+        )
+    };
+    let invalid_config = || carina_core::parser::InferredFile {
+        providers: provider_configs(),
+        arguments: vec![carina_core::parser::ArgumentParameter {
+            name: "unrelated".to_string(),
+            type_expr: carina_core::parser::TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }],
+        ..Default::default()
+    };
+
+    let evaluated_error = match incomplete_load().validate_evaluated_config(
+        invalid_config(),
+        Path::new("."),
+        true,
+        &[],
+        &[],
+    ) {
+        Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
+        Err(error) => error,
+    };
+    let unresolved = carina_core::parser::ParsedFile::default();
+    let pair_error = match incomplete_load().validate_config_pair(
+        invalid_config(),
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+        Path::new("."),
+        true,
+        &[],
+        &[],
+    ) {
+        Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
+        Err(error) => error,
+    };
+
+    let expected = "arguments blocks are only valid inside module definitions, not in root configurations.\nalpha failed\nzeta failed";
+    assert_eq!(evaluated_error.to_string(), expected);
+    assert_eq!(pair_error.to_string(), expected);
+}
+
+#[test]
+fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors() {
+    let provider = ProviderConfig {
+        name: "broken".to_string(),
+        source: Some("file:///definitely-missing/broken.wasm".parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let providers = ProviderLoad::for_test_with_load_errors(
+        Vec::new(),
+        std::slice::from_ref(&provider),
+        HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
+    );
+    let parsed = carina_core::parser::InferredFile {
+        providers: vec![provider],
+        arguments: vec![carina_core::parser::ArgumentParameter {
+            name: "unrelated".to_string(),
+            type_expr: carina_core::parser::TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }],
+        ..Default::default()
+    };
+
+    let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
+        carina_core::parser::ParsedFile::default(),
+    );
+    let error =
+        match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[], &[]) {
+            Ok(_) => panic!("plan-style validation must reject both independent errors"),
+            Err(error) => error,
+        };
+    let message = error.to_string();
+
+    assert!(message.contains("broken provider failed"), "{message}");
+    assert!(message.contains("arguments blocks"), "{message}");
+}
+
+#[test]
+fn hard_reporting_load_returns_schema_only_diagnostics() {
+    let user_dirs = carina_core::TestUserDirs::new();
+    let base = tempfile::tempdir().unwrap();
+    let provider = ProviderConfig {
+        name: "mock".to_string(),
+        source: Some("file:///definitely-missing/mock.wasm".parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let (providers, hard_error) =
+        ProviderLoad::load_reporting(&user_dirs, &[provider.clone(), provider], base.path());
+    assert!(
+        hard_error
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("declared more than once")),
+        "fixture must exercise the hard loader failure"
+    );
+
+    let mut parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&mut parsed, base.path(), true, &[], &[]);
+
+    assert!(report.errors().is_empty());
+    assert!(report.schemas().iter().next().is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let user_dirs = carina_core::TestUserDirs::new();
@@ -1007,7 +1152,8 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         provider_configs.as_provider_configs(),
         base_dir,
     )?;
-    let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
+    let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
+    let ctx = wiring.context();
     let unresolved = carina_core::parser::ParsedFile {
         resources: unresolved_resources.to_vec(),
         ..Default::default()
@@ -1018,9 +1164,9 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         ctx.schemas(),
     )
     .expect("test block-name resolution must succeed");
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
-        canonical_resources,
+        validated,
         provider_configs,
         state_file,
         refresh,
@@ -1030,7 +1176,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resolved_state_block_targets,
     )
     .await
-    .map(ExpandedPlanContext::into_context)
+    .map(ValidatedConfig::into_context_for_test)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1882,16 +2028,17 @@ fn assert_provider_config_constraint_error(error: &AppError) {
 async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
     let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
         provider_configs.as_provider_configs(),
     );
+    let ctx = wiring.context();
     let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
     let result = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
-        canonical_resources,
+        validated,
         &provider_configs,
         &None,
         false,
@@ -2368,19 +2515,20 @@ let shared = read test.shared.Type {}
         .expect("test state row is unique");
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
-    let ctx = WiringContext::new_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ManagedAndDataSourceFactory)],
         provider_configs.as_provider_configs(),
     );
+    let ctx = wiring.context();
     let canonical_resources = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
-        canonical_resources,
+        validated,
         &provider_configs,
         &state_file,
         true,
@@ -2391,6 +2539,7 @@ let shared = read test.shared.Type {}
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
+    let plan_context = plan_context.resources();
 
     let summary = plan_context.plan.summary();
     assert_eq!(summary.read, 1);
@@ -4746,11 +4895,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         }
     "#;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let ctx = wiring.context();
     let mut parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let mut unresolved_parsed = parsed.clone();
-    compute_initial_anonymous_ids(&ctx, &mut parsed);
-    compute_initial_anonymous_ids(&ctx, &mut unresolved_parsed);
+    compute_initial_anonymous_ids(ctx, &mut parsed);
+    compute_initial_anonymous_ids(ctx, &mut unresolved_parsed);
 
     let unresolved_subnet_key_before_plan = unresolved_parsed
         .resources
@@ -4759,7 +4909,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .expect("anonymous subnet should parse")
         .id
         .clone();
-    let state_subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
+    let state_subnet_identity = concrete_subnet_identity(ctx, &parsed.providers);
 
     let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
         .expect("fixture identifier is non-empty")
@@ -4793,9 +4943,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
-        canonical_resources,
+        validated,
         &provider_configs,
         &Some(state_file),
         false,
@@ -4806,7 +4956,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     )
     .await
     .expect("plan should build");
-    let plan_ctx = plan_ctx.into_context();
+    let plan_ctx = plan_ctx.into_context_for_test();
 
     let subnet_create = plan_ctx
         .plan
@@ -5707,7 +5857,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical_unresolved = resolve_config_block_names_with_ctx(
+    let canonical_unresolved = resolve_config_names_with_ctx(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5769,7 +5919,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     };
     let unresolved = evaluated.clone();
 
-    let errors = resolve_config_block_names_with_ctx(
+    let errors = resolve_config_names_with_ctx(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -8841,7 +8991,9 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
         let module_gate =
@@ -8851,7 +9003,7 @@ mod resolved_value_constraint_gate {
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
-        PlanPreprocessor::new(normalizer, &ctx)
+        PlanPreprocessor::new(normalizer, ctx)
             .prepare(
                 &mut resources,
                 &origins,
@@ -8913,7 +9065,9 @@ mod resolved_value_constraint_gate {
         producer_values: Vec<(&str, Value)>,
         composition: &mut LiveComposition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let mut producer =
             Resource::with_provider("test", "source", "producer", None).with_binding("producer");
         for (name, value) in producer_values {
@@ -8945,7 +9099,7 @@ mod resolved_value_constraint_gate {
             std::slice::from_ref(composition),
         );
 
-        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
+        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, ctx)
             .prepare(
                 &mut resources,
                 &origins,
@@ -9225,7 +9379,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("upstream state fixture must load");
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring =
+            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = wiring.context();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &remote_bindings,
@@ -9233,9 +9389,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &ctx,
-            canonical_resources,
+            validated,
             &provider_configs,
             &None,
             true,
@@ -9246,6 +9402,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
+        let plan = plan.resources();
 
         assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
         match &plan.plan.errors()[0].kind {
@@ -9294,12 +9451,13 @@ exports { team_prefix: String = "x" }"#,
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
         let reads = Arc::new(AtomicUsize::new(0));
-        let ctx = WiringContext::new_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test(
             vec![Box::new(RecordingDataSourceFactory {
                 reads: reads.clone(),
             })],
             &[],
         );
+        let ctx = wiring.context();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -9307,9 +9465,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &ctx,
-            canonical_resources,
+            validated,
             &provider_configs,
             &None,
             true,
@@ -9320,6 +9478,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("module violations must be represented by the plan");
+        let plan = plan.resources();
 
         assert_eq!(
             reads.load(Ordering::SeqCst),
