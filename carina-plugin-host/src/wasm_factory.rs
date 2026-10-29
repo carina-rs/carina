@@ -40,7 +40,8 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{
-    CreateFailureKind, InFlightCreate, InFlightPersistence, ResumeFailureKind,
+    CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
+    UnobservedReason,
 };
 use carina_core::resource::{
     Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
@@ -6290,7 +6291,19 @@ mod tests {
         match failure.into_kind() {
             CreateFailureKind::Created { created, error: _ } => {
                 assert_eq!(created.identifier().as_str(), "decoded-created-id");
-                assert!(matches!(created.observation(), Observation::ReadFailed(_)));
+                match created.observation() {
+                    CreateObservation::Observed(state) => {
+                        panic!("decode failure became an observed create: {state:?}")
+                    }
+                    CreateObservation::Unobserved(reason) => match reason {
+                        UnobservedReason::NotFound => {
+                            panic!("decode failure became a not-found observation")
+                        }
+                        UnobservedReason::ReadFailed(error) => {
+                            assert!(!error.to_string().is_empty())
+                        }
+                    },
+                }
             }
             CreateFailureKind::Untracked(error) => {
                 panic!("post-identifier decode failure became untracked: {error}")
@@ -6308,7 +6321,19 @@ mod tests {
         match failure.into_kind() {
             ResumeFailureKind::Created { created, error: _ } => {
                 assert_eq!(created.identifier().as_str(), "decoded-created-id");
-                assert!(matches!(created.observation(), Observation::ReadFailed(_)));
+                match created.observation() {
+                    CreateObservation::Observed(state) => {
+                        panic!("resume decode failure became an observed create: {state:?}")
+                    }
+                    CreateObservation::Unobserved(reason) => match reason {
+                        UnobservedReason::NotFound => {
+                            panic!("resume decode failure became a not-found observation")
+                        }
+                        UnobservedReason::ReadFailed(error) => {
+                            assert!(!error.to_string().is_empty())
+                        }
+                    },
+                }
             }
             ResumeFailureKind::Ended(error) => {
                 panic!("post-identifier resume decode failure ended the record: {error}")

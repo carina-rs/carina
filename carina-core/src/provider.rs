@@ -2175,17 +2175,78 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
-/// Provider observation plus the accepted create's sent values.
+/// What carina-core knows about a create for which the provider reported an
+/// identifier.
+#[derive(Debug)]
+pub enum CreateObservation {
+    /// The read-back found the resource.
+    Observed(AppliedState),
+    /// The resource could not be observed after the identifier was reported.
+    Unobserved(UnobservedReason),
+}
+
+/// Why a create with a provider-reported identifier could not be observed.
+#[derive(Debug)]
+pub enum UnobservedReason {
+    /// The read-back reported that the identifier did not resolve.
+    NotFound,
+    /// The read-back itself failed.
+    ReadFailed(ProviderError),
+}
+
+impl std::fmt::Display for UnobservedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("provider read after create returned not found"),
+            Self::ReadFailed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Core-classified create observation plus the accepted create's sent values.
 #[derive(Debug)]
 pub struct ObservedCreate {
     id: ResourceId,
     identifier: AppliedIdentifier,
-    observation: Observation,
+    observation: CreateObservation,
     sent: SentRecord,
     resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
 impl ObservedCreate {
+    fn new(
+        id: ResourceId,
+        identifier: AppliedIdentifier,
+        observation: Observation,
+        sent: SentRecord,
+    ) -> Self {
+        let observation = match observation {
+            Observation::Read(ReadOutcome::Found { state }) => CreateObservation::Observed(state),
+            Observation::Read(ReadOutcome::NotFound { id: _id }) => {
+                CreateObservation::Unobserved(UnobservedReason::NotFound)
+            }
+            Observation::ReadFailed(error) => {
+                CreateObservation::Unobserved(UnobservedReason::ReadFailed(error))
+            }
+        };
+        Self::from_create_observation(id, identifier, observation, sent)
+    }
+
+    fn from_create_observation(
+        id: ResourceId,
+        identifier: AppliedIdentifier,
+        observation: CreateObservation,
+        sent: SentRecord,
+    ) -> Self {
+        Self {
+            id,
+            identifier,
+            observation,
+            sent,
+            resolved_desired_attributes: None,
+        }
+    }
+
     /// Construct the observation produced by a resumed in-flight create in
     /// cross-crate tests.
     #[cfg(feature = "test-utils")]
@@ -2193,7 +2254,7 @@ impl ObservedCreate {
     pub fn from_in_flight_for_test(
         pending: InFlightCreate,
         identifier: AppliedIdentifier,
-        observation: Observation,
+        observation: CreateObservation,
     ) -> Self {
         observed_from_resume(pending, identifier, observation)
     }
@@ -2206,7 +2267,7 @@ impl ObservedCreate {
         &self.identifier
     }
 
-    pub fn observation(&self) -> &Observation {
+    pub fn observation(&self) -> &CreateObservation {
         &self.observation
     }
 
@@ -2226,8 +2287,23 @@ impl ObservedCreate {
         self.resolved_desired_attributes.as_ref()
     }
 
-    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, Observation, SentRecord) {
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, CreateObservation, SentRecord) {
         (self.id, self.identifier, self.observation, self.sent)
+    }
+
+    pub(crate) fn post_error_note(&self) -> String {
+        match &self.observation {
+            CreateObservation::Observed(_state) => {
+                "resource created; recorded in state, the next apply completes it".to_string()
+            }
+            CreateObservation::Unobserved(reason) => {
+                let reason = reason.to_string().replace('\n', "\n  ");
+                format!(
+                    "{} reported identifier '{}' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: {reason}",
+                    self.id.provider, self.identifier,
+                )
+            }
+        }
     }
 
     pub(crate) fn validate_request_sent(
@@ -2245,9 +2321,8 @@ impl ObservedCreate {
     /// Sent desired values are intentionally excluded.
     pub fn observed_state(&self) -> State {
         let attributes = match &self.observation {
-            Observation::Read(ReadOutcome::Found { state }) => state.attributes().clone(),
-            Observation::Read(ReadOutcome::NotFound { id: _id }) => HashMap::new(),
-            Observation::ReadFailed(_error) => HashMap::new(),
+            CreateObservation::Observed(state) => state.attributes().clone(),
+            CreateObservation::Unobserved(_reason) => HashMap::new(),
         };
         State::existing(self.id.clone(), attributes)
             .with_identifier(self.identifier.as_str().to_string())
@@ -2686,16 +2761,67 @@ impl CreateFailure {
 #[derive(Debug)]
 pub struct ResumeOutcome(ResumeOutcomeKind);
 
+/// A resumed create that completed with an applied state.
+///
+/// The wrapped [`ObservedCreate`] is private so callers cannot put an
+/// unobserved created failure in the successful `Resumed` arm.
+///
+/// ```compile_fail
+/// use carina_core::provider::{CompletedResume, ObservedCreate};
+///
+/// fn forge(created: ObservedCreate) -> CompletedResume {
+///     CompletedResume(created)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CompletedResume(ObservedCreate);
+
+impl CompletedResume {
+    fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
+        let (_state_id, _observed_identifier, attributes) = state.into_parts();
+        let state =
+            AppliedState::from_identifier(pending.id().clone(), identifier.clone(), attributes);
+        Self(observed_from_resume(
+            pending,
+            identifier,
+            CreateObservation::Observed(state),
+        ))
+    }
+
+    fn id(&self) -> &ResourceId {
+        self.0.id()
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        self.0.identifier()
+    }
+
+    pub fn observed_state(&self) -> State {
+        self.0.observed_state()
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        self,
+        attributes: SecretPreservingAttributes,
+    ) -> Self {
+        Self(self.0.with_resolved_desired_attributes(attributes))
+    }
+
+    pub(crate) fn into_observed_create(self) -> ObservedCreate {
+        self.0
+    }
+}
+
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
 pub enum ResumeOutcomeKind {
-    Resumed(Box<ObservedCreate>),
+    Resumed(Box<CompletedResume>),
     Resent(Box<CreateOutcome>),
 }
 
 impl ResumeOutcome {
-    fn resumed(created: ObservedCreate) -> Self {
-        Self(ResumeOutcomeKind::Resumed(Box::new(created)))
+    fn resumed(completed: CompletedResume) -> Self {
+        Self(ResumeOutcomeKind::Resumed(Box::new(completed)))
     }
 
     fn resent(outcome: CreateOutcome) -> Self {
@@ -2712,7 +2838,7 @@ impl ResumeOutcome {
 
     pub fn id(&self) -> &ResourceId {
         match &self.0 {
-            ResumeOutcomeKind::Resumed(created) => created.id(),
+            ResumeOutcomeKind::Resumed(completed) => completed.id(),
             ResumeOutcomeKind::Resent(outcome) => outcome.id(),
         }
     }
@@ -2934,13 +3060,12 @@ impl IssuedCreate {
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
         CreateFailure::from_kind(CreateFailureKind::Created {
-            created: ObservedCreate {
-                id: self.id,
-                identifier: self.identifier,
+            created: ObservedCreate::new(
+                self.id,
+                self.identifier,
                 observation,
-                sent: SentRecord::Request(self.sent),
-                resolved_desired_attributes: None,
-            },
+                SentRecord::Request(self.sent),
+            ),
             error,
         })
     }
@@ -2978,13 +3103,12 @@ impl FinishingCreate {
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
         CreateFailure::from_kind(CreateFailureKind::Created {
-            created: ObservedCreate {
-                id: self.id,
-                identifier: self.identifier,
+            created: ObservedCreate::new(
+                self.id,
+                self.identifier,
                 observation,
-                sent: SentRecord::Request(self.sent),
-                resolved_desired_attributes: None,
-            },
+                SentRecord::Request(self.sent),
+            ),
             error,
         })
     }
@@ -3176,18 +3300,12 @@ impl ResumedCreate {
     }
 
     pub fn completed(self, state: AppliedState) -> ResumeOutcome {
-        let (_state_id, _observed_identifier, attributes) = state.into_parts();
-        let state = AppliedState::from_identifier(
-            self.pending.id().clone(),
-            self.identifier.clone(),
-            attributes,
-        );
-        let observed = self.observed(Observation::Read(ReadOutcome::found(state)));
-        ResumeOutcome::resumed(observed)
+        ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
-        let created = self.observed(observation);
+        let sent = self.pending.sent();
+        let created = ObservedCreate::new(self.pending.id, self.identifier, observation, sent);
         ResumeFailure::created(created, error)
     }
 
@@ -3202,10 +3320,6 @@ impl ResumedCreate {
     pub fn discarded(self, error: ProviderError) -> ResumeFailure {
         ResumeFailure::ended_from_verdict(error)
     }
-
-    fn observed(self, observation: Observation) -> ObservedCreate {
-        observed_from_resume(self.pending, self.identifier, observation)
-    }
 }
 
 /// Canonicalized resumed-create witness. It intentionally cannot re-pend.
@@ -3217,23 +3331,13 @@ pub struct FinishingResume {
 
 impl FinishingResume {
     pub fn completed(self, state: AppliedState) -> ResumeOutcome {
-        let (_state_id, _observed_identifier, attributes) = state.into_parts();
-        let state = AppliedState::from_identifier(
-            self.pending.id().clone(),
-            self.identifier.clone(),
-            attributes,
-        );
-        let observed = observed_from_resume(
-            self.pending,
-            self.identifier,
-            Observation::Read(ReadOutcome::found(state)),
-        );
-        ResumeOutcome::resumed(observed)
+        ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+        let sent = self.pending.sent();
         ResumeFailure::created(
-            observed_from_resume(self.pending, self.identifier, observation),
+            ObservedCreate::new(self.pending.id, self.identifier, observation, sent),
             error,
         )
     }
@@ -3246,16 +3350,10 @@ impl FinishingResume {
 fn observed_from_resume(
     pending: InFlightCreate,
     identifier: AppliedIdentifier,
-    observation: Observation,
+    observation: CreateObservation,
 ) -> ObservedCreate {
     let sent = pending.sent();
-    ObservedCreate {
-        id: pending.id,
-        identifier,
-        observation,
-        sent,
-        resolved_desired_attributes: None,
-    }
+    ObservedCreate::from_create_observation(pending.id, identifier, observation, sent)
 }
 
 impl ResumeCreateRequest {
@@ -6351,6 +6449,24 @@ mod tests {
         assert_eq!(
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf resume failure")
+        );
+    }
+
+    #[test]
+    fn created_failure_post_error_note_indents_multiline_reason() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let created = ObservedCreate::from_create_observation(
+            id,
+            AppliedIdentifier::new("widget-id").expect("fixture identifier is non-empty"),
+            CreateObservation::Unobserved(UnobservedReason::ReadFailed(ProviderError::api_error(
+                "read failed\nrequest id: req-123\nretry later",
+            ))),
+            SentRecord::Request(Sent::AllRequestAttributes),
+        );
+
+        assert_eq!(
+            created.post_error_note(),
+            "test reported identifier 'widget-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: read failed\n  request id: req-123\n  retry later"
         );
     }
 

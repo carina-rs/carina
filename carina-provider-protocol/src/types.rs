@@ -609,7 +609,8 @@ pub enum CreateStep<A, D, T> {
     Pending(PendingCreate<T>),
 }
 
-/// Failure payload for a create that is known to have produced a resource.
+/// Failure payload for a create for which the provider reported an identifier.
+/// The observation says whether the resource was found during read-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedFailure<R, E> {
     pub identifier: AppliedIdentifier,
@@ -656,7 +657,9 @@ impl<R, E> From<CreateVerdict<R, E>> for PollVerdict<R, E> {
     }
 }
 
-/// Failure payload for an issued create resumed from persisted state.
+/// Failure payload for a resumed create for which the provider reported an
+/// identifier. The observation says whether the resource was found during
+/// read-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumedFailure<R, E> {
     pub identifier: AppliedIdentifier,
