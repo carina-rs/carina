@@ -351,13 +351,14 @@ pub fn validate_and_resolve_with_config(
 /// Test-support entry point that exercises the real command-scoped provider loader.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_provider_load_for_test(
+    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<(), AppError> {
-    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     validate_and_resolve_with_config(
         parsed,
         base_dir,
@@ -1080,6 +1081,7 @@ mod tests {
 
     #[test]
     fn backend_validation_keeps_the_typed_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
@@ -1093,7 +1095,7 @@ mod tests {
         let mut parsed = empty_parsed_file();
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
-        let providers = ProviderLoad::load(&parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
         let errors =
             validate_and_resolve_errors(&mut parsed, base.path(), &providers, false, &[], &[]);
@@ -1114,6 +1116,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provider_load_error_shows_actual_reason() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         let source_path = base.path().join("local-provider.wasm");
         let installed_path = base
@@ -1134,7 +1137,7 @@ mod tests {
             binding: None,
         });
 
-        let providers = ProviderLoad::load(&parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
         let error =
             validate_and_resolve_with_config(&mut parsed, base.path(), &providers, false, &[], &[])
                 .unwrap_err();
@@ -1157,6 +1160,7 @@ mod tests {
 
     #[test]
     fn test_provider_without_source_shows_source_hint() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // A provider without source should tell the user to add source config.
         let mut parsed = empty_parsed_file();
         parsed.providers.push(ProviderConfig {
@@ -1170,7 +1174,7 @@ mod tests {
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let providers = ProviderLoad::load(&parsed.providers, base_dir).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir).unwrap();
         let result =
             validate_and_resolve_with_config(&mut parsed, base_dir, &providers, false, &[], &[]);
 
@@ -1185,6 +1189,7 @@ mod tests {
 
     #[test]
     fn upstream_field_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         // `destroy` and `state` subcommands pass `skip_resource_validation =
         // true` so they can run on projects whose upstream has drifted.
         // The static upstream-exports check must respect that gate;
@@ -1220,7 +1225,7 @@ exports {
         let inference_errors = loaded.inference_errors;
         let duplicate_declarations = loaded.duplicate_declarations;
         let mut parsed = loaded.parsed;
-        let providers = ProviderLoad::load(&parsed.providers, &base).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base).unwrap();
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
@@ -1253,6 +1258,7 @@ exports {
 
     #[test]
     fn duplicate_declaration_check_honors_skip_resource_validation() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let base = tempfile::tempdir().unwrap();
         std::fs::write(
             base.path().join("a.crn"),
@@ -1274,7 +1280,7 @@ exports {
         let inference_errors = loaded.inference_errors;
         let duplicate_declarations = loaded.duplicate_declarations;
         let mut parsed = loaded.parsed;
-        let providers = ProviderLoad::load(&parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
         let err = validate_and_resolve_with_config(
             &mut parsed.clone(),

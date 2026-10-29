@@ -16,3 +16,9 @@ wasi = "0.14"
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
 aws-smithy-types = "1"
 http = "1"
+
+[dev-dependencies]
+wasi = "0.14"
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+aws-smithy-types = "1"
+http = "1"

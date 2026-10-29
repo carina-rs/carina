@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use carina_core::UserDirs;
 use carina_core::hint::ProjectCommand;
 use carina_core::provider_source::{GithubSource, RemoteSourceKey};
 use sha2::{Digest, Sha256};
@@ -895,14 +896,21 @@ fn locked_artifact_error(
 }
 
 struct RevisionArtifactLocation<'a> {
+    user_dirs: &'a UserDirs,
     source: &'a GithubSource,
     sha: &'a CommitSha,
     project_dir: &'a Path,
 }
 
 impl<'a> RevisionArtifactLocation<'a> {
-    fn new(source: &'a GithubSource, sha: &'a CommitSha, project_dir: &'a Path) -> Self {
+    fn new(
+        user_dirs: &'a UserDirs,
+        source: &'a GithubSource,
+        sha: &'a CommitSha,
+        project_dir: &'a Path,
+    ) -> Self {
         Self {
+            user_dirs,
             source,
             sha,
             project_dir,
@@ -927,11 +935,12 @@ where
     Z: IntoRevisionArtifactDownload,
 {
     let RevisionArtifactLocation {
+        user_dirs,
         source,
         sha,
         project_dir,
     } = location;
-    let pin_state = if artifact_pin.pinned().is_some() {
+    let pin_state = if artifact_pin.pinned(user_dirs).is_some() {
         RevisionArtifactPinState::Pinned
     } else {
         RevisionArtifactPinState::Unpinned
@@ -940,7 +949,7 @@ where
     let mut fallback_run_ids = None;
     let mut recovery = None;
     if mode != LockMode::Upgrade
-        && let Some((_lock_entry, pin)) = artifact_pin.pinned()
+        && let Some((_lock_entry, pin)) = artifact_pin.pinned(user_dirs)
     {
         match replay_locked_artifact(
             source,
@@ -1111,11 +1120,13 @@ pub fn cache_path_revision(base_dir: &Path, source: &GithubSource, sha: &CommitS
 }
 
 pub(crate) fn global_cache_path_revision(
+    user_dirs: &carina_core::UserDirs,
     source: &GithubSource,
     sha: &CommitSha,
 ) -> Option<GlobalArtifactPath> {
     let sha_prefix = sha.short();
     global_cache_artifact_path(
+        user_dirs,
         PathBuf::from(source.to_string())
             .join(format!("rev-{sha_prefix}"))
             .join(format!("{}.wasm", source.repo())),
@@ -1314,14 +1325,19 @@ mod verified_revision_artifact {
             &self.sha256
         }
 
-        fn record_origin_download(&self) -> Result<(), String> {
+        fn record_origin_download(&self, user_dirs: &UserDirs) -> Result<(), String> {
             let RevisionArtifactProvenance::Downloaded(location) = &self.provenance else {
                 return Err(
                     "cached revision artifact cannot create an origin trust record".to_string(),
                 );
             };
-            record_verified_revision_origin_download(&self.source, location.clone(), &self.sha256)
-                .map_err(String::from)
+            record_verified_revision_origin_download(
+                user_dirs,
+                &self.source,
+                location.clone(),
+                &self.sha256,
+            )
+            .map_err(String::from)
         }
     }
 
@@ -1398,6 +1414,7 @@ mod verified_revision_artifact {
     }
 
     fn publish_selected_download(
+        user_dirs: &UserDirs,
         selected: &SelectedRevisionArtifact,
         install_lock: &ProviderInstallLock,
         destination: &WasmArtifactPath,
@@ -1413,7 +1430,7 @@ mod verified_revision_artifact {
                 crate::verified_artifact::publish_revision_download(staged, pin)
             }?;
             let published = from_downloaded(selected, downloaded, name);
-            published.artifact().record_origin_download()?;
+            published.artifact().record_origin_download(user_dirs)?;
             Ok(published)
         })
         .map_err(|error| match error {
@@ -1425,23 +1442,41 @@ mod verified_revision_artifact {
     }
 
     pub(super) fn publish_download(
+        user_dirs: &UserDirs,
         selected: &SelectedRevisionArtifact,
         install_lock: &ProviderInstallLock,
         destination: &WasmArtifactPath,
         pin: ArtifactPin<'_, RevisionArtifactPin>,
         name: &str,
     ) -> Result<PublishedRevisionArtifact, String> {
-        publish_selected_download(selected, install_lock, destination, pin, name, false)
+        publish_selected_download(
+            user_dirs,
+            selected,
+            install_lock,
+            destination,
+            pin,
+            name,
+            false,
+        )
     }
 
     pub(super) fn publish_unchanged_revision_download(
+        user_dirs: &UserDirs,
         selected: &SelectedRevisionArtifact,
         install_lock: &ProviderInstallLock,
         destination: &WasmArtifactPath,
         pin: ArtifactPin<'_, RevisionArtifactPin>,
         name: &str,
     ) -> Result<PublishedRevisionArtifact, String> {
-        publish_selected_download(selected, install_lock, destination, pin, name, true)
+        publish_selected_download(
+            user_dirs,
+            selected,
+            install_lock,
+            destination,
+            pin,
+            name,
+            true,
+        )
     }
 }
 
@@ -1534,6 +1569,7 @@ struct RevisionGithubOps<R, F, A, M, D> {
 
 /// Resolve a provider by revision: download from CI artifacts if not cached.
 pub fn resolve_provider_by_revision(
+    user_dirs: &UserDirs,
     lock_file: &mut GuardedLockFile<'_>,
     source: &GithubSource,
     revision: &str,
@@ -1543,10 +1579,11 @@ pub fn resolve_provider_by_revision(
     let token = get_github_token()?;
     let http = UreqGithubHttp;
     let api = GithubApi::new(&http, Some(&token));
-    resolve_provider_by_revision_with_api(lock_file, source, revision, name, mode, &api)
+    resolve_provider_by_revision_with_api(user_dirs, lock_file, source, revision, name, mode, &api)
 }
 
 pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
+    user_dirs: &UserDirs,
     lock_file: &mut GuardedLockFile<'_>,
     source: &GithubSource,
     revision: &str,
@@ -1556,6 +1593,7 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
 ) -> Result<(WasmArtifactPath, CommitSha), String> {
     let (repo, git_ref) = validate_revision_location(source, revision)?;
     resolve_provider_by_revision_with(
+        user_dirs,
         lock_file,
         source,
         revision,
@@ -1572,6 +1610,7 @@ pub(crate) fn resolve_provider_by_revision_with_api<H: GithubHttp + ?Sized>(
 }
 
 fn resolve_provider_by_revision_with<R, F, A, M, D, Z>(
+    user_dirs: &UserDirs,
     lock_file: &mut GuardedLockFile<'_>,
     source: &GithubSource,
     revision: &str,
@@ -1625,7 +1664,7 @@ where
 
     let legacy_pin = legacy_pin.filter(|(resolved_sha, _sha256)| resolved_sha == &sha);
     let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
-    if mode == LockMode::Locked && artifact_pin.pinned().is_none() {
+    if mode == LockMode::Locked && artifact_pin.pinned(user_dirs).is_none() {
         return Err(format!(
             "Locked resolution for provider '{name}' has no matching revision entry"
         ));
@@ -1636,7 +1675,7 @@ where
     // is skipped in favor of a fresh origin download.
     let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
     if mode != LockMode::Upgrade
-        && let Some((lock_entry, pin)) = artifact_pin.pinned()
+        && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
         && let Some(cached) = revision_artifact_cache::read(wasm_path.as_path(), pin.artifact_id)
     {
         let pin = pin.clone();
@@ -1660,8 +1699,8 @@ where
     }
 
     if mode != LockMode::Upgrade
-        && let Some((lock_entry, pin)) = artifact_pin.pinned()
-        && let Some(global_wasm) = global_cache_path_revision(source, &sha)
+        && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
+        && let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha)
         && let Some(cached) = revision_artifact_cache::read(global_wasm.as_path(), pin.artifact_id)
     {
         let pin = pin.clone();
@@ -1704,7 +1743,7 @@ where
 
     let selected = resolve_revision_artifact(
         &artifact_pin,
-        RevisionArtifactLocation::new(source, &sha, base_dir),
+        RevisionArtifactLocation::new(user_dirs, source, &sha, base_dir),
         mode,
         || list_runs(sha.clone()),
         &mut list_artifacts,
@@ -1719,9 +1758,10 @@ where
             ));
         }
     }
-    let unchanged_revision = artifact_pin.pinned().is_some();
+    let unchanged_revision = artifact_pin.pinned(user_dirs).is_some();
     let published = if unchanged_revision {
         verified_revision_artifact::publish_unchanged_revision_download(
+            user_dirs,
             &selected,
             install_lock,
             &wasm_path,
@@ -1730,6 +1770,7 @@ where
         )
     } else {
         verified_revision_artifact::publish_download(
+            user_dirs,
             &selected,
             install_lock,
             &wasm_path,
@@ -1761,7 +1802,7 @@ where
     let installed_path = verified.path().clone();
 
     // Save to global cache
-    if let Some(global_wasm) = global_cache_path_revision(source, &sha) {
+    if let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha) {
         install_global_revision_artifact(
             installed_path.as_path(),
             &global_wasm,
@@ -1841,13 +1882,8 @@ mod tests {
         files
     }
 
-    fn isolated_trust_records() -> (tempfile::TempDir, crate::ScopedEnvVar) {
-        let trust = tempfile::tempdir().unwrap();
-        let trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
-        (trust, trust_env)
-    }
-
     fn record_revision_lock_trust(
+        user_dirs: &UserDirs,
         lock_file: &crate::provider_resolver::LockFile,
         source: &GithubSource,
         sha: &CommitSha,
@@ -1860,6 +1896,7 @@ mod tests {
             kind => panic!("expected revision lock entry, got {kind:?}"),
         };
         crate::verified_artifact::record_verified_revision_origin_download(
+            user_dirs,
             &source.source_key(),
             GithubRevisionDownloadLocation::new(RepoSlug::try_from(source).unwrap(), artifact_id),
             &entry.sha256,
@@ -1939,15 +1976,17 @@ mod tests {
 
     #[test]
     fn cached_revision_checksum_mismatch_uses_resolver_project_dir() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::test_env_guard();
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
 
         let dir = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = test_source();
         let expected_sha256 = "0".repeat(64);
         crate::verified_artifact::record_test_github_origin_download(
+            &user_dirs,
             &source.source_key(),
             &expected_sha256,
             None,
@@ -1973,8 +2012,14 @@ mod tests {
 
         let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
         let mut lock_file = install_lock.guard_lock_file_for_test(lock_file);
-        let result =
-            resolve_provider_by_revision(&mut lock_file, &source, "main", "aws", LockMode::Normal);
+        let result = resolve_provider_by_revision(
+            &user_dirs,
+            &mut lock_file,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+        );
         let error = result.expect_err("the cached artifact hash must not match its lock pin");
 
         assert!(
@@ -2038,13 +2083,14 @@ mod tests {
 
     #[test]
     fn revision_global_cache_mismatch_is_not_published_or_repinned() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = test_source();
         let locked_bytes = b"locked revision provider";
         let cached_bytes = b"tampered global revision provider";
@@ -2052,6 +2098,7 @@ mod tests {
         std::fs::write(&expected_file, locked_bytes).unwrap();
         let expected_sha256 = sha256_file(&expected_file).unwrap();
         crate::verified_artifact::record_test_github_origin_download(
+            &user_dirs,
             &source.source_key(),
             &expected_sha256,
             None,
@@ -2072,7 +2119,7 @@ mod tests {
         let lock_path = crate::provider_resolver::provider_lock_path(project.path());
         lock_file.save(&lock_path).unwrap();
         let lock_before = std::fs::read(&lock_path).unwrap();
-        let global_wasm = global_cache_path_revision(&source, &test_sha()).unwrap();
+        let global_wasm = global_cache_path_revision(&user_dirs, &source, &test_sha()).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
@@ -2082,8 +2129,14 @@ mod tests {
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
-        let result =
-            resolve_provider_by_revision(&mut guarded, &source, "main", "aws", LockMode::Normal);
+        let result = resolve_provider_by_revision(
+            &user_dirs,
+            &mut guarded,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+        );
 
         let error = result.expect_err("a global cache entry must match the revision lock pin");
         assert!(
@@ -2116,21 +2169,23 @@ mod tests {
 
     #[test]
     fn revision_global_cache_match_installs_without_repinning() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "test-token");
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
         let source = test_source();
         let cached_bytes = b"lock-matching global revision provider";
-        let global_wasm = global_cache_path_revision(&source, &test_sha()).unwrap();
+        let global_wasm = global_cache_path_revision(&user_dirs, &source, &test_sha()).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
         let sha256 = sha256_file(global_wasm.as_path()).unwrap();
         crate::verified_artifact::record_test_github_origin_download(
+            &user_dirs,
             &source.source_key(),
             &sha256,
             None,
@@ -2154,9 +2209,15 @@ mod tests {
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
-        let (resolved, resolved_sha) =
-            resolve_provider_by_revision(&mut guarded, &source, "main", "aws", LockMode::Normal)
-                .unwrap();
+        let (resolved, resolved_sha) = resolve_provider_by_revision(
+            &user_dirs,
+            &mut guarded,
+            &source,
+            "main",
+            "aws",
+            LockMode::Normal,
+        )
+        .unwrap();
 
         assert_eq!(resolved_sha, test_sha());
         assert_eq!(std::fs::read(resolved.as_path()).unwrap(), cached_bytes);
@@ -2178,13 +2239,12 @@ mod tests {
 
     #[test]
     fn revision_global_sidecar_write_failure_does_not_replace_cached_bytes() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
-        let global_wasm = global_cache_path_revision(&source, &test_sha()).unwrap();
+        let global_wasm = global_cache_path_revision(&user_dirs, &source, &test_sha()).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         let old_bytes = b"old globally cached provider";
         let new_bytes = b"newly selected provider";
@@ -2197,6 +2257,7 @@ mod tests {
         let mut guarded =
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
         let result = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2224,11 +2285,10 @@ mod tests {
 
     #[test]
     fn revision_project_sidecar_write_failure_after_recovery_does_not_publish_bytes() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -2243,7 +2303,7 @@ mod tests {
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
         let sidecar = revision_sidecar_path(&wasm_path);
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
@@ -2252,6 +2312,7 @@ mod tests {
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2288,11 +2349,10 @@ mod tests {
 
     #[test]
     fn revision_cache_crash_state_is_reverified_before_use() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
@@ -2323,11 +2383,12 @@ mod tests {
             sha256: sha256_bytes(b"locked provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2687,12 +2748,9 @@ mod tests {
 
     #[test]
     fn verified_revision_download_writes_user_trust_record() {
-        let _env_guard = crate::test_env_guard();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
         let source = test_source();
         let wasm = b"verified revision provider";
         let commit_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/commits/main";
@@ -2721,6 +2779,7 @@ mod tests {
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with_api(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2734,11 +2793,15 @@ mod tests {
         assert_eq!(resolved_sha, test_sha());
         assert_eq!(std::fs::read(installed.as_path()).unwrap(), wasm);
         assert!(
-            crate::user_trust::load_user_verified_identity(&sha256, &source.source_key())
-                .unwrap()
-                .is_some()
+            crate::user_trust::load_user_verified_identity(
+                &user_dirs,
+                &sha256,
+                &source.source_key(),
+            )
+            .unwrap()
+            .is_some()
         );
-        assert_eq!(trust_record_files(trust.path()).len(), 1);
+        assert_eq!(trust_record_files(user_dirs.trust_record_dir()).len(), 1);
         assert_eq!(
             std::fs::read_to_string(revision_sidecar_path(installed.as_path()))
                 .unwrap()
@@ -2749,16 +2812,16 @@ mod tests {
 
     #[test]
     fn revision_global_cache_copy_does_not_write_user_trust_record() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = test_source();
         let wasm = b"cached allow-listed revision provider";
         let sha = test_sha();
-        let global_wasm = global_cache_path_revision(&source, &sha).unwrap();
+        let global_wasm = global_cache_path_revision(&user_dirs, &source, &sha).unwrap();
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), wasm).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
@@ -2790,17 +2853,17 @@ mod tests {
 
         assert_eq!(installed.artifact_id(), test_artifact_id(42));
         assert_eq!(std::fs::read(installed.path().as_path()).unwrap(), wasm);
-        assert!(trust_record_files(trust.path()).is_empty());
+        assert!(trust_record_files(trust).is_empty());
     }
 
     #[test]
     fn fork_pull_request_revision_run_is_rejected_without_trust_record() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
+        let trust = user_dirs.trust_record_dir();
+        std::fs::create_dir_all(trust).unwrap();
         let source = test_source();
         let commit_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/commits/main";
         let runs_url = format!(
@@ -2820,6 +2883,7 @@ mod tests {
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
         let error = resolve_provider_by_revision_with_api(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2830,7 +2894,7 @@ mod tests {
         .expect_err("a fork pull_request run must not be eligible");
 
         assert!(error.contains("Only push runs"), "{error}");
-        assert!(trust_record_files(trust.path()).is_empty());
+        assert!(trust_record_files(trust).is_empty());
         assert_eq!(
             http.requests()
                 .iter()
@@ -2844,11 +2908,10 @@ mod tests {
         rejected_head_repository: &str,
         rejected_head_sha: &str,
     ) {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let commit_url = "https://api.github.com/repos/carina-rs/carina-provider-aws/commits/main";
         let runs_url = format!(
@@ -2893,6 +2956,7 @@ mod tests {
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with_api(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -2935,11 +2999,10 @@ mod tests {
 
     #[test]
     fn normal_mode_reselects_legacy_revision_at_locked_sha_and_records_artifact_id() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let wasm = b"legacy pinned provider";
         let lock_path = crate::provider_resolver::provider_lock_path(project.path());
         std::fs::write(
@@ -2965,6 +3028,7 @@ sha256 = "{}"
         let listed_shas = RefCell::new(Vec::new());
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut lock_file,
             &test_source(),
             "main",
@@ -3008,10 +3072,10 @@ sha256 = "{}"
 
     #[test]
     fn upgrade_mode_rejects_changed_content_at_legacy_locked_sha() {
-        let _env_guard = crate::test_env_guard();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let locked_wasm = b"legacy pinned provider";
         let lock_path = crate::provider_resolver::provider_lock_path(project.path());
         std::fs::write(
@@ -3037,6 +3101,7 @@ sha256 = "{}"
         let resolved_ref = Cell::new(false);
 
         let error = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut lock_file,
             &test_source(),
             "main",
@@ -3402,6 +3467,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_first_use_expiry_remedy_does_not_claim_a_sha256_pin() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let lock_file = crate::provider_resolver::LockFile::default();
         let source = test_source();
         let pin = lookup_revision_artifact_pin(
@@ -3414,7 +3480,12 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&source, &test_sha(), Path::new("infra/project")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &source,
+                &test_sha(),
+                Path::new("infra/project"),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("expired-build", 1, true)]),
@@ -3518,8 +3589,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_locked_replay_skips_run_listing() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -3533,7 +3603,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -3545,7 +3615,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || {
                 listed_runs.set(true);
@@ -3567,8 +3637,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_locked_replay_without_head_sha_uses_pinned_download() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -3582,7 +3651,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -3593,7 +3662,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> {
                 panic!("missing replay metadata must not force run discovery")
@@ -3613,11 +3682,10 @@ sha256 = "{}"
     }
 
     fn assert_revision_artifact_recovery_mode(mode: LockMode, expected_artifact_id: u64) {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm = b"locked provider";
         let locked_sha256 = sha256_bytes(wasm);
@@ -3633,7 +3701,7 @@ sha256 = "{}"
             sha256: locked_sha256.clone(),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let lock_path = crate::provider_resolver::provider_lock_path(project.path());
         let lock_model_before = lock_file.to_toml_string().unwrap();
         lock_file.save(&lock_path).unwrap();
@@ -3642,6 +3710,7 @@ sha256 = "{}"
         let mut guarded = install_lock.load_lock_file().unwrap().unwrap();
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -3705,11 +3774,10 @@ sha256 = "{}"
     }
 
     fn assert_locked_recovery_then_warm_cache_updates_artifact_id(global_cache_only: bool) {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -3724,11 +3792,12 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -3762,6 +3831,7 @@ sha256 = "{}"
         }
 
         resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -3891,8 +3961,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_missing_locked_artifact_recovers_by_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         for status in [404, 410] {
             let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -3907,7 +3976,7 @@ sha256 = "{}"
                 sha256: sha256_bytes(wasm),
                 registry: None,
             });
-            record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+            record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
             let pin = lookup_revision_artifact_pin(
                 &lock_file,
                 &test_source().source_key(),
@@ -3919,7 +3988,12 @@ sha256 = "{}"
 
             let selected = resolve_revision_artifact(
                 &pin,
-                RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+                RevisionArtifactLocation::new(
+                    &user_dirs,
+                    &test_source(),
+                    &test_sha(),
+                    Path::new("."),
+                ),
                 LockMode::Normal,
                 || Ok(vec![workflow_run_id(100)]),
                 |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -3955,6 +4029,7 @@ sha256 = "{}"
             .unwrap();
             let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
             let (verified, verified_pin) = match verified_revision_artifact::publish_download(
+                &user_dirs,
                 &selected,
                 &install_lock,
                 &destination,
@@ -3990,8 +4065,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_missing_metadata_recovers_without_downloading_the_pin() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4005,7 +4079,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4016,7 +4090,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4037,8 +4111,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_metadata_transport_error_fails_closed() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4052,7 +4125,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4063,7 +4136,7 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> {
                 panic!("metadata failure must not enter recovery")
@@ -4089,8 +4162,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_different_commit_recovery_carries_reason_to_notice() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4104,7 +4176,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4115,7 +4187,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4141,8 +4213,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_same_id_recovery_has_no_notice_or_lock_update_report() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4156,7 +4227,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4168,7 +4239,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |_| Ok(vec![artifact("same-build", 42, false)]),
@@ -4200,11 +4271,10 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_from_another_commit_recovers_before_downloading_the_pin() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -4219,7 +4289,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
 
         let metadata_url =
             "https://api.github.com/repos/carina-rs/carina-provider-aws/actions/artifacts/42";
@@ -4261,6 +4331,7 @@ sha256 = "{}"
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with_api(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -4292,8 +4363,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_missing_locked_artifact_rejects_different_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
@@ -4307,7 +4377,7 @@ sha256 = "{}"
             registry: None,
         });
         let source = test_source();
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &source.source_key(),
@@ -4317,7 +4387,7 @@ sha256 = "{}"
         );
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&source, &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &source, &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4350,8 +4420,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_expired_locked_artifact_recovers_by_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4365,7 +4434,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4376,7 +4445,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| {
@@ -4402,8 +4471,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_expired_pin_is_found_on_second_artifact_page() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4418,7 +4486,7 @@ sha256 = "{}"
             registry: None,
         });
         let source = test_source();
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let repo = RepoSlug::try_from(&source).unwrap();
         let pin = lookup_revision_artifact_pin(
             &lock_file,
@@ -4443,7 +4511,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&source, &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &source, &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |run_id| fetch_run_artifacts(&repo, run_id, &api),
@@ -4471,8 +4539,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_locked_download_failure_does_not_recommend_rerunning_ci() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4486,7 +4553,7 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4497,7 +4564,7 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("still-current", 42, false)]),
@@ -4606,8 +4673,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_locked_replay_without_head_sha_rejects_sha256_mismatch() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
@@ -4620,7 +4686,7 @@ sha256 = "{}"
             sha256: sha256_bytes(b"locked provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4631,7 +4697,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> { panic!("locked replay must not list runs") },
             |_| panic!("locked replay must not fetch run artifacts"),
@@ -4660,8 +4726,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_upgrade_reselects_instead_of_replaying_pin() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
@@ -4674,7 +4739,7 @@ sha256 = "{}"
             sha256: sha256_bytes(b"new provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &test_source(), &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &test_source(), &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &test_source().source_key(),
@@ -4686,7 +4751,7 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
             LockMode::Upgrade,
             || {
                 listed_runs.set(true);
@@ -4722,8 +4787,7 @@ sha256 = "{}"
 
     #[test]
     fn revision_artifact_same_sha_upgrade_rejects_changed_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -4738,7 +4802,7 @@ sha256 = "{}"
             sha256: sha256_bytes(b"old provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let pin = lookup_revision_artifact_pin(
             &lock_file,
             &source.source_key(),
@@ -4776,11 +4840,10 @@ sha256 = "{}"
 
     #[test]
     fn upgrade_same_sha_rejects_changed_content_through_revision_resolver() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4794,11 +4857,12 @@ sha256 = "{}"
             sha256: sha256_bytes(b"old provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",
@@ -4828,12 +4892,11 @@ sha256 = "{}"
 
     #[test]
     fn normal_and_upgrade_unchanged_revision_mismatches_have_the_same_remedy() {
+        let user_dirs = carina_core::TestUserDirs::new();
         for mode in [LockMode::Normal, LockMode::Upgrade] {
-            let _env_guard = crate::test_env_guard();
-            let (_trust, _trust_env) = isolated_trust_records();
             let project = tempfile::tempdir().unwrap();
-            let global = tempfile::tempdir().unwrap();
-            let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+            let global = user_dirs.plugin_cache_dir();
+            std::fs::create_dir_all(global).unwrap();
             let source = test_source();
             let mut lock_file = crate::provider_resolver::LockFile::default();
             lock_file.upsert(LockEntry {
@@ -4847,11 +4910,12 @@ sha256 = "{}"
                 sha256: sha256_bytes(b"old provider"),
                 registry: None,
             });
-            record_revision_lock_trust(&lock_file, &source, &test_sha());
+            record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
             let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
             let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
             let error = resolve_provider_by_revision_with(
+                &user_dirs,
                 &mut guarded,
                 &source,
                 "main",
@@ -4882,11 +4946,10 @@ sha256 = "{}"
 
     #[test]
     fn upgrade_renamed_revision_at_same_sha_rejects_changed_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
@@ -4900,11 +4963,12 @@ sha256 = "{}"
             sha256: sha256_bytes(b"old provider"),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "v1.2.3",
@@ -4934,11 +4998,10 @@ sha256 = "{}"
 
     #[test]
     fn upgrade_renamed_revision_at_same_sha_records_new_revision_when_content_matches() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let wasm = b"locked provider";
         let mut lock_file = crate::provider_resolver::LockFile::default();
@@ -4953,11 +5016,12 @@ sha256 = "{}"
             sha256: sha256_bytes(wasm),
             registry: None,
         });
-        record_revision_lock_trust(&lock_file, &source, &test_sha());
+        record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
         let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "v1.2.3",
@@ -4993,11 +5057,10 @@ sha256 = "{}"
 
     #[test]
     fn upgrade_moved_sha_reselects_and_records_new_content() {
-        let _env_guard = crate::test_env_guard();
-        let (_trust, _trust_env) = isolated_trust_records();
+        let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let _cache = crate::ScopedEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
+        let global = user_dirs.plugin_cache_dir();
+        std::fs::create_dir_all(global).unwrap();
         let source = test_source();
         let moved_sha = commit_sha(OTHER_SHA);
         let moved_wasm = b"provider from moved commit";
@@ -5017,6 +5080,7 @@ sha256 = "{}"
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
+            &user_dirs,
             &mut guarded,
             &source,
             "main",

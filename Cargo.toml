@@ -6,6 +6,7 @@ members = [
     "carina-plugin-host",
     "carina-plugin-sdk",
     "carina-provider-mock",
+    "carina-provider-mock-http",
     "carina-provider-resolver",
     "carina-provider-protocol",
     "carina-sigstore-tlog",

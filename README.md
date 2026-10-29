@@ -374,6 +374,7 @@ carina/
 ├── carina-plugin-sdk/       # SDK for building WASM provider plugins
 ├── carina-plugin-wit/       # WIT interface definitions (git submodule)
 ├── carina-provider-mock/    # Mock provider for testing
+├── carina-provider-mock-http/ # Minimal wasi:http integration-test provider
 ├── carina-provider-protocol/ # Protocol definitions for provider communication
 ├── carina-provider-resolver/ # Resolves and loads provider plugins
 ├── carina-state/            # State management
@@ -506,12 +507,14 @@ The state file tracks:
 
 ### Run tests
 
-Tests run under [nextest](https://nexte.st/) (`cargo install cargo-nextest --locked`); doctests need a separate run:
+Tests run under [nextest](https://nexte.st/) 0.9.133 or later (`cargo install cargo-nextest --locked`); doctests need a separate run:
 
 ```bash
 cargo nextest run
 cargo test --workspace --doc
 ```
+
+Before any test starts, nextest runs a setup script (`.config/nextest.toml`) that points `HOME`, `TMPDIR` and the `CARINA_*` directory variables at a temporary home under the target directory. Tests therefore never read or write your real `~/.carina`. Inside a nextest run, `carina` refuses to use any other home. Running the test suite with plain `cargo test` skips this isolation, so use it for doctests only.
 
 ### Build
 

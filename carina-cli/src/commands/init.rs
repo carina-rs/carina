@@ -14,6 +14,7 @@ use crate::commands::{
 use carina_core::hint::ProjectCommand;
 
 pub async fn run_init(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     upgrade: bool,
     locked: bool,
@@ -27,7 +28,7 @@ pub async fn run_init(
         migrate_state,
         force,
         |install_lock, providers, mode| {
-            carina_provider_resolver::resolve_all(install_lock, providers, mode)
+            carina_provider_resolver::resolve_all(user_dirs, install_lock, providers, mode)
                 .map(|resolved| resolved.len())
                 .map_err(|error| error.to_string())
         },
@@ -206,6 +207,7 @@ async fn run_init_with_provider_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::UserDirs;
     use carina_core::provider_source::{ProviderSource, RemoteSource};
     use carina_provider_resolver::{
         AssetId, FixtureGithubHttp, FixtureRegistryHttp, LockEntry, LockEntryKind, LockFile,
@@ -279,7 +281,11 @@ mod tests {
             .count()
     }
 
-    async fn run_init_with_fixture(project: &Path, http: &FixtureRegistryHttp) {
+    async fn run_init_with_fixture(
+        user_dirs: &UserDirs,
+        project: &Path,
+        http: &FixtureRegistryHttp,
+    ) {
         run_init_with_provider_resolver(
             project,
             false,
@@ -288,6 +294,7 @@ mod tests {
             false,
             |install_lock, providers, mode| {
                 carina_provider_resolver::resolve_all_with_fixture_registry(
+                    user_dirs,
                     install_lock,
                     providers,
                     mode,
@@ -302,6 +309,7 @@ mod tests {
     }
 
     async fn run_init_with_fixtures(
+        user_dirs: &UserDirs,
         project: &Path,
         registry_http: &FixtureRegistryHttp,
         github_http: &FixtureGithubHttp,
@@ -314,6 +322,7 @@ mod tests {
             false,
             |install_lock, providers, mode| {
                 carina_provider_resolver::resolve_all_with_fixture_clients(
+                    user_dirs,
                     install_lock,
                     providers,
                     mode,
@@ -328,7 +337,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn assert_installed_provider_loads_as_aws(project: &Path) {
+    async fn assert_installed_provider_loads_as_aws(user_dirs: &UserDirs, project: &Path) {
         let loaded = load_configuration_with_config(
             project,
             &ProviderContext::default(),
@@ -339,7 +348,7 @@ mod tests {
         let installed = carina_provider_resolver::find_installed_provider(project, config).unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
         let class = installed
-            .load_with(&grants, |verified| async move {
+            .load_with(user_dirs, &grants, |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
             })
             .await
@@ -349,7 +358,6 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -359,10 +367,8 @@ mod tests {
 
     async fn init_with_up_to_date_github_lock_case() {
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"up-to-date GitHub provider";
@@ -417,7 +423,7 @@ mod tests {
             )
             .bytes(&origin_url, bytes);
 
-        run_init_with_fixtures(project.path(), &registry_http, &github_http).await;
+        run_init_with_fixtures(&user_dirs, project.path(), &registry_http, &github_http).await;
 
         assert_eq!(
             github_http
@@ -435,11 +441,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(tree_contains_file(trust.path()));
+        assert!(tree_contains_file(user_dirs.trust_record_dir()));
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
-        assert_installed_provider_loads_as_aws(project.path()).await;
+        assert_installed_provider_loads_as_aws(&user_dirs, project.path()).await;
 
-        run_init_with_fixtures(project.path(), &registry_http, &github_http).await;
+        run_init_with_fixtures(&user_dirs, project.path(), &registry_http, &github_http).await;
 
         assert_eq!(
             github_http
@@ -462,7 +468,6 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -472,12 +477,16 @@ mod tests {
 
     async fn init_with_up_to_date_registry_lock_case() {
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let first_trust = tempfile::tempdir().unwrap();
-        let fresh_trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _first_trust_env =
-            crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", first_trust.path());
+        let first_user_root = tempfile::tempdir().unwrap();
+        let fresh_user_root = tempfile::tempdir().unwrap();
+        let first_user_dirs = UserDirs::under(first_user_root.path());
+        let fresh_user_dirs = first_user_dirs
+            .clone()
+            .with_trust_record_dir(fresh_user_root.path().join(".carina").join("trust"));
+        assert_eq!(
+            first_user_dirs.plugin_cache_dir(),
+            fresh_user_dirs.plugin_cache_dir()
+        );
         fs::write(
             project.path().join("providers.crn"),
             "provider aws {\n  source = 'carina-rs/aws'\n}\n",
@@ -485,29 +494,46 @@ mod tests {
         .unwrap();
         let http = official_signed_fixture_registry();
 
-        run_init_with_fixture(project.path(), &http).await;
+        run_init_with_fixture(&first_user_dirs, project.path(), &http).await;
 
         let lock_path = project.path().join("carina-providers.lock");
         let lock_before = fs::read(&lock_path).unwrap();
         let downloads_before = request_count(&http, SIGNED_ARTIFACT_URL);
         assert_eq!(downloads_before, 1);
-        assert_installed_provider_loads_as_aws(project.path()).await;
+        let project_wasm = project
+            .path()
+            .join(".carina/providers/carina-rs/aws")
+            .join(SIGNED_VERSION)
+            .join("aws.wasm");
+        let global_wasm = first_user_dirs
+            .plugin_cache_dir()
+            .join("carina-rs/aws")
+            .join(SIGNED_VERSION)
+            .join("aws.wasm");
+        // Model a warm shared cache whose verified bytes are not yet trusted by
+        // the fresh user.
+        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
+        fs::copy(&project_wasm, &global_wasm).unwrap();
+        assert!(
+            global_wasm.is_file(),
+            "warm shared global cache must contain {}",
+            global_wasm.display()
+        );
+        assert_installed_provider_loads_as_aws(&first_user_dirs, project.path()).await;
 
-        let _fresh_trust_env =
-            crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", fresh_trust.path());
-        assert!(!tree_contains_file(fresh_trust.path()));
+        assert!(!tree_contains_file(fresh_user_dirs.trust_record_dir()));
 
-        run_init_with_fixture(project.path(), &http).await;
+        run_init_with_fixture(&fresh_user_dirs, project.path(), &http).await;
 
         assert_eq!(
             request_count(&http, SIGNED_ARTIFACT_URL),
             downloads_before + 1
         );
-        assert!(tree_contains_file(fresh_trust.path()));
+        assert!(tree_contains_file(fresh_user_dirs.trust_record_dir()));
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
-        assert_installed_provider_loads_as_aws(project.path()).await;
+        assert_installed_provider_loads_as_aws(&fresh_user_dirs, project.path()).await;
 
-        run_init_with_fixture(project.path(), &http).await;
+        run_init_with_fixture(&fresh_user_dirs, project.path(), &http).await;
 
         assert_eq!(
             request_count(&http, SIGNED_ARTIFACT_URL),
@@ -518,10 +544,8 @@ mod tests {
 
     async fn assert_init_runs_real_verifier_inside_async_command() {
         let project = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _cache_env = crate::ScopedTestEnvVar::set("CARINA_PLUGIN_CACHE_DIR", global.path());
-        let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
         fs::write(
             project.path().join("providers.crn"),
             r#"provider aws {
@@ -541,6 +565,7 @@ mod tests {
             false,
             |install_lock, providers, mode| {
                 carina_provider_resolver::resolve_all_with_fixture_registry(
+                    &user_dirs,
                     install_lock,
                     providers,
                     mode,
@@ -573,7 +598,6 @@ mod tests {
 
     #[test]
     fn init_real_verifier_is_safe_on_current_thread_runtime() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -583,7 +607,6 @@ mod tests {
 
     #[test]
     fn init_real_verifier_is_safe_on_multi_thread_runtime() {
-        let _env_guard = crate::test_env_guard();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

@@ -190,6 +190,15 @@ fn blank_lines_above(text: &str, marker: &str) -> usize {
     n
 }
 
+/// Remove rendered line breaks for assertions about text whose diagnostic
+/// prefix can push it across the PTY width. Structural assertions must keep
+/// using the original rendered output so blank lines remain observable.
+fn without_rendered_line_breaks(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect()
+}
+
 /// Round-4 regression (#3150): a warning printed after refresh outcomes must
 /// still be followed by exactly one backend-owned separator before the plan.
 #[test]
@@ -209,7 +218,7 @@ fn warning_after_bars_yields_single_blank_line_on_pty() {
     let out = run_on_pty(&["plan", tmp.path().to_str().unwrap()], tmp.path());
 
     assert!(
-        out.contains("for-loop binding 'x' is unused"),
+        without_rendered_line_breaks(&out).contains("for-loop binding 'x' is unused"),
         "expected the unused-for-binding warning.\n{out}"
     );
     assert!(

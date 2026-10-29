@@ -292,6 +292,7 @@ impl StateCommands {
 
 /// Run state subcommands
 pub async fn run_state_command(
+    user_dirs: &carina_core::UserDirs,
     command: StateCommands,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -301,9 +302,9 @@ pub async fn run_state_command(
             bucket_name,
             force,
             path,
-        } => run_state_bucket_delete(&bucket_name, force, &path, provider_context).await,
+        } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
-            run_state_refresh(&path, lock, provider_context, cancel).await
+            run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
         }
         StateCommands::List { path, state_url } => {
             run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
@@ -875,6 +876,7 @@ async fn run_state_show(
 
 /// Run state bucket delete command
 async fn run_state_bucket_delete(
+    user_dirs: &carina_core::UserDirs,
     bucket_name: &str,
     force: bool,
     path: &Path,
@@ -910,7 +912,7 @@ async fn run_state_bucket_delete(
     // that command wiring before asking the operator to confirm deletion; the
     // resolved provider values needed for construction can wait until after
     // confirmation.
-    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let validated_config = providers.validate_evaluated_config(
         parsed,
         base_dir,
@@ -1034,6 +1036,7 @@ async fn create_state_bucket_delete_provider<R>(
 
 /// Run state refresh command
 pub async fn run_state_refresh(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
@@ -1049,7 +1052,7 @@ pub async fn run_state_refresh(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_evaluated_config(
         parsed,
         base_dir,
@@ -2533,6 +2536,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -2544,7 +2548,7 @@ mod tests {
         .unwrap();
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
-        let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let mut validated_config = providers
             .validate_evaluated_config(parsed, &downstream, true, &[], &[])
             .unwrap();
@@ -2563,9 +2567,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let mut validated_config = providers
             .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
@@ -2584,9 +2589,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let mut validated_config = providers
             .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
@@ -3423,6 +3429,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_loads_providers_once() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
         fixture.write_crn(format!(
@@ -3432,6 +3439,7 @@ mod tests {
 
         let load_count = crate::wiring::track_provider_loads_for_test();
         run_state_refresh(
+            &user_dirs,
             fixture.config_path(),
             false,
             &ProviderContext::default(),
@@ -3449,6 +3457,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
         let fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
@@ -3494,6 +3503,7 @@ mod tests {
 
         let provider_context = ProviderContext::default();
         let refresh = run_state_refresh(
+            &user_dirs,
             fixture.config_path(),
             true,
             &provider_context,

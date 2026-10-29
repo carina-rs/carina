@@ -66,6 +66,7 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
 /// Each entry is (source_directory, provider_config) so providers are installed
 /// in the directory containing the `.crn` file, not at the workspace root.
 fn build_factories(
+    user_dirs: Result<&carina_core::UserDirs, &str>,
     providers: &[(PathBuf, ProviderConfig)],
     grants: &carina_provider_resolver::TrustedLocalGrants,
 ) -> FactoryBuildResult {
@@ -97,12 +98,26 @@ fn build_factories(
                 continue;
             }
         };
+        let user_dirs = match user_dirs {
+            Ok(user_dirs) => user_dirs,
+            Err(error) => {
+                errors.insert(
+                    config.name.clone(),
+                    format!(
+                        "Could not resolve user directories required to load provider '{}': {error}",
+                        config.name
+                    ),
+                );
+                continue;
+            }
+        };
 
         match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
+                user_dirs,
                 grants,
                 |verified| async move {
-                    carina_plugin_host::WasmProviderFactory::from_bytes(verified).await
+                    carina_plugin_host::WasmProviderFactory::from_bytes(verified, user_dirs).await
                 },
             ))
         }) {
@@ -143,6 +158,16 @@ fn trusted_local_grants_from_env(
 async fn main() {
     env_logger::init();
 
+    // Provider loading needs user-owned storage, but the rest of the language
+    // server remains useful when that storage cannot be resolved.
+    #[expect(clippy::disallowed_methods)]
+    let user_dirs = carina_core::UserDirs::from_real_home().map_err(|error| {
+        let message = error.to_string();
+        log::error!("LSP provider loading disabled: {message}");
+        message
+    });
+    let user_dirs = std::sync::Arc::new(user_dirs);
+
     let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
     let trusted_local_grants =
         trusted_local_grants_from_env(trusted_local_env.as_deref(), |error| {
@@ -169,8 +194,15 @@ async fn main() {
         // Pass factory builder callback — actual WASM loading happens asynchronously
         // after initialize, not during server construction.
         let trusted_local_grants = std::sync::Arc::clone(&trusted_local_grants);
+        let user_dirs = std::sync::Arc::clone(&user_dirs);
         let factory_builder: carina_lsp::backend::FactoryBuilder =
-            std::sync::Arc::new(move |providers| build_factories(providers, &trusted_local_grants));
+            std::sync::Arc::new(move |providers| {
+                build_factories(
+                    user_dirs.as_ref().as_ref().map_err(String::as_str),
+                    providers,
+                    &trusted_local_grants,
+                )
+            });
 
         // Provider install prober: used by the drift poller to notice selected
         // artifact or lock-file metadata changes. Factory construction still
@@ -192,37 +224,6 @@ mod tests {
     use carina_provider_resolver::ProviderArtifactFingerprint;
     use indexmap::IndexMap;
     use std::path::PathBuf;
-
-    fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct ScopedTestEnvVar {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl ScopedTestEnvVar {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: callers hold test_env_guard while this process-wide override is active.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for ScopedTestEnvVar {
-        fn drop(&mut self) {
-            // SAFETY: the test still holds test_env_guard while this guard is dropped.
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var(self.name, value) },
-                None => unsafe { std::env::remove_var(self.name) },
-            }
-        }
-    }
 
     fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
         carina_provider_resolver::TrustedLocalGrants::parse(&[], None).unwrap()
@@ -275,11 +276,14 @@ mod tests {
     /// it and the poll detected fake drift every tick.
     #[test]
     fn build_factories_fingerprint_length_matches_configs_length() {
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = carina_core::UserDirs::under(user_root.path());
         let providers = vec![
             cfg("aws", Some("file:///nonexistent/fake.wasm"), None),
             cfg("aws", None, Some("us")),
         ];
-        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
+        let (_factories, errors, fingerprint) =
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
         assert_eq!(
             fingerprint.len(),
             providers.len(),
@@ -302,10 +306,12 @@ mod tests {
     #[test]
     fn source_less_mock_uses_builtin_provider_without_load_error() {
         let tmp = tempfile::tempdir().unwrap();
+        let user_dirs = carina_core::UserDirs::under(&tmp.path().join("user"));
         let (_, config) = cfg("mock", None, None);
         let providers = vec![(tmp.path().to_path_buf(), config)];
 
-        let (factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
+        let (factories, errors, fingerprint) =
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
 
         assert!(factories.is_empty());
         assert!(
@@ -318,6 +324,31 @@ mod tests {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )]
+        );
+    }
+
+    #[test]
+    fn user_dirs_resolution_failure_is_reported_as_a_provider_load_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("local-provider.wasm");
+        std::fs::write(&wasm, b"fixture").unwrap();
+        let providers = vec![cfg(
+            "local",
+            Some(&format!("file://{}", wasm.display())),
+            None,
+        )];
+        let guard_error = "nextest home isolation guard rejected user directories";
+
+        let (factories, errors, fingerprint) =
+            build_factories(Err(guard_error), &providers, &no_local_grants());
+
+        assert!(factories.is_empty());
+        assert_eq!(fingerprint.len(), 1);
+        assert_eq!(
+            errors.get("local").map(String::as_str),
+            Some(
+                "Could not resolve user directories required to load provider 'local': nextest home isolation guard rejected user directories"
+            )
         );
     }
 
@@ -388,10 +419,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unverified_official_provider_is_reported_before_wasm_loading() {
-        let _env_guard = test_env_guard();
         let tmp = tempfile::tempdir().unwrap();
-        let trust = tempfile::tempdir().unwrap();
-        let _trust_env = ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+        let user_home = tempfile::tempdir().unwrap();
+        let user_dirs = carina_core::UserDirs::under(user_home.path());
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.5.0";
         let parsed_source: ProviderSource = source.parse().unwrap();
@@ -422,8 +452,11 @@ mod tests {
             .unwrap();
         let (_, config) = cfg("aws", Some(source), None);
 
-        let (factories, errors, _) =
-            build_factories(&[(tmp.path().to_path_buf(), config)], &no_local_grants());
+        let (factories, errors, _) = build_factories(
+            Ok(&user_dirs),
+            &[(tmp.path().to_path_buf(), config)],
+            &no_local_grants(),
+        );
 
         assert!(factories.is_empty());
         let message = errors.get("aws").expect("LSP load diagnostic");
@@ -475,7 +508,9 @@ mod tests {
 
         let (_, config) = cfg("aws", Some(source), None);
         let providers = vec![(tmp.path().to_path_buf(), config.clone())];
-        let (_factories, errors, fingerprint) = build_factories(&providers, &no_local_grants());
+        let user_dirs = carina_core::UserDirs::under(&tmp.path().join("user"));
+        let (_factories, errors, fingerprint) =
+            build_factories(Ok(&user_dirs), &providers, &no_local_grants());
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(

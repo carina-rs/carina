@@ -1095,6 +1095,7 @@ dependencies = [
  "argon2",
  "carina-provider-protocol",
  "chrono",
+ "dirs",
  "futures",
  "hex",
  "indexmap 2.13.0",
@@ -1148,7 +1149,6 @@ dependencies = [
  "carina-provider-protocol",
  "carina-provider-resolver",
  "carina-state",
- "dirs",
  "getrandom 0.3.4",
  "hex",
  "hmac 0.12.1",
@@ -1206,6 +1206,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "carina-provider-mock-http"
+version = "0.7.1"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "carina-plugin-sdk",
+ "futures",
+ "serde",
+ "serde_json",
+ "wasi 0.14.7+wasi-0.2.4",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "carina-provider-protocol"
 version = "0.3.0"
 dependencies = [
@@ -1220,7 +1233,6 @@ dependencies = [
  "base64 0.22.1",
  "carina-core",
  "carina-sigstore-tlog",
- "dirs",
  "futures",
  "indexmap 2.13.0",
  "libc",

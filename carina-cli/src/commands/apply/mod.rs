@@ -1321,7 +1321,9 @@ fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1331,6 +1333,7 @@ pub async fn run_apply(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_with_observer_factory(
+        user_dirs,
         path,
         auto_approve,
         lock,
@@ -1346,6 +1349,7 @@ pub async fn run_apply(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_with_observer_factory(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1367,7 +1371,7 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
@@ -2976,7 +2980,9 @@ fn rehydrate_desired_plan_file_from_parts(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_apply_from_plan(
+    user_dirs: &carina_core::UserDirs,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -2986,6 +2992,7 @@ pub async fn run_apply_from_plan(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_from_plan_with_observer_factory(
+        user_dirs,
         plan_path,
         auto_approve,
         lock,
@@ -3001,6 +3008,7 @@ pub async fn run_apply_from_plan(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
+    user_dirs: &carina_core::UserDirs,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -3168,6 +3176,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // current-config secret validation, backend drift, saved-plan backend
     // mismatch, or the state-lock gate.
     let providers = ProviderLoad::load(
+        user_dirs,
         inspected_plan.provider_configs().as_provider_configs(),
         base_dir,
     )?
@@ -3778,6 +3787,7 @@ async fn run_apply_from_plan_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
+    user_dirs: &carina_core::UserDirs,
     inspected_plan: InspectedPlanFile,
     provider_context: &ProviderContext,
     auto_approve: bool,
@@ -3790,6 +3800,7 @@ async fn run_apply_from_plan_locked(
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
     let inspected_plan = match ProviderLoad::load(
+        user_dirs,
         inspected_plan.provider_configs().as_provider_configs(),
         apply_target.source_dir(),
     )

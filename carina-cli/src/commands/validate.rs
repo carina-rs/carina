@@ -266,6 +266,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
 }
 
 pub fn run_validate(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     json: bool,
     provider_context: &ProviderContext,
@@ -304,7 +305,7 @@ pub fn run_validate(
     }
 
     let (providers, provider_load_error) =
-        ProviderLoad::load_reporting(&parsed.providers, base_dir);
+        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
     let validation_report = providers.validation_report(
         &mut parsed,
@@ -447,6 +448,7 @@ mod tests {
 
     #[test]
     fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
             fixture.path().join("main.crn"),
@@ -468,9 +470,14 @@ backend s3 {
         )
         .unwrap();
 
-        let error = run_validate(fixture.path(), false, &ProviderContext::default())
-            .expect_err("loader and backend validation errors must both fail validation")
-            .to_string();
+        let error = run_validate(
+            &user_dirs,
+            fixture.path(),
+            false,
+            &ProviderContext::default(),
+        )
+        .expect_err("loader and backend validation errors must both fail validation")
+        .to_string();
 
         assert!(
             error.contains("declared more than once with a source"),
