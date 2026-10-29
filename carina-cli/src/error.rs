@@ -590,9 +590,7 @@ pub enum AppError {
 
     /// Distinct desired resources resolved to the same execution identity.
     #[error(transparent)]
-    DuplicateResolvedResourceId(
-        #[from] carina_core::override_aware::DuplicateResolvedResourceIdError,
-    ),
+    DuplicateResolvedResourceId(#[from] crate::wiring::DuplicateResolvedResourceIdError),
 
     /// A provider-boundary check failed for a resource before dispatch.
     #[error(transparent)]

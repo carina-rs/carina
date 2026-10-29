@@ -1,7 +1,6 @@
 use super::*;
 use carina_core::binding_index::PreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -31,6 +30,7 @@ use crate::commands::plan::PlanFileContents;
 use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
+use crate::wiring::{CanonicalResourcePair, OverrideAwareResources, resolve_config_names_for_test};
 
 fn validate_with_test_factories(
     parsed: &mut carina_core::parser::InferredFile,
@@ -78,36 +78,42 @@ fn canonical_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::InferredExportParam> {
-    carina_core::schema::resolve_config_block_names_with_schemas(
-        parsed.clone(),
-        unresolved.clone(),
-        ctx.schemas(),
+) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
+    resolve_config_names_for_test(ctx, parsed.clone(), unresolved.clone()).unwrap_or_else(
+        |errors| {
+            panic!(
+                "test block-name resolution failed: {}",
+                errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        },
     )
-    .unwrap_or_else(|errors| {
-        panic!(
-            "test block-name resolution failed: {}",
-            errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    })
 }
 
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
+) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
     let unresolved = carina_core::parser::ParsedFile {
         resources,
         ..Default::default()
     };
-    carina_core::schema::resolve_config_block_names_with_schemas(
+    let ctx = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &[],
+        schemas
+            .iter()
+            .map(|(provider, _resource_type, _kind, schema)| {
+                (provider.to_string(), schema.clone())
+            }),
+    );
+    resolve_config_names_for_test(
+        &ctx,
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
     )
     .expect("test block-name resolution must succeed")
 }

@@ -272,9 +272,10 @@ impl AuthoredBindingView {
 ///
 /// Its parsed representation is crate-private so downstream callers cannot
 /// extract a raw resource vector. Function calls may already be folded in this
-/// snapshot; it does not represent the exact authored reference graph. Schema
-/// block-name resolution consumes this value and returns the typestate required
-/// by override-aware planning.
+/// snapshot; it does not represent the exact authored reference graph. Core
+/// block-name resolution consumes this value and returns plain resolved files;
+/// carina-cli validation wiring alone turns those files into its canonical
+/// resource-pair typestate.
 #[derive(Debug, Clone)]
 pub struct UnresolvedConfigSnapshot {
     parsed: ParsedFile,

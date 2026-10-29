@@ -1,14 +1,16 @@
-//! Resolved resources with permanent name overrides applied.
+//! Canonical resource pairs and resolved resources with permanent name overrides applied.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
-use crate::data_source_value::DataSourceValues;
-use crate::deps::sort_resources_by_dependencies;
-use crate::effect::deps::UnresolvedResource;
-use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
-use crate::parser::File;
-use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::binding_index::{ManagedBindingStability, PreApplyInputs, ResolvedBindings};
+use carina_core::data_source_value::DataSourceValues;
+use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::effect::deps::UnresolvedResource;
+use carina_core::name_override::{
+    ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
+};
+use carina_core::parser::File;
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
 
 /// Evaluated and pre-value-resolution resources whose provider-schema block
 /// aliases have been folded into canonical attribute names together.
@@ -22,11 +24,20 @@ use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 /// evaluated configuration:
 ///
 /// ```compile_fail
-/// # use carina_core::override_aware::CanonicalResourcePair;
+/// # use carina_cli::wiring::CanonicalResourcePair;
 /// # use carina_core::resource::Resource;
 /// # fn bypass(pair: CanonicalResourcePair<()>, arbitrary: Vec<Resource>) {
 /// let _ = pair.with_transformed_evaluated(arbitrary);
 /// # }
+/// ```
+///
+/// The pair cannot be minted outside validation wiring:
+///
+/// ```compile_fail,E0624
+/// use carina_cli::wiring::CanonicalResourcePair;
+/// use carina_core::parser::File;
+///
+/// let _ = CanonicalResourcePair::new(File::<()>::default(), Vec::new());
 /// ```
 #[derive(Debug, Clone)]
 pub struct CanonicalResourcePair<E> {
@@ -50,13 +61,13 @@ pub enum DeferredForExpansionChoice {
 #[derive(Debug, thiserror::Error)]
 pub enum CanonicalResourceIdentityError {
     #[error(transparent)]
-    EnumCanonicalization(#[from] crate::value::EnumCanonicalizationError),
+    EnumCanonicalization(#[from] carina_core::value::EnumCanonicalizationError),
     #[error("{0}")]
     Identity(String),
 }
 
 impl<E> CanonicalResourcePair<E> {
-    pub(crate) fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
+    pub(super) fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
         Self { parsed, unresolved }
     }
 
@@ -81,9 +92,9 @@ impl<E> CanonicalResourcePair<E> {
     /// canonical configuration back into an untyped `File`.
     pub fn resolve_attr_prefixes(
         mut self,
-        registry: &crate::schema::SchemaRegistry,
+        registry: &carina_core::schema::SchemaRegistry,
     ) -> Result<Self, String> {
-        crate::identifier::resolve_attr_prefixes(&mut self.parsed.resources, registry)?;
+        carina_core::identifier::resolve_attr_prefixes(&mut self.parsed.resources, registry)?;
         Ok(self)
     }
 
@@ -91,15 +102,15 @@ impl<E> CanonicalResourcePair<E> {
     /// exposing the mutable resource slice held by the pair.
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
-        registry: &crate::schema::SchemaRegistry,
-        providers: &crate::value::CanonicalizedProviderConfigs,
+        registry: &carina_core::schema::SchemaRegistry,
+        providers: &carina_core::value::CanonicalizedProviderConfigs,
         identity_attributes: &dyn Fn(&str) -> Vec<String>,
     ) -> Result<(), CanonicalResourceIdentityError> {
-        let mut resources = crate::value::canonicalize_resources_with_schemas(
+        let mut resources = carina_core::value::canonicalize_resources_with_schemas(
             &mut self.parsed.resources,
             registry,
         )?;
-        crate::identifier::compute_anonymous_identifiers_with_provider_configs(
+        carina_core::identifier::compute_anonymous_identifiers_with_provider_configs(
             resources.as_mut_slice(),
             providers,
             registry,
@@ -112,9 +123,9 @@ impl<E> CanonicalResourcePair<E> {
     /// resolver-owned evaluated file.
     pub fn reconcile_prefixed_names(
         &mut self,
-        find_state: &dyn Fn(&str, &str, &str) -> Option<crate::identifier::PrefixStateInfo>,
+        find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,
     ) {
-        crate::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
+        carina_core::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
     }
 
     /// Reconcile anonymous module-instance addresses against state without
@@ -122,9 +133,9 @@ impl<E> CanonicalResourcePair<E> {
     pub fn reconcile_anonymous_module_instances(
         &mut self,
         find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
-        claims: &crate::identifier::StateBlockClaims,
+        claims: &carina_core::identifier::StateBlockClaims,
     ) {
-        crate::module_resolver::reconcile_anonymous_module_instances(
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut self.parsed.resources,
             &mut self.parsed.compositions,
             find_state_names_by_type,
@@ -136,17 +147,20 @@ impl<E> CanonicalResourcePair<E> {
     /// releasing the canonical evaluated resource set.
     pub fn reconcile_anonymous_identifiers(
         &mut self,
-        registry: &crate::schema::SchemaRegistry,
+        registry: &carina_core::schema::SchemaRegistry,
         find_state_by_type: &dyn Fn(
             &str,
             &str,
-        ) -> crate::identifier::ScreenedStateEntries<
-            crate::identifier::AnonymousIdStateInfo,
+        ) -> carina_core::identifier::ScreenedStateEntries<
+            carina_core::identifier::AnonymousIdStateInfo,
         >,
-        find_state_by_binding: &dyn Fn(&str) -> Vec<crate::identifier::AnonymousIdBindingStateInfo>,
-        claims: &crate::identifier::StateBlockClaims,
+        find_state_by_binding: &dyn Fn(
+            &str,
+        )
+            -> Vec<carina_core::identifier::AnonymousIdBindingStateInfo>,
+        claims: &carina_core::identifier::StateBlockClaims,
     ) -> Vec<(String, String)> {
-        crate::identifier::reconcile_anonymous_identifiers(
+        carina_core::identifier::reconcile_anonymous_identifiers(
             &mut self.parsed.resources,
             &self.parsed.data_sources,
             registry,
@@ -162,18 +176,21 @@ impl<E> CanonicalResourcePair<E> {
     /// already-resolved file.
     pub fn expand_deferred_for_expressions<F>(
         &mut self,
-        bindings: &crate::binding_index::IterableBindings<'_>,
+        bindings: &carina_core::binding_index::IterableBindings<'_>,
         mut classify: F,
-    ) -> Result<Vec<crate::parser::DeferredForExpression>, crate::parser::DeferredForExpansionError>
+    ) -> Result<
+        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::DeferredForExpansionError,
+    >
     where
-        F: FnMut(&crate::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
         let (selected, retained): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.parsed.deferred_for_expressions)
                 .into_iter()
                 .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.parsed.warnings.retain(|warning| {
-            warning.kind != crate::parser::WarningKind::DeferredFor
+            warning.kind != carina_core::parser::WarningKind::DeferredFor
                 || !retained
                     .iter()
                     .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
@@ -189,15 +206,15 @@ impl<E> CanonicalResourcePair<E> {
     /// evaluated resources and data sources.
     pub async fn prepare_desired_side_for_plan(
         &mut self,
-        provider_configs: &[crate::parser::ProviderConfig],
-        normalizer: &dyn crate::provider::ProviderNormalizer,
-        schemas: &crate::schema::SchemaRegistry,
-    ) -> crate::provider::ProviderResult<()> {
-        crate::value::canonicalize_data_sources_with_schemas(
+        provider_configs: &[carina_core::parser::ProviderConfig],
+        normalizer: &dyn carina_core::provider::ProviderNormalizer,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> carina_core::provider::ProviderResult<()> {
+        carina_core::value::canonicalize_data_sources_with_schemas(
             &mut self.parsed.data_sources,
             schemas,
         )?;
-        crate::executor::normalized::apply_desired_normalization_slice(
+        carina_core::executor::normalized::apply_desired_normalization_slice(
             &mut self.parsed.resources,
             provider_configs,
             normalizer,
@@ -218,23 +235,6 @@ pub struct DuplicateResolvedResourceIdError {
     id: ResourceId,
 }
 
-/// Minimal state-like surface needed by [`OverrideAwareResources`].
-pub trait NameOverrideSource {
-    fn name_overrides_for(
-        &self,
-        resource_id: &ResourceId,
-    ) -> Option<&HashMap<String, NameOverride>>;
-}
-
-impl NameOverrideSource for HashMap<ResourceId, HashMap<String, NameOverride>> {
-    fn name_overrides_for(
-        &self,
-        resource_id: &ResourceId,
-    ) -> Option<&HashMap<String, NameOverride>> {
-        self.get(resource_id)
-    }
-}
-
 /// Reference-resolution mode for an evaluated/authored resource pair.
 #[derive(Debug, Clone, Copy)]
 pub enum OverrideAwareBuildMode<'a> {
@@ -253,7 +253,7 @@ pub enum OverrideAwareBuildMode<'a> {
 /// # use std::collections::HashMap;
 /// # use carina_core::binding_index::PreApplyInputs;
 /// # use carina_core::name_override::NameOverride;
-/// # use carina_core::override_aware::{OverrideAwareBuildMode, OverrideAwareResources};
+/// # use carina_cli::wiring::{OverrideAwareBuildMode, OverrideAwareResources};
 /// # use carina_core::resource::{Resource, ResourceId};
 /// # fn bypass(raw: Vec<Resource>, inputs: PreApplyInputs<'_>) {
 /// let _ = OverrideAwareResources::build_pair_with_stability::<
@@ -284,11 +284,11 @@ pub struct OverrideAwareResources {
 /// late identity reconciliation. The managed set is deliberately absent: the
 /// rebuilt view always uses the resource set owned by the receiver.
 pub struct RebuildBindingsInputs<'a> {
-    pub compositions: &'a [crate::resource::Composition],
-    pub managed_current: &'a HashMap<ResourceId, crate::resource::PlanInputCurrent>,
+    pub compositions: &'a [carina_core::resource::Composition],
+    pub managed_current: &'a HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
-    pub wait_aliases: &'a [crate::binding_index::WaitAliasSpec],
+    pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
 }
 
 impl OverrideAwareResources {
@@ -493,9 +493,9 @@ impl OverrideAwareResources {
 
     pub fn apply_plan_stability(
         &mut self,
-        managed_current: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
-        plan: &crate::plan::Plan,
-        schemas: &crate::schema::SchemaRegistry,
+        managed_current: &HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
+        plan: &carina_core::plan::Plan,
+        schemas: &carina_core::schema::SchemaRegistry,
     ) {
         self.bindings
             .apply_plan_stability(&self.resources, managed_current, plan, schemas);
@@ -541,33 +541,6 @@ impl OverrideAwareResources {
 
     pub fn skipped_overrides(&self) -> &[ResourceId] {
         &self.skipped_overrides
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_parts_for_tests(
-        resources: Vec<Resource>,
-        unresolved_resources: Vec<Resource>,
-    ) -> Self {
-        let compositions = [];
-        let managed_current = HashMap::new();
-        let data_source_values = DataSourceValues::empty();
-        let remote_bindings = HashMap::new();
-        let wait_aliases = [];
-        let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
-            managed: &resources,
-            compositions: &compositions,
-            managed_current: &managed_current,
-            data_source_values: &data_source_values,
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        });
-        Self {
-            resources,
-            unresolved_resources,
-            bindings,
-            legacy_overrides_applied: Vec::new(),
-            skipped_overrides: Vec::new(),
-        }
     }
 }
 
@@ -624,11 +597,11 @@ fn resolve_resources(
 ) -> Result<(), String> {
     match mode {
         OverrideAwareBuildMode::Apply => {
-            crate::resolver::resolve_refs_with_state_and_remote(resources, bindings)
+            carina_core::resolver::resolve_refs_with_state_and_remote(resources, bindings)
         }
         OverrideAwareBuildMode::Plan {
             unresolved_upstream_bindings,
-        } => crate::resolver::resolve_refs_for_plan(
+        } => carina_core::resolver::resolve_refs_for_plan(
             resources,
             bindings,
             unresolved_upstream_bindings,
@@ -667,8 +640,8 @@ fn push_unique(resources: &mut Vec<ResourceId>, id: ResourceId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binding_index::WaitAliasSpec;
-    use crate::resource::{AccessPath, DeferredValue, PlanInputCurrent};
+    use carina_core::binding_index::WaitAliasSpec;
+    use carina_core::resource::{AccessPath, DeferredValue, PlanInputCurrent};
 
     fn string(value: impl Into<String>) -> Value {
         Value::Concrete(ConcreteValue::String(value.into().into()))
@@ -711,7 +684,7 @@ mod tests {
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
         let canonical = CanonicalResourcePair::new(
-            crate::parser::ParsedFile {
+            carina_core::parser::ParsedFile {
                 resources: resources.clone(),
                 ..Default::default()
             },

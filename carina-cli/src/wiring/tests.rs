@@ -424,12 +424,25 @@ fn canonical_unresolved(
         resources,
         ..Default::default()
     };
-    carina_core::schema::resolve_config_block_names_with_schemas(
+    let ctx = wiring_context_with_schemas(schemas);
+    resolve_config_names_for_test(
+        &ctx,
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
     )
     .expect("test block-name resolution must succeed")
+}
+
+fn wiring_context_with_schemas(schemas: &SchemaRegistry) -> WiringContext {
+    WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &[],
+        schemas
+            .iter()
+            .map(|(provider, _resource_type, _kind, schema)| {
+                (provider.to_string(), schema.clone())
+            }),
+    )
 }
 
 const TEST_COMMIT_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
@@ -452,10 +465,11 @@ fn canonical_pair<E: Clone>(
         resources: unresolved_resources,
         ..Default::default()
     };
-    carina_core::schema::resolve_config_block_names_with_schemas(
+    let ctx = wiring_context_with_schemas(schemas);
+    resolve_config_names_for_test(
+        &ctx,
         evaluated.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
     )
     .expect("test block-name resolution must succeed")
 }
@@ -466,7 +480,7 @@ fn build_override_aware_pair_for_test<S>(
     inputs: PreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
 where
-    S: carina_core::override_aware::NameOverrideSource + ?Sized,
+    S: carina_core::name_override::NameOverrideSource + ?Sized,
 {
     OverrideAwareResources::build_pair_with_stability(
         &unresolved,
@@ -1006,10 +1020,10 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resources: unresolved_resources.to_vec(),
         ..Default::default()
     };
-    let canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+    let canonical_resources = resolve_config_names_for_test(
+        ctx,
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        ctx.schemas(),
     )
     .expect("test block-name resolution must succeed");
     let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
@@ -5706,7 +5720,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical_unresolved = resolve_config_names_with_ctx(
+    let canonical_unresolved = resolve_config_names_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5768,7 +5782,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     };
     let unresolved = evaluated.clone();
 
-    let errors = resolve_config_names_with_ctx(
+    let errors = resolve_config_names_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5804,7 +5818,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical = resolve_config_names_with_ctx(
+    let canonical = resolve_config_names_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),

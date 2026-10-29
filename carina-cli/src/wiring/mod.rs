@@ -19,9 +19,9 @@
 //! with the resources it owns before it can reach a downstream consumer.
 //! Production command paths call the loader once; formatting calls its separate
 //! loader once per provider-declaring directory and receives schemas rather
-//! than a context. `carina_core` can still construct a raw canonical pair, but
-//! no carina-cli planning, execution, or recording entry point accepts one,
-//! and a raw pair cannot replace the resources inside an existing owner.
+//! than a context. `carina_core` returns only plain block-name-resolved files;
+//! this module alone can mint their canonical pair, and no planning,
+//! execution, or recording entry point accepts the plain values instead.
 //!
 //! ```compile_fail,E0603
 //! let providers = Vec::new();
@@ -68,6 +68,20 @@
 //!     let _ = providers.context();
 //! }
 //! ```
+//!
+//! A canonical resource pair cannot be minted outside validation wiring.
+//!
+//! ```compile_fail,E0308
+//! use carina_cli::wiring::CanonicalResourcePair;
+//! use carina_core::config_loader::UnresolvedConfigSnapshot;
+//! use carina_core::parser::ParsedFile;
+//! use carina_core::schema::{SchemaRegistry, resolve_config_block_names};
+//!
+//! let parsed = ParsedFile::default();
+//! let unresolved = UnresolvedConfigSnapshot::from_parsed(ParsedFile::default());
+//! let _: CanonicalResourcePair<_> =
+//!     resolve_config_block_names(parsed, unresolved, &SchemaRegistry::new()).unwrap();
+//! ```
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -112,10 +126,6 @@ use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
-use carina_core::override_aware::{
-    CanonicalResourcePair, DeferredForExpansionChoice, OverrideAwareBuildMode,
-    OverrideAwareResources, RebuildBindingsInputs,
-};
 #[cfg(test)]
 use carina_core::parser::{MovedAddresses, ParseWarning};
 use carina_core::parser::{
@@ -150,6 +160,14 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
+
+mod override_aware;
+
+pub use override_aware::{
+    CanonicalResourceIdentityError, CanonicalResourcePair, DeferredForExpansionChoice,
+    DuplicateResolvedResourceIdError, OverrideAwareBuildMode, OverrideAwareResources,
+    RebuildBindingsInputs,
+};
 
 static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
 
@@ -496,8 +514,7 @@ pub struct ValidatedWiring {
 /// resources with unrelated wiring:
 ///
 /// ```compile_fail,E0451
-/// use carina_cli::wiring::{ValidatedConfig, ValidatedWiring};
-/// use carina_core::override_aware::CanonicalResourcePair;
+/// use carina_cli::wiring::{CanonicalResourcePair, ValidatedConfig, ValidatedWiring};
 /// use carina_core::parser::InferredExportParam;
 ///
 /// fn rebind(
@@ -513,7 +530,7 @@ pub struct ValidatedWiring {
 ///
 /// ```compile_fail,E0308
 /// use carina_cli::commands::plan::PlanFileContents;
-/// use carina_core::override_aware::CanonicalResourcePair;
+/// use carina_cli::wiring::CanonicalResourcePair;
 /// use carina_core::parser::InferredExportParam;
 ///
 /// fn record_unbound(
@@ -2058,10 +2075,23 @@ fn resolve_config_names_with_ctx<E>(
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    carina_core::schema::resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
-        .map_err(block_name_errors)?
+    let (parsed, unresolved) =
+        carina_core::schema::resolve_config_block_names(parsed, unresolved, ctx.schemas())
+            .map_err(block_name_errors)?;
+    CanonicalResourcePair::new(parsed, unresolved.resources)
         .resolve_attr_prefixes(ctx.schemas())
         .map_err(|error| split_validation_message(&error))
+}
+
+/// Resolve a canonical pair through the same validated-wiring minting path
+/// used by production validation.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn resolve_config_names_for_test<E>(
+    ctx: &WiringContext,
+    parsed: carina_core::parser::File<E>,
+    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
+    resolve_config_names_with_ctx(ctx, parsed, unresolved)
 }
 
 pub fn resolve_attr_prefixes_with_ctx(
@@ -2101,7 +2131,7 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
     });
 }
 
-pub fn reconcile_canonical_prefixed_names<E>(
+pub(crate) fn reconcile_canonical_prefixed_names<E>(
     resources: &mut CanonicalResourcePair<E>,
     state_file: &Option<StateFile>,
 ) {
@@ -2313,7 +2343,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     state_file.rename_resource_identities(&renames)
 }
 
-pub fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
+pub(crate) fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
     ctx: &WiringContext,
     resources: &mut CanonicalResourcePair<E>,
     state_file: &mut StateFile,
@@ -2496,10 +2526,8 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
         &|name| identity_attributes_for_provider(ctx, name),
     ) {
         Ok(()) => Ok(Vec::new()),
-        Err(carina_core::override_aware::CanonicalResourceIdentityError::EnumCanonicalization(
-            error,
-        )) => Err(error.into()),
-        Err(carina_core::override_aware::CanonicalResourceIdentityError::Identity(message)) => {
+        Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
+        Err(CanonicalResourceIdentityError::Identity(message)) => {
             Ok(vec![AppError::Config(message)])
         }
     }
@@ -3591,7 +3619,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
     /// Build every state/config-derived input used by deferred `for`
     /// expansion. Call this after prefix/module/anonymous identity
     /// reconciliation has produced the state view the plan pipeline uses.
-    pub fn new<E>(
+    pub(crate) fn new<E>(
         resources: &CanonicalResourcePair<E>,
         state_file: &'state Option<StateFile>,
         schemas: &SchemaRegistry,
