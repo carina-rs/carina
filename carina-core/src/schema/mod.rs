@@ -314,59 +314,6 @@ pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
     &|_declared_type, _value| Ok(())
 }
 
-/// If `value` is a bare reference to a `let` binding (no access path,
-/// no attribute selector), return the binding name. Otherwise return
-/// `None`. Used by `AttrTypeKind::validate` to detect the collision
-/// case from #2978: a Enum attribute receives a bare identifier
-/// that the parser already resolved as a binding reference rather than
-/// as the enum's DSL alias of the same spelling.
-fn bare_binding_name(value: &Value) -> Option<&str> {
-    match value {
-        Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.as_str()),
-        _ => None,
-    }
-}
-
-/// True when `binding` matches a canonical enum value or a DSL alias
-/// of `(values, dsl_aliases)`. Drives the #2978 collision check.
-fn enum_alias_collides_with(
-    binding: &str,
-    values: &[String],
-    dsl_aliases: &[(String, String)],
-) -> bool {
-    if values.iter().any(|v| v == binding) {
-        return true;
-    }
-    dsl_aliases.iter().any(|(_api, dsl)| dsl == binding)
-}
-
-/// Build the user-facing error message for the #2978 collision case.
-fn enum_binding_collision_message(
-    binding: &str,
-    type_name: &str,
-    namespace: Option<&str>,
-    values: &[String],
-    dsl_aliases: &[(String, String)],
-) -> String {
-    // Prefer the DSL spelling if one exists for the colliding API value;
-    // that is the form the user almost certainly meant to write.
-    let dsl_spelling = dsl_aliases
-        .iter()
-        .find(|(_api, dsl)| dsl == binding)
-        .map(|(_api, dsl)| dsl.as_str())
-        .or_else(|| values.iter().find(|v| *v == binding).map(String::as_str))
-        .unwrap_or(binding);
-    let type_qualified = format!("{}.{}", type_name, dsl_spelling);
-    let fully_qualified = match namespace {
-        Some(ns) => format!("{}.{}.{}", ns, type_name, dsl_spelling),
-        None => type_qualified.clone(),
-    };
-    format!(
-        "bare identifier `{binding}` is shadowed by a `let` binding of the same name; \
-         to use the enum value, write `{type_qualified}`, `{fully_qualified}`, or `'{dsl_spelling}'`"
-    )
-}
-
 /// Walk an [`AttributeType`] and apply `lookup` to every identified refined node
 /// reached. Pushes any returned error into `errors`, tagged with
 /// `attr_name` so it points back at the user-visible attribute. Used
@@ -2089,7 +2036,7 @@ fn validate_attr_with_defs(
     validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
 }
 
-fn validate_attr_with_defs_and_ancestry(
+pub(crate) fn validate_attr_with_defs_and_ancestry(
     attr: &AttributeType,
     value: &Value,
     defs: &BTreeMap<String, AttributeType>,
@@ -3239,34 +3186,6 @@ impl AttributeType {
                 | AttrTypeKind::Struct { .. }
                 | AttrTypeKind::Union(_)
         ));
-        // Enum attributes assigned a bare `BindingRef` are the
-        // shadowing collision case described in #2978: the user wrote a
-        // bare identifier that happens to be a `let` binding *and* is
-        // also a DSL alias for one of this enum's variants. Surface a
-        // pointed error so they can disambiguate (use `TypeName.value`,
-        // fully-qualified, or quoted string). Without this check the
-        // deferred value flows through validation unchecked and only
-        // surfaces later as a `${vpc}`-style error from the resolver.
-        if let AttrTypeKind::Enum {
-            identity,
-            values: Some(values),
-            dsl_aliases,
-            ..
-        } = &self.kind
-            && let Some(binding) = bare_binding_name(value)
-            && enum_alias_collides_with(binding, values, dsl_aliases)
-        {
-            let prefix = identity.dotted_prefix();
-            return Err(TypeError::ValidationFailed {
-                message: enum_binding_collision_message(
-                    binding,
-                    &identity.kind,
-                    prefix.as_deref(),
-                    values,
-                    dsl_aliases,
-                ),
-            });
-        }
         let Some(concrete) = value.as_concrete() else {
             return Ok(());
         };
@@ -4441,17 +4360,6 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
         ));
     }
 
-    if let AT::Enum {
-        values: Some(values),
-        dsl_aliases,
-        ..
-    } = &attr.kind
-        && let Some(binding) = bare_binding_name(value)
-        && enum_alias_collides_with(binding, values, dsl_aliases)
-    {
-        return None;
-    }
-
     let Some(concrete) = value.as_concrete() else {
         return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
     };
@@ -5623,6 +5531,23 @@ pub struct ExpectedEnumVariant {
 }
 
 impl ExpectedEnumVariant {
+    /// Build the accepted fully-qualified DSL spelling directly from the
+    /// structured enum identity. This avoids re-parsing a dotted display name
+    /// at the binding/enum disambiguation seam.
+    pub fn from_identity(
+        identity: &TypeIdentity,
+        value: impl Into<String>,
+        is_alias: bool,
+    ) -> Self {
+        Self {
+            provider: identity.provider.clone(),
+            segments: identity.segments.clone(),
+            type_name: identity.kind.clone(),
+            value: DslSpelling(value.into()),
+            is_alias,
+        }
+    }
+
     /// `namespace` head becomes `provider`; the rest become `segments`.
     /// `None` produces a bare-form variant.
     ///
@@ -5664,6 +5589,23 @@ impl fmt::Display for ExpectedEnumVariant {
                 write!(f, ".{}.{}", self.type_name, self.value)
             }
             None => write!(f, "{}", self.value),
+        }
+    }
+}
+
+/// Lexical declaration kind named by a binding/enum shadowing diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingKind {
+    Let,
+    Argument,
+}
+
+impl fmt::Display for BindingKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Let => f.write_str("let"),
+            Self::Argument => f.write_str("argument"),
         }
     }
 }
@@ -6122,6 +6064,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::MapValueError { inner, .. }
         | TypeError::StructFieldError { inner, .. } => contains_union_alternatives_mismatch(inner),
         TypeError::TypeMismatch { .. }
+        | TypeError::BindingShadowsEnumMember(_)
         | TypeError::InvalidEnumVariant { .. }
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
@@ -6138,11 +6081,27 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
     }
 }
 
+/// A lexical binding that shadows an enum member with the same bare spelling.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+        "`{name}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
+        r#enum.kind
+    )]
+pub struct BindingShadowsEnumMemberError {
+    pub name: String,
+    pub binding_kind: BindingKind,
+    pub r#enum: TypeIdentity,
+    pub qualified: ExpectedEnumVariant,
+}
+
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
     #[error("Type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
+
+    #[error(transparent)]
+    BindingShadowsEnumMember(Box<BindingShadowsEnumMemberError>),
 
     #[error(
         "{}",
@@ -6348,6 +6307,7 @@ impl TypeError {
                     .then_some(first)
             }
             TypeError::TypeMismatch { .. }
+            | TypeError::BindingShadowsEnumMember(_)
             | TypeError::ValidationFailed { .. }
             | TypeError::MissingRequired { .. }
             | TypeError::UnknownStructField { .. }
@@ -6483,6 +6443,7 @@ impl TypeError {
                 inner: Box::new(inner.masked_for_secret()),
             },
             TypeError::TypeMismatch { .. }
+            | TypeError::BindingShadowsEnumMember(_)
             | TypeError::MissingRequired { .. }
             | TypeError::ReadOnlyAttribute { .. }
             | TypeError::BlockSyntaxNotAllowed { .. } => self,

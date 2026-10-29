@@ -178,17 +178,33 @@ vpc: aws.vpc
 ```
 EOF
 
+plaintext_file_tree="$fixture_dir/plaintext-file-tree.md"
+cat > "$plaintext_file_tree" <<'EOF'
+```plaintext
+    aws.json
+```
+EOF
+
+untagged_file_tree="$fixture_dir/untagged-file-tree.md"
+cat > "$untagged_file_tree" <<'EOF'
+```
+    aws.json
+```
+EOF
+
 assert_rejected "snake_case primitive in type position" "$primitive_type"
 assert_rejected "lowercase resource after a known service" "$service_resource"
 assert_rejected "service-less resource in an untagged fence" "$service_less_resource"
 assert_rejected "service-less resource in type position" "$service_less_type"
 assert_rejected "pre-#3707 README excerpt" "$readme_excerpt"
 assert_rejected "old spelling in a text fence" "$text_old_spelling"
+assert_rejected "service-less filename in an untagged fence" "$untagged_file_tree"
 assert_rejected "old spelling after an exempt fence" "$fence_state_reset"
 assert_accepted "current spellings in hcl and crn fences" "$current_spellings"
 assert_accepted "old spelling in prose" "$prose_only"
 assert_accepted "AWS URLs in a bash fence" "$url_examples"
 assert_accepted "native Rust type annotations" "$native_rust"
+assert_accepted "service-less filename in a plaintext fence" "$plaintext_file_tree"
 assert_repo_accepted
 
 if [ "$failures" -ne 0 ]; then

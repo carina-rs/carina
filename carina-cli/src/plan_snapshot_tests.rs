@@ -637,6 +637,74 @@ fn snapshot_replace_create_only() {
 }
 
 #[test]
+fn snapshot_anonymous_create_only_rekey() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("anonymous_create_only_rekey");
+    assert_eq!(
+        plan.summary().replace,
+        1,
+        "partial create-only match must remain a Replace"
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Move { .. })),
+        "anonymous state re-key must emit a Move"
+    );
+    assert_eq!(moved_origins.len(), 1);
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert!(output.contains("(moved from: test_test_widget_11111111)"));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn anonymous_old_identity_name_override_is_a_pure_move() {
+    let fixture = build_plan_from_fixture_name("anonymous_old_identity_name_override");
+    let summary = fixture.plan.summary();
+
+    assert_eq!(summary.create, 0);
+    assert_eq!(summary.update, 0);
+    assert_eq!(summary.replace, 0);
+    assert_eq!(summary.delete, 0);
+    assert_eq!(summary.moved, 1);
+    assert_eq!(fixture.plan.effects().len(), 1);
+    assert!(matches!(fixture.plan.effects()[0], Effect::Move { .. }));
+}
+
+#[test]
+fn snapshot_anonymous_old_identity_update() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("anonymous_old_identity_update");
+    assert_eq!(plan.summary().update, 1);
+    assert_eq!(plan.summary().moved, 1);
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert!(output.contains("~ awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb"));
+    assert!(output.contains("(moved from: ec2_vpc_0bc2a2bb)"));
+    assert!(output.contains("1 to change, 0 to destroy, 1 to move"));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_replace_with_non_forcing_diffs() {
     let (plan, schemas, _moved) = build_plan_from_fixture("replace_with_non_forcing_diffs");
     let output = strip_ansi(&format_plan(

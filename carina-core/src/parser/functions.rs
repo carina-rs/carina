@@ -250,7 +250,7 @@ fn prepare_user_function_call<'cfg>(
     }
 
     // Create a child context with recursion tracking
-    let mut child_ctx = ctx.clone();
+    let mut child_ctx = ctx.child_scope();
     child_ctx.evaluating_functions.push(fn_name.clone());
 
     // Evaluate local lets, substituting and resolving each one

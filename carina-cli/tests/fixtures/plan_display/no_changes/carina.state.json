@@ -44,7 +44,7 @@
     },
     {
       "resource_type": "ec2.Subnet",
-      "identity": "ec2_subnet_aac7c86b",
+      "identity": "awscc_ec2_subnet_896cf31f",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
       "attributes": {
@@ -59,7 +59,7 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "binding": "ec2_subnet_aac7c86b",
+      "binding": "awscc_ec2_subnet_896cf31f",
       "dependency_bindings": [
         "vpc"
       ],

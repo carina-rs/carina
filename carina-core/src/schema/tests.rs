@@ -11370,15 +11370,13 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
     );
 }
 
-// #2978 — collision between a `let` binding name and a `Enum`
-// DSL alias. The parser resolves a bare identifier to the binding
-// first (see parser/expressions/primary.rs:367-374), producing a
-// `Value::Deferred(DeferredValue::BindingRef { binding: "vpc" })` for
-// the attribute value. Without the dedicated check, the deferred value
-// flows past `validate` and only surfaces later as a `${vpc}`-style
-// error from the resolver, which is hard to diagnose. Pin the
-// behavior here so a regression on the `validate` side is visible
-// without round-tripping through plan execution.
+// #2978 / #4012 — collisions between a binding name and an Enum DSL
+// alias are resolved only after the expected type and binding provenance
+// are both available. Schema validation is deliberately name-blind: a
+// deferred binding passes through here, and the shared typed resolver in
+// `validation` decides whether the binding is assignable or shadows a
+// member. These tests guard against reintroducing a parallel string-table
+// collision policy in the schema layer.
 mod enum_binding_collision {
     use super::*;
     use crate::resource::DeferredValue;
@@ -11408,52 +11406,21 @@ mod enum_binding_collision {
     }
 
     #[test]
-    fn bare_binding_matching_dsl_alias_is_rejected() {
+    fn bare_binding_matching_dsl_alias_passes_through_schema_validation() {
         let t = flow_log_resource_type();
-        // `let vpc = ...` in scope → parser hands the validator a
-        // `BindingRef("vpc")` for `resource_type = vpc`.
         let value = Value::Deferred(DeferredValue::BindingRef {
             binding: "vpc".to_string(),
         });
-        let err = t.validate(&value).unwrap_err();
-        let TypeError::ValidationFailed { message } = err else {
-            panic!("expected ValidationFailed, got {:?}", err);
-        };
-        assert!(
-            message.contains("shadowed by a `let` binding"),
-            "message did not mention the shadowing rule: {message}"
-        );
-        // Suggest the type-qualified form using the DSL spelling.
-        assert!(
-            message.contains("ResourceType.vpc"),
-            "missing type-qualified suggestion: {message}"
-        );
-        // And the fully qualified form.
-        assert!(
-            message.contains("awscc.ec2.FlowLog.ResourceType.vpc"),
-            "missing fully-qualified suggestion: {message}"
-        );
-        // And the quoted-string escape hatch.
-        assert!(
-            message.contains("'vpc'"),
-            "missing quoted-string suggestion: {message}"
-        );
+        assert!(t.validate(&value).is_ok());
     }
 
     #[test]
-    fn bare_binding_matching_canonical_value_is_rejected() {
-        // Same trap, hit through the canonical spelling rather than
-        // the alias: `let VPC = ...` would collide with the `"VPC"`
-        // value directly.
+    fn bare_binding_matching_canonical_value_passes_through_schema_validation() {
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
             binding: "VPC".to_string(),
         });
-        let err = t.validate(&value).unwrap_err();
-        let TypeError::ValidationFailed { message } = err else {
-            panic!("expected ValidationFailed, got {:?}", err);
-        };
-        assert!(message.contains("shadowed by a `let` binding"), "{message}");
+        assert!(t.validate(&value).is_ok());
     }
 
     #[test]
@@ -11470,10 +11437,9 @@ mod enum_binding_collision {
     }
 
     #[test]
-    fn collision_check_only_fires_on_enum() {
-        // Other AttributeType kinds (e.g., String) must not be
-        // affected by the collision check — many of them legitimately
-        // accept a `BindingRef`.
+    fn non_enum_binding_ref_also_passes_through_schema_validation() {
+        // Other AttributeType kinds (e.g., String) retain the same
+        // deferred-aware pass-through behavior.
         let t = AttributeType::string();
         let value = Value::Deferred(DeferredValue::BindingRef {
             binding: "vpc".to_string(),

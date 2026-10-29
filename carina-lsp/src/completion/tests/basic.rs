@@ -2169,6 +2169,53 @@ fn module_call_value_completion_with_sibling_use_decl() {
     );
 }
 
+#[test]
+fn module_call_provider_enum_completion_uses_owner_declaration_and_filters_structural_binding() {
+    let provider = test_provider_with_enum_shadow_schema();
+    let fixture = tempfile::tempdir().expect("module enum completion fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  event_type: awscc.cloudfront.Distribution.EventType\n}\n",
+    )
+    .expect("write module signature");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let viewer_request = awscc.test.Source { name = \"shadow\" }\n",
+    )
+    .expect("write sibling binding");
+    let main = r#"let inner = use { source = "./modules/inner" }
+
+inner {
+  event_type =
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), main).expect("write module call");
+    let doc = create_enum_shadow_document(main);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 3,
+            character: "  event_type =".chars().count() as u32,
+        },
+        Some(fixture.path()),
+    );
+    let labels = completions
+        .iter()
+        .map(|completion| completion.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        labels.contains(&"awscc.cloudfront.Distribution.EventType.viewer_request"),
+        "provider SchemaType completion must use the owner-indexed enum declaration: {labels:#?}",
+    );
+    assert!(
+        !labels.contains(&"viewer_request"),
+        "a structural binding must not be presented as a provider-enum value: {labels:#?}",
+    );
+}
+
 /// Issue #2621: a specific ARN-family semantic type
 /// (e.g. `IamOidcProviderArn`) must NOT surface the generic
 /// `arn:partition:service:region:account:resource` snippet — its

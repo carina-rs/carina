@@ -2742,6 +2742,44 @@ fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
 }
 
 #[test]
+fn enum_typed_completion_excludes_shadowing_structural_binding() {
+    let provider = test_provider_with_enum_shadow_schema();
+    let fixture = tempfile::tempdir().expect("enum completion fixture");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let viewer_request = awscc.test.Source { name = \"shadow\" }\n",
+    )
+    .expect("write sibling binding");
+    let main = r#"awscc.cloudfront.Distribution {
+  event_type =
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), main).expect("write completion buffer");
+    let doc = create_document(main);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 1,
+            character: "  event_type =".chars().count() as u32,
+        },
+        Some(fixture.path()),
+    );
+    let labels = completions
+        .iter()
+        .map(|completion| completion.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        labels.contains(&"awscc.cloudfront.Distribution.EventType.viewer_request"),
+        "the qualified enum member must be offered: {labels:#?}",
+    );
+    assert!(
+        !labels.contains(&"viewer_request"),
+        "a structural binding must not be presented as a valid enum value: {labels:#?}",
+    );
+}
+
+#[test]
 fn dynamic_enum_completion_offers_namespaced_prefix() {
     let zone_name = AttributeType::enum_(
         carina_core::schema::TypeIdentity::new(

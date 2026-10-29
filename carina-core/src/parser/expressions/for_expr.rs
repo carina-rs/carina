@@ -172,7 +172,9 @@ pub(crate) fn parse_for_expr(
             ForBodyResult::Resource(r) => resources.push(*r),
             ForBodyResult::DataSource(d) => data_sources.push(*d),
             ForBodyResult::ModuleCall(mut c) => {
+                let unexpanded_id = c.id().clone();
                 c.set_expansion_key(expansion_key);
+                ctx.remap_binding_use_module_call(&unexpanded_id, c.id());
                 module_calls.push(c);
             }
         }
@@ -195,7 +197,7 @@ pub(crate) fn parse_for_expr(
         (ForBinding::Simple(var), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
-                let mut iter_ctx = ctx.clone();
+                let mut iter_ctx = ctx.child_scope();
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
                     Some(
@@ -227,7 +229,7 @@ pub(crate) fn parse_for_expr(
         (ForBinding::Indexed(idx_var, val_var), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
-                let mut iter_ctx = ctx.clone();
+                let mut iter_ctx = ctx.child_scope();
                 bind(
                     &mut iter_ctx,
                     idx_var,
@@ -268,7 +270,7 @@ pub(crate) fn parse_for_expr(
             for key in keys {
                 let val = &map[key];
                 let address = crate::utils::map_key_address(binding_name, key);
-                let mut iter_ctx = ctx.clone();
+                let mut iter_ctx = ctx.child_scope();
                 bind(
                     &mut iter_ctx,
                     key_var,
@@ -323,7 +325,7 @@ pub(crate) fn parse_for_expr(
 
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
-            let mut template_ctx = ctx.clone();
+            let mut template_ctx = ctx.child_scope();
             let bind = |c: &mut ParseContext, name: &str, v: Value| {
                 if name != "_" {
                     c.set_variable(name.to_string(), v);
@@ -404,7 +406,7 @@ pub(crate) fn parse_for_expr(
                     ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
                     ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
                 };
-                let mut template_ctx = ctx.clone();
+                let mut template_ctx = ctx.child_scope();
                 let bind = |c: &mut ParseContext, name: &str, v: Value| {
                     if name != "_" {
                         c.set_variable(name.to_string(), v);
@@ -640,7 +642,7 @@ pub(crate) fn parse_for_body(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<ForBodyResult, ParseError> {
-    let mut local_ctx = ctx.clone();
+    let mut local_ctx = ctx.child_scope();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -656,11 +658,23 @@ pub(crate) fn parse_for_body(
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {
-                let resource = parse_resource_expr(inner, &local_ctx, address)?;
+                let resource = parse_resource_expr(
+                    inner,
+                    &local_ctx,
+                    address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                let data_source = parse_read_resource_expr(inner, &local_ctx, address)?;
+                let data_source = parse_read_resource_expr(
+                    inner,
+                    &local_ctx,
+                    address,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 return Ok(ForBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {

@@ -389,7 +389,8 @@ fn parse_primary_with_resource_or_module(
 
     match inner.as_rule() {
         Rule::read_resource_expr => {
-            let data_source = parse_read_resource_expr(inner, ctx, binding_name)?;
+            let data_source =
+                parse_read_resource_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
             let resource_type = super::ast::ResourceTypePath::new(
                 data_source.id.provider.clone(),
                 data_source.id.resource_type.clone(),
@@ -466,7 +467,8 @@ fn parse_primary_with_resource_or_module(
             ))
         }
         Rule::resource_expr => {
-            let resource = parse_resource_expr(inner, ctx, binding_name)?;
+            let resource =
+                parse_resource_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
             let resource_type = super::ast::ResourceTypePath::new(
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),

@@ -89,7 +89,7 @@ pub fn validate_with_factories(
             &loaded.duplicate_declarations,
         )
         .iter()
-        .map(ToString::to_string),
+        .map(|error| crate::error::format_error_with_source_chain(error)),
     );
 
     error_reports
@@ -315,7 +315,12 @@ pub fn run_validate(
         &loaded.duplicate_declarations,
     );
     parsed.print_warnings_from(printed_warning_count);
-    error_reports.extend(validation_report.errors().iter().map(ToString::to_string));
+    error_reports.extend(
+        validation_report
+            .errors()
+            .iter()
+            .map(|error| crate::error::format_error_with_source_chain(error)),
+    );
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));

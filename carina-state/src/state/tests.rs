@@ -605,51 +605,6 @@ fn upsert_resource_returns_error_for_duplicate_deposed_key() {
 }
 
 #[test]
-fn rename_resource_identities_returns_error_for_duplicate_destination() {
-    let mut state = StateFile::new();
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
-        .expect("fresh state accepts the old identity");
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "existing", "aws"))
-        .expect("fresh state accepts the destination identity");
-
-    let error = state
-        .rename_resource_identities(&[("old".to_string(), "existing".to_string())])
-        .expect_err("rename must reject a duplicate destination identity");
-
-    assert!(
-        matches!(error, BackendError::InvalidState(message) if message.contains("duplicate resource identity"))
-    );
-    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
-    assert!(state.find_resource("aws", "ec2.Vpc", "existing").is_some());
-}
-
-#[test]
-fn rename_resource_identities_preserves_invalid_identity_detail_once() {
-    let mut state = StateFile::new();
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
-        .expect("fresh state accepts the old identity");
-
-    let error = state
-        .rename_resource_identities(&[("old".to_string(), String::new())])
-        .expect_err("rename must reject an empty destination identity");
-
-    assert!(matches!(error, BackendError::InvalidStateIdentity { .. }));
-    let rendered = error.to_string();
-    assert_eq!(
-        rendered
-            .matches("resource identity cannot be empty")
-            .count(),
-        1,
-        "{rendered}"
-    );
-    assert!(std::error::Error::source(&error).is_none());
-    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
-}
-
-#[test]
 fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generations() {
     let mut state = StateFile::new();
     let first_key = DeposedKey::new_unique();

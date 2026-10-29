@@ -98,10 +98,8 @@ fn canonical_resources_for_test(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
-    let unresolved = carina_core::parser::ParsedFile {
-        resources,
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = resources;
     resolve_config_block_names_for_test(
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -666,10 +664,8 @@ fn resolve_and_materialize_exports_for_test(
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let parsed = carina_core::parser::InferredFile {
-        providers: configs,
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = configs;
     carina_core::parser::SavedProviderConfigs::from(&resolved_provider_configs(&parsed))
 }
 
@@ -737,19 +733,17 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         identifier: string_value("provider-id"),
     });
 
-    let parsed = carina_core::parser::InferredFile {
-        resources: vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "example",
-            Some("current".to_string()),
-        )],
-        state_blocks: vec![carina_core::parser::StateBlock::Import {
-            to: carina_core::parser::StateBlockAddress::new("mock", "test.resource", "example"),
-            id: string_value("provider-id"),
-        }],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "example",
+        Some("current".to_string()),
+    )];
+    parsed.state_blocks = vec![carina_core::parser::StateBlock::Import {
+        to: carina_core::parser::StateBlockAddress::new("mock", "test.resource", "example"),
+        id: string_value("provider-id"),
+    }];
 
     let identifiers = import_identifiers_from_current_config(&plan, &parsed);
 
@@ -789,10 +783,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     ));
     current.binding = None;
     current.call_path = crate::test_composition_call_path_in(&current_source);
-    let parsed = carina_core::parser::InferredFile {
-        compositions: vec![current],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.compositions = vec![current];
     let provider_inputs = load_and_resolve_provider_configs(
         &parsed,
         tmp.path(),
@@ -1623,9 +1615,11 @@ inner { x = a }
         unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
-    let message = error.to_string();
+    let message = crate::error::format_error_with_source_chain(&error);
     assert!(
-        message.contains("cannot assign String to 'x'") && message.contains("expected Int"),
+        message.contains("Type mismatch: expected Int, got String (from a)")
+            && message.contains("outer/main.crn")
+            && message.contains("line 3"),
         "{message}"
     );
 }
@@ -2259,11 +2253,16 @@ let vpc = awscc.ec2.Vpc {{
     )
 }
 
-fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> ResourceIdentity {
+fn concrete_subnet_identity(
+    ctx: &WiringContext,
+    providers: &[ProviderConfig],
+    vpc_id: &str,
+    cidr_block: &str,
+) -> ResourceIdentity {
     let mut resources = vec![
         Resource::pending_with_provider("awscc", "ec2.Subnet", None)
-            .with_attribute("vpc_id", string_value("vpc-old"))
-            .with_attribute("cidr_block", string_value("10.220.1.0/24"))
+            .with_attribute("vpc_id", string_value(vpc_id))
+            .with_attribute("cidr_block", string_value(cidr_block))
             .with_attribute("availability_zone", string_value("ap-northeast-1c")),
     ];
     let canonical =
@@ -2298,7 +2297,7 @@ fn seed_apply_cascade_state(
     if include_subnet {
         let mut subnet_state = ResourceState::try_applied(
             "ec2.Subnet",
-            concrete_subnet_identity(ctx, providers),
+            concrete_subnet_identity(ctx, providers, "vpc-old", "10.220.1.0/24"),
             "awscc",
             "subnet-old",
         )
@@ -3642,13 +3641,11 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
 #[tokio::test]
 async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
-    let parsed = carina_core::parser::InferredFile {
-        compositions: vec![saved_module_composition(
-            Value::resource_ref("missing", "value", vec![]),
-            "bad",
-        )],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.compositions = vec![saved_module_composition(
+        Value::resource_ref("missing", "value", vec![]),
+        "bad",
+    )];
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
@@ -3782,9 +3779,10 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let current_states = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
+    let projected_state = crate::wiring::ProjectedStateRead::for_test_unmoved(Some(&state));
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
         &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
-        Some(&state),
+        &projected_state,
         LivePreApplyInputs {
             managed: &[],
             compositions: &[],
@@ -3801,7 +3799,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let mut stderr = Vec::new();
     crate::legacy_name_overrides::write_legacy_override_warnings(
         &override_aware,
-        Some(&state),
+        &projected_state,
         &mut stderr,
     )
     .expect("warning write should succeed");
@@ -4457,8 +4455,22 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
 
     let raw = std::fs::read_to_string(fixture.state_path()).expect("state file must be written");
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
-    let subnet_identity = concrete_subnet_identity(ctx, &parsed.providers);
-    let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", subnet_identity.as_str());
+    let old_subnet_identity =
+        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24");
+    let subnet_rows = state["resources"]
+        .as_array()
+        .expect("state resources must be an array")
+        .iter()
+        .filter(|row| row["provider"] == "awscc" && row["resource_type"] == "ec2.Subnet")
+        .collect::<Vec<_>>();
+    let [subnet] = subnet_rows.as_slice() else {
+        panic!("expected exactly one persisted subnet row: {subnet_rows:#?}")
+    };
+    assert_ne!(
+        subnet["identity"],
+        old_subnet_identity.as_str(),
+        "Move+Replace writeback must not leave the anonymous subnet under its old hash",
+    );
     assert_eq!(
         subnet["current"]["identifier"],
         serde_json::json!("subnet-new")
@@ -4644,7 +4656,7 @@ awscc.ec2.Subnet {{
 
     let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
-        concrete_subnet_identity(ctx, &parsed.providers),
+        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24"),
         "awscc",
         "subnet-old",
     )
@@ -6203,13 +6215,11 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         "bucket",
         Value::Concrete(ConcreteValue::String("state-bucket".into())),
     );
-    let parsed = carina_core::parser::InferredFile {
-        compositions: vec![saved_module_composition(
-            Value::Concrete(ConcreteValue::String("forbidden".into())),
-            "forbidden",
-        )],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.compositions = vec![saved_module_composition(
+        Value::Concrete(ConcreteValue::String("forbidden".into())),
+        "forbidden",
+    )];
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",

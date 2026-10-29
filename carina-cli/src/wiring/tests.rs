@@ -19,6 +19,14 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
+fn saved_plan_validation_ready_constructor_is_unit_typed() {
+    let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
+    let ValidationReady { inner: (), origin } = ready;
+
+    assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
+}
+
+#[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
     let module_dir = tmp.path().join("modules/query");
@@ -202,16 +210,17 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
             ]),
         )
     };
-    let invalid_config = || carina_core::parser::InferredFile {
-        providers: provider_configs(),
-        arguments: vec![carina_core::parser::ArgumentParameter {
+    let invalid_config = || {
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = provider_configs();
+        parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
             type_expr: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
-        }],
-        ..Default::default()
+        }];
+        parsed
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
@@ -259,17 +268,15 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
     );
-    let parsed = carina_core::parser::InferredFile {
-        providers: vec![provider],
-        arguments: vec![carina_core::parser::ArgumentParameter {
-            name: "unrelated".to_string(),
-            type_expr: carina_core::parser::TypeExpr::String,
-            default: None,
-            description: None,
-            validations: Vec::new(),
-        }],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = vec![provider];
+    parsed.arguments = vec![carina_core::parser::ArgumentParameter {
+        name: "unrelated".to_string(),
+        type_expr: carina_core::parser::TypeExpr::String,
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
@@ -572,10 +579,8 @@ fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
-    let unresolved = carina_core::parser::ParsedFile {
-        resources,
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = resources;
     resolve_config_block_names_for_test(
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -600,10 +605,8 @@ fn canonical_pair<E: Clone>(
     unresolved_resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<E> {
-    let unresolved = carina_core::parser::ParsedFile {
-        resources: unresolved_resources,
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = unresolved_resources;
     resolve_config_block_names_for_test(
         evaluated.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -612,17 +615,15 @@ fn canonical_pair<E: Clone>(
     .expect("test block-name resolution must succeed")
 }
 
-fn build_override_aware_pair_for_test<S>(
+fn build_override_aware_pair_for_test(
     unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
-    state_file: Option<&S>,
+    state_file: Option<&StateFile>,
     inputs: LivePreApplyInputs<'_>,
-) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
-where
-    S: carina_core::name_override::NameOverrideSource + ?Sized,
-{
+) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
+    let state = ProjectedStateRead::for_test_unmoved(state_file);
     OverrideAwareResources::build_pair_with_stability(
         &unresolved,
-        state_file,
+        &state,
         inputs,
         &HashMap::new(),
         OverrideAwareBuildMode::Apply,
@@ -1127,10 +1128,8 @@ fn resolved_provider_configs_with_remote<E>(
 fn validated_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
-    let parsed = carina_core::parser::InferredFile {
-        providers: configs,
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = configs;
     resolved_provider_configs(&parsed)
 }
 
@@ -1154,10 +1153,8 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     )?;
     let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
     let ctx = wiring.context();
-    let unresolved = carina_core::parser::ParsedFile {
-        resources: unresolved_resources.to_vec(),
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = unresolved_resources.to_vec();
     let canonical_resources = resolve_config_block_names_for_test(
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -1440,6 +1437,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let data_source = DataSource::with_provider("mock", "test.lookup", "source", None);
     let mut data_source_values =
         test_data_source_values(std::slice::from_ref(&data_source), &data_source_states);
+    let projected_state = ProjectedStateRead::for_test_unmoved(None);
 
     hydrate_prior_data_source_values(
         &mut current_states,
@@ -1447,7 +1445,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         &mut orphans,
         &normalizer,
         &saved_attrs,
-        None,
+        &projected_state,
     )
     .await
     .unwrap();
@@ -1586,13 +1584,14 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         DataSourceValues::from_data_sources(std::slice::from_ref(&data_source), |_| {
             DataSourceValue::read(State::existing(id.clone(), HashMap::new()))
         });
+    let projected_state = ProjectedStateRead::for_test_unmoved(Some(&state_file));
     hydrate_prior_data_source_values(
         &mut current_states,
         &mut data_source_values,
         &mut orphans,
         &SavedAttrsHydratingNormalizer,
         &saved_attrs,
-        Some(&state_file),
+        &projected_state,
     )
     .await
     .expect("combined state hydration");
@@ -4124,6 +4123,340 @@ removed {
     );
 }
 
+fn detected_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
+    moves
+        .iter()
+        .map(|resolved_move| {
+            (
+                resolved_move.from().identity_str().to_string(),
+                resolved_move.to().identity_str().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn test_detected_bucket_move(from: &str, to: &str) -> ResolvedMove {
+    ResolvedMove::from_moved_block(
+        &MovedAddresses::new(
+            "awscc",
+            "s3.Bucket",
+            test_identity(from.to_string()),
+            test_identity(to.to_string()),
+        ),
+        bucket_id(from),
+        bucket_id(to),
+    )
+    .expect("test move addresses must match their resolved ids")
+}
+
+#[test]
+fn resource_move_invariants_missing_detected_source_is_an_error() {
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    let result = apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("missing", "target")],
+        None,
+        MoveOverlapPolicy::ComposeForward,
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::MoveSourceNotLoaded { from, to })
+                if from.identity_str() == "missing" && to.identity_str() == "target"
+        ),
+        "a missing move source must fail with the typed invariant error"
+    );
+    assert!(
+        addressed.moved_pairs.is_empty(),
+        "a failed transfer must not record a move"
+    );
+}
+
+#[test]
+fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
+    use carina_core::parser::ProviderContext;
+    use carina_state::DeposedKey;
+    use carina_state::state::{DeposedInstance, ResourceState, StateFile};
+
+    let parsed = parse(
+        r#"
+            moved {
+                from = awscc.s3.Bucket 'old_bucket'
+                to   = awscc.s3.Bucket 'new_bucket'
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("same-type moved block must parse");
+    let from = bucket_id("old_bucket");
+    let to = bucket_id("new_bucket");
+    let mut deposed_only = ResourceState::new("s3.Bucket", from.identity().clone(), "awscc");
+    deposed_only
+        .deposed
+        .push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "bucket-deposed".to_string(),
+            None,
+            HashMap::new(),
+            Default::default(),
+        ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(deposed_only)
+        .expect("test state setup must be valid");
+    let mut managed_current = HashMap::from([(
+        to.as_inner().clone(),
+        Current::absent(to.as_inner().clone()),
+    )]);
+    let mut orphans = state_file
+        .build_orphans(&HashSet::from([to.as_inner().clone()]))
+        .into_plan_orphans();
+
+    let moved_pairs = materialize_moved_states(
+        &mut managed_current,
+        &mut orphans,
+        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
+        &parsed.state_blocks,
+        &Some(state_file),
+    )
+    .expect("a persisted deposed-only source is a valid move source");
+
+    assert_eq!(moved_pairs, vec![(from, to.clone())]);
+    assert!(matches!(
+        managed_current.get(to.as_inner()),
+        Some(Current::Absent(state)) if state.state().id == *to.as_inner()
+    ));
+}
+
+#[test]
+fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
+    use carina_state::DeposedKey;
+    use carina_state::state::{DeposedInstance, ResourceState, StateFile};
+
+    let from = bucket_id("old_bucket");
+    let to = bucket_id("new_bucket");
+    let mut deposed_only = ResourceState::new("s3.Bucket", from.identity().clone(), "awscc");
+    deposed_only
+        .deposed
+        .push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "bucket-deposed".to_string(),
+            None,
+            HashMap::new(),
+            Default::default(),
+        ));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(deposed_only)
+        .expect("test state setup must be valid");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("old_bucket", "new_bucket")],
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("a persisted deposed-only source is a valid detected move source");
+
+    assert_eq!(addressed.moved_pairs(), &[(from, to)]);
+}
+
+#[test]
+fn resource_move_invariants_chained_moves_are_composed() {
+    let source = bucket_id("source");
+    let intermediate = bucket_id("intermediate");
+    let target = bucket_id("target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            source.as_inner().clone(),
+            Current::absent(source.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![
+            test_detected_bucket_move("source", "intermediate"),
+            test_detected_bucket_move("intermediate", "target"),
+        ],
+        None,
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("both links have a loaded source");
+
+    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert!(
+        addressed.managed_current.contains_key(target.as_inner()),
+        "the state maps must be re-keyed to the final destination"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(intermediate.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
+    let explicit_source = bucket_id("explicit_source");
+    let explicit_target = bucket_id("explicit_target");
+    let detected_source = bucket_id("detected_source");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            detected_source.as_inner().clone(),
+            Current::absent(detected_source.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+    };
+
+    let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
+        "detected_source",
+        "explicit_source",
+    )]);
+    let result = detected.apply_after_explicit(&mut addressed, None);
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DetectedMoveConflict {
+                from,
+                to,
+                existing_from,
+                existing_to,
+            }) if *from == detected_source
+                && *to == explicit_source
+                && *existing_from == explicit_source
+                && *existing_to == explicit_target
+        ),
+        "the pre-refresh projection cannot be applied across an explicit move"
+    );
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(explicit_source.clone(), explicit_target)]
+    );
+    assert!(
+        addressed
+            .managed_current
+            .contains_key(detected_source.as_inner()),
+        "conflict detection must run before state is re-keyed"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(explicit_source.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
+    let explicit_source = bucket_id("explicit_source");
+    let explicit_target = bucket_id("explicit_target");
+    let detected_target = bucket_id("detected_target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            explicit_target.as_inner().clone(),
+            Current::absent(explicit_target.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+    };
+
+    let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
+        "explicit_target",
+        "detected_target",
+    )]);
+    let result = detected.apply_after_explicit(&mut addressed, None);
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DetectedMoveConflict {
+                from,
+                to,
+                existing_from,
+                existing_to,
+            }) if *from == explicit_target
+                && *to == detected_target
+                && *existing_from == explicit_source
+                && *existing_to == explicit_target
+        ),
+        "an automatic projection cannot compose through an explicit move"
+    );
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(explicit_source, explicit_target.clone())]
+    );
+    assert!(
+        addressed
+            .managed_current
+            .contains_key(explicit_target.as_inner()),
+        "conflict detection must run before state is re-keyed"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(detected_target.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_late_move_can_extend_an_early_chain() {
+    let source = bucket_id("source");
+    let intermediate = bucket_id("intermediate");
+    let target = bucket_id("target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            intermediate.as_inner().clone(),
+            Current::absent(intermediate.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(source.clone(), intermediate.clone())],
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("intermediate", "target")],
+        None,
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("late detection may extend the already-applied early move");
+
+    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert!(addressed.managed_current.contains_key(target.as_inner()));
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(intermediate.as_inner())
+    );
+}
+
 #[test]
 fn test_plan_fails_on_two_moves_to_same_target() {
     let desired = Vec::new();
@@ -4183,7 +4516,7 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         "subnet_id".to_string(),
         Value::Concrete(ConcreteValue::String("subnet-current".into())),
     );
-    let mut desired = vec![resource];
+    let desired = vec![resource];
     let mut state = StateFile::new();
     state
         .upsert_resource(association_state(
@@ -4204,15 +4537,16 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", desired_name),
     }];
     let resolution = resolve_state_blocks(&blocks, &state_file, &desired, ctx.schemas());
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut desired,
+        &desired,
         &[],
-        &mut state,
+        &state_view,
         &resolution.claims,
-    )
-    .expect("test state identities must remain unique");
+    );
 
+    assert!(moves.is_empty());
     assert_eq!(desired[0].id.identity_str(), Some(desired_name));
 
     assert_collision_contains(
@@ -4476,6 +4810,237 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
     resource
 }
 
+#[test]
+fn resource_move_invariants_anonymous_match_uses_state_row_routing() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    let mut prior = association_state(old_name, "rtb-private", "subnet-a");
+    prior.directives.provider_instance = Some("persisted-route".to_string());
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+
+    let mut desired = desired_association(new_name, "private_rtb", "subnet-a");
+    desired.id.provider_instance = Some("desired-route".to_string());
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(
+        moves[0].from().provider_instance.as_deref(),
+        Some("persisted-route"),
+        "move.from must be the matched state row's routed address"
+    );
+    assert_eq!(
+        moves[0].to().provider_instance.as_deref(),
+        Some("desired-route")
+    );
+}
+
+#[test]
+fn resource_move_invariants_named_match_uses_state_row_routing() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "awscc_s3_bucket_11111111";
+    let mut prior = ResourceState::new("s3.Bucket", test_identity(old_name), "awscc");
+    prior.directives.provider_instance = Some("persisted-route".to_string());
+    prior.set_persisted_attribute("bucket_name", serde_json::json!("logs"));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+    let desired = Resource::with_provider(
+        "awscc",
+        "s3.Bucket",
+        test_identity("logs"),
+        Some("desired-route".to_string()),
+    )
+    .with_binding("logs")
+    .with_attribute(
+        "bucket_name",
+        Value::Concrete(ConcreteValue::String("logs".into())),
+    );
+
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = detect_anonymous_to_named_moves_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    )
+    .expect("empty provider configuration is valid for this create-only match");
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(
+        moves[0].from().provider_instance.as_deref(),
+        Some("persisted-route"),
+        "anonymous-to-named move.from must retain the state row's route"
+    );
+    assert_eq!(
+        moves[0].to().provider_instance.as_deref(),
+        Some("desired-route")
+    );
+}
+
+#[test]
+fn resource_move_invariants_projected_attribute_less_row_is_not_a_candidate() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let source = bucket_id("awscc_s3_bucket_11111111");
+    let target = bucket_id("awscc_s3_bucket_aaaaaaaa");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(ResourceState::new(
+            "s3.Bucket",
+            source.identity().clone(),
+            "awscc",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(ResourceState::new(
+            "s3.Bucket",
+            test_identity("awscc_s3_bucket_22222222"),
+            "awscc",
+        ))
+        .expect("test state setup must be valid");
+
+    let state_view =
+        AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target.clone())]);
+    assert!(
+        state_view
+            .entries_by_type(&StateBlockClaims::empty(), "awscc", "s3.Bucket")
+            .candidates()
+            .next()
+            .is_none(),
+        "a projected row without persisted attributes is existence-only"
+    );
+
+    let desired = bucket_resource(target.identity_str());
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+    assert!(
+        moves.is_empty(),
+        "the projected target must still satisfy the exact-address existence check"
+    );
+}
+
+#[test]
+fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
+    use carina_core::provider::Sent;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let target_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let desired = desired_association(target_name, "private_rtb", "subnet-a");
+    let persisted_target = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(target_name),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let resolved_persisted_target = ResolvedResource::new(persisted_target);
+    let pending = crate::fixture_in_flight_create(
+        &desired.id,
+        "opaque-token",
+        None,
+        Sent::AllRequestAttributes,
+    );
+    let in_flight =
+        ResourceState::from_in_flight(&resolved_persisted_target, &pending, None, None, None)
+            .expect("in-flight fixture must encode");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(in_flight)
+        .expect("test state setup must be valid");
+
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+
+    assert!(
+        moves.is_empty(),
+        "the existing in-flight target address must prevent rebinding an orphan onto it"
+    );
+}
+
+#[test]
+fn resource_move_invariants_projected_state_read_preserves_dependency_bindings() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let mut prior = association_state(old_name, "rtb-private", "subnet-a");
+    prior.dependency_bindings.insert("private_rtb".to_string());
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+    let desired = desired_association(new_name, "private_rtb", "subnet-a");
+    let resources = vec![desired];
+    let state = Some(state_file);
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.resources = resources;
+    let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
+        .expect("build expansion prelude")
+        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .expect("the automatic move projection must resolve");
+    let (loaded_id, loaded) = detected.build_current(&parsed.resources[0].id);
+    let saved = detected.saved_dependency_bindings();
+
+    assert_eq!(loaded_id.identity_str(), Some(old_name));
+    assert_eq!(loaded.id().identity_str(), Some(old_name));
+    assert_eq!(
+        saved.get(&parsed.resources[0].id),
+        Some(&["private_rtb".to_string()].into_iter().collect()),
+        "phase-1 metadata lookup must read the moved source row"
+    );
+}
+
 fn assert_claimed_association_stays_orphaned_after_reconcile() {
     use carina_state::state::StateFile;
 
@@ -4489,7 +5054,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
     state_file
         .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
         .expect("test state setup must be valid");
-    let mut resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
+    let resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
     let state_blocks = vec![StateBlock::Removed {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", old_name),
     }];
@@ -4513,9 +5078,11 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         "effective removed block must claim its state entry"
     );
 
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
 
+    assert!(moves.is_empty());
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
         desired_name,
@@ -4530,13 +5097,89 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
 }
 
 #[test]
-fn claimed_state_entry_survives_orphan_reconcile_for_destroy_and_refresh() {
-    // Both command shapes reach the same
-    // `reconcile_anonymous_identifiers_with_ctx` exclusion seam:
-    // destroy sends the claimed entry through the orphan-delete path under
-    // its old name, while state refresh refreshes it in place under that
-    // old name.
+fn claimed_state_entry_is_excluded_from_automatic_move_detection() {
     assert_claimed_association_stays_orphaned_after_reconcile();
+}
+
+#[test]
+fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses() {
+    use carina_core::parser::InferredFile;
+    use carina_core::schema::ValidatedResourceSchema;
+    use carina_state::state::StateFile;
+
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let fresh_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let desired = || {
+        Resource::with_provider(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            test_identity(fresh_name),
+            None,
+        )
+        .with_attribute(
+            "route_table_id",
+            Value::Concrete(ConcreteValue::String("rtb-private".into())),
+        )
+        .with_attribute(
+            "subnet_id",
+            Value::Concrete(ConcreteValue::String("subnet-a".into())),
+        )
+    };
+    let state = || {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
+            .expect("test state setup must be valid");
+        Some(state)
+    };
+    let config = || {
+        let mut parsed = InferredFile::default();
+        parsed.resources = vec![desired()];
+        ValidatedConfig::from_factories_with_additional_schemas_for_test(
+            parsed,
+            vec![Box::new(AssociationCreateOnlyFactory)],
+            &[],
+            Vec::<(String, ValidatedResourceSchema)>::new(),
+        )
+    };
+
+    let mut destroy_config = config();
+    let destroy_state = state();
+    destroy_config.reconcile_for_destroy(&destroy_state);
+    assert!(
+        destroy_state
+            .as_ref()
+            .and_then(|state| {
+                state.find_resource("awscc", "ec2.SubnetRouteTableAssociation", old_name)
+            })
+            .is_some(),
+        "destroy must leave the persisted row at its old address for orphan deletion"
+    );
+    assert_eq!(
+        destroy_config.evaluated_resources_for_test().resources[0]
+            .id
+            .identity_str(),
+        Some(fresh_name)
+    );
+
+    let mut refresh_config = config();
+    let refresh_state = state();
+    refresh_config.reconcile_for_state_refresh(&refresh_state);
+    assert!(
+        refresh_state
+            .as_ref()
+            .and_then(|state| {
+                state.find_resource("awscc", "ec2.SubnetRouteTableAssociation", old_name)
+            })
+            .is_some(),
+        "state refresh must keep the persisted row at its old address"
+    );
+    assert_eq!(
+        refresh_config.evaluated_resources_for_test().resources[0]
+            .id
+            .identity_str(),
+        Some(fresh_name)
+    );
 }
 
 #[test]
@@ -4573,7 +5216,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         ))
         .expect("test state setup must be valid");
 
-    let mut resources = vec![
+    let resources = vec![
         desired_association(
             "ec2_subnet_route_table_association_aaaaaaaa",
             "private_rtb",
@@ -4591,14 +5234,14 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         ),
     ];
 
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut resources,
+        &resources,
         &[],
-        &mut state_file,
+        &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
-    )
-    .expect("test state identities must remain unique");
+    );
 
     let names: Vec<_> = resources
         .iter()
@@ -4607,11 +5250,29 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
     assert_eq!(
         names,
         vec![
-            "ec2_subnet_route_table_association_11111111",
-            "ec2_subnet_route_table_association_22222222",
-            "ec2_subnet_route_table_association_33333333",
+            "ec2_subnet_route_table_association_aaaaaaaa",
+            "ec2_subnet_route_table_association_bbbbbbbb",
+            "ec2_subnet_route_table_association_cccccccc",
         ],
-        "desired anonymous associations must adopt state names by resolved create-only values",
+        "desired anonymous associations must retain their freshly computed identities",
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![
+            (
+                "ec2_subnet_route_table_association_11111111".to_string(),
+                "ec2_subnet_route_table_association_aaaaaaaa".to_string(),
+            ),
+            (
+                "ec2_subnet_route_table_association_22222222".to_string(),
+                "ec2_subnet_route_table_association_bbbbbbbb".to_string(),
+            ),
+            (
+                "ec2_subnet_route_table_association_33333333".to_string(),
+                "ec2_subnet_route_table_association_cccccccc".to_string(),
+            ),
+        ],
+        "resolved create-only values must produce state-row moves",
     );
 }
 
@@ -4650,7 +5311,7 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
         .upsert_resource(prior)
         .expect("test state setup must be valid");
 
-    let mut managed = vec![
+    let managed = vec![
         Resource::with_provider(
             "aws",
             "s3.Bucket",
@@ -4665,15 +5326,16 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
             .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
     ];
 
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut managed,
+        &managed,
         &data_sources,
-        &mut state_file,
+        &state_view,
         &StateBlockClaims::empty(),
-    )
-    .expect("test state identities must remain unique");
+    );
 
+    assert!(moves.is_empty());
     assert_ne!(
         managed[0].id, data_sources[0].id,
         "anonymous managed resource must not adopt a data-source binding's ResourceId",
@@ -4697,7 +5359,7 @@ fn test_stale_moved_block_releases_claims() {
         ))
         .expect("test state setup must be valid");
 
-    let mut resources = vec![desired_association(
+    let resources = vec![desired_association(
         "ec2_subnet_route_table_association_aaaaaaaa",
         "private_rtb",
         "subnet-a",
@@ -4721,13 +5383,22 @@ fn test_stale_moved_block_releases_claims() {
         !claims.claims_to(&resources[0].id),
         "ineffective moved block must not pin its to address"
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        "ec2_subnet_route_table_association_11111111",
-        "stale moved block must release claims so meaning-based matching can preserve the no-op"
+        "ec2_subnet_route_table_association_aaaaaaaa",
+        "reconciliation must not rewrite the desired identity"
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![(
+            "ec2_subnet_route_table_association_11111111".to_string(),
+            "ec2_subnet_route_table_association_aaaaaaaa".to_string(),
+        )],
+        "stale moved block must release claims so meaning-based matching can move the row"
     );
 }
 
@@ -4784,8 +5455,10 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &resources,
         ctx.schemas(),
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
+    assert!(moves.is_empty());
     assert_eq!(
         resources
             .iter()
@@ -5773,10 +6446,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     // produces its own "Unknown resource type" entry.
     let r1 = Resource::new("foo.nothing", "first");
     let r2 = Resource::new("bar.nothing", "second");
-    let parsed = ParsedFile {
-        resources: vec![r1, r2],
-        ..ParsedFile::default()
-    };
+    let mut parsed = ParsedFile::default();
+    parsed.resources = vec![r1, r2];
 
     let provider_ctx = carina_core::parser::ProviderContext::default();
     let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
@@ -5850,11 +6521,9 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         binding: carina_core::parser::ForBinding::Simple("item".to_string()),
         template_resource,
     };
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![resource],
-        deferred_for_expressions: vec![deferred],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![resource];
+    evaluated.deferred_for_expressions = vec![deferred];
     let unresolved = evaluated.clone();
 
     let canonical_unresolved = resolve_config_names_with_ctx(
@@ -5914,10 +6583,8 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let resource = Resource::with_provider("test", "thing", "direct", None)
         .with_attribute("rule", rules.clone())
         .with_attribute("rules", rules);
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![resource],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![resource];
     let unresolved = evaluated.clone();
 
     let errors = resolve_config_names_with_ctx(
@@ -5946,15 +6613,13 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
         &[],
         [("test".to_string(), schema)],
     );
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![
-            Resource::with_provider("test", "thing", "direct", None).with_attribute(
-                "name_prefix",
-                Value::Concrete(ConcreteValue::String("owned-".into())),
-            ),
-        ],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![
+        Resource::with_provider("test", "thing", "direct", None).with_attribute(
+            "name_prefix",
+            Value::Concrete(ConcreteValue::String("owned-".into())),
+        ),
+    ];
     let unresolved = evaluated.clone();
 
     let canonical = resolve_config_names_with_ctx(
@@ -6117,11 +6782,19 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
     )
     .expect("schema-less test resource has no references to resolve");
     let claims = StateBlockClaims::empty();
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
         LateAnonymousIdentityInputs {
             resources: &mut resources,
+            addressed: &mut addressed,
             data_sources: &[],
             state_file: None,
             state_block_claims: &claims,
@@ -6145,6 +6818,130 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             .iter()
             .all(|resource| resource.id.identity_str().is_none()),
         "the error path must leave every anonymous identity pending",
+    );
+}
+
+#[test]
+fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let desired = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity("fresh_late_identity"),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![desired], ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("late-reconciliation fixture has no unresolved live references");
+
+    let early_source_name = "ec2_subnet_route_table_association_11111111";
+    let other_orphan_name = "ec2_subnet_route_table_association_22222222";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(association_state(
+            early_source_name,
+            "rtb-private",
+            "subnet-a",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            other_orphan_name,
+            "rtb-private",
+            "subnet-b",
+        ))
+        .expect("test state setup must be valid");
+
+    let desired_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let early_source_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(early_source_name),
+        None,
+    );
+    let other_orphan_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(other_orphan_name),
+        None,
+    );
+    let desired_ids = HashSet::from([desired_id.as_inner().clone()]);
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let early_moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        resources.resources(),
+        &[],
+        &state_view,
+        &claims,
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&early_moves),
+        vec![(
+            early_source_name.to_string(),
+            desired_id.identity_str().to_string(),
+        )],
+        "the unique full match must win over the partial-match orphan",
+    );
+    apply_detected_resource_moves(
+        &mut addressed,
+        early_moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("early move must re-key its orphan state");
+    let early_pair = (early_source_id, desired_id.clone());
+    assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
+    assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: Some(&state_file),
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    )
+    .expect("late anonymous identity must resolve");
+
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![early_pair],
+        "the projected early destination must make late reconciliation a no-op"
+    );
+    assert!(
+        addressed.orphans.contains_key(other_orphan_id.as_inner()),
+        "the other matching row must remain an orphan and therefore a Delete candidate",
     );
 }
 
@@ -6183,7 +6980,7 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
 }
 
 #[test]
-fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums() {
+fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums() {
     use carina_state::state::{ResourceState, StateFile};
 
     let ctx = region_identity_ctx();
@@ -6215,27 +7012,33 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
                 .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
-    let mut current_states = HashMap::new();
     let desired_ids = HashSet::from([named.id.clone()]);
-    let mut orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
-    let mut prev_explicit = HashMap::new();
-    let mut saved_attrs = crate::empty_lifted_saved_attrs();
-
-    let renames = apply_anonymous_to_named_renames(
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        prev_explicit: HashMap::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        moved_pairs: Vec::new(),
+    };
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
         &resources,
         &providers_aws,
-        &mut current_states,
-        &mut orphans,
-        &mut prev_explicit,
-        &mut saved_attrs,
-        &Some(state_file),
+        &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
+    )
+    .unwrap();
+    apply_detected_resource_moves(
+        &mut addressed,
+        moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
     )
     .unwrap();
 
     assert_eq!(
-        renames,
+        addressed.moved_pairs,
         vec![(
             ResolvedResourceId::with_provider_identity(
                 "awscc",
@@ -6247,8 +7050,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         )],
         "provider config region spelling must canonicalize before rename simhash"
     );
-    assert!(orphans.is_empty());
-    let current = current_states.get(&named.id).expect("renamed state");
+    assert!(addressed.orphans.is_empty());
+    let current = addressed
+        .managed_current
+        .get(&named.id)
+        .expect("renamed state");
     let state = match current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
@@ -6272,10 +7078,21 @@ fn module_and_provider_wrappers_return_vec_app_error() {
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
+    let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        &parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            &parsed,
+            ctx.schemas(),
+            &provider_ctx,
+            &module_signatures,
+        ),
+    );
     let errors = validate_module_calls_with_imported(
         &parsed,
-        &carina_core::module_resolver::ResolvedModuleSignatures::new(),
+        &module_signatures,
         &provider_ctx,
+        &binding_use_report,
     );
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 
@@ -6295,10 +7112,9 @@ fn module_and_provider_wrappers_return_vec_app_error() {
 fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
     let mut r = Resource::new("foo.bar", "x");
     r.attributes.insert(attr_name.to_string(), attr_value);
-    ParsedFile {
-        resources: vec![r],
-        ..ParsedFile::default()
-    }
+    let mut parsed = ParsedFile::default();
+    parsed.resources = vec![r];
+    parsed
 }
 
 #[test]
@@ -7037,20 +7853,13 @@ mod expand_same_config_deferred_for_tests {
             &parsed.resources,
             &schemas,
         );
-        let prepared = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
+        let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
             .expect("build expansion prelude")
-            .reconcile_addresses(
-                ReconcileDeferredForExpansionInputs {
-                    ctx: &wiring,
-                    parsed: &parsed,
-                    provider_configs: &[],
-                    state_block_claims: &claims,
-                    managed_current: HashMap::new(),
-                    orphans: Orphans::new(),
-                    already_refreshed: HashSet::new(),
-                },
-                DeferredForWarningPolicy::Suppress,
-            )
+            .detect_moves(&wiring, &parsed.data_sources, &[], &claims)
+            .expect("detect automatic moves");
+        let prepared = prelude
+            .bind_projected_phase1_state(HashMap::new(), Orphans::new(), HashSet::new())
+            .reconcile_addresses(&parsed, DeferredForWarningPolicy::Suppress)
             .expect("prepare expansion")
             .seal(DataSourceValues::empty());
 
@@ -8066,10 +8875,8 @@ mod kind_default_source_tests {
     }
 
     fn resolved(configs: Vec<ProviderConfig>) -> ResolvedProviderConfigs {
-        let parsed = carina_core::parser::InferredFile {
-            providers: configs,
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = configs;
         carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &std::collections::HashMap::new(),

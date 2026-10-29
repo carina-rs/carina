@@ -1,0 +1,11 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -/+ test.test.Widget test_test_widget_571a9cd1 (must be replaced) (moved from: test_test_widget_11111111)
+      external_name: 'old' → 'new' (forces replacement)
+      # (1 unchanged attribute hidden)
+
+Plan: 0 to add, 0 to change, 1 to replace, 0 to destroy, 1 to move.

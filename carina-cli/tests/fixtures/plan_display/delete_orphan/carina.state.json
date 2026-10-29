@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "identity": "ec2_vpc_fb75c929",
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
@@ -22,7 +22,7 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "binding": "ec2_vpc_fb75c929",
+      "binding": "awscc_ec2_vpc_0bc2a2bb",
       "dependency_bindings": [],
       "explicit": {
         "kind": "struct",
@@ -62,7 +62,7 @@
       "name_overrides": {},
       "binding": "my_subnet",
       "dependency_bindings": [
-        "ec2_vpc_fb75c929"
+        "awscc_ec2_vpc_0bc2a2bb"
       ],
       "explicit": {
         "kind": "struct",

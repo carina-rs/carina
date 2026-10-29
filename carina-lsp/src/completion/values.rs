@@ -8,6 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
+use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
@@ -336,7 +337,17 @@ impl CompletionProvider {
                             .map(|t| (name, t))
                     })
                     .collect();
+                let structural_resources = EnumValueResolver::with_defs(attr_type, target_defs)
+                    .enum_identity()
+                    .is_some()
+                    .then(|| self.structural_resource_binding_names(src));
                 completions.extend(in_scope.into_iter().filter(|item| {
+                    if structural_resources
+                        .as_ref()
+                        .is_some_and(|names| names.contains(&item.label))
+                    {
+                        return false;
+                    }
                     let Some((_, arg_type_expr)) =
                         typed_arguments.iter().find(|(n, _)| n == &item.label)
                     else {
@@ -1038,6 +1049,28 @@ impl CompletionProvider {
         }
 
         items
+    }
+
+    fn structural_resource_binding_names(
+        &self,
+        src: DslSource<'_>,
+    ) -> std::collections::HashSet<String> {
+        self.extract_resource_bindings(src)
+            .into_iter()
+            .filter_map(|(name, resource_type)| (!resource_type.is_empty()).then_some(name))
+            .collect()
+    }
+
+    pub(super) fn remove_structural_resource_bindings(
+        &self,
+        items: &mut Vec<CompletionItem>,
+        text: &str,
+        base_path: Option<&Path>,
+    ) {
+        let mut storage = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut storage);
+        let structural = self.structural_resource_binding_names(src);
+        items.retain(|item| !structural.contains(&item.label));
     }
 
     /// Completions for `<binding>.<partial>` where `<binding>` is an

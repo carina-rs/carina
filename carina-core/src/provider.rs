@@ -5573,6 +5573,47 @@ where
             }
         }
     }
+
+    fn enum_declaration(
+        &self,
+        owned: &crate::parser::OwnedTypeIdentity,
+    ) -> Result<Option<AttributeType>, crate::parser::CustomTypeValidationError> {
+        use crate::parser::{CustomTypeValidationError, SchemaTypeOwner};
+
+        let identity = owned.identity();
+        let mut selected: Option<(String, EnumDefinitionSignature, AttributeType)> = None;
+        for owner in owned.owners().iter() {
+            let SchemaTypeOwner::Provider(owner) = owner;
+            let owner_index = self.index.get(owner).ok_or_else(|| {
+                CustomTypeValidationError::MissingDeclaration {
+                    owner: owner.clone(),
+                    identity: identity.clone(),
+                }
+            })?;
+            let declarations = owner_index.declarations.get(identity).ok_or_else(|| {
+                CustomTypeValidationError::MissingDeclaration {
+                    owner: owner.clone(),
+                    identity: identity.clone(),
+                }
+            })?;
+            for declaration in declarations {
+                let Some(signature) = enum_definition_signature(declaration) else {
+                    continue;
+                };
+                if let Some((first_owner, first_signature, _)) = &selected
+                    && first_signature != &signature
+                {
+                    return Err(CustomTypeValidationError::ConflictingEnumDefinitions {
+                        identity: identity.clone(),
+                        first_owner: first_owner.clone(),
+                        second_owner: owner.clone(),
+                    });
+                }
+                selected.get_or_insert_with(|| (owner.clone(), signature, declaration.clone()));
+            }
+        }
+        Ok(selected.map(|(_, _, declaration)| declaration))
+    }
 }
 
 impl<F> crate::parser::ProviderCustomTypeSource for FactoryCustomTypeResolver<F>
