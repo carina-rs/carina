@@ -174,17 +174,26 @@ const currentPath = Astro.url.pathname;
   .sidebar {
     position: sticky;
     top: var(--topbar-height);
+    display: flex;
+    flex-direction: column;
     box-sizing: border-box;
     max-height: calc(100dvh - var(--topbar-height));
     padding: calc(var(--space-8) + var(--space-4)) 0 var(--space-4);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    scrollbar-width: thin;
-    scrollbar-gutter: stable;
+    overflow: hidden;
     background: var(--sidebar-bg);
   }
 
   .sidebar-toggle-mobile { display: none; }
+
+  .sidebar-content {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-gutter: stable;
+  }
 
   :global(html[data-nav-collapsed]) .sidebar-content { display: none; }
 
@@ -251,12 +260,10 @@ const currentPath = Astro.url.pathname;
     .sidebar {
       position: static;
       top: auto;
+      display: block;
       max-height: none;
       padding: var(--space-8) 0 0;
-      overflow-y: visible;
-      overscroll-behavior: auto;
-      scrollbar-width: auto;
-      scrollbar-gutter: auto;
+      overflow: visible;
     }
 
     .sidebar-toggle-mobile {
@@ -294,8 +301,14 @@ const currentPath = Astro.url.pathname;
     }
 
     .sidebar-content {
+      position: static;
       display: none;
+      min-height: auto;
       padding-top: var(--space-4);
+      overflow-y: visible;
+      overscroll-behavior: auto;
+      scrollbar-width: auto;
+      scrollbar-gutter: auto;
     }
 
     :global(html[data-mobile-nav-open]) .sidebar-content { display: block; }

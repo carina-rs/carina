@@ -49,6 +49,7 @@ const openPoints = side === 'start' ? '13 9 16 12 13 15' : '11 9 8 12 11 15';
 <style>
   .rail-header {
     display: flex;
+    flex: none;
     align-items: center;
     gap: var(--space-2);
     min-height: 2rem;
@@ -91,15 +92,6 @@ const openPoints = side === 'start' ? '13 9 16 12 13 15' : '11 9 8 12 11 15';
 
   :global(html[data-nav-collapsed]) .rail-header-start .rail-label,
   :global(html[data-toc-collapsed]) .rail-header-end .rail-label { display: none; }
-
-  @media (min-width: 48.001rem) {
-    .rail-header {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: var(--bg);
-    }
-  }
 
   @media (max-width: 48rem) {
     .rail-header-start { display: none; }

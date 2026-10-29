@@ -34,14 +34,22 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
   .toc {
     position: sticky;
     top: var(--topbar-height);
+    display: flex;
+    flex-direction: column;
     box-sizing: border-box;
     max-height: calc(100dvh - var(--topbar-height));
     padding: calc(var(--space-8) + var(--space-4)) 0 var(--space-4);
+    overflow: hidden;
+    font-size: var(--text-sm);
+  }
+
+  .toc-content {
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-width: thin;
     scrollbar-gutter: stable;
-    font-size: var(--text-sm);
   }
 
   :global(html[data-toc-collapsed]) .toc-content { display: none; }
@@ -77,8 +85,14 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
     .toc {
       position: static;
       top: auto;
+      display: block;
       max-height: none;
       padding: 0;
+      overflow: visible;
+    }
+
+    .toc-content {
+      min-height: auto;
       overflow-y: visible;
       overscroll-behavior: auto;
       scrollbar-width: auto;

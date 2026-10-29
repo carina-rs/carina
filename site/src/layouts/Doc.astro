@@ -261,17 +261,17 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
       || root.hasAttribute('data-nav-collapsed')
     ) return;
 
-    const sidebar = document.querySelector<HTMLElement>('.sidebar');
-    const activeLink = sidebar?.querySelector<HTMLElement>('.sidebar-link[aria-current="page"]');
-    if (!sidebar || !activeLink) return;
+    const navigation = document.querySelector<HTMLElement>('#doc-navigation');
+    const activeLink = navigation?.querySelector<HTMLElement>('.sidebar-link[aria-current="page"]');
+    if (!navigation || !activeLink) return;
 
     const linkTop = activeLink.offsetTop;
     const linkBottom = linkTop + activeLink.offsetHeight;
-    const visibleTop = sidebar.scrollTop;
-    const visibleBottom = visibleTop + sidebar.clientHeight;
+    const visibleTop = navigation.scrollTop;
+    const visibleBottom = visibleTop + navigation.clientHeight;
 
     if (linkTop < visibleTop || linkBottom > visibleBottom) {
-      sidebar.scrollTop = linkTop - (sidebar.clientHeight - activeLink.offsetHeight) / 2;
+      navigation.scrollTop = linkTop - (navigation.clientHeight - activeLink.offsetHeight) / 2;
     }
   };
 
