@@ -1,30 +1,24 @@
 use std::io::{self, Write};
 
+use crate::wiring::{OverrideAwareResources, ProjectedStateRead};
 use carina_core::name_override::NameOverrideSource;
-use carina_state::StateFile;
-
-use crate::wiring::OverrideAwareResources;
 
 pub(crate) fn emit_legacy_override_warnings(
     resources: &OverrideAwareResources,
-    state_file: Option<&StateFile>,
+    state: &ProjectedStateRead<'_>,
 ) {
     let mut stderr = io::stderr().lock();
-    let _ = write_legacy_override_warnings(resources, state_file, &mut stderr);
+    let _ = write_legacy_override_warnings(resources, state, &mut stderr);
 }
 
 pub(crate) fn write_legacy_override_warnings<W: Write>(
     resources: &OverrideAwareResources,
-    state_file: Option<&StateFile>,
+    state: &ProjectedStateRead<'_>,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(state_file) = state_file else {
-        return Ok(());
-    };
-
     let mut warnings = Vec::new();
     for resource_id in resources.legacy_overrides_applied() {
-        let Some(overrides) = state_file.name_overrides_for(resource_id) else {
+        let Some(overrides) = state.name_overrides_for(resource_id) else {
             continue;
         };
         for (attribute, override_) in overrides {

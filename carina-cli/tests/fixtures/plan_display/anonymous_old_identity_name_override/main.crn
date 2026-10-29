@@ -1,0 +1,6 @@
+provider test {}
+
+test.test.Widget {
+  external_name = "stable"
+  legacy_token  = "shared"
+}

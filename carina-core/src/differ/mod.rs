@@ -122,6 +122,18 @@ pub struct Orphan {
 }
 
 impl Orphan {
+    pub fn absent(
+        state: crate::resource::AbsentState,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::Absent(state),
+            binding,
+            directives,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_state(
         state: State,

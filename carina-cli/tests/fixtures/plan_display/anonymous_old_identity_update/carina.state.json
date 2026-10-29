@@ -1,0 +1,38 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-anonymous-old-identity-update",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "ec2_vpc_0bc2a2bb",
+      "provider": "awscc",
+      "identifier": "vpc-live",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "enable_dns_support": false
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "enable_dns_support": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

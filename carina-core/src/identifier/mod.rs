@@ -34,32 +34,38 @@ pub struct StateBlockClaims {
 /// resource type, retaining both the complete entry set and the safe heuristic
 /// candidate subset.
 pub struct ScreenedStateEntries<T> {
-    entries: Vec<(T, bool, bool)>,
+    entries: Vec<ScreenedStateEntry<T>>,
+}
+
+struct ScreenedStateEntry<T> {
+    value: T,
+    claimed: bool,
+    candidate_eligible: bool,
 }
 
 impl<T> ScreenedStateEntries<T> {
     pub fn candidates(&self) -> impl Iterator<Item = &T> {
-        self.entries
-            .iter()
-            .filter_map(|(entry, claimed, eligible)| (!claimed && *eligible).then_some(entry))
+        self.entries.iter().filter_map(|entry| {
+            (!entry.claimed && entry.candidate_eligible).then_some(&entry.value)
+        })
     }
 
     pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
-        self.entries.iter().map(|(entry, _, _)| entry)
+        self.entries.iter().map(|entry| &entry.value)
     }
 
     pub(crate) fn claimed(&self) -> impl Iterator<Item = &T> {
         self.entries
             .iter()
-            .filter_map(|(entry, claimed, _)| claimed.then_some(entry))
+            .filter_map(|entry| entry.claimed.then_some(&entry.value))
     }
 
     /// Retain entries for exact-address existence checks while excluding
     /// entries that do not carry enough state to participate in heuristics.
     pub fn exclude_candidates(mut self, excluded: impl Fn(&T) -> bool) -> Self {
-        for (entry, _, eligible) in &mut self.entries {
-            if excluded(entry) {
-                *eligible = false;
+        for entry in &mut self.entries {
+            if excluded(&entry.value) {
+                entry.candidate_eligible = false;
             }
         }
         self
@@ -100,7 +106,11 @@ impl StateBlockClaims {
                             self.claims_from(&resource_id)
                         },
                     );
-                    (entry, claimed, true)
+                    ScreenedStateEntry {
+                        value: entry,
+                        claimed,
+                        candidate_eligible: true,
+                    }
                 })
                 .collect(),
         }

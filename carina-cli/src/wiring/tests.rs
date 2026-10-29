@@ -612,17 +612,15 @@ fn canonical_pair<E: Clone>(
     .expect("test block-name resolution must succeed")
 }
 
-fn build_override_aware_pair_for_test<S>(
+fn build_override_aware_pair_for_test(
     unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
-    state_file: Option<&S>,
+    state_file: Option<&StateFile>,
     inputs: LivePreApplyInputs<'_>,
-) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
-where
-    S: carina_core::name_override::NameOverrideSource + ?Sized,
-{
+) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
+    let state = ProjectedStateRead::for_test_unmoved(state_file);
     OverrideAwareResources::build_pair_with_stability(
         &unresolved,
-        state_file,
+        &state,
         inputs,
         &HashMap::new(),
         OverrideAwareBuildMode::Apply,
@@ -1440,6 +1438,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let data_source = DataSource::with_provider("mock", "test.lookup", "source", None);
     let mut data_source_values =
         test_data_source_values(std::slice::from_ref(&data_source), &data_source_states);
+    let projected_state = ProjectedStateRead::for_test_unmoved(None);
 
     hydrate_prior_data_source_values(
         &mut current_states,
@@ -1447,7 +1446,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         &mut orphans,
         &normalizer,
         &saved_attrs,
-        None,
+        &projected_state,
     )
     .await
     .unwrap();
@@ -1586,13 +1585,14 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         DataSourceValues::from_data_sources(std::slice::from_ref(&data_source), |_| {
             DataSourceValue::read(State::existing(id.clone(), HashMap::new()))
         });
+    let projected_state = ProjectedStateRead::for_test_unmoved(Some(&state_file));
     hydrate_prior_data_source_values(
         &mut current_states,
         &mut data_source_values,
         &mut orphans,
         &SavedAttrsHydratingNormalizer,
         &saved_attrs,
-        Some(&state_file),
+        &projected_state,
     )
     .await
     .expect("combined state hydration");
@@ -4164,6 +4164,7 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
         &mut addressed,
         vec![test_detected_bucket_move("missing", "target")],
         None,
+        MoveOverlapPolicy::ComposeForward,
     );
 
     assert!(
@@ -4270,6 +4271,7 @@ fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
         &mut addressed,
         vec![test_detected_bucket_move("old_bucket", "new_bucket")],
         Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
     )
     .expect("a persisted deposed-only source is a valid detected move source");
 
@@ -4299,6 +4301,7 @@ fn resource_move_invariants_chained_moves_are_composed() {
             test_detected_bucket_move("intermediate", "target"),
         ],
         None,
+        MoveOverlapPolicy::ComposeForward,
     )
     .expect("both links have a loaded source");
 
@@ -4442,6 +4445,7 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
         &mut addressed,
         vec![test_detected_bucket_move("intermediate", "target")],
         None,
+        MoveOverlapPolicy::ComposeForward,
     )
     .expect("late detection may extend the already-applied early move");
 
@@ -6918,8 +6922,13 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
         )],
         "the unique full match must win over the partial-match orphan",
     );
-    apply_detected_resource_moves(&mut addressed, early_moves, Some(&state_file))
-        .expect("early move must re-key its orphan state");
+    apply_detected_resource_moves(
+        &mut addressed,
+        early_moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("early move must re-key its orphan state");
     let early_pair = (early_source_id, desired_id.clone());
     assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
     assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
@@ -7032,7 +7041,13 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         &carina_core::identifier::StateBlockClaims::empty(),
     )
     .unwrap();
-    apply_detected_resource_moves(&mut addressed, moves, Some(&state_file)).unwrap();
+    apply_detected_resource_moves(
+        &mut addressed,
+        moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .unwrap();
 
     assert_eq!(
         addressed.moved_pairs,

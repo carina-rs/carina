@@ -444,24 +444,20 @@ pub(super) struct ExpansionPriorStates {
     pub already_refreshed: HashSet<ResourceId>,
 }
 
-fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Option<Orphan> {
+fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
     match current {
-        Current::Absent(_state) => None,
-        Current::Present(present) => Some(Orphan::present(
-            present,
-            row.binding.clone(),
-            row.directives.clone(),
-        )),
-        Current::CreateInFlight(pending) => Some(Orphan::create_in_flight(
-            pending,
-            row.binding.clone(),
-            row.directives.clone(),
-        )),
-        Current::MissingIdentifier(state) => Some(Orphan::missing_identifier(
-            state,
-            row.binding.clone(),
-            row.directives.clone(),
-        )),
+        Current::Absent(state) => {
+            Orphan::absent(state, row.binding.clone(), row.directives.clone())
+        }
+        Current::Present(present) => {
+            Orphan::present(present, row.binding.clone(), row.directives.clone())
+        }
+        Current::CreateInFlight(pending) => {
+            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
+        }
+        Current::MissingIdentifier(state) => {
+            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
+        }
     }
 }
 
@@ -585,9 +581,7 @@ impl SchemaCheckedPendingPlanFile {
                             from: Box::new(ResolvedResourceId::new(replay_origin.clone())),
                             to: Box::new(ResolvedResourceId::new(id.clone())),
                         })?;
-                    if let Some(orphan) = saved_orphan_from_current(current, row) {
-                        orphans.insert(orphan);
-                    }
+                    orphans.insert(saved_orphan_from_current(current, row));
                 } else {
                     managed.insert(replay_origin.clone(), current);
                 }
@@ -1292,6 +1286,42 @@ mod tests {
             .expect("saved move replay state must restore");
 
         assert!(prior.orphans.contains_key(&from));
+        assert!(!prior.managed.contains_key(&from));
+        assert!(matches!(
+            prior.managed.get(&to),
+            Some(Current::Absent(state)) if state.state().id == to
+        ));
+    }
+
+    #[test]
+    fn saved_move_replay_keeps_absent_source_as_an_orphan() {
+        let from = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old",
+            Some("source-route".to_string()),
+        );
+        let to = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "new",
+            Some("target-route".to_string()),
+        );
+        let planned = Current::absent(to.clone());
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(to.clone())],
+                &SavedPlanReplayMoves::for_test_explicit([from.clone()]),
+                &state_file,
+            )
+            .expect("saved absent move replay state must restore");
+
+        assert!(matches!(
+            prior.orphans.get(&from).map(|orphan| orphan.current()),
+            Some(Current::Absent(state)) if state.state().id == from
+        ));
         assert!(!prior.managed.contains_key(&from));
         assert!(matches!(
             prior.managed.get(&to),

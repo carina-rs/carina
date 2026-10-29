@@ -2026,10 +2026,11 @@ async fn run_apply_locked_owned(
                 remote_bindings,
                 &wait_aliases,
             )?;
+            let projected_state = addressed.projected_state(state_file.as_ref());
             let (mut override_aware_resources, unresolved_override_aware_resources) =
                 OverrideAwareResources::build_pair_with_stability(
                     expanded_canonical_resources.as_pair(),
-                    state_file.as_ref(),
+                    &projected_state,
                     carina_core::binding_index::LivePreApplyInputs {
                         managed: &[],
                         compositions: &pre_resolve_compositions,
@@ -2043,7 +2044,7 @@ async fn run_apply_locked_owned(
                 )?;
             crate::legacy_name_overrides::emit_legacy_override_warnings(
                 &override_aware_resources,
-                state_file.as_ref(),
+                &projected_state,
             );
             // Resolve and canonicalize only refresh-time data sources. Deferred
             // reads keep their original input refs so the plan/executor dependency
@@ -2157,10 +2158,9 @@ async fn run_apply_locked_owned(
                 ctx.schemas(),
                 override_aware_resources.resources(),
             );
-            let directives_map = state_file
-                .as_ref()
-                .map(|sf| sf.build_directives())
-                .unwrap_or_default();
+            let directives_map = addressed
+                .projected_state(state_file.as_ref())
+                .build_directives();
             let schemas = ctx.schemas();
             let mut plan = create_plan_with_cascades(
                 &resolved_resources,

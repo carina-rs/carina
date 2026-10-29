@@ -3787,9 +3787,10 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let current_states = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
+    let projected_state = crate::wiring::ProjectedStateRead::for_test_unmoved(Some(&state));
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
         &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
-        Some(&state),
+        &projected_state,
         LivePreApplyInputs {
             managed: &[],
             compositions: &[],
@@ -3806,7 +3807,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let mut stderr = Vec::new();
     crate::legacy_name_overrides::write_legacy_override_warnings(
         &override_aware,
-        Some(&state),
+        &projected_state,
         &mut stderr,
     )
     .expect("warning write should succeed");

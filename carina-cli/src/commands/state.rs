@@ -1336,6 +1336,7 @@ pub(crate) async fn run_state_refresh_locked(
         mut data_source_values,
         wait_aliases,
     } = prepared_expansion.into_parts();
+    let projected_state = addressed.projected_state(state_file.as_ref());
     let crate::wiring::AddressedStateParts {
         mut managed_current,
         orphans,
@@ -1399,7 +1400,7 @@ pub(crate) async fn run_state_refresh_locked(
         &mut Orphans::new(),
         &provider,
         &saved_attrs,
-        state_file.as_ref(),
+        &projected_state,
     )
     .await?;
     crate::wiring::lift_data_source_value_enum_leaves(

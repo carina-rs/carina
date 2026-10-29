@@ -14,6 +14,8 @@ use carina_core::parser::File;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
+use super::ProjectedStateRead;
+
 /// Evaluated and pre-value-resolution resources whose provider-schema block
 /// aliases have been folded into canonical attribute names together.
 ///
@@ -252,16 +254,12 @@ pub enum OverrideAwareBuildMode<'a> {
 /// ```compile_fail,E0308
 /// # use std::collections::HashMap;
 /// # use carina_core::binding_index::LivePreApplyInputs;
-/// # use carina_core::name_override::NameOverride;
 /// # use carina_cli::wiring::{OverrideAwareBuildMode, OverrideAwareResources};
-/// # use carina_core::resource::{Resource, ResourceId};
+/// # use carina_core::resource::Resource;
 /// # fn bypass(raw: Vec<Resource>, inputs: LivePreApplyInputs<'_>) {
-/// let _ = OverrideAwareResources::build_pair_with_stability::<
-///     (),
-///     HashMap<ResourceId, HashMap<String, NameOverride>>,
-/// >(
+/// let _ = OverrideAwareResources::build_pair_with_stability(
 ///     &raw,
-///     None,
+///     todo!(),
 ///     inputs,
 ///     &HashMap::new(),
 ///     OverrideAwareBuildMode::Apply,
@@ -294,33 +292,38 @@ pub struct RebuildBindingsInputs<'a> {
 impl OverrideAwareResources {
     /// Build evaluated and authored views from the opaque pair returned by the
     /// schema block-name resolver.
-    pub fn build_pair_with_stability<E, S>(
+    pub(crate) fn build_pair_with_stability<E>(
         resources: &CanonicalResourcePair<E>,
-        state_file: Option<&S>,
+        state: &ProjectedStateRead<'_>,
         inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
-    ) -> Result<(Self, Self), String>
-    where
-        S: NameOverrideSource + ?Sized,
-    {
+    ) -> Result<(Self, Self), String> {
         let (evaluated, unresolved) = resources.resources_for_build()?;
-        let evaluated = Self::build_inner(evaluated, state_file, &inputs, managed_stability, mode)?;
-        let unresolved =
-            Self::build_inner(unresolved, state_file, &inputs, managed_stability, mode)?;
+        let evaluated = Self::build_inner(evaluated, state, &inputs, managed_stability, mode)?;
+        let unresolved = Self::build_inner(unresolved, state, &inputs, managed_stability, mode)?;
         Ok((evaluated, unresolved))
     }
 
-    fn build_inner<S>(
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn build_pair_without_state_for_test<E>(
+        resources: &CanonicalResourcePair<E>,
+        inputs: LivePreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+        mode: OverrideAwareBuildMode<'_>,
+    ) -> Result<(Self, Self), String> {
+        let state = ProjectedStateRead::for_test_unmoved(None);
+        Self::build_pair_with_stability(resources, &state, inputs, managed_stability, mode)
+    }
+
+    fn build_inner(
         unresolved: Vec<Resource>,
-        state_file: Option<&S>,
+        state: &ProjectedStateRead<'_>,
         inputs: &LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
-    ) -> Result<Self, String>
-    where
-        S: NameOverrideSource + ?Sized,
-    {
+    ) -> Result<Self, String> {
         let mut resources = unresolved.clone();
         let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
             LivePreApplyInputs {
@@ -340,31 +343,29 @@ impl OverrideAwareResources {
         let mut legacy_overrides_applied = Vec::new();
         let mut skipped_overrides = Vec::new();
 
-        if let Some(state_file) = state_file {
-            for ((resource, snapshot_resource), unresolved_resource) in resources
-                .iter_mut()
-                .zip(snapshot.iter())
-                .zip(unresolved_resources.iter_mut())
-            {
-                let Some(name_overrides) = state_file.name_overrides_for(&resource.id) else {
-                    continue;
-                };
-                for (attribute, override_) in name_overrides {
-                    let snapshot_value = snapshot_resource
-                        .attributes
-                        .get(attribute)
-                        .and_then(concrete_string);
-                    match should_apply_override(snapshot_value, override_) {
-                        ApplyDecision::Apply | ApplyDecision::ApplyWithUnknownDsl => {
-                            apply_override(resource, unresolved_resource, attribute, override_);
-                        }
-                        ApplyDecision::ApplyLegacy => {
-                            apply_override(resource, unresolved_resource, attribute, override_);
-                            push_unique(&mut legacy_overrides_applied, resource.id.clone());
-                        }
-                        ApplyDecision::Skip => {
-                            push_unique(&mut skipped_overrides, resource.id.clone());
-                        }
+        for ((resource, snapshot_resource), unresolved_resource) in resources
+            .iter_mut()
+            .zip(snapshot.iter())
+            .zip(unresolved_resources.iter_mut())
+        {
+            let Some(name_overrides) = state.name_overrides_for(&resource.id) else {
+                continue;
+            };
+            for (attribute, override_) in name_overrides {
+                let snapshot_value = snapshot_resource
+                    .attributes
+                    .get(attribute)
+                    .and_then(concrete_string);
+                match should_apply_override(snapshot_value, override_) {
+                    ApplyDecision::Apply | ApplyDecision::ApplyWithUnknownDsl => {
+                        apply_override(resource, unresolved_resource, attribute, override_);
+                    }
+                    ApplyDecision::ApplyLegacy => {
+                        apply_override(resource, unresolved_resource, attribute, override_);
+                        push_unique(&mut legacy_overrides_applied, resource.id.clone());
+                    }
+                    ApplyDecision::Skip => {
+                        push_unique(&mut skipped_overrides, resource.id.clone());
                     }
                 }
             }
@@ -690,9 +691,10 @@ mod tests {
             },
             resources,
         );
+        let state = ProjectedStateRead::for_test_name_overrides(overrides);
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
-            Some(overrides),
+            &state,
             LivePreApplyInputs {
                 managed: &[],
                 compositions: &compositions,

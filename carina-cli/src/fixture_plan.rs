@@ -297,12 +297,13 @@ where
         &provider_configs,
         fixture_schemas(),
     );
-    if fixture_pathbuf
-        .file_name()
-        .is_some_and(|name| name == "moved_claims_precede_heuristics")
-    {
-        // This fixture writes moved.to as the literal schema-derived anonymous
-        // hash name, so compute the desired anonymous id before claims resolve.
+    if fixture_pathbuf.file_name().is_some_and(|name| {
+        name == "moved_claims_precede_heuristics"
+            || name == "anonymous_old_identity_name_override"
+            || name == "anonymous_old_identity_update"
+    }) {
+        // These fixtures exercise pre-refresh anonymous reconciliation, so
+        // compute their desired addresses before claims and move detection.
         let errors = validated_config
             .compute_anonymous_identifiers_for_fixture(&provider_configs)
             .unwrap();
@@ -404,11 +405,6 @@ where
             )
         });
 
-    let directives_map = state_file
-        .as_ref()
-        .map(|sf| sf.build_directives())
-        .unwrap_or_default();
-
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
     // resolve through the composition layer to the managed sibling.
@@ -438,10 +434,11 @@ where
         expansion_prelude.wait_aliases(),
     )
     .expect("fixture managed binding stability must resolve");
+    let projected_state = expansion_prelude.projected_state();
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
             canonical_resources,
-            state_file.as_ref(),
+            &projected_state,
             carina_core::binding_index::LivePreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
@@ -458,7 +455,7 @@ where
         .expect("Failed to build override-aware resources");
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,
-        state_file.as_ref(),
+        &projected_state,
     );
 
     // Resolve data-source input refs for the plan (carina#3181).
@@ -602,6 +599,9 @@ where
         &state_file,
     )
     .expect("state block collision validation failed");
+    let directives_map = reconciled_expansion
+        .projected_state(state_file.as_ref())
+        .build_directives();
 
     let reconciled_provider_states = provider_states_for(
         reconciled_expansion.managed_current(),
@@ -778,6 +778,7 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
                 vec![Box::new(PlanImageFixtureFactory)]
             }
             Some("anonymous_create_only_rekey")
+            | Some("anonymous_old_identity_name_override")
             | Some("replace_create_only")
             | Some("replace_with_non_forcing_diffs") => {
                 vec![Box::new(ReplaceCreateOnlyFixtureFactory)]

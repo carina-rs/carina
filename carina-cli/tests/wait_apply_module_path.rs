@@ -573,25 +573,25 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ctx.schemas(),
     )
     .expect("block-name resolution");
-    let (mut override_aware_resources, _) = OverrideAwareResources::build_pair_with_stability(
-        &canonical_unresolved,
-        None::<&carina_state::StateFile>,
-        carina_core::binding_index::LivePreApplyInputs {
-            managed: &[],
-            compositions: &parsed.compositions,
-            managed_current: &carina_core::resource::into_plan_input_current_map(
-                current_states.clone(),
-                ctx.schemas(),
-                &resource_origins,
-            ),
-            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &HashMap::new(),
-        OverrideAwareBuildMode::Apply,
-    )
-    .expect("override-aware resolve");
+    let (mut override_aware_resources, _) =
+        OverrideAwareResources::build_pair_without_state_for_test(
+            &canonical_unresolved,
+            carina_core::binding_index::LivePreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                managed_current: &carina_core::resource::into_plan_input_current_map(
+                    current_states.clone(),
+                    ctx.schemas(),
+                    &resource_origins,
+                ),
+                data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &HashMap::new(),
+            OverrideAwareBuildMode::Apply,
+        )
+        .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
     let wait_bindings = parsed.wait_bindings.clone();
