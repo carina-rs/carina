@@ -16,7 +16,6 @@ carina-provider-hello-v0.1.0-docs.tar.gz
     greeting.md            # one page per resource type
   data-sources/
     lookup.md              # one page per data source
-  services.json            # optional: groups the pages by service
 ```
 
 `index.md` is the version's top page: what the provider manages, and how to configure its `provider` block. Each file under `resources/` and `data-sources/` becomes a page. A file's name without `.md` is its **slug**, and is the last part of its page URL: `resources/greeting.md` is served at `/providers/<namespace>/<name>/<version>/resources/greeting`. You choose the slugs; the registry does not derive them from resource type names.
@@ -30,8 +29,7 @@ The registry checks every rule when a version is published and refuses a bundle 
 | Archive | One gzip member holding a POSIX tar archive (`ustar` or `pax`) |
 | Entries | Regular files and directories only, no links; see below |
 | Paths | Relative, `/`-separated, no empty, `.` or `..` component; one leading `./` is ignored |
-| Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`, and optionally `services.json` at the root; nothing else |
-| `services.json` | If present, puts every page in exactly one service; see below |
+| Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`; nothing else |
 | Slugs | `[a-z0-9][a-z0-9_]*`, at most 128 bytes |
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
@@ -44,20 +42,7 @@ Docs are accepted only for stable versions. A pre-release publish that carries a
 
 ## Grouping pages by service
 
-Without `services.json`, the sidebar lists every resource and data source in one flat list. A provider with many pages can add `services.json` at the root of the bundle to group them under collapsible service headings:
-
-```json
-{"services":[{"id":"greetings","title":"Greetings","resources":["greeting"],"data_sources":["lookup"]}]}
-```
-
-The registry refuses the whole bundle when the file breaks any of these rules:
-
-- Both levels have exactly the keys shown, with no duplicates, and `services` is not empty.
-- Each `id` matches `[a-z0-9][a-z0-9_]*` and is at most 128 bytes. Each `title` is non-empty, at most 128 characters, and has no control characters or invisible formatting characters such as bidirectional overrides and zero-width spaces.
-- No two services share an `id` or a `title`.
-- Every page in `resources/` and `data-sources/` appears in exactly one service, in the matching list, and every listed slug has a page. A service may not be empty.
-
-Services are shown sorted by `id`, and pages within each list by slug, whatever order the file uses. The file is part of the archive, so it is covered by the archive's digest and signature like the pages. The protocol's [Documentation source](/reference/registry/protocol/#documentation-source-the-docs-bundle) section has the exact rules.
+The bundle does not control how the sidebar is organized. By default it lists every resource and data source in one flat list. The registry can group a provider's pages under collapsible service headings from navigation metadata it keeps for that provider. That metadata applies to every version, including ones already published, so a provider never needs a new release to change its grouping. See the protocol's [Provider Documentation](/reference/registry/protocol/#provider-documentation) section.
 
 ## How pages are rendered
 
@@ -72,7 +57,7 @@ The registry treats documentation as untrusted input. It renders GitHub Flavored
 
 Build the archive reproducibly: entries sorted by name, a fixed modification time, owner and group 0, and no timestamp in the gzip header. A publish that is retried compares the archive's digest, so a rebuild that produces different bytes from the same files is refused as a conflict.
 
-This script uses only the Python standard library. It packs `index.md`, `services.json` when present, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8, the Markdown limits in the table above or the contents of `services.json`. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
+This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8 or the Markdown limits in the table above. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
 
 ```python
 #!/usr/bin/env python3
@@ -89,7 +74,7 @@ import tarfile
 from pathlib import Path
 
 src, out = Path(sys.argv[1]), Path(sys.argv[2])
-allowed = re.compile(r"index\.md|services\.json|(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md")
+allowed = re.compile(r"index\.md|(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md")
 
 files, unexpected = [], []
 for root, dirs, names in os.walk(src, followlinks=True):
