@@ -141,63 +141,6 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
-    /// Whether editor source checks own the diagnostic carried by this
-    /// expansion backstop. Module-call boundaries are collected by
-    /// `check_module_calls`; reference-type joins may also contain output
-    /// declaration failures owned by their declaration checks.
-    pub(crate) fn is_source_diagnostic_owned(&self) -> bool {
-        match self {
-            Self::OwnedByCalls {
-                calls: _calls,
-                error,
-            } => error.is_source_diagnostic_owned(),
-            Self::AtCall { call: _call, error } => error.is_source_diagnostic_owned(),
-            Self::MissingArgument {
-                module: _module,
-                argument: _argument,
-            } => true,
-            Self::InvalidArgumentType {
-                module: _module,
-                argument: _argument,
-                mismatch: _mismatch,
-            } => true,
-            Self::BareStructuralHandleArgument {
-                module: _module,
-                argument: _argument,
-                source_path: _source_path,
-                line: _line,
-                message: _message,
-            } => true,
-            Self::ArgumentValueAccess {
-                module: _module,
-                source_path: _source_path,
-                line: _line,
-                message: _message,
-            } => false,
-            Self::ReferenceType(_joined) => true,
-            Self::UnknownArgument {
-                module: _module,
-                argument: _argument,
-            } => true,
-            Self::NotFound(_module) => false,
-            Self::CircularImport(_module) => false,
-            Self::Io(_error) => false,
-            Self::Parse(_error) => false,
-            Self::ParseInFile {
-                path: _path,
-                error: _error,
-            } => false,
-            Self::UnknownModule(_module) => false,
-            Self::ProviderInModule
-            | Self::StateBlockInModule
-            | Self::BackendInModule
-            | Self::UpstreamStateInModule
-            | Self::ExportsInModule => false,
-            Self::Constraint(_diagnostic) => false,
-            Self::NotADirectory { path: _path } => false,
-        }
-    }
-
     pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallId>) -> Self {
         if calls.is_empty() {
             self
@@ -240,6 +183,53 @@ impl ModuleError {
             | Self::ExportsInModule
             | Self::Constraint(_)
             | Self::NotADirectory { .. } => ModuleErrorCallSource::Unavailable,
+        }
+    }
+
+    pub(crate) fn failing_call(&self) -> Option<&ModuleCallId> {
+        match self {
+            Self::OwnedByCalls { calls: _, error } => error.failing_call(),
+            Self::AtCall { call, error: _ } => Some(call),
+            Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { path: _ } => None,
         }
     }
 

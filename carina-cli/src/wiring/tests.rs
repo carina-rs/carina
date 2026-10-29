@@ -6280,15 +6280,14 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
     let findings = carina_core::validation::check_module_calls(
         carina_core::validation::ModuleCallCheckInput {
             authored: &parsed,
-            semantic: carina_core::validation::ModuleCallSemanticView::Available(&parsed),
+            semantic: Some(&parsed),
             base_dir: Some(std::path::Path::new(".")),
             imported_signatures: &module_signatures,
             provider_context: &provider_ctx,
             schemas: ctx.schemas(),
             binding_use_report: &binding_use_report,
             bindings: &bindings,
-            expanded_compositions: None,
-            constraint_reports: None,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
         },
     );
     assert!(findings.is_empty(), "module_calls: got {findings:?}");

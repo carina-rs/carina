@@ -1211,6 +1211,9 @@ impl DiagnosticEngine {
                 DiagnosticSeverity::ERROR,
                 relative_message,
             ),
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ModuleCall => {
+                (None, None, DiagnosticSeverity::ERROR, relative_message)
+            }
             carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse => {
                 (None, None, DiagnosticSeverity::ERROR, relative_message)
             }

@@ -87,15 +87,14 @@ fn module_call_findings_for_test(
     let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
     check_module_calls(ModuleCallCheckInput {
         authored: parsed,
-        semantic: ModuleCallSemanticView::Available(parsed),
+        semantic: Some(parsed),
         base_dir: Some(std::path::Path::new(".")),
         imported_signatures: signatures,
         provider_context,
         schemas: &schemas,
         binding_use_report: &binding_use_report,
         bindings: &bindings,
-        expanded_compositions: None,
-        constraint_reports: None,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
     })
 }
 
@@ -3565,6 +3564,102 @@ fn check_module_calls_rejects_literal_union_mismatch() {
 }
 
 #[test]
+fn check_module_calls_reports_parameter_type_resolution_errors() {
+    use crate::parser::ArgumentParameter;
+
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
+        "child",
+        Some("instance".to_string()),
+        module_arguments([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("input".into())),
+        )]),
+    )];
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "value".to_string(),
+                type_expr: TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new(
+                    "aws",
+                    "missing.Type",
+                )),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let provider_context = context_with_known_custom_types(HashSet::new());
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert!(
+        findings[0]
+            .message()
+            .to_string()
+            .contains("unknown custom type 'aws.missing.Type'"),
+        "type-resolution error must remain a module-call finding: {findings:#?}",
+    );
+}
+
+#[test]
+fn check_module_calls_reports_nested_file_type_resolution_errors() {
+    let fixture = tempfile::tempdir().expect("nested type-resolution fixture");
+    let child = fixture.path().join("child");
+    std::fs::create_dir_all(&child).expect("create child module");
+    std::fs::write(
+        child.join("main.crn"),
+        "attributes { bad: aws.missing.Type = \"value\" }\n",
+    )
+    .expect("write child module");
+    let root_path = fixture.path().join("main.crn");
+    let parsed = crate::parser::parse_file(
+        "let child = use { source = \"./child\" }\nchild {}\n",
+        &root_path,
+        &ProviderContext::default(),
+    )
+    .expect("root fixture must parse");
+    let provider_context = context_with_known_custom_types(HashSet::new());
+    let schemas = SchemaRegistry::new();
+    let signatures = crate::module_resolver::load_resolved_module_signatures(
+        &parsed,
+        fixture.path(),
+        &provider_context,
+    );
+    let binding_use_report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
+    );
+    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+
+    let findings = check_module_calls(ModuleCallCheckInput {
+        authored: &parsed,
+        semantic: Some(&parsed),
+        base_dir: Some(fixture.path()),
+        imported_signatures: &signatures,
+        provider_context: &provider_context,
+        schemas: &schemas,
+        binding_use_report: &binding_use_report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    });
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert!(
+        findings[0]
+            .message()
+            .to_string()
+            .contains("attribute 'bad': unknown custom type 'aws.missing.Type'"),
+        "nested declaration resolution errors must not be discarded: {findings:#?}",
+    );
+}
+
+#[test]
 fn check_module_calls_uses_original_line_after_heredoc() {
     use crate::parser::ArgumentParameter;
 
@@ -3763,6 +3858,48 @@ child { values = [vpc] }
             .all(|finding| { finding.kind() != ModuleCallFindingKind::MissingRequiredArgument }),
         "the pending slot must not also become a missing argument: {findings:#?}",
     );
+}
+
+#[test]
+fn expanded_module_argument_binding_findings_block_recovery_pipeline() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child = use { source = "./child" }
+child { values = [vpc] }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "values".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let schemas = SchemaRegistry::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+    );
+    assert!(!report.is_ready(), "fixture must produce a binding finding");
+
+    let findings = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
+        binding_use_report: &report,
+        compositions: &[],
+    });
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert_eq!(findings[0].kind(), ModuleCallFindingKind::BindingUse);
 }
 
 #[test]

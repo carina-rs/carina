@@ -51,34 +51,34 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
-        .filter_map(|finding| {
-            let span = if finding.anchor().source_file.path() == current_file {
-                finding.anchor().span
-            } else if finding.owner().root.source_file() == current_file {
-                finding.owner().root.call_span()
+        .flat_map(|finding| {
+            let mut spans = Vec::new();
+            if finding.anchor().source_file.path() == current_file {
+                spans.push(finding.anchor().span);
             } else {
-                return None;
-            };
-            let severity = match finding.class() {
-                carina_core::validation::ModuleCallFindingClass::Blocking => {
-                    DiagnosticSeverity::ERROR
+                for owner in finding.owners() {
+                    if owner.root.source_file() == current_file
+                        && !spans.contains(&owner.root.call_span())
+                    {
+                        spans.push(owner.root.call_span());
+                    }
                 }
-                carina_core::validation::ModuleCallFindingClass::Advisory => {
-                    DiagnosticSeverity::WARNING
-                }
-            };
-            let range = parser_span_range(doc, span)?;
-            let message = finding.message().to_string();
-            if let Some(type_error) = finding.message().type_error()
-                && let Some(mut diagnostic) =
-                    build_enum_diagnostic_from_error(type_error, Some(range))
-            {
-                diagnostic.severity = Some(severity);
-                diagnostic.message = message;
-                Some(diagnostic)
-            } else {
-                Some(carina_diagnostic_range(range, severity, message))
             }
+            spans.into_iter().filter_map(|span| {
+                let range = parser_span_range(doc, span)?;
+                let severity = DiagnosticSeverity::ERROR;
+                let message = finding.message().to_string();
+                if let Some(type_error) = finding.message().type_error()
+                    && let Some(mut diagnostic) =
+                        build_enum_diagnostic_from_error(type_error, Some(range))
+                {
+                    diagnostic.severity = Some(severity);
+                    diagnostic.message = message;
+                    Some(diagnostic)
+                } else {
+                    Some(carina_diagnostic_range(range, severity, message))
+                }
+            })
         })
         .collect()
 }
@@ -707,10 +707,6 @@ impl DiagnosticEngine {
             let expansion_succeeded = merged_result
                 .as_ref()
                 .is_some_and(|result| result.module_resolution_status.is_complete());
-            let semantic = match merged {
-                Some(merged) => carina_core::validation::ModuleCallSemanticView::Available(merged),
-                None => carina_core::validation::ModuleCallSemanticView::Unavailable,
-            };
             let expanded_compositions = expansion_succeeded
                 .then_some(merged)
                 .flatten()
@@ -718,26 +714,47 @@ impl DiagnosticEngine {
             let constraint_reports = merged_result
                 .as_ref()
                 .map(|result| &result.module_constraint_reports);
-            let findings = carina_core::validation::check_module_calls(
+            let authored_findings = carina_core::validation::check_module_calls(
                 carina_core::validation::ModuleCallCheckInput {
                     authored: parsed,
-                    semantic,
+                    semantic: merged,
                     base_dir: base_path,
                     imported_signatures: &module_signatures,
                     provider_context: &self.provider_context,
                     schemas: &self.schemas,
                     binding_use_report: &binding_use_report,
                     bindings: &binding_index,
-                    expanded_compositions,
+                    reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                },
+            );
+            let compositions = expanded_compositions.unwrap_or(&[]);
+            let expanded_binding_findings = match expanded_compositions {
+                Some(compositions) => carina_core::validation::check_expanded_module_calls(
+                    carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {
+                        binding_use_report: &binding_use_report,
+                        compositions,
+                    },
+                ),
+                None => Vec::new(),
+            };
+            let expanded_reference_findings = carina_core::validation::check_expanded_module_calls(
+                carina_core::validation::ExpandedModuleCallCheckInput::References {
+                    compositions,
+                    bindings: &binding_index,
                     constraint_reports,
                 },
             );
+            let findings = carina_core::validation::merge_module_call_findings([
+                authored_findings,
+                expanded_binding_findings,
+                expanded_reference_findings,
+            ]);
             diagnostics.extend(render_module_call_findings(doc, diagnostic_file, &findings));
             if let (Some(base_path), Some(error)) = (
                 base_path,
                 merged_result
                     .as_ref()
-                    .and_then(|result| result.module_resolution_status.unowned_error()),
+                    .and_then(|result| result.module_resolution_status.uncovered_error(&findings)),
             ) {
                 diagnostics.extend(self.module_resolver_error_diagnostics(
                     doc,

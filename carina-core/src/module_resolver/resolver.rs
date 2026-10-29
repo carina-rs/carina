@@ -82,7 +82,6 @@ pub enum ModuleResolutionDiagnosticStatus {
 
 pub enum ModuleResolutionDiagnosticFailure {
     ConstraintReports,
-    SourceFindings,
     Unowned(ResidualModuleResolutionError),
 }
 
@@ -95,6 +94,7 @@ pub struct ResidualModuleResolutionError(Box<ModuleError>);
 pub enum ResidualModuleResolutionDiagnostic<'a> {
     Constraint { origin: &'a ConstraintOrigin },
     ArgumentValueAccess { source_path: &'a str, line: usize },
+    ModuleCall,
     Parse,
 }
 
@@ -132,16 +132,20 @@ impl ResidualModuleResolutionError {
                 path: _path,
                 error: _error,
             } => Some(ResidualModuleResolutionDiagnostic::Parse),
-            ModuleError::NotFound(_module) => None,
+            ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
-            ModuleError::Io(_error) => None,
-            ModuleError::UnknownModule(_module) => None,
+            ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
+            ModuleError::UnknownModule(_module) => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
+            }
             ModuleError::ProviderInModule
             | ModuleError::StateBlockInModule
             | ModuleError::BackendInModule
             | ModuleError::UpstreamStateInModule
             | ModuleError::ExportsInModule => None,
-            ModuleError::NotADirectory { path: _path } => None,
+            ModuleError::NotADirectory { path: _path } => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
+            }
             ModuleError::OwnedByCalls {
                 calls: _calls,
                 error: _error,
@@ -153,25 +157,111 @@ impl ResidualModuleResolutionError {
             ModuleError::MissingArgument {
                 module: _module,
                 argument: _argument,
-            } => None,
+            } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::InvalidArgumentType {
                 module: _module,
                 argument: _argument,
                 mismatch: _mismatch,
-            } => None,
+            } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::BareStructuralHandleArgument {
                 module: _module,
                 argument: _argument,
                 source_path: _source_path,
                 line: _line,
                 message: _message,
-            } => None,
-            ModuleError::ReferenceType(_joined) => None,
+            } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
+            ModuleError::ReferenceType(_joined) => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
+            }
             ModuleError::UnknownArgument {
                 module: _module,
                 argument: _argument,
-            } => None,
+            } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
         }
+    }
+
+    pub fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
+        let root_cause = self.0.root_cause();
+        match root_cause {
+            ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
+                self.finding_owns_error(finding)
+                    && finding.message().covers_missing_argument(module, argument)
+            }),
+            ModuleError::InvalidArgumentType {
+                module: _,
+                argument,
+                mismatch,
+            } => findings.iter().any(|finding| {
+                self.finding_owns_error(finding)
+                    && finding
+                        .message()
+                        .covers_invalid_argument_type(argument, mismatch)
+            }),
+            ModuleError::BareStructuralHandleArgument {
+                module: _,
+                argument,
+                source_path: _,
+                line: _,
+                message: _,
+            } => findings.iter().any(|finding| {
+                self.finding_owns_error(finding)
+                    && finding.message().covers_bare_handle_argument(argument)
+            }),
+            ModuleError::ReferenceType(joined) => {
+                let mut lines = joined.lines().filter(|line| !line.is_empty()).peekable();
+                lines.peek().is_some()
+                    && lines.all(|line| {
+                        // Non-call lines belong to declaration/resource/function
+                        // reference checks. A call-boundary line is covered only
+                        // by the concrete core finding for its owning call.
+                        !line.starts_with("module call '")
+                            || findings.iter().any(|finding| {
+                                self.finding_owns_error(finding)
+                                    && finding.message().covers_reference_type_line(line)
+                            })
+                    })
+            }
+            ModuleError::UnknownArgument { module, argument } => findings.iter().any(|finding| {
+                self.finding_owns_error(finding)
+                    && finding.message().covers_unknown_argument(module, argument)
+            }),
+            ModuleError::OwnedByCalls { calls: _, error: _ } => false,
+            ModuleError::AtCall { call: _, error: _ } => false,
+            ModuleError::NotFound(_) => false,
+            ModuleError::CircularImport(_) => false,
+            ModuleError::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                message: _,
+            } => false,
+            ModuleError::Io(_) => false,
+            ModuleError::Parse(_) => false,
+            ModuleError::ParseInFile { path: _, error: _ } => false,
+            ModuleError::UnknownModule(_) => false,
+            ModuleError::ProviderInModule => false,
+            ModuleError::StateBlockInModule => false,
+            ModuleError::BackendInModule => false,
+            ModuleError::UpstreamStateInModule => false,
+            ModuleError::ExportsInModule => false,
+            ModuleError::Constraint(_) => false,
+            ModuleError::NotADirectory { path: _ } => false,
+        }
+    }
+
+    fn finding_owns_error(&self, finding: &crate::validation::ModuleCallFinding) -> bool {
+        if let Some(failing_call) = self.0.failing_call() {
+            return finding
+                .owners()
+                .iter()
+                .any(|owner| owner.immediate == *failing_call);
+        }
+        let call_source = self.0.call_source();
+        finding.owners().iter().any(|owner| match call_source {
+            ModuleErrorCallSource::Failing(call) => owner.immediate == *call,
+            ModuleErrorCallSource::Owners(calls) => calls.contains(&owner.root),
+            ModuleErrorCallSource::Unavailable => false,
+        })
     }
 }
 
@@ -185,13 +275,19 @@ impl ModuleResolutionDiagnosticStatus {
 
     pub fn unowned_error(&self) -> Option<&ResidualModuleResolutionError> {
         match self {
-            Self::Complete
-            | Self::Failed(
-                ModuleResolutionDiagnosticFailure::ConstraintReports
-                | ModuleResolutionDiagnosticFailure::SourceFindings,
-            ) => None,
+            Self::Complete | Self::Failed(ModuleResolutionDiagnosticFailure::ConstraintReports) => {
+                None
+            }
             Self::Failed(ModuleResolutionDiagnosticFailure::Unowned(error)) => Some(error),
         }
+    }
+
+    pub fn uncovered_error(
+        &self,
+        findings: &[crate::validation::ModuleCallFinding],
+    ) -> Option<&ResidualModuleResolutionError> {
+        self.unowned_error()
+            .filter(|error| !error.is_covered_by(findings))
     }
 }
 
@@ -221,12 +317,94 @@ fn module_resolution_diagnostic_status(
         ModuleResolutionDiagnosticStatus::Failed(
             ModuleResolutionDiagnosticFailure::ConstraintReports,
         )
-    } else if error.is_source_diagnostic_owned() {
-        ModuleResolutionDiagnosticStatus::Failed(ModuleResolutionDiagnosticFailure::SourceFindings)
     } else {
         ModuleResolutionDiagnosticStatus::Failed(ModuleResolutionDiagnosticFailure::Unowned(
             ResidualModuleResolutionError::new(error),
         ))
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_status_tests {
+    use super::*;
+
+    #[test]
+    fn source_ownership_requires_a_covering_module_call_finding() {
+        let parsed = crate::parser::parse_file(
+            "let child = use { source = './child' }\nchild {}\n",
+            std::path::Path::new("root.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("fixture parse");
+        let signatures = HashMap::from([(
+            "child".to_string(),
+            crate::module_resolver::ResolvedModuleSignature {
+                arguments: vec![crate::parser::ArgumentParameter {
+                    name: "required".to_string(),
+                    type_expr: crate::parser::TypeExpr::String,
+                    default: None,
+                    description: None,
+                    validations: Vec::new(),
+                }],
+                attributes: IndexMap::new(),
+                requires: Vec::new(),
+            },
+        )]);
+        let schemas = SchemaRegistry::new();
+        let provider_context = ProviderContext::default();
+        let binding_use_report = crate::validation::check_bare_binding_uses(
+            &parsed,
+            &crate::validation::ValidationTypeContext::new(
+                &parsed,
+                &schemas,
+                &provider_context,
+                &signatures,
+            ),
+        );
+        let bindings = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
+            &parsed,
+            &schemas,
+            &signatures,
+        );
+        let findings =
+            crate::validation::check_module_calls(crate::validation::ModuleCallCheckInput {
+                authored: &parsed,
+                semantic: Some(&parsed),
+                base_dir: None,
+                imported_signatures: &signatures,
+                provider_context: &provider_context,
+                schemas: &schemas,
+                binding_use_report: &binding_use_report,
+                bindings: &bindings,
+                reference_checks: crate::validation::ModuleCallReferenceChecks::Skipped,
+            });
+        let error = ModuleError::MissingArgument {
+            module: "child".to_string(),
+            argument: "required".to_string(),
+        }
+        .with_failing_call(parsed.module_calls[0].id().clone());
+        let status = module_resolution_diagnostic_status(Some(error), &IndexMap::new());
+
+        assert!(
+            status.unowned_error().is_some(),
+            "a resolver error cannot be hidden before a concrete finding covers it",
+        );
+        assert!(status.uncovered_error(&[]).is_some());
+        let unrelated = ModuleError::MissingArgument {
+            module: "child".to_string(),
+            argument: "different".to_string(),
+        }
+        .with_failing_call(parsed.module_calls[0].id().clone());
+        let unrelated_status =
+            module_resolution_diagnostic_status(Some(unrelated), &IndexMap::new());
+        assert!(
+            unrelated_status.uncovered_error(&findings).is_some(),
+            "a finding for another argument must not claim this resolver error",
+        );
+        assert!(
+            status.uncovered_error(&findings).is_none(),
+            "the exact call-owner finding must cover the resolver backstop",
+        );
     }
 }
 

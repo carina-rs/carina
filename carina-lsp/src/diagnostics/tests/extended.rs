@@ -5461,27 +5461,10 @@ let first = unrelated { }
     );
     binding_input.compositions.extend([source, consumer]);
     let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
-    let signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-    let binding_use_report = carina_core::validation::check_bare_binding_uses(
-        parsed,
-        &carina_core::validation::ValidationTypeContext::new(
-            parsed,
-            &engine.schemas,
-            &engine.provider_context,
-            &signatures,
-        ),
-    );
-    let findings = carina_core::validation::check_module_calls(
-        carina_core::validation::ModuleCallCheckInput {
-            authored: parsed,
-            semantic: carina_core::validation::ModuleCallSemanticView::Available(&binding_input),
-            base_dir: Some(std::path::Path::new("/")),
-            imported_signatures: &signatures,
-            provider_context: &engine.provider_context,
-            schemas: &engine.schemas,
-            binding_use_report: &binding_use_report,
+    let findings = carina_core::validation::check_expanded_module_calls(
+        carina_core::validation::ExpandedModuleCallCheckInput::References {
+            compositions: &binding_input.compositions,
             bindings: &bindings,
-            expanded_compositions: Some(&binding_input.compositions),
             constraint_reports: None,
         },
     );
@@ -6207,6 +6190,49 @@ fn explicit_current_file_does_not_anchor_sibling_with_identical_span() {
         "a sibling failure must not be anchored on a different current file: \
          {diagnostics:#?}"
     );
+}
+
+#[test]
+fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call() {
+    let engine = test_engine();
+    let fixture = tempfile::tempdir().expect("resolver ownership fixture");
+    let source = "let missing = use { source = './missing' }\nmissing {}\n";
+    std::fs::write(fixture.path().join("main.crn"), source).expect("root source");
+
+    let path = fixture.path().join("main.crn");
+    let document = create_document_at(source, path.clone());
+    let mut resolver_input = document.parsed().expect("root parse").clone();
+    let report = carina_core::module_resolver::resolve_modules_with_diagnostics(
+        &mut resolver_input,
+        fixture.path(),
+        &engine.provider_context,
+        &engine.schemas,
+    );
+    let residual = report
+        .status
+        .unowned_error()
+        .expect("resolver fixture must retain the uncovered nested call error");
+    assert!(
+        matches!(
+            residual.diagnostic(),
+            Some(carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ModuleCall)
+        ),
+        "unexpected residual: {}",
+        residual.display_relative_to(fixture.path()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let fallback = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("IO error: No such file or directory")
+        })
+        .unwrap_or_else(|| panic!("missing resolver fallback: {diagnostics:#?}"));
+
+    assert_eq!(fallback.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(fallback.range.start.line, 1);
+    assert_eq!(fallback.range.start.character, 0);
 }
 
 #[test]
@@ -6996,7 +7022,7 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 }
 
 #[test]
-fn annotated_nested_mismatches_deduplicate_by_the_inner_authored_site() {
+fn annotated_nested_mismatches_keep_each_root_call_owner() {
     let engine = module_boundary_identity_engine();
     let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
     let root_source = r#"let outer = use { source = '../outer' }
@@ -7025,13 +7051,16 @@ outer {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(mismatches.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(mismatches.len(), 2, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         mismatches
             .iter()
             .map(|diagnostic| diagnostic.range)
             .collect::<Vec<_>>(),
-        vec![Range::new(Position::new(6, 0), Position::new(8, 1))],
+        vec![
+            Range::new(Position::new(6, 0), Position::new(8, 1)),
+            Range::new(Position::new(10, 0), Position::new(12, 1)),
+        ],
     );
 }
 

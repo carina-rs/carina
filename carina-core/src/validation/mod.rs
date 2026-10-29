@@ -662,12 +662,11 @@ fn deferred_value_mismatch(
                 DeferredAccessTypeError::TypeMismatch {
                     expected,
                     actual,
-                    origin,
+                    origin: _origin,
                 } => {
                     // Inference describes a parser-internal unresolved-module
                     // placeholder here. The authored binding path is the
                     // stable source used for the shared diagnostic and dedupe.
-                    drop(origin);
                     BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
                         expected,
                         actual,
@@ -1776,6 +1775,7 @@ pub struct CompositionAttributeRefError {
     pub module_name: String,
     pub module_source: Option<String>,
     pub module_directory: Option<std::path::PathBuf>,
+    pub call_paths: Vec<CompositionCallPath>,
     reference_position: usize,
 }
 
@@ -2439,6 +2439,7 @@ pub fn validate_composition_ref_types_with_bindings(
                             module_name: call.module_name.clone(),
                             module_source: call.module_source.clone(),
                             module_directory: call.module_directory.clone(),
+                            call_paths: vec![call_path.clone()],
                             reference_position: current_position,
                         },
                     ));
@@ -2448,26 +2449,45 @@ pub fn validate_composition_ref_types_with_bindings(
     }
 
     let mut seen_calls = HashSet::new();
-    let mut seen_attributes = HashSet::new();
-    errors.retain(|error| match error {
-        CompositionRefError::ModuleCall(error) => {
-            seen_calls.insert(CompositionModuleCallErrorKey {
-                call_path: error.call_path.clone(),
-                argument: error.argument.clone(),
-                reference_position: error.reference_position,
-                kind: (&error.kind).into(),
-            })
+    let mut attribute_indices = std::collections::HashMap::new();
+    let mut deduplicated = Vec::new();
+    for error in errors {
+        match error {
+            CompositionRefError::ModuleCall(error) => {
+                let key = CompositionModuleCallErrorKey {
+                    call_path: error.call_path.clone(),
+                    argument: error.argument.clone(),
+                    reference_position: error.reference_position,
+                    kind: (&error.kind).into(),
+                };
+                if seen_calls.insert(key) {
+                    deduplicated.push(CompositionRefError::ModuleCall(error));
+                }
+            }
+            CompositionRefError::Attribute(error) => {
+                let key = CompositionAttributeErrorKey {
+                    module_identity: error.module_identity(),
+                    attribute: error.error.attribute.clone(),
+                    reference_position: error.reference_position,
+                    kind: (&error.error.kind).into(),
+                };
+                if let Some(index) = attribute_indices.get(&key).copied() {
+                    let CompositionRefError::Attribute(existing) = &mut deduplicated[index] else {
+                        unreachable!("attribute deduplication indexes only attribute errors")
+                    };
+                    for call_path in error.call_paths {
+                        if !existing.call_paths.contains(&call_path) {
+                            existing.call_paths.push(call_path);
+                        }
+                    }
+                } else {
+                    attribute_indices.insert(key, deduplicated.len());
+                    deduplicated.push(CompositionRefError::Attribute(error));
+                }
+            }
         }
-        CompositionRefError::Attribute(error) => {
-            seen_attributes.insert(CompositionAttributeErrorKey {
-                module_identity: error.module_identity(),
-                attribute: error.error.attribute.clone(),
-                reference_position: error.reference_position,
-                kind: (&error.error.kind).into(),
-            })
-        }
-    });
-    errors
+    }
+    deduplicated
 }
 
 /// Identity shared by anonymous resources with the same missing schema.
@@ -3883,14 +3903,6 @@ pub fn validate_provider_config<E>(
     Ok(())
 }
 
-/// Whether a module-call finding blocks the same configuration accepted by
-/// CLI validation or is advisory-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModuleCallFindingClass {
-    Blocking,
-    Advisory,
-}
-
 /// Stable semantic category used for source-aware deduplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleCallFindingKind {
@@ -3900,6 +3912,7 @@ pub enum ModuleCallFindingKind {
     HandleSink,
     BindingUse,
     ReferenceType,
+    TypeResolution,
     Constraint,
 }
 
@@ -3949,8 +3962,16 @@ pub enum ModuleCallFindingMessage {
         argument: String,
         error: HandleSinkError,
     },
-    BindingUse(Box<BindingResolutionError>),
+    BindingUse {
+        argument: String,
+        error: Box<BindingResolutionError>,
+    },
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
+    TypeResolution {
+        context: String,
+        error: String,
+    },
+    AttributeReference(String),
     Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
@@ -3959,7 +3980,10 @@ impl ModuleCallFindingMessage {
     /// this message's canonical rendering or diagnostic ownership.
     pub fn type_error(&self) -> Option<&TypeError> {
         match self {
-            Self::BindingUse(error) => error.type_error(),
+            Self::BindingUse {
+                argument: _argument,
+                error,
+            } => error.type_error(),
             Self::UnknownArgument {
                 module: _module,
                 argument: _argument,
@@ -3980,7 +4004,194 @@ impl ModuleCallFindingMessage {
                 error: _error,
             } => None,
             Self::ReferenceType(_diagnostic) => None,
+            Self::TypeResolution {
+                context: _context,
+                error: _error,
+            } => None,
+            Self::AttributeReference(_message) => None,
             Self::Constraint(_diagnostic) => None,
+        }
+    }
+
+    pub(crate) fn covers_missing_argument(&self, module: &str, argument: &str) -> bool {
+        match self {
+            Self::MissingRequiredArgument {
+                module: finding_module,
+                argument: finding_argument,
+            } => finding_module == module && finding_argument == argument,
+            Self::BindingUse {
+                argument: finding_argument,
+                error: _,
+            } => finding_argument == argument,
+            Self::UnknownArgument {
+                module: _,
+                argument: _,
+                suggestion: _,
+            }
+            | Self::ValueType {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::HandleSink {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::TypeResolution {
+                context: _,
+                error: _,
+            }
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
+        }
+    }
+
+    pub(crate) fn covers_invalid_argument_type(
+        &self,
+        argument: &str,
+        mismatch: &typecheck::TypeExprValueError,
+    ) -> bool {
+        match self {
+            Self::ValueType {
+                call_label: _,
+                argument: finding_argument,
+                error,
+            } => finding_argument == argument && error.as_ref() == mismatch,
+            Self::BindingUse {
+                argument: finding_argument,
+                error: _,
+            } => finding_argument == argument,
+            Self::UnknownArgument {
+                module: _,
+                argument: _,
+                suggestion: _,
+            }
+            | Self::MissingRequiredArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::HandleSink {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::TypeResolution {
+                context: _,
+                error: _,
+            }
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
+        }
+    }
+
+    pub(crate) fn covers_bare_handle_argument(&self, argument: &str) -> bool {
+        match self {
+            Self::HandleSink {
+                call_label: _,
+                argument: finding_argument,
+                error: _,
+            }
+            | Self::BindingUse {
+                argument: finding_argument,
+                error: _,
+            } => finding_argument == argument,
+            Self::UnknownArgument {
+                module: _,
+                argument: _,
+                suggestion: _,
+            }
+            | Self::MissingRequiredArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::ValueType {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::TypeResolution {
+                context: _,
+                error: _,
+            }
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
+        }
+    }
+
+    pub(crate) fn covers_unknown_argument(&self, module: &str, argument: &str) -> bool {
+        match self {
+            Self::UnknownArgument {
+                module: finding_module,
+                argument: finding_argument,
+                suggestion: _,
+            } => finding_module == module && finding_argument == argument,
+            Self::MissingRequiredArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::ValueType {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::HandleSink {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::BindingUse {
+                argument: _,
+                error: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::TypeResolution {
+                context: _,
+                error: _,
+            }
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
+        }
+    }
+
+    pub(crate) fn covers_reference_type_line(&self, line: &str) -> bool {
+        match self {
+            Self::ReferenceType(_diagnostic) => {
+                let rendered = self.to_string();
+                rendered == line || rendered.replace(" (anonymous call)", "") == line
+            }
+            Self::UnknownArgument {
+                module: _,
+                argument: _,
+                suggestion: _,
+            }
+            | Self::MissingRequiredArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::ValueType {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::HandleSink {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::BindingUse {
+                argument: _,
+                error: _,
+            }
+            | Self::TypeResolution {
+                context: _,
+                error: _,
+            }
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
         }
     }
 }
@@ -4022,7 +4233,10 @@ impl std::fmt::Display for ModuleCallFindingMessage {
                 formatter,
                 "module call '{call_label}': argument '{argument}': {error}"
             ),
-            Self::BindingUse(error) => error.fmt(formatter),
+            Self::BindingUse {
+                argument: _argument,
+                error,
+            } => error.fmt(formatter),
             Self::ReferenceType(error) => format_module_call_ref_error(
                 formatter,
                 &error.call_label,
@@ -4030,6 +4244,10 @@ impl std::fmt::Display for ModuleCallFindingMessage {
                 &error.path,
                 &error.kind,
             ),
+            Self::TypeResolution { context, error } => {
+                write!(formatter, "{context}: {error}")
+            }
+            Self::AttributeReference(message) => formatter.write_str(message),
             Self::Constraint(diagnostic) => diagnostic.fmt(formatter),
         }
     }
@@ -4037,12 +4255,11 @@ impl std::fmt::Display for ModuleCallFindingMessage {
 
 impl std::error::Error for ModuleCallFindingMessage {}
 
-/// One blocking/advisory module-call result with typed ownership and source.
+/// One module-call result with typed ownership and source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleCallFinding {
     kind: ModuleCallFindingKind,
-    class: ModuleCallFindingClass,
-    owner: ModuleCallFindingOwner,
+    owners: Vec<ModuleCallFindingOwner>,
     anchor: ModuleCallFindingAnchor,
     message: ModuleCallFindingMessage,
 }
@@ -4052,12 +4269,8 @@ impl ModuleCallFinding {
         self.kind
     }
 
-    pub fn class(&self) -> ModuleCallFindingClass {
-        self.class
-    }
-
-    pub fn owner(&self) -> &ModuleCallFindingOwner {
-        &self.owner
+    pub fn owners(&self) -> &[ModuleCallFindingOwner] {
+        &self.owners
     }
 
     pub fn anchor(&self) -> &ModuleCallFindingAnchor {
@@ -4086,24 +4299,39 @@ impl std::error::Error for ModuleCallFinding {
     }
 }
 
-/// Directory-authoritative values for a source-local module-call check.
-pub enum ModuleCallSemanticView<'a, E> {
-    Available(&'a crate::parser::File<E>),
-    Unavailable,
+/// Whether the authored pass includes resource-reference checks and recursive
+/// module loading. Recovery commands skip this phase while retaining direct
+/// argument, missing-argument, and unknown-argument validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleCallReferenceChecks {
+    Enabled,
+    Skipped,
 }
 
-/// Complete input to the single module-call diagnostic authority.
+/// Input to the authored module-call diagnostic phase.
 pub struct ModuleCallCheckInput<'a, 'bindings, E> {
     pub authored: &'a crate::parser::File<E>,
-    pub semantic: ModuleCallSemanticView<'a, E>,
+    pub semantic: Option<&'a crate::parser::File<E>>,
     pub base_dir: Option<&'a std::path::Path>,
     pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     pub provider_context: &'a ProviderContext,
     pub schemas: &'a SchemaRegistry,
     pub binding_use_report: &'a BindingUseReport,
     pub bindings: &'a BindingIndex<'bindings>,
-    pub expanded_compositions: Option<&'a [crate::resource::LiveComposition]>,
-    pub constraint_reports: Option<&'a crate::module_resolver::ModuleCallConstraintReports>,
+    pub reference_checks: ModuleCallReferenceChecks,
+}
+
+/// Typed inputs for checks that become authoritative only after expansion.
+pub enum ExpandedModuleCallCheckInput<'a, 'bindings> {
+    BindingUses {
+        binding_use_report: &'a BindingUseReport,
+        compositions: &'a [crate::resource::LiveComposition],
+    },
+    References {
+        compositions: &'a [crate::resource::LiveComposition],
+        bindings: &'a BindingIndex<'bindings>,
+        constraint_reports: Option<&'a crate::module_resolver::ModuleCallConstraintReports>,
+    },
 }
 
 struct ModuleCallChecker<'a> {
@@ -4120,6 +4348,7 @@ struct ModuleFileCheckContext<'a, 'bindings, E> {
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
     root_owner: Option<&'a ModuleCallId>,
+    reference_checks: ModuleCallReferenceChecks,
 }
 
 struct ModuleBoundaryCheckContext<'a, E> {
@@ -4147,15 +4376,17 @@ impl ModuleCallChecker<'_> {
         anchor: ModuleCallFindingAnchor,
         message: ModuleCallFindingMessage,
     ) {
-        if self.findings.iter().any(|existing| {
+        if let Some(existing) = self.findings.iter_mut().find(|existing| {
             existing.anchor == anchor && existing.kind == kind && existing.message == message
         }) {
+            if !existing.owners.contains(&owner) {
+                existing.owners.push(owner);
+            }
             return;
         }
         self.findings.push(ModuleCallFinding {
             kind,
-            class: ModuleCallFindingClass::Blocking,
-            owner,
+            owners: vec![owner],
             anchor,
             message,
         });
@@ -4173,6 +4404,7 @@ impl ModuleCallChecker<'_> {
             binding_use_report,
             bindings,
             root_owner,
+            reference_checks,
         } = context;
 
         for authored_call in &authored.module_calls {
@@ -4212,19 +4444,40 @@ impl ModuleCallChecker<'_> {
                 );
             }
 
-            self.check_reference_types(
-                authored_call,
-                ModuleReferenceCheckContext {
-                    semantic_call,
-                    authority_file,
-                    signatures,
-                    binding_use_report,
-                    bindings,
-                    owner: owner.clone(),
-                },
-            );
+            match reference_checks {
+                ModuleCallReferenceChecks::Enabled => {
+                    self.check_reference_types(
+                        authored_call,
+                        ModuleReferenceCheckContext {
+                            semantic_call,
+                            authority_file,
+                            signatures,
+                            binding_use_report,
+                            bindings,
+                            owner: owner.clone(),
+                        },
+                    );
+                    self.check_nested_module(
+                        authority_file,
+                        checked_call,
+                        base_dir,
+                        Some(&owner.root),
+                    );
+                }
+                ModuleCallReferenceChecks::Skipped => {}
+            }
+        }
 
-            self.check_nested_module(authority_file, checked_call, base_dir, &owner.root);
+        if matches!(reference_checks, ModuleCallReferenceChecks::Enabled) {
+            for import in &authored.uses {
+                let called = authored
+                    .module_calls
+                    .iter()
+                    .any(|call| call.module_name == import.alias);
+                if !called {
+                    self.check_nested_import(authored, import, base_dir, None);
+                }
+            }
         }
     }
 
@@ -4254,57 +4507,77 @@ impl ModuleCallChecker<'_> {
                     source_file: finding.use_site.source_file.clone(),
                     span: finding.use_site.span,
                 });
-            match &finding.error {
-                BindingResolutionError::ValueType(error) => {
-                    self.push(
-                        ModuleCallFindingKind::ValueType,
-                        owner.clone(),
-                        argument_anchor,
-                        ModuleCallFindingMessage::ValueType {
-                            call_label: module_call_label(call),
-                            argument: argument.clone(),
-                            error: error.clone(),
-                        },
-                    );
-                    continue;
-                }
-                BindingResolutionError::ReferenceType(error) => {
-                    self.push(
-                        ModuleCallFindingKind::ReferenceType,
-                        owner.clone(),
-                        argument_anchor,
-                        ModuleCallFindingMessage::ReferenceType(Box::new(
-                            ModuleCallReferenceDiagnostic {
-                                call_label: module_call_label(call),
-                                argument: argument.clone(),
-                                path: error.path.clone(),
-                                kind: ModuleCallRefErrorKind::TypeMismatch {
-                                    expected: error.expected.clone(),
-                                    actual: error.actual.clone(),
-                                    declared: error.declared.clone(),
-                                },
-                            },
-                        )),
-                    );
-                    continue;
-                }
-                BindingResolutionError::Type(_error) => {}
-                BindingResolutionError::DeferredAccess(_error) => {}
-                BindingResolutionError::CustomType(_error) => {}
-                BindingResolutionError::Existing(_message) => {}
-            }
-
-            let binding_anchor = ModuleCallFindingAnchor {
-                source_file: finding.use_site.source_file.clone(),
-                span: finding.use_site.span,
-            };
-            self.push(
-                ModuleCallFindingKind::BindingUse,
-                owner.clone(),
-                binding_anchor,
-                ModuleCallFindingMessage::BindingUse(Box::new(finding.error.clone())),
+            self.push_binding_use_finding(
+                &module_call_label(call),
+                argument,
+                finding,
+                owner,
+                argument_anchor,
             );
         }
+    }
+
+    fn push_binding_use_finding(
+        &mut self,
+        call_label: &str,
+        argument: &str,
+        finding: &BindingUseFinding,
+        owner: &ModuleCallFindingOwner,
+        argument_anchor: ModuleCallFindingAnchor,
+    ) {
+        match &finding.error {
+            BindingResolutionError::ValueType(error) => {
+                self.push(
+                    ModuleCallFindingKind::ValueType,
+                    owner.clone(),
+                    argument_anchor,
+                    ModuleCallFindingMessage::ValueType {
+                        call_label: call_label.to_string(),
+                        argument: argument.to_string(),
+                        error: error.clone(),
+                    },
+                );
+                return;
+            }
+            BindingResolutionError::ReferenceType(error) => {
+                self.push(
+                    ModuleCallFindingKind::ReferenceType,
+                    owner.clone(),
+                    argument_anchor,
+                    ModuleCallFindingMessage::ReferenceType(Box::new(
+                        ModuleCallReferenceDiagnostic {
+                            call_label: call_label.to_string(),
+                            argument: argument.to_string(),
+                            path: error.path.clone(),
+                            kind: ModuleCallRefErrorKind::TypeMismatch {
+                                expected: error.expected.clone(),
+                                actual: error.actual.clone(),
+                                declared: error.declared.clone(),
+                            },
+                        },
+                    )),
+                );
+                return;
+            }
+            BindingResolutionError::Type(_error) => {}
+            BindingResolutionError::DeferredAccess(_error) => {}
+            BindingResolutionError::CustomType(_error) => {}
+            BindingResolutionError::Existing(_message) => {}
+        }
+
+        let binding_anchor = ModuleCallFindingAnchor {
+            source_file: finding.use_site.source_file.clone(),
+            span: finding.use_site.span,
+        };
+        self.push(
+            ModuleCallFindingKind::BindingUse,
+            owner.clone(),
+            binding_anchor,
+            ModuleCallFindingMessage::BindingUse {
+                argument: argument.to_string(),
+                error: Box::new(finding.error.clone()),
+            },
+        );
     }
 
     fn check_call<E>(
@@ -4348,7 +4621,7 @@ impl ModuleCallChecker<'_> {
                 continue;
             };
 
-            if module_argument_owned_by_binding_use(
+            if binding_use_authority_owns_module_argument(
                 authority_file,
                 binding_use_report,
                 authored_call.id(),
@@ -4357,11 +4630,31 @@ impl ModuleCallChecker<'_> {
                 continue;
             }
 
-            let Ok(Some(resolved_parameter)) =
-                resolve_parameter_type_for_check(&parameter.type_expr, self.provider_context)
-            else {
-                continue;
-            };
+            let resolved_parameter =
+                match resolve_parameter_type_for_check(&parameter.type_expr, self.provider_context)
+                {
+                    Ok(Some(resolved_parameter)) => resolved_parameter,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let source_file = authored_call.id().source_file();
+                        let line = authored.value_span().start_line();
+                        self.push(
+                            ModuleCallFindingKind::TypeResolution,
+                            owner.clone(),
+                            module_call_anchor(authored_call.id(), authored.key_span()),
+                            ModuleCallFindingMessage::TypeResolution {
+                                context: format!(
+                                    "module {} argument '{}' in {} at line {line}",
+                                    authored_call.module_name,
+                                    argument,
+                                    source_file.display(),
+                                ),
+                                error,
+                            },
+                        );
+                        continue;
+                    }
+                };
             let semantic_argument = semantic_call.and_then(|call| call.argument(argument));
             let argument_value = semantic_argument.unwrap_or_else(|| authored.argument());
             if let Some(handle) = argument_value.handle() {
@@ -4465,7 +4758,7 @@ impl ModuleCallChecker<'_> {
                         .iter()
                         .any(|parameter| parameter.name == error.argument)
                 })
-                || module_argument_owned_by_binding_use(
+                || binding_use_authority_owns_module_argument(
                     authority_file,
                     binding_use_report,
                     authored_call.id(),
@@ -4501,16 +4794,26 @@ impl ModuleCallChecker<'_> {
         file: &crate::parser::File<E>,
         call: &ModuleCall,
         base_dir: Option<&std::path::Path>,
-        root_owner: &ModuleCallId,
+        root_owner: Option<&ModuleCallId>,
     ) {
-        let Some(base_dir) = base_dir else {
-            return;
-        };
         let Some(import) = file
             .uses
             .iter()
             .find(|import| import.alias == call.module_name)
         else {
+            return;
+        };
+        self.check_nested_import(file, import, base_dir, root_owner);
+    }
+
+    fn check_nested_import<E>(
+        &mut self,
+        file: &crate::parser::File<E>,
+        import: &crate::parser::UseStatement,
+        base_dir: Option<&std::path::Path>,
+        root_owner: Option<&ModuleCallId>,
+    ) {
+        let Some(base_dir) = base_dir else {
             return;
         };
         let module_dir = base_dir.join(&import.path);
@@ -4520,9 +4823,7 @@ impl ModuleCallChecker<'_> {
         }
 
         if let Some(mut module) = crate::module_resolver::load_module(&module_dir) {
-            // Declaration diagnostics are owned by the type-resolution pass;
-            // this call needs only its resolved in-memory type expressions.
-            drop(resolve_file_type_exprs(&mut module, self.provider_context));
+            let resolution_errors = resolve_file_type_exprs(&mut module, self.provider_context);
             let signatures = crate::module_resolver::load_resolved_module_signatures(
                 &module,
                 &module_dir,
@@ -4542,6 +4843,28 @@ impl ModuleCallChecker<'_> {
                     &signatures,
                 ),
             );
+            let boundary_call = file
+                .module_calls
+                .iter()
+                .find(|call| call.module_name == import.alias);
+            let diagnostic_call = boundary_call.or_else(|| module.module_calls.first());
+            if let Some(diagnostic_call) = diagnostic_call {
+                let root = root_owner.unwrap_or_else(|| diagnostic_call.id()).clone();
+                for error in resolution_errors {
+                    self.push(
+                        ModuleCallFindingKind::TypeResolution,
+                        ModuleCallFindingOwner {
+                            root: root.clone(),
+                            immediate: diagnostic_call.id().clone(),
+                        },
+                        module_call_anchor(diagnostic_call.id(), diagnostic_call.source_span()),
+                        ModuleCallFindingMessage::TypeResolution {
+                            context: module_dir.display().to_string(),
+                            error,
+                        },
+                    );
+                }
+            }
             self.check_file(
                 &module,
                 ModuleFileCheckContext {
@@ -4550,7 +4873,8 @@ impl ModuleCallChecker<'_> {
                     signatures: &signatures,
                     binding_use_report: &binding_use_report,
                     bindings: &bindings,
-                    root_owner: Some(root_owner),
+                    root_owner,
+                    reference_checks: ModuleCallReferenceChecks::Enabled,
                 },
             );
         }
@@ -4564,48 +4888,111 @@ impl ModuleCallChecker<'_> {
         bindings: &BindingIndex<'_>,
     ) {
         for error in validate_composition_ref_types_with_bindings(compositions, bindings) {
-            let CompositionRefError::ModuleCall(error) = error else {
+            match error {
+                CompositionRefError::ModuleCall(error) => {
+                    let root = error.call_path.root();
+                    let immediate = error.call_path.immediate();
+                    let span = match *error.origin {
+                        crate::parser::ArgumentOrigin::Authored {
+                            key_span,
+                            value_span: _value_span,
+                        } => key_span,
+                        crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
+                    };
+                    self.push(
+                        ModuleCallFindingKind::ReferenceType,
+                        ModuleCallFindingOwner {
+                            root: root.id.clone(),
+                            immediate: immediate.id.clone(),
+                        },
+                        module_call_anchor(&immediate.id, span),
+                        ModuleCallFindingMessage::ReferenceType(Box::new(
+                            ModuleCallReferenceDiagnostic {
+                                call_label: immediate.display_label(),
+                                argument: error.argument,
+                                path: error.path,
+                                kind: error.kind,
+                            },
+                        )),
+                    );
+                }
+                CompositionRefError::Attribute(error) => {
+                    let Some(first_path) = error.call_paths.first() else {
+                        unreachable!("expanded attribute errors retain their call path")
+                    };
+                    let first_immediate = first_path.immediate();
+                    let anchor =
+                        module_call_anchor(&first_immediate.id, first_immediate.id.call_span());
+                    let message = error.to_string();
+                    for call_path in &error.call_paths {
+                        self.push(
+                            ModuleCallFindingKind::ReferenceType,
+                            ModuleCallFindingOwner {
+                                root: call_path.root().id.clone(),
+                                immediate: call_path.immediate().id.clone(),
+                            },
+                            anchor.clone(),
+                            ModuleCallFindingMessage::AttributeReference(message.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_expanded_binding_uses(
+        &mut self,
+        report: &BindingUseReport,
+        compositions: &[crate::resource::LiveComposition],
+    ) {
+        for finding in report.findings() {
+            let crate::parser::BindingUseOwner::ModuleArgument { call, argument } =
+                &finding.use_site.owner
+            else {
                 continue;
             };
-            let root = error.call_path.root();
-            let immediate = error.call_path.immediate();
-            let span = match *error.origin {
-                crate::parser::ArgumentOrigin::Authored {
-                    key_span,
-                    value_span: _value_span,
-                } => key_span,
-                crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
-            };
-            self.push(
-                ModuleCallFindingKind::ReferenceType,
-                ModuleCallFindingOwner {
-                    root: root.id.clone(),
-                    immediate: immediate.id.clone(),
-                },
-                module_call_anchor(&immediate.id, span),
-                ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
-                    call_label: match immediate.id.expansion() {
-                        crate::parser::CallExpansion::Direct => {
-                            immediate.binding.clone().unwrap_or_else(|| {
-                                format!("{} (anonymous call)", immediate.module_name)
-                            })
-                        }
-                        crate::parser::CallExpansion::Expanded(_expansion_key) => {
-                            format!("{} (anonymous call)", immediate.module_name)
-                        }
+            let mut owners = Vec::new();
+            for composition in compositions {
+                let path = composition.call_path();
+                if let Some(immediate) = path.calls().find(|candidate| candidate.id == *call) {
+                    let owner = ModuleCallFindingOwner {
+                        root: path.root().id.clone(),
+                        immediate: immediate.id.clone(),
+                    };
+                    if !owners.iter().any(|(existing, _label)| existing == &owner) {
+                        owners.push((owner, immediate.display_label()));
+                    }
+                }
+            }
+            if owners.is_empty() {
+                owners.push((
+                    ModuleCallFindingOwner {
+                        root: call.clone(),
+                        immediate: call.clone(),
                     },
-                    argument: error.argument,
-                    path: error.path,
-                    kind: error.kind,
-                })),
-            );
+                    "anonymous module call".to_string(),
+                ));
+            }
+            let anchor = ModuleCallFindingAnchor {
+                source_file: finding.use_site.source_file.clone(),
+                span: finding.use_site.span,
+            };
+            for (owner, call_label) in owners {
+                self.push_binding_use_finding(
+                    &call_label,
+                    argument,
+                    finding,
+                    &owner,
+                    anchor.clone(),
+                );
+            }
         }
     }
 
     fn check_constraints(
         &mut self,
         reports: &crate::module_resolver::ModuleCallConstraintReports,
-        compositions: Option<&[crate::resource::LiveComposition]>,
+        compositions: &[crate::resource::LiveComposition],
     ) {
         for report in reports.values() {
             for outcome in &report.outcomes {
@@ -4631,8 +5018,7 @@ impl ModuleCallChecker<'_> {
                     }
                 };
                 let (root, immediate) = compositions
-                    .into_iter()
-                    .flatten()
+                    .iter()
                     .find_map(|composition| {
                         let path = composition.call_path();
                         (path.immediate().id == report.source.id)
@@ -4658,15 +5044,6 @@ fn module_call_anchor(call: &ModuleCallId, span: SourceSpan) -> ModuleCallFindin
         source_file: call.source_file_id().clone(),
         span,
     }
-}
-
-fn module_argument_owned_by_binding_use<E>(
-    file: &crate::parser::File<E>,
-    report: &BindingUseReport,
-    call: &ModuleCallId,
-    argument: &str,
-) -> bool {
-    binding_use_authority_owns_module_argument(file, report, call, argument)
 }
 
 fn module_call_label(call: &ModuleCall) -> String {
@@ -4731,8 +5108,7 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
     }
 }
 
-/// Collect every module-call finding available from authored, expanded, and
-/// resolver-owned semantic views.
+/// Collect module-call findings from authored source and its imported graph.
 pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<ModuleCallFinding> {
     let ModuleCallCheckInput {
         authored,
@@ -4743,13 +5119,8 @@ pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<Modu
         schemas,
         binding_use_report,
         bindings,
-        expanded_compositions,
-        constraint_reports,
+        reference_checks,
     } = input;
-    let semantic = match semantic {
-        ModuleCallSemanticView::Available(semantic) => Some(semantic),
-        ModuleCallSemanticView::Unavailable => None,
-    };
     let mut checker = ModuleCallChecker {
         provider_context,
         schemas,
@@ -4765,15 +5136,65 @@ pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<Modu
             binding_use_report,
             bindings,
             root_owner: None,
+            reference_checks,
         },
     );
-    if let Some(compositions) = expanded_compositions {
-        checker.check_expanded(compositions, bindings);
-    }
-    if let Some(reports) = constraint_reports {
-        checker.check_constraints(reports, expanded_compositions);
+    checker.findings
+}
+
+/// Collect only findings whose authoritative inputs exist after expansion.
+pub fn check_expanded_module_calls(
+    input: ExpandedModuleCallCheckInput<'_, '_>,
+) -> Vec<ModuleCallFinding> {
+    let provider_context = ProviderContext::default();
+    let schemas = SchemaRegistry::new();
+    let mut checker = ModuleCallChecker {
+        provider_context: &provider_context,
+        schemas: &schemas,
+        findings: Vec::new(),
+        active_modules: HashSet::new(),
+    };
+    match input {
+        ExpandedModuleCallCheckInput::BindingUses {
+            binding_use_report,
+            compositions,
+        } => checker.check_expanded_binding_uses(binding_use_report, compositions),
+        ExpandedModuleCallCheckInput::References {
+            compositions,
+            bindings,
+            constraint_reports,
+        } => {
+            checker.check_expanded(compositions, bindings);
+            if let Some(reports) = constraint_reports {
+                checker.check_constraints(reports, compositions);
+            }
+        }
     }
     checker.findings
+}
+
+/// Merge authored and expanded results using the same source-aware identity
+/// as the individual phases while retaining every distinct root owner.
+pub fn merge_module_call_findings(
+    groups: impl IntoIterator<Item = Vec<ModuleCallFinding>>,
+) -> Vec<ModuleCallFinding> {
+    let mut merged: Vec<ModuleCallFinding> = Vec::new();
+    for finding in groups.into_iter().flatten() {
+        if let Some(existing) = merged.iter_mut().find(|existing| {
+            existing.anchor == finding.anchor
+                && existing.kind == finding.kind
+                && existing.message == finding.message
+        }) {
+            for owner in finding.owners {
+                if !existing.owners.contains(&owner) {
+                    existing.owners.push(owner);
+                }
+            }
+        } else {
+            merged.push(finding);
+        }
+    }
+    merged
 }
 
 /// Export parameters checked against the pre-apply binding view.

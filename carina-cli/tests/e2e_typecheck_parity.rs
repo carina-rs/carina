@@ -380,6 +380,145 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
 }
 
 #[test]
+fn unannotated_forwarded_module_output_mismatch_has_cli_lsp_error_parity() {
+    let fixture = tempfile::tempdir().expect("forwarded-output parity fixture");
+    let outer = fixture.path().join("outer");
+    let inner = fixture.path().join("inner");
+    std::fs::create_dir_all(&outer).expect("create outer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let outer = use { source = "./outer" }
+
+let outer_instance = outer {}
+"#,
+    )
+    .expect("write root call");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"let inner = use { source = "../inner" }
+
+let inner_instance = inner { value = "forwarded" }
+
+attributes {
+  bad: Int = inner_instance.forwarded
+}
+"#,
+    )
+    .expect("write outer module");
+    std::fs::write(
+        inner.join("main.crn"),
+        r#"arguments { value: String }
+
+attributes {
+  forwarded = value
+}
+"#,
+    )
+    .expect("write inner module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let cli_mismatches = cli
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("attribute 'bad': type mismatch")
+                && diagnostic.contains("expected Int")
+                && diagnostic.contains("got String")
+        })
+        .collect::<Vec<_>>();
+    let lsp_mismatches = lsp
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'bad': type mismatch")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cli_mismatches.len(),
+        1,
+        "CLI must retain the expanded output-declaration failure: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_mismatches.len(),
+        1,
+        "LSP must retain the same expanded output-declaration failure: {lsp:#?}",
+    );
+    assert_eq!(
+        lsp_mismatches[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
+    let cli_message = cli_located_message_multiset(&cli)
+        .into_keys()
+        .find(|message| message.contains("attribute 'bad': type mismatch"))
+        .expect("canonical CLI mismatch message");
+    assert_eq!(
+        cli_message, lsp_mismatches[0].message,
+        "CLI and LSP must render the core finding identically",
+    );
+}
+
+#[test]
+fn uncalled_imported_module_internal_call_has_cli_lsp_error_parity() {
+    let fixture = tempfile::tempdir().expect("uncalled-module parity fixture");
+    let outer = fixture.path().join("outer");
+    let inner = fixture.path().join("inner");
+    let source = fixture.path().join("source");
+    std::fs::create_dir_all(&outer).expect("create outer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::create_dir_all(&source).expect("create source module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        "let unused_outer = use { source = \"./outer\" }\n",
+    )
+    .expect("write uncalled root import");
+    let outer_source = r#"
+let inner = use { source = "../inner" }
+let source = use { source = "../source" }
+
+let source_instance = source {}
+inner { value = source_instance.value }
+attributes { loaded: Bool = true }
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).expect("write outer module");
+    std::fs::write(inner.join("main.crn"), "arguments { value: String }\n")
+        .expect("write inner module");
+    std::fs::write(source.join("main.crn"), "attributes { value: Int = 1 }\n")
+        .expect("write source module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "outer/main.crn",
+    );
+    let lsp_errors = lsp_error_multiset(&lsp);
+    let expected = CanonicalDiagnostic {
+        message: "module call 'inner (anonymous call)': argument 'value': cannot assign Int to 'value': expected String, got Int (from source_instance.value)".to_string(),
+        severity: "ERROR",
+    };
+
+    assert_eq!(
+        lsp_errors.get(&expected),
+        Some(&1),
+        "the authored internal call must be reported once: {lsp:#?}",
+    );
+    assert_eq!(
+        cli_located_error_multiset(&cli).get(&expected),
+        Some(&1),
+        "CLI must walk an imported-but-uncalled module and render the same core finding: {cli:#?}",
+    );
+}
+
+#[test]
 fn postfix_wrong_shape_access_has_cli_lsp_parity_for_local_and_wait_bindings() {
     let fixture = write_fixture(&[
         ("providers.crn", "provider mock {}\n"),
