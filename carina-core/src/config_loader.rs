@@ -908,76 +908,11 @@ pub(crate) fn relabel_export_phase<A, B>(f: File<A>) -> File<B> {
 /// Fold one parsed file's content into another (the sibling-`.crn`
 /// directory merge, and the module-load merge).
 ///
-/// `source` is **destructured exhaustively** rather than field-accessed:
-/// this is the single source of truth for "every mergeable `File<E>`
-/// field", and the destructure is a compile-time forcing function — if
-/// a field is added to `File<E>`, this stops compiling until someone
-/// decides how it merges. Without that guard a new field is silently
-/// dropped on this path, which is exactly the carina#3126 / carina#3061
-/// class of bug (a `File<E>` field that one merge path forgot). Generic
-/// over the export-param phase `E` so the parser phase and inferred
-/// phase share one merge.
+/// [`File::merge_from`] performs the exhaustive private-field-preserving
+/// merge. Keeping this wrapper generic over the export-param phase lets the
+/// parser and inferred phases share that single merge contract.
 pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
-    let File {
-        providers,
-        resources,
-        data_sources,
-        compositions,
-        variables,
-        uses,
-        module_calls,
-        arguments,
-        attribute_params,
-        export_params,
-        backend,
-        state_blocks,
-        user_functions,
-        upstream_states,
-        wait_bindings,
-        requires,
-        structural_bindings,
-        parser_binding_metadata,
-        parsed_binding_uses,
-        warnings,
-        deferred_for_expressions,
-        expansion_trace,
-    } = source;
-
-    target.providers.extend(providers);
-    target.resources.extend(resources);
-    target.data_sources.extend(data_sources);
-    target.compositions.extend(compositions);
-    target.variables.extend(variables);
-    target.uses.extend(uses);
-    target.module_calls.extend(module_calls);
-    target.arguments.extend(arguments);
-    target.attribute_params.extend(attribute_params);
-    target.export_params.extend(export_params);
-    target.state_blocks.extend(state_blocks);
-    target.user_functions.extend(user_functions);
-    target.upstream_states.extend(upstream_states);
-    target.wait_bindings.extend(wait_bindings);
-    target.requires.extend(requires);
-    target.structural_bindings.extend(structural_bindings);
-    target
-        .parser_binding_metadata
-        .extend(parser_binding_metadata);
-    target.parsed_binding_uses.extend(parsed_binding_uses);
-    target.warnings.extend(warnings);
-    target
-        .deferred_for_expressions
-        .extend(deferred_for_expressions);
-    // `expansion_trace`: merge every (leaf, chain) entry. Different
-    // sources never produce the same leaf id (the expander prefixes
-    // leaf ids with the call-site instance), so the merge is just a
-    // disjoint-set union; the iteration order does not matter.
-    for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
-        target.expansion_trace.record(leaf, call_sites);
-    }
-    // `backend` is config, not accumulated content: last file wins.
-    if let Some(backend) = backend {
-        target.backend = Some(backend);
-    }
+    target.merge_from(source);
 }
 
 /// Parse every `(path, source)` pair as part of a single directory unit.

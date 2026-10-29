@@ -13,10 +13,9 @@ use super::ast::{
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{Resource, ResourceId};
+use crate::resource::{Resource, ResourceId, Value};
 use indexmap::IndexMap;
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,9 +31,10 @@ use std::sync::Arc;
 pub(super) enum ParseBinding {
     Value {
         value: Box<EvalValue>,
+        shared_value: OnceCell<Arc<Value>>,
         source_line: usize,
         declaration: crate::schema::BindingKind,
-        declared_type: Option<TypeExpr>,
+        declared_type: Option<Arc<TypeExpr>>,
         scope: BindingScopeId,
     },
     Structural {
@@ -48,7 +48,7 @@ pub(super) enum ParseBindingRef<'a> {
     Value {
         value: &'a EvalValue,
         declaration: crate::schema::BindingKind,
-        declared_type: Option<&'a TypeExpr>,
+        declared_type: Option<&'a Arc<TypeExpr>>,
     },
     Structural(&'a StructuralHandle),
     Unbound,
@@ -261,6 +261,7 @@ impl<'cfg> ParseContext<'cfg> {
             name,
             ParseBinding::Value {
                 value: Box::new(value.into()),
+                shared_value: OnceCell::new(),
                 source_line,
                 declaration: crate::schema::BindingKind::Let,
                 declared_type: None,
@@ -279,9 +280,10 @@ impl<'cfg> ParseContext<'cfg> {
             name,
             ParseBinding::Value {
                 value: Box::new(value.into()),
+                shared_value: OnceCell::new(),
                 source_line: 0,
                 declaration: crate::schema::BindingKind::Argument,
-                declared_type,
+                declared_type: declared_type.map(Arc::new),
                 scope: self.binding_scope.clone(),
             },
         );
@@ -338,6 +340,23 @@ impl<'cfg> ParseContext<'cfg> {
             }
             None => None,
         }
+    }
+
+    fn shared_binding_value(&self, name: &str) -> Option<Arc<Value>> {
+        let ParseBinding::Value {
+            value,
+            shared_value,
+            ..
+        } = self.bindings.get(name)?
+        else {
+            return None;
+        };
+        if let Some(value) = shared_value.get() {
+            return Some(Arc::clone(value));
+        }
+        let value = Arc::new(value.as_ref().clone().into_value().ok()?);
+        let _ = shared_value.set(Arc::clone(&value));
+        Some(value)
     }
 
     pub(super) fn contains_binding(&self, name: &str) -> bool {
@@ -497,19 +516,16 @@ impl<'a> ExpressionMode<'a> {
         let sink = self.sink.as_ref()?;
         let (binding, source) = match ctx.lookup_binding(name) {
             ParseBindingRef::Value {
-                value,
                 declaration,
                 declared_type,
-            } => {
-                let value = value.clone().into_value().ok()?;
-                (
-                    BareBindingKind::Value { declaration },
-                    BareBindingSource::Value {
-                        value,
-                        declared_type: declared_type.cloned(),
-                    },
-                )
-            }
+                ..
+            } => (
+                BareBindingKind::Value { declaration },
+                BareBindingSource::Value {
+                    value: ctx.shared_binding_value(name)?,
+                    declared_type: declared_type.cloned(),
+                },
+            ),
             ParseBindingRef::Structural(handle) => {
                 let resource_type = match handle.kind() {
                     StructuralHandleKind::Resource(resource_type) => Some(resource_type.clone()),
@@ -545,22 +561,16 @@ impl<'a> ExpressionMode<'a> {
             span: SourceSpan::from_pest(token, sink.preprocessed_file),
             binding,
         };
-        ctx.parsed_binding_uses
-            .borrow_mut()
-            .record(authored, source);
-
-        if matches!(ctx.lookup_binding(name), ParseBindingRef::Structural(_))
-            && sink.structural == StructuralSinkMode::Pending
-        {
-            let slot = PendingValueSlot {
+        let pending_slot = (matches!(&source, BareBindingSource::Structural(_))
+            && sink.structural == StructuralSinkMode::Pending)
+            .then(|| PendingValueSlot {
                 owner: sink.owner.clone(),
                 path: sink.root_path.clone(),
-            };
-            ctx.parsed_binding_uses.borrow_mut().reserve(slot.clone());
-            Some(slot)
-        } else {
-            None
-        }
+            });
+        ctx.parsed_binding_uses
+            .borrow_mut()
+            .record(authored, source, pending_slot.clone());
+        pending_slot
     }
 }
 

@@ -284,21 +284,6 @@ fn parse_namespaced_id_value(
 
     let head_binding = ctx.lookup_binding(parts[0]);
 
-    // Only an unbound dotted name can use the fully-qualified enum spelling.
-    // A lexical value or structural head keeps the same access semantics as
-    // every other dotted path, including when a later segment is PascalCase.
-    if matches!(head_binding, ParseBindingRef::Unbound)
-        && trailing_segments.is_empty()
-        && matches!(
-            crate::resource::RawEnumIdentifier::parse(full_str).parsed(),
-            crate::resource::RawEnumIdentifierParts::FullyQualified { .. }
-        )
-    {
-        return Ok(EvalValue::from_value(Value::Concrete(
-            ConcreteValue::enum_identifier(full_str.to_string()),
-        )));
-    }
-
     match head_binding {
         ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {
             return Ok(as_resource_ref(trailing_segments));

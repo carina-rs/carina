@@ -1058,35 +1058,31 @@ fn parse_with_seeded_bindings_inner(
     let mut user_functions = Arc::unwrap_or_clone(ctx.user_functions);
     user_functions.retain(|name, _| !ctx.seeded_user_functions.contains(name));
 
-    Ok(ParsedFile {
-        providers,
-        resources,
-        data_sources,
-        // Virtual resources are synthesized by module-call expansion,
-        // not the parser — left empty here, populated in `expander.rs`.
-        compositions: Vec::new(),
-        variables,
-        uses,
-        module_calls,
-        arguments,
-        attribute_params,
-        export_params,
-        backend,
-        state_blocks,
-        user_functions,
-        upstream_states,
-        wait_bindings,
-        requires,
-        structural_bindings: ctx.structural_bindings,
-        parser_binding_metadata,
-        parsed_binding_uses,
-        warnings: ctx.warnings,
-        deferred_for_expressions: ctx.deferred_for_expressions,
-        // The parser never synthesizes composition resources, so it
-        // never records lineage — the trace starts empty here and is
-        // populated by `module_resolver::expander` (#3306).
-        expansion_trace: crate::resource::ExpansionTrace::new(),
-    })
+    let mut parsed = ParsedFile::empty_with_parsed_binding_uses(parsed_binding_uses);
+    parsed.providers = providers;
+    parsed.resources = resources;
+    parsed.data_sources = data_sources;
+    // Virtual resources are synthesized by module-call expansion, not the
+    // parser; `ParsedFile::default()` leaves compositions empty here.
+    parsed.variables = variables;
+    parsed.uses = uses;
+    parsed.module_calls = module_calls;
+    parsed.arguments = arguments;
+    parsed.attribute_params = attribute_params;
+    parsed.export_params = export_params;
+    parsed.backend = backend;
+    parsed.state_blocks = state_blocks;
+    parsed.user_functions = user_functions;
+    parsed.upstream_states = upstream_states;
+    parsed.wait_bindings = wait_bindings;
+    parsed.requires = requires;
+    parsed.structural_bindings = ctx.structural_bindings;
+    parsed.parser_binding_metadata = parser_binding_metadata;
+    parsed.warnings = ctx.warnings;
+    parsed.deferred_for_expressions = ctx.deferred_for_expressions;
+    // The parser never synthesizes composition resources, so its default
+    // expansion trace remains empty until module expansion (#3306).
+    Ok(parsed)
 }
 
 fn collect_single_quoted_interpolation_warnings(

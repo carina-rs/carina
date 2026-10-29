@@ -227,10 +227,8 @@ fn checked_exports(
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let parsed = carina_core::parser::InferredFile {
-        providers: configs,
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = configs;
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -1187,35 +1185,13 @@ fn test_anonymous_id_named_resources_are_skipped() {
 
 #[test]
 fn test_find_state_bucket_resource_matching_type() {
-    let parsed = ParsedFile {
-        providers: vec![],
-        backend: None,
-        resources: vec![
-            Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
-                "bucket",
-                Value::Concrete(ConcreteValue::String("my-bucket".into())),
-            ),
-        ],
-        data_sources: vec![],
-        compositions: vec![],
-        variables: IndexMap::new(),
-        uses: vec![],
-        module_calls: vec![],
-        arguments: vec![],
-        attribute_params: vec![],
-        export_params: vec![],
-        state_blocks: vec![],
-        user_functions: HashMap::new(),
-        upstream_states: vec![],
-        wait_bindings: vec![],
-        requires: vec![],
-        structural_bindings: HashSet::new(),
-        parser_binding_metadata: Default::default(),
-        parsed_binding_uses: Default::default(),
-        warnings: vec![],
-        deferred_for_expressions: vec![],
-        expansion_trace: carina_core::resource::ExpansionTrace::new(),
-    };
+    let mut parsed = ParsedFile::default();
+    parsed.resources = vec![
+        Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
+            "bucket",
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
+        ),
+    ];
 
     // Matching resource type
     assert!(
@@ -2239,13 +2215,11 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let backend = RefreshTestBackend::new(state);
 
     // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
-    let parsed = carina_core::parser::InferredFile {
-        resources: vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
-            "bucket",
-            Value::Concrete(ConcreteValue::String("keep-bucket".into())),
-        )],
-        ..carina_core::parser::InferredFile::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.resources = vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("keep-bucket".into())),
+    )];
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");

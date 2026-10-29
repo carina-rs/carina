@@ -406,19 +406,17 @@ fn resolved_provider_config(
     name: &str,
     attributes: indexmap::IndexMap<String, Value>,
 ) -> carina_core::parser::ResolvedProviderConfig {
-    let parsed = carina_core::parser::InferredFile {
-        providers: vec![carina_core::parser::ProviderConfig {
-            name: name.to_string(),
-            attributes,
-            default_tags: indexmap::IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
-            binding: None,
-        }],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = vec![carina_core::parser::ProviderConfig {
+        name: name.to_string(),
+        attributes,
+        default_tags: indexmap::IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: indexmap::IndexMap::new(),
+        binding: None,
+    }];
     carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),

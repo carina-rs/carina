@@ -679,6 +679,14 @@ pub enum AppError {
     #[error(transparent)]
     PlanImage(#[from] crate::plan_image::PlanImageError),
 
+    /// One schema-aware bare-binding failure at its authored source token.
+    #[error("{0}")]
+    BindingUse(#[source] Box<carina_core::validation::BindingUseFinding>),
+
+    /// All schema-aware bare-binding failures from one resolved file.
+    #[error("{0}")]
+    BindingUseReport(#[source] Box<carina_core::validation::BindingUseReport>),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
@@ -1040,6 +1048,62 @@ mod tests {
     fn validation_error() {
         let app_err = AppError::Validation("invalid region".to_string());
         assert_eq!(app_err.to_string(), "invalid region");
+    }
+
+    #[test]
+    fn located_binding_use_keeps_its_typed_error_chain() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let parsed = carina_core::parser::parse_file(
+            "let source = mock.test.Source { name = \"source\" }\n\
+             mock.test.Consumer { name = source }\n",
+            std::path::Path::new("test.crn"),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("parse binding-use fixture");
+        let mut schemas = SchemaRegistry::new();
+        for resource_type in ["test.Source", "test.Consumer"] {
+            schemas.insert(
+                "mock",
+                ResourceSchema::new(resource_type)
+                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                    .validate()
+                    .expect("valid fixture schema"),
+            );
+        }
+        let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
+        let provider_context = carina_core::parser::ProviderContext::default();
+        let context = carina_core::validation::ValidationTypeContext::new(
+            &parsed,
+            &schemas,
+            &provider_context,
+            &module_signatures,
+        );
+        let finding = carina_core::validation::check_bare_binding_uses(&parsed, &context)
+            .into_findings()
+            .into_iter()
+            .next()
+            .expect("bare structural binding finding");
+        let app_err = AppError::BindingUse(Box::new(finding));
+
+        assert!(app_err.to_string().contains("test.crn:"));
+        assert!(app_err.to_string().contains("at line 2"));
+        let finding =
+            std::error::Error::source(&app_err).expect("AppError must retain the located finding");
+        assert!(
+            finding
+                .downcast_ref::<Box<carina_core::validation::BindingUseFinding>>()
+                .is_some(),
+            "the large located finding should remain boxed in the source chain",
+        );
+        let resolution = finding
+            .source()
+            .expect("located finding must retain the binding resolution error");
+        assert!(
+            resolution
+                .downcast_ref::<carina_core::validation::BindingResolutionError>()
+                .is_some()
+        );
     }
 
     #[test]

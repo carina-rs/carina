@@ -1079,10 +1079,8 @@ mod tests {
     fn saved_provider_configs(
         configs: Vec<ProviderConfig>,
     ) -> carina_core::parser::SavedProviderConfigs {
-        let parsed = carina_core::parser::InferredFile {
-            providers: configs,
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = configs;
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),

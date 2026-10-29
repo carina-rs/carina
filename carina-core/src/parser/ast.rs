@@ -19,6 +19,7 @@ use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -1214,11 +1215,11 @@ impl From<Value> for ModuleArgument {
 /// diagnostics and saved-plan normalization, but only the parser can mint an
 /// identity-bearing module call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SourceFileId(PathBuf);
+pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
     pub(in crate::parser) fn new(path: PathBuf) -> Self {
-        Self(path)
+        Self(Arc::from(path.into_boxed_path()))
     }
 
     pub fn path(&self) -> &Path {
@@ -1234,18 +1235,19 @@ impl SourceFileId {
 /// deliberately not used as scope identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BindingScopeId {
-    directory: PathBuf,
-    lexical_source_file: Option<PathBuf>,
+    directory: Arc<Path>,
+    lexical_source_file: Option<Arc<Path>>,
     ordinal: u64,
 }
 
 impl BindingScopeId {
     pub(crate) fn root(source_file: &Path) -> Self {
+        let directory = source_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         Self {
-            directory: source_file
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
+            directory: Arc::from(directory.into_boxed_path()),
             lexical_source_file: None,
             ordinal: 0,
         }
@@ -1254,7 +1256,7 @@ impl BindingScopeId {
     pub(in crate::parser) fn child(&self, source_file: &Path, ordinal: u64) -> Self {
         Self {
             directory: self.directory.clone(),
-            lexical_source_file: Some(source_file.to_path_buf()),
+            lexical_source_file: Some(Arc::from(source_file.to_path_buf().into_boxed_path())),
             ordinal,
         }
     }
@@ -1303,17 +1305,17 @@ pub enum AttributePathSegment {
 
 /// Parser-authored path from an owning sink to one bare binding leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AttributePath(Vec<AttributePathSegment>);
+pub struct AttributePath(Arc<[AttributePathSegment]>);
 
 impl AttributePath {
     pub(in crate::parser) fn root(name: impl Into<String>) -> Self {
-        Self(vec![AttributePathSegment::Attribute(name.into())])
+        Self(Arc::from([AttributePathSegment::Attribute(name.into())]))
     }
 
     pub(in crate::parser) fn with_segment(&self, segment: AttributePathSegment) -> Self {
-        let mut path = self.0.clone();
+        let mut path = self.0.to_vec();
         path.push(segment);
-        Self(path)
+        Self(path.into())
     }
 
     pub fn segments(&self) -> &[AttributePathSegment] {
@@ -1369,8 +1371,8 @@ pub struct PendingValueSlot {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BareBindingSource {
     Value {
-        value: Value,
-        declared_type: Option<TypeExpr>,
+        value: Arc<Value>,
+        declared_type: Option<Arc<TypeExpr>>,
     },
     Structural(StructuralHandle),
 }
@@ -1387,17 +1389,56 @@ pub(crate) struct ParsedBareBindingUse {
 pub struct ParsedBindingUses {
     records: Vec<ParsedBareBindingUse>,
     pending_slots: Vec<PendingValueSlot>,
+    record_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
+    pending_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BindingUseOwnerKey {
+    Resource(ResourceId),
+    ModuleCall(ModuleCallId),
+}
+
+impl From<&BindingUseOwner> for BindingUseOwnerKey {
+    fn from(owner: &BindingUseOwner) -> Self {
+        match owner {
+            BindingUseOwner::Resource(address) => Self::Resource(address.resource_id().clone()),
+            BindingUseOwner::ModuleArgument { call, .. } => Self::ModuleCall(call.clone()),
+        }
+    }
 }
 
 impl ParsedBindingUses {
-    pub(crate) fn record(&mut self, authored: BareBindingUse, source: BareBindingSource) {
+    pub(crate) fn record(
+        &mut self,
+        authored: BareBindingUse,
+        source: BareBindingSource,
+        pending_slot: Option<PendingValueSlot>,
+    ) {
+        let owner = BindingUseOwnerKey::from(&authored.owner);
+        let index = self.records.len();
         self.records.push(ParsedBareBindingUse { authored, source });
+        self.record_indices_by_owner
+            .entry(owner)
+            .or_default()
+            .push(index);
+        if let Some(slot) = pending_slot {
+            self.reserve(slot);
+        }
     }
 
-    pub(crate) fn reserve(&mut self, slot: PendingValueSlot) {
-        if !self.pending_slots.contains(&slot) {
-            self.pending_slots.push(slot);
+    fn reserve(&mut self, slot: PendingValueSlot) {
+        let owner = BindingUseOwnerKey::from(&slot.owner);
+        let indices = self.pending_indices_by_owner.entry(owner).or_default();
+        if indices
+            .iter()
+            .any(|index| self.pending_slots[*index] == slot)
+        {
+            return;
         }
+        let index = self.pending_slots.len();
+        self.pending_slots.push(slot);
+        indices.push(index);
     }
 
     pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
@@ -1412,40 +1453,89 @@ impl ParsedBindingUses {
         &self.pending_slots
     }
 
+    pub(crate) fn has_pending_slot_for(&self, use_site: &BareBindingUse) -> bool {
+        self.pending_indices_by_owner
+            .get(&BindingUseOwnerKey::from(&use_site.owner))
+            .is_some_and(|indices| {
+                indices.iter().any(|index| {
+                    self.pending_slots[*index].path.root_name() == use_site.path.root_name()
+                })
+            })
+    }
+
     pub(crate) fn remap_resource_owner(&mut self, from: &ResourceId, to: &ResourceId) {
-        let remap = |owner: &mut BindingUseOwner| {
-            if let BindingUseOwner::Resource(address) = owner
-                && address.resource_id() == from
-            {
+        let from = BindingUseOwnerKey::Resource(from.clone());
+        let to_key = BindingUseOwnerKey::Resource(to.clone());
+        if let Some(indices) = self.record_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::Resource(address) = &mut self.records[*index].authored.owner
+                else {
+                    unreachable!("resource owner index points to a module argument")
+                };
                 *address = ResourceAddress::new(to.clone());
             }
-        };
-        for record in &mut self.records {
-            remap(&mut record.authored.owner);
+            self.record_indices_by_owner
+                .entry(to_key.clone())
+                .or_default()
+                .extend(indices);
         }
-        for slot in &mut self.pending_slots {
-            remap(&mut slot.owner);
+        if let Some(indices) = self.pending_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::Resource(address) = &mut self.pending_slots[*index].owner
+                else {
+                    unreachable!("resource pending index points to a module argument")
+                };
+                *address = ResourceAddress::new(to.clone());
+            }
+            self.pending_indices_by_owner
+                .entry(to_key)
+                .or_default()
+                .extend(indices);
         }
     }
 
     pub(crate) fn remap_module_call_owner(&mut self, from: &ModuleCallId, to: &ModuleCallId) {
-        let remap = |owner: &mut BindingUseOwner| {
-            if let BindingUseOwner::ModuleArgument { call, .. } = owner
-                && call == from
-            {
+        let from = BindingUseOwnerKey::ModuleCall(from.clone());
+        let to_key = BindingUseOwnerKey::ModuleCall(to.clone());
+        if let Some(indices) = self.record_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::ModuleArgument { call, .. } =
+                    &mut self.records[*index].authored.owner
+                else {
+                    unreachable!("module-call owner index points to a resource")
+                };
                 *call = to.clone();
             }
-        };
-        for record in &mut self.records {
-            remap(&mut record.authored.owner);
+            self.record_indices_by_owner
+                .entry(to_key.clone())
+                .or_default()
+                .extend(indices);
         }
-        for slot in &mut self.pending_slots {
-            remap(&mut slot.owner);
+        if let Some(indices) = self.pending_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::ModuleArgument { call, .. } =
+                    &mut self.pending_slots[*index].owner
+                else {
+                    unreachable!("module-call pending index points to a resource")
+                };
+                *call = to.clone();
+            }
+            self.pending_indices_by_owner
+                .entry(to_key)
+                .or_default()
+                .extend(indices);
         }
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
+        let record_offset = self.records.len();
         self.records.extend(other.records);
+        for (owner, indices) in other.record_indices_by_owner {
+            self.record_indices_by_owner
+                .entry(owner)
+                .or_default()
+                .extend(indices.into_iter().map(|index| index + record_offset));
+        }
         for slot in other.pending_slots {
             self.reserve(slot);
         }
@@ -1484,7 +1574,7 @@ pub struct ModuleCallId {
 impl ModuleCallId {
     pub(in crate::parser) fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
         Self {
-            source_file: SourceFileId(source_file),
+            source_file: SourceFileId::new(source_file),
             call_span,
             expansion: CallExpansion::Direct,
         }
@@ -2219,6 +2309,10 @@ impl ExportParamLike for InferredExportParam {
 /// `apply_inference` and yields `File<InferredExportParam>` where every
 /// export's `type_expr` is bare. Every other field is identical between
 /// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
+///
+/// Bare-binding provenance is read-only outside the parser pipeline in
+/// production builds, so callers cannot erase it to bypass
+/// [`crate::validation::resolve_bare_binding_uses`].
 #[derive(Debug, Clone)]
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
@@ -2259,8 +2353,14 @@ pub struct File<E> {
     #[doc(hidden)]
     pub parser_binding_metadata: ParserBindingMetadata,
     /// Bare binding provenance and typed pending value slots.
+    #[cfg(not(test))]
     #[doc(hidden)]
-    pub parsed_binding_uses: ParsedBindingUses,
+    parsed_binding_uses: ParsedBindingUses,
+    /// Crate-local unit-test fixtures may initialize the otherwise-private
+    /// provenance channel.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) parsed_binding_uses: ParsedBindingUses,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
@@ -2318,6 +2418,71 @@ impl<E> Default for File<E> {
 impl<E> File<E> {
     pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
         &self.parsed_binding_uses
+    }
+
+    pub(crate) fn empty_with_parsed_binding_uses(parsed_binding_uses: ParsedBindingUses) -> Self {
+        Self {
+            parsed_binding_uses,
+            ..Self::default()
+        }
+    }
+
+    /// Merge one same-phase file without exposing mutable bare-binding
+    /// provenance. The exhaustive destructure keeps new `File` fields from
+    /// being silently dropped by directory and module merges.
+    pub(crate) fn merge_from(&mut self, source: Self) {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_expressions,
+            expansion_trace,
+        } = source;
+
+        self.providers.extend(providers);
+        self.resources.extend(resources);
+        self.data_sources.extend(data_sources);
+        self.compositions.extend(compositions);
+        self.variables.extend(variables);
+        self.uses.extend(uses);
+        self.module_calls.extend(module_calls);
+        self.arguments.extend(arguments);
+        self.attribute_params.extend(attribute_params);
+        self.export_params.extend(export_params);
+        self.state_blocks.extend(state_blocks);
+        self.user_functions.extend(user_functions);
+        self.upstream_states.extend(upstream_states);
+        self.wait_bindings.extend(wait_bindings);
+        self.requires.extend(requires);
+        self.structural_bindings.extend(structural_bindings);
+        self.parser_binding_metadata.extend(parser_binding_metadata);
+        self.parsed_binding_uses.extend(parsed_binding_uses);
+        self.warnings.extend(warnings);
+        self.deferred_for_expressions
+            .extend(deferred_for_expressions);
+        for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
+            self.expansion_trace.record(leaf, call_sites);
+        }
+        if let Some(backend) = backend {
+            self.backend = Some(backend);
+        }
     }
 
     /// Transform only the export-param phase (`File<E>` → `File<B>`),

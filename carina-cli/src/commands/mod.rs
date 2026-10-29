@@ -434,13 +434,9 @@ fn extend_binding_use_errors(
         report
             .findings()
             .iter()
-            .map(|finding| AppError::Validation(finding.error.to_string())),
+            .cloned()
+            .map(|finding| AppError::BindingUse(Box::new(finding))),
     );
-    if !report.is_ready() && report.findings().is_empty() {
-        errors.push(AppError::Validation(
-            "bare binding validation left an unconsumed pending value slot".to_string(),
-        ));
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -617,18 +613,13 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 &module_signatures,
             ),
         );
-        let prefix = module.diagnostic_path().display();
         errors.extend(
             report
                 .findings()
                 .iter()
-                .map(|finding| AppError::Validation(format!("{prefix}: {}", finding.error))),
+                .cloned()
+                .map(|finding| AppError::BindingUse(Box::new(finding))),
         );
-        if !report.is_ready() && report.findings().is_empty() {
-            errors.push(AppError::Validation(format!(
-                "{prefix}: bare binding validation left an unconsumed pending value slot"
-            )));
-        }
     }
 
     // Validate module call arguments before expansion (needs enriched
@@ -1458,10 +1449,9 @@ exports {
             Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
         );
 
-        carina_core::parser::InferredFile {
-            resources: vec![resource],
-            ..carina_core::parser::InferredFile::default()
-        }
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.resources = vec![resource];
+        parsed
     }
 
     #[test]

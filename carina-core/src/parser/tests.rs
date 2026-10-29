@@ -14322,6 +14322,36 @@ mock.test.Consumer { name = authored_name }"#,
 }
 
 #[test]
+fn repeated_bare_binding_records_share_the_bound_value_payload() {
+    let parsed = parse(
+        r#"let payload = { nested = ["one", "two", "three"] }
+mock.test.Consumer {
+  first = payload
+  second = payload
+}"#,
+        &ProviderContext::default(),
+    )
+    .expect("record repeated value binding uses");
+    let sources = parsed
+        .bare_binding_uses()
+        .records()
+        .iter()
+        .filter_map(|record| match &record.source {
+            BareBindingSource::Value { value, .. } if record.authored.name == "payload" => {
+                Some(value)
+            }
+            BareBindingSource::Value { .. } | BareBindingSource::Structural(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(sources.len(), 2);
+    assert!(
+        std::sync::Arc::ptr_eq(sources[0], sources[1]),
+        "each use should clone only the shared pointer, not the Value tree",
+    );
+}
+
+#[test]
 fn lexical_child_scope_ids_are_unique_across_sibling_files() {
     use crate::config_loader::parse_directory;
 

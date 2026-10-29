@@ -721,13 +721,9 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let canonical = CanonicalResourcePair::new(
-            carina_core::parser::ParsedFile {
-                resources: resources.clone(),
-                ..Default::default()
-            },
-            resources,
-        );
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        parsed.resources = resources.clone();
+        let canonical = CanonicalResourcePair::new(parsed, resources);
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
             Some(overrides),

@@ -463,7 +463,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Expand managed resources with substituted values.
         let mut resources: Vec<Resource> = Vec::new();
         let mut expanded_parser_metadata = crate::parser::ParserBindingMetadata::default();
-        let mut expanded_binding_uses = module.parsed_binding_uses.clone();
+        let mut expanded_binding_uses = module.bare_binding_uses().clone();
         for resource in &module.resources {
             let source_file = module
                 .parser_binding_metadata
@@ -701,65 +701,20 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             &data_sources,
         );
 
-        // The contribution is a full `ParsedFile` built with an
-        // **exhaustive struct literal** (no `..Default::default()`):
-        // adding a `File<E>` field breaks this until someone decides
-        // whether a module instance contributes it. Fields a module
-        // does *not* propagate are explicitly empty *here*, with the
-        // reason — never silently absent (the carina#3126 fix).
-        Ok(ParsedFile {
-            // Populated from the module, instance-prefixed:
-            resources,
-            data_sources,
-            compositions,
-            wait_bindings: expanded_wait_bindings,
-            deferred_for_expressions: expanded_deferred_for_expressions,
-
-            // Not propagated to the caller (a module instance does not
-            // re-export these as raw collections — they are either consumed
-            // during expansion, surfaced through the composition attribute
-            // resource above, or rejected at the module boundary):
-            //   - `providers`: rejected during module loading because modules
-            //     inherit the caller's providers.
-            //   - `variables` / `user_functions`: module-local, already
-            //     substituted into the expanded resources.
-            //   - `uses` / `module_calls`: nested modules are resolved
-            //     within `expand_module_call`, not re-emitted.
-            //   - `arguments`: the call's args are bound here.
-            //   - `attribute_params`: outputs reach the caller through the
-            //     `_virtual` attribute resource.
-            //   - `export_params`: rejected during module loading because
-            //     exports publish root state, not module instance outputs.
-            //   - `requires`: evaluated against this call's args here.
-            //   - `state_blocks`: rejected during module loading because a
-            //     module does not own caller state config.
-            //   - `backend`: rejected during module loading because a module
-            //     does not own caller backend config.
-            //   - `upstream_states`: rejected during module loading because a
-            //     module does not own caller upstream state dependencies.
-            //   - `structural_bindings`: scoped to the module's own
-            //     parse, not merged upward.
-            providers: Vec::new(),
-            variables: IndexMap::new(),
-            uses: Vec::new(),
-            module_calls: Vec::new(),
-            arguments: Vec::new(),
-            attribute_params: Vec::new(),
-            export_params: Vec::new(),
-            backend: None,
-            state_blocks: Vec::new(),
-            user_functions: HashMap::new(),
-            upstream_states: Vec::new(),
-            requires: Vec::new(),
-            structural_bindings: HashSet::new(),
-            parser_binding_metadata: expanded_parser_metadata,
-            parsed_binding_uses: expanded_binding_uses,
-            warnings: module.warnings.clone(),
-
-            // ExpansionTrace (#3306): pre-built above against the
-            // call's leaves before the struct literal moved them.
-            expansion_trace,
-        })
+        // A module instance contributes only its instance-prefixed runtime
+        // graph. Module-local declarations and boundary inputs remain empty
+        // on `ParsedFile::default()` because they were consumed above or are
+        // rejected while loading the module.
+        let mut contribution = ParsedFile::empty_with_parsed_binding_uses(expanded_binding_uses);
+        contribution.resources = resources;
+        contribution.data_sources = data_sources;
+        contribution.compositions = compositions;
+        contribution.wait_bindings = expanded_wait_bindings;
+        contribution.deferred_for_expressions = expanded_deferred_for_expressions;
+        contribution.parser_binding_metadata = expanded_parser_metadata;
+        contribution.warnings = module.warnings.clone();
+        contribution.expansion_trace = expansion_trace;
+        Ok(contribution)
     }
 
     /// Unit tests exercise isolated expansion mechanics with synthetic module

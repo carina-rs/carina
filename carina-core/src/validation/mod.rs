@@ -310,13 +310,48 @@ pub struct BindingUseFinding {
     pub error: BindingResolutionError,
 }
 
+impl std::fmt::Display for BindingUseFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} at line {}",
+            self.use_site.source_file.path().display(),
+            self.error,
+            self.use_site.span.start_line(),
+        )
+    }
+}
+
+impl std::error::Error for BindingUseFinding {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Complete result of consuming one parsed file's out-of-band provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
-    consumed_uses: usize,
-    total_uses: usize,
-    pending_slots: Vec<crate::parser::PendingValueSlot>,
+}
+
+impl std::fmt::Display for BindingUseReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, finding) in self.findings.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            finding.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BindingUseReport {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.findings
+            .first()
+            .map(|finding| finding as &(dyn std::error::Error + 'static))
+    }
 }
 
 /// The exact parsed file whose bare binding uses were resolved successfully.
@@ -368,12 +403,6 @@ impl BindingUseReport {
 
     pub fn is_ready(&self) -> bool {
         self.findings.is_empty()
-            && self.consumed_uses == self.total_uses
-            && self.pending_slots.is_empty()
-    }
-
-    pub fn pending_slots(&self) -> &[crate::parser::PendingValueSlot] {
-        &self.pending_slots
     }
 }
 
@@ -443,18 +472,20 @@ fn enum_shadow_or_existing(
         return existing_error;
     };
     match resolver.resolve_member(&RawEnumIdentifier::parse(use_site.name.clone())) {
-        Ok((_canonical, qualified)) => BindingResolutionError::Type(
-            TypeError::BindingShadowsEnumMember(Box::new(BindingShadowsEnumMemberError {
-                name: use_site.name.clone(),
-                binding_kind: match &use_site.binding {
-                    crate::parser::BareBindingKind::Value { declaration } => *declaration,
-                    crate::parser::BareBindingKind::Structural { .. } => BindingKind::Let,
+        Ok((_canonical, qualified)) if qualified.to_string() != use_site.name => {
+            BindingResolutionError::Type(TypeError::BindingShadowsEnumMember(Box::new(
+                BindingShadowsEnumMemberError {
+                    name: use_site.name.clone(),
+                    binding_kind: match &use_site.binding {
+                        crate::parser::BareBindingKind::Value { declaration } => *declaration,
+                        crate::parser::BareBindingKind::Structural { .. } => BindingKind::Let,
+                    },
+                    r#enum: identity,
+                    qualified,
                 },
-                r#enum: identity,
-                qualified,
-            })),
-        ),
-        Err(_) => existing_error,
+            )))
+        }
+        Ok(_) | Err(_) => existing_error,
     }
 }
 
@@ -862,7 +893,7 @@ fn resolve_record_against_module(
                     .expect("module enum declaration must have an enum identity");
                 return binding_value_assignable_to_enum(
                     value,
-                    declared_type.as_ref(),
+                    declared_type.as_deref(),
                     context.provider_context,
                     &target,
                     &resolver,
@@ -873,7 +904,7 @@ fn resolve_record_against_module(
             resolve_value_source_against_sink(
                 &record.authored,
                 value,
-                declared_type.as_ref(),
+                declared_type.as_deref(),
                 RefSink::TypeExpr(&expected),
                 context,
             )
@@ -962,14 +993,10 @@ pub fn check_bare_binding_uses<E>(
 ) -> BindingUseReport {
     let mut report = BindingUseReport {
         findings: Vec::new(),
-        consumed_uses: 0,
-        total_uses: file.parsed_binding_uses.records().len(),
-        pending_slots: file.parsed_binding_uses.pending_slots().to_vec(),
     };
 
-    for record in file.parsed_binding_uses.records() {
-        report.consumed_uses += 1;
-        let result = match &record.authored.owner {
+    for record in file.bare_binding_uses().records() {
+        let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
                 match resource_sink(file, address, &record.authored.path, context.schemas) {
                     Some(sink) => match &record.source {
@@ -979,7 +1006,7 @@ pub fn check_bare_binding_uses<E>(
                         } => resolve_value_source_against_sink(
                             &record.authored,
                             value,
-                            declared_type.as_ref(),
+                            declared_type.as_deref(),
                             sink,
                             context,
                         ),
@@ -1015,6 +1042,22 @@ pub fn check_bare_binding_uses<E>(
             }
         };
 
+        // A pending slot means the parser deliberately omitted the owning
+        // runtime value because this structural leaf cannot be represented in
+        // `Value`. Even when its declared nested type is a matching `Ref`, the
+        // authored handle therefore needs the normal bare-handle diagnostic;
+        // no pending slot can survive as an internal-only fallback.
+        if result.is_ok()
+            && file
+                .bare_binding_uses()
+                .has_pending_slot_for(&record.authored)
+            && let crate::parser::BareBindingSource::Structural(handle) = &record.source
+        {
+            result = Err(BindingResolutionError::Existing(
+                handle.bare_error().to_string(),
+            ));
+        }
+
         if let Err(error) = result {
             let finding = BindingUseFinding {
                 use_site: record.authored.clone(),
@@ -1035,12 +1078,11 @@ pub fn check_bare_binding_uses<E>(
 
 /// Consume the exact file checked by the bare-binding authority.
 ///
-/// Success removes the parser-only provenance and pending-slot channel before
-/// returning [`ResolvedFile`], so no later caller can pair an unrelated file
-/// with a detached proof. On failure the report contains every authored
-/// finding and any unconsumed pending slot.
+/// Success wraps the exact checked file without exposing a mutable provenance
+/// channel, so no later caller can pair an unrelated file with a detached
+/// proof. On failure the report contains every authored finding.
 pub fn resolve_bare_binding_uses<E>(
-    mut file: crate::parser::File<E>,
+    file: crate::parser::File<E>,
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
@@ -1054,7 +1096,6 @@ pub fn resolve_bare_binding_uses<E>(
         return Err(report);
     }
 
-    file.parsed_binding_uses = Default::default();
     Ok(ResolvedFile { inner: file })
 }
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {

@@ -817,17 +817,7 @@ fn resolve_config_pair_with_context(
 }
 
 fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
-    let mut errors = report
-        .findings()
-        .iter()
-        .map(|finding| AppError::Validation(finding.error.to_string()))
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
-        errors.push(AppError::Validation(
-            "bare binding validation left an unconsumed pending value slot".to_string(),
-        ));
-    }
-    crate::commands::collapse_errors(errors)
+    AppError::BindingUseReport(Box::new(report))
 }
 
 fn resolve_file_binding_uses<E>(
@@ -7305,10 +7295,8 @@ pub(crate) fn prepare_data_sources_for_plan(
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ParsedFile;
     let ctx = WiringContext::new_for_test(vec![], &[]);
-    let parsed = ParsedFile {
-        resources: resources.to_vec(),
-        ..ParsedFile::default()
-    };
+    let mut parsed = ParsedFile::default();
+    parsed.resources = resources.to_vec();
     errors_to_legacy_result(validate_resources_with_ctx(
         &ctx,
         &parsed,
@@ -7319,10 +7307,8 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx = WiringContext::new_for_test(vec![], &[]);
-    let mut parsed = carina_core::parser::ParsedFile {
-        resources: resources.to_vec(),
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::ParsedFile::default();
+    parsed.resources = resources.to_vec();
     let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
     resources.clone_from_slice(&parsed.resources);
     errors_to_legacy_result(errors)

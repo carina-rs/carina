@@ -125,10 +125,6 @@ fn cli_diagnostics_at(
     )
 }
 
-fn cli_message_set(diagnostics: &[String]) -> BTreeSet<String> {
-    diagnostics.iter().cloned().collect()
-}
-
 fn lsp_message_set(diagnostics: &[tower_lsp::lsp_types::Diagnostic]) -> BTreeSet<String> {
     diagnostics
         .iter()
@@ -236,8 +232,10 @@ inner {
     let mismatches = diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic
-                .contains("cannot assign Int to 'name': expected String, got Int (from count)")
+            diagnostic.contains(
+                "Type mismatch: expected String, got Int (from (unresolved module argument: count))",
+            ) && diagnostic.contains("main.crn")
+                && diagnostic.contains("line 4")
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -393,7 +391,11 @@ inner { x = a }
     );
     let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
     assert!(
-        cli_messages_contain(&module_cli, expected),
+        module_cli.iter().any(|message| {
+            message.contains("Type mismatch: expected Int, got mock.test.resource (from a)")
+                && message.contains("main.crn")
+                && message.contains("line 3")
+        }),
         "validating the module directory must reject Ref -> Int forwarding: {module_cli:#?}"
     );
     let outer_path = outer.join("main.crn");
@@ -1102,6 +1104,20 @@ fn enum_shadow_schemas() -> SchemaRegistry {
     schemas
 }
 
+fn bare_enum_shadow_schemas() -> SchemaRegistry {
+    let mode = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Mode"),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    single_schema_map(
+        ResourceSchema::new("r.mode_holder")
+            .attribute(AttributeSchema::optional("mode", mode).build()),
+    )
+}
+
 const ENUM_SHADOW_MESSAGE: &str = "`viewer_request` was interpreted as the `let` binding; if you meant the enum `EventType` value, write `awscc.cloudfront.Distribution.EventType.viewer_request`";
 
 fn enum_shadow_fixture(use_site: &str) -> TempDir {
@@ -1334,6 +1350,81 @@ fn enum_member_shadowed_by_resource_binding_reports_cli_lsp_parity_and_quick_fix
 }
 
 #[test]
+fn namespace_less_enum_shadow_keeps_the_mismatch_without_a_noop_quick_fix() {
+    let schemas = bare_enum_shadow_schemas();
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"let fast = 42
+test.r.mode_holder {
+  mode = fast
+}
+"#,
+    )]);
+
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let mismatch = "Type mismatch: expected Mode, got Int";
+    assert!(
+        cli.iter().any(|message| message.contains(mismatch)),
+        "CLI must keep the ordinary mismatch when no distinct enum spelling exists: {cli:#?}",
+    );
+    let diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == mismatch)
+        .unwrap_or_else(|| panic!("LSP must keep the ordinary mismatch: {lsp:#?}"));
+    assert!(
+        cli.iter().all(|message| !message.contains("write `fast`"))
+            && lsp
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("write `fast`")),
+        "a namespace-less enum must not suggest replacing a token with itself; CLI={cli:#?}; LSP={lsp:#?}",
+    );
+
+    let uri = tower_lsp::lsp_types::Url::from_file_path(fixture.path().join("main.crn"))
+        .expect("fixture URI");
+    assert!(
+        carina_lsp::code_action::code_actions_for_diagnostic(&uri, diagnostic).is_empty(),
+        "the ordinary mismatch must not carry an enum quick fix",
+    );
+}
+
+#[test]
+fn pending_nested_resource_handle_reports_the_authored_use_instead_of_internal_jargon() {
+    let schemas = enum_shadow_schemas();
+    let fixture = tempfile::tempdir().expect("nested resource-handle fixture");
+    let module = fixture.path().join("module");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let source = awscc.test.Source { name = "source" }
+let imported = use { source = "./module" }
+imported { sources = [source] }
+"#,
+    )
+    .expect("write caller fixture");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { sources: list(awscc.test.Source) }\n",
+    )
+    .expect("write module signature");
+
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        cli.iter().any(|message| {
+            message.contains("'source' is a resource, not a value")
+                && message.contains("main.crn")
+                && message.contains("line 3")
+        }),
+        "the unrepresentable nested handle must point to the authored token: {cli:#?}",
+    );
+    assert!(
+        cli.iter()
+            .all(|message| !message.contains("unconsumed pending value slot")),
+        "internal pending-slot terminology must not reach users: {cli:#?}",
+    );
+}
+
+#[test]
 fn issue_2978_canonical_api_spelling_has_cli_lsp_parity_and_identity_derived_fix() {
     let schemas = enum_shadow_schemas();
     let fixture = write_fixture(&[(
@@ -1543,10 +1634,12 @@ inner {
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
     let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
-    assert_eq!(
-        cli_message_set(&cli),
-        expected,
-        "CLI must emit only the shared binding-use finding: {cli:#?}",
+    assert!(
+        matches!(cli.as_slice(), [message]
+            if message.contains(ENUM_SHADOW_MESSAGE)
+                && message.contains("main.crn")
+                && message.contains("line 4")),
+        "CLI must emit only the located shared binding-use finding: {cli:#?}",
     );
     assert_eq!(
         lsp_message_set(&lsp),
@@ -1624,10 +1717,12 @@ inner {
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
     let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
-    assert_eq!(
-        cli_message_set(&cli),
-        expected,
-        "the CLI authority must replace its legacy argument diagnostic: {cli:#?}",
+    assert!(
+        matches!(cli.as_slice(), [message]
+            if message.contains(ENUM_SHADOW_MESSAGE)
+                && message.contains("main.crn")
+                && message.contains("line 4")),
+        "the CLI authority must replace its legacy argument diagnostic with one located finding: {cli:#?}",
     );
     assert_eq!(
         lsp_message_set(&lsp),
@@ -1658,15 +1753,12 @@ inner { count = count }
         &fixture,
         "main.crn",
     );
-    assert_eq!(
-        cli_message_set(&cli),
-        lsp_message_set(&lsp),
-        "the binding-use authority must suppress the CLI-only legacy duplicate; CLI={cli:#?}; LSP={lsp:#?}",
-    );
-    assert_eq!(
-        cli.len(),
-        1,
-        "one authored mismatch must yield one diagnostic"
+    assert!(
+        matches!((cli.as_slice(), lsp.as_slice()), ([cli_message], [lsp_diagnostic])
+            if cli_message.contains(&lsp_diagnostic.message)
+                && cli_message.contains("main.crn")
+                && cli_message.contains("line 3")),
+        "one authored mismatch must yield the same message with a CLI source location; CLI={cli:#?}; LSP={lsp:#?}",
     );
 }
 
