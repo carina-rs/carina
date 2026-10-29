@@ -2,8 +2,12 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+mod user_dirs;
 mod value_description;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub use user_dirs::TestUserDirs;
+pub use user_dirs::{UserDirs, UserDirsError};
 pub use value_description::ValueDescription;
 
 pub mod binding_index;
@@ -34,6 +38,7 @@ pub mod override_aware;
 pub mod parser;
 pub mod plan;
 pub mod plan_tree;
+pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
 pub mod resolver;

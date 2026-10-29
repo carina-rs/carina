@@ -24,6 +24,8 @@ fn share_provider_attrs_resolves_default_tags() {
     .collect();
 
     let mut config = load_configuration(&fixture).expect("load_configuration");
+    let user_root = tempfile::tempdir().expect("create isolated user directory");
+    let user_dirs = carina_core::UserDirs::under(user_root.path());
 
     // Run the CLI's full validate-and-resolve pipeline so module
     // expansion + finalize happen. `skip_resource_validation = true`
@@ -31,6 +33,7 @@ fn share_provider_attrs_resolves_default_tags() {
     // available in the test environment, but we only need pipeline
     // semantics here.
     carina_cli::commands::validate_and_resolve_with_config(
+        &user_dirs,
         &mut config.parsed,
         &fixture,
         true,

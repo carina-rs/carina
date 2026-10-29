@@ -3137,6 +3137,7 @@ async fn drift_detection_test_barrier() {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     out: Option<&Path>,
     image: Option<&ResolvedPlanImageTarget>,
@@ -3165,6 +3166,7 @@ pub async fn run_plan(
 
     let base_dir = get_base_dir(path);
     let mut canonical_resources = crate::commands::validate_and_resolve_config_pair(
+        user_dirs,
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -3310,6 +3312,7 @@ pub async fn run_plan(
             },
         provider_inputs,
     } = prepare_plan_identity_and_provider_inputs(
+        user_dirs,
         &mut canonical_resources,
         &mut state_file,
         base_dir,
@@ -3616,6 +3619,7 @@ pub(crate) struct PreparedPlanIdentityData {
 }
 
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
+    user_dirs: &carina_core::UserDirs,
     canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
     state_file: &mut Option<StateFile>,
     base_dir: &Path,
@@ -3625,7 +3629,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     // Factory/schema wiring uses declaration metadata only. Provider values
     // are folded after identities are reconciled against state.
     let parsed = canonical_resources.parsed();
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, _) = build_factories_from_providers(user_dirs, &parsed.providers, base_dir)?;
     let wiring = WiringContext::new(factories, &parsed.providers);
     let PreparedPlanIdentityData {
         state_blocks,
@@ -4957,6 +4961,7 @@ mod run_plan_upstream_state_tests {
 
     #[tokio::test]
     async fn run_plan_resolves_upstream_state_exports() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join("a");
         let dir_b = tmp.path().join("b");
@@ -4990,6 +4995,7 @@ exports { region: String = "ap-northeast-1" }"#,
         crate::commands::ensure_backend_lock(&dir_b, None).unwrap();
 
         let has_changes = run_plan(
+            &user_dirs,
             &dir_b,
             None,
             None,
@@ -5063,6 +5069,7 @@ exports { region: String = "ap-northeast-1" }"#,
 
     #[tokio::test]
     async fn run_plan_allows_missing_upstream_referenced_only_by_default_tags() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         let missing = tmp.path().join("missing");
@@ -5085,6 +5092,7 @@ exports { region: String = "ap-northeast-1" }"#,
         crate::commands::ensure_backend_lock(&project, None).unwrap();
 
         run_plan(
+            &user_dirs,
             &project,
             None,
             None,
@@ -5280,6 +5288,7 @@ mod run_plan_out_tests {
 
     #[tokio::test]
     async fn provider_attributes_observe_reconciled_prefixed_resource_names() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -5313,6 +5322,7 @@ mod run_plan_out_tests {
 
         let plan_path = dir.join("plan.json");
         run_plan(
+            &user_dirs,
             dir,
             Some(&plan_path),
             None,
@@ -5344,6 +5354,7 @@ mod run_plan_out_tests {
     // carina.state.json, and carina-providers.lock (#2583).
     #[tokio::test]
     async fn run_plan_out_file_ends_with_trailing_newline() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -5356,6 +5367,7 @@ mod run_plan_out_tests {
 
         let plan_path = dir.join("plan.json");
         run_plan(
+            &user_dirs,
             dir,
             Some(&plan_path),
             None,
@@ -5382,6 +5394,7 @@ mod run_plan_out_tests {
 
     #[tokio::test]
     async fn run_plan_does_not_write_image_when_out_file_fails() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -5395,6 +5408,7 @@ mod run_plan_out_tests {
         let image = resolved_image_target(image_path.clone(), ImageTheme::Light);
         let missing_parent_out = dir.join("missing/plan.json");
         let result = run_plan(
+            &user_dirs,
             dir,
             Some(&missing_parent_out),
             Some(&image),

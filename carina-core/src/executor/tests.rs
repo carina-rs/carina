@@ -980,7 +980,7 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
                     enum_identity("Mode", Some("test")),
                     Some(vec!["AES256".to_string(), "aws:kms".to_string()]),
                     Vec::new(),
-                    None,
+                    Some(crate::schema::legacy_validator(|_| Ok(()))),
                     None,
                 ),
             )

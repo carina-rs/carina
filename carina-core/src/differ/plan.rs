@@ -415,7 +415,7 @@ fn create_plan_parts(
                 &resource.id.resource_type,
                 SchemaKind::Resource,
             )
-            .map(|schema| schema.as_schema());
+            .map(|schema| schema.schema().as_schema());
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
             Current::CreateInFlight(pending) => {
@@ -618,7 +618,7 @@ fn create_plan_parts(
         let until = match resolve_wait_predicate(
             &wb.until_predicate.lhs_segments,
             wb.until_predicate.rhs.clone(),
-            schema,
+            schema.as_deref(),
         ) {
             Ok(until) => until,
             Err(error) => {

@@ -20,16 +20,13 @@ use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
-use crate::provider::{
-    CanonicalCustomTypeValue, CreateRequest, ProviderError, ProviderFactory, ProviderNormalizer,
-    ProviderResult, UpdateRequest,
-};
+use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
     ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
     ResourceId, SavedComposition, Value,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, TypeError, TypeIdentity};
+use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
 
 /// An immutable value that passed the provider-boundary constraint gate.
@@ -136,13 +133,13 @@ impl ProviderReadyConfig {
 /// Keeping these values together gives create, update, and data-source
 /// preparation one coherent execution snapshot, rather than letting each
 /// downstream helper accept independently supplied views.
-#[derive(Clone, Copy)]
 pub struct ProviderPreparationContext<'a> {
     bindings: &'a ResolvedBindings,
     module_gate: &'a ModuleConstraintGate,
     provider_configs: &'a [ProviderConfig],
     normalizer: &'a dyn ProviderNormalizer,
-    factories: &'a [Box<dyn ProviderFactory>],
+    custom_type_resolver:
+        crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
     schemas: &'a SchemaRegistry,
 }
 
@@ -155,12 +152,13 @@ impl<'a> ProviderPreparationContext<'a> {
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
     ) -> Self {
+        let custom_type_resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
         Self {
             bindings,
             module_gate,
             provider_configs,
             normalizer,
-            factories,
+            custom_type_resolver,
             schemas,
         }
     }
@@ -171,6 +169,10 @@ impl<'a> ProviderPreparationContext<'a> {
 
     pub(super) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
+    }
+
+    fn custom_type_resolver(&self) -> &dyn crate::parser::CustomTypeResolver {
+        &self.custom_type_resolver
     }
 }
 
@@ -441,7 +443,7 @@ pub enum ProviderConfigPreparationError {
     InvalidAttribute {
         provider: String,
         attribute: String,
-        error: Box<TypeError>,
+        error: ProviderValueConstraintErrors,
     },
     /// The provider rejected cross-attribute or provider-specific semantics.
     #[error("provider {provider}: {error}")]
@@ -484,7 +486,7 @@ fn canonicalize_provider_config_attributes(
         ProviderConfigPreparationError::InvalidAttribute {
             provider,
             attribute,
-            error: Box::new(error),
+            error: vec![error].into(),
         }
     })?;
     Ok(CanonicalProviderConfigAttributes { attributes })
@@ -507,7 +509,12 @@ pub fn validate_and_canonicalize_provider_config(
     let config_schema = factory.provider_config_attribute_types();
     let canonical =
         canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
-    validate_provider_config_attributes(provider_name, canonical.attributes(), &config_schema)?;
+    validate_provider_config_attributes(
+        factory,
+        provider_name,
+        canonical.attributes(),
+        &config_schema,
+    )?;
 
     let serializable = canonical
         .attributes
@@ -573,19 +580,21 @@ pub fn prepare_provider_ready_config(
 /// are intentionally allowed there. Provider construction calls it only after
 /// proving the complete map resolved.
 fn validate_provider_config_attributes(
+    factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
+    let lookup = crate::parser::custom_type_lookup_for_factory(factory);
     for (attribute, value) in attributes {
-        if let Some(attr_type) = attr_types.effective_type(attribute) {
-            attr_type.validate(value).map_err(|error| {
-                ProviderConfigPreparationError::InvalidAttribute {
+        if let Some(attr_type) = attr_types.rootless_type(attribute) {
+            attr_type
+                .validate_with_lookup(value, &lookup)
+                .map_err(|errors| ProviderConfigPreparationError::InvalidAttribute {
                     provider: provider_name.to_string(),
                     attribute: attribute.clone(),
-                    error: Box::new(error),
-                }
-            })?;
+                    error: errors.into(),
+                })?;
         }
     }
     Ok(())
@@ -683,7 +692,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
                 schema,
                 &resource.resolved_attributes(),
                 &resource.quoted_string_attrs,
-                context.factories,
+                context.custom_type_resolver(),
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
                 validate_selected_provider_values(
@@ -692,7 +701,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
                     &attributes,
                     &names,
                     &resource.quoted_string_attrs,
-                    context.factories,
+                    context.custom_type_resolver(),
                 )?;
             }
         }
@@ -753,7 +762,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
                 schema,
                 &crate::resource::attrs_to_hashmap(&resource.attributes),
                 &resource.quoted_string_attrs,
-                context.factories,
+                context.custom_type_resolver(),
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
                 validate_selected_provider_values(
@@ -762,7 +771,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
                     &attributes,
                     &names,
                     &resource.quoted_string_attrs,
-                    context.factories,
+                    context.custom_type_resolver(),
                 )?;
             }
         }
@@ -798,7 +807,7 @@ pub(super) fn managed_update_schema<'a, S>(
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)
-        .map(|schema| schema.as_schema())
+        .map(|schema| schema.schema().as_schema())
         .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
             resource: resource.id.clone(),
         })
@@ -821,59 +830,16 @@ pub async fn prepare_update_request(
     ))
 }
 
-/// Build a custom-type lookup that retains typed provider failures for callers
-/// with retry or diagnostic policy.
-pub fn provider_custom_type_lookup(
-    factories: &[Box<dyn ProviderFactory>],
-) -> impl Fn(&TypeIdentity, &Value) -> ProviderResult<()> + Send + Sync + '_ {
-    move |identity, value| {
-        let canonical = match value {
-            Value::Concrete(ConcreteValue::String(text)) => {
-                CanonicalCustomTypeValue::from_literal_string(text)
-            }
-            Value::Concrete(ConcreteValue::CanonicalEnum(value))
-                if value.identity().same_type(identity) =>
-            {
-                CanonicalCustomTypeValue::from_canonical_enum(value)
-            }
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                return Err(ProviderError::invalid_input(format!(
-                    "unresolved enum identifier `{raw}` reached provider custom-type validation"
-                )));
-            }
-            _ => return Ok(()),
-        };
-        for factory in factories {
-            factory
-                .validate_custom_type(identity, &canonical)
-                .map_err(|error| {
-                    if error.detail().provider_name.is_some() {
-                        error
-                    } else {
-                        error.for_provider(factory.name())
-                    }
-                })?;
-        }
-        Ok(())
-    }
-}
-
 fn validate_known_provider_values(
     id: &ResourceId,
-    schema: &crate::schema::ValidatedResourceSchema,
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &HashMap<String, Value>,
     quoted_string_attrs: &HashSet<String>,
-    factories: &[Box<dyn ProviderFactory>],
+    resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<(), ProviderPreparationError> {
-    let provider_lookup = provider_custom_type_lookup(factories);
-    let lookup = |identity: &TypeIdentity, value: &Value| {
-        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
-            message: error.to_string(),
-        })
-    };
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
     schema
-        .validate_known_values_with_origins_and_lookup(attributes, &is_string_literal, &lookup)
+        .validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
             resource: id.clone(),
             errors: errors.into(),
@@ -882,25 +848,19 @@ fn validate_known_provider_values(
 
 fn validate_selected_provider_values(
     id: &ResourceId,
-    schema: &crate::schema::ValidatedResourceSchema,
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &HashMap<String, Value>,
     selected: &HashSet<String>,
     quoted_string_attrs: &HashSet<String>,
-    factories: &[Box<dyn ProviderFactory>],
+    resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<(), ProviderPreparationError> {
-    let provider_lookup = provider_custom_type_lookup(factories);
-    let lookup = |identity: &TypeIdentity, value: &Value| {
-        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
-            message: error.to_string(),
-        })
-    };
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
     schema
-        .validate_selected_known_values_with_origins_and_lookup(
+        .validate_selected_known_values_with_resolver(
             attributes,
             selected,
             &is_string_literal,
-            &lookup,
+            resolver,
         )
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
             resource: id.clone(),
@@ -933,15 +893,16 @@ fn unwrap_secret(value: Value) -> Value {
 mod provider_config_tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use futures::future::BoxFuture;
     use indexmap::IndexMap;
 
     use super::*;
     use crate::parser::ResolvedProviderConfigs;
-    use crate::provider::{Provider, ProviderResult};
+    use crate::provider::{Provider, ProviderError, ProviderResult};
     use crate::resource::ConcreteValue;
-    use crate::schema::AttributeType;
+    use crate::schema::{AttributeType, RootlessType, TypeIdentity, legacy_validator};
 
     #[tokio::test]
     async fn prepare_update_request_rejects_a_missing_managed_schema() {
@@ -1043,6 +1004,823 @@ mod provider_config_tests {
     enum ConfigFailure {
         Invalid(&'static str),
         Timeout(&'static str),
+    }
+
+    struct RoutingFactory {
+        name: &'static str,
+        declaration: AttributeType,
+        sibling_declaration: Option<AttributeType>,
+        accepted: Option<&'static str>,
+        validate_calls: Arc<AtomicUsize>,
+        seen_values: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl ProviderFactory for RoutingFactory {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn display_name(&self) -> &str {
+            self.name
+        }
+
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            crate::schema::ValidatedConfigSchema::default()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn validate_custom_type(
+            &self,
+            _identity: &TypeIdentity,
+            value: &crate::provider::CanonicalCustomTypeValue,
+        ) -> ProviderResult<()> {
+            self.validate_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(seen_values) = &self.seen_values {
+                seen_values.lock().unwrap().push(value.to_string());
+            }
+            match self.accepted {
+                Some(expected) if value.as_str() != expected => {
+                    Err(ProviderError::invalid_input(format!(
+                        "{} accepts `{expected}`, not `{}`",
+                        self.name,
+                        value.as_str()
+                    )))
+                }
+                Some(_) | None => Ok(()),
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("routing tests do not create providers")
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+            let mut schema = ResourceSchema::new(format!("test.{}", self.name)).attribute(
+                crate::schema::AttributeSchema::optional("value", self.declaration.clone()).build(),
+            );
+            if let Some(sibling) = &self.sibling_declaration {
+                schema = schema.attribute(
+                    crate::schema::AttributeSchema::optional("sibling", sibling.clone()).build(),
+                );
+            }
+            vec![
+                schema
+                    .validate()
+                    .expect("routing test schema must validate"),
+            ]
+        }
+    }
+
+    fn test_schema_path_resolver(
+        factories: &[Box<dyn ProviderFactory>],
+    ) -> impl crate::parser::CustomTypeResolver + '_ {
+        crate::provider::FactoryCustomTypeResolver::new(factories)
+    }
+
+    fn test_schema_registry(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
+        let mut registry = SchemaRegistry::new();
+        for factory in factories {
+            for schema in factory.schemas() {
+                registry.insert(factory.name(), schema);
+            }
+        }
+        registry
+    }
+
+    fn test_lookup_for_owner<'a>(
+        resolver: &'a dyn crate::parser::CustomTypeResolver,
+        registry: &'a SchemaRegistry,
+        owner: &str,
+    ) -> impl Fn(&AttributeType, &Value) -> Result<(), TypeError> + use<'a> {
+        let resource_type = format!("test.{owner}");
+        let schema = registry
+            .get(owner, &resource_type, crate::schema::SchemaKind::Resource)
+            .expect("routing fixture schema must be registered under its owner");
+        crate::parser::custom_type_lookup_for_schema(resolver, schema)
+    }
+
+    fn test_custom_type_validator(
+        factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> crate::parser::CustomTypeValidatorFn {
+        let resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
+        Box::new(move |target, value| {
+            crate::parser::CustomTypeResolver::validate(&resolver, target, value)
+        })
+    }
+
+    #[test]
+    fn same_identity_routes_each_value_to_its_owning_factory() {
+        let owner_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(Some(identity), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(RoutingFactory {
+                name: "owner",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: Some("owner-value"),
+                validate_calls: Arc::clone(&owner_calls),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "other",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: Some("other-value"),
+                validate_calls: Arc::clone(&other_calls),
+                seen_values: None,
+            }),
+        ];
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        let owner_lookup = test_lookup_for_owner(&resolver, &registry, "owner");
+        let other_lookup = test_lookup_for_owner(&resolver, &registry, "other");
+
+        owner_lookup(
+            &declaration,
+            &Value::Concrete(ConcreteValue::String("owner-value".into())),
+        )
+        .expect("the owner must apply its own verdict");
+        assert!(
+            owner_lookup(
+                &declaration,
+                &Value::Concrete(ConcreteValue::String("other-value".into())),
+            )
+            .is_err(),
+            "the owner's verdict must not be replaced by the colliding factory"
+        );
+        other_lookup(
+            &declaration,
+            &Value::Concrete(ConcreteValue::String("other-value".into())),
+        )
+        .expect("the other factory must apply its own verdict");
+        assert!(
+            other_lookup(
+                &declaration,
+                &Value::Concrete(ConcreteValue::String("owner-value".into())),
+            )
+            .is_err(),
+            "the other factory's verdict must stay owner-qualified"
+        );
+
+        assert_eq!(owner_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn resource_lookup_rejects_an_unknown_schema_owner() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+        let resolver = test_schema_path_resolver(&factories);
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "missing",
+            ResourceSchema::new("test.missing")
+                .attribute(
+                    crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
+                )
+                .validate()
+                .expect("missing-owner fixture schema must validate"),
+        );
+        let lookup = test_lookup_for_owner(&resolver, &registry, "missing");
+
+        let error = lookup(
+            &declaration,
+            &Value::Concrete(ConcreteValue::String("value".into())),
+        )
+        .expect_err("an owner absent from the factory index must not disable validation");
+
+        let TypeError::CustomTypeValidation {
+            error,
+            attribute: None,
+        } = error
+        else {
+            panic!("expected typed custom-type validation error");
+        };
+        assert!(matches!(
+            error.as_ref(),
+            crate::parser::CustomTypeValidationError::MissingDeclaration { owner, identity: actual }
+                if owner == "missing" && actual == &identity
+        ));
+    }
+
+    #[test]
+    fn unloaded_provider_context_never_approves_an_identified_declaration() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let context = crate::parser::ProviderContext::default();
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "missing",
+            ResourceSchema::new("test.missing")
+                .attribute(
+                    crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
+                )
+                .validate()
+                .expect("unloaded-owner fixture schema must validate"),
+        );
+        let lookup = test_lookup_for_owner(context.custom_type_resolver(), &registry, "missing");
+
+        let error = lookup(
+            &declaration,
+            &Value::Concrete(ConcreteValue::String("value".into())),
+        )
+        .expect_err("an unloaded context must not turn a custom declaration into success");
+
+        assert!(matches!(
+            error,
+            TypeError::CustomTypeValidation { error, attribute: None }
+                if matches!(error.as_ref(),
+                    crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+        ));
+    }
+
+    #[test]
+    fn shared_factory_resolver_rejects_an_unknown_schema_owner() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let declaration = crate::parser::IdentifiedCustomTypeDeclaration::new(&declaration)
+            .expect("fixture declaration is identified");
+        let factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+        let validator = crate::provider::FactoryCustomTypeResolver::new(factories.as_slice());
+
+        let error = crate::parser::CustomTypeResolver::validate(
+            &validator,
+            crate::parser::CustomTypeValidationTarget::Declaration {
+                owner: "missing",
+                declaration,
+            },
+            &Value::Concrete(ConcreteValue::String("value".into())),
+        )
+        .expect_err("an owner absent from the shared index must not disable validation");
+
+        assert!(matches!(
+            error,
+            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                owner,
+                identity: actual,
+            } if owner == "missing" && actual == identity
+        ));
+    }
+
+    #[test]
+    fn multi_owner_annotation_requires_every_owner_to_accept() {
+        use crate::parser::{NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner};
+
+        let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> = std::sync::Arc::new(vec![
+            Box::new(RoutingFactory {
+                name: "aws",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: Some("arn:accepted"),
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "awscc",
+                declaration,
+                sibling_declaration: None,
+                accepted: Some("arn:other"),
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            }),
+        ]);
+        let validator = test_custom_type_validator(factories);
+        let owned = OwnedTypeIdentity::with_owners(
+            identity,
+            NonEmptySchemaTypeOwners::try_from_iter([
+                SchemaTypeOwner::Provider("aws".to_string()),
+                SchemaTypeOwner::Provider("awscc".to_string()),
+            ])
+            .expect("two owners are non-empty"),
+        );
+        let value = Value::Concrete(ConcreteValue::String("arn:accepted".into()));
+
+        let error = validator(
+            crate::parser::CustomTypeValidationTarget::Annotation(&owned),
+            &value,
+        )
+        .expect_err("one rejecting owner rejects the shared annotation");
+
+        assert!(error.to_string().contains("awscc"), "{error}");
+    }
+
+    #[test]
+    fn multi_owner_enum_definition_disagreement_is_typed() {
+        use crate::parser::{
+            CustomTypeValidationError, NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner,
+        };
+
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
+        let first = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["COMMON".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let second = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["COMMON".to_string(), "OTHER".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> = std::sync::Arc::new(vec![
+            Box::new(RoutingFactory {
+                name: "one",
+                declaration: first,
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "two",
+                declaration: second,
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            }),
+        ]);
+        let validator = test_custom_type_validator(factories);
+        let owned = OwnedTypeIdentity::with_owners(
+            identity.clone(),
+            NonEmptySchemaTypeOwners::try_from_iter([
+                SchemaTypeOwner::Provider("one".to_string()),
+                SchemaTypeOwner::Provider("two".to_string()),
+            ])
+            .expect("two owners are non-empty"),
+        );
+        let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
+
+        let error = validator(
+            crate::parser::CustomTypeValidationTarget::Annotation(&owned),
+            &value,
+        )
+        .expect_err("owners with different enum sets must not be first-matched");
+
+        assert!(
+            matches!(
+                &error,
+                CustomTypeValidationError::ConflictingEnumDefinitions {
+                    identity: actual,
+                    first_owner,
+                    second_owner,
+                } if actual == &identity && first_owner == "one" && second_owner == "two"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_enum_declarations_do_not_report_an_owner_conflict_with_itself() {
+        use crate::parser::{CustomTypeValidationTarget, OwnedTypeIdentity};
+
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
+        let first = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["COMMON".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let sibling = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["COMMON".to_string(), "OTHER".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(RoutingFactory {
+                name: "owner",
+                declaration: first,
+                sibling_declaration: Some(sibling),
+                accepted: None,
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            })]);
+        let validator = test_custom_type_validator(factories);
+        let owned = OwnedTypeIdentity::provider("owner", identity);
+        let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
+
+        validator(CustomTypeValidationTarget::Annotation(&owned), &value)
+            .expect("sibling declarations belong to one owner, not two conflicting owners");
+    }
+
+    #[test]
+    fn declaration_local_schema_failure_remains_typed() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(
+            Some(identity.clone()),
+            Some("^accepted$".to_string()),
+            None,
+            None,
+        );
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(RoutingFactory {
+                name: "owner",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::new(AtomicUsize::new(0)),
+                seen_values: None,
+            })]);
+        let validator = test_custom_type_validator(factories);
+        let declaration = crate::parser::IdentifiedCustomTypeDeclaration::new(&declaration)
+            .expect("fixture declaration is identified");
+
+        let error = validator(
+            crate::parser::CustomTypeValidationTarget::Declaration {
+                owner: "owner",
+                declaration,
+            },
+            &Value::Concrete(ConcreteValue::String("rejected".into())),
+        )
+        .expect_err("the declaration pattern must reject the value");
+
+        assert!(matches!(
+            error,
+            crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                owner,
+                identity: actual,
+                error,
+            } if owner == "owner"
+                && actual == identity
+                && matches!(error.as_ref(), TypeError::PatternMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_lookup_validates_only_the_exact_declared_type() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let own_declaration = AttributeType::refined_string(
+            Some(identity.clone()),
+            Some("^own$".to_string()),
+            None,
+            None,
+        );
+        let sibling_declaration = AttributeType::refined_string(
+            Some(identity),
+            Some("^sibling$".to_string()),
+            None,
+            None,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
+            name: "owner",
+            declaration: own_declaration.clone(),
+            sibling_declaration: Some(sibling_declaration),
+            accepted: None,
+            validate_calls: Arc::clone(&calls),
+            seen_values: None,
+        })];
+
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        test_lookup_for_owner(&resolver, &registry, "owner")(
+            &own_declaration,
+            &Value::Concrete(ConcreteValue::String("own".into())),
+        )
+        .expect("a sibling declaration with the same identity must not constrain this attribute");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn same_identity_enum_spelling_resolves_in_the_owning_schema() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
+        let owner_type = AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["OWNER_API".to_string()]),
+            vec![("OWNER_API".to_string(), "owner".to_string())],
+            None,
+            None,
+        );
+        let other_type = AttributeType::enum_(
+            identity,
+            Some(vec!["OTHER_API".to_string()]),
+            vec![("OTHER_API".to_string(), "other".to_string())],
+            None,
+            None,
+        );
+        let owner_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(RoutingFactory {
+                name: "owner",
+                declaration: owner_type.clone(),
+                sibling_declaration: None,
+                accepted: Some("OWNER_API"),
+                validate_calls: Arc::clone(&owner_calls),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "other",
+                declaration: other_type.clone(),
+                sibling_declaration: None,
+                accepted: Some("OTHER_API"),
+                validate_calls: Arc::clone(&other_calls),
+                seen_values: None,
+            }),
+        ];
+
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        test_lookup_for_owner(&resolver, &registry, "owner")(
+            &owner_type,
+            &Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.owner")),
+        )
+        .expect("the owner alias must resolve to the owner's API spelling");
+        test_lookup_for_owner(&resolver, &registry, "other")(
+            &other_type,
+            &Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.other")),
+        )
+        .expect("the other alias must resolve to the other API spelling");
+
+        assert_eq!(owner_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owning_factory_schema_rejects_scalar_shape_mismatch() {
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Count");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = RoutingFactory {
+            name: "owner",
+            declaration: AttributeType::refined_int(Some(identity.clone()), None),
+            sibling_declaration: None,
+            accepted: None,
+            validate_calls: Arc::clone(&calls),
+            seen_values: None,
+        };
+
+        let error = crate::provider::validate_custom_type_with_factory(
+            &factory,
+            crate::parser::IdentifiedCustomTypeDeclaration::new(&factory.declaration)
+                .expect("fixture declaration is identified"),
+            &Value::Concrete(ConcreteValue::String("5".into())),
+        )
+        .expect_err("an Int declaration must not accept bridge-shaped String input");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("expected shared.Count"), "{rendered}");
+        assert!(rendered.contains("got String"), "{rendered}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn executor_lookup_receives_canonical_numeric_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_values = Arc::new(Mutex::new(Vec::new()));
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Number");
+        let declaration = AttributeType::refined_float(Some(identity), None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
+            name: "owner",
+            declaration: declaration.clone(),
+            sibling_declaration: None,
+            accepted: None,
+            validate_calls: Arc::clone(&calls),
+            seen_values: Some(Arc::clone(&seen_values)),
+        })];
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        let lookup = test_lookup_for_owner(&resolver, &registry, "owner");
+
+        for value in [
+            Value::Concrete(ConcreteValue::Int(60)),
+            Value::Concrete(ConcreteValue::Int(-61)),
+            Value::Concrete(ConcreteValue::Float(1.25)),
+        ] {
+            lookup(&declaration, &value).expect("numeric scalar must bridge");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(*seen_values.lock().unwrap(), ["60", "-61", "1.25"]);
+    }
+
+    #[test]
+    fn decoded_refinement_bridge_calls_only_the_owning_factory_once() {
+        let owner_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let declaration = AttributeType::refined_string(Some(identity), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(RoutingFactory {
+                name: "owner",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::clone(&owner_calls),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "other",
+                declaration: declaration.clone(),
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::clone(&other_calls),
+                seen_values: None,
+            }),
+        ];
+        let decoded = crate::protocol_convert::protocol_to_attribute_type(
+            &carina_provider_protocol::types::AttributeType::String {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: Some("shared.Identifier".to_string()),
+            },
+        )
+        .expect("callback-free protocol refinement must decode");
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        let lookup = test_lookup_for_owner(&resolver, &registry, "owner");
+
+        RootlessType::new(decoded)
+            .validate_with_lookup(
+                &Value::Concrete(ConcreteValue::String("value".into())),
+                &lookup,
+            )
+            .expect("the owning bridge validator must accept the value");
+
+        assert_eq!(owner_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_refinement_callback_runs_once_without_factory_fallback() {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let owner_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
+        let calls = Arc::clone(&native_calls);
+        let native_type = AttributeType::refined_string_with_validator(
+            identity.clone(),
+            None,
+            None,
+            legacy_validator(move |_value| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            None,
+        );
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(RoutingFactory {
+                name: "owner",
+                declaration: AttributeType::refined_string(
+                    Some(identity.clone()),
+                    None,
+                    None,
+                    None,
+                ),
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::clone(&owner_calls),
+                seen_values: None,
+            }),
+            Box::new(RoutingFactory {
+                name: "other",
+                declaration: AttributeType::refined_string(Some(identity), None, None, None),
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::clone(&other_calls),
+                seen_values: None,
+            }),
+        ];
+        let registry = test_schema_registry(&factories);
+        let resolver = test_schema_path_resolver(&factories);
+        let lookup = test_lookup_for_owner(&resolver, &registry, "owner");
+
+        RootlessType::new(native_type)
+            .validate_with_lookup(
+                &Value::Concrete(ConcreteValue::String("value".into())),
+                &lookup,
+            )
+            .expect("the native callback must accept the value");
+
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct RefinedConfigFactory {
+        validate_calls: AtomicUsize,
+    }
+
+    impl ProviderFactory for RefinedConfigFactory {
+        fn name(&self) -> &str {
+            "owner"
+        }
+
+        fn display_name(&self) -> &str {
+            "refined config test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+                "endpoint".to_string(),
+                AttributeType::refined_string(
+                    Some(TypeIdentity::new(
+                        Some("shared"),
+                        Vec::<String>::new(),
+                        "Endpoint",
+                    )),
+                    None,
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("test provider config schema must be valid")
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn validate_custom_type(
+            &self,
+            _identity: &TypeIdentity,
+            value: &crate::provider::CanonicalCustomTypeValue,
+        ) -> ProviderResult<()> {
+            self.validate_calls.fetch_add(1, Ordering::SeqCst);
+            if value.as_str() == "valid" {
+                Ok(())
+            } else {
+                Err(ProviderError::invalid_input("invalid endpoint"))
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn decoded_refined_provider_config_calls_its_factory_once() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let attributes = IndexMap::from([(
+            "endpoint".to_string(),
+            Value::Concrete(ConcreteValue::String("valid".into())),
+        )]);
+
+        validate_and_canonicalize_provider_config(&factory, "owner", &attributes)
+            .expect("the owning factory must validate its decoded refined config type");
+
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn provider_config_lookup_routes_through_selected_factory_not_loose_name() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let attributes = IndexMap::from([(
+            "endpoint".to_string(),
+            Value::Concrete(ConcreteValue::String("valid".into())),
+        )]);
+
+        validate_and_canonicalize_provider_config(&factory, "display-alias", &attributes)
+            .expect("the already-selected factory is the provider-config routing authority");
+
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
 
     impl ConfigFactory {

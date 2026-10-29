@@ -1,7 +1,10 @@
-//! Integration tests: load MockProvider .wasm via WasmProviderFactory and perform CRUD.
+//! Integration tests for the general mock and the isolated wasi:http probe guests.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
@@ -30,6 +33,13 @@ fn mock_identity() -> ProviderLoadIdentity {
 
 fn mock_load(bytes: &[u8]) -> VerifiedLoad {
     VerifiedLoad::for_test(bytes, mock_identity())
+}
+
+fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
+    VerifiedLoad::for_test(
+        bytes,
+        ProviderLoadIdentity::for_test("mock_http", ProviderTrustClass::Untrusted),
+    )
 }
 
 fn mock_identifier() -> AppliedIdentifier {
@@ -183,6 +193,20 @@ fn wasm_path() -> Option<PathBuf> {
     None
 }
 
+fn http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http.wasm",
+        "carina-provider-mock-http.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 macro_rules! skip_if_no_wasm {
     () => {
         match wasm_path() {
@@ -198,10 +222,25 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
+macro_rules! skip_if_no_http_wasm {
+    () => {
+        match http_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
 ///
 /// Tests in this binary run in parallel; if they all shared
-/// `WasmProviderFactory::from_bytes()`'s default `~/.carina/cache`, concurrent
+/// `WasmProviderFactory::from_bytes()`'s configured compiled-WASM cache, concurrent
 /// precompile runs race on the same `.cwasm` path and one test can observe
 /// a partially-written file (`"failed to load code for …"`). Each test gets
 /// its own cache dir via this helper to eliminate that race.
@@ -212,6 +251,16 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
         WasmProviderFactory::from_bytes_with_cache_dir(mock_load(&wasm_bytes), cache.path())
             .await
             .expect("Failed to load WASM provider");
+    (factory, cache)
+}
+
+async fn load_http_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(mock_http_load(&wasm_bytes), cache.path())
+            .await
+            .expect("Failed to load HTTP probe WASM provider");
     (factory, cache)
 }
 
@@ -236,14 +285,59 @@ fn resource_with_string_attribute(
     attribute: &str,
     value: &str,
 ) -> Resource {
+    resource_with_provider_string_attribute("mock", resource_type, identity, attribute, value)
+}
+
+fn resource_with_provider_string_attribute(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+    attribute: &str,
+    value: &str,
+) -> Resource {
     let identity = carina_core::resource::ResourceIdentity::try_from(identity.to_string())
         .expect("test identity must be non-empty");
-    let mut resource = Resource::with_provider("mock", resource_type, identity, None);
+    let mut resource = Resource::with_provider(provider, resource_type, identity, None);
     resource.attributes.insert(
         attribute.into(),
         Value::Concrete(ConcreteValue::String(value.to_string().into())),
     );
     resource
+}
+
+fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str) -> Resource {
+    let mut resource = resource_with_provider_string_attribute(
+        "mock_http",
+        "test.send_phase",
+        identity,
+        "url",
+        url,
+    );
+    resource.attributes.insert(
+        "method".to_string(),
+        Value::Concrete(ConcreteValue::String(method.to_string().into())),
+    );
+    resource.attributes.insert(
+        "body".to_string(),
+        Value::Concrete(ConcreteValue::String(body.to_string().into())),
+    );
+    resource
+}
+
+fn http_probe_body() -> String {
+    // Exceed the two-chunk host body buffer so the closed-port case can close
+    // the receiver while the guest is still writing, exercising the
+    // future-error recovery path. The denied-host case fails synchronously in
+    // outgoing_handler::handle instead.
+    "x".repeat(16 * 1024)
+}
+
+fn http_probe_outcome(state: &State) -> &str {
+    let Some(Value::Concrete(ConcreteValue::String(outcome))) = state.attributes.get("send_phase")
+    else {
+        panic!("HTTP probe state must contain a string send_phase attribute");
+    };
+    outcome.expose_plaintext()
 }
 
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
@@ -354,6 +448,282 @@ async fn test_wasm_mock_provider_factory() {
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));
     assert_eq!(short_budget.delete_timeout_secs, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_override() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.sdk_validator",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("mock SDK validator schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    let attributes = HashMap::from([(
+        "guarded".to_string(),
+        Value::Concrete(ConcreteValue::String("rejected".into())),
+    )]);
+
+    let errors = schema
+        .validate_with_resolver(&attributes, &|_| false, &custom_types)
+        .expect_err("the SDK schema callback must reject through the guest bridge");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("intentional SDK schema validator rejection")),
+        "unexpected errors: {errors:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-denied",
+        None,
+    );
+    let resource =
+        http_send_phase_resource("wasi-http-denied", "http://example.invalid/", "POST", &body);
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+
+    assert_eq!(http_probe_outcome(&state), "not_sent:HttpRequestDenied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let reserved_socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        Ok(socket)
+    }) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot reserve a closed loopback port: {error}");
+            return;
+        }
+    };
+    let closed_address = reserved_socket
+        .local_addr()
+        .expect("reserved socket has an address");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", closed_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-connect-failure",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-connect-failure",
+        &format!("http://phase-test.invalid:{}/", closed_address.port()),
+        "POST",
+        &body,
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+    drop(reserved_socket);
+
+    assert!(
+        matches!(
+            http_probe_outcome(&state),
+            "not_sent:ConnectionRefused" | "not_sent:ConnectionTimeout"
+        ),
+        "unexpected closed-port outcome: {}",
+        http_probe_outcome(&state)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-closed",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-closed",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
+    );
+
+    // Component compilation and provider initialization can be slow under
+    // parallel load, so start the accept deadline only once the guest is ready.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = [0_u8; 4096];
+        stream
+            .read(&mut request)
+            .expect("read request bytes before closing")
+    });
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the server must receive request bytes");
+    assert_eq!(http_probe_outcome(&state), "maybe_sent:HttpProtocolError");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-first-byte-timeout",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-first-byte-timeout",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
+    );
+
+    let (release_server, wait_for_release) = std::sync::mpsc::channel();
+    // Start both the accept deadline and the silent-server lifetime only after
+    // component compilation and provider initialization have completed.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = [0_u8; 4096];
+        let bytes_read = stream
+            .read(&mut request)
+            .expect("read request bytes before waiting");
+        assert!(bytes_read > 0, "the server must receive request bytes");
+        wait_for_release
+            .recv_timeout(Duration::from_secs(10))
+            .expect("guest did not finish before the silent-server deadline");
+        bytes_read
+    });
+
+    let outcome = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await;
+    release_server
+        .send(())
+        .expect("silent server should still be waiting");
+    let bytes_read = server.join().expect("loopback server should finish");
+    let state = create_state_for_writeback(
+        outcome.expect("the mock transport probe should report its phase"),
+    );
+
+    assert!(bytes_read > 0, "the server must receive request bytes");
+    assert_eq!(
+        http_probe_outcome(&state),
+        "maybe_sent:ConnectionReadTimeout"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1747,13 +2117,27 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
     carina_core::executor::prepare_provider_ready_config(&factory, &config)
         .expect_err("validate_config should time out before custom-type validation");
 
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
-    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
-    validate(
-        &TypeIdentity::new(Some("mock"), Vec::<String>::new(), "RecoveryProbe"),
-        &Value::Concrete(ConcreteValue::String("clean".into())),
-    )
-    .expect("validate_custom_type should rebuild the timed-out init instance");
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.recovery_probe",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("the recovery probe schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    schema
+        .validate_with_resolver(
+            &HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String("clean".into())),
+            )]),
+            &|_| false,
+            &custom_types,
+        )
+        .expect("validate_custom_type should rebuild the timed-out init instance");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1765,21 +2149,45 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         Duration::from_secs(30),
         Duration::from_secs(2),
     ));
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
-    let validate = carina_core::executor::provider_custom_type_lookup(&factories);
-    let identity = TypeIdentity::new(Some("mock"), Vec::<String>::new(), "TimingProbe");
-    let hanging = Value::Concrete(ConcreteValue::String(
-        "__mock_validate_custom_type_hang__".into(),
-    ));
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    let schema = schemas
+        .get(
+            "mock",
+            "test.timing_probe",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("the timing probe schema must cross the host boundary");
+    let custom_types =
+        carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+    let validate = |value: &str| {
+        schema.validate_with_resolver(
+            &HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String(value.to_string().into())),
+            )]),
+            &|_| false,
+            &custom_types,
+        )
+    };
 
     for attempt in 1..=2 {
         let started = Instant::now();
-        let error = validate(&identity, &hanging)
-            .expect_err("the mock custom-type hook must exceed the wall-clock budget");
+        let error = validate("__mock_validate_custom_type_hang__")
+            .expect_err("the mock custom-type hook must exceed the wall-clock budget")
+            .into_iter()
+            .next()
+            .expect("custom-type validation must return an error");
         let elapsed = started.elapsed();
 
+        let provider_error = match &error {
+            carina_core::schema::TypeError::CustomTypeValidation { error, .. } => error
+                .provider_error()
+                .expect("WASM validation must retain the typed provider error"),
+            other => panic!("expected a custom-type validation error, got {other:?}"),
+        };
         assert_eq!(
-            error.kind(),
+            provider_error.kind(),
             ProviderErrorKind::Timeout,
             "attempt {attempt}: {error}"
         );
@@ -1794,11 +2202,14 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
     }
 
     let suspended_started = Instant::now();
-    let suspended = validate(&identity, &hanging)
-        .expect_err("the repeatedly timed-out custom-type value must be suspended");
+    let suspended = validate("__mock_validate_custom_type_hang__")
+        .expect_err("the repeatedly timed-out custom-type value must be suspended")
+        .into_iter()
+        .next()
+        .expect("suspended validation must return an error");
     let suspended_elapsed = suspended_started.elapsed();
     assert!(matches!(
-        suspended.detail().host_cause(),
+        suspended.host_cause(),
         Some(carina_core::provider::HostErrorCause::ValidationSuspended(
             _
         ))
@@ -1808,11 +2219,7 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         "the suspended value must fail fast; elapsed {suspended_elapsed:?}"
     );
 
-    validate(
-        &identity,
-        &Value::Concrete(ConcreteValue::String("healthy-value".into())),
-    )
-    .expect("a different custom-type value must still validate");
+    validate("healthy-value").expect("a different custom-type value must still validate");
 }
 
 #[tokio::test(flavor = "multi_thread")]

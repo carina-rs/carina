@@ -172,6 +172,7 @@ outer {{}}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("mock-provider.wasm");
     let installed_path = tmp
@@ -195,6 +196,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let loader_called = Arc::new(AtomicBool::new(false));
     let called = Arc::clone(&loader_called);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        &user_dirs,
         &[],
         tmp.path(),
         false,
@@ -215,6 +217,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
 
     let called = Arc::clone(&loader_called);
     let result = build_factories_from_providers_impl_using(
+        &user_dirs,
         std::slice::from_ref(&config),
         tmp.path(),
         false,
@@ -243,6 +246,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let saw_aws = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&saw_aws);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        &user_dirs,
         &[config],
         tmp.path(),
         false,
@@ -274,6 +278,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("duplicate-provider.wasm");
     let installed_path = tmp
@@ -298,6 +303,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let observed = Arc::clone(&hard_loads);
 
     let result = build_factories_from_providers_impl_using(
+        &user_dirs,
         &configs,
         tmp.path(),
         true,
@@ -324,6 +330,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let formatting_loads = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&formatting_loads);
     let (factories, errors) = build_factories_from_providers_impl_using(
+        &user_dirs,
         &configs,
         tmp.path(),
         false,
@@ -545,19 +552,19 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
 #[test]
 fn tied_union_error_reports_shared_attribute() {
     let error = tied_union_error_with_attributes("target", "target");
-    assert_eq!(type_error_attribute(&error), Some("target"));
+    assert_eq!(error.attribute_name(), Some("target"));
 }
 
 #[test]
 fn tied_union_error_with_different_attributes_has_no_single_attribute() {
     let error = tied_union_error_with_attributes("first", "second");
-    assert_eq!(type_error_attribute(&error), None);
+    assert_eq!(error.attribute_name(), None);
 }
 
 #[test]
 fn tied_union_error_ignores_failures_without_an_attribute() {
     let error = tied_union_error_with_one_unattributed_failure();
-    assert_eq!(type_error_attribute(&error), Some("target"));
+    assert_eq!(error.attribute_name(), Some("target"));
 }
 
 #[tokio::test]
@@ -741,6 +748,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
 
 #[tokio::test(flavor = "multi_thread")]
 async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let wasm_path = tmp.path().join("provider.wasm");
     std::fs::write(&wasm_path, b"fixture").unwrap();
@@ -779,7 +787,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     )
     .unwrap();
     let identity_mismatch = installed
-        .load_with(&grants, |_verified| async {
+        .load_with(&user_dirs, &grants, |_verified| async {
             Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
         })
         .await
@@ -800,6 +808,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     std::fs::write(&installed_path, b"fixture").unwrap();
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
     let result = build_factories_from_providers_impl_using(
+        &user_dirs,
         std::slice::from_ref(&config),
         tmp.path(),
         true,
@@ -821,6 +830,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let trusted_inputs =
         TrustedLocalGrantInputs::new(vec![format!("{}=aws", wasm_path.display())], None);
     let result = build_factories_from_providers_impl_using(
+        &user_dirs,
         std::slice::from_ref(&config),
         tmp.path(),
         true,
@@ -836,6 +846,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     ));
 
     let (factories, errors) = build_factories_from_providers_impl_using(
+        &user_dirs,
         std::slice::from_ref(&config),
         tmp.path(),
         false,
@@ -861,7 +872,6 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
 
 #[test]
 fn unverified_official_factory_load_is_fatal_before_loader() {
-    let _env_guard = crate::test_env_guard();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -870,9 +880,9 @@ fn unverified_official_factory_load_is_fatal_before_loader() {
 }
 
 async fn unverified_official_factory_load_case() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let project = tempfile::tempdir().unwrap();
-    let trust = tempfile::tempdir().unwrap();
-    let _trust_env = crate::ScopedTestEnvVar::set("CARINA_TRUST_RECORD_DIR", trust.path());
+    std::fs::create_dir_all(user_dirs.trust_record_dir()).unwrap();
     let source = "github.com/carina-rs/carina-provider-aws";
     let version = "0.1.0";
     let provider_source: ProviderSource = source.parse().unwrap();
@@ -916,6 +926,7 @@ async fn unverified_official_factory_load_case() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
     let result = build_factories_from_providers_impl_using(
+        &user_dirs,
         std::slice::from_ref(&config),
         project.path(),
         false,
@@ -947,6 +958,13 @@ async fn unverified_official_factory_load_case() {
         "the transparent AppError must not re-expose the self-contained diagnostic"
     );
     assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
+    assert!(
+        std::fs::read_dir(user_dirs.trust_record_dir())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a rejected artifact must not write a trust record"
+    );
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -983,8 +1001,12 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    let (factories, _) =
-        build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
+    let user_dirs = carina_core::TestUserDirs::new();
+    let (factories, _) = build_factories_from_providers(
+        &user_dirs,
+        provider_configs.as_provider_configs(),
+        base_dir,
+    )?;
     let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
     let unresolved = carina_core::parser::ParsedFile {
         resources: unresolved_resources.to_vec(),
@@ -7987,6 +8009,7 @@ mod kind_default_source_tests {
 /// command-specific consumer.
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/example/carina-provider-awscc";
@@ -8046,6 +8069,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
     let (factories, errors) = build_factories_from_providers_impl_using(
+        &user_dirs,
         &[config],
         base,
         false,
@@ -8083,6 +8107,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
 
 #[test]
 fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -8113,7 +8138,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let (factories, errors) = build_factories_from_providers(&user_dirs, &[config], base).unwrap();
     let rendered = errors
         .get("awscc")
         .expect("missing locked artifact must reach the CLI diagnostic boundary");
@@ -8133,6 +8158,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_source_reaches_cli_artifact_loader() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "example/awscc";
@@ -8170,7 +8196,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
+    let (factories, errors) = build_factories_from_providers(&user_dirs, &[config], base).unwrap();
     let rendered = errors
         .get("awscc")
         .expect("the invalid fixture should fail only after registry resolution");
@@ -8182,6 +8208,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_source_reaches_plan_apply_provider_loader() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "example/awscc";
@@ -8218,8 +8245,9 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let (factories, errors) = build_factories_from_providers(std::slice::from_ref(&config), base)
-        .expect("registry source must reach the single factory-load boundary");
+    let (factories, errors) =
+        build_factories_from_providers(&user_dirs, std::slice::from_ref(&config), base)
+            .expect("registry source must reach the single factory-load boundary");
     let load_error = errors
         .get("awscc")
         .expect("invalid WASM fixture must be reported during factory loading");
@@ -8280,6 +8308,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
 
 #[test]
 fn formatting_factory_loader_returns_lock_constraint_errors() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -8309,7 +8338,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     };
 
     let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&[config], base).unwrap();
+        build_factories_from_providers_for_formatting(&user_dirs, &[config], base).unwrap();
 
     assert!(factories.is_empty());
     assert!(!load_errors.is_empty());
@@ -8322,6 +8351,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
 
 #[test]
 fn unversioned_lock_error_reaches_cli_typed_with_restore_remediation() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     std::fs::write(
@@ -8351,10 +8381,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         default_tags: IndexMap::new(),
     };
 
-    let runtime_error = match build_factories_from_providers(std::slice::from_ref(&config), base) {
-        Err(error) => error,
-        Ok(_) => panic!("unversioned provider lock must be returned as an error"),
-    };
+    let runtime_error =
+        match build_factories_from_providers(&user_dirs, std::slice::from_ref(&config), base) {
+            Err(error) => error,
+            Ok(_) => panic!("unversioned provider lock must be returned as an error"),
+        };
     let rendered = runtime_error.to_string();
     assert!(
         rendered.contains("predates lock format versioning"),
@@ -8383,7 +8414,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     assert!(std::error::Error::source(&runtime_error).is_none());
 
     let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&[config], base).unwrap();
+        build_factories_from_providers_for_formatting(&user_dirs, &[config], base).unwrap();
     assert!(factories.is_empty());
     let formatting_error = load_errors
         .get("carina-providers.lock")
@@ -8421,6 +8452,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
 
 #[test]
 fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -8449,7 +8481,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         default_tags: IndexMap::new(),
     };
 
-    let result = build_factories_from_providers(&[config], base);
+    let result = build_factories_from_providers(&user_dirs, &[config], base);
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("mismatched provider lock must be returned as an error"),

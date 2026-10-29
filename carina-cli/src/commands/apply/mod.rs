@@ -240,7 +240,7 @@ async fn create_checked_bootstrap_resource(
                 None,
                 schemas
                     .get_for(resolved.as_resource())
-                    .map(|schema| schema.as_schema()),
+                    .map(|schema| schema.schema().as_schema()),
                 RowBasis::Applied(&accepted_request),
                 None,
             )
@@ -279,7 +279,7 @@ async fn create_checked_bootstrap_resource(
                     None,
                     schemas
                         .get_for(resolved.as_resource())
-                        .map(|schema| schema.as_schema()),
+                        .map(|schema| schema.schema().as_schema()),
                     None,
                 )
                 .map(Some)
@@ -293,7 +293,7 @@ async fn create_checked_bootstrap_resource(
                     None,
                     schemas
                         .get_for(resolved.as_resource())
-                        .map(|schema| schema.as_schema()),
+                        .map(|schema| schema.schema().as_schema()),
                     None,
                 )
                 .map(Some)
@@ -1342,7 +1342,9 @@ fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1352,6 +1354,7 @@ pub async fn run_apply(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_with_observer_factory(
+        user_dirs,
         path,
         auto_approve,
         lock,
@@ -1367,6 +1370,7 @@ pub async fn run_apply(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_with_observer_factory(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1389,6 +1393,7 @@ async fn run_apply_with_observer_factory(
 
     let base_dir = get_base_dir(path);
     let mut canonical_resources = crate::commands::validate_and_resolve_config_pair(
+        user_dirs,
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -1402,7 +1407,7 @@ async fn run_apply_with_observer_factory(
     // provider may be created. Provider inputs are loaded lazily in that
     // branch; ordinary apply reaches backend verification without touching
     // upstream state and resolves once in the lock-held path.
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let (factories, _) = build_factories_from_providers(user_dirs, &parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
 
     let verified_backend = verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Apply)?;
@@ -1526,6 +1531,7 @@ async fn run_apply_with_observer_factory(
                     // resource pairing; replace only the resolved snapshot so
                     // the lock-held path sees the injected bucket row.
                     canonical_resources = reload_apply_configuration_after_bootstrap(
+                        user_dirs,
                         path,
                         base_dir,
                         provider_context,
@@ -1621,6 +1627,7 @@ async fn run_apply_with_observer_factory(
 }
 
 fn reload_apply_configuration_after_bootstrap(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     base_dir: &Path,
     provider_context: &ProviderContext,
@@ -1634,6 +1641,7 @@ fn reload_apply_configuration_after_bootstrap(
     let inference_errors = reloaded.inference_errors;
     let duplicate_declarations = reloaded.duplicate_declarations;
     crate::commands::validate_and_resolve_config_pair(
+        user_dirs,
         reloaded.parsed,
         unresolved,
         base_dir,
@@ -2998,7 +3006,9 @@ fn rehydrate_desired_plan_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_apply_from_plan(
+    user_dirs: &carina_core::UserDirs,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -3008,6 +3018,7 @@ pub async fn run_apply_from_plan(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_from_plan_with_observer_factory(
+        user_dirs,
         plan_path,
         auto_approve,
         lock,
@@ -3023,6 +3034,7 @@ pub async fn run_apply_from_plan(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
+    user_dirs: &carina_core::UserDirs,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -3226,6 +3238,7 @@ async fn run_apply_from_plan_with_observer_factory(
             ));
         }
         let canonical = crate::commands::validate_and_resolve_config_pair(
+            user_dirs,
             current_config.parsed,
             current_config.unresolved_parsed,
             base_dir,
@@ -3285,6 +3298,7 @@ async fn run_apply_from_plan_with_observer_factory(
     };
 
     let outcome = run_apply_from_plan_locked_owned(
+        user_dirs,
         inspected_plan,
         current_resources,
         provider_context,
@@ -3310,6 +3324,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
+    user_dirs: &carina_core::UserDirs,
     inspected_plan: InspectedPlanFile,
     current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     provider_context: &ProviderContext,
@@ -3423,7 +3438,7 @@ async fn run_apply_from_plan_locked_owned(
             // immediately, before normalizer construction or secret evaluation.
             let saved_provider_configs = inspected_plan.provider_configs().as_provider_configs();
             let (factories, _) =
-                build_factories_from_providers(saved_provider_configs, project_dir)?;
+                build_factories_from_providers(user_dirs, saved_provider_configs, project_dir)?;
             let ctx = WiringContext::new(factories, saved_provider_configs);
             let (schema_checked_plan, verified_wiring) =
                 inspected_plan.verify_loaded_providers(ctx, apply_target)?;
@@ -3805,6 +3820,7 @@ async fn run_apply_from_plan_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
+    user_dirs: &carina_core::UserDirs,
     inspected_plan: InspectedPlanFile,
     current_resources: Option<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     provider_context: &ProviderContext,
@@ -3818,6 +3834,7 @@ async fn run_apply_from_plan_locked(
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
     let outcome = run_apply_from_plan_locked_owned(
+        user_dirs,
         inspected_plan,
         current_resources,
         provider_context,

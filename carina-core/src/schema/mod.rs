@@ -297,25 +297,22 @@ where
     Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
 }
 
-/// External validator looked up by refined primitive identity.
-/// at validation time. Used to bridge to provider-supplied validators
-/// (the `ProviderContext.validators` map and WASM factory's
-/// `validate_custom_type`) that the schema itself cannot carry across
-/// the WASM boundary — see #2354.
+/// External validator resolved from the exact declared refined type.
 ///
-/// The lookup is keyed on a structured [`TypeIdentity`], not a flat
-/// type-name string, so two providers' same-named custom types resolve
-/// to distinct validators instead of colliding first-wins.
+/// Provider-owned call sites pair this declaration with its schema owner before
+/// invoking the owning factory. A [`TypeIdentity`] alone is descriptive metadata
+/// and is never used as routing authority.
 pub type CustomTypeLookup<'a> =
-    &'a (dyn Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
+    &'a (dyn Fn(&AttributeType, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
 
 /// A [`CustomTypeLookup`] that approves every value. Pass to
 /// `validate_with_origins_and_lookup` from contexts that have no
 /// `ProviderContext` (snapshot tests, schema unit tests). The
 /// schema-attached `validate` closure still runs for built-in
 /// validators registered directly on the type.
-pub fn no_lookup() -> CustomTypeLookup<'static> {
-    &|_name, _value| Ok(())
+#[cfg(test)]
+pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
+    &|_declared_type, _value| Ok(())
 }
 
 /// If `value` is a bare reference to a `let` binding (no access path,
@@ -381,7 +378,7 @@ fn enum_binding_collision_message(
 fn walk_custom_lookup(
     attr_type: &AttributeType,
     value: &Value,
-    attr_name: &str,
+    attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     errors: &mut Vec<TypeError>,
@@ -401,7 +398,7 @@ fn walk_custom_lookup(
 fn walk_custom_lookup_on_path<'a>(
     attr_type: &'a AttributeType,
     value: &Value,
-    attr_name: &str,
+    attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     errors: &mut Vec<TypeError>,
@@ -463,9 +460,23 @@ fn walk_custom_lookup_on_path<'a>(
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => {
-            run_identified_lookup(binding.identity(), value, attr_name, lookup, errors)
+            if binding.callback().is_none() {
+                run_identified_lookup(
+                    attr_type,
+                    binding.identity(),
+                    value,
+                    attr_name,
+                    lookup,
+                    errors,
+                );
+            }
         }
-        AttrTypeKind::Enum { identity, .. } => {
+        AttrTypeKind::Enum {
+            identity, validate, ..
+        } => {
+            if validate.is_some() {
+                return;
+            }
             let resolver = EnumValueResolver::with_defs(attr_type, defs);
             let canonical = match value {
                 Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver.resolve_raw(raw),
@@ -485,22 +496,11 @@ fn walk_custom_lookup_on_path<'a>(
                 return;
             };
             let resolved = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
-            if let Err(e) = lookup(identity, &resolved) {
-                match e {
-                    error @ TypeError::ProviderValidationFailed { .. } => {
-                        errors.push(error.with_attribute(attr_name));
-                    }
-                    TypeError::ValidationFailed { message } => {
-                        errors.push(TypeError::ResourceValidationFailed {
-                            message,
-                            attribute: Some(attr_name.to_string()),
-                        });
-                    }
-                    other => errors.push(TypeError::ResourceValidationFailed {
-                        message: other.to_string(),
-                        attribute: Some(attr_name.to_string()),
-                    }),
-                }
+            if let Err(e) = lookup(attr_type, &resolved) {
+                errors.push(match attr_name {
+                    Some(attr_name) => e.with_attribute(attr_name),
+                    None => e,
+                });
             }
         }
         AttrTypeKind::List {
@@ -607,30 +607,20 @@ fn walk_custom_lookup_on_path<'a>(
 }
 
 fn run_identified_lookup(
+    attribute_type: &AttributeType,
     identity: Option<&TypeIdentity>,
     value: &Value,
-    attr_name: &str,
+    attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     errors: &mut Vec<TypeError>,
 ) {
-    if let Some(id) = identity
-        && let Err(e) = lookup(id, value)
+    if identity.is_some()
+        && let Err(e) = lookup(attribute_type, value)
     {
-        match e {
-            error @ TypeError::ProviderValidationFailed { .. } => {
-                errors.push(error.with_attribute(attr_name));
-            }
-            TypeError::ValidationFailed { message } => {
-                errors.push(TypeError::ResourceValidationFailed {
-                    message,
-                    attribute: Some(attr_name.to_string()),
-                });
-            }
-            other => errors.push(TypeError::ResourceValidationFailed {
-                message: other.to_string(),
-                attribute: Some(attr_name.to_string()),
-            }),
-        }
+        errors.push(match attr_name {
+            Some(attr_name) => e.with_attribute(attr_name),
+            None => e,
+        });
     }
 }
 
@@ -1626,6 +1616,42 @@ impl RootlessType {
 
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         self.schema.validate(value)
+    }
+
+    /// Validate a rootless value and bridge any callback-free identified
+    /// refinements through an owning provider lookup. Native callbacks run in
+    /// the structural pass and are skipped by the lookup walk.
+    pub(crate) fn validate_with_lookup(
+        &self,
+        value: &Value,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        if let Err(error) = self.schema.validate(value) {
+            return Err(vec![error]);
+        }
+        let mut errors = Vec::new();
+        walk_custom_lookup(
+            &self.schema.root,
+            value,
+            None,
+            lookup,
+            &self.schema.defs,
+            &mut errors,
+        );
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors
+                .into_iter()
+                .map(|error| match error {
+                    TypeError::ResourceValidationFailed {
+                        message,
+                        attribute: _attribute,
+                    } => TypeError::ValidationFailed { message },
+                    error => error,
+                })
+                .collect())
+        }
     }
 
     pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
@@ -3001,9 +3027,9 @@ impl AttributeType {
     ///   validator and transform.
     /// - `values: None`, empty `dsl_aliases`, `validate: None`,
     ///   `to_dsl: Some(...)`: a WASM-bridged dynamic enum. Schema-local
-    ///   validation is absent because validation happens through
-    ///   `ProviderContext.validators`; the protocol payload carries
-    ///   the transform as data and the host applies it directly.
+    ///   validation is absent because validation is dispatched through
+    ///   the schema-owning factory; the protocol payload carries the
+    ///   transform as data and the host applies it directly.
     ///
     /// At least one of `values: Some(...)`, `validate: Some(...)`, or a
     /// separately registered provider validator should exist for real
@@ -3277,6 +3303,19 @@ impl AttributeType {
                 unreachable!("validate_leaf_value must only be called after structural dispatch")
             }
         }
+    }
+
+    /// Validate one already-identified scalar declaration without opening a
+    /// public rootless constructor for arbitrary resource-path types.
+    pub(crate) fn validate_identified_scalar_value(&self, value: &Value) -> Result<(), TypeError> {
+        debug_assert!(matches!(
+            self.kind,
+            AttrTypeKind::String { .. }
+                | AttrTypeKind::Int { .. }
+                | AttrTypeKind::Float { .. }
+                | AttrTypeKind::Enum { .. }
+        ));
+        self.validate_leaf_value(value)
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
@@ -4111,8 +4150,7 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
 
 fn validation_error_message(err: TypeError) -> String {
     match err {
-        TypeError::ValidationFailed { message }
-        | TypeError::ProviderValidationFailed { message, .. } => message,
+        TypeError::ValidationFailed { message } => message,
         other => other.to_string(),
     }
 }
@@ -6090,7 +6128,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::LengthOutOfRange { .. }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
-        | TypeError::ProviderValidationFailed { .. }
+        | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
         | TypeError::ReadOnlyAttribute { .. }
@@ -6192,13 +6230,9 @@ pub enum TypeError {
     #[error("Validation failed: {message}")]
     ValidationFailed { message: String },
 
-    /// Provider-backed validation failure with host policy metadata retained
-    /// for diagnostic decisions such as suspension deduplication.
-    #[error("Validation failed: {message}")]
-    ProviderValidationFailed {
-        message: String,
-        host_cause: Option<crate::provider::HostErrorCause>,
-        provider_name: Option<String>,
+    #[error("{error}")]
+    CustomTypeValidation {
+        error: Box<crate::parser::CustomTypeValidationError>,
         attribute: Option<String>,
     },
 
@@ -6266,6 +6300,15 @@ pub enum TypeError {
     BlockSyntaxNotAllowed { attribute: String },
 }
 
+impl From<crate::parser::CustomTypeValidationError> for TypeError {
+    fn from(error: crate::parser::CustomTypeValidationError) -> Self {
+        Self::CustomTypeValidation {
+            error: Box::new(error),
+            attribute: None,
+        }
+    }
+}
+
 impl TypeError {
     fn from_union_member_failures(
         first: UnionMemberFailure,
@@ -6278,6 +6321,39 @@ impl TypeError {
         match UnionArmFailures::new(first, rest) {
             Ok(failures) => Self::UnionAlternativesMismatch { failures },
             Err(error) => error,
+        }
+    }
+
+    /// Return the authored top-level attribute carried by this diagnostic.
+    /// Container and union wrappers delegate to their leaf failures so
+    /// consumers do not need variant-specific position recovery.
+    pub fn attribute_name(&self) -> Option<&str> {
+        match self {
+            TypeError::InvalidEnumVariant { attribute, .. }
+            | TypeError::PatternMismatch { attribute, .. }
+            | TypeError::LengthOutOfRange { attribute, .. }
+            | TypeError::StringLiteralExpectedEnum { attribute, .. }
+            | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+            TypeError::ReadOnlyAttribute { name }
+            | TypeError::UnknownAttribute { name, .. }
+            | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
+            TypeError::ListItemError { inner, .. }
+            | TypeError::MapKeyError { inner, .. }
+            | TypeError::MapValueError { inner, .. }
+            | TypeError::StructFieldError { inner, .. } => inner.attribute_name(),
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let mut attributes = failures.iter().filter_map(TypeError::attribute_name);
+                let first = attributes.next()?;
+                attributes
+                    .all(|attribute| attribute == first)
+                    .then_some(first)
+            }
+            TypeError::TypeMismatch { .. }
+            | TypeError::ValidationFailed { .. }
+            | TypeError::MissingRequired { .. }
+            | TypeError::UnknownStructField { .. }
+            | TypeError::UnionStructMismatch { .. } => None,
+            TypeError::CustomTypeValidation { attribute, .. } => attribute.as_deref(),
         }
     }
 
@@ -6345,17 +6421,12 @@ impl TypeError {
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
                 message: MASKED_MESSAGE.to_string(),
             },
-            TypeError::ProviderValidationFailed {
-                host_cause,
-                provider_name,
-                attribute,
-                ..
-            } => TypeError::ProviderValidationFailed {
-                message: MASKED_MESSAGE.to_string(),
-                host_cause,
-                provider_name,
-                attribute,
-            },
+            TypeError::CustomTypeValidation { error, attribute } => {
+                TypeError::CustomTypeValidation {
+                    error: Box::new((*error).masked_for_secret()),
+                    attribute,
+                }
+            }
             TypeError::ResourceValidationFailed { attribute, .. } => {
                 TypeError::ResourceValidationFailed {
                     message: MASKED_MESSAGE.to_string(),
@@ -6428,13 +6499,11 @@ impl TypeError {
     /// leaf validator unaware of attribute names while still
     /// letting the final message say `for 'target_id'`.
     ///
-    /// See #2098. Adding the same slot to `ValidationFailed` /
-    /// `TypeMismatch` is tracked as future work.
     #[must_use]
     pub fn with_attribute(self, attribute: impl Into<String>) -> Self {
+        let attribute = attribute.into();
         match self {
             TypeError::UnionAlternativesMismatch { failures } => {
-                let attribute = attribute.into();
                 let (first, rest) = failures.into_parts();
                 TypeError::from_union_arm_errors(
                     first.with_attribute(attribute.clone()),
@@ -6442,6 +6511,40 @@ impl TypeError {
                         .map(|failure| failure.with_attribute(attribute.clone())),
                 )
             }
+            TypeError::ValidationFailed { message } => TypeError::ResourceValidationFailed {
+                message,
+                attribute: Some(attribute),
+            },
+            TypeError::ResourceValidationFailed {
+                message,
+                attribute: existing,
+            } => TypeError::ResourceValidationFailed {
+                message,
+                attribute: existing.or(Some(attribute)),
+            },
+            TypeError::CustomTypeValidation {
+                error,
+                attribute: existing,
+            } => TypeError::CustomTypeValidation {
+                error,
+                attribute: existing.or(Some(attribute)),
+            },
+            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
+                index,
+                inner: Box::new(inner.with_attribute(attribute)),
+            },
+            TypeError::MapKeyError { key, inner } => TypeError::MapKeyError {
+                key,
+                inner: Box::new(inner.with_attribute(attribute)),
+            },
+            TypeError::MapValueError { key, inner } => TypeError::MapValueError {
+                key,
+                inner: Box::new(inner.with_attribute(attribute)),
+            },
+            TypeError::StructFieldError { field, inner } => TypeError::StructFieldError {
+                field,
+                inner: Box::new(inner.with_attribute(attribute)),
+            },
             mut other => {
                 match &mut other {
                     TypeError::InvalidEnumVariant {
@@ -6459,12 +6562,8 @@ impl TypeError {
                     | TypeError::StringLiteralExpectedEnum {
                         attribute: attr_slot,
                         ..
-                    }
-                    | TypeError::ProviderValidationFailed {
-                        attribute: attr_slot,
-                        ..
                     } => {
-                        *attr_slot = Some(attribute.into());
+                        *attr_slot = Some(attribute);
                     }
                     _ => {}
                 }
@@ -6501,7 +6600,9 @@ impl TypeError {
     /// Host-side lifecycle marker retained from provider validation.
     pub fn host_cause(&self) -> Option<crate::provider::HostErrorCause> {
         match self {
-            TypeError::ProviderValidationFailed { host_cause, .. } => *host_cause,
+            TypeError::CustomTypeValidation { error, .. } => error
+                .provider_error()
+                .and_then(|error| error.detail().host_cause()),
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
             | TypeError::MapValueError { inner, .. }
@@ -6516,7 +6617,9 @@ impl TypeError {
     /// Provider name retained from provider-backed validation.
     pub fn provider_name(&self) -> Option<&str> {
         match self {
-            TypeError::ProviderValidationFailed { provider_name, .. } => provider_name.as_deref(),
+            TypeError::CustomTypeValidation { error, .. } => error
+                .provider_error()
+                .and_then(|error| error.detail().provider_name.as_deref()),
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
             | TypeError::MapValueError { inner, .. }
@@ -8005,11 +8108,16 @@ impl ValidatedResourceSchema {
         Ok(current)
     }
 
-    pub fn validate(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    #[cfg(test)]
+    pub(crate) fn validate(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> Result<(), Vec<TypeError>> {
         self.schema.validate_values(attributes)
     }
 
-    pub fn validate_with_origins(
+    #[cfg(test)]
+    pub(crate) fn validate_with_origins(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -8018,7 +8126,7 @@ impl ValidatedResourceSchema {
             .validate_values_with_origins(attributes, is_string_literal)
     }
 
-    pub fn validate_with_origins_and_lookup(
+    pub(crate) fn validate_with_origins_and_lookup(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -8028,7 +8136,7 @@ impl ValidatedResourceSchema {
             .validate_values_with_origins_and_lookup(attributes, is_string_literal, lookup)
     }
 
-    pub fn validate_known_values_with_origins_and_lookup(
+    pub(crate) fn validate_known_values_with_origins_and_lookup(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
@@ -8071,13 +8179,21 @@ impl ValidatedConfigSchema {
         let defs = BTreeMap::new();
         let mut issues = Vec::new();
         let mut visited_definitions = HashSet::new();
+        let mut identified_kinds = HashMap::new();
         for (name, attr_type) in &attribute_types {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
             validate_type_definition(
                 attr_type,
                 &defs,
-                SchemaValidationIssueLocation::Attribute(name.clone()),
+                location.clone(),
                 Some(false),
                 &mut visited_definitions,
+                &mut issues,
+            );
+            validate_identified_scalar_kind_consistency(
+                attr_type,
+                location,
+                &mut identified_kinds,
                 &mut issues,
             );
         }
@@ -8153,6 +8269,188 @@ fn push_schema_issue(
         location: location.clone(),
         message: message.into(),
     });
+}
+
+fn validate_identified_scalar_kind_consistency(
+    attribute_type: &AttributeType,
+    location: SchemaValidationIssueLocation,
+    seen: &mut HashMap<TypeIdentity, (RefinedScalarKind, SchemaValidationIssueLocation)>,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    let identified = match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(identity),
+            ..
+        } => Some((identity, RefinedScalarKind::String)),
+        RawShape::Int {
+            identity: Some(identity),
+            ..
+        } => Some((identity, RefinedScalarKind::Int)),
+        RawShape::Float {
+            identity: Some(identity),
+            ..
+        } => Some((identity, RefinedScalarKind::Float)),
+        RawShape::Enum {
+            identity,
+            base,
+            values,
+            dsl_aliases,
+            validate: _validate,
+            to_dsl,
+        } => {
+            let kind = scalar_kind_for_schema_base(base);
+            if kind.is_none() {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    format!("custom type `{identity}` must have a scalar base"),
+                );
+            }
+
+            match values {
+                Some(_values) => {
+                    if to_dsl.is_some() {
+                        push_schema_issue(
+                            issues,
+                            &location,
+                            format!(
+                                "closed enum `{identity}` has a DSL transform that protocol v12 cannot represent"
+                            ),
+                        );
+                    }
+                    if !matches!(
+                        base.raw_shape(),
+                        RawShape::String {
+                            identity: None,
+                            pattern: None,
+                            length: None,
+                            validate: None,
+                            to_dsl: None,
+                        }
+                    ) {
+                        push_schema_issue(
+                            issues,
+                            &location,
+                            format!(
+                                "closed enum `{identity}` has base metadata that protocol v12 cannot represent"
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    if !dsl_aliases.is_empty() {
+                        push_schema_issue(
+                            issues,
+                            &location,
+                            format!(
+                                "open enum `{identity}` has DSL aliases that protocol v12 cannot represent"
+                            ),
+                        );
+                    }
+                    if identity.dotted_prefix().is_none() {
+                        push_schema_issue(
+                            issues,
+                            &location,
+                            format!("open enum `{identity}` has no namespace for protocol v12"),
+                        );
+                    }
+                }
+            }
+
+            kind.map(|kind| (identity, kind))
+        }
+        RawShape::String { identity: None, .. }
+        | RawShape::Int { identity: None, .. }
+        | RawShape::Float { identity: None, .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    };
+    if let Some((identity, kind)) = identified {
+        if let Some((first_kind, first_location)) = seen.get(identity) {
+            if *first_kind != kind {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    format!(
+                        "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
+                    ),
+                );
+            }
+        } else {
+            seen.insert(identity.clone(), (kind, location.clone()));
+        }
+    }
+
+    match attribute_type.raw_shape() {
+        RawShape::List { element_type, .. } => validate_identified_scalar_kind_consistency(
+            element_type,
+            location.with_suffix(".element"),
+            seen,
+            issues,
+        ),
+        RawShape::Map { key, value } => {
+            validate_identified_scalar_kind_consistency(
+                key,
+                location.with_suffix(".key"),
+                seen,
+                issues,
+            );
+            validate_identified_scalar_kind_consistency(
+                value,
+                location.with_suffix(".value"),
+                seen,
+                issues,
+            );
+        }
+        RawShape::Struct { fields, .. } => {
+            for field in fields {
+                validate_identified_scalar_kind_consistency(
+                    &field.field_type,
+                    location.with_suffix(format_args!(".{}", field.name)),
+                    seen,
+                    issues,
+                );
+            }
+        }
+        RawShape::Union(members) => {
+            for (index, member) in members.iter().enumerate() {
+                validate_identified_scalar_kind_consistency(
+                    member,
+                    location.with_suffix(format_args!("[{index}]")),
+                    seen,
+                    issues,
+                );
+            }
+        }
+        RawShape::String { .. }
+        | RawShape::Int { .. }
+        | RawShape::Float { .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Enum { .. }
+        | RawShape::Ref(_) => {}
+    }
+}
+
+fn scalar_kind_for_schema_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
+    match attribute_type.raw_shape() {
+        RawShape::String { .. } => Some(RefinedScalarKind::String),
+        RawShape::Int { .. } => Some(RefinedScalarKind::Int),
+        RawShape::Float { .. } => Some(RefinedScalarKind::Float),
+        RawShape::Enum { base, .. } => scalar_kind_for_schema_base(base),
+        RawShape::Bool
+        | RawShape::Duration
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => None,
+    }
 }
 
 fn validate_attribute_mode(
@@ -8931,6 +9229,7 @@ impl ResourceSchema {
     pub fn validate(mut self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
         let mut issues = Vec::new();
         let mut visited_definitions = HashSet::new();
+        let mut identified_kinds = HashMap::new();
 
         for name in &self.duplicate_attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
@@ -8950,14 +9249,26 @@ impl ResourceSchema {
             validate_type_definition(
                 &attribute.attr_type,
                 &self.defs,
-                location,
+                location.clone(),
                 Some(attribute.input_mode.is_provider_populated()),
                 &mut visited_definitions,
+                &mut issues,
+            );
+            validate_identified_scalar_kind_consistency(
+                &attribute.attr_type,
+                location,
+                &mut identified_kinds,
                 &mut issues,
             );
         }
 
         for (name, definition) in &self.defs {
+            validate_identified_scalar_kind_consistency(
+                definition,
+                SchemaValidationIssueLocation::Definition(name.clone()),
+                &mut identified_kinds,
+                &mut issues,
+            );
             if !visited_definitions.insert((name.clone(), None)) {
                 continue;
             }
@@ -9444,6 +9755,7 @@ impl ResourceSchema {
     /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
     /// knows which attributes were written as quoted string literals
     /// (see #2094).
+    #[cfg(test)]
     fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
         self.validate_inner(attributes, &|_attr_name| false, no_lookup())
     }
@@ -9458,6 +9770,7 @@ impl ResourceSchema {
     /// `StringLiteralExpectedEnum` so the error message describes the
     /// form mismatch instead of asking the user to match a list of
     /// variants. Non-enum errors are passed through unchanged.
+    #[cfg(test)]
     fn validate_values_with_origins(
         &self,
         attributes: &HashMap<String, Value>,
@@ -9662,7 +9975,7 @@ impl ResourceSchema {
                 walk_custom_lookup(
                     &schema.attr_type,
                     value,
-                    name,
+                    Some(name),
                     lookup,
                     &self.defs,
                     &mut errors,
@@ -10615,13 +10928,33 @@ pub mod types {
     }
 }
 
+/// Primitive shape attached to a core-owned identified refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefinedScalarKind {
+    String,
+    Int,
+    Float,
+}
+
+impl fmt::Display for RefinedScalarKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "String",
+            Self::Int => "Int",
+            Self::Float => "Float",
+        })
+    }
+}
+
 /// Return the validators for every core-owned identified refinement.
 ///
 /// The registry is built from the same constructors providers use, so schema
 /// construction and process-boundary reconstruction cannot drift onto two
 /// hand-maintained identity lists.
-pub fn builtin_validator_registry() -> &'static HashMap<TypeIdentity, CustomValidator> {
-    static REGISTRY: OnceLock<HashMap<TypeIdentity, CustomValidator>> = OnceLock::new();
+pub fn builtin_validator_registry()
+-> &'static HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator> {
+    static REGISTRY: OnceLock<HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator>> =
+        OnceLock::new();
     REGISTRY.get_or_init(|| {
         let builtins = [
             types::positive_int(),
@@ -10639,22 +10972,27 @@ pub fn builtin_validator_registry() -> &'static HashMap<TypeIdentity, CustomVali
         ];
         let mut validators = HashMap::new();
         for attr_type in builtins {
-            let binding = match &attr_type.kind {
-                AttrTypeKind::String { binding, .. }
-                | AttrTypeKind::Int { binding, .. }
-                | AttrTypeKind::Float { binding, .. } => binding,
+            let (kind, binding) = match &attr_type.kind {
+                AttrTypeKind::String { binding, .. } => (RefinedScalarKind::String, binding),
+                AttrTypeKind::Int { binding, .. } => (RefinedScalarKind::Int, binding),
+                AttrTypeKind::Float { binding, .. } => (RefinedScalarKind::Float, binding),
                 _ => continue,
             };
             if let Some((identity, callback)) = binding.validator_parts() {
-                validators.insert(identity.clone(), callback.clone());
+                validators.insert((kind, identity.clone()), callback.clone());
             }
         }
         validators
     })
 }
 
-pub fn builtin_validator(identity: &TypeIdentity) -> Option<CustomValidator> {
-    builtin_validator_registry().get(identity).cloned()
+pub fn builtin_validator(
+    kind: RefinedScalarKind,
+    identity: &TypeIdentity,
+) -> Option<CustomValidator> {
+    builtin_validator_registry()
+        .get(&(kind, identity.clone()))
+        .cloned()
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -11050,6 +11388,136 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 
 // --- SchemaRegistry ---
 
+/// A validated resource schema inseparably paired with the provider owner
+/// under which it was registered.
+///
+/// The fields and constructor are private: only [`SchemaRegistry`] lookups can
+/// produce this routing capability. Callers therefore cannot walk one schema
+/// while independently supplying another provider name to custom-type
+/// validation.
+///
+/// Resolver-backed validation is deliberately unavailable on an unbound
+/// witness, so callers cannot pair one provider's lookup with another
+/// provider's schema:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::schema::{ResourceSchema, no_lookup};
+///
+/// let schema = ResourceSchema::new("test.Widget").validate().unwrap();
+/// let _ = schema.validate_with_origins_and_lookup(
+///     &HashMap::new(),
+///     &|_| false,
+///     no_lookup(),
+/// );
+/// ```
+///
+/// An unbound witness also has no public structural-only validation shortcut:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::schema::ResourceSchema;
+///
+/// let schema = ResourceSchema::new("test.Widget").validate().unwrap();
+/// let _ = schema.validate(&HashMap::new());
+/// ```
+///
+/// Nor can external callers install an approve-all lookup for provider config:
+///
+/// ```compile_fail
+/// use carina_core::schema::no_lookup;
+///
+/// let _ = no_lookup();
+/// ```
+///
+/// A rootless config type likewise cannot accept an arbitrary lookup:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
+///
+/// let config = ValidatedConfigSchema::validate(HashMap::from([
+///     ("name".to_string(), AttributeType::string()),
+/// ])).unwrap();
+/// let rootless = config.rootless_type("name").unwrap();
+/// let value = Value::Concrete(ConcreteValue::String("ok".into()));
+/// let _ = rootless.validate_with_lookup(&value, &|_, _| Ok(()));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerBoundResourceSchema<'a> {
+    owner: &'a str,
+    schema: &'a ValidatedResourceSchema,
+}
+
+impl<'a> OwnerBoundResourceSchema<'a> {
+    fn new(owner: &'a str, schema: &'a ValidatedResourceSchema) -> Self {
+        Self { owner, schema }
+    }
+
+    pub fn owner(self) -> &'a str {
+        self.owner
+    }
+
+    pub fn schema(self) -> &'a ValidatedResourceSchema {
+        self.schema
+    }
+
+    /// Validate authored resource values with custom-type routing derived from
+    /// this schema's registered owner.
+    pub fn validate_with_resolver(
+        self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Result<(), Vec<TypeError>> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema
+            .validate_with_origins_and_lookup(attributes, is_string_literal, &lookup)
+    }
+
+    /// Validate every concrete value known at the provider boundary, routing
+    /// identified declarations through this schema's registered owner.
+    pub fn validate_known_values_with_resolver(
+        self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Result<(), Vec<TypeError>> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema.validate_known_values_with_origins_and_lookup(
+            attributes,
+            is_string_literal,
+            &lookup,
+        )
+    }
+
+    pub(crate) fn validate_selected_known_values_with_resolver(
+        self,
+        attributes: &HashMap<String, Value>,
+        selected: &HashSet<String>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Result<(), Vec<TypeError>> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema
+            .validate_selected_known_values_with_origins_and_lookup(
+                attributes,
+                selected,
+                is_string_literal,
+                &lookup,
+            )
+    }
+}
+
+impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
+    type Target = ValidatedResourceSchema;
+
+    fn deref(&self) -> &Self::Target {
+        self.schema
+    }
+}
+
 /// A registry that holds resource schemas keyed by `(provider, resource_type)`
 /// and `SchemaKind`. The same `(provider, resource_type)` may have **two
 /// independent entries** — a `Managed` one and a `DataSource` one — so that
@@ -11096,19 +11564,21 @@ impl SchemaRegistry {
         provider: &str,
         resource_type: &str,
         kind: SchemaKind,
-    ) -> Option<&ValidatedResourceSchema> {
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
         let key = (provider.to_string(), resource_type.to_string());
-        match kind {
-            SchemaKind::Resource => self.managed.get(&key),
-            SchemaKind::DataSource => self.data_sources.get(&key),
-        }
+        let map = match kind {
+            SchemaKind::Resource => &self.managed,
+            SchemaKind::DataSource => &self.data_sources,
+        };
+        map.get_key_value(&key)
+            .map(|((owner, _resource_type), schema)| OwnerBoundResourceSchema::new(owner, schema))
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
     pub fn get_for<S>(
         &self,
         resource: &crate::resource::Resource<S>,
-    ) -> Option<&ValidatedResourceSchema> {
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -11120,7 +11590,7 @@ impl SchemaRegistry {
     pub fn get_for_data_source<S>(
         &self,
         resource: &crate::resource::DataSource<S>,
-    ) -> Option<&ValidatedResourceSchema> {
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
             &resource.id.resource_type,

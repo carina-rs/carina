@@ -2,13 +2,14 @@
 //!
 //! Implement [`CarinaProvider`] and export it with [`export_provider!`].
 
+pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod wasm_guest;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 pub mod wasi_http;
 
 // `wasi_http_body` is compiled for every target so its pure-Rust
@@ -51,12 +52,129 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
     }
 }
 
+use carina_core::schema::{ValidatedConfigSchema, ValidatedResourceSchema};
 use carina_provider_protocol::types::{
-    AppliedIdentifier, AppliedState, AttributeType, CompletionValue, CreateRequest, DeleteRequest,
-    PersistedState, PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest,
-    Resource, ResourceId, ResourceSchema, State, TypeIdentity, UpdateRequest, Value,
+    AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
+    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId,
+    State, TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::HashMap;
+
+/// Failure while projecting validated SDK schemas onto version-12 JSON.
+#[derive(Debug)]
+pub enum SchemaSerializationError {
+    Convert(carina_core::protocol_convert::ProtocolConvertError),
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for SchemaSerializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Convert(_error) => formatter.write_str("schema protocol conversion failed"),
+            Self::Json(_error) => formatter.write_str("schema JSON serialization failed"),
+        }
+    }
+}
+
+impl std::error::Error for SchemaSerializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Convert(error) => Some(error),
+            Self::Json(error) => Some(error),
+        }
+    }
+}
+
+/// Serialize validated resource schemas through the core protocol seam.
+/// Raw drafts cannot enter this API:
+///
+/// ```compile_fail
+/// use carina_core::schema::ResourceSchema;
+/// use carina_plugin_sdk::schemas_to_json;
+///
+/// let drafts = vec![ResourceSchema::new("test.Widget")];
+/// let _ = schemas_to_json(&drafts);
+/// ```
+pub fn schemas_to_json(
+    schemas: &[ValidatedResourceSchema],
+) -> Result<String, SchemaSerializationError> {
+    let protocol = carina_core::protocol_convert::resource_schemas_to_protocol(schemas.iter())
+        .map_err(SchemaSerializationError::Convert)?;
+    serde_json::to_string(&protocol).map_err(SchemaSerializationError::Json)
+}
+
+/// Serialize one validated provider-config schema through the core seam.
+/// A raw attribute-type map is intentionally not accepted:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::schema::AttributeType;
+/// use carina_plugin_sdk::provider_config_schema_to_json;
+///
+/// let draft = HashMap::<String, AttributeType>::new();
+/// let _ = provider_config_schema_to_json(&draft);
+/// ```
+pub fn provider_config_schema_to_json(
+    schema: &ValidatedConfigSchema,
+) -> Result<String, SchemaSerializationError> {
+    let protocol = carina_core::protocol_convert::config_schema_to_protocol(schema)
+        .map_err(SchemaSerializationError::Convert)?;
+    serde_json::to_string(&protocol).map_err(SchemaSerializationError::Json)
+}
+
+/// Schemas and validator dispatch captured once from an SDK provider.
+///
+/// The aggregate constructor rejects a semantic identity reused with a
+/// different primitive scalar kind anywhere in the provider's resource or
+/// config schemas.
+pub struct ProviderSchemaCache {
+    schemas: Vec<ValidatedResourceSchema>,
+    config: ValidatedConfigSchema,
+    custom_type_dispatch: carina_core::provider::CustomTypeDispatchTable,
+}
+
+impl ProviderSchemaCache {
+    pub fn from_provider<P: CarinaProvider + ?Sized>(
+        provider: &P,
+    ) -> Result<Self, carina_core::provider::CustomTypeDispatchTableError> {
+        let schemas = provider.schemas();
+        let config = provider.provider_config_attribute_types();
+        let custom_type_dispatch =
+            carina_core::provider::CustomTypeDispatchTable::build(&schemas, &config)?;
+        Ok(Self {
+            schemas,
+            config,
+            custom_type_dispatch,
+        })
+    }
+
+    pub fn schemas(&self) -> &[ValidatedResourceSchema] {
+        &self.schemas
+    }
+
+    pub fn config(&self) -> &ValidatedConfigSchema {
+        &self.config
+    }
+}
+
+/// Dispatch one identity bridge call through the cached table.
+///
+/// The validated provider schemas determine the scalar kind. The version-12
+/// guest ABI deliberately carries only the identity and canonical text.
+pub fn dispatch_custom_type_validation(
+    cache: &ProviderSchemaCache,
+    identity: &TypeIdentity,
+    canonical_text: &str,
+) -> Result<(), String> {
+    let core_identity = carina_core::schema::TypeIdentity::new(
+        (!identity.provider.is_empty()).then(|| identity.provider.clone()),
+        identity.segments.clone(),
+        identity.kind.clone(),
+    );
+    cache
+        .custom_type_dispatch
+        .dispatch(&core_identity, canonical_text)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOp {
@@ -714,14 +832,14 @@ pub trait CarinaProvider {
     }
 
     /// Return all resource schemas this provider supports.
-    fn schemas(&self) -> Vec<ResourceSchema>;
+    fn schemas(&self) -> Vec<ValidatedResourceSchema>;
 
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
     /// against their declared types *before* calling [`validate_config`].
     /// This keeps format validation on the host side so fixes in
     /// `carina-core` take effect without rebuilding provider binaries.
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType>;
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema;
 
     /// Validate provider-specific configuration semantics not expressible
     /// in the attribute type schema. Host-side type validation has
@@ -872,17 +990,6 @@ pub trait CarinaProvider {
         vec![]
     }
 
-    /// Validate a value against a provider-defined custom type.
-    /// Returns `Ok(())` if the value is valid or the type is unknown.
-    /// Returns `Err(message)` if the value is invalid for the given type.
-    ///
-    /// `identity` is the structured [`TypeIdentity`] of the type, so a
-    /// provider matches on the discrete axes instead of splitting a
-    /// flat name string.
-    fn validate_custom_type(&self, _identity: &TypeIdentity, _value: &str) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Normalize desired resources (optional).
     fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
         Ok(resources)
@@ -960,6 +1067,28 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_admission_rejects_a_closed_enum_transform_before_guest_serialization() {
+        let error = carina_core::schema::ResourceSchema::new("test.Widget")
+            .attribute(
+                carina_core::schema::AttributeSchema::optional(
+                    "mode",
+                    carina_core::schema::AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::new(Some("test"), ["widget"], "Mode"),
+                        Some(vec!["api-value".to_string()]),
+                        Vec::new(),
+                        None,
+                        Some(carina_core::schema::DslTransform::HyphenToUnderscore),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect_err("a validated schema must always be projectable to protocol v12");
+
+        assert!(error.to_string().contains("protocol v12"), "{error}");
+    }
 
     #[test]
     fn never_token_decode_always_fails() {

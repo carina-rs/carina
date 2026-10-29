@@ -264,6 +264,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
 }
 
 pub fn run_validate(
+    user_dirs: &carina_core::UserDirs,
     path: &Path,
     json: bool,
     provider_context: &ProviderContext,
@@ -301,14 +302,14 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let (factories, load_errors) = match build_factories_from_providers(&parsed.providers, base_dir)
-    {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            error_reports.push(error.to_string());
-            (Vec::new(), Default::default())
-        }
-    };
+    let (factories, load_errors) =
+        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                error_reports.push(error.to_string());
+                (Vec::new(), Default::default())
+            }
+        };
     let ctx = WiringContext::new(factories, &parsed.providers);
     let validation_errors = super::validate_and_resolve_errors_with_context(
         &mut parsed,

@@ -136,7 +136,6 @@ impl DiagnosticEngine {
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
         known_provider_names: HashSet<String>,
     ) -> Self {
-        let factories_clone = Arc::clone(&factories);
         // carina#3239 gate: the strict "unknown custom type in type
         // position" parser check requires the project to actually
         // *have* a provider surface to compare against. The LSP
@@ -155,33 +154,17 @@ impl DiagnosticEngine {
         // load error and the unknown-custom-type error together
         // instead of having the carina#3239 fix silently masked by an
         // unrelated install failure.
-        let customs_loaded = !provider_names.is_empty();
+        let has_loaded_providers = !provider_names.is_empty();
+        let custom_types = if has_loaded_providers {
+            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories))
+        } else {
+            carina_core::parser::ProviderCustomTypes::default()
+        };
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
-            validators: carina_core::provider::collect_custom_type_validators(&schemas),
-            custom_type_attribute_types: carina_core::provider::collect_custom_type_attribute_types(
-                &schemas,
-            ),
-            custom_type_validator: Some(Box::new(
-                move |identity: &carina_core::schema::TypeIdentity,
-                      value: &carina_core::provider::CanonicalCustomTypeValue| {
-                    for factory in factories_clone.iter() {
-                        factory
-                            .validate_custom_type(identity, value)
-                            .map_err(|error| {
-                                if error.detail().provider_name.is_some() {
-                                    error
-                                } else {
-                                    error.for_provider(factory.name())
-                                }
-                            })?;
-                    }
-                    Ok(())
-                },
-            )),
+            custom_types,
             resource_types:
                 carina_core::parser::ProviderContext::resource_types_from_schema_registry(&schemas),
-            customs_loaded,
         };
         Self {
             schemas,
@@ -393,14 +376,14 @@ impl DiagnosticEngine {
         //
         // 2. The buffer-only parse (`doc.parsed()`) — load-bearing
         //    fallback when the merged parse failed. The merged parse
-        //    uses the enriched `customs_loaded=true` context, so the
+        //    uses the enriched `ProviderCustomTypes::Loaded` context, so the
         //    parser's strict gate raises `ParseError::InvalidExpression`
         //    on the very unknown-type-name shape we want to report.
         //    `parse_merged_with_buffer` returns that directory error; the
         //    owner-aware path above surfaces errors from the current file,
         //    while this fallback still handles shapes found only in the
         //    bootstrap AST. The buffer-only parse uses the bootstrap context
-        //    (`customs_loaded=false`), so it always succeeds and
+        //    (`ProviderCustomTypes::Unloaded`), so it always succeeds and
         //    `doc.parsed()` is `Some`, letting the walker still run
         //    against the user's in-flight edits.
         //
@@ -418,13 +401,13 @@ impl DiagnosticEngine {
         // a span — we accept the same trade-off here so the LSP
         // reaches CLI parity in this PR; precise spans can land as a
         // follow-up.
-        // Gate on `customs_loaded`. The walker itself is unconditional
+        // Gate on the custom-type load state. The walker itself is unconditional
         // by design (the carina-core helper "always reports unknowns;
         // gating is the caller's choice"); the orphaned-file
         // fallback context turns this flag off so its diagnostics
         // don't over-fire for `arguments {}` blocks in files outside
         // any known project root.
-        if self.provider_context.customs_loaded {
+        if self.provider_context.custom_types_loaded() {
             let custom_type_findings = match merged {
                 Some(m) => {
                     let mut parsed = m.clone();
@@ -854,8 +837,6 @@ impl DiagnosticEngine {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
-                    let mut provider_errors_reported_at_attribute_level = HashSet::new();
-
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_attr_value) {
                             resolved_resource_attributes
@@ -1108,71 +1089,30 @@ impl DiagnosticEngine {
                                         reshaped.to_string()
                                     })
                                 }
+                                // The shared whole-schema pass below validates identified
+                                // scalars with the owner-bound lookup. Doing it here as well
+                                // would execute native or bridged callbacks twice per edit.
                                 (
                                     carina_core::schema::Shape::String {
-                                        identity: Some(identity),
-                                        validate,
+                                        identity: Some(_identity),
                                         ..
                                     },
-                                    value,
+                                    _value,
                                 )
                                 | (
                                     carina_core::schema::Shape::Int {
-                                        identity: Some(identity),
-                                        validate,
+                                        identity: Some(_identity),
                                         ..
                                     },
-                                    value,
+                                    _value,
                                 )
                                 | (
                                     carina_core::schema::Shape::Float {
-                                        identity: Some(identity),
-                                        validate,
+                                        identity: Some(_identity),
                                         ..
                                     },
-                                    value,
-                                ) => {
-                                    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply — skip,
-                                    // matching the CLI's `walk_custom_lookup` behavior.
-                                    if matches!(
-                                        value,
-                                        carina_core::resource::Value::Deferred(
-                                            carina_core::resource::DeferredValue::Unknown(_)
-                                        )
-                                    ) {
-                                        None
-                                    } else {
-                                        // Structural Custom: values reach the validator
-                                        // verbatim. Enum has its own arm below — the
-                                        // pre-#3222 `namespace.is_some()` gate is now a
-                                        // type-level split.
-                                        let lookup = carina_core::parser::provider_context_lookup(
-                                            &self.provider_context,
-                                        );
-                                        validate
-                                            .and_then(|validator| validator(value).err())
-                                            .or_else(|| lookup(identity, value).err())
-                                            .and_then(|inner_err| {
-                                                if !provider_validation_deduplicator
-                                                    .should_emit_type_error(&inner_err)
-                                                {
-                                                    return None;
-                                                }
-                                                let message = inner_err.to_string();
-                                                if matches!(
-                                                    inner_err,
-                                                    TypeError::ProviderValidationFailed { .. }
-                                                ) {
-                                                    provider_errors_reported_at_attribute_level
-                                                        .insert((
-                                                            canonical_name.to_string(),
-                                                            message.clone(),
-                                                        ));
-                                                }
-                                                Some(message)
-                                            })
-                                    }
-                                }
+                                    _value,
+                                ) => None,
                                 // Validate List item types (non-Struct items only;
                                 // List<Struct> is handled by validate_struct_value below).
                                 // Use `Shape` on the inner so a
@@ -1295,51 +1235,18 @@ impl DiagnosticEngine {
                             *value = evaluated;
                         }
                     }
-                    let lookup =
-                        carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
                         |attr: &str| resource_quoted_string_attrs.contains(attr);
-                    if let Err(errors) = validated_schema.validate_with_origins_and_lookup(
+                    if let Err(errors) = validated_schema.validate_with_resolver(
                         &resolved_attrs,
                         &is_string_literal,
-                        &lookup,
+                        self.provider_context.custom_type_resolver(),
                     ) {
                         for error in errors {
                             if !provider_validation_deduplicator.should_emit_type_error(&error) {
                                 continue;
                             }
-                            if let TypeError::ProviderValidationFailed {
-                                attribute: Some(attribute),
-                                ..
-                            } = &error
-                                && provider_errors_reported_at_attribute_level
-                                    .contains(&(attribute.clone(), error.to_string()))
-                            {
-                                continue;
-                            }
-                            let deferred_attribute = match &error {
-                                TypeError::ProviderValidationFailed { attribute, .. }
-                                | TypeError::ResourceValidationFailed { attribute, .. } => {
-                                    attribute.as_deref()
-                                }
-                                TypeError::TypeMismatch { .. }
-                                | TypeError::InvalidEnumVariant { .. }
-                                | TypeError::PatternMismatch { .. }
-                                | TypeError::LengthOutOfRange { .. }
-                                | TypeError::StringLiteralExpectedEnum { .. }
-                                | TypeError::ValidationFailed { .. }
-                                | TypeError::MissingRequired { .. }
-                                | TypeError::ReadOnlyAttribute { .. }
-                                | TypeError::UnknownAttribute { .. }
-                                | TypeError::UnknownStructField { .. }
-                                | TypeError::UnionStructMismatch { .. }
-                                | TypeError::UnionAlternativesMismatch { .. }
-                                | TypeError::ListItemError { .. }
-                                | TypeError::MapKeyError { .. }
-                                | TypeError::MapValueError { .. }
-                                | TypeError::StructFieldError { .. }
-                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
-                            };
+                            let deferred_attribute = error.attribute_name();
                             if deferred_attribute.is_some_and(|attribute| {
                                 matches!(
                                     resource_attributes.get(attribute),
@@ -1361,7 +1268,6 @@ impl DiagnosticEngine {
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
                                         | carina_core::schema::TypeError::TypeMismatch { .. }
                                         | carina_core::schema::TypeError::InvalidEnumVariant { .. }
-                                        | carina_core::schema::TypeError::ValidationFailed { .. }
                                         | carina_core::schema::TypeError::UnknownStructField { .. }
                                         | carina_core::schema::TypeError::UnionStructMismatch { .. }
                                         | carina_core::schema::TypeError::UnionAlternativesMismatch { .. }
@@ -1372,34 +1278,12 @@ impl DiagnosticEngine {
                             {
                                 continue;
                             }
-                            // Try attribute-level position first, fall back to resource position
-                            let position = match &error {
-                                TypeError::ProviderValidationFailed { attribute, .. }
-                                | TypeError::ResourceValidationFailed { attribute, .. } => {
-                                    attribute.as_deref().and_then(|attr| {
-                                        self.find_attribute_position(doc, attr, scope)
-                                    })
-                                }
-                                TypeError::ReadOnlyAttribute { name } => {
-                                    self.find_attribute_position(doc, name, scope)
-                                }
-                                TypeError::TypeMismatch { .. }
-                                | TypeError::InvalidEnumVariant { .. }
-                                | TypeError::PatternMismatch { .. }
-                                | TypeError::LengthOutOfRange { .. }
-                                | TypeError::StringLiteralExpectedEnum { .. }
-                                | TypeError::ValidationFailed { .. }
-                                | TypeError::MissingRequired { .. }
-                                | TypeError::UnknownAttribute { .. }
-                                | TypeError::UnknownStructField { .. }
-                                | TypeError::UnionStructMismatch { .. }
-                                | TypeError::UnionAlternativesMismatch { .. }
-                                | TypeError::ListItemError { .. }
-                                | TypeError::MapKeyError { .. }
-                                | TypeError::MapValueError { .. }
-                                | TypeError::StructFieldError { .. }
-                                | TypeError::BlockSyntaxNotAllowed { .. } => None,
-                            };
+                            // Structured type errors carry the authored attribute through
+                            // container wrappers; fall back to the resource only when the
+                            // error genuinely has no attribute provenance.
+                            let position = error
+                                .attribute_name()
+                                .and_then(|attr| self.find_attribute_position(doc, attr, scope));
                             let position = position.or_else(|| {
                                 self.find_resource_type_position(
                                     doc,
@@ -1435,7 +1319,7 @@ impl DiagnosticEngine {
                     diagnostics.extend(self.check_list_struct_syntax(
                         doc,
                         &resolved_attrs,
-                        validated_schema,
+                        validated_schema.schema(),
                     ));
                 }
             }

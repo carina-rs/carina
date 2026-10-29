@@ -8,7 +8,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
-use super::{AllowListHttpHooks, ProviderKind, build_sandboxed_wasi_ctx};
+use super::{AllowListHttpHooks, HttpTestRoute, ProviderKind, build_sandboxed_wasi_ctx};
 
 /// Period between increments of the wasmtime engine epoch.
 pub(super) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -177,8 +177,19 @@ impl GuestStore {
         limits: StoreLimits,
         budget: GuestCallBudget,
     ) -> Self {
+        Self::new_with_http_test_route(engine, provider_kind, http_ctx, limits, budget, None)
+    }
+
+    pub(super) fn new_with_http_test_route(
+        engine: &Engine,
+        provider_kind: Option<ProviderKind>,
+        http_ctx: Option<WasiHttpCtx>,
+        limits: StoreLimits,
+        budget: GuestCallBudget,
+        http_test_route: Option<HttpTestRoute>,
+    ) -> Self {
         let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
-        let http_hooks = AllowListHttpHooks::new(provider_kind);
+        let http_hooks = AllowListHttpHooks::with_test_route(provider_kind, http_test_route);
         let host_state = HostState {
             wasi_ctx,
             http_ctx,

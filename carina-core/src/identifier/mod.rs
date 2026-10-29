@@ -385,7 +385,7 @@ pub fn resolve_attr_prefixes(
 
     for resource in resources.iter_mut() {
         let schema = match registry.get_for(resource) {
-            Some(schema) => schema.as_schema(),
+            Some(schema) => schema.schema().as_schema(),
             None => continue, // Unknown resource type; validate_resources will catch this
         };
 

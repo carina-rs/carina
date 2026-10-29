@@ -3904,33 +3904,41 @@ fn test_argument_type_mismatch_string_for_bool() {
 
 #[test]
 fn test_argument_type_custom_validator() {
-    use crate::parser::ValidatorFn;
-
     // Create a ProviderContext with a custom "arn" validator
-    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
-    validators.insert(
-        TypeIdentity::bare("Arn"),
-        Box::new(|s: &str| {
-            if s.starts_with("arn:") {
-                Ok(())
-            } else {
-                Err(format!("expected ARN format, got '{}'", s))
-            }
-        }),
-    );
+    let identity = TypeIdentity::bare("Arn");
+    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let validator_identity = identity.clone();
     let config = ProviderContext {
-        decryptor: None,
-        validators,
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([owned.clone()]),
+            Box::new(move |target, value| {
+                if target.identity() != &validator_identity {
+                    return Ok(());
+                }
+                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                    return Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        "Expected string",
+                    ));
+                };
+                let s = s.expose_plaintext();
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        format!("expected ARN format, got '{s}'"),
+                    ))
+                }
+            }),
+        ),
+        ..ProviderContext::default()
     };
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
-        type_expr: TypeExpr::Simple("arn".to_string()),
+        type_expr: TypeExpr::SchemaType { owned },
         default: None,
         description: None,
         validations: Vec::new(),
@@ -3979,32 +3987,40 @@ fn test_argument_type_custom_validator() {
 
 #[test]
 fn test_argument_type_list_of_custom_type() {
-    use crate::parser::ValidatorFn;
-
-    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
-    validators.insert(
-        TypeIdentity::bare("Arn"),
-        Box::new(|s: &str| {
-            if s.starts_with("arn:") {
-                Ok(())
-            } else {
-                Err(format!("expected ARN format, got '{}'", s))
-            }
-        }),
-    );
+    let identity = TypeIdentity::bare("Arn");
+    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let validator_identity = identity.clone();
     let config = ProviderContext {
-        decryptor: None,
-        validators,
-        custom_type_attribute_types: HashMap::new(),
-        custom_type_validator: None,
-        resource_types: Default::default(),
-        customs_loaded: false,
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([owned.clone()]),
+            Box::new(move |target, value| {
+                if target.identity() != &validator_identity {
+                    return Ok(());
+                }
+                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                    return Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        "Expected string",
+                    ));
+                };
+                let s = s.expose_plaintext();
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(crate::parser::fixture_custom_type_rejection(
+                        target,
+                        format!("expected ARN format, got '{s}'"),
+                    ))
+                }
+            }),
+        ),
+        ..ProviderContext::default()
     };
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7048,5 +7064,40 @@ fn argument_type_mismatch_error_shows_canonical_enum_value() {
     assert!(
         msg.contains("got canonical enum aws.foo.Bar.baz"),
         "error should include the canonical enum value; got: {msg}"
+    );
+}
+
+#[test]
+fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
+    let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+    let context = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([
+                crate::parser::OwnedTypeIdentity::provider("aws", identity.clone()),
+                crate::parser::OwnedTypeIdentity::provider("awscc", identity),
+            ]),
+            Box::new(|target, _value| {
+                Err(
+                    crate::parser::CustomTypeValidationError::MissingDeclaration {
+                        owner: "fixture".to_string(),
+                        identity: target.identity().clone(),
+                    },
+                )
+            }),
+        ),
+        ..ProviderContext::default()
+    };
+    let parsed = crate::parser::parse(
+        "arguments {\n  roles: list(aws.iam.Role.Arn)\n}\n",
+        &ProviderContext::default(),
+    )
+    .expect("module signature fixture must parse");
+
+    let signature = super::signature::resolved_signature(&parsed, &context);
+    let resolved = &signature.arguments[0].type_expr;
+
+    assert!(
+        matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
     );
 }

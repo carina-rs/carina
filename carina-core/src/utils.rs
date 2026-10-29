@@ -605,7 +605,7 @@ pub(crate) fn lift_saved_state_enum_leaves(
             crate::schema::SchemaKind::Resource,
         ) {
             lift_state_enum_leaves(attrs, schema.as_schema());
-            crate::value::canonicalize_state_attribute_map_with_schema(attrs, schema);
+            crate::value::canonicalize_state_attribute_map_with_schema(attrs, schema.schema());
         }
     }
 }

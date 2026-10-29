@@ -128,7 +128,7 @@ pub fn validate_wait_bindings<E>(
         if let Err(error) = resolve_wait_predicate(
             &wb.until_predicate.lhs_segments,
             wb.until_predicate.rhs.clone(),
-            Some(schema),
+            Some(schema.schema()),
         ) {
             let attribute = wb
                 .until_predicate

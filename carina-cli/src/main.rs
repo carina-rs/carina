@@ -359,15 +359,16 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
                 })
             })
         })),
-        validators: std::collections::HashMap::new(),
-        custom_type_attribute_types: std::collections::HashMap::new(),
-        custom_type_validator: None,
         resource_types: Default::default(),
-        // Schemas not yet loaded — early-parse runs before
-        // `enrich_provider_context` populates the validator set, so the
-        // carina#3239 strict check is deferred to that later context.
-        customs_loaded: false,
+        ..carina_core::parser::ProviderContext::default()
     }
+}
+
+fn resolve_user_dirs() -> Result<carina_core::UserDirs, error::AppError> {
+    // Home discovery is intentionally confined to this binary boundary and
+    // invoked only by command arms that use user-owned storage.
+    #[expect(clippy::disallowed_methods)]
+    carina_core::UserDirs::from_real_home().map_err(Into::into)
 }
 
 #[tokio::main]
@@ -434,7 +435,12 @@ async fn main() {
             strict_iam,
         } = cli.command
         {
+            let user_dirs = match resolve_user_dirs() {
+                Ok(user_dirs) => user_dirs,
+                Err(error) => return CommandCompletion::Error(error),
+            };
             match run_plan(
+                &user_dirs,
                 &path,
                 out.as_deref(),
                 plan_images.file(),
@@ -461,156 +467,210 @@ async fn main() {
             }
         }
 
-        let result = match cli.command {
-            Commands::Validate { path, json } => run_validate(&path, json, &provider_context),
-            Commands::Plan { .. } => unreachable!(),
-            Commands::Apply {
-                path,
-                auto_approve,
-                lock,
-                parallelism,
-                accept_legacy_name_overrides,
-            } => match classify_apply_input(&path) {
-                Ok(ApplyInput::SavedPlan(plan_path)) => {
-                    run_apply_from_plan(
-                        plan_path,
-                        auto_approve,
-                        lock,
-                        parallelism,
-                        accept_legacy_name_overrides,
-                        &provider_context,
-                        shutdown.clone(),
-                    )
-                    .await
+        let result: Result<(), error::AppError> = async {
+            match cli.command {
+                Commands::Validate { path, json } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    run_validate(&user_dirs, &path, json, &provider_context)
                 }
-                Ok(ApplyInput::Project(project_path)) => run_apply(
-                    project_path,
+                Commands::Plan { .. } => unreachable!(),
+                Commands::Apply {
+                    path,
                     auto_approve,
                     lock,
                     parallelism,
                     accept_legacy_name_overrides,
-                    &provider_context,
-                    shutdown.clone(),
-                )
-                .await
-                .map_err(|error| error.with_project_dir(project_path)),
-                Err(error) => Err(error),
-            },
-            Commands::Destroy {
-                path,
-                auto_approve,
-                lock,
-                refresh,
-                force,
-                parallelism,
-            } => run_destroy(
-                &path,
-                auto_approve,
-                lock,
-                refresh,
-                force,
-                parallelism,
-                &provider_context,
-                shutdown.clone(),
-            )
-            .await
-            .map_err(|error| error.with_project_dir(&path)),
-            Commands::Export {
-                name,
-                json,
-                raw,
-                state_url,
-            } => {
-                let format = if raw {
-                    commands::export::OutputFormat::Raw
-                } else if json {
-                    commands::export::OutputFormat::Json
-                } else {
-                    commands::export::OutputFormat::Human
-                };
-                let path = PathBuf::from(".");
-                commands::export::run_export(
-                    &path,
-                    state_url.as_deref(),
+                } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    match classify_apply_input(&path) {
+                        Ok(ApplyInput::SavedPlan(plan_path)) => {
+                            run_apply_from_plan(
+                                &user_dirs,
+                                plan_path,
+                                auto_approve,
+                                lock,
+                                parallelism,
+                                accept_legacy_name_overrides,
+                                &provider_context,
+                                shutdown.clone(),
+                            )
+                            .await
+                        }
+                        Ok(ApplyInput::Project(project_path)) => run_apply(
+                            &user_dirs,
+                            project_path,
+                            auto_approve,
+                            lock,
+                            parallelism,
+                            accept_legacy_name_overrides,
+                            &provider_context,
+                            shutdown.clone(),
+                        )
+                        .await
+                        .map_err(|error| error.with_project_dir(project_path)),
+                        Err(error) => Err(error),
+                    }
+                }
+                Commands::Destroy {
+                    path,
+                    auto_approve,
+                    lock,
+                    refresh,
+                    force,
+                    parallelism,
+                } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    run_destroy(
+                        &user_dirs,
+                        &path,
+                        auto_approve,
+                        lock,
+                        refresh,
+                        force,
+                        parallelism,
+                        &provider_context,
+                        shutdown.clone(),
+                    )
+                    .await
+                    .map_err(|error| error.with_project_dir(&path))
+                }
+                Commands::Export {
                     name,
-                    format,
-                    &provider_context,
-                )
-                .await
-                .map_err(|error| error.with_project_dir(&path))
-            }
-            Commands::Fmt {
-                path,
-                check,
-                diff,
-                recursive,
-            } => run_fmt(&path, FmtMode::from_flags(check, diff), recursive),
-            Commands::Module { command } => run_module_command(command, &provider_context),
-            Commands::ForceUnlock { lock_id, path } => {
-                run_force_unlock(&lock_id, &path, &provider_context).await
-            }
-            Commands::State { command } => {
-                let project_dir = command.project_dir().map(Path::to_path_buf);
-                let result = run_state_command(command, &provider_context, shutdown.clone()).await;
-                match project_dir {
-                    Some(project_dir) => {
-                        result.map_err(|error| error.with_project_dir(&project_dir))
+                    json,
+                    raw,
+                    state_url,
+                } => {
+                    let format = if raw {
+                        commands::export::OutputFormat::Raw
+                    } else if json {
+                        commands::export::OutputFormat::Json
+                    } else {
+                        commands::export::OutputFormat::Human
+                    };
+                    let path = PathBuf::from(".");
+                    commands::export::run_export(
+                        &path,
+                        state_url.as_deref(),
+                        name,
+                        format,
+                        &provider_context,
+                    )
+                    .await
+                    .map_err(|error| error.with_project_dir(&path))
+                }
+                Commands::Fmt {
+                    path,
+                    check,
+                    diff,
+                    recursive,
+                } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    run_fmt(
+                        &user_dirs,
+                        &path,
+                        FmtMode::from_flags(check, diff),
+                        recursive,
+                    )
+                }
+                Commands::Module { command } => run_module_command(command, &provider_context),
+                Commands::ForceUnlock { lock_id, path } => {
+                    run_force_unlock(&lock_id, &path, &provider_context).await
+                }
+                Commands::State { command } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    let project_dir = command.project_dir().map(Path::to_path_buf);
+                    let result =
+                        run_state_command(&user_dirs, command, &provider_context, shutdown.clone())
+                            .await;
+                    match project_dir {
+                        Some(project_dir) => {
+                            result.map_err(|error| error.with_project_dir(&project_dir))
+                        }
+                        None => result,
                     }
-                    None => result,
+                }
+                Commands::Providers { command } => run_providers_command(command),
+                Commands::Init {
+                    path,
+                    upgrade,
+                    locked,
+                    migrate_state,
+                    force,
+                } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    commands::init::run_init(
+                        &user_dirs,
+                        &path,
+                        upgrade,
+                        locked,
+                        migrate_state,
+                        force,
+                    )
+                    .await
+                    .map_err(error::AppError::from)
+                    .map_err(|error| error.with_project_dir(&path))
+                }
+                Commands::Lint { path } => {
+                    let user_dirs = resolve_user_dirs()?;
+                    run_lint(&user_dirs, &path, &provider_context)
+                }
+                Commands::Completions { shell } => {
+                    generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
+                    Ok(())
+                }
+                Commands::Skills { command } => {
+                    let output = match command {
+                        SkillsCommands::List => Ok(skills::run_skills_list()),
+                        SkillsCommands::Install => {
+                            let user_dirs = resolve_user_dirs()?;
+                            skills::run_skills_install(&user_dirs)
+                        }
+                        SkillsCommands::Update => {
+                            let user_dirs = resolve_user_dirs()?;
+                            skills::run_skills_update(&user_dirs)
+                        }
+                        SkillsCommands::Reinstall => {
+                            let user_dirs = resolve_user_dirs()?;
+                            skills::run_skills_reinstall(&user_dirs)
+                        }
+                        SkillsCommands::Uninstall => {
+                            let user_dirs = resolve_user_dirs()?;
+                            skills::run_skills_uninstall(&user_dirs)
+                        }
+                        SkillsCommands::Status => {
+                            let user_dirs = resolve_user_dirs()?;
+                            skills::run_skills_status(&user_dirs)
+                        }
+                    };
+                    match output {
+                        Ok(text) => {
+                            println!("{text}");
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Commands::Docs { list, search, name } => {
+                    let output: Result<String, error::AppError> = if list {
+                        Ok(docs::run_docs_list())
+                    } else if let Some(query) = search {
+                        Ok(docs::run_docs_search(&query))
+                    } else if let Some(doc_name) = name {
+                        docs::run_docs_show(&doc_name)
+                    } else {
+                        Ok(docs::run_docs_default())
+                    };
+                    match output {
+                        Ok(text) => {
+                            println!("{text}");
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             }
-            Commands::Providers { command } => run_providers_command(command),
-            Commands::Init {
-                path,
-                upgrade,
-                locked,
-                migrate_state,
-                force,
-            } => commands::init::run_init(&path, upgrade, locked, migrate_state, force)
-                .await
-                .map_err(error::AppError::from)
-                .map_err(|error| error.with_project_dir(&path)),
-            Commands::Lint { path } => run_lint(&path, &provider_context),
-            Commands::Completions { shell } => {
-                generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
-                Ok(())
-            }
-            Commands::Skills { command } => {
-                let output = match command {
-                    SkillsCommands::List => Ok(skills::run_skills_list()),
-                    SkillsCommands::Install => skills::run_skills_install(),
-                    SkillsCommands::Update => skills::run_skills_update(),
-                    SkillsCommands::Reinstall => skills::run_skills_reinstall(),
-                    SkillsCommands::Uninstall => skills::run_skills_uninstall(),
-                    SkillsCommands::Status => skills::run_skills_status(),
-                };
-                match output {
-                    Ok(text) => {
-                        println!("{text}");
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Commands::Docs { list, search, name } => {
-                let output: Result<String, error::AppError> = if list {
-                    Ok(docs::run_docs_list())
-                } else if let Some(query) = search {
-                    Ok(docs::run_docs_search(&query))
-                } else if let Some(doc_name) = name {
-                    docs::run_docs_show(&doc_name)
-                } else {
-                    Ok(docs::run_docs_default())
-                };
-                match output {
-                    Ok(text) => {
-                        println!("{text}");
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        };
+        }
+        .await;
 
         match result {
             Ok(()) => CommandCompletion::Success,

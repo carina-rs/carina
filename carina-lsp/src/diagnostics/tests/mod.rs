@@ -219,16 +219,16 @@ impl ProviderFactory for SuspendedValidationFactory {
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-        use carina_core::resource::Value;
-        use carina_core::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
-        };
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
-        let probe = AttributeType::refined_string_with_validator(
-            TypeIdentity::new(Some("mock"), ["test", "resource"], "Probe"),
+        let probe = AttributeType::refined_string(
+            Some(TypeIdentity::new(
+                Some("mock"),
+                ["test", "resource"],
+                "Probe",
+            )),
             None,
             None,
-            legacy_validator(|_value: &Value| Ok(())),
             None,
         );
         vec![
@@ -315,16 +315,14 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-        use carina_core::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
-        };
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
         let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
-        let custom = AttributeType::refined_string_with_validator(
+        let custom = AttributeType::enum_(
             identity,
+            Some(vec!["ENABLED".to_string()]),
+            vec![("ENABLED".to_string(), "enabled".to_string())],
             None,
-            None,
-            legacy_validator(|_| Ok(())),
             None,
         );
         vec![
@@ -338,30 +336,208 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
 
 pub(super) fn test_engine_with_enum_declared_custom_type()
 -> (DiagnosticEngine, Arc<std::sync::Mutex<Vec<String>>>) {
-    use carina_core::schema::{AttributeType, TypeIdentity};
-
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumDeclaredCustomTypeFactory {
         seen: Arc::clone(&seen),
     })];
     let schemas = Arc::new(provider_mod::collect_schemas(&factories));
-    let mut engine = DiagnosticEngine::new(
+    let engine = DiagnosticEngine::new(
         Arc::clone(&schemas),
         vec!["mock".to_string()],
         Arc::new(factories),
     );
-    let identity = TypeIdentity::new(Some("mock"), ["shared"], "Mode");
-    engine.provider_context.custom_type_attribute_types.insert(
-        identity.clone(),
-        AttributeType::enum_(
-            identity,
-            Some(vec!["ENABLED".to_string()]),
-            vec![("ENABLED".to_string(), "enabled".to_string())],
-            None,
-            None,
-        ),
-    );
     (engine, seen)
+}
+
+struct SharedRoleArnFactory {
+    name: &'static str,
+    accepted: &'static str,
+}
+
+impl ProviderFactory for SharedRoleArnFactory {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn display_name(&self) -> &str {
+        self.name
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        identity: &carina_core::schema::TypeIdentity,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        assert_eq!(
+            identity,
+            &carina_core::schema::TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")
+        );
+        (value.as_str() == self.accepted)
+            .then_some(())
+            .ok_or_else(|| {
+                carina_core::provider::ProviderError::invalid_input(format!(
+                    "{} rejects `{}`",
+                    self.name,
+                    value.as_str()
+                ))
+            })
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+    > {
+        unimplemented!("diagnostics tests do not construct providers")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+        vec![
+            ResourceSchema::new("iam.Role")
+                .attribute(
+                    AttributeSchema::optional(
+                        "arn",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("shared Role ARN schema must validate"),
+        ]
+    }
+}
+
+pub(super) fn shared_role_arn_engine(awscc_accepted: &'static str) -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![
+        Box::new(SharedRoleArnFactory {
+            name: "aws",
+            accepted: "arn:accepted",
+        }),
+        Box::new(SharedRoleArnFactory {
+            name: "awscc",
+            accepted: awscc_accepted,
+        }),
+    ];
+    let schemas = Arc::new(provider_mod::collect_schemas(&factories));
+    DiagnosticEngine::new(
+        schemas,
+        vec!["aws".to_string(), "awscc".to_string()],
+        Arc::new(factories),
+    )
+}
+
+struct BareTypeFactory;
+
+impl ProviderFactory for BareTypeFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "test"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        identity: &carina_core::schema::TypeIdentity,
+        _value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        assert_eq!(
+            identity,
+            &carina_core::schema::TypeIdentity::bare("TestToken")
+        );
+        Err(carina_core::provider::ProviderError::invalid_input(
+            "bare token rejected by its owner",
+        ))
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+    > {
+        unimplemented!("diagnostics tests do not construct providers")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+        vec![
+            ResourceSchema::new("test.Token")
+                .attribute(
+                    AttributeSchema::optional(
+                        "value",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::bare("TestToken")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("bare custom type schema must validate"),
+        ]
+    }
+}
+
+pub(super) fn bare_type_engine() -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(BareTypeFactory)];
+    DiagnosticEngine::new(
+        Arc::new(provider_mod::collect_schemas(&factories)),
+        vec!["test".to_string()],
+        Arc::new(factories),
+    )
 }
 
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {
@@ -460,7 +636,7 @@ pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine 
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
+    custom_engine(schemas)
 }
 
 pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
@@ -659,12 +835,78 @@ pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
     )
 }
 
+struct SchemaFixtureFactory {
+    name: String,
+    schemas: Vec<carina_core::schema::ValidatedResourceSchema>,
+}
+
+impl ProviderFactory for SchemaFixtureFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        &self.name
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+    > {
+        unimplemented!("schema fixture factories do not construct providers")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        self.schemas.clone()
+    }
+}
+
 pub(super) fn custom_engine(schemas: SchemaRegistry) -> DiagnosticEngine {
-    let provider_names: Vec<String> = schemas
-        .iter()
-        .map(|(provider, _, _, _)| provider.to_string())
-        .collect::<std::collections::HashSet<_>>()
+    let mut schemas_by_owner = std::collections::HashMap::<
+        String,
+        Vec<carina_core::schema::ValidatedResourceSchema>,
+    >::new();
+    for (owner, _resource_type, _kind, schema) in schemas.iter() {
+        schemas_by_owner
+            .entry(owner.to_string())
+            .or_default()
+            .push(schema.clone());
+    }
+    let factories = schemas_by_owner
         .into_iter()
+        .map(|(name, schemas)| {
+            Box::new(SchemaFixtureFactory { name, schemas }) as Box<dyn ProviderFactory>
+        })
+        .collect::<Vec<_>>();
+    let provider_names = factories
+        .iter()
+        .map(|factory| factory.name().to_string())
         .collect();
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
+    DiagnosticEngine::new(
+        Arc::new(provider_mod::collect_schemas(&factories)),
+        provider_names,
+        Arc::new(factories),
+    )
 }

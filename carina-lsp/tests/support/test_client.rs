@@ -2,7 +2,6 @@
 //! `tower_lsp` server backed by `carina_lsp::Backend`.
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_lsp::{LspService, Server};
@@ -29,11 +28,8 @@ impl TestClient {
         let (service, socket) = LspService::new(|client| {
             let provider_context = ProviderContext {
                 decryptor: None,
-                validators: HashMap::new(),
-                custom_type_attribute_types: HashMap::new(),
-                custom_type_validator: None,
                 resource_types: Default::default(),
-                customs_loaded: false,
+                ..ProviderContext::default()
             };
             Backend::new(client, provider_context, None)
         });

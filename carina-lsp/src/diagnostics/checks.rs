@@ -2731,12 +2731,20 @@ impl DiagnosticEngine {
                 if carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) {
                     return None;
                 }
-                // `Simple` annotations name a built-in custom type; key
-                // the validator lookup on the bare structured identity.
+                // The document's provisional parse has no provider context,
+                // so a registered bare provider type may still be a `Simple`
+                // node here. The authoritative directory parse promotes it to
+                // owner-bearing `SchemaType`; mirror only the recognition
+                // check here and never route validation by bare identity.
                 let identity = carina_core::schema::TypeIdentity::bare(
                     carina_core::parser::snake_to_pascal(name),
                 );
-                if self.provider_context.validators.contains_key(&identity) {
+                if self
+                    .provider_context
+                    .known_custom_types()
+                    .iter()
+                    .any(|owned| owned.identity() == &identity)
+                {
                     return None;
                 }
                 Some(format!("Unknown type '{name}'."))

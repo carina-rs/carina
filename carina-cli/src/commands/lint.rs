@@ -50,7 +50,11 @@ fn mixed_tag_key_style_warnings_for_population<E>(
     mixed_tag_key_style_warnings(&tag_keys)
 }
 
-pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
+pub fn run_lint(
+    user_dirs: &carina_core::UserDirs,
+    path: &Path,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -68,7 +72,7 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
     let (provider_factories, provider_factory_error) =
-        match build_factories_from_providers(&parsed.providers, base_dir) {
+        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
             Ok((factories, _)) => (factories, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -277,6 +281,7 @@ mod tests {
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let temp = tempfile::tempdir().unwrap();
         let module_dir = temp.path().join("broken");
         std::fs::create_dir_all(&module_dir).unwrap();
@@ -287,7 +292,7 @@ mod tests {
         .unwrap();
         std::fs::write(module_dir.join("main.crn"), "let =\n").unwrap();
 
-        let error = run_lint(temp.path(), &ProviderContext::default())
+        let error = run_lint(&user_dirs, temp.path(), &ProviderContext::default())
             .expect_err("invalid imported module syntax must fail lint");
         let rendered = error.to_string();
 

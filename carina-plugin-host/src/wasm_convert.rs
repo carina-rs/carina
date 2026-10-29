@@ -18,18 +18,17 @@ use carina_core::resource::{
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
     State as CoreState, Value as CoreValue,
 };
-use carina_core::schema::{
-    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
-    SchemaValidationIssueLocation as CoreSchemaValidationIssueLocation,
-    StructField as CoreStructField, TypeIdentity, UniqueNameSpec as CoreUniqueNameSpec,
-    ValidatedConfigSchema as CoreValidatedConfigSchema,
-    ValidatedResourceSchema as CoreValidatedResourceSchema,
-};
 #[cfg(test)]
 use carina_core::schema::{
-    AttributeSchemaParts as CoreAttributeSchemaParts,
-    ResourceSchemaParts as CoreResourceSchemaParts, StructFieldParts as CoreStructFieldParts,
+    AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
+    AttributeType as CoreAttributeType, InputMode as CoreInputMode,
+    ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
+    SchemaRegistry as CoreSchemaRegistry, StructField as CoreStructField,
+    StructFieldParts as CoreStructFieldParts, UniqueNameSpec as CoreUniqueNameSpec,
+};
+use carina_core::schema::{
+    ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -45,191 +44,36 @@ use crate::wasm_factory::version_checked_bindings::{WitPlanOp, wit_types as wit}
 /// boundary; carina#3459 makes unsupported wire shapes explicit errors instead
 /// of panics so callers can attach provider context.
 #[derive(Debug)]
-pub struct SchemaDecodeError {
-    detail: String,
-    resource_type: Option<String>,
-    attribute_path: Vec<String>,
-    schema_issue_location: Option<Box<CoreSchemaValidationIssueLocation>>,
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    render_source: bool,
+pub enum SchemaDecodeError {
+    JsonParse(serde_json::Error),
+    Protocol(carina_core::protocol_convert::SchemaDecodeError),
 }
 
 impl SchemaDecodeError {
-    fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-            resource_type: None,
-            attribute_path: vec![],
-            schema_issue_location: None,
-            source: None,
-            render_source: false,
-        }
-    }
-
     fn schema_json_parse(err: serde_json::Error) -> Self {
-        Self {
-            detail: "schema JSON parse error".to_string(),
-            resource_type: None,
-            attribute_path: vec![],
-            schema_issue_location: None,
-            source: Some(Box::new(err)),
-            render_source: true,
-        }
+        Self::JsonParse(err)
     }
 
-    fn schema_default_value_encode(err: serde_json::Error) -> Self {
-        Self {
-            detail: "schema default value conversion error".to_string(),
-            resource_type: None,
-            attribute_path: vec![],
-            schema_issue_location: None,
-            source: Some(Box::new(err)),
-            render_source: true,
-        }
-    }
-
-    fn schema_default_value_decode(err: WasmValueDecodeError) -> Self {
-        Self {
-            detail: "schema default value conversion error".to_string(),
-            resource_type: None,
-            attribute_path: vec![],
-            schema_issue_location: None,
-            source: Some(Box::new(err)),
-            render_source: true,
-        }
-    }
-
-    fn config_schema_validation(err: carina_core::schema::ConfigSchemaValidationError) -> Self {
-        let mut detail = "provider config schema is invalid".to_string();
-        for (index, (path, message)) in err.issues().enumerate() {
-            detail.push_str(if index == 0 { ": " } else { "; " });
-            detail.push_str(path);
-            detail.push_str(": ");
-            detail.push_str(message);
-        }
-        Self {
-            detail,
-            resource_type: None,
-            attribute_path: vec![],
-            schema_issue_location: None,
-            source: Some(Box::new(err)),
-            render_source: false,
-        }
-    }
-
-    fn resource_schema_validation(
-        resource_type: &str,
-        err: carina_core::schema::ResourceSchemaValidationError,
-    ) -> Self {
-        let mut issues = err.located_issues();
-        let (schema_issue_location, mut detail) = match issues.next() {
-            Some((location, message)) => (Some(location.clone()), message.to_string()),
-            None => (None, "resource schema is invalid".to_string()),
-        };
-        for (location, message) in issues {
-            detail.push_str("; ");
-            detail.push_str(&location.to_string());
-            detail.push_str(": ");
-            detail.push_str(message);
-        }
-        Self {
-            detail,
-            resource_type: Some(resource_type.to_string()),
-            attribute_path: Vec::new(),
-            schema_issue_location: schema_issue_location.map(Box::new),
-            source: Some(Box::new(err)),
-            render_source: false,
-        }
-    }
-
-    fn conflicting_input_mode() -> Self {
-        Self::new("input mode cannot be both required and read-only")
-    }
-
-    fn conflicting_write_only_mode() -> Self {
-        Self::new("struct field cannot be both write-only and provider-populated")
-    }
-
-    fn conflicting_attribute_write_only_mode() -> Self {
-        Self::new("attribute cannot be both write-only and provider-populated")
-    }
-
-    fn incompatible_attribute_modifier(mode: CoreInputMode, modifier: &str) -> Self {
-        Self::new(format!(
-            "{modifier} is not valid for {} attribute input mode",
-            core_input_mode_name(mode)
-        ))
-    }
-
-    fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
-        Self::new(format!(
-            "legacy Custom wire type '{enclosing_custom_name}' has unsupported base {base:?}"
-        ))
-    }
-
-    fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.to_string());
-        self
-    }
-
-    fn with_resource_type(mut self, resource_type: &str) -> Self {
-        self.resource_type = Some(resource_type.to_string());
-        self
-    }
-}
-
-fn core_input_mode_name(mode: CoreInputMode) -> &'static str {
-    match mode {
-        CoreInputMode::Optional => "optional user-input",
-        CoreInputMode::Required => "required user-input",
-        CoreInputMode::ProviderPopulated => "provider-populated",
+    fn protocol_conversion(err: carina_core::protocol_convert::SchemaDecodeError) -> Self {
+        Self::Protocol(err)
     }
 }
 
 impl fmt::Display for SchemaDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(resource_type) = &self.resource_type {
-            write!(f, "resource '{resource_type}'")?;
-            if !self.attribute_path.is_empty() {
-                write!(f, " attribute '{}'", self.attribute_path.join("."))?;
-            } else if let Some(attribute_path) = self
-                .schema_issue_location
-                .as_deref()
-                .and_then(CoreSchemaValidationIssueLocation::attribute_path)
-            {
-                write!(f, " attribute '{attribute_path}'")?;
-            }
-            f.write_str(": ")?;
-            if let Some(location) = &self.schema_issue_location
-                && location.attribute_path().is_none()
-            {
-                write!(f, "{location}: ")?;
-            }
-            f.write_str(&self.detail)?;
-        } else if self.attribute_path.is_empty() {
-            f.write_str(&self.detail)?;
-        } else {
-            write!(
-                f,
-                "attribute '{}': {}",
-                self.attribute_path.join("."),
-                self.detail
-            )?;
+        match self {
+            Self::JsonParse(_) => f.write_str("schema JSON parse error"),
+            Self::Protocol(_) => f.write_str("schema protocol conversion failed"),
         }
-        if self.render_source
-            && let Some(source) = &self.source
-        {
-            write!(f, ": {source}")?;
-        }
-        Ok(())
     }
 }
 
 impl std::error::Error for SchemaDecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
+        match self {
+            Self::JsonParse(source) => Some(source),
+            Self::Protocol(source) => Some(source),
+        }
     }
 }
 
@@ -248,23 +92,21 @@ pub struct WasmValueDecodeError {
 
 #[derive(Debug, Clone, Copy)]
 enum WitValueVariant {
-    StringListVal,
-    ListVal,
-    MapVal,
-    SecretVal,
-    RedactedSecretVal,
-    SchemaDefault,
+    StringList,
+    List,
+    Map,
+    Secret,
+    RedactedSecret,
 }
 
 impl fmt::Display for WitValueVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::StringListVal => "string-list-val",
-            Self::ListVal => "list-val",
-            Self::MapVal => "map-val",
-            Self::SecretVal => "secret-val",
-            Self::RedactedSecretVal => "redacted-secret-val",
-            Self::SchemaDefault => "schema-default",
+            Self::StringList => "string-list-val",
+            Self::List => "list-val",
+            Self::Map => "map-val",
+            Self::Secret => "secret-val",
+            Self::RedactedSecret => "redacted-secret-val",
         })
     }
 }
@@ -630,13 +472,13 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
         wit::Value::StringListVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::StringListVal,
+                    WitValueVariant::StringList,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
             let serde_json::Value::Array(items) = value else {
                 return Err(WasmValueDecodeError::new(
-                    WitValueVariant::StringListVal,
+                    WitValueVariant::StringList,
                     WasmValueDecodeErrorKind::ExpectedArray,
                 ));
             };
@@ -646,7 +488,7 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                 .map(|(index, item)| match item {
                     serde_json::Value::String(item) => Ok(item.into()),
                     _ => Err(WasmValueDecodeError::new(
-                        WitValueVariant::StringListVal,
+                        WitValueVariant::StringList,
                         WasmValueDecodeErrorKind::ExpectedString { index },
                     )),
                 })
@@ -656,32 +498,32 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
         wit::Value::ListVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::ListVal,
+                    WitValueVariant::List,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
             if !value.is_array() {
                 return Err(WasmValueDecodeError::new(
-                    WitValueVariant::ListVal,
+                    WitValueVariant::List,
                     WasmValueDecodeErrorKind::ExpectedArray,
                 ));
             }
-            json_to_core_value(&value, WitValueVariant::ListVal)
+            json_to_core_value(&value, WitValueVariant::List)
         }
         wit::Value::MapVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::MapVal,
+                    WitValueVariant::Map,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
             if !value.is_object() {
                 return Err(WasmValueDecodeError::new(
-                    WitValueVariant::MapVal,
+                    WitValueVariant::Map,
                     WasmValueDecodeErrorKind::ExpectedObject,
                 ));
             }
-            json_to_core_value(&value, WitValueVariant::MapVal)
+            json_to_core_value(&value, WitValueVariant::Map)
         }
         wit::Value::SecretVal(json) => {
             // Decode the JSON-encoded inner value the same way `ListVal` /
@@ -690,11 +532,11 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
             // working. Malformed input is a boundary error, never a value.
             let inner_json: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::SecretVal,
+                    WitValueVariant::Secret,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
-            let inner = json_to_core_value(&inner_json, WitValueVariant::SecretVal)?;
+            let inner = json_to_core_value(&inner_json, WitValueVariant::Secret)?;
             Ok(CoreValue::Deferred(DeferredValue::Secret(Box::new(inner))))
         }
     }
@@ -709,7 +551,7 @@ fn wit_to_core_persisted_value(
                 .map(|hash| CoreValue::Deferred(DeferredValue::RedactedSecret { hash }))
                 .ok_or_else(|| {
                     WasmValueDecodeError::new(
-                        WitValueVariant::RedactedSecretVal,
+                        WitValueVariant::RedactedSecret,
                         WasmValueDecodeErrorKind::InvalidRedactedSecretDigest,
                     )
                 })
@@ -717,32 +559,32 @@ fn wit_to_core_persisted_value(
         wit::PersistedValue::ListVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::ListVal,
+                    WitValueVariant::List,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
             if !value.is_array() {
                 return Err(WasmValueDecodeError::new(
-                    WitValueVariant::ListVal,
+                    WitValueVariant::List,
                     WasmValueDecodeErrorKind::ExpectedArray,
                 ));
             }
-            persisted_json_to_core_value(&value, WitValueVariant::ListVal)
+            persisted_json_to_core_value(&value, WitValueVariant::List)
         }
         wit::PersistedValue::MapVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
                 WasmValueDecodeError::new(
-                    WitValueVariant::MapVal,
+                    WitValueVariant::Map,
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
             if !value.is_object() {
                 return Err(WasmValueDecodeError::new(
-                    WitValueVariant::MapVal,
+                    WitValueVariant::Map,
                     WasmValueDecodeErrorKind::ExpectedObject,
                 ));
             }
-            persisted_json_to_core_value(&value, WitValueVariant::MapVal)
+            persisted_json_to_core_value(&value, WitValueVariant::Map)
         }
         wit::PersistedValue::BoolVal(value) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*value))),
         wit::PersistedValue::IntVal(value) => Ok(CoreValue::Concrete(ConcreteValue::Int(*value))),
@@ -1144,7 +986,7 @@ pub(crate) fn resource_id_wire_key(id: &CoreResourceId) -> String {
 }
 
 pub(crate) fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
-    let wire = id.to_wire();
+    let wire = carina_core::protocol_convert::resource_id_to_protocol(id);
     wit::ResourceId {
         provider: wire.provider,
         resource_type: wire.resource_type,
@@ -1759,7 +1601,8 @@ pub(crate) fn core_data_source_to_wit_resource<S>(
 pub(crate) fn wit_to_core_resource(
     resource: &wit::ResourceDef,
 ) -> Result<CoreResource, WasmValueDecodeError> {
-    let id = CoreResourceId::from_wire(wit_to_wire_resource_id(resource.id.clone()));
+    let wire_id = wit_to_wire_resource_id(resource.id.clone());
+    let id = carina_core::protocol_convert::protocol_to_resource_id(&wire_id);
     let mut core_resource = CoreResource::from_id(id);
     core_resource.attributes = wit_to_core_value_map(&resource.attributes)?
         .into_iter()
@@ -1997,7 +1840,8 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
     let proto_schemas: Vec<proto::ResourceSchema> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    proto_schemas.iter().map(proto_schema_to_core).collect()
+    carina_core::protocol_convert::protocol_to_resource_schemas(&proto_schemas)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
 /// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
@@ -2005,643 +1849,68 @@ pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, S
 pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
     let proto_types: HashMap<String, proto::AttributeType> =
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    let attribute_types = proto_types
-        .into_iter()
-        .map(|(k, v)| proto_attr_type_to_core(&v).map(|attr_type| (k, attr_type)))
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    CoreValidatedConfigSchema::validate(attribute_types)
-        .map_err(SchemaDecodeError::config_schema_validation)
+    carina_core::protocol_convert::protocol_to_config_schema(proto_types)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
-// -- Protocol schema to core schema conversion --
-
+#[cfg(test)]
 fn proto_schema_to_core(
-    s: &proto::ResourceSchema,
+    schema: &proto::ResourceSchema,
 ) -> Result<CoreValidatedResourceSchema, SchemaDecodeError> {
-    // Exhaustive source destructuring is a compile-time forcing function: a
-    // new protocol field cannot be silently omitted from this conversion.
-    let proto::ResourceSchema {
-        resource_type,
-        attributes,
-        description,
-        kind,
-        unique_name,
-        operation_config,
-        validators,
-        exclusive_required,
-        defs,
-    } = s;
-
-    let mut schema = CoreResourceSchema::new(resource_type.clone());
-    if let Some(description) = description {
-        schema = schema.with_description(description.clone());
-    }
-    schema = schema.with_declared_validators(validators.clone());
-    schema = match kind {
-        proto::SchemaKind::Managed => schema,
-        proto::SchemaKind::DataSource => schema.as_data_source(),
-    };
-    schema = match proto_unique_name_to_core(unique_name) {
-        CoreUniqueNameSpec::Attribute(attribute) => schema.with_unique_name_attribute(attribute),
-        CoreUniqueNameSpec::Coexisting => schema.with_coexisting_replacement(),
-        CoreUniqueNameSpec::Conflicting => schema.with_conflicting_replacement(),
-    };
-    if let Some(operation_config) = operation_config {
-        schema = schema.with_operation_config(operation_config.clone());
-    }
-    for group in exclusive_required {
-        let fields = group.iter().map(String::as_str).collect::<Vec<_>>();
-        schema = schema.exclusive_required(&fields);
-    }
-
-    // Wait defaults are not (yet) carried across the WASM plugin boundary —
-    // providers fall back to the carina-core constants until the protocol
-    // gains explicit fields. See carina-rs/carina#2825.
-
-    for (name, definition) in defs {
-        let definition = proto_attr_type_to_core(definition).map_err(|error| {
-            error
-                .prepend_attribute(name)
-                .with_resource_type(resource_type)
-        })?;
-        schema = schema.with_def(name.clone(), definition);
-    }
-    let mut attributes = attributes.iter().collect::<Vec<_>>();
-    attributes.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    for (map_name, attribute) in attributes {
-        let attribute = proto_attr_schema_to_core(attribute)
-            .map_err(|error| error.with_resource_type(resource_type))?;
-        if attribute.name() != map_name {
-            return Err(SchemaDecodeError::new(
-                "attribute map key does not match the attribute schema name",
-            )
-            .prepend_attribute(map_name)
-            .with_resource_type(resource_type));
-        }
-        schema = schema.attribute(attribute);
-    }
-    schema
-        .validate()
-        .map_err(|error| SchemaDecodeError::resource_schema_validation(resource_type, error))
+    carina_core::protocol_convert::protocol_to_resource_schema(schema)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
-fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
-    match spec {
-        proto::UniqueNameSpec::Attribute(attribute) => {
-            CoreUniqueNameSpec::Attribute(attribute.clone())
-        }
-        proto::UniqueNameSpec::Coexisting => CoreUniqueNameSpec::Coexisting,
-        proto::UniqueNameSpec::Conflicting => CoreUniqueNameSpec::Conflicting,
-    }
-}
-
+#[cfg(test)]
 fn proto_attr_schema_to_core(
-    a: &proto::AttributeSchema,
+    attribute: &proto::AttributeSchema,
 ) -> Result<CoreAttributeSchema, SchemaDecodeError> {
-    // Exhaustive source destructuring is a compile-time forcing function: a
-    // new protocol field cannot be silently omitted from this conversion.
-    let proto::AttributeSchema {
-        name,
-        attr_type,
-        required,
-        default,
-        description,
-        create_only,
-        read_only,
-        write_only,
-        block_name,
-        provider_name,
-        removable,
-        identity,
-        deferred_populate,
-    } = a;
-
-    if *read_only && *write_only {
-        return Err(
-            SchemaDecodeError::conflicting_attribute_write_only_mode().prepend_attribute(name)
-        );
-    }
-
-    let input_mode = proto_input_mode_to_core(*required, *read_only)
-        .map_err(|error| error.prepend_attribute(name))?;
-    let attr_type =
-        proto_attr_type_to_core(attr_type).map_err(|error| error.prepend_attribute(name))?;
-    let default = default
-        .as_ref()
-        .map(|value| {
-            let json = serde_json::to_value(value)
-                .map_err(SchemaDecodeError::schema_default_value_encode)?;
-            json_to_core_value(&json, WitValueVariant::SchemaDefault)
-                .map_err(SchemaDecodeError::schema_default_value_decode)
-        })
-        .transpose()
-        .map_err(|error| error.prepend_attribute(name))?;
-
-    match input_mode {
-        CoreInputMode::Optional => {
-            if *deferred_populate {
-                return Err(SchemaDecodeError::incompatible_attribute_modifier(
-                    input_mode,
-                    "deferred_populate",
-                )
-                .prepend_attribute(name));
-            }
-            let mut builder = CoreAttributeSchema::optional(name.clone(), attr_type);
-            if let Some(default) = default {
-                builder = builder.with_default(default);
-            }
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if *create_only {
-                builder = builder.create_only();
-            }
-            builder = match removable {
-                Some(true) => builder.removable(),
-                Some(false) => builder.non_removable(),
-                None => builder,
-            };
-            if let Some(block_name) = block_name {
-                builder = builder.with_block_name(block_name.clone());
-            }
-            if *write_only {
-                builder = builder.write_only();
-            }
-            if *identity {
-                builder = builder.identity();
-            }
-            Ok(builder.build())
-        }
-        CoreInputMode::Required => {
-            if default.is_some() {
-                return Err(SchemaDecodeError::incompatible_attribute_modifier(
-                    input_mode, "default",
-                )
-                .prepend_attribute(name));
-            }
-            if removable.is_some() {
-                return Err(SchemaDecodeError::incompatible_attribute_modifier(
-                    input_mode,
-                    "removable",
-                )
-                .prepend_attribute(name));
-            }
-            if *deferred_populate {
-                return Err(SchemaDecodeError::incompatible_attribute_modifier(
-                    input_mode,
-                    "deferred_populate",
-                )
-                .prepend_attribute(name));
-            }
-            let mut builder = CoreAttributeSchema::required(name.clone(), attr_type);
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if *create_only {
-                builder = builder.create_only();
-            }
-            if let Some(block_name) = block_name {
-                builder = builder.with_block_name(block_name.clone());
-            }
-            if *write_only {
-                builder = builder.write_only();
-            }
-            if *identity {
-                builder = builder.identity();
-            }
-            Ok(builder.build())
-        }
-        CoreInputMode::ProviderPopulated => {
-            for (present, modifier) in [
-                (default.is_some(), "default"),
-                (*create_only, "create_only"),
-                (*write_only, "write_only"),
-                (block_name.is_some(), "block_name"),
-                (removable.is_some(), "removable"),
-                (*identity, "identity"),
-            ] {
-                if present {
-                    return Err(SchemaDecodeError::incompatible_attribute_modifier(
-                        input_mode, modifier,
-                    )
-                    .prepend_attribute(name));
-                }
-            }
-            let mut builder = CoreAttributeSchema::provider_populated(name.clone(), attr_type);
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if *deferred_populate {
-                builder = builder.deferred_populate();
-            }
-            Ok(builder.build())
-        }
-    }
+    carina_core::protocol_convert::protocol_to_attribute_schema(attribute)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
-fn decoded_refined_string(
-    identity: Option<TypeIdentity>,
-    pattern: Option<String>,
-    length: Option<(Option<u64>, Option<u64>)>,
-    to_dsl: Option<proto::DslTransform>,
-) -> CoreAttributeType {
-    match identity {
-        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
-            Some(validate) => CoreAttributeType::refined_string_with_validator(
-                identity, pattern, length, validate, to_dsl,
-            ),
-            None => CoreAttributeType::refined_string(Some(identity), pattern, length, to_dsl),
-        },
-        None => CoreAttributeType::refined_string(None, pattern, length, to_dsl),
-    }
-}
-
-fn decoded_refined_int(
-    identity: Option<TypeIdentity>,
-    range: Option<(Option<i64>, Option<i64>)>,
-) -> CoreAttributeType {
-    match identity {
-        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
-            Some(validate) => {
-                CoreAttributeType::refined_int_with_validator(identity, range, validate)
-            }
-            None => CoreAttributeType::refined_int(Some(identity), range),
-        },
-        None => CoreAttributeType::refined_int(None, range),
-    }
-}
-
-fn decoded_refined_float(
-    identity: Option<TypeIdentity>,
-    range: Option<(Option<f64>, Option<f64>)>,
-) -> CoreAttributeType {
-    match identity {
-        Some(identity) => match carina_core::schema::builtin_validator(&identity) {
-            Some(validate) => {
-                CoreAttributeType::refined_float_with_validator(identity, range, validate)
-            }
-            None => CoreAttributeType::refined_float(Some(identity), range),
-        },
-        None => CoreAttributeType::refined_float(None, range),
-    }
-}
-
+#[cfg(test)]
 fn proto_attr_type_to_core(
-    t: &proto::AttributeType,
+    attribute_type: &proto::AttributeType,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
-    // Legacy opaque per-type `validate` payloads have no host-side decoder;
-    // serializable resource validators travel through ResourceSchema.validators.
-    // Bind those fields explicitly so any new wire field still breaks this match.
-    Ok(match t {
-        proto::AttributeType::String {
-            pattern,
-            length,
-            validate: _validate,
-            to_dsl,
-            identity,
-        } => decoded_refined_string(
-            identity
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(carina_core::schema::TypeIdentity::from_dotted),
-            pattern.clone(),
-            *length,
-            to_dsl.clone(),
-        ),
-        proto::AttributeType::Int { range, identity } => decoded_refined_int(
-            identity
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(carina_core::schema::TypeIdentity::from_dotted),
-            *range,
-        ),
-        proto::AttributeType::Float { range, identity } => decoded_refined_float(
-            identity
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(carina_core::schema::TypeIdentity::from_dotted),
-            *range,
-        ),
-        proto::AttributeType::Bool => CoreAttributeType::bool(),
-        proto::AttributeType::Duration => CoreAttributeType::duration(),
-        proto::AttributeType::StringEnum {
-            values,
-            name,
-            namespace,
-            dsl_aliases,
-        } => CoreAttributeType::enum_(
-            // Lift the wire-form flat dotted prefix into the
-            // structured `TypeIdentity` the core schema now carries
-            // (carina#3222). The pre-#3222 core form mirrored the
-            // wire form one-to-one; with the split, the wire form
-            // remains flat while the core form is structural — the
-            // boundary cost lives here.
-            namespace
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|ns| carina_core::schema::enum_identity(name, Some(ns)))
-                .unwrap_or_else(|| carina_core::schema::TypeIdentity::bare(name)),
-            Some(values.clone()),
-            dsl_aliases.clone(),
-            None,
-            None,
-        ),
-        proto::AttributeType::List {
-            element_type,
-            ordered,
-            length,
-            validate: _validate,
-        } => CoreAttributeType::refined_list(
-            proto_attr_type_to_core(element_type)?,
-            *ordered,
-            *length,
-        ),
-        proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
-            proto_attr_type_to_core(key)?,
-            proto_attr_type_to_core(inner)?,
-        ),
-        proto::AttributeType::Struct { name, fields } => CoreAttributeType::struct_(
-            name.clone(),
-            fields
-                .iter()
-                .map(proto_struct_field_to_core)
-                .collect::<Result<_, _>>()?,
-        ),
-        proto::AttributeType::Union { members } => CoreAttributeType::union(
-            members
-                .iter()
-                .map(proto_attr_type_to_core)
-                .collect::<Result<_, _>>()?,
-        ),
-        proto::AttributeType::Custom {
-            name,
-            base,
-            pattern,
-            length,
-            validate: _validate,
-            to_dsl,
-        } => proto_legacy_custom_to_core(name, base, pattern.clone(), *length, to_dsl.clone())?,
-        proto::AttributeType::CustomEnum {
-            name,
-            base,
-            namespace,
-            dsl_transform,
-        } => CoreAttributeType::enum_with_base(
-            // Enum requires a populated identity (the
-            // shorthand expansion needs the dotted prefix);
-            // `enum_identity` is the inverse of
-            // `TypeIdentity::dotted_prefix` and recovers the
-            // structured form from the wire's flat `namespace + name`
-            // shape.
-            carina_core::schema::enum_identity(name, Some(namespace.as_str())),
-            proto_attr_type_to_core(base)?,
-            None,
-            vec![],
-            None, // Validation is handled via ProviderContext.validators
-            dsl_transform.clone(),
-        ),
-        // Cyclic CFN struct reference (carina#3340). The host's
-        // structural counterpart is `AttributeType::Ref`; the matching
-        // `ResourceSchema.defs` map is converted alongside in
-        // `proto_schema_to_core` so resolution at walk-sites succeeds.
-        proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
-    })
+    carina_core::protocol_convert::protocol_to_attribute_type(attribute_type)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
-fn proto_legacy_custom_to_core(
-    enclosing_name: &str,
-    base: &proto::AttributeType,
-    pattern: Option<String>,
-    length: Option<(Option<u64>, Option<u64>)>,
-    to_dsl: Option<proto::DslTransform>,
-) -> Result<CoreAttributeType, SchemaDecodeError> {
-    if let proto::AttributeType::Custom {
-        name: _inner_name,
-        base,
-        pattern: inner_pattern,
-        length: inner_length,
-        validate: _inner_validate,
-        to_dsl: inner_to_dsl,
-    } = base
-    {
-        // carina#3459: pre-namespace-adoption providers can encode resource
-        // IDs as Custom -> Custom -> primitive refinement chains. The outer
-        // name remains the only identity, with no inner-name fallback even if
-        // empty; pattern/length/to_dsl use outer-first fallback.
-        return proto_legacy_custom_to_core(
-            enclosing_name,
-            base,
-            pattern.or_else(|| inner_pattern.clone()),
-            length.or(*inner_length),
-            to_dsl.or_else(|| inner_to_dsl.clone()),
-        );
-    }
-
-    let identity = if enclosing_name.is_empty() {
-        None
-    } else {
-        Some(carina_core::schema::TypeIdentity::from_dotted(
-            enclosing_name,
-        ))
-    };
-    // A legacy Custom's outer record owns its identity and refinements; its
-    // base is a shape discriminator (plus List element type/order). Name every
-    // unused base field so extending a variant cannot silently change that rule.
-    match base {
-        proto::AttributeType::String {
-            pattern: _base_pattern,
-            length: _base_length,
-            validate: _base_validate,
-            to_dsl: _base_to_dsl,
-            identity: _base_identity,
-        } => Ok(decoded_refined_string(identity, pattern, length, to_dsl)),
-        proto::AttributeType::Int {
-            range: _base_range,
-            identity: _base_identity,
-        } => Ok(decoded_refined_int(
-            identity,
-            length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
-        )),
-        proto::AttributeType::Float {
-            range: _base_range,
-            identity: _base_identity,
-        } => Ok(decoded_refined_float(identity, None)),
-        proto::AttributeType::List {
-            element_type,
-            ordered,
-            length: _base_length,
-            validate: _base_validate,
-        } => Ok(CoreAttributeType::refined_list(
-            proto_attr_type_to_core(element_type)?,
-            *ordered,
-            length,
-        )),
-        proto::AttributeType::Bool | proto::AttributeType::Duration => Err(
-            SchemaDecodeError::unsupported_custom_base(enclosing_name, base),
-        ),
-        proto::AttributeType::StringEnum {
-            values: _base_values,
-            name: _base_name,
-            namespace: _base_namespace,
-            dsl_aliases: _base_dsl_aliases,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::Map {
-            inner: _base_inner,
-            key: _base_key,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::Struct {
-            name: _base_name,
-            fields: _base_fields,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::Union {
-            members: _base_members,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::Custom {
-            name: _base_name,
-            base: _base,
-            pattern: _base_pattern,
-            length: _base_length,
-            validate: _base_validate,
-            to_dsl: _base_to_dsl,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::CustomEnum {
-            name: _base_name,
-            base: _base,
-            namespace: _base_namespace,
-            dsl_transform: _base_dsl_transform,
-        } => Err(SchemaDecodeError::unsupported_custom_base(
-            enclosing_name,
-            base,
-        )),
-        proto::AttributeType::Ref { name: _base_name } => Err(
-            SchemaDecodeError::unsupported_custom_base(enclosing_name, base),
-        ),
-    }
-}
-
+#[cfg(test)]
 fn proto_struct_field_to_core(
-    f: &proto::StructField,
+    field: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
-    // Exhaustive source destructuring is a compile-time forcing function: a
-    // new protocol field cannot be silently omitted from this conversion.
-    let proto::StructField {
-        name,
-        field_type,
-        required,
-        description,
-        block_name,
-        provider_name,
-        read_only,
-        write_only,
-        deferred_populate,
-    } = f;
-
-    let input_mode = proto_input_mode_to_core(*required, *read_only)
-        .map_err(|error| error.prepend_attribute(name))?;
-
-    if input_mode == CoreInputMode::ProviderPopulated && *write_only {
-        return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
-    }
-    let field_type =
-        proto_attr_type_to_core(field_type).map_err(|error| error.prepend_attribute(name))?;
-
-    match input_mode {
-        CoreInputMode::Optional => {
-            let mut builder = CoreStructField::optional(name.clone(), field_type);
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if let Some(block_name) = block_name {
-                builder = builder.with_block_name(block_name.clone());
-            }
-            if *write_only {
-                builder = builder.write_only();
-            }
-            if *deferred_populate {
-                builder = builder.deferred_populate();
-            }
-            Ok(builder.build())
-        }
-        CoreInputMode::Required => {
-            let mut builder = CoreStructField::required(name.clone(), field_type);
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if let Some(block_name) = block_name {
-                builder = builder.with_block_name(block_name.clone());
-            }
-            if *write_only {
-                builder = builder.write_only();
-            }
-            if *deferred_populate {
-                builder = builder.deferred_populate();
-            }
-            Ok(builder.build())
-        }
-        CoreInputMode::ProviderPopulated => {
-            let mut builder = CoreStructField::provider_populated(name.clone(), field_type);
-            if let Some(description) = description {
-                builder = builder.with_description(description.clone());
-            }
-            if let Some(provider_name) = provider_name {
-                builder = builder.with_provider_name(provider_name.clone());
-            }
-            if let Some(block_name) = block_name {
-                builder = builder.with_block_name(block_name.clone());
-            }
-            if *deferred_populate {
-                builder = builder.deferred_populate();
-            }
-            Ok(builder.build())
-        }
-    }
-}
-
-fn proto_input_mode_to_core(
-    required: bool,
-    read_only: bool,
-) -> Result<CoreInputMode, SchemaDecodeError> {
-    match (required, read_only) {
-        (false, false) => Ok(CoreInputMode::Optional),
-        (true, false) => Ok(CoreInputMode::Required),
-        (false, true) => Ok(CoreInputMode::ProviderPopulated),
-        (true, true) => Err(SchemaDecodeError::conflicting_input_mode()),
-    }
+    carina_core::protocol_convert::protocol_to_struct_field(field)
+        .map_err(SchemaDecodeError::protocol_conversion)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_error_in_chain<'a, T: std::error::Error + 'static>(
+        error: &'a (dyn std::error::Error + 'static),
+    ) -> Option<&'a T> {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(found) = error.downcast_ref::<T>() {
+                return Some(found);
+            }
+            current = error.source();
+        }
+        None
+    }
+
+    fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        let mut rendered = vec![error.to_string()];
+        let mut current = error.source();
+        while let Some(source) = current {
+            rendered.push(source.to_string());
+            current = source.source();
+        }
+        rendered.join(" -> ")
+    }
 
     #[test]
     fn read_outcome_rejects_empty_identifier_with_typed_context() {
@@ -2870,98 +2139,160 @@ mod tests {
         }
     }
 
-    fn core_string_to_proto_for_schema_round_trip(
-        attr_type: &CoreAttributeType,
-    ) -> proto::AttributeType {
-        assert!(matches!(
-            attr_type
-                .shape_ref_free()
-                .expect("round-trip fixture must be Ref-free"),
-            carina_core::schema::Shape::String { .. }
-        ));
-        proto_string()
+    #[test]
+    fn sdk_json_host_round_trip_property_covers_portable_defaults() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let cases = vec![
+            (
+                AttributeType::bool(),
+                CoreValue::Concrete(ConcreteValue::Bool(true)),
+            ),
+            (
+                AttributeType::int(),
+                CoreValue::Concrete(ConcreteValue::Int(-42)),
+            ),
+            (
+                AttributeType::float(),
+                CoreValue::Concrete(ConcreteValue::Float(1.25)),
+            ),
+            (
+                AttributeType::string(),
+                CoreValue::Concrete(ConcreteValue::String("portable".into())),
+            ),
+            (
+                AttributeType::list(AttributeType::string()),
+                CoreValue::Concrete(ConcreteValue::StringList(vec!["one".into(), "two".into()])),
+            ),
+            (
+                AttributeType::list(AttributeType::int()),
+                CoreValue::Concrete(ConcreteValue::List(vec![
+                    CoreValue::Concrete(ConcreteValue::Int(1)),
+                    CoreValue::Concrete(ConcreteValue::Int(2)),
+                ])),
+            ),
+            (
+                AttributeType::map(AttributeType::string()),
+                CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "key".to_string(),
+                    CoreValue::Concrete(ConcreteValue::String("value".into())),
+                )]))),
+            ),
+        ];
+
+        for (index, (attribute_type, default)) in cases.into_iter().enumerate() {
+            let schema = ResourceSchema::new(format!("test.Portable{index}"))
+                .attribute(
+                    AttributeSchema::optional("value", attribute_type)
+                        .with_default(default)
+                        .build(),
+                )
+                .validate()
+                .expect("generated portable witness must validate");
+            let guest_json = carina_plugin_sdk::schemas_to_json(&[schema])
+                .expect("typed SDK witness must serialize");
+            let host_witnesses =
+                json_to_schemas(&guest_json).expect("host must decode SDK schema JSON");
+            let host_json = carina_plugin_sdk::schemas_to_json(&host_witnesses)
+                .expect("host witness must serialize through the same seam");
+
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&guest_json).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&host_json).unwrap(),
+                "portable JSON projection changed for generated case {index}"
+            );
+        }
     }
 
-    fn core_input_mode_to_proto(input_mode: CoreInputMode) -> (bool, bool) {
-        match input_mode {
-            CoreInputMode::Optional => (false, false),
-            CoreInputMode::Required => (true, false),
-            CoreInputMode::ProviderPopulated => (false, true),
-        }
+    #[test]
+    fn typed_sdk_resource_and_config_witnesses_load_in_host() {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+            ValidatedConfigSchema, ValidatorType, legacy_validator,
+        };
+
+        let resource_record = AttributeType::struct_(
+            "ResourceRecord",
+            vec![StructField::required("name", AttributeType::string()).build()],
+        );
+        let output = AttributeType::list(AttributeType::struct_(
+            "DomainValidation",
+            vec![
+                StructField::required("domain_name", AttributeType::string()).build(),
+                StructField::optional("resource_record", resource_record)
+                    .deferred_populate()
+                    .build(),
+            ],
+        ));
+        let schema = ResourceSchema::new("test.Certificate")
+            .attribute(
+                AttributeSchema::provider_populated("domain_validation_options", output).build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "count",
+                    AttributeType::refined_int_with_validator(
+                        TypeIdentity::new(Some("test"), ["Certificate"], "PositiveCount"),
+                        None,
+                        legacy_validator(|value| match value {
+                            CoreValue::Concrete(ConcreteValue::Int(value)) if *value > 0 => Ok(()),
+                            _other => Err("count must be positive".to_string()),
+                        }),
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+            .validate()
+            .expect("SDK resource fixture must validate");
+        let schema_json = carina_plugin_sdk::schemas_to_json(&[schema]).unwrap();
+        let decoded = json_to_schemas(&schema_json).expect("typed resource witness must load");
+        let resource_record = decoded[0]
+            .effective_node_at_path(&[
+                "domain_validation_options".to_string(),
+                "resource_record".to_string(),
+            ])
+            .expect("nested output path must survive transport");
+        assert!(resource_record.is_read_only());
+        assert!(resource_record.is_deferred_populate());
+
+        let config = ValidatedConfigSchema::validate(HashMap::from([(
+            "assume_role".to_string(),
+            AttributeType::struct_(
+                "AssumeRole",
+                vec![
+                    StructField::required("role_arn", AttributeType::string()).build(),
+                    StructField::optional("session_name", AttributeType::string()).build(),
+                ],
+            ),
+        )]))
+        .expect("SDK config fixture must validate");
+        let config_json = carina_plugin_sdk::provider_config_schema_to_json(&config).unwrap();
+        let decoded_config =
+            json_to_attribute_types(&config_json).expect("typed config witness must load");
+        assert!(
+            decoded_config
+                .effective_field_at_path(&["assume_role".to_string(), "role_arn".to_string(),])
+                .is_some()
+        );
     }
 
     fn core_struct_field_to_proto_for_schema_round_trip(
         field: &CoreStructField,
     ) -> proto::StructField {
-        let CoreStructFieldParts {
-            name,
-            field_type,
-            declared_input_mode,
-            description,
-            provider_name,
-            block_name,
-            deferred_populate,
-            write_only,
-        } = field.parts();
-        let (required, read_only) = core_input_mode_to_proto(declared_input_mode);
-
-        proto::StructField {
-            name: name.to_string(),
-            field_type: core_string_to_proto_for_schema_round_trip(field_type),
-            required,
-            description: description.map(str::to_owned),
-            block_name: block_name.map(str::to_owned),
-            provider_name: provider_name.map(str::to_owned),
-            read_only,
-            write_only,
-            deferred_populate,
-        }
+        carina_core::protocol_convert::struct_field_to_protocol(field)
+            .expect("round-trip fixture must cross the core protocol seam")
     }
 
     fn core_attr_schema_to_proto_for_schema_round_trip(
         attr: &CoreAttributeSchema,
     ) -> proto::AttributeSchema {
-        let CoreAttributeSchemaParts {
-            name,
-            attr_type,
-            declared_input_mode,
-            default,
-            description,
-            completions,
-            provider_name,
-            create_only,
-            removable,
-            block_name,
-            write_only,
-            identity,
-            deferred_populate,
-        } = attr.parts();
-
-        assert!(
-            completions.is_none(),
-            "provider configuration completions use a separate WIT export"
-        );
-        let (required, read_only) = core_input_mode_to_proto(declared_input_mode);
-        proto::AttributeSchema {
-            name: name.to_string(),
-            attr_type: core_string_to_proto_for_schema_round_trip(attr_type),
-            required,
-            default: default.map(|value| {
-                let json = core_value_to_json(value)
-                    .expect("round-trip fixture default must cross the WASM boundary");
-                serde_json::from_value(json)
-                    .expect("round-trip fixture default must decode as a protocol value")
-            }),
-            description: description.map(str::to_owned),
-            create_only,
-            read_only,
-            write_only,
-            block_name: block_name.map(str::to_owned),
-            provider_name: provider_name.map(str::to_owned),
-            removable,
-            identity,
-            deferred_populate,
-        }
+        carina_core::protocol_convert::attribute_schema_to_protocol(attr)
+            .expect("round-trip fixture must cross the core protocol seam")
     }
 
     #[test]
@@ -2981,9 +2312,12 @@ mod tests {
         let error = proto_struct_field_to_core(&field)
             .expect_err("required and read-only must not form a core StructField");
 
-        assert_eq!(
-            error.to_string(),
-            "attribute 'provider_id': input mode cannot be both required and read-only"
+        let rendered = render_error_chain(&error);
+        assert!(
+            rendered.contains(
+                "attribute 'provider_id': input mode cannot be both required and read-only"
+            ),
+            "{rendered}"
         );
     }
 
@@ -3004,9 +2338,12 @@ mod tests {
         let error = proto_struct_field_to_core(&field)
             .expect_err("read-only and write-only must not form a core StructField");
 
-        assert_eq!(
-            error.to_string(),
-            "attribute 'client_secret': struct field cannot be both write-only and provider-populated"
+        let rendered = render_error_chain(&error);
+        assert!(
+            rendered.contains(
+                "attribute 'client_secret': struct field cannot be both write-only and provider-populated"
+            ),
+            "{rendered}"
         );
     }
 
@@ -3106,8 +2443,18 @@ mod tests {
 
         let error = proto_schema_to_core(&schema)
             .expect_err("shared validation must reject write-only output descendants");
-        assert!(error.to_string().contains("write-only"));
-        assert!(error.to_string().contains("secret"));
+        assert_eq!(
+            render_error_chain(&error).split(" -> ").nth(1).unwrap(),
+            "resource 'test.Widget' attribute 'output.secret': resource schema is invalid"
+        );
+        let source =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("typed resource validation error must remain in the chain");
+        assert!(
+            source.issues().any(|(path, message)| {
+                path == "output.secret" && message.contains("write-only")
+            })
+        );
     }
 
     #[test]
@@ -3121,10 +2468,10 @@ mod tests {
         let error = json_to_schemas(&json)
             .expect_err("required and read-only must not form a core AttributeSchema");
 
-        assert_eq!(
-            error.to_string(),
+        let rendered = render_error_chain(&error);
+        assert!(rendered.contains(
             "resource 'awscc.acm.Certificate' attribute 'arn': input mode cannot be both required and read-only"
-        );
+        ), "{rendered}");
     }
 
     #[test]
@@ -3137,10 +2484,10 @@ mod tests {
         let error = proto_schema_to_core(&schema)
             .expect_err("read-only and write-only must not form a core AttributeSchema");
 
-        assert_eq!(
-            error.to_string(),
+        let rendered = render_error_chain(&error);
+        assert!(rendered.contains(
             "resource 'test.Resource' attribute 'token': attribute cannot be both write-only and provider-populated"
-        );
+        ), "{rendered}");
     }
 
     #[test]
@@ -3186,10 +2533,10 @@ mod tests {
         let error = json_to_schemas(&json)
             .expect_err("the invalid nested field must abort schema decoding");
 
-        assert_eq!(
-            error.to_string(),
+        let rendered = render_error_chain(&error);
+        assert!(rendered.contains(
             "resource 'awscc.s3.Bucket' attribute 'metadata_configuration.destination.table_arn': input mode cannot be both required and read-only"
-        );
+        ), "{rendered}");
     }
 
     #[test]
@@ -3217,10 +2564,20 @@ mod tests {
         let error = proto_schema_to_core(&schema)
             .expect_err("whole and nested write-only modes cannot be combined");
 
-        assert_eq!(
-            error.to_string(),
-            "resource 'test.Resource' attribute 'config': top-level attribute cannot be both write-only and write-only-bearing"
+        let rendered = render_error_chain(&error);
+        assert!(
+            rendered.contains(
+                "resource 'test.Resource' attribute 'config': resource schema is invalid"
+            ),
+            "{rendered}"
         );
+        let source =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("typed resource validation error must remain in the chain");
+        assert!(source.issues().any(|(path, message)| {
+            path == "config"
+                && message == "top-level attribute cannot be both write-only and write-only-bearing"
+        }));
     }
 
     #[test]
@@ -3274,11 +2631,22 @@ mod tests {
         let error = proto_schema_to_core(&schema)
             .expect_err("both attributes violate the nested write-only invariant");
 
+        let rendered = render_error_chain(&error);
+        assert!(
+            rendered.contains(&format!(
+                "resource 'test.Resource' attribute '{lexical_first}': resource schema is invalid"
+            )),
+            "{rendered}"
+        );
+        let source =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("typed resource validation error must remain in the chain");
         assert_eq!(
-            error.to_string(),
-            format!(
-                "resource 'test.Resource' attribute '{lexical_first}': top-level attribute cannot be both write-only and write-only-bearing"
-            )
+            source.issues().next(),
+            Some((
+                lexical_first.as_str(),
+                "top-level attribute cannot be both write-only and write-only-bearing"
+            ))
         );
     }
 
@@ -3314,10 +2682,19 @@ mod tests {
         let error = proto_schema_to_core(&schema)
             .expect_err("a union member must not hide nested write-only fields");
 
-        assert_eq!(
-            error.to_string(),
-            "resource 'test.Resource' attribute 'authentication': union members cannot be write-only-bearing"
+        let rendered = render_error_chain(&error);
+        assert!(
+            rendered.contains(
+                "resource 'test.Resource' attribute 'authentication': resource schema is invalid"
+            ),
+            "{rendered}"
         );
+        let source =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("typed resource validation error must remain in the chain");
+        assert!(source.issues().any(|(path, message)| {
+            path == "authentication" && message == "union members cannot be write-only-bearing"
+        }));
     }
 
     #[test]
@@ -3819,24 +3196,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_default_decode_preserves_the_typed_value_error() {
-        let value_error = wit_to_core_value(&wit::Value::ListVal("not json".to_string()))
-            .expect_err("invalid schema default must fail value decoding");
-        let error = SchemaDecodeError::schema_default_value_decode(value_error);
-
-        let rendered = error.to_string();
-        assert!(rendered.contains("schema default value conversion error"));
-        assert_eq!(rendered.matches("list-val").count(), 1, "{rendered}");
-        assert_eq!(rendered.matches("invalid JSON").count(), 1, "{rendered}");
-        assert!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<WasmValueDecodeError>())
-                .is_some(),
-            "typed schema-default decode error must remain in the source chain"
-        );
-    }
-
-    #[test]
     fn provider_read_state_with_malformed_map_is_rejected() {
         let id = CoreResourceId::with_provider_identity("mock", "test.resource", "example", None);
         let state = wit::State {
@@ -4211,7 +3570,7 @@ mod tests {
             "my-bucket",
             Some("west".to_string()),
         );
-        let wire = core.to_wire();
+        let wire = carina_core::protocol_convert::resource_id_to_protocol(&core);
         assert_eq!(wire.provider, "aws");
         assert_eq!(wire.resource_type, "s3.Bucket");
         assert_eq!(wire.identity, "my-bucket");
@@ -4219,7 +3578,7 @@ mod tests {
         assert_eq!(wit.provider, "aws");
         assert_eq!(wit.resource_type, "s3.Bucket");
         assert_eq!(wit.identity, "my-bucket");
-        let back = CoreResourceId::from_wire(proto::ResourceId {
+        let back = carina_core::protocol_convert::protocol_to_resource_id(&proto::ResourceId {
             provider: wit.provider,
             resource_type: wit.resource_type,
             identity: wit.identity,
@@ -4237,7 +3596,7 @@ mod tests {
             "test.resource",
             Some("secondary".to_string()),
         );
-        let encoded = pending.to_wire();
+        let encoded = carina_core::protocol_convert::resource_id_to_protocol(&pending);
         assert_eq!(encoded.identity, "");
         let wit = core_to_wit_resource_id(&pending);
         assert_eq!(wit.provider, "mock");
@@ -4249,8 +3608,8 @@ mod tests {
             resource_type: wit.resource_type,
             identity: wit.identity,
         };
-        let first = CoreResourceId::from_wire(wire.clone());
-        let second = CoreResourceId::from_wire(wire);
+        let first = carina_core::protocol_convert::protocol_to_resource_id(&wire);
+        let second = carina_core::protocol_convert::protocol_to_resource_id(&wire);
         assert_eq!(first.identity_str(), None);
         assert_eq!(second.identity_str(), None);
         assert_eq!(first.provider_instance, None);
@@ -4910,6 +4269,71 @@ mod tests {
     }
 
     #[test]
+    fn released_protocol_v12_schema_fixtures_load_through_the_core_seam() {
+        let fixtures = [
+            (
+                "acm.Certificate",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
+                ),
+            ),
+            (
+                "ec2.EgressOnlyInternetGateway",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
+                ),
+            ),
+            (
+                "ec2.Vpc",
+                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+            ),
+        ];
+
+        for (expected_resource_type, json) in fixtures {
+            let schemas = json_to_schemas(json).unwrap_or_else(|error| {
+                panic!(
+                    "released fixture {expected_resource_type} must load: {}",
+                    render_error_chain(&error)
+                )
+            });
+            assert_eq!(schemas.len(), 1);
+            assert_eq!(
+                schemas[0].as_schema().resource_type(),
+                expected_resource_type
+            );
+            match expected_resource_type {
+                "ec2.EgressOnlyInternetGateway" => {
+                    let vpc_id = schemas[0].parts().attributes["vpc_id"].attr_type();
+                    assert!(matches!(
+                        vpc_id.raw_shape(),
+                        carina_core::schema::RawShape::String {
+                            identity: Some(identity),
+                            pattern: Some("^vpc-[0-9a-f]{8,}$"),
+                            ..
+                        } if identity.to_string() == "aws.ec2.Vpc.Id"
+                    ));
+                }
+                "ec2.Vpc" => {
+                    let tenancy = schemas[0].parts().attributes["instance_tenancy"].attr_type();
+                    assert!(matches!(
+                        tenancy.raw_shape(),
+                        carina_core::schema::RawShape::Enum {
+                            identity,
+                            values: Some([first, second, third]),
+                            ..
+                        } if identity.to_string() == "aws.ec2.Vpc.InstanceTenancy"
+                            && first == "default"
+                            && second == "dedicated"
+                            && third == "host"
+                    ));
+                }
+                "acm.Certificate" => {}
+                other => panic!("unhandled released fixture {other}"),
+            }
+        }
+    }
+
+    #[test]
     fn released_acm_optional_deferred_descendant_under_read_only_output_loads() {
         let schemas = json_to_schemas(
             r#"[{
@@ -5161,7 +4585,7 @@ mod tests {
         )
         .expect_err("protocol v12 schema JSON must declare nested write_only");
 
-        let rendered = err.to_string();
+        let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));
         assert!(rendered.contains("missing field `write_only`"));
     }
@@ -5176,7 +4600,7 @@ mod tests {
             }]"#,
         )
         .unwrap_err();
-        let rendered = err.to_string();
+        let rendered = render_error_chain(&err);
 
         assert!(
             rendered.contains("schema JSON parse error"),
@@ -5445,7 +4869,7 @@ mod tests {
     #[test]
     fn json_to_attribute_types_rejects_malformed_json() {
         let error = json_to_attribute_types("not json").unwrap_err();
-        let rendered = error.to_string();
+        let rendered = render_error_chain(&error);
         assert_eq!(rendered.matches("schema JSON parse error").count(), 1);
         assert!(rendered.contains("expected ident"), "{rendered}");
         assert!(
@@ -5466,15 +4890,23 @@ mod tests {
         )
         .expect_err("both dangling config references must be rejected");
 
-        let source = std::error::Error::source(&error)
-            .and_then(|source| {
-                source.downcast_ref::<carina_core::schema::ConfigSchemaValidationError>()
-            })
-            .expect("typed config validation error must remain in the chain");
+        let source =
+            find_error_in_chain::<carina_core::schema::ConfigSchemaValidationError>(&error)
+                .expect("typed config validation error must remain in the chain");
         assert_eq!(source.issues().len(), 2);
-        let rendered = error.to_string();
+        assert_eq!(error.to_string(), "schema protocol conversion failed");
+        let rendered = render_error_chain(&error);
+        assert_eq!(
+            rendered
+                .matches("schema protocol conversion failed")
+                .count(),
+            1,
+            "the host wrapper must not repeat the core conversion error: {rendered}"
+        );
         assert!(rendered.contains("MissingFirst"), "{rendered}");
         assert!(rendered.contains("MissingSecond"), "{rendered}");
+        assert_eq!(rendered.matches("MissingFirst").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("MissingSecond").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -5505,15 +4937,23 @@ mod tests {
         let error = proto_schema_to_core(&schema)
             .expect_err("both dangling resource references must be rejected");
 
-        let source = std::error::Error::source(&error)
-            .and_then(|source| {
-                source.downcast_ref::<carina_core::schema::ResourceSchemaValidationError>()
-            })
-            .expect("typed resource validation error must remain in the chain");
+        let source =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("typed resource validation error must remain in the chain");
         assert_eq!(source.issues().len(), 2);
-        let rendered = error.to_string();
+        assert_eq!(error.to_string(), "schema protocol conversion failed");
+        let rendered = render_error_chain(&error);
+        assert_eq!(
+            rendered
+                .matches("schema protocol conversion failed")
+                .count(),
+            1,
+            "the host wrapper label must occur once: {rendered}"
+        );
         assert!(rendered.contains("MissingFirst"), "{rendered}");
         assert!(rendered.contains("MissingSecond"), "{rendered}");
+        assert_eq!(rendered.matches("MissingFirst").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("MissingSecond").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -5526,7 +4966,7 @@ mod tests {
 
         let error = proto_schema_to_core(&schema)
             .expect_err("unknown exclusive-required member must be rejected");
-        let rendered = error.to_string();
+        let rendered = render_error_chain(&error);
 
         assert!(rendered.contains("exclusive_required[0]"), "{rendered}");
         assert!(
@@ -5560,7 +5000,7 @@ mod tests {
 
         let error = proto_schema_to_core(&schema)
             .expect_err("a dangling definition reference must be rejected");
-        let rendered = error.to_string();
+        let rendered = render_error_chain(&error);
 
         assert!(rendered.contains("defs.Tag.key"), "{rendered}");
         assert!(!rendered.contains("attribute 'defs.Tag.key'"), "{rendered}");
@@ -5668,8 +5108,7 @@ mod tests {
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(matches!(
             core_schema.parts().validation,
-            carina_core::schema::ResourceValidation::Declared(validators)
-                if validators.is_empty()
+            carina_core::schema::ResourceValidation::None
         ));
     }
 
@@ -5712,7 +5151,14 @@ mod tests {
         );
 
         // And the resulting core schema rejects empty attributes.
-        let err = core_schema.validate(&HashMap::new()).unwrap_err();
+        let mut registry = CoreSchemaRegistry::new();
+        registry.insert("awscc", core_schema);
+        let resolver = carina_core::parser::ProviderCustomTypes::default();
+        let err = registry
+            .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
+            .expect("decoded fixture must be owner-bound")
+            .validate_with_resolver(&HashMap::new(), &|_| false, &resolver)
+            .unwrap_err();
         assert!(
             err.iter().any(|e| e
                 .to_string()
@@ -6249,9 +5695,49 @@ mod tests {
             None,
         );
         let err = proto_attr_type_to_core(&proto_attr).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("aws.ec2.Unsupported.Id"), "{msg}");
-        assert!(msg.contains("Bool"), "{msg}");
+        assert!(matches!(
+            find_error_in_chain::<carina_core::protocol_convert::ProtocolConvertError>(&err),
+            Some(
+                carina_core::protocol_convert::ProtocolConvertError::LegacyCustomUnsupportedBase {
+                    identity,
+                    base_kind: "Bool",
+                }
+            ) if identity == "aws.ec2.Unsupported.Id"
+        ));
+    }
+
+    #[test]
+    fn non_null_opaque_validator_payload_is_rejected() {
+        let payloads = [
+            r#"{
+                "type":"String",
+                "identity":"test.ValidatedString",
+                "validate":true
+            }"#,
+            r#"{
+                "type":"list",
+                "element_type":{"type":"String"},
+                "ordered":true,
+                "validate":{"legacy":"callback"}
+            }"#,
+            r#"{
+                "type":"custom",
+                "name":"test.Legacy",
+                "base":{"type":"String"},
+                "validate":"opaque"
+            }"#,
+        ];
+
+        for payload in payloads {
+            let wire: proto::AttributeType = serde_json::from_str(payload).unwrap();
+            let error = proto_attr_type_to_core(&wire)
+                .expect_err("opaque executable validators must not be silently discarded");
+            let rendered = render_error_chain(&error);
+            assert!(
+                rendered.contains("opaque validator"),
+                "unexpected error: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -6291,7 +5777,7 @@ mod tests {
     }
 
     #[test]
-    fn old_custom_list_payload_lifts_to_refined_core_list() {
+    fn old_custom_list_payload_rejects_unrepresentable_enclosing_identity() {
         let json = r#"{
             "type":"custom",
             "name":"awscc.wafv2.StatementList",
@@ -6301,27 +5787,20 @@ mod tests {
                 "ordered":false
             },
             "length":[1,5],
-            "validate":true
+            "validate":null
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
-
-        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
-            carina_core::schema::Shape::List {
-                element_type,
-                ordered,
-                length,
-                ..
-            } => {
-                assert!(!ordered);
-                assert_eq!(length, Some((Some(1), Some(5))));
-                assert!(matches!(
-                    element_type.shape_ref_free().expect("element is Ref-free"),
-                    carina_core::schema::Shape::String { .. }
-                ));
-            }
-            other => panic!("expected refined List, got {other:?}"),
-        }
+        let error = proto_attr_type_to_core(&proto_attr)
+            .expect_err("core cannot bind an enclosing custom identity to a List");
+        assert!(matches!(
+            find_error_in_chain::<carina_core::protocol_convert::ProtocolConvertError>(&error),
+            Some(
+                carina_core::protocol_convert::ProtocolConvertError::LegacyCustomUnsupportedBase {
+                    identity,
+                    base_kind: "List",
+                }
+            ) if identity == "awscc.wafv2.StatementList"
+        ));
     }
 
     #[test]
@@ -6340,8 +5819,7 @@ mod tests {
                 "type":"list",
                 "element_type":{"type":"String"},
                 "ordered":true,
-                "length":[1,3],
-                "validate":true
+                "length":[1,3]
             }"#,
         ];
 
@@ -6386,22 +5864,23 @@ mod tests {
 
     #[test]
     fn protocol_json_reconstructs_every_core_builtin_validator_by_identity() {
-        let positive_int_identity = TypeIdentity::bare("PositiveInt");
-
-        for expected_identity in carina_core::schema::builtin_validator_registry().keys() {
-            let wire_type = if expected_identity == &positive_int_identity {
-                proto::AttributeType::Int {
-                    range: None,
-                    identity: Some(expected_identity.to_string()),
-                }
-            } else {
-                proto::AttributeType::String {
+        for (kind, expected_identity) in carina_core::schema::builtin_validator_registry().keys() {
+            let wire_type = match kind {
+                carina_core::schema::RefinedScalarKind::String => proto::AttributeType::String {
                     pattern: None,
                     length: None,
                     validate: None,
                     to_dsl: None,
                     identity: Some(expected_identity.to_string()),
-                }
+                },
+                carina_core::schema::RefinedScalarKind::Int => proto::AttributeType::Int {
+                    range: None,
+                    identity: Some(expected_identity.to_string()),
+                },
+                carina_core::schema::RefinedScalarKind::Float => proto::AttributeType::Float {
+                    range: None,
+                    identity: Some(expected_identity.to_string()),
+                },
             };
             let json = serde_json::to_string(&wire_type).expect("builtin type must serialize");
             let decoded_wire: proto::AttributeType =
@@ -6418,6 +5897,11 @@ mod tests {
                     to_dsl: _,
                 } => (identity, validate.is_some()),
                 carina_core::schema::RawShape::Int {
+                    identity,
+                    range: _,
+                    validate,
+                } => (identity, validate.is_some()),
+                carina_core::schema::RawShape::Float {
                     identity,
                     range: _,
                     validate,
@@ -6460,6 +5944,12 @@ mod tests {
             carina_core::schema::ResourceValidation::Declared(validators)
                 if validators == &[proto::ValidatorType::TagsKeyValueCheck]
         ));
+        let mut registry = CoreSchemaRegistry::new();
+        registry.insert("awscc", core_schema);
+        let resolver = carina_core::parser::ProviderCustomTypes::default();
+        let bound_schema = registry
+            .get("awscc", "awscc.s3.Bucket", CoreSchemaKind::Resource)
+            .expect("decoded fixture must be owner-bound");
 
         // key/value pattern should fail
         let mut attrs = HashMap::new();
@@ -6480,7 +5970,11 @@ mod tests {
                 .collect(),
             )),
         );
-        assert!(core_schema.validate(&attrs).is_err());
+        assert!(
+            bound_schema
+                .validate_with_resolver(&attrs, &|_| false, &resolver)
+                .is_err()
+        );
 
         // normal tags should pass
         let mut attrs = HashMap::new();
@@ -6495,6 +5989,10 @@ mod tests {
                 .collect(),
             )),
         );
-        assert!(core_schema.validate(&attrs).is_ok());
+        assert!(
+            bound_schema
+                .validate_with_resolver(&attrs, &|_| false, &resolver)
+                .is_ok()
+        );
     }
 }

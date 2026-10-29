@@ -1545,15 +1545,33 @@ let suspended_b = mock.test.resource {
 #[test]
 fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
     let engine = test_engine_with_suspended_validation_provider();
-    let lookup = carina_core::parser::provider_context_lookup(&engine.provider_context);
-    let identity =
-        carina_core::schema::TypeIdentity::new(Some("mock"), ["test", "resource"], "Probe");
     let value = carina_core::resource::Value::Concrete(
         carina_core::resource::ConcreteValue::String("suspended".into()),
     );
+    let attributes = std::collections::HashMap::from([("probe".to_string(), value)]);
+    let schema = engine
+        .schemas
+        .get(
+            "mock",
+            "test.resource",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("suspended-validation schema must be registered");
+    let validate = || {
+        schema
+            .validate_with_resolver(
+                &attributes,
+                &|_| false,
+                engine.provider_context.custom_type_resolver(),
+            )
+            .expect_err("validation must remain an error")
+            .into_iter()
+            .find(|error| error.host_cause().is_some())
+            .expect("provider validation error must retain host policy metadata")
+    };
 
-    let first = lookup(&identity, &value).expect_err("validation must remain an error");
-    let second = lookup(&identity, &value).expect_err("validation must remain an error");
+    let first = validate();
+    let second = validate();
     let Some(carina_core::provider::HostErrorCause::ValidationSuspended(first_id)) =
         first.host_cause()
     else {
@@ -1783,8 +1801,25 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
             Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into())),
         ),
     ]);
-    let core_errors = schema
-        .validate_with_origins(&attributes, &|name| name == "hosted_zone_id")
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(SchemaFixtureFactory {
+        name: "test".to_string(),
+        schemas: vec![schema.clone()],
+    })];
+    let core_resolver = provider_mod::provider_custom_types_from_factories(Arc::new(factories));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let core_errors = schemas
+        .get(
+            "test",
+            "route53.Record",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("test schema must be owner-bound")
+        .validate_with_resolver(
+            &attributes,
+            &|name| name == "hosted_zone_id",
+            &core_resolver,
+        )
         .expect_err("core validation must reject both union alternatives");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let core_message = core_errors[0].to_string();
@@ -1794,8 +1829,6 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         "core must render both tied alternatives: {core_message}"
     );
 
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema);
     let engine = custom_engine(schemas);
     let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
     let main = r#"test.route53.Record {
@@ -3512,6 +3545,31 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         diag.range.start.line, 2,
         "Diagnostic should point to the 'tags' attribute line (line 2), not the resource line. Got line {}",
         diag.range.start.line
+    );
+}
+
+#[test]
+fn builtin_cidr_validator_diagnostic_points_to_attribute_line() {
+    use carina_core::schema::{AttributeSchema, ResourceSchema, types};
+
+    let schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::optional("cidr_block", types::ipv4_cidr()).build());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let engine = custom_engine(schemas);
+    let doc = create_document("awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/33'\n}");
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("prefix length"))
+        .unwrap_or_else(|| panic!("expected invalid CIDR diagnostic: {diagnostics:#?}"));
+    assert_eq!(
+        diagnostic.range.start.line, 1,
+        "CIDR validator diagnostic must point to cidr_block: {diagnostic:#?}"
     );
 }
 
@@ -5243,9 +5301,10 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
 
     fn schema_type(path: &str) -> TypeExpr {
         TypeExpr::SchemaType {
-            provider: "aws".to_string(),
-            path: path.to_string(),
-            type_name: "Id".to_string(),
+            owned: carina_core::parser::OwnedTypeIdentity::provider(
+                "aws",
+                carina_core::schema::TypeIdentity::from_schema_type("aws", path, "Id"),
+            ),
         }
     }
 
@@ -7174,6 +7233,103 @@ fn analyze_with_buffer(
         std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
     );
     engine.analyze(&doc, Some(&path))
+}
+
+fn shared_role_arn_directory() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let temp = tempfile::tempdir().expect("shared identity fixture");
+    let module = temp.path().join("identity_center");
+    let root = temp.path().join("root");
+    std::fs::create_dir(&module).expect("module directory");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  role_arns: list(aws.iam.Role.Arn)\n}\n",
+    )
+    .expect("module arguments");
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  admin_access_role_arns: list(aws.iam.Role.Arn) = role_arns\n}\n",
+    )
+    .expect("module attributes");
+    std::fs::write(
+        root.join("providers.crn"),
+        "provider aws {}\n\nprovider awscc {}\n",
+    )
+    .expect("root providers");
+    std::fs::write(
+        root.join("main.crn"),
+        "let identity_center = use { source = '../identity_center' }\n\
+         let admin = identity_center { role_arns = [\"arn:accepted\"] }\n",
+    )
+    .expect("root module call");
+    let exports =
+        "exports {\n  admin_access_role_arns: list(aws.iam.Role.Arn) = admin.admin_access_role_arns\n}\n"
+            .to_string();
+    std::fs::write(root.join("exports.crn"), &exports).expect("root exports");
+    (temp, root, exports)
+}
+
+#[test]
+fn shared_identity_annotation_is_owner_conjunctive_in_multi_file_lsp_analysis() {
+    let (_temp, root, exports) = shared_role_arn_directory();
+    let main = std::fs::read_to_string(root.join("main.crn")).expect("root main fixture");
+    let accepted_engine = shared_role_arn_engine("arn:accepted");
+    let mut accepted = analyze_with_buffer(&accepted_engine, &root, "main.crn", &main);
+    accepted.extend(analyze_with_buffer(
+        &accepted_engine,
+        &root,
+        "exports.crn",
+        &exports,
+    ));
+    assert!(
+        !accepted.iter().any(|diagnostic| {
+            diagnostic.message.contains("ambiguous custom type")
+                || diagnostic.message.contains("Unknown type")
+                || diagnostic.message.contains("rejects")
+        }),
+        "both owners accepting the shared annotation must be diagnostic-free: {accepted:#?}"
+    );
+
+    let rejected = analyze_with_buffer(
+        &shared_role_arn_engine("arn:other"),
+        &root,
+        "main.crn",
+        &main,
+    );
+    assert!(
+        rejected
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("awscc rejects")),
+        "one rejecting owner must reject the shared annotation: {rejected:#?}"
+    );
+}
+
+#[test]
+fn registered_bare_provider_type_does_not_remain_a_fail_open_simple_in_lsp() {
+    let directory = tempfile::tempdir().expect("bare type fixture");
+    std::fs::write(directory.path().join("providers.crn"), "provider test {}\n")
+        .expect("provider fixture");
+    let exports = "exports {\n  token: TestToken = 'anything'\n}\n";
+    std::fs::write(directory.path().join("exports.crn"), exports).expect("exports fixture");
+
+    let diagnostics = analyze_with_buffer(
+        &bare_type_engine(),
+        directory.path(),
+        "exports.crn",
+        exports,
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("bare token rejected by its owner")),
+        "the registered bare type must route to its provider owner: {diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Unknown type")),
+        "the registered bare type must resolve before validation: {diagnostics:#?}"
+    );
 }
 
 #[test]

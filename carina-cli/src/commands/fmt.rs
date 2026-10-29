@@ -279,17 +279,19 @@ where
 /// the same walk. Formatting a module directory alone remains plain because
 /// that invocation has no caller context, matching an LSP session opened
 /// without the caller workspace.
-pub fn run_fmt(path: &Path, mode: FmtMode, recursive: bool) -> Result<(), AppError> {
+pub fn run_fmt(
+    user_dirs: &carina_core::UserDirs,
+    path: &Path,
+    mode: FmtMode,
+    recursive: bool,
+) -> Result<(), AppError> {
     // Schema-aware conversion costs one installed-WASM provider load per
     // provider-declaring directory visible to the invocation. The startup cost
     // is intentional: editor and CLI formatting correctness must win over the
     // old schema-free fast path.
-    run_fmt_with_factory_builder(
-        path,
-        mode,
-        recursive,
-        build_factories_from_providers_for_formatting,
-    )
+    run_fmt_with_factory_builder(path, mode, recursive, |providers, directory| {
+        build_factories_from_providers_for_formatting(user_dirs, providers, directory)
+    })
 }
 
 fn run_fmt_with_factory_builder<F>(

@@ -263,6 +263,107 @@ fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
     ])
 }
 
+struct SharedRoleArnFactory {
+    name: &'static str,
+    accepted: &'static str,
+}
+
+impl ProviderFactory for SharedRoleArnFactory {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn display_name(&self) -> &str {
+        self.name
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        identity: &TypeIdentity,
+        value: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> carina_core::provider::ProviderResult<()> {
+        assert_eq!(
+            identity,
+            &TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")
+        );
+        (value.as_str() == self.accepted)
+            .then_some(())
+            .ok_or_else(|| {
+                carina_core::provider::ProviderError::invalid_input(format!(
+                    "{} rejects `{}`",
+                    self.name,
+                    value.as_str()
+                ))
+            })
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        vec![
+            ResourceSchema::new("iam.Role")
+                .attribute(
+                    AttributeSchema::optional(
+                        "arn",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("shared Role ARN schema must validate"),
+        ]
+    }
+}
+
+fn shared_role_arn_factories(
+    awscc_accepted: &'static str,
+) -> Vec<carina_cli::wiring::LoadedProviderFactory> {
+    carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+        Box::new(SharedRoleArnFactory {
+            name: "aws",
+            accepted: "arn:accepted",
+        }),
+        Box::new(SharedRoleArnFactory {
+            name: "awscc",
+            accepted: awscc_accepted,
+        }),
+    ])
+}
+
 struct Fixture {
     _temp: TempDir,
     root: PathBuf,
@@ -321,6 +422,64 @@ const MODULE_SECURITY_GROUP: &str = r#"let web_sg = aws.ec2.SecurityGroup {
   vpc_id = vpc_id
 }
 "#;
+
+fn shared_role_arn_directory() -> (TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let module = temp.path().join("identity_center");
+    let root = temp.path().join("root");
+    std::fs::create_dir(&module).expect("module directory");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  role_arns: list(aws.iam.Role.Arn)\n}\n",
+    )
+    .expect("module arguments");
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  admin_access_role_arns: list(aws.iam.Role.Arn) = role_arns\n}\n",
+    )
+    .expect("module attributes");
+    std::fs::write(
+        root.join("providers.crn"),
+        "provider aws {}\n\nprovider awscc {}\n",
+    )
+    .expect("root providers");
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let identity_center = use { source = '../identity_center' }
+let admin = identity_center { role_arns = ["arn:accepted"] }
+"#,
+    )
+    .expect("root module call");
+    std::fs::write(
+        root.join("exports.crn"),
+        "exports {\n  admin_access_role_arns: list(aws.iam.Role.Arn) = admin.admin_access_role_arns\n}\n",
+    )
+    .expect("root exports");
+    (temp, root)
+}
+
+#[test]
+fn shared_semantic_identity_annotation_is_conjunctive_across_module_signature_owners() {
+    let (_temp, root) = shared_role_arn_directory();
+    let accepted = carina_cli::commands::validate::validate_with_factories(
+        &root,
+        shared_role_arn_factories("arn:accepted"),
+    );
+    assert!(
+        accepted.is_empty(),
+        "the multi-file module export must resolve without ambiguity or Unknown: {accepted:#?}"
+    );
+
+    let rejected = carina_cli::commands::validate::validate_with_factories(
+        &root,
+        shared_role_arn_factories("arn:other"),
+    );
+    assert!(
+        rejected.iter().any(|error| error.contains("awscc rejects")),
+        "a verdict from only one owner must reject the annotation: {rejected:#?}"
+    );
+}
 
 fn issue_module(argument_type: &str, attribute_declaration: &str) -> [(&'static str, String); 3] {
     [

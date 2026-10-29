@@ -1,0 +1,9 @@
+nextest-version = { required = "0.9.133" }
+experimental = ["setup-scripts"]
+
+[scripts.setup.carina-user-dirs]
+command = "scripts/setup-nextest-user-dirs.sh"
+
+[[profile.default.scripts]]
+filter = "all()"
+setup = "carina-user-dirs"

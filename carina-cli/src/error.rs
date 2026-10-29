@@ -518,6 +518,10 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// User-owned Carina directories could not be resolved safely.
+    #[error(transparent)]
+    UserDirs(#[from] carina_core::UserDirsError),
+
     /// An official provider artifact lacks usable user-owned verification.
     #[error(transparent)]
     UnverifiedOfficialProvider(#[from] carina_provider_resolver::UnverifiedOfficialProviderError),

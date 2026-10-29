@@ -1,7 +1,7 @@
 use std::fs;
 use std::sync::{Arc, Barrier};
 
-use carina_core::parser::ProviderConfig;
+use carina_core::{UserDirs, parser::ProviderConfig};
 use carina_provider_resolver::{LockFile, LockMode, ProviderInstallLock, resolve_all};
 use indexmap::IndexMap;
 
@@ -40,15 +40,17 @@ fn resolving_unchanged_file_provider_twice_leaves_only_final_artifact() {
     fs::write(&source, b"provider wasm").unwrap();
     let provider = file_provider("test", &source);
     let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+    let user_dirs = UserDirs::under(&project.path().join("user"));
 
     let first = resolve_all(
+        &user_dirs,
         &install_lock,
         std::slice::from_ref(&provider),
         LockMode::Normal,
     )
     .unwrap();
     let destination = first["test"].as_path().to_path_buf();
-    resolve_all(&install_lock, &[provider], LockMode::Normal).unwrap();
+    resolve_all(&user_dirs, &install_lock, &[provider], LockMode::Normal).unwrap();
 
     let entries = fs::read_dir(destination.parent().unwrap())
         .unwrap()
@@ -70,11 +72,12 @@ fn concurrent_resolutions_preserve_both_lock_entries() {
 
     let threads = [provider_a, provider_b].map(|provider| {
         let project_dir = project.path().to_path_buf();
+        let user_dirs = UserDirs::under(&project.path().join("user"));
         let start = Arc::clone(&start);
         std::thread::spawn(move || {
             start.wait();
             let install_lock = ProviderInstallLock::acquire(&project_dir).unwrap();
-            resolve_all(&install_lock, &[provider], LockMode::Normal).unwrap();
+            resolve_all(&user_dirs, &install_lock, &[provider], LockMode::Normal).unwrap();
         })
     });
     start.wait();

@@ -2156,6 +2156,7 @@ impl StateBackend for RefreshTestBackend {
 /// (resources in state but removed from config).
 #[tokio::test]
 async fn state_refresh_removes_orphaned_resource_deleted_externally() {
+    let user_dirs = carina_core::TestUserDirs::new();
     // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
     let mut state = StateFile::new();
     state
@@ -2187,6 +2188,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
     let result = run_state_refresh_locked(
+        &user_dirs,
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),
@@ -2214,6 +2216,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
 #[tokio::test]
 async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let mut state = StateFile::new();
     let mut row = ResourceState::new("s3.Bucket", "deposed-bucket", "");
     row.deposed.push(DeposedInstance::from_persisted_json(
@@ -2232,6 +2235,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
+        &user_dirs,
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),
@@ -2255,6 +2259,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
 
 #[tokio::test]
 async fn state_refresh_locked_updates_alive_deposed_generation() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     std::fs::write(
@@ -2295,6 +2300,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let lock = LockInfo::for_test("state-refresh");
 
     let result = run_state_refresh_locked(
+        &user_dirs,
         &mut parsed,
         &backend,
         StateLockRef::Held(&lock),

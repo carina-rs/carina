@@ -323,6 +323,7 @@ async fn run_saved_plan_schema_fingerprint_case(
     identity: &str,
     secret_bearing: bool,
 ) -> (Result<Option<Duration>, AppError>, String) {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -395,6 +396,7 @@ async fn run_saved_plan_schema_fingerprint_case(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -791,11 +793,11 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let rendered = error.to_string();
     assert!(
         !rendered.contains('\u{1b}'),
-        "a saved source path injected a terminal escape byte: {rendered:?}",
+        "a saved source path injected a terminal escape byte",
     );
     assert!(
         rendered.contains(r"saved\u{1b}[31m.crn"),
-        "the escaped source path was not retained in the moved-call diagnostic: {rendered:?}",
+        "the escaped source path was not retained in the moved-call diagnostic",
     );
 
     std::fs::remove_file(&current_source).expect("remove current composition source");
@@ -809,17 +811,18 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .expect_err("an unreadable live call source must fail with its typed identity error");
     let AppError::CompositionSourceIdentity(identity_error) = error else {
-        panic!("apply flattened the composition identity error: {error:?}");
+        panic!("apply flattened the composition identity error");
     };
     assert!(
         std::error::Error::source(&identity_error)
             .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
-        "apply dropped the composition identity io source: {identity_error:?}",
+        "apply dropped the composition identity io source",
     );
 }
 
 #[tokio::test]
 async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_corrupt() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let source_file = tmp.path().join("source.crn");
     std::fs::write(&source_file, "source fixture").expect("write composition source");
@@ -878,6 +881,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         .expect("write malformed plan");
 
         let error = run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -905,6 +909,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
 #[tokio::test]
 async fn saved_plan_persists_pending_state_migration_before_drift_return() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -982,6 +987,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -1127,6 +1133,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
 
 #[tokio::test]
 async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -1147,6 +1154,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
     .unwrap();
 
     let error = run_apply_with_observer_factory(
+        &user_dirs,
         &downstream,
         true,
         false,
@@ -1166,6 +1174,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
 
 #[tokio::test]
 async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -1224,6 +1233,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     write_upstream("arn:aws:iam::222222222222:role/new");
     let reloaded = reload_apply_configuration_after_bootstrap(
+        &user_dirs,
         &downstream,
         &downstream,
         &ProviderContext::default(),
@@ -1270,6 +1280,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
 #[test]
 fn bootstrap_reload_rejects_nested_forwarding_mismatch() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = tempfile::tempdir().expect("tempdir");
     let outer = fixture.path().join("outer");
     let inner = outer.join("inner");
@@ -1300,6 +1311,7 @@ inner { x = a }
     .unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
+        &user_dirs,
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
@@ -1366,6 +1378,7 @@ let y = m { n = x.s }
 
 #[test]
 fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
+    let user_dirs = carina_core::TestUserDirs::new();
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
         let unresolved = load_configuration_with_config(
@@ -1376,6 +1389,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         .expect("load unresolved bootstrap snapshot")
         .unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
+            &user_dirs,
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
@@ -2776,6 +2790,7 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
 
 #[tokio::test]
 async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2912,6 +2927,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -2950,6 +2966,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
 #[tokio::test]
 async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3036,6 +3053,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3078,6 +3096,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
 #[tokio::test]
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
@@ -3110,6 +3129,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3144,6 +3164,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
 #[tokio::test]
 async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let contents = PlanFileContents {
@@ -3193,6 +3214,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3222,6 +3244,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 
 #[tokio::test]
 async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_provider_temp, downstream, _) =
@@ -3294,6 +3317,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         &ProviderContext::default(),
@@ -3532,6 +3556,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
 
 #[tokio::test]
 async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases_lock() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["first", "second", "third"])
         .cancel_after_successes(1);
@@ -3539,6 +3564,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
+        &user_dirs,
         fixture.config_path(),
         true,
         true,
@@ -3582,6 +3608,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 
 #[tokio::test]
 async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
@@ -3600,6 +3627,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     crate::commands::validate_and_resolve_with_config(
+        &user_dirs,
         &mut parsed,
         base_dir,
         false,
@@ -3607,7 +3635,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         &loaded.duplicate_declarations,
     )
     .expect("fixture must validate");
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)
+    let (factories, _) = build_factories_from_providers(&user_dirs, &parsed.providers, base_dir)
         .expect("mock factory must load");
     let ctx = WiringContext::new(factories, &parsed.providers);
     let observer_factory = fixture.observer_factory();
@@ -3646,6 +3674,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
 
 #[tokio::test]
 async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
@@ -3701,6 +3730,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
 
     let error = run_apply_from_plan_locked(
+        &user_dirs,
         inspected_saved_plan(plan_file),
         None,
         fixture.provider_context(),
@@ -3727,6 +3757,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
 #[tokio::test]
 async fn apply_cancel_token_integration_persists_completed_state_releases_lock_and_returns_interrupted()
  {
+    let user_dirs = carina_core::TestUserDirs::new();
     // Regression test for #3498: a cancelled apply must persist completed
     // resources to state, release the lock, and return AppError::Interrupted.
     // The resource names mirror the publish-ALB scenario that surfaced this
@@ -3738,6 +3769,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
+        &user_dirs,
         fixture.config_path(),
         true,
         true,
@@ -3775,6 +3807,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
 #[tokio::test]
 async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
+    let user_dirs = carina_core::TestUserDirs::new();
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["a_completed", "z_blocked"])
@@ -3783,6 +3816,7 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
     let observer_factory = fixture.observer_factory();
 
     let apply = run_apply_with_observer_factory(
+        &user_dirs,
         fixture.config_path(),
         true,
         true,
@@ -8205,6 +8239,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -8215,6 +8250,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8240,6 +8276,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn previous_plan_version_is_rejected_before_payload_decoding() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("previous-plan.json");
         let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
@@ -8253,6 +8290,7 @@ mod saved_plan_version_tests {
             .expect("write previous plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8276,6 +8314,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -8301,6 +8340,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8336,11 +8376,13 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn future_saved_plan_without_source_path_is_rejected_by_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("future-plan");
         std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8384,6 +8426,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn current_saved_plan_without_source_path_is_corrupt_without_command() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("current-plan");
         let malformed = serde_json::json!({
@@ -8398,6 +8441,7 @@ mod saved_plan_version_tests {
         .expect("write malformed plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8434,6 +8478,7 @@ mod saved_plan_version_tests {
     /// stub `effects: []` / resource arrays are enough.
     #[tokio::test]
     async fn version_3_saved_plan_is_rejected() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         // A v3 plan: everything required by the pre-#3248 PlanFile
@@ -8458,6 +8503,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v3).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8522,6 +8568,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_10_saved_plan_is_rejected_after_constraint_metadata_bump() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v10 = serde_json::json!({
@@ -8546,6 +8593,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v10).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8592,6 +8640,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_13_saved_plan_is_rejected_after_orphan_ownership_change() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v13 = serde_json::json!({
@@ -8616,6 +8665,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v13).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8647,6 +8697,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_15_saved_plan_is_rejected_after_wait_rhs_typing_change() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v15 = serde_json::json!({
@@ -8672,6 +8723,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v15).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8702,6 +8754,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_18_saved_plan_is_rejected_after_abandoned_generation_shape_change() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v18 = serde_json::json!({
@@ -8727,6 +8780,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v18).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8757,6 +8811,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_19_saved_plan_is_rejected_after_current_state_tagging_change() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v19 = serde_json::json!({
@@ -8782,6 +8837,7 @@ mod saved_plan_version_tests {
         std::fs::write(&plan_path, serde_json::to_string(&v19).unwrap()).expect("write plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8813,6 +8869,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let import_id = carina_core::resource::ResolvedResourceId::new(
@@ -8851,6 +8908,7 @@ mod saved_plan_version_tests {
         .expect("write legacy plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -8886,6 +8944,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_reports_malformed_current_version_as_corrupt() {
+        let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let malformed = serde_json::json!({
@@ -8914,6 +8973,7 @@ mod saved_plan_version_tests {
         .expect("write malformed plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             &plan_path,
             true,
             false,
@@ -9070,9 +9130,11 @@ mod saved_plan_version_tests {
         json: &serde_json::Value,
         expectation: &str,
     ) -> String {
+        let user_dirs = carina_core::TestUserDirs::new();
         std::fs::write(plan_path, serde_json::to_string(json).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
             plan_path,
             true,
             false,

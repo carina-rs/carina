@@ -62,8 +62,8 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    BlockNameConflict, CustomTypeLookup, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedResourceSchema, resolve_config_block_names_with_schemas,
+    BlockNameConflict, OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry,
+    TypeError, ValidatedResourceSchema, resolve_config_block_names_with_schemas,
     resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
@@ -232,6 +232,7 @@ pub struct StateBlockResolution {
 /// `WiringContext` and pass it through the command execution path.
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    custom_types: carina_core::parser::ProviderCustomTypes,
     schemas: SchemaRegistry,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
@@ -391,8 +392,12 @@ impl WiringContext {
         if uses_builtin_mock {
             known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
+        let factories = Arc::new(factories);
+        let custom_types =
+            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
         Self {
-            factories: Arc::new(factories),
+            factories,
+            custom_types,
             schemas,
             known_providers,
             uses_builtin_mock,
@@ -429,6 +434,10 @@ impl WiringContext {
         Arc::clone(&self.factories)
     }
 
+    pub fn custom_type_resolver(&self) -> &dyn carina_core::parser::CustomTypeResolver {
+        &self.custom_types
+    }
+
     pub fn schemas(&self) -> &SchemaRegistry {
         &self.schemas
     }
@@ -455,12 +464,13 @@ impl WiringContext {
 /// to their failure reasons, so callers can show accurate diagnostics. A stale
 /// lock constraint is returned to the supervised command rather than exiting.
 pub fn build_factories_from_providers(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
     carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
-    build_factories_from_providers_impl(providers, base_dir, true)
+    build_factories_from_providers_impl(user_dirs, providers, base_dir, true)
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -471,6 +481,7 @@ pub fn build_factories_from_providers(
 /// Suppressed provider and lock-constraint failures are returned as load errors
 /// so `--check` can report degraded conversion without failing formatting.
 pub(crate) fn build_factories_from_providers_for_formatting(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<FormattingFactoryLoad, AppError> {
@@ -484,7 +495,8 @@ pub(crate) fn build_factories_from_providers_for_formatting(
         ));
     }
 
-    let (factories, load_errors) = build_factories_from_providers_impl(providers, base_dir, false)?;
+    let (factories, load_errors) =
+        build_factories_from_providers_impl(user_dirs, providers, base_dir, false)?;
     Ok((
         factories,
         load_errors
@@ -495,22 +507,31 @@ pub(crate) fn build_factories_from_providers_for_formatting(
 }
 
 fn build_factories_from_providers_impl(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
+    let loader_user_dirs = user_dirs.clone();
     build_factories_from_providers_impl_using(
+        user_dirs,
         providers,
         base_dir,
         report_errors,
         grant_inputs,
-        |verified| async move { carina_plugin_host::WasmProviderFactory::from_bytes(verified).await },
+        move |verified| {
+            let user_dirs = loader_user_dirs.clone();
+            async move {
+                carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs).await
+            }
+        },
     )
 }
 
 fn build_factories_from_providers_impl_using<L, Fut>(
+    user_dirs: &carina_core::UserDirs,
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
@@ -560,11 +581,15 @@ where
 
         let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(grants, |verified| {
-                let artifact = verified.artifact().clone();
-                let loaded = loader(verified);
-                async move { loaded.await.map(|factory| (factory, artifact)) }
-            }))
+            tokio::runtime::Handle::current().block_on(installed.load_with(
+                user_dirs,
+                grants,
+                |verified| {
+                    let artifact = verified.artifact().clone();
+                    let loaded = loader(verified);
+                    async move { loaded.await.map(|factory| (factory, artifact)) }
+                },
+            ))
         });
 
         match factory_result {
@@ -1009,7 +1034,7 @@ pub fn apply_anonymous_to_named_renames(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|schema| schema.as_schema().create_only_attributes())
+                .map(|schema| schema.schema().as_schema().create_only_attributes())
                 .unwrap_or_default();
             let state_entries = sf
                 .resources_by_type(provider, resource_type)
@@ -1098,7 +1123,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|schema| schema.as_schema().create_only_attributes())
+                .map(|schema| schema.schema().as_schema().create_only_attributes())
                 .unwrap_or_default();
 
             let state_entries = state_file
@@ -1173,7 +1198,7 @@ pub fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
                     resource_type,
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|schema| schema.as_schema().create_only_attributes())
+                .map(|schema| schema.schema().as_schema().create_only_attributes())
                 .unwrap_or_default();
 
             let state_entries = state_file
@@ -1416,7 +1441,7 @@ pub(crate) fn lift_data_source_value_enum_leaves(
         .filter_map(|data_source| {
             schemas
                 .get_for_data_source(data_source)
-                .map(|schema| (&data_source.id, schema.as_schema()))
+                .map(|schema| (&data_source.id, schema.schema().as_schema()))
         })
         .collect::<HashMap<_, _>>();
     for (id, state) in data_source_values.iter_read_states_mut() {
@@ -1482,36 +1507,6 @@ pub enum PlanPreparationError {
     Provider(#[from] ProviderError),
 }
 
-fn type_error_attribute(error: &TypeError) -> Option<&str> {
-    match error {
-        TypeError::InvalidEnumVariant { attribute, .. }
-        | TypeError::PatternMismatch { attribute, .. }
-        | TypeError::LengthOutOfRange { attribute, .. }
-        | TypeError::StringLiteralExpectedEnum { attribute, .. }
-        | TypeError::ResourceValidationFailed { attribute, .. }
-        | TypeError::ProviderValidationFailed { attribute, .. } => attribute.as_deref(),
-        TypeError::BlockSyntaxNotAllowed { attribute } => Some(attribute),
-        TypeError::ListItemError { inner, .. }
-        | TypeError::MapKeyError { inner, .. }
-        | TypeError::MapValueError { inner, .. }
-        | TypeError::StructFieldError { inner, .. } => type_error_attribute(inner),
-        TypeError::UnionAlternativesMismatch { failures } => {
-            let mut attributes = failures.iter().filter_map(type_error_attribute);
-            let first = attributes.next()?;
-            attributes
-                .all(|attribute| attribute == first)
-                .then_some(first)
-        }
-        TypeError::TypeMismatch { .. }
-        | TypeError::ValidationFailed { .. }
-        | TypeError::MissingRequired { .. }
-        | TypeError::ReadOnlyAttribute { .. }
-        | TypeError::UnknownAttribute { .. }
-        | TypeError::UnknownStructField { .. }
-        | TypeError::UnionStructMismatch { .. } => None,
-    }
-}
-
 fn resolved_constraint_context(
     error: &TypeError,
     origin_attributes: &IndexMap<String, Value>,
@@ -1530,7 +1525,7 @@ fn resolved_constraint_context(
         });
     }
 
-    let explicit_attribute = type_error_attribute(error).map(str::to_string);
+    let explicit_attribute = error.attribute_name().map(str::to_string);
     let attributes = if let Some(attribute) = explicit_attribute {
         vec![attribute]
     } else if origins_by_attribute.is_empty() {
@@ -1576,12 +1571,6 @@ fn validate_resolved_value_constraints(
         "plan value checking requires paired data sources"
     );
 
-    let provider_lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
-    let lookup = |identity: &carina_core::schema::TypeIdentity, value: &Value| {
-        provider_lookup(identity, value).map_err(|error| TypeError::ValidationFailed {
-            message: error.to_string(),
-        })
-    };
     let mut plan_errors = Vec::new();
     for (resource, origin) in resources.iter().zip(resource_origins) {
         let Some(schema) = ctx.schemas().get_for(resource) else {
@@ -1594,7 +1583,7 @@ fn validate_resolved_value_constraints(
             &resource.resolved_attributes(),
             &resource.quoted_string_attrs,
             &origin.attributes,
-            &lookup,
+            ctx.custom_type_resolver(),
         );
     }
 
@@ -1609,7 +1598,7 @@ fn validate_resolved_value_constraints(
             &carina_core::resource::attrs_to_hashmap(&resource.attributes),
             &resource.quoted_string_attrs,
             &origin.attributes,
-            &lookup,
+            ctx.custom_type_resolver(),
         );
     }
 
@@ -1619,24 +1608,22 @@ fn validate_resolved_value_constraints(
 fn append_resolved_value_constraint_errors(
     plan_errors: &mut Vec<PlanError>,
     id: &ResourceId,
-    schema: &carina_core::schema::ValidatedResourceSchema,
+    schema: OwnerBoundResourceSchema<'_>,
     attributes: &HashMap<String, Value>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
-    lookup: CustomTypeLookup<'_>,
+    resolver: &dyn carina_core::parser::CustomTypeResolver,
 ) {
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
-    let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
-        attributes,
-        &is_string_literal,
-        lookup,
-    ) else {
+    let Err(errors) =
+        schema.validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
+    else {
         return;
     };
 
     for error in errors {
         let (attributes, origins) =
-            resolved_constraint_context(&error, origin_attributes, schema.as_schema());
+            resolved_constraint_context(&error, origin_attributes, schema.schema().as_schema());
         plan_errors.push(PlanError::new(
             id.clone(),
             PlanErrorKind::ResolvedValueConstraint {

@@ -27,6 +27,7 @@ use wasmtime_wasi::random::WasiRandom;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 
+use carina_core::UserDirs;
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CanonicalCustomTypeValue,
@@ -179,6 +180,26 @@ fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> 
     }
 }
 
+#[derive(Debug)]
+struct ProviderSchemaDecodeDiagnostic(wasm_convert::SchemaDecodeError);
+
+impl fmt::Display for ProviderSchemaDecodeDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut current: &(dyn std::error::Error + 'static) = &self.0;
+        write!(formatter, "{current}")?;
+        while let Some(source) = current.source() {
+            write!(formatter, ": {source}")?;
+            current = source;
+        }
+        Ok(())
+    }
+}
+
+// `WasmProviderLoadError::Metadata` deliberately renders its source and does
+// not expose it again. This adapter follows that policy while retaining every
+// typed schema-decode cause in the one rendered diagnostic.
+impl std::error::Error for ProviderSchemaDecodeDiagnostic {}
+
 fn provider_schema_decode_error(
     provider_name: &str,
     provider_version: &str,
@@ -188,7 +209,7 @@ fn provider_schema_decode_error(
         format!(
             "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode; the provider revision may predate this host"
         ),
-        detail,
+        ProviderSchemaDecodeDiagnostic(detail),
     )
 }
 
@@ -926,6 +947,17 @@ struct VettedDestination {
     is_metadata: bool,
 }
 
+/// A factory-scoped HTTP route used only by host/guest integration tests.
+///
+/// Production construction never sets this value. Keeping it on the factory,
+/// instead of a process-global override, prevents parallel tests from changing
+/// one another's outbound policy.
+#[derive(Clone, Debug)]
+struct HttpTestRoute {
+    host: String,
+    destination: SocketAddr,
+}
+
 fn ip_literal(host: &str) -> Option<IpAddr> {
     host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
@@ -1127,15 +1159,22 @@ impl DestinationResolver for TokioDestinationResolver {
 struct AllowListHttpHooks {
     kind: Option<ProviderKind>,
     resolver: Arc<dyn DestinationResolver>,
+    test_route: Option<HttpTestRoute>,
 }
 
 impl AllowListHttpHooks {
-    fn new(kind: Option<ProviderKind>) -> Self {
-        Self::with_resolver(kind, Arc::new(TokioDestinationResolver))
+    fn with_resolver(kind: Option<ProviderKind>, resolver: Arc<dyn DestinationResolver>) -> Self {
+        Self {
+            kind,
+            resolver,
+            test_route: None,
+        }
     }
 
-    fn with_resolver(kind: Option<ProviderKind>, resolver: Arc<dyn DestinationResolver>) -> Self {
-        Self { kind, resolver }
+    fn with_test_route(kind: Option<ProviderKind>, test_route: Option<HttpTestRoute>) -> Self {
+        let mut hooks = Self::with_resolver(kind, Arc::new(TokioDestinationResolver));
+        hooks.test_route = test_route;
+        hooks
     }
 }
 
@@ -1154,17 +1193,32 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 return Err(ErrorCode::HttpRequestUriInvalid.into());
             }
         };
-        let allowed_host = check_host(self.kind, host).map_err(|_| {
-            log::warn!(
-                "WASM plugin HTTP request blocked: host {:?} is not in the allow-list",
-                host,
-            );
-            ErrorCode::HttpRequestDenied
-        })?;
         let port = request
             .uri()
             .port_u16()
             .unwrap_or(if config.use_tls { 443 } else { 80 });
+        let test_destination = self
+            .test_route
+            .as_ref()
+            .filter(|route| {
+                !config.use_tls
+                    && route.host.eq_ignore_ascii_case(host)
+                    && route.destination.port() == port
+            })
+            .map(|route| route.destination);
+        let allowed_host = match test_destination {
+            Some(_) => AllowedHost {
+                kind: self.kind,
+                target: AllowedHostTarget::Name(host.to_string()),
+            },
+            None => check_host(self.kind, host).map_err(|_| {
+                log::warn!(
+                    "WASM plugin HTTP request blocked: host {:?} is not in the allow-list",
+                    host,
+                );
+                ErrorCode::HttpRequestDenied
+            })?,
+        };
         let resolver = Arc::clone(&self.resolver);
         let trace_state = trace_http_enabled().then(|| {
             (
@@ -1177,33 +1231,36 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             let handler_start = std::time::Instant::now();
             let trace = trace_state.is_some();
             let result = async {
-                let resolved = match &allowed_host.target {
-                    AllowedHostTarget::Name(host) => tokio::time::timeout(
-                        config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
-                        resolver.resolve(host.clone(), port),
-                    )
-                    .await
-                    .map_err(|_| {
-                        log::warn!(
-                            "WASM plugin HTTP request timed out resolving host {:?}",
-                            host,
-                        );
-                        ErrorCode::ConnectionTimeout
-                    })?
-                    .map_err(|error| {
-                        log::warn!(
-                            "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                            host,
-                            error,
-                        );
-                        ErrorCode::DnsError(DnsErrorPayload {
-                            rcode: Some("address not available".to_string()),
-                            info_code: Some(0),
-                        })
-                    })?,
-                    AllowedHostTarget::Literal(address) => {
-                        vec![SocketAddr::new(*address, port)]
-                    }
+                let resolved = match test_destination {
+                    Some(destination) => vec![destination],
+                    None => match &allowed_host.target {
+                        AllowedHostTarget::Name(host) => tokio::time::timeout(
+                            config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
+                            resolver.resolve(host.clone(), port),
+                        )
+                        .await
+                        .map_err(|_| {
+                            log::warn!(
+                                "WASM plugin HTTP request timed out resolving host {:?}",
+                                host,
+                            );
+                            ErrorCode::ConnectionTimeout
+                        })?
+                        .map_err(|error| {
+                            log::warn!(
+                                "WASM plugin HTTP request failed to resolve host {:?}: {}",
+                                host,
+                                error,
+                            );
+                            ErrorCode::DnsError(DnsErrorPayload {
+                                rcode: Some("address not available".to_string()),
+                                info_code: Some(0),
+                            })
+                        })?,
+                        AllowedHostTarget::Literal(address) => {
+                            vec![SocketAddr::new(*address, port)]
+                        }
+                    },
                 };
                 let vetted =
                     vet_resolved_destination(allowed_host, &resolved).map_err(|denied| {
@@ -1275,8 +1332,6 @@ fn trace_http_enabled() -> bool {
 /// - `http_handshake_ms` — hyper http/1.1 protocol handshake
 /// - `send_request_ms` — request headers/body sent, response head arrived
 ///
-/// Errors are mapped to the upstream `ErrorCode` variants for parity with
-/// the non-traced path.
 async fn send_request_handler(
     mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
     config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
@@ -1346,10 +1401,11 @@ async fn send_request_handler(
                 },
             )
         })?;
-        let stream = connector
-            .connect(domain, tcp_stream)
-            .await
-            .map_err(|_| ErrorCode::TlsProtocolError)?;
+        let stream = connector.connect(domain, tcp_stream).await.map_err(|_| {
+            // The SDK classifies TlsProtocolError as NotSent because the
+            // carina host emits it only here, during the TLS handshake.
+            ErrorCode::TlsProtocolError
+        })?;
         let tls_handshake_ms = ms(phase_start);
 
         let stream = TokioIo::new(stream);
@@ -1359,7 +1415,11 @@ async fn send_request_handler(
         )
         .await
         .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|_| ErrorCode::HttpProtocolError)?;
+        .map_err(|_| {
+            // Hyper has not received a request yet, so this is pre-send even
+            // though wasi:http has no dedicated HTTP-handshake error code.
+            ErrorCode::ConnectionRefused
+        })?;
         let http_handshake_ms = ms(phase_start);
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
@@ -1374,7 +1434,11 @@ async fn send_request_handler(
         )
         .await
         .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|_| ErrorCode::HttpProtocolError)?;
+        .map_err(|_| {
+            // Hyper has not received a request yet, so this is pre-send even
+            // though wasi:http has no dedicated HTTP-handshake error code.
+            ErrorCode::ConnectionRefused
+        })?;
         let http_handshake_ms = ms(phase_start);
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
@@ -2319,13 +2383,15 @@ async fn create_instance_with_http(
     component: &Component,
     provider_kind: Option<ProviderKind>,
     budget: GuestCallBudget,
+    http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut store = GuestStore::new(
+    let mut store = GuestStore::new_with_http_test_route(
         engine,
         provider_kind,
         Some(WasiHttpCtx::new()),
         build_store_limits(),
         budget,
+        http_test_route,
     );
 
     let mut linker = Linker::new(engine);
@@ -2355,10 +2421,12 @@ async fn create_instance_for_world(
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
+    http_test_route: Option<HttpTestRoute>,
 ) -> Result<LiveInstance, WasmBindingCreationError> {
     let (store, bindings) = match world {
         InstantiationWorld::HttpEnabled => {
-            create_instance_with_http(engine, component, provider_kind, budget).await
+            create_instance_with_http(engine, component, provider_kind, budget, http_test_route)
+                .await
         }
         InstantiationWorld::Basic => {
             create_instance(engine, component, provider_kind, budget).await
@@ -2373,8 +2441,17 @@ async fn create_runtime_instance(
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
+    http_test_route: Option<HttpTestRoute>,
 ) -> Result<LiveInstance, WasmProviderInstanceError> {
-    let result = create_instance_for_world(engine, component, provider_kind, world, budget).await;
+    let result = create_instance_for_world(
+        engine,
+        component,
+        provider_kind,
+        world,
+        budget,
+        http_test_route,
+    )
+    .await;
     result.map_err(|failure| {
         map_binding_creation_error(
             failure,
@@ -3029,6 +3106,7 @@ struct RebuildContext {
     provider_kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
+    http_test_route: Option<HttpTestRoute>,
 }
 
 impl RebuildContext {
@@ -3039,6 +3117,7 @@ impl RebuildContext {
             provider_kind: None,
             world: InstantiationWorld::HttpEnabled,
             budget,
+            http_test_route: None,
         }
     }
 
@@ -3049,6 +3128,7 @@ impl RebuildContext {
             self.provider_kind,
             self.world,
             self.budget,
+            self.http_test_route.clone(),
         )
         .await
     }
@@ -3213,6 +3293,7 @@ pub struct WasmProviderFactory {
     /// catching format bugs without requiring a provider rebuild.
     cached_provider_config_types: ValidatedConfigSchema,
     enable_http: bool,
+    http_test_route: Option<HttpTestRoute>,
     /// Reusable, rebuildable WASM instance for editor-facing validation.
     /// A poisoned instance is recreated from `engine` + `component`; each input
     /// is suspended after its second wall-clock timeout. A successful retry
@@ -3319,12 +3400,6 @@ fn decode_config_completions_json(
 }
 
 impl WasmProviderFactory {
-    /// Compute the default cache directory (`~/.carina/cache/`).
-    /// Returns `None` if the home directory cannot be determined.
-    fn default_cache_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".carina").join("cache"))
-    }
-
     /// Load provider metadata from WIT functions.
     ///
     /// Every export and decode is required to succeed. Substituting empty
@@ -3530,6 +3605,7 @@ impl WasmProviderFactory {
             cached_identity_attributes,
             cached_provider_config_types,
             enable_http,
+            http_test_route: None,
             init_instance,
             shared_instances: Mutex::new(HashMap::new()),
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
@@ -3537,28 +3613,27 @@ impl WasmProviderFactory {
         })
     }
 
-    /// Load provider bytes using the default precompile cache at `~/.carina/cache/`.
+    /// Load provider bytes using the supplied per-user precompile cache.
     ///
     /// The verified load binds the resolver-retained bytes to their configured
     /// name and trust classification. An artifact reporting a different name
     /// is rejected.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn from_bytes(load: VerifiedLoad) -> Result<Self, WasmProviderLoadError> {
+    pub async fn from_bytes(
+        load: VerifiedLoad,
+        user_dirs: &UserDirs,
+    ) -> Result<Self, WasmProviderLoadError> {
         let configured = ConfiguredProvider::new(load.identity());
         let wasm_bytes = load.bytes().clone();
+        let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
         let load: BoxFuture<'_, Result<Self, WasmProviderLoadError>> = Box::pin(async move {
-            match Self::default_cache_dir() {
-                Some(cache_dir) => {
-                    Self::from_bytes_with_cache_dir_configured(
-                        wasm_bytes.as_bytes(),
-                        &cache_dir,
-                        configured,
-                    )
-                    .await
-                }
-                None => Self::new_uncached_configured(wasm_bytes.as_bytes(), configured).await,
-            }
+            Self::from_bytes_with_cache_dir_configured(
+                wasm_bytes.as_bytes(),
+                &cache_dir,
+                configured,
+            )
+            .await
         });
         load.await
     }
@@ -3724,9 +3799,15 @@ impl WasmProviderFactory {
         } else {
             InstantiationWorld::Basic
         };
-        let mut live =
-            create_runtime_instance(&self.engine, &self.component, kind, world, self.budget)
-                .await?;
+        let mut live = create_runtime_instance(
+            &self.engine,
+            &self.component,
+            kind,
+            world,
+            self.budget,
+            self.http_test_route.clone(),
+        )
+        .await?;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
             .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
         live.store
@@ -3794,6 +3875,25 @@ impl WasmProviderFactory {
     pub fn with_guest_call_budget(mut self, budget: GuestCallBudget) -> Self {
         self.budget = budget;
         self.init_instance.set_budget(budget);
+        self
+    }
+
+    /// Route one exact guest HTTP hostname and port to a test server.
+    ///
+    /// This exists only for host/guest integration tests. The override is
+    /// factory-scoped and is never available in production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_http_test_route(
+        mut self,
+        host: impl Into<String>,
+        destination: SocketAddr,
+    ) -> Self {
+        let route = HttpTestRoute {
+            host: host.into(),
+            destination,
+        };
+        self.init_instance.rebuild.http_test_route = Some(route.clone());
+        self.http_test_route = Some(route);
         self
     }
 
@@ -6085,6 +6185,24 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn http_test_route_is_retained_for_validation_rebuilds() {
+        let Some(factory) = rebuildable_state_test_factory().await else {
+            return;
+        };
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 43210));
+        let factory = factory.with_http_test_route("phase-test.invalid", destination);
+
+        let route = factory
+            .init_instance
+            .rebuild
+            .http_test_route
+            .as_ref()
+            .expect("validation rebuild context must retain the test route");
+        assert_eq!(route.host, "phase-test.invalid");
+        assert_eq!(route.destination, destination);
+    }
+
     #[test]
     fn protocol_v12_wit_surface_compiles() {
         fn assert_type<T>() {}
@@ -7959,6 +8077,86 @@ mod tests {
             .boxed_unsync()
     }
 
+    fn test_outgoing_request_config(
+        use_tls: bool,
+    ) -> wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls,
+            connect_timeout: std::time::Duration::from_secs(1),
+            first_byte_timeout: std::time::Duration::from_secs(1),
+            between_bytes_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn denied_and_invalid_requests_are_reported_as_pre_send() {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            Some(ProviderKind::Untrusted),
+            Arc::new(StubResolver {
+                addresses: HashMap::new(),
+            }),
+        );
+
+        let denied = hyper::Request::builder()
+            .uri("http://example.invalid/")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let denied = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            denied,
+            test_outgoing_request_config(false),
+        )
+        .expect_err("a denied host should fail before spawning a request");
+        assert!(matches!(
+            denied.downcast_ref(),
+            Some(ErrorCode::HttpRequestDenied)
+        ));
+
+        let invalid = hyper::Request::builder()
+            .uri("/relative")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let invalid = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            invalid,
+            test_outgoing_request_config(false),
+        )
+        .expect_err("a URI without a host should fail before spawning a request");
+        assert!(matches!(
+            invalid.downcast_ref(),
+            Some(ErrorCode::HttpRequestUriInvalid)
+        ));
+    }
+
+    #[test]
+    fn http_test_route_does_not_override_https_policy() {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 4443));
+        let mut hooks = AllowListHttpHooks::with_test_route(
+            Some(ProviderKind::Untrusted),
+            Some(HttpTestRoute {
+                host: "phase-test.invalid".to_string(),
+                destination,
+            }),
+        );
+        let request = hyper::Request::builder()
+            .uri("https://phase-test.invalid:4443/")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = test_outgoing_request_config(true);
+
+        let error =
+            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                .expect_err("an HTTP-only test route must not bypass HTTPS host policy");
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ErrorCode::HttpRequestDenied)
+        ));
+    }
+
     #[tokio::test]
     async fn dns_resolution_respects_connect_timeout() {
         use wasmtime_wasi::p2::Pollable;
@@ -7973,10 +8171,8 @@ mod tests {
             .body(empty_outgoing_body())
             .unwrap();
         let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
             connect_timeout: std::time::Duration::from_millis(10),
-            first_byte_timeout: std::time::Duration::from_secs(1),
-            between_bytes_timeout: std::time::Duration::from_secs(1),
+            ..test_outgoing_request_config(false)
         };
 
         let mut response =
@@ -7993,6 +8189,153 @@ mod tests {
             matches!(result, Err(ErrorCode::ConnectionTimeout)),
             "a DNS timeout returned the wrong result: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_reported_as_pre_send() {
+        use wasmtime_wasi::p2::Pollable;
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            Some(ProviderKind::Untrusted),
+            Arc::new(StubResolver {
+                addresses: HashMap::new(),
+            }),
+        );
+        let request = hyper::Request::builder()
+            .uri("http://service.amazonaws.com/")
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = test_outgoing_request_config(false);
+
+        let mut response =
+            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                .expect("an allow-listed hostname should reach resolution");
+        response.ready().await;
+        let result = response
+            .unwrap_ready()
+            .expect("a DNS failure should not trap the request task");
+
+        assert!(matches!(result, Err(ErrorCode::DnsError(..))));
+    }
+
+    #[tokio::test]
+    async fn closed_tcp_port_is_reported_as_pre_send() {
+        use wasmtime_wasi::p2::Pollable;
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        // Keep the ephemeral port reserved by a TCP socket that never starts
+        // listening. This removes the bind/drop/rebind race from the usual
+        // "closed port" test. Kernels may either refuse the connection
+        // immediately or leave it pending until the connect timeout expires.
+        let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+            socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+            Ok(socket)
+        }) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("SKIP: sandbox cannot reserve a closed loopback port: {error}");
+                return;
+            }
+        };
+        let closed_address = socket.local_addr().unwrap();
+
+        let resolver = StubResolver {
+            addresses: HashMap::from([("closed.amazonaws.com".to_string(), vec![closed_address])]),
+        };
+        let mut hooks =
+            AllowListHttpHooks::with_resolver(Some(ProviderKind::Untrusted), Arc::new(resolver));
+        let request = hyper::Request::builder()
+            .uri(format!(
+                "http://closed.amazonaws.com:{}/",
+                closed_address.port()
+            ))
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = test_outgoing_request_config(false);
+
+        let mut response =
+            wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                .expect("an allow-listed hostname should start a request task");
+        response.ready().await;
+        let result = response
+            .unwrap_ready()
+            .expect("a TCP-connect failure should not trap the request task");
+        let code = match result {
+            Err(code) => code,
+            Ok(_) => panic!("a bound-but-not-listening socket unexpectedly accepted a request"),
+        };
+
+        assert!(
+            matches!(
+                &code,
+                ErrorCode::ConnectionRefused | ErrorCode::ConnectionTimeout
+            ),
+            "a TCP-connect failure returned an unexpected code: {code:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_after_receiving_request_is_reported_as_maybe_sent() {
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let listener = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+                return;
+            }
+        };
+        let server_address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = hyper::Request::builder()
+            .uri(format!(
+                "http://phase-test.invalid:{}/",
+                server_address.port()
+            ))
+            .body(empty_outgoing_body())
+            .unwrap();
+        let config = test_outgoing_request_config(false);
+        let destination = VettedDestination {
+            host: "phase-test.invalid".to_string(),
+            first: server_address,
+            rest: Vec::new(),
+            is_metadata: false,
+        };
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "server accept timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("server accept failed: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted socket blocking");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            stream
+                .read(&mut request)
+                .expect("read request before close")
+        });
+
+        let error = send_request_handler(request, config, destination, false)
+            .await
+            .expect_err("closing before a response should fail the request");
+        let bytes_read = server.join().expect("loopback server should finish");
+
+        assert!(bytes_read > 0, "the server must receive request bytes");
+        assert!(matches!(error, ErrorCode::HttpProtocolError));
     }
 
     #[tokio::test]
@@ -8019,6 +8362,9 @@ mod tests {
                     Err(error) => panic!("server accept failed: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted socket blocking");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
@@ -8485,6 +8831,7 @@ mod tests {
             None,
             InstantiationWorld::HttpEnabled,
             GuestCallBudget::PRODUCTION,
+            None,
         )
         .await
         {
@@ -8525,6 +8872,7 @@ mod tests {
             None,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
+            None,
         )
         .await
         {
@@ -9253,6 +9601,7 @@ mod tests {
             None,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
+            None,
         )
         .await
         {
@@ -9268,6 +9617,7 @@ mod tests {
                 provider_kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
+                http_test_route: None,
             },
         );
         instance.state.lock().await.instance = ValidationInstanceState::Poisoned {
@@ -9315,6 +9665,7 @@ mod tests {
                 provider_kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
+                http_test_route: None,
             },
             fingerprint_key,
         };

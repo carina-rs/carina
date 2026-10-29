@@ -29,7 +29,7 @@ pub use provider_ready::{
     ProviderConfigPreparationError, ProviderConfigValidationError, ProviderPreparationContext,
     ProviderPreparationError, ProviderReadyConfig, ProviderValueConstraintErrors,
     prepare_create_request, prepare_provider_ready_config, prepare_provider_ready_data_source,
-    prepare_provider_ready_resource, prepare_update_request, provider_custom_type_lookup,
+    prepare_provider_ready_resource, prepare_update_request,
 };
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.

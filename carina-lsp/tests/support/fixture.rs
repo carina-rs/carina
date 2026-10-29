@@ -5,11 +5,74 @@
 
 use std::sync::Arc;
 
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::resource::Value;
+use carina_core::schema::{
+    ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedResourceSchema,
+};
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
+use indexmap::IndexMap;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::Diagnostic;
+
+struct SchemaFixtureFactory {
+    name: String,
+    schemas: Vec<ValidatedResourceSchema>,
+}
+
+impl ProviderFactory for SchemaFixtureFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        &self.name
+    }
+
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        unimplemented!("schema fixture factories are never instantiated")
+    }
+
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        self.schemas.clone()
+    }
+}
+
+fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
+    let mut by_provider = std::collections::HashMap::<String, Vec<ValidatedResourceSchema>>::new();
+    for (provider, _resource_type, _kind, schema) in schemas.iter() {
+        by_provider
+            .entry(provider.to_string())
+            .or_default()
+            .push(schema.clone());
+    }
+    by_provider
+        .into_iter()
+        .map(|(name, schemas)| {
+            Box::new(SchemaFixtureFactory { name, schemas }) as Box<dyn ProviderFactory>
+        })
+        .collect()
+}
 
 /// Lay a multi-file fixture under `tempfile::tempdir()` and return the
 /// owning `TempDir`. Caller keeps it alive for the duration of the test.
@@ -47,7 +110,8 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
+    let factories = factories_for(&schemas);
+    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
 }
 
 /// Wrap one `ResourceSchema` in a `SchemaRegistry` registered under the

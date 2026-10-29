@@ -801,7 +801,7 @@ fn infer_resource_ref_with_visiting(
             ) => value,
             _ => {
                 return Err(InferenceError::InvalidAccess {
-                    base_type: attribute_type_to_type_expr(resolved).to_string(),
+                    base_type: attribute_type_to_type_expr(resolved, target.0).to_string(),
                     step: seg.clone(),
                 });
             }
@@ -833,7 +833,7 @@ fn infer_resource_ref_with_visiting(
             ),
         });
     }
-    Ok(attribute_type_to_type_expr(current))
+    Ok(attribute_type_to_type_expr(current, target.0))
 }
 
 fn lookup_schema<'a>(
@@ -844,7 +844,7 @@ fn lookup_schema<'a>(
     schemas
         .get(provider, resource_type, SchemaKind::Resource)
         .or_else(|| schemas.get(provider, resource_type, SchemaKind::DataSource))
-        .map(|schema| schema.as_schema())
+        .map(|schema| schema.schema().as_schema())
 }
 
 fn descend_struct_field<'a>(
@@ -872,12 +872,9 @@ fn descend_struct_field<'a>(
 /// recursive descent into `List`/`Map`/`Struct` schema receivers.
 ///
 /// Notable mappings:
-/// - `Custom { identity: Some(id), .. }` with a provider axis →
-///   `TypeExpr::SchemaType` (the same structured form the parser
-///   produces for a dotted `awscc.ec2.VpcId` annotation). A bare,
-///   provider-agnostic identity → `TypeExpr::Simple(snake)` so the
-///   predicate's existing `Simple(name)` arm matches by
-///   pascal_to_snake equality.
+/// - `Custom { identity: Some(id), .. }` → `TypeExpr::SchemaType`, including
+///   bare semantic identities. The schema owner must survive inference so a
+///   downstream sink never falls back to identity-only routing.
 /// - `Custom { identity: None, .. }` → falls through to the base
 ///   type; an anonymous Custom is structurally a wrapper and carries
 ///   no identity to project.
@@ -886,7 +883,10 @@ fn descend_struct_field<'a>(
 ///   validator) → `TypeExpr::SchemaType`, preserving the typed
 ///   identity old CustomEnum-origin schemas carried before enum
 ///   unification.
-pub(super) fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
+pub(super) fn attribute_type_to_type_expr(
+    attr_type: &AttributeType,
+    schema_owner: &str,
+) -> TypeExpr {
     let scalar_identity = match attr_type.kind() {
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
@@ -903,13 +903,8 @@ pub(super) fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr
         | AttrTypeKind::Ref(_) => None,
     };
     if let Some(id) = scalar_identity {
-        return match &id.provider {
-            Some(provider) => TypeExpr::SchemaType {
-                provider: provider.clone(),
-                path: id.segments.join("."),
-                type_name: id.kind.clone(),
-            },
-            None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
+        return TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(schema_owner, id.clone()),
         };
     }
 
@@ -943,28 +938,26 @@ pub(super) fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr
             validate,
             to_dsl,
             ..
-        } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => {
-            match &identity.provider {
-                Some(provider) => TypeExpr::SchemaType {
-                    provider: provider.clone(),
-                    path: identity.segments.join("."),
-                    type_name: identity.kind.clone(),
-                },
-                None => TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind)),
-            }
-        }
+        } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(schema_owner, identity.clone()),
+        },
         AttrTypeKind::Enum { .. } => TypeExpr::String,
         AttrTypeKind::List {
             element_type: inner,
             ..
-        } => TypeExpr::List(Box::new(attribute_type_to_type_expr(inner))),
+        } => TypeExpr::List(Box::new(attribute_type_to_type_expr(inner, schema_owner))),
         AttrTypeKind::Map { value, .. } => {
-            TypeExpr::Map(Box::new(attribute_type_to_type_expr(value)))
+            TypeExpr::Map(Box::new(attribute_type_to_type_expr(value, schema_owner)))
         }
         AttrTypeKind::Struct { fields, .. } => TypeExpr::Struct {
             fields: fields
                 .iter()
-                .map(|f| (f.name.clone(), attribute_type_to_type_expr(&f.field_type)))
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        attribute_type_to_type_expr(&f.field_type, schema_owner),
+                    )
+                })
                 .collect(),
         },
         // A union receiver has no single TypeExpr that captures it —
@@ -1228,6 +1221,12 @@ mod tests {
         s
     }
 
+    fn owned_vpc_id_type() -> TypeExpr {
+        TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider("awscc", TypeIdentity::bare("VpcId")),
+        }
+    }
+
     fn binding_to_vpc(name: &str) -> InferenceBindings {
         let mut b = InferenceBindings::new();
         b.insert(
@@ -1473,18 +1472,16 @@ mod tests {
     }
 
     #[test]
-    fn resource_ref_to_custom_attr_inferred_as_simple_snake() {
+    fn resource_ref_to_custom_attr_keeps_its_schema_owner() {
         // `vpc.vpc_id` where vpc is `awscc.ec2.Vpc` and `vpc_id` is
-        // `Custom { semantic_name: "VpcId" }` → `Simple("vpc_id")`.
-        // The pascal_to_snake normalization mirrors how the parser
-        // stores `: VpcId` annotations.
+        // identified as bare `VpcId` still carries the `awscc` schema owner.
         let path = AccessPath::new("vpc", "vpc_id");
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
         );
-        assert_eq!(r, Ok(TypeExpr::Simple("vpc_id".to_string())));
+        assert_eq!(r, Ok(owned_vpc_id_type()));
     }
 
     #[test]
@@ -1509,11 +1506,12 @@ mod tests {
         );
 
         assert_eq!(
-            attribute_type_to_type_expr(&region),
+            attribute_type_to_type_expr(&region, "aws"),
             TypeExpr::SchemaType {
-                provider: "aws".to_string(),
-                path: String::new(),
-                type_name: "Region".to_string(),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                ),
             }
         );
     }
@@ -1531,7 +1529,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(attribute_type_to_type_expr(&effect), TypeExpr::String);
+        assert_eq!(
+            attribute_type_to_type_expr(&effect, "aws"),
+            TypeExpr::String
+        );
     }
 
     #[test]
@@ -1931,10 +1932,7 @@ mod tests {
         let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
         assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
         assert_eq!(inferred.export_params.len(), 1);
-        assert_eq!(
-            inferred.export_params[0].type_expr,
-            TypeExpr::Simple("vpc_id".to_string())
-        );
+        assert_eq!(inferred.export_params[0].type_expr, owned_vpc_id_type());
     }
 
     #[test]
@@ -2136,7 +2134,7 @@ mod tests {
         assert_eq!(inferred.export_params.len(), 1);
         assert_eq!(
             inferred.export_params[0].type_expr,
-            TypeExpr::Simple("vpc_id".to_string()),
+            owned_vpc_id_type(),
             "expected the inner attribute's type to flow through the composition binding"
         );
     }

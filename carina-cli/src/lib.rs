@@ -31,14 +31,6 @@ use std::num::NonZeroUsize;
 pub const DEFAULT_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 #[cfg(test)]
-pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(test)]
 pub(crate) fn test_composition_call_path() -> carina_core::resource::CompositionCallPath {
     test_composition_call_path_in(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
@@ -67,33 +59,6 @@ pub(crate) fn test_composition_call_path_in(
         module_source: Some("./fixture_module".to_string()),
         module_directory: None,
     })
-}
-
-#[cfg(test)]
-pub(crate) struct ScopedTestEnvVar {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl ScopedTestEnvVar {
-    pub(crate) fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(name);
-        // SAFETY: callers hold test_env_guard while this process-wide override is active.
-        unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScopedTestEnvVar {
-    fn drop(&mut self) {
-        // SAFETY: the test still holds test_env_guard while this guard is dropped.
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.name, value) },
-            None => unsafe { std::env::remove_var(self.name) },
-        }
-    }
 }
 
 #[cfg(test)]

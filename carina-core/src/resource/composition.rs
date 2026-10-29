@@ -1521,9 +1521,10 @@ mod tests {
     #[test]
     fn argument_declared_type_is_carried_with_value_rewrites() {
         let declared = TypeExpr::SchemaType {
-            provider: "aws".to_string(),
-            path: "ec2.Vpc".to_string(),
-            type_name: "Id".to_string(),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "aws",
+                crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+            ),
         };
         let argument = LiveCompositionArgument::from_value(
             Value::Deferred(DeferredValue::ResourceRef {
