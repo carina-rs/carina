@@ -600,7 +600,7 @@ Client                          Registry                        GitHub Releases
 
 Metadata that the registry holds for each provider. In the initial implementation, this is managed as JSON files.
 
-```
+```plaintext
 providers/
   carina-rs/
     aws.json
