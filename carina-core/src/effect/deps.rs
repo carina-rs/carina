@@ -6,16 +6,16 @@ use crate::parser::ResourceRef;
 use crate::resource::{Resource, ResourceId, ResourceIdentity};
 
 #[derive(Debug, Clone)]
-pub struct UnresolvedResource(Resource);
+pub struct UnresolvedResource<S = crate::resource::ModuleSource>(Resource<S>);
 
-impl UnresolvedResource {
+impl<S> UnresolvedResource<S> {
     /// Pre-resolution snapshot used by dependency analysis and apply-time
     /// reference re-resolution.
-    pub fn from_pre_resolve(resource: Resource) -> Self {
+    pub fn from_pre_resolve(resource: Resource<S>) -> Self {
         Self(resource)
     }
 
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &Resource<S> {
         &self.0
     }
 }
@@ -92,7 +92,7 @@ pub(crate) struct WritesSet {
 }
 
 impl WritesSet {
-    pub(crate) fn from_update(effect: &Effect) -> Option<Self> {
+    pub(crate) fn from_update<S>(effect: &Effect<S>) -> Option<Self> {
         let Effect::Update {
             changed_attributes, ..
         } = effect
@@ -380,7 +380,7 @@ impl<'a> DependencyAnalyzer<'a> {
         self.lookup_by_identity(&ResourceIdentity::new(binding))
     }
 
-    fn collect_from_schedule_edges<E: AsRef<Effect>>(
+    fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
         &self,
         effects: &[E],
         edges: Vec<ScheduleEdge>,
@@ -433,9 +433,9 @@ impl<'a> DependencyAnalyzer<'a> {
         }
     }
 
-    fn collect_from_resource_ref(
+    fn collect_from_resource_ref<S>(
         &self,
-        resource: ResourceRef<'_>,
+        resource: ResourceRef<'_, S>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -468,9 +468,9 @@ impl<'a> DependencyAnalyzer<'a> {
         }
     }
 
-    fn collect_from_resource(
+    fn collect_from_resource<S>(
         &self,
-        resource: &Resource,
+        resource: &Resource<S>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -530,9 +530,9 @@ impl<'a> DependencyAnalyzer<'a> {
 /// resulting [`DependencyAnalysis`] is indexed by effect position, with
 /// any destroy `aliases` appearing at indices `effects.len()..` so callers
 /// can distinguish real effects from wait-binding bridges.
-pub fn build_effect_dependency_analysis(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+pub fn build_effect_dependency_analysis<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
     compositions: &[crate::resource::LiveComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
@@ -550,9 +550,9 @@ pub fn build_effect_dependency_analysis(
     )
 }
 
-pub fn build_saved_effect_dependency_analysis(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+pub fn build_saved_effect_dependency_analysis<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
     compositions: &[crate::resource::SavedComposition],
     inputs: ScheduleInputs<'_>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
@@ -594,15 +594,15 @@ pub(crate) fn build_effect_dependency_analysis_from_resources(
     )
 }
 
-fn build_effect_dependency_analysis_with_lookup<'a, 'composition, E, F>(
+fn build_effect_dependency_analysis_with_lookup<'a, 'composition, E, F, S: 'a>(
     effects: &[E],
     compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'composition>>,
     inputs: ScheduleInputs<'_>,
     unresolved_resource: F,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
-    E: AsRef<Effect>,
-    F: Fn(&ResourceId) -> Option<&'a Resource>,
+    E: AsRef<Effect<S>>,
+    F: Fn(&ResourceId) -> Option<&'a Resource<S>>,
 {
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
@@ -703,7 +703,7 @@ where
     }
 }
 
-fn add_same_identity_replacement_order_edges<E: AsRef<Effect>>(
+fn add_same_identity_replacement_order_edges<S, E: AsRef<Effect<S>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
@@ -721,7 +721,7 @@ fn add_same_identity_replacement_order_edges<E: AsRef<Effect>>(
     }
 }
 
-pub fn relax_update_update_edges<E: AsRef<Effect>>(
+pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn effect_identity_returns_system_hash_for_anonymous_effect() {
-        let anonymous = Effect::Delete {
+        let anonymous: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "anon_1234")),
             identifier: crate::effect::fixture_applied_identifier("anonymous-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn destroy_delete_edges_block_dependencies_by_consumers() {
-        let parent = Effect::Delete {
+        let parent: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "parent",
             )),
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[test]
     fn destroy_wait_alias_bridges_target_to_consumers() {
-        let cert = Effect::Delete {
+        let cert: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "cert")),
             identifier: crate::effect::fixture_applied_identifier("cert-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn unknown_destroy_dependency_names_are_dropped() {
-        let orphan = Effect::Delete {
+        let orphan: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "listener",
             )),

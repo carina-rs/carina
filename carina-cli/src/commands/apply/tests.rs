@@ -2654,19 +2654,14 @@ fn legacy_override_state() -> StateFile {
 }
 
 fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
-    serde_json::from_value::<carina_core::plan::SavedPlan>(serde_json::json!({
-        "effects": [],
-        "permanent_name_overrides": [
-            {
-                "resource_id": id,
-                "attribute": "name",
-                "temp_value": temp_value,
-                "original_value": original_value
-            }
-        ]
-    }))
-    .expect("saved plan with permanent name override should deserialize")
-    .into_live()
+    let mut plan = Plan::new();
+    plan.fixture_add_permanent_name_override(
+        carina_core::resource::ResolvedResourceId::new(id.clone()),
+        "name",
+        temp_value,
+        Some(original_value.to_string()),
+    );
+    plan
 }
 
 #[test]
@@ -2760,8 +2755,11 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
         id: unexpected.id.clone(),
         value: DataSourceValue::deferred_to_apply(Vec::new()),
     };
-    let extra = data_source_values_from_saved_plan(&[], &[unexpected_outcome])
-        .expect_err("an outcome outside the configured set must be rejected");
+    let extra = data_source_values_from_saved_plan::<carina_core::resource::ModuleSource>(
+        &[],
+        &[unexpected_outcome],
+    )
+    .expect_err("an outcome outside the configured set must be rejected");
     assert!(extra.to_string().contains("unknown data source"));
 
     let configured_outcome = crate::commands::plan::SavedDataSourceValue {
@@ -9331,7 +9329,7 @@ fn apply_exit_code_prioritizes_failure_over_partial() {
 
 #[test]
 fn skipped_export_does_not_downgrade_partial_success() {
-    let result = ExecutionResult {
+    let result: ExecutionResult = ExecutionResult {
         success_count: 0,
         failure_count: 0,
         partial_count: 1,

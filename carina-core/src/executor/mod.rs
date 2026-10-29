@@ -116,8 +116,8 @@ use crate::provider::{
     ResumeFailureKind, ResumeOutcome, UpdateRequest,
 };
 use crate::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
-    Resource, ResourceId, State, UnknownReason, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
+    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, UnknownReason, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -398,7 +398,7 @@ pub struct LiveExecutionInput<'a> {
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
-    pub provider_check_inputs: ProviderCheckInputs<'a>,
+    pub provider_check_inputs: ProviderCheckInputs<'a, ModuleSource>,
     /// Virtual resources (module attribute containers). carina#3181:
     /// compositions are a distinct typestate from managed resources, so the
     /// executor's dependency walk receives them as their own slice. A
@@ -410,7 +410,7 @@ pub struct LiveExecutionInput<'a> {
     pub managed_current: HashMap<ResourceId, Current>,
     /// One executor-safe outcome for every configured data source. This type
     /// cannot contain a plan-error-blocked read.
-    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues,
+    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<ModuleSource>,
     /// The same provider normalizer that ran at plan time
     /// (`PlanPreprocessor`). Apply-time reference re-resolution rebuilds
     /// attributes from the un-normalized source, so the executor must
@@ -436,7 +436,7 @@ pub struct LiveExecutionInput<'a> {
     /// Required handoff for accumulated execution snapshots. Production
     /// callers must choose and construct the handoff explicitly; tests that do
     /// not persist effect results may use the test-only no-op constructor.
-    pub checkpoint_sink: ExecutionCheckpointSink,
+    pub checkpoint_sink: ExecutionCheckpointSink<ModuleSource>,
 }
 
 /// Saved-plan counterpart of [`LiveExecutionInput`].
@@ -444,19 +444,19 @@ pub struct LiveExecutionInput<'a> {
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan,
-    pub provider_check_inputs: ProviderCheckInputs<'a>,
+    pub plan: &'a crate::plan::SavedPlan,
+    pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
     pub compositions: &'a [crate::resource::SavedComposition],
     pub bindings: ResolvedBindings,
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues,
+    pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
     pub normalizer: &'a dyn ProviderNormalizer,
     pub provider_configs: &'a [ProviderConfig],
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub schemas: &'a crate::schema::SchemaRegistry,
     pub parallelism: NonZeroUsize,
     pub precompleted_success_count: usize,
-    pub checkpoint_sink: ExecutionCheckpointSink,
+    pub checkpoint_sink: ExecutionCheckpointSink<SavedModuleSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -475,10 +475,10 @@ impl RuntimeCompositions<'_> {
         }
     }
 
-    fn scheduler_dependencies(
+    fn scheduler_dependencies<S>(
         self,
-        effects: &[Effect],
-        unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+        effects: &[Effect<S>],
+        unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
     ) -> scheduler::SchedulerDeps {
         match self {
@@ -498,23 +498,23 @@ impl RuntimeCompositions<'_> {
     }
 }
 
-pub(super) struct RuntimeExecutionInput<'a> {
-    pub(super) plan: &'a crate::plan::Plan,
-    pub(super) provider_check_inputs: ProviderCheckInputs<'a>,
+pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
+    pub(super) plan: &'a crate::plan::Plan<S>,
+    pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
     pub(super) bindings: ResolvedBindings,
     pub(super) managed_current: HashMap<ResourceId, Current>,
-    pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues,
+    pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues<S>,
     pub(super) normalizer: &'a dyn ProviderNormalizer,
     pub(super) provider_configs: &'a [ProviderConfig],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
     pub(super) parallelism: NonZeroUsize,
     pub(super) precompleted_success_count: usize,
-    pub(super) checkpoint_sink: ExecutionCheckpointSink,
+    pub(super) checkpoint_sink: ExecutionCheckpointSink<S>,
 }
 
-impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a> {
+impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a, ModuleSource> {
     fn from(input: LiveExecutionInput<'a>) -> Self {
         let LiveExecutionInput {
             plan,
@@ -549,7 +549,7 @@ impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a> {
     }
 }
 
-impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a> {
+impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModuleSource> {
     fn from(input: SavedExecutionInput<'a>) -> Self {
         let SavedExecutionInput {
             plan,
@@ -600,16 +600,16 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a> {
 /// let origins: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
 /// let _: ProviderCheckInputs<'_> = (&origins).into();
 /// ```
-pub enum ProviderCheckInputs<'a> {
+pub enum ProviderCheckInputs<'a, S = ModuleSource> {
     Authored,
     PlanNormalized {
-        resource_origins: &'a HashMap<ResourceId, UnresolvedResource>,
-        data_source_origins: &'a [DataSource],
+        resource_origins: &'a HashMap<ResourceId, UnresolvedResource<S>>,
+        data_source_origins: &'a [DataSource<S>],
     },
 }
 
-impl ProviderCheckInputs<'_> {
-    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource>> {
+impl<S: Clone> ProviderCheckInputs<'_, S> {
+    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource<S>>> {
         match self {
             Self::Authored => None,
             Self::PlanNormalized {
@@ -620,9 +620,9 @@ impl ProviderCheckInputs<'_> {
 
     pub(in crate::executor) fn resource_input(
         &self,
-        resolved: &Resource,
+        resolved: &Resource<S>,
         runtime_authored: bool,
-    ) -> Result<provider_ready::CheckInput<Resource>, String> {
+    ) -> Result<provider_ready::CheckInput<Resource<S>>, String> {
         if runtime_authored || matches!(self, Self::Authored) {
             return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
         }
@@ -646,8 +646,8 @@ impl ProviderCheckInputs<'_> {
 
     pub(in crate::executor) fn data_source_input(
         &self,
-        resolved: &DataSource,
-    ) -> Result<provider_ready::CheckInput<DataSource>, String> {
+        resolved: &DataSource<S>,
+    ) -> Result<provider_ready::CheckInput<DataSource<S>>, String> {
         match self {
             Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
             Self::PlanNormalized {
@@ -714,7 +714,9 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
     }
 }
 
-pub fn unresolved_data_source_inputs(resource: &DataSource) -> Vec<UnresolvedDataSourceInput> {
+pub fn unresolved_data_source_inputs<S>(
+    resource: &DataSource<S>,
+) -> Vec<UnresolvedDataSourceInput> {
     resource
         .attributes
         .iter()
@@ -773,12 +775,12 @@ pub async fn read_data_source_with_retry(
 /// this synchronous callback. Implementations must hand the snapshot to a
 /// background consumer and must not perform state I/O in the callback.
 #[derive(Clone)]
-pub struct ExecutionCheckpointSink {
-    publish: Arc<dyn Fn(Arc<ExecutionResult>) + Send + Sync>,
+pub struct ExecutionCheckpointSink<S = ModuleSource> {
+    publish: Arc<dyn Fn(Arc<ExecutionResult<S>>) + Send + Sync>,
 }
 
-impl ExecutionCheckpointSink {
-    pub fn new(publish: impl Fn(Arc<ExecutionResult>) + Send + Sync + 'static) -> Self {
+impl<S: Clone> ExecutionCheckpointSink<S> {
+    pub fn new(publish: impl Fn(Arc<ExecutionResult<S>>) + Send + Sync + 'static) -> Self {
         Self {
             publish: Arc::new(publish),
         }
@@ -787,20 +789,23 @@ impl ExecutionCheckpointSink {
     /// Explicit sink for callers that do not persist executor results.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn noop() -> Self {
+    pub fn noop() -> Self
+    where
+        S: 'static,
+    {
         Self::new(drop)
     }
 
-    pub fn publish(&self, result: &ExecutionResult) {
+    pub fn publish(&self, result: &ExecutionResult<S>) {
         (self.publish)(Arc::new(result.clone()));
     }
 
-    fn publish_owned(&self, result: ExecutionResult) {
+    fn publish_owned(&self, result: ExecutionResult<S>) {
         (self.publish)(Arc::new(result));
     }
 }
 
-impl std::fmt::Debug for ExecutionCheckpointSink {
+impl<S> std::fmt::Debug for ExecutionCheckpointSink<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionCheckpointSink")
             .finish_non_exhaustive()
@@ -809,14 +814,14 @@ impl std::fmt::Debug for ExecutionCheckpointSink {
 
 /// Result of executing a plan's effects.
 #[derive(Clone)]
-pub struct ExecutionResult {
+pub struct ExecutionResult<S = ModuleSource> {
     pub success_count: usize,
     pub failure_count: usize,
     pub partial_count: usize,
     pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
-    pub runtime_synthesized_resources: Vec<ResolvedResource>,
+    pub runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub managed_current: HashMap<ResourceId, Current>,
@@ -831,13 +836,13 @@ pub struct ExecutionResult {
 /// an executor branch to add a state without explicitly choosing whether its
 /// identifier is published to downstream Wait effects.
 #[derive(Clone)]
-pub(super) struct ExecutionResultFields {
+pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) success_count: usize,
     pub(super) failure_count: usize,
     pub(super) partial_count: usize,
     pub(super) partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) skip_count: usize,
-    pub(super) runtime_synthesized_resources: Vec<ResolvedResource>,
+    pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
     pub(super) permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub(super) managed_current: HashMap<ResourceId, Current>,
@@ -846,11 +851,11 @@ pub(super) struct ExecutionResultFields {
     pub(super) failed_refreshes: HashSet<ResourceId>,
 }
 
-impl ExecutionResultFields {
+impl<S> ExecutionResultFields<S> {
     fn into_result(
         self,
         applied_states: std::collections::HashMap<ResourceId, Applied>,
-    ) -> ExecutionResult {
+    ) -> ExecutionResult<S> {
         let Self {
             success_count,
             failure_count,
@@ -885,15 +890,15 @@ impl ExecutionResultFields {
 
 /// The executor's single mutable result, with applied-state publication and
 /// checkpoint dirtiness attached.
-pub(super) struct ExecutionAccumulator {
-    fields: ExecutionResultFields,
+pub(super) struct ExecutionAccumulator<S = ModuleSource> {
+    fields: ExecutionResultFields<S>,
     applied_states: std::collections::HashMap<ResourceId, Applied>,
     wait_identifiers: wait::SharedWaitIdentifiers,
     dirty: bool,
 }
 
-impl ExecutionAccumulator {
-    pub(super) fn new(result: ExecutionResult) -> (Self, wait::SharedWaitIdentifiers) {
+impl<S: Clone> ExecutionAccumulator<S> {
+    pub(super) fn new(result: ExecutionResult<S>) -> (Self, wait::SharedWaitIdentifiers) {
         let ExecutionResult {
             success_count,
             failure_count,
@@ -936,7 +941,7 @@ impl ExecutionAccumulator {
         (accumulator, wait_identifiers)
     }
 
-    pub(super) fn result(&self) -> &ExecutionResultFields {
+    pub(super) fn result(&self) -> &ExecutionResultFields<S> {
         &self.fields
     }
 
@@ -947,7 +952,7 @@ impl ExecutionAccumulator {
 
     pub(super) fn mutate<T>(
         &mut self,
-        mutation: impl FnOnce(&mut ExecutionResultFields) -> T,
+        mutation: impl FnOnce(&mut ExecutionResultFields<S>) -> T,
     ) -> T {
         self.dirty = true;
         mutation(&mut self.fields)
@@ -990,7 +995,7 @@ impl ExecutionAccumulator {
         self.dirty = true;
     }
 
-    pub(super) fn publish_if_dirty(&mut self, sink: &ExecutionCheckpointSink) {
+    pub(super) fn publish_if_dirty(&mut self, sink: &ExecutionCheckpointSink<S>) {
         if !std::mem::take(&mut self.dirty) {
             return;
         }
@@ -1000,7 +1005,7 @@ impl ExecutionAccumulator {
         sink.publish_owned(self.fields.clone().into_result(self.applied_states.clone()));
     }
 
-    pub(super) fn finish(mut self, sink: &ExecutionCheckpointSink) -> ExecutionResult {
+    pub(super) fn finish(mut self, sink: &ExecutionCheckpointSink<S>) -> ExecutionResult<S> {
         self.publish_if_dirty(sink);
         self.fields.into_result(self.applied_states)
     }
@@ -1017,9 +1022,9 @@ impl ExecutionAccumulator {
 /// silently drop the `Cancelled` arm — the compiler forces explicit
 /// handling. See [`ExecutionOutcomeCannotBeQuestionMarked`] for the
 /// compile-fail evidence.
-pub enum ExecutionOutcome {
-    Completed(ExecutionResult),
-    Cancelled(ExecutionResult),
+pub enum ExecutionOutcome<S = ModuleSource> {
+    Completed(ExecutionResult<S>),
+    Cancelled(ExecutionResult<S>),
 }
 
 /// Marker type whose `compile_fail` doctest is the type-safety evidence
@@ -1048,37 +1053,37 @@ pub struct ProgressInfo {
 }
 
 /// Events emitted during plan execution.
-pub enum ExecutionEvent<'a> {
+pub enum ExecutionEvent<'a, S = ModuleSource> {
     /// An effect is waiting for dependencies to complete before it can start.
     Waiting {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
         /// Binding names of the dependencies that have not yet completed.
         pending_dependencies: Vec<String>,
     },
     EffectStarted {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
     },
     EffectSucceeded {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
         state: Option<&'a State>,
         duration: Duration,
         progress: ProgressInfo,
     },
     EffectPartiallySucceeded {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
         state: &'a State,
         diagnostic: &'a PartialReadDiagnostic,
         duration: Duration,
         progress: ProgressInfo,
     },
     EffectFailed {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
         error: &'a str,
         duration: Duration,
         progress: ProgressInfo,
     },
     EffectSkipped {
-        effect: &'a Effect,
+        effect: &'a Effect<S>,
         reason: &'a str,
         progress: ProgressInfo,
     },
@@ -1124,8 +1129,8 @@ pub enum ExecutionEvent<'a> {
 ///
 /// Implementations must handle concurrent calls from parallel effect execution.
 /// Use interior mutability (e.g., `Mutex`) if mutable state is needed.
-pub trait ExecutionObserver: Send + Sync {
-    fn on_event(&self, event: &ExecutionEvent);
+pub trait ExecutionObserver<S = ModuleSource>: Send + Sync {
+    fn on_event(&self, event: &ExecutionEvent<S>);
 }
 
 /// Execute a plan by dispatching effects to a provider.
@@ -1161,18 +1166,18 @@ async fn execute_plan(
 pub async fn execute_saved_plan(
     provider: &dyn Provider,
     input: SavedExecutionInput<'_>,
-    observer: &dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver<SavedModuleSource>,
     shutdown: ShutdownToken,
-) -> ExecutionOutcome {
+) -> ExecutionOutcome<SavedModuleSource> {
     execute_runtime_plan(provider, input.into(), observer, shutdown).await
 }
 
-async fn execute_runtime_plan(
+async fn execute_runtime_plan<S: Clone>(
     provider: &dyn Provider,
-    mut input: RuntimeExecutionInput<'_>,
-    observer: &dyn ExecutionObserver,
+    mut input: RuntimeExecutionInput<'_, S>,
+    observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
-) -> ExecutionOutcome {
+) -> ExecutionOutcome<S> {
     let (result, was_cancelled) =
         execute_effects_sequential(provider, &mut input, observer, &shutdown).await;
     if was_cancelled {

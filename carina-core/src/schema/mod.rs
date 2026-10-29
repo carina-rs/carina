@@ -10170,8 +10170,8 @@ fn find_block_name_alias_in_value(
 /// This uses the same field matcher as the rename pass, including the narrow
 /// ambiguous-name rule for parser-produced lists. Union values are left to
 /// normal schema validation.
-pub(crate) fn find_resource_block_name_alias(
-    resource: &Resource,
+pub(crate) fn find_resource_block_name_alias<S>(
+    resource: &Resource<S>,
     schema: &ResourceSchema,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
@@ -11105,9 +11105,9 @@ impl SchemaRegistry {
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
-    pub fn get_for(
+    pub fn get_for<S>(
         &self,
-        resource: &crate::resource::Resource,
+        resource: &crate::resource::Resource<S>,
     ) -> Option<&ValidatedResourceSchema> {
         self.get(
             &resource.id.provider,
@@ -11117,9 +11117,9 @@ impl SchemaRegistry {
     }
 
     /// Look up the `DataSource` schema for a given [`DataSource`].
-    pub fn get_for_data_source(
+    pub fn get_for_data_source<S>(
         &self,
-        resource: &crate::resource::DataSource,
+        resource: &crate::resource::DataSource<S>,
     ) -> Option<&ValidatedResourceSchema> {
         self.get(
             &resource.id.provider,

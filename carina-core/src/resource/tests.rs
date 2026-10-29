@@ -461,10 +461,8 @@ fn resolved_resource_serde_round_trips_as_resource() {
         Some("primary".to_string()),
     ));
     let json = serde_json::to_string(&resolved).unwrap();
-    let decoded = serde_json::from_str::<SavedResolvedResource>(&json)
-        .unwrap()
-        .into_live();
-    assert_eq!(decoded, resolved);
+    let decoded = serde_json::from_str::<SavedResolvedResource>(&json).unwrap();
+    assert_eq!(decoded, SavedResolvedResource::from(resolved));
     assert_eq!(decoded.id.identity_str(), Some("logs"));
 }
 
@@ -508,10 +506,8 @@ fn resolved_data_source_serde_round_trips_as_data_source() {
         Some("primary".to_string()),
     ));
     let json = serde_json::to_string(&resolved).unwrap();
-    let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json)
-        .unwrap()
-        .into_live();
-    assert_eq!(decoded, resolved);
+    let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json).unwrap();
+    assert_eq!(decoded, SavedResolvedDataSource::from(resolved));
     assert_eq!(decoded.id.identity_str(), Some("ubuntu"));
 }
 
@@ -2475,6 +2471,13 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     let resource =
         Resource::new("fixture.Resource", "instance.resource").with_module_source(live.clone());
     let encoded = serde_json::to_value(&resource).expect("serialize live resource metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!({
+            "Module": { "name": "fixture", "instance": "instance" }
+        }),
+        "the live module variant must retain the historical saved-plan wire shape",
+    );
     let decoded: SavedResource =
         serde_json::from_value(encoded.clone()).expect("deserialize saved resource metadata");
 
@@ -2491,6 +2494,13 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     let mut data_source = DataSource::new("fixture.Lookup", "instance.lookup");
     data_source.module_source = Some(live);
     let encoded = serde_json::to_value(&data_source).expect("serialize live data-source metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!({
+            "Module": { "name": "fixture", "instance": "instance" }
+        }),
+        "data sources must use the same literal module wire variant",
+    );
     let decoded: SavedDataSource =
         serde_json::from_value(encoded.clone()).expect("deserialize saved data-source metadata");
     assert!(matches!(
@@ -2505,14 +2515,14 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
 
     let root = Resource::new("fixture.Resource", "root").with_module_source(ModuleSource::Root);
     let encoded = serde_json::to_value(&root).expect("serialize live root metadata");
+    assert_eq!(
+        encoded["module_source"],
+        serde_json::json!("Root"),
+        "the live root variant must retain the literal saved-plan wire shape",
+    );
     let decoded: SavedResource =
         serde_json::from_value(encoded.clone()).expect("deserialize saved root metadata");
     assert_eq!(decoded.module_source, Some(SavedModuleSource::Root));
-    assert_eq!(
-        decoded.into_live().module_source,
-        Some(ModuleSource::Root),
-        "saved root metadata is already complete live metadata",
-    );
 }
 
 #[test]

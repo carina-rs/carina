@@ -25,8 +25,9 @@ use crate::provider::{
     ProviderResult, UpdateRequest,
 };
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, LiveComposition, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
+    ResourceId, SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeError, TypeIdentity};
 use crate::value::SerializationError;
@@ -63,10 +64,10 @@ impl<T> Deref for ProviderReady<T> {
 }
 
 /// A fully resolved managed resource whose known value constraints have run.
-pub type ProviderReadyResource = ProviderReady<ResolvedResource>;
+pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
 
 /// A fully resolved data source whose known input constraints have run.
-pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
+pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModuleSource>>;
 
 /// Provider configuration attributes whose schema-known enum leaves are in
 /// host-resolved API spelling.
@@ -369,14 +370,14 @@ impl ModuleConstraintGate {
 
 impl ProviderReadyResource {
     /// Borrow the provider-facing resource payload.
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &ProviderResource {
         self.0.as_resource()
     }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
-    pub fn as_data_source(&self) -> &DataSource {
+    pub fn as_data_source(&self) -> &ProviderDataSource {
         self.0.as_inner()
     }
 }
@@ -650,8 +651,8 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-pub(super) async fn prepare_provider_ready_resource_after_resolution(
-    input: ResolvedCheckInput<Resource>,
+pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
+    input: ResolvedCheckInput<Resource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(input, context).await
@@ -665,8 +666,8 @@ enum ResourceValueCheck {
     },
 }
 
-async fn prepare_provider_ready_resource_with_value_check(
-    input: ResolvedCheckInput<Resource>,
+async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
+    input: ResolvedCheckInput<Resource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -708,7 +709,9 @@ async fn prepare_provider_ready_resource_with_value_check(
     .await?;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(ProviderReady(ResolvedResource::new(resource)))
+    Ok(ProviderReady(ResolvedResource::new(
+        resource.into_provider_resource(),
+    )))
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -733,8 +736,8 @@ pub fn prepare_provider_ready_data_source(
 /// authored inputs and derived which attributes became known during apply.
 /// Plan-normalized literal attributes are deliberately outside that check
 /// scope because they already passed the plan-time authored-value gate.
-pub(super) fn prepare_provider_ready_data_source_after_resolution(
-    input: ResolvedCheckInput<DataSource>,
+pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
+    input: ResolvedCheckInput<DataSource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -774,7 +777,9 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    Ok(ProviderReady(ResolvedDataSource::new(value)))
+    Ok(ProviderReady(ResolvedDataSource::new(
+        value.into_provider_data_source(),
+    )))
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -787,9 +792,9 @@ pub async fn prepare_create_request(
 }
 
 /// Look up the schema required to construct an update request.
-pub(super) fn managed_update_schema<'a>(
+pub(super) fn managed_update_schema<'a, S>(
     schemas: &'a SchemaRegistry,
-    resource: &Resource,
+    resource: &Resource<S>,
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)

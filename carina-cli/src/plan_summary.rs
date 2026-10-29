@@ -43,8 +43,8 @@ pub struct PlanChangeSummary {
 }
 
 impl PlanChangeSummary {
-    pub fn new(
-        plan: &Plan,
+    pub fn new<S>(
+        plan: &Plan<S>,
         export_changes: &[ExportChange],
         residual_deferred_for: &[DeferredForExpression],
     ) -> Self {

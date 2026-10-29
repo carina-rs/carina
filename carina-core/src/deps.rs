@@ -14,7 +14,7 @@ use crate::resource::{Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
+pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -68,7 +68,9 @@ pub(crate) fn get_composition_runtime_dependencies(
 /// `dependency_bindings` ∪ `directives.depends_on`" — structurally the
 /// same union [`get_resource_dependencies`] computes for a managed
 /// resource.
-pub fn get_data_source_dependencies(data_source: &crate::resource::DataSource) -> HashSet<String> {
+pub fn get_data_source_dependencies<S>(
+    data_source: &crate::resource::DataSource<S>,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in data_source.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -109,8 +111,8 @@ pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// can compute the snapshot for any node kind ([`Resource`],
 /// [`DataSource`], [`LiveComposition`](crate::resource::LiveComposition))
 /// uniformly (carina#3181 / #3308).
-pub fn get_resource_value_ref_dependencies(
-    resource: crate::parser::ResourceRef<'_>,
+pub fn get_resource_value_ref_dependencies<S>(
+    resource: crate::parser::ResourceRef<'_, S>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
     let attrs = resource.attributes();

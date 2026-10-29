@@ -11,14 +11,17 @@ use crate::commands::shared::progress::{FailedOutcome, ProgressBackend, Progress
 
 /// Owns all result mutation for one import iteration and publishes at most one
 /// checkpoint when the iteration leaves scope, including through `continue`.
-struct ImportResultIteration<'a> {
-    result: &'a mut ExecutionResult,
-    checkpoint_sink: &'a ExecutionCheckpointSink,
+struct ImportResultIteration<'a, S: Clone> {
+    result: &'a mut ExecutionResult<S>,
+    checkpoint_sink: &'a ExecutionCheckpointSink<S>,
     dirty: bool,
 }
 
-impl<'a> ImportResultIteration<'a> {
-    fn new(result: &'a mut ExecutionResult, checkpoint_sink: &'a ExecutionCheckpointSink) -> Self {
+impl<'a, S: Clone> ImportResultIteration<'a, S> {
+    fn new(
+        result: &'a mut ExecutionResult<S>,
+        checkpoint_sink: &'a ExecutionCheckpointSink<S>,
+    ) -> Self {
         Self {
             result,
             checkpoint_sink,
@@ -26,13 +29,13 @@ impl<'a> ImportResultIteration<'a> {
         }
     }
 
-    fn mutate<T>(&mut self, mutation: impl FnOnce(&mut ExecutionResult) -> T) -> T {
+    fn mutate<T>(&mut self, mutation: impl FnOnce(&mut ExecutionResult<S>) -> T) -> T {
         self.dirty = true;
         mutation(self.result)
     }
 }
 
-impl Drop for ImportResultIteration<'_> {
+impl<S: Clone> Drop for ImportResultIteration<'_, S> {
     fn drop(&mut self) {
         if self.dirty {
             // ponytail: this clones the full cumulative result once per import
@@ -47,12 +50,12 @@ impl Drop for ImportResultIteration<'_> {
 /// For each Import effect, calls provider.read() with the given identifier
 /// to fetch the current state and stores the result in applied_states
 /// so that finalize_apply can persist it.
-pub(crate) async fn execute_import_effects(
-    plan: &Plan,
+pub(crate) async fn execute_import_effects<S: Clone>(
+    plan: &Plan<S>,
     provider: &dyn Provider,
-    result: &mut ExecutionResult,
+    result: &mut ExecutionResult<S>,
     shutdown: &ShutdownToken,
-    checkpoint_sink: &ExecutionCheckpointSink,
+    checkpoint_sink: &ExecutionCheckpointSink<S>,
 ) {
     let progress = ProgressBackend::<()>::new(ProgressSink::Human);
     let cleanup_loop = shutdown.cleanup_aware_loop();
@@ -151,7 +154,7 @@ pub(crate) async fn execute_import_effects(
 /// token here is now a neutral `~` and the operation name
 /// (`removed-from-state`) carries the meaning, so a state-only
 /// success line can never be misread as a failure.
-fn format_state_only_effect_line(effect: &Effect) -> Option<String> {
+fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::Remove { id } => Some(format!("  {} removed-from-state {}", "~".yellow(), id)),
         Effect::Move { from, to } => Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to)),
@@ -164,7 +167,7 @@ fn format_state_only_effect_line(effect: &Effect) -> Option<String> {
 ///
 /// State writeback applies these effects to every checkpoint and to the final
 /// state; this function only emits their user-facing output.
-pub(crate) fn execute_state_only_effects(plan: &Plan) -> usize {
+pub(crate) fn execute_state_only_effects<S>(plan: &Plan<S>) -> usize {
     let mut completed = 0;
     for effect in plan.effects() {
         if let Some(line) = format_state_only_effect_line(effect) {
@@ -413,10 +416,11 @@ mod tests {
         colored::control::set_override(true);
         let id =
             ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
-        let line = format_state_only_effect_line(&Effect::Remove {
-            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-        })
-        .expect("Remove must render a line");
+        let line =
+            format_state_only_effect_line(&Effect::<carina_core::resource::ModuleSource>::Remove {
+                id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+            })
+            .expect("Remove must render a line");
         colored::control::unset_override();
 
         // No literal `x` or `✗` anywhere — the leading token and the
@@ -451,11 +455,12 @@ mod tests {
         colored::control::set_override(false);
         let from = ResourceId::with_identity("aws.s3.Bucket", "old");
         let to = ResourceId::with_identity("aws.s3.Bucket", "new");
-        let line = format_state_only_effect_line(&Effect::Move {
-            from: carina_core::resource::ResolvedResourceId::new(from.clone()),
-            to: carina_core::resource::ResolvedResourceId::new(to.clone()),
-        })
-        .expect("Move must render a line");
+        let line =
+            format_state_only_effect_line(&Effect::<carina_core::resource::ModuleSource>::Move {
+                from: carina_core::resource::ResolvedResourceId::new(from.clone()),
+                to: carina_core::resource::ResolvedResourceId::new(to.clone()),
+            })
+            .expect("Move must render a line");
         colored::control::unset_override();
 
         assert_eq!(line, format!("  -> Moving {} -> {}", from, to));

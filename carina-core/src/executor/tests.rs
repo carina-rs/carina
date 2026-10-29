@@ -316,12 +316,12 @@ struct MockProvider {
     /// Resources passed in to `create()` in call order — lets a test
     /// assert that the executor handed the provider a fully-resolved
     /// resource (no remaining `Value::Deferred(ResourceRef)` etc.).
-    create_resources: Arc<Mutex<Vec<Resource>>>,
+    create_resources: Arc<Mutex<Vec<crate::resource::ProviderResource>>>,
     /// `UpdateRequest`s passed in to `update()` in call order — lets a
     /// test assert the patch carries re-normalized attribute values.
     update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
     /// Data sources passed to `read_data_source()` in call order.
-    data_source_reads: Arc<Mutex<Vec<DataSource>>>,
+    data_source_reads: Arc<Mutex<Vec<crate::resource::ProviderDataSource>>>,
 }
 
 enum ClassifiedCreateFixture {
@@ -393,7 +393,7 @@ impl MockProvider {
         self.call_log.lock().unwrap().clone()
     }
 
-    fn captured_create_resources(&self) -> Vec<Resource> {
+    fn captured_create_resources(&self) -> Vec<crate::resource::ProviderResource> {
         self.create_resources.lock().unwrap().clone()
     }
 
@@ -401,7 +401,7 @@ impl MockProvider {
         self.update_requests.lock().unwrap().clone()
     }
 
-    fn captured_data_source_reads(&self) -> Vec<DataSource> {
+    fn captured_data_source_reads(&self) -> Vec<crate::resource::ProviderDataSource> {
         self.data_source_reads.lock().unwrap().clone()
     }
 }
@@ -818,7 +818,7 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
 impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for r in resources.iter_mut() {
@@ -856,7 +856,7 @@ struct SecretListToScalarNormalizer;
 impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
@@ -2546,7 +2546,7 @@ struct MustNotNormalizeInvalidValue;
 impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
     fn normalize_desired<'a>(
         &'a self,
-        _resources: &'a mut [Resource],
+        _resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("normalizer ran before the value-constraint gate") })
     }
@@ -6161,7 +6161,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     impl crate::provider::ProviderNormalizer for LockHoldingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             Box::pin(async move {
                 let mut guard = self.store.lock().await;
@@ -9431,7 +9431,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     impl crate::provider::ProviderNormalizer for LockOrderNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let is_alb = resources.iter().any(|resource| {

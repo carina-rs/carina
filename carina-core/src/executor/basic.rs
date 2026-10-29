@@ -76,9 +76,9 @@ pub(super) enum BasicEffectResult {
 ///
 /// Groups the counters, result maps, and binding state that are threaded
 /// through every call to `process_basic_result`, reducing parameter count.
-pub(super) struct ExecutionState<'a> {
+pub(super) struct ExecutionState<'a, S> {
     pub(super) idx: usize,
-    pub(super) accumulator: &'a mut ExecutionAccumulator,
+    pub(super) accumulator: &'a mut ExecutionAccumulator<S>,
     pub(super) failed_indices: &'a mut std::collections::HashSet<usize>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, AppliedIdentifier>,
 }
@@ -93,12 +93,12 @@ pub(super) fn queue_state_refresh(
 }
 
 /// Refresh states for resources whose operations failed.
-pub(super) async fn refresh_pending_states(
+pub(super) async fn refresh_pending_states<S: Clone>(
     provider: &dyn Provider,
-    accumulator: &mut ExecutionAccumulator,
+    accumulator: &mut ExecutionAccumulator<S>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
-    observer: &dyn ExecutionObserver,
-    checkpoint_sink: &ExecutionCheckpointSink,
+    observer: &dyn ExecutionObserver<S>,
+    checkpoint_sink: &ExecutionCheckpointSink<S>,
 ) {
     if pending_refreshes.is_empty() {
         return;
@@ -148,8 +148,8 @@ pub(super) async fn refresh_pending_states(
 /// `wait` as the synchronization mechanism for upstream attributes
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
-pub(super) async fn resolve_resource(
-    input: Result<CheckInput<Resource>, String>,
+pub(super) async fn resolve_resource<S: Clone>(
+    input: Result<CheckInput<Resource<S>>, String>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
     let bindings = context.bindings();
@@ -244,11 +244,11 @@ fn needs_apply_resolution(value: &Value) -> bool {
     }
 }
 
-pub(super) fn resolve_data_source(
-    input: Result<CheckInput<DataSource>, String>,
+pub(super) fn resolve_data_source<S: Clone>(
+    input: Result<CheckInput<DataSource<S>>, String>,
     bindings: &ResolvedBindings,
-) -> Result<ResolvedCheckInput<DataSource>, String> {
-    match input? {
+) -> Result<ResolvedCheckInput<DataSource<S>>, String> {
+    let checked = match input? {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
@@ -256,7 +256,7 @@ pub(super) fn resolve_data_source(
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
-            Ok(ResolvedCheckInput::authored(resolved))
+            ResolvedCheckInput::authored(resolved)
         }
         CheckInput::PlanNormalized {
             resolved: target,
@@ -291,13 +291,14 @@ pub(super) fn resolve_data_source(
                 }
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
-            Ok(ResolvedCheckInput::plan_normalized(
+            ResolvedCheckInput::plan_normalized(
                 resolved,
                 validation_attributes,
                 apply_resolved_attributes,
-            ))
+            )
         }
-    }
+    };
+    Ok(checked)
 }
 
 #[cfg(test)]
@@ -540,7 +541,10 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 ///
 /// This helper is used by both sequential and phased execution paths to avoid
 /// duplicating the result-processing logic for Create/Update/Delete effects.
-pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut ExecutionState<'_>) {
+pub(super) fn process_basic_result<S: Clone>(
+    result: BasicEffectResult,
+    exec: &mut ExecutionState<'_, S>,
+) {
     let idx = exec.idx;
     let failed_indices = &mut *exec.failed_indices;
     let pending_refreshes = &mut *exec.pending_refreshes;
@@ -644,7 +648,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
 }
 
 /// Count the number of actionable effects (excluding Read and state operations).
-pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
+pub(super) fn count_actionable_effects<S>(effects: &[Effect<S>]) -> usize {
     effects
         .iter()
         .filter(|e| {
@@ -656,9 +660,9 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 /// Resolution + dispatch context for a basic effect, bundled to keep
 /// `execute_basic_effect`'s arity in check (clippy `too_many_arguments`)
 /// and keeping dispatch context fields grouped consistently.
-pub(super) struct BasicEffectCtx<'a> {
+pub(super) struct BasicEffectCtx<'a, S> {
     pub(super) provider: &'a dyn Provider,
-    pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a>,
+    pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a, S>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
     pub(super) resume_create: Option<crate::provider::InFlightCreate>,
@@ -679,10 +683,10 @@ pub(super) struct BasicEffectCtx<'a> {
 ///
 /// Returns a `BasicEffectResult` that callers map to their path-specific
 /// result types.
-pub(super) async fn execute_basic_effect<'a>(
-    basic: BasicEffect<'a>,
-    ctx: &BasicEffectCtx<'a>,
-    observer: &'a dyn ExecutionObserver,
+pub(super) async fn execute_basic_effect<'a, S: Clone>(
+    basic: BasicEffect<'a, S>,
+    ctx: &BasicEffectCtx<'a, S>,
+    observer: &'a dyn ExecutionObserver<S>,
 ) -> BasicEffectResult {
     let provider = ctx.provider;
     let preparation = ctx.preparation;

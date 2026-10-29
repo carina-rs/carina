@@ -10,7 +10,7 @@ use super::wait::WaitOutcome;
 use crate::binding_index::SecretPreservingAttributes;
 
 /// Result of executing a single effect.
-pub(super) enum SingleEffectResult {
+pub(super) enum SingleEffectResult<S> {
     /// Create/Update/Delete completed (wraps BasicEffectResult)
     Basic(Box<BasicEffectResult>),
     ReadNoOp,
@@ -18,7 +18,7 @@ pub(super) enum SingleEffectResult {
     /// their returned state under the data-source binding before
     /// downstream effects are scheduled.
     Read {
-        resource: Box<DataSource>,
+        resource: Box<DataSource<S>>,
         outcome: Result<(SecretPreservingAttributes, State), String>,
         duration: Duration,
         progress: ProgressInfo,

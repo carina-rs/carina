@@ -15,8 +15,9 @@ use carina_core::provider::{
     normalize_provider_states,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, EnumValueResolver, RawEnumIdentifier,
-    RedactedSecretHash, ResolvedResource, Resource, ResourceId, State, UnknownReason, Value,
+    ConcreteValue, DataSource, DeferredValue, EnumValueResolver, ProviderResource,
+    RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource, ResourceId, State,
+    UnknownReason, Value,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
@@ -33,6 +34,10 @@ fn mock_load(bytes: &[u8]) -> VerifiedLoad {
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
+
+fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
+    resources.into_iter().map(ProviderResource::from).collect()
 }
 
 fn create_state_for_writeback(outcome: CreateOutcome) -> State {
@@ -2277,14 +2282,14 @@ async fn test_wasm_mock_provider_normalizer() {
         .expect("normalizer should initialize");
 
     // normalize_desired: mock provider returns resources unchanged
-    let mut resources = vec![{
+    let mut resources = provider_resources(vec![{
         let mut r = Resource::with_provider("mock", "test.resource", "norm-test", None);
         r.attributes = indexmap::IndexMap::from([(
             "key".into(),
             Value::Concrete(ConcreteValue::String("value".into())),
         )]);
         r
-    }];
+    }]);
     let original_attrs = resources[0].resolved_attributes();
     normalizer.normalize_desired(&mut resources).await.unwrap();
     assert_eq!(resources[0].resolved_attributes(), original_attrs);
@@ -2387,7 +2392,7 @@ async fn wasm_normalize_desired_echo_preserves_nested_enum_typing() {
     let hosted_zone = EnumValueResolver::new(&hosted_zone_type)
         .resolve_raw(&RawEnumIdentifier::parse("Z2FDTNDATAQYW2"))
         .expect("the authored identifier must resolve through the Enum union member");
-    let mut resources = vec![
+    let mut resources = provider_resources(vec![
         Resource::with_provider("mock", "test.resource", "enum-echo", None).with_attribute(
             "alias_target",
             Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -2395,7 +2400,7 @@ async fn wasm_normalize_desired_echo_preserves_nested_enum_typing() {
                 Value::Concrete(ConcreteValue::CanonicalEnum(hosted_zone)),
             )]))),
         ),
-    ];
+    ]);
 
     normalizer
         .normalize_desired(&mut resources)
@@ -2449,7 +2454,7 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
             DeferredValue::Unknown(UnknownReason::ForValue),
         )])),
     );
-    let mut resources = vec![resource];
+    let mut resources = provider_resources(vec![resource]);
     let expected_tags = resources[0]
         .get_attr("tags")
         .expect("tags must be present")
@@ -3217,12 +3222,12 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         "__mock_normalize_desired_error__",
         None,
     );
-    let mut desired_resources = vec![Resource::with_provider(
+    let mut desired_resources = provider_resources(vec![Resource::with_provider(
         "mock",
         "test.resource",
         "__mock_normalize_desired_error__",
         None,
-    )];
+    )]);
     desired_resources[0].set_attr(
         "peer",
         Value::resource_ref("peer", "identifier", Vec::new()),
@@ -3248,12 +3253,12 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         "provider normalizer errors must be atomic and restore stripped attributes"
     );
 
-    let mut recovery_resources = vec![Resource::with_provider(
+    let mut recovery_resources = provider_resources(vec![Resource::with_provider(
         "mock",
         "test.resource",
         "after-normalize-desired-error",
         None,
-    )];
+    )]);
     normalizer
         .normalize_desired(&mut recovery_resources)
         .await
@@ -3361,7 +3366,7 @@ async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_r
             ConcreteValue::Float(f64::INFINITY),
         )])),
     );
-    let mut resources = vec![resource];
+    let mut resources = provider_resources(vec![resource]);
     let before = resources.clone();
 
     let error = normalizer
@@ -3453,7 +3458,7 @@ async fn test_wasm_normalize_desired_preserves_secret() {
     resource
         .attributes
         .insert("api_key".to_string(), secret.clone());
-    let mut resources = vec![resource];
+    let mut resources = provider_resources(vec![resource]);
 
     normalizer.normalize_desired(&mut resources).await.unwrap();
 

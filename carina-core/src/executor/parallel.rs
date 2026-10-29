@@ -36,13 +36,15 @@ use super::{
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(super) struct ExpandedEffects {
-    pub(super) effects: Vec<Effect>,
+pub(super) struct ExpandedEffects<S> {
+    pub(super) effects: Vec<Effect<S>>,
     pub(super) deferred_replace_delete_deps: Vec<(usize, usize)>,
     pub(super) source_effect_indices: Vec<usize>,
 }
 
-pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> ExpandedEffects {
+pub(super) fn expand_deferred_replace_effects<S: Clone>(
+    plan_effects: &[Effect<S>],
+) -> ExpandedEffects<S> {
     let mut effects = Vec::with_capacity(plan_effects.len());
     let mut deferred_replace_delete_deps = Vec::new();
     let mut source_effect_indices = Vec::with_capacity(plan_effects.len());
@@ -77,8 +79,8 @@ pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> Expand
     }
 }
 
-pub(super) fn apply_deferred_replace_delete_deps(
-    effects: &[Effect],
+pub(super) fn apply_deferred_replace_delete_deps<S>(
+    effects: &[Effect<S>],
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
@@ -108,18 +110,18 @@ pub(super) fn apply_deferred_replace_delete_deps(
     }
 }
 
-pub(super) fn is_runtime_dispatchable(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+pub(super) fn is_runtime_dispatchable<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     is_deferred_read(effect, data_source_values)
         || (!matches!(effect, Effect::Read { .. })
             && (!effect.is_state_operation() || effect.is_scheduler_meta()))
 }
 
-pub(super) fn is_runtime_noop(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+pub(super) fn is_runtime_noop<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     match effect {
         Effect::Read { .. } => !is_deferred_read(effect, data_source_values),
@@ -127,9 +129,9 @@ pub(super) fn is_runtime_noop(
     }
 }
 
-fn count_runtime_effects(
-    effects: &[Effect],
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+fn count_runtime_effects<S: Clone>(
+    effects: &[Effect<S>],
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> usize {
     count_actionable_effects(effects)
         + effects
@@ -138,9 +140,9 @@ fn count_runtime_effects(
             .count()
 }
 
-fn is_deferred_read(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+fn is_deferred_read<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     matches!(effect, Effect::Read { resource } if data_source_values.deferred_inputs(&resource.id).is_some())
 }
@@ -232,12 +234,12 @@ pub(super) fn build_dependency_levels(
     result
 }
 
-pub(super) async fn execute_effects_sequential(
+pub(super) async fn execute_effects_sequential<S: Clone>(
     provider: &dyn Provider,
-    input: &mut RuntimeExecutionInput<'_>,
-    observer: &dyn ExecutionObserver,
+    input: &mut RuntimeExecutionInput<'_, S>,
+    observer: &dyn ExecutionObserver<S>,
     shutdown: &ShutdownToken,
-) -> (ExecutionResult, bool) {
+) -> (ExecutionResult<S>, bool) {
     let result = ExecutionResult {
         success_count: input.precompleted_success_count,
         failure_count: 0,
@@ -333,7 +335,7 @@ pub(super) async fn execute_effects_sequential(
         }
     }
 
-    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
+    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<S>> = WaitAwareInFlight::new();
     let mut cancelled = false;
     let cleanup_loop = shutdown.cleanup_aware_loop();
 
@@ -583,6 +585,7 @@ pub(super) async fn execute_effects_sequential(
                                     provider_check_inputs.data_source_input(resource.as_inner());
                                 match resolve_data_source(check_input, &binding_snapshot) {
                                     Ok(resolved_input) => {
+                                        resolved = resolved_input.value().clone();
                                         let resolved_secret_shapes =
                                             crate::resource::attrs_to_hashmap(
                                                 &resolved_input.value().attributes,
@@ -595,10 +598,9 @@ pub(super) async fn execute_effects_sequential(
                                                 &preparation,
                                             ) {
                                                 Ok(ready) => {
-                                                    resolved = ready.as_data_source().clone();
                                                     let provider_values =
                                                         crate::resource::attrs_to_hashmap(
-                                                            &resolved.attributes,
+                                                            &ready.as_data_source().attributes,
                                                         );
                                                     let resolved_attrs = crate::binding_index::SecretPreservingAttributes::from_provider_values(
                                                         &resolved_secret_shapes,
@@ -1650,7 +1652,7 @@ mod tests {
 
     #[test]
     fn relax_update_update_edges_handles_empty_plan() {
-        let effects = Vec::new();
+        let effects: Vec<Effect> = Vec::new();
         let mut analysis =
             build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");

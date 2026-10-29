@@ -817,12 +817,6 @@ impl From<ResolvedResource> for SavedResolvedResource {
     }
 }
 
-impl ResolvedResource<SavedModuleSource> {
-    pub fn into_live(self) -> ResolvedResource {
-        ResolvedResource::new(self.into_inner().into_live())
-    }
-}
-
 /// A resource reached a resolved-only pipeline boundary before its identity
 /// was assigned.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -878,10 +872,6 @@ impl<S> ResolvedResource<S> {
     /// Borrow the inner [`Resource`].
     pub fn as_inner(&self) -> &Resource<S> {
         &self.0
-    }
-
-    pub(crate) fn as_inner_mut(&mut self) -> &mut Resource<S> {
-        &mut self.0
     }
 
     /// Borrow the underlying resource for provider-boundary consumers.
@@ -5945,6 +5935,15 @@ pub enum SavedModuleSource {
     Module { name: String, instance: String },
 }
 
+/// Source marker for resources after module provenance has been deliberately
+/// removed at the provider boundary.
+///
+/// The enum is uninhabited, so a [`ProviderResource`] can never acquire live
+/// module-call identity or persisted module metadata. Its `module_source`
+/// field is therefore necessarily `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderModuleSource {}
+
 impl From<&ModuleSource> for SavedModuleSource {
     fn from(source: &ModuleSource) -> Self {
         match source {
@@ -5953,21 +5952,6 @@ impl From<&ModuleSource> for SavedModuleSource {
                 name: module.name.clone(),
                 instance: module.instance.clone(),
             },
-        }
-    }
-}
-
-impl SavedModuleSource {
-    /// Recover the only saved source that is also complete live metadata.
-    /// A saved module deliberately has no call path and therefore cannot
-    /// cross this boundary.
-    pub(crate) fn into_live_root(self) -> Option<ModuleSource> {
-        match self {
-            Self::Root => Some(ModuleSource::Root),
-            Self::Module {
-                name: _name,
-                instance: _instance,
-            } => None,
         }
     }
 }
@@ -6157,6 +6141,16 @@ pub struct Resource<S = ModuleSource> {
 /// display-only [`SavedModuleSource`] metadata rather than a live call path.
 pub type SavedResource = Resource<SavedModuleSource>;
 
+/// Source-neutral resource payload exposed to provider normalizers and CRUD
+/// request construction.
+pub type ProviderResource = Resource<ProviderModuleSource>;
+
+impl From<Resource> for ProviderResource {
+    fn from(resource: Resource) -> Self {
+        resource.into_provider_resource()
+    }
+}
+
 impl From<Resource> for SavedResource {
     fn from(resource: Resource) -> Self {
         let Resource {
@@ -6178,36 +6172,6 @@ impl From<Resource> for SavedResource {
             binding,
             dependency_bindings,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
-            default_tag_keys,
-            quoted_string_attrs,
-        }
-    }
-}
-
-impl Resource<SavedModuleSource> {
-    /// Enter the live runtime without manufacturing call identity that is not
-    /// present in the saved plan. Saved compositions retain the persisted
-    /// module-call information needed by apply.
-    pub fn into_live(self) -> Resource {
-        let Self {
-            id,
-            attributes,
-            directives,
-            prefixes,
-            binding,
-            dependency_bindings,
-            module_source,
-            default_tag_keys,
-            quoted_string_attrs,
-        } = self;
-        Resource {
-            id,
-            attributes,
-            directives,
-            prefixes,
-            binding,
-            dependency_bindings,
-            module_source: module_source.and_then(SavedModuleSource::into_live_root),
             default_tag_keys,
             quoted_string_attrs,
         }
@@ -6272,7 +6236,9 @@ impl Resource {
             provider_instance,
         ))
     }
+}
 
+impl<S: Clone> Resource<S> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
@@ -6283,6 +6249,62 @@ impl Resource {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_with_identity(identity);
         resource
+    }
+}
+
+impl<S> Resource<S> {
+    /// Remove module provenance while crossing into provider-owned code.
+    pub(crate) fn into_provider_resource(self) -> ProviderResource {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source: _,
+            default_tag_keys,
+            quoted_string_attrs,
+        } = self;
+        ProviderResource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source: None,
+            default_tag_keys,
+            quoted_string_attrs,
+        }
+    }
+
+    /// Apply provider-normalized fields while retaining the exact live or
+    /// saved module provenance already attached to this resource.
+    pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource) {
+        let module_source = self.module_source.take();
+        let Resource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source: _,
+            default_tag_keys,
+            quoted_string_attrs,
+        } = provider;
+        *self = Self {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            quoted_string_attrs,
+        };
     }
 
     /// Returns the attributes projected to a `HashMap<String, Value>`.
@@ -6384,7 +6406,9 @@ impl Resource {
         self.dependency_bindings = deps;
         self
     }
+}
 
+impl Resource {
     pub fn with_module_source(mut self, source: ModuleSource) -> Self {
         self.module_source = Some(source);
         self
@@ -7175,8 +7199,8 @@ mod enum_attr_tests {
 
 /// Check that a resource's attribute tree is free of any
 /// [`Value::Deferred`] placeholder before provider dispatch.
-pub(crate) fn assert_resource_fully_resolved(
-    resource: &Resource,
+pub(crate) fn assert_resource_fully_resolved<S>(
+    resource: &Resource<S>,
 ) -> Result<(), crate::value::SerializationError> {
     for value in resource.attributes.values() {
         assert_value_fully_resolved(value)?;
@@ -7538,10 +7562,10 @@ impl PlanInputCurrent {
     }
 }
 
-pub fn into_plan_input_current_map(
+pub fn into_plan_input_current_map<S>(
     mut current: HashMap<ResourceId, Current>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: &[Resource],
+    resources: &[Resource<S>],
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     crate::value::canonicalize_states_with_schemas(&mut current, schemas);
     crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
@@ -7554,10 +7578,10 @@ pub fn into_plan_input_current_map(
 /// Borrowing counterpart used when a caller layers configured and orphan
 /// state. Each current value is cloned once into the canonicalized plan-input
 /// map; the source maps and resource graph are never deep-cloned first.
-pub fn plan_input_current_map_from_refs<'a>(
+pub fn plan_input_current_map_from_refs<'a, S: 'a>(
     current: impl IntoIterator<Item = (&'a ResourceId, &'a Current)>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: impl IntoIterator<Item = &'a Resource>,
+    resources: impl IntoIterator<Item = &'a Resource<S>>,
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     let mut current = current
         .into_iter()
@@ -7684,7 +7708,9 @@ pub use composition::{
     PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
     SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
 };
-pub use data_source::{DataSource, ResolvedDataSource, SavedDataSource, SavedResolvedDataSource};
+pub use data_source::{
+    DataSource, ProviderDataSource, ResolvedDataSource, SavedDataSource, SavedResolvedDataSource,
+};
 pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};

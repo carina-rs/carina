@@ -2505,8 +2505,8 @@ fn attributes_contain_redacted_secret<'a>(values: impl Iterator<Item = &'a Value
     values.into_iter().any(contains_redacted_secret)
 }
 
-fn deferred_template_contains_redacted_secret(
-    template: &crate::parser::DeferredForExpression,
+fn deferred_template_contains_redacted_secret<S>(
+    template: &crate::parser::DeferredForExpression<S>,
 ) -> bool {
     let crate::parser::DeferredForExpression {
         file: _file,
@@ -2524,7 +2524,7 @@ fn deferred_template_contains_redacted_secret(
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
-pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) -> bool {
+pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
     use crate::effect::Effect;
 
     match effect {
@@ -3544,10 +3544,10 @@ pub fn redact_secrets_in_resource_using_evaluated(
 }
 
 /// Restore every placeholder in a resource from a freshly evaluated resource.
-pub fn rehydrate_resource_secrets(
-    saved: &crate::resource::Resource,
-    evaluated: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SecretRehydrationSiteError> {
+pub fn rehydrate_resource_secrets<S: Clone, T>(
+    saved: &crate::resource::Resource<S>,
+    evaluated: &crate::resource::Resource<T>,
+) -> Result<crate::resource::Resource<S>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3592,10 +3592,10 @@ pub fn redact_secrets_in_data_source_using_evaluated(
     })
 }
 
-pub fn rehydrate_data_source_secrets(
-    saved: &crate::resource::DataSource,
-    evaluated: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SecretRehydrationSiteError> {
+pub fn rehydrate_data_source_secrets<S: Clone, T>(
+    saved: &crate::resource::DataSource<S>,
+    evaluated: &crate::resource::DataSource<T>,
+) -> Result<crate::resource::DataSource<S>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3981,7 +3981,7 @@ pub fn redact_secrets_in_plan(
     redact_secrets_in_plan_with_desired_and_historical(plan, &HashMap::new(), &HashMap::new())
 }
 
-fn create_effect_ids(plan: &crate::plan::Plan) -> Vec<Option<crate::resource::ResourceId>> {
+fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resource::ResourceId>> {
     plan.effects()
         .iter()
         .map(|effect| match effect {
@@ -4093,13 +4093,13 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
 /// resources/data sources. Historical state is restored separately from the
 /// single verified provider-read pass by
 /// [`rehydrate_plan_historical_secrets_from_verified_states`].
-pub fn rehydrate_plan_desired_secrets(
-    plan: &crate::plan::Plan,
+pub fn rehydrate_plan_desired_secrets<S: Clone>(
+    plan: &crate::plan::Plan<S>,
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
     deferred_templates: &[crate::parser::DeferredForExpression],
-) -> Result<crate::plan::Plan, SecretRehydrationSiteError> {
+) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
     let mut out = plan.clone();
@@ -4195,10 +4195,10 @@ pub fn rehydrate_plan_desired_secrets(
     Ok(out)
 }
 
-fn rehydrate_deferred_template(
-    saved: &crate::parser::DeferredForExpression,
-    candidates: &[crate::parser::DeferredForExpression],
-) -> Result<crate::parser::DeferredForExpression, SecretRehydrationSiteError> {
+fn rehydrate_deferred_template<S: Clone, T>(
+    saved: &crate::parser::DeferredForExpression<S>,
+    candidates: &[crate::parser::DeferredForExpression<T>],
+) -> Result<crate::parser::DeferredForExpression<S>, SecretRehydrationSiteError> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
     if !has_placeholder {
         return Ok(saved.clone());
@@ -4266,11 +4266,11 @@ fn rehydrate_deferred_template(
 /// each plan placeholder has the same hash as the corresponding saved-state
 /// placeholder, while the latter supplies the plaintext shape produced by the
 /// single Argon2 verification pass. This deliberately performs no hashing.
-pub fn rehydrate_plan_historical_secrets_from_verified_states(
-    plan: &crate::plan::Plan,
+pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
+    plan: &crate::plan::Plan<S>,
     redacted_states: &HashMap<crate::resource::ResourceId, crate::resource::State>,
     verified_states: &HashMap<crate::resource::ResourceId, crate::resource::State>,
-) -> Result<crate::plan::Plan, SecretRehydrationSiteError> {
+) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::Effect;
 
     fn restore_verified_value(
@@ -5820,12 +5820,12 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// through another borrow, so identity code can require this type as
 /// evidence that the canonicalize pass already ran.
 #[derive(Debug)]
-pub struct CanonicalizedResources<'a> {
-    resources: &'a mut [crate::resource::Resource],
+pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
+    resources: &'a mut [crate::resource::Resource<S>],
 }
 
-impl<'a> CanonicalizedResources<'a> {
-    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource] {
+impl<'a, S> CanonicalizedResources<'a, S> {
+    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource<S>] {
         self.resources
     }
 }
@@ -5987,10 +5987,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a>(
-    resources: &'a mut [crate::resource::Resource],
+pub fn canonicalize_resources_with_schemas<'a, S>(
+    resources: &'a mut [crate::resource::Resource<S>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -6015,8 +6015,8 @@ pub fn canonicalize_resources_with_schemas<'a>(
 /// Guest output is provider/state text, so strings resolve only by literal API
 /// membership or a declared alias. Dotted strings are never reinterpreted as
 /// namespaced DSL identifiers.
-pub fn canonicalize_normalized_resources_with_schemas(
-    resources: &mut [crate::resource::Resource],
+pub fn canonicalize_normalized_resources_with_schemas<S>(
+    resources: &mut [crate::resource::Resource<S>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
@@ -6174,8 +6174,8 @@ pub fn canonicalize_provider_configs_with_schemas(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas(
-    data_sources: &mut [crate::resource::DataSource],
+pub fn canonicalize_data_sources_with_schemas<S>(
+    data_sources: &mut [crate::resource::DataSource<S>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {

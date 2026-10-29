@@ -87,33 +87,6 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
     }
 }
 
-impl DeferredForExpression<SavedModuleSource> {
-    pub fn into_live(self) -> DeferredForExpression {
-        let Self {
-            file,
-            line,
-            header,
-            resource_type,
-            attributes,
-            binding_name,
-            iterable,
-            binding,
-            template_resource,
-        } = self;
-        DeferredForExpression {
-            file,
-            line,
-            header,
-            resource_type,
-            attributes,
-            binding_name,
-            iterable,
-            binding,
-            template_resource: template_resource.into_live(),
-        }
-    }
-}
-
 impl<S> DeferredForExpression<S> {
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
@@ -212,10 +185,10 @@ impl ShapeMismatch {
 /// template body of a `for` expression whose iterable resolves later;
 /// consumers that care about loop-variable placeholders need the
 /// `DeferredForExpression` reference to filter them out.
-#[derive(Debug, Clone, Copy)]
-pub enum ResourceContext<'a> {
+#[derive(Debug)]
+pub enum ResourceContext<'a, S = ModuleSource> {
     Direct,
-    Deferred(&'a DeferredForExpression),
+    Deferred(&'a DeferredForExpression<S>),
 }
 
 /// A resource yielded by [`File::iter_all_resources`], discriminated by
@@ -231,23 +204,39 @@ pub enum ResourceContext<'a> {
 /// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
 /// `binding` passthroughs); callers that branch on the kind match the
 /// enum arm directly.
-#[derive(Debug, Clone, Copy)]
-pub enum ResourceRef<'a> {
+#[derive(Debug)]
+pub enum ResourceRef<'a, S = ModuleSource> {
     /// A top-level resource.
-    Resource(&'a Resource),
+    Resource(&'a Resource<S>),
     /// A top-level composition (module-expansion synthetic node).
     LiveComposition(&'a LiveComposition),
     /// A top-level data source (`read`-keyword resource).
-    DataSource(&'a DataSource),
+    DataSource(&'a DataSource<S>),
     /// The template body of a deferred `for` expression — always a
     /// resource (`for` bodies never carry `read` / composition).
     Deferred {
-        resource: &'a Resource,
-        deferred: &'a DeferredForExpression,
+        resource: &'a Resource<S>,
+        deferred: &'a DeferredForExpression<S>,
     },
 }
 
-impl<'a> ResourceRef<'a> {
+impl<S> Copy for ResourceContext<'_, S> {}
+
+impl<S> Clone for ResourceContext<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S> Copy for ResourceRef<'_, S> {}
+
+impl<S> Clone for ResourceRef<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, S> ResourceRef<'a, S> {
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
@@ -335,7 +324,7 @@ impl<'a> ResourceRef<'a> {
     /// The [`ResourceContext`] an old `iter_all_resources` caller would
     /// have seen — `Deferred` for a for-expression template, `Direct`
     /// otherwise.
-    pub fn context(&self) -> ResourceContext<'a> {
+    pub fn context(&self) -> ResourceContext<'a, S> {
         match self {
             ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
             _ => ResourceContext::Direct,
@@ -2481,11 +2470,11 @@ fn retain_non_matching_deferred_for_warnings(
     });
 }
 
-pub fn expand_deferred_children(
-    deferred: &DeferredForExpression,
+pub fn expand_deferred_children<S: Clone>(
+    deferred: &DeferredForExpression<S>,
     iterable_value: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
-) -> Result<Vec<Resource>, DeferredForExpansionError> {
+) -> Result<Vec<Resource<S>>, DeferredForExpansionError> {
     match (&deferred.binding, iterable_value) {
         (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => items
             .iter()
@@ -2556,14 +2545,14 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
     }
 }
 
-fn build_expanded_child(
-    deferred: &DeferredForExpression,
+fn build_expanded_child<S: Clone>(
+    deferred: &DeferredForExpression<S>,
     address: String,
     index: Option<i64>,
     key: Option<&str>,
     item: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
-) -> Result<Resource, DeferredForExpansionError> {
+) -> Result<Resource<S>, DeferredForExpansionError> {
     let mut resource = deferred
         .template_resource
         .instantiate_with_identity(ResourceIdentity::new(address.clone()));
@@ -2588,8 +2577,8 @@ fn build_expanded_child(
 /// (and not at parse time) because once placeholders have been replaced
 /// with concrete scalars, surrounding `Interpolation` shapes can collapse
 /// to a `String` (#2227).
-fn substitute_attrs(
-    resource: &mut crate::resource::Resource,
+fn substitute_attrs<S>(
+    resource: &mut crate::resource::Resource<S>,
     index: Option<i64>,
     key: Option<&str>,
     value: &Value,
@@ -3166,8 +3155,7 @@ mod substitute_placeholder_tests {
         );
 
         let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
-            .expect("deserialize deferred for expression")
-            .into_live();
+            .expect("deserialize deferred for expression");
         assert_eq!(decoded.file, None);
         assert_eq!(decoded.line, 0);
         assert_eq!(decoded.iterable, deferred.iterable);

@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::effect::{
     ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
 };
-use crate::module::DependencyGraph;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
@@ -455,57 +454,6 @@ impl<S> Default for Plan<S> {
 
 pub type SavedPlan = Plan<SavedModuleSource>;
 
-/// Saved module-source fields retained while a decoded plan is represented by
-/// live execution types. Entries align with `Plan::effects` and contain only
-/// display metadata; they are reapplied solely when the plan is serialized
-/// again.
-#[derive(Debug, Clone, Default)]
-pub struct SavedPlanModuleSources(Vec<Option<SavedModuleSource>>);
-
-fn saved_effect_module_source(effect: &SavedEffect) -> Option<&SavedModuleSource> {
-    match effect {
-        SavedEffect::Read { resource } => resource.module_source.as_ref(),
-        SavedEffect::Create(resource) | SavedEffect::ResumeCreate { resource, .. } => {
-            resource.module_source.as_ref()
-        }
-        SavedEffect::Update { to, .. } => to.module_source.as_ref(),
-        SavedEffect::DeferredCreate { template, .. } => {
-            template.template_resource.module_source.as_ref()
-        }
-        SavedEffect::DeferredReplace(payload) => {
-            payload.template.template_resource.module_source.as_ref()
-        }
-        SavedEffect::Delete { .. }
-        | SavedEffect::Import { .. }
-        | SavedEffect::Remove { .. }
-        | SavedEffect::Move { .. }
-        | SavedEffect::Wait { .. } => None,
-    }
-}
-
-fn saved_effect_module_source_mut(
-    effect: &mut SavedEffect,
-) -> Option<&mut Option<SavedModuleSource>> {
-    match effect {
-        SavedEffect::Read { resource } => Some(&mut resource.as_inner_mut().module_source),
-        SavedEffect::Create(resource) | SavedEffect::ResumeCreate { resource, .. } => {
-            Some(&mut resource.as_inner_mut().module_source)
-        }
-        SavedEffect::Update { to, .. } => Some(&mut to.as_inner_mut().module_source),
-        SavedEffect::DeferredCreate { template, .. } => {
-            Some(&mut template.template_resource.module_source)
-        }
-        SavedEffect::DeferredReplace(payload) => {
-            Some(&mut payload.template.template_resource.module_source)
-        }
-        SavedEffect::Delete { .. }
-        | SavedEffect::Import { .. }
-        | SavedEffect::Remove { .. }
-        | SavedEffect::Move { .. }
-        | SavedEffect::Wait { .. } => None,
-    }
-}
-
 impl From<Plan> for SavedPlan {
     fn from(plan: Plan) -> Self {
         let Plan {
@@ -525,57 +473,9 @@ impl From<Plan> for SavedPlan {
     }
 }
 
-impl Plan<SavedModuleSource> {
-    pub fn into_live(self) -> Plan {
-        let Self {
-            effects,
-            replace_display,
-            permanent_name_overrides,
-            errors,
-            abandoned_deposed,
-        } = self;
-        Plan {
-            effects: effects.into_iter().map(SavedEffect::into_live).collect(),
-            replace_display,
-            permanent_name_overrides,
-            errors,
-            abandoned_deposed,
-        }
-    }
-
-    pub fn into_live_with_module_sources(self) -> (Plan, SavedPlanModuleSources) {
-        let sources = SavedPlanModuleSources(
-            self.effects
-                .iter()
-                .map(|effect| saved_effect_module_source(effect).cloned())
-                .collect(),
-        );
-        (self.into_live(), sources)
-    }
-}
-
 impl Plan {
-    pub fn into_saved_with_module_sources(self, sources: &SavedPlanModuleSources) -> SavedPlan {
-        let mut saved = SavedPlan::from(self);
-        for (effect, source) in saved.effects.iter_mut().zip(&sources.0) {
-            let Some(source) = source else {
-                continue;
-            };
-            if let Some(slot) = saved_effect_module_source_mut(effect)
-                && slot.is_none()
-            {
-                *slot = Some(source.clone());
-            }
-        }
-        saved
-    }
-
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn add(&mut self, effect: Effect) {
-        self.effects.push(effect);
     }
 
     /// Add a token-free resume effect and retain only its non-secret display
@@ -628,8 +528,14 @@ impl Plan {
             self.permanent_name_overrides.push(override_);
         }
     }
+}
 
-    pub fn effects(&self) -> &[Effect] {
+impl<S> Plan<S> {
+    pub fn add(&mut self, effect: Effect<S>) {
+        self.effects.push(effect);
+    }
+
+    pub fn effects(&self) -> &[Effect<S>] {
         &self.effects
     }
 
@@ -720,7 +626,26 @@ impl Plan {
         overrides
     }
 
-    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect> {
+    /// Add persisted name-override metadata to a fixture without requiring
+    /// the persisted plan representation to deserialize as a live plan.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn fixture_add_permanent_name_override(
+        &mut self,
+        resource_id: ResolvedResourceId,
+        attribute: impl Into<String>,
+        temp_value: impl Into<String>,
+        original_value: Option<String>,
+    ) {
+        self.permanent_name_overrides.push(PermanentNameOverride {
+            resource_id,
+            attribute: attribute.into(),
+            temp_value: temp_value.into(),
+            original_value,
+        });
+    }
+
+    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S>> {
         &mut self.effects
     }
 
@@ -776,7 +701,7 @@ impl Plan {
     /// Remove effects that don't satisfy the predicate
     pub fn retain<F>(&mut self, f: F)
     where
-        F: FnMut(&Effect) -> bool,
+        F: FnMut(&Effect<S>) -> bool,
     {
         let mut keep = f;
         let mut old_to_new = vec![None; self.effects.len()];
@@ -982,72 +907,12 @@ impl std::fmt::Display for PlanSummary {
     }
 }
 
-/// A Plan with module source information
-#[derive(Debug, Clone, Default)]
-pub struct ModularPlan {
-    /// The underlying plan
-    pub plan: Plan,
-    /// Effect index -> module source mapping
-    pub effect_sources: HashMap<usize, ModuleSource>,
-    /// Module name -> dependency graph
-    pub module_graphs: HashMap<String, DependencyGraph>,
-}
-
-impl ModularPlan {
-    /// Create a new empty modular plan
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a modular plan from a regular plan with source extraction
-    pub fn from_plan(plan: Plan) -> Self {
-        let mut modular = Self {
-            plan: plan.clone(),
-            effect_sources: HashMap::new(),
-            module_graphs: HashMap::new(),
-        };
-
-        // Extract module sources from effect resources
-        for (idx, effect) in plan.effects().iter().enumerate() {
-            let source = match effect {
-                Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
-                    Self::extract_source(&r.module_source)
-                }
-                Effect::Update { to, .. } => Self::extract_source(&to.module_source),
-                Effect::Read { resource } => Self::extract_source(&resource.module_source),
-                Effect::Delete { .. }
-                | Effect::Import { .. }
-                | Effect::Remove { .. }
-                | Effect::Move { .. }
-                | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
-                | Effect::DeferredReplace(_) => ModuleSource::Root,
-            };
-            modular.effect_sources.insert(idx, source);
-        }
-
-        modular
-    }
-
-    fn extract_source(module_source: &Option<ModuleSource>) -> ModuleSource {
-        module_source.clone().unwrap_or(ModuleSource::Root)
-    }
-
-    /// Get the source for an effect by index
-    pub fn source_of(&self, effect_idx: usize) -> &ModuleSource {
-        self.effect_sources
-            .get(&effect_idx)
-            .unwrap_or(&ModuleSource::Root)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::effect::DeferredReplacePayload;
     use crate::resource::{
-        CompositionCall, CompositionCallPath, DataSource, ModuleInstanceScope, ResolvedDataSource,
-        ResolvedResource, Resource, ResourceIdentity,
+        DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
     };
 
     fn resolved(resource: Resource) -> ResolvedResource {
@@ -1058,14 +923,12 @@ mod tests {
         ResolvedDataSource::new(resource)
     }
 
-    fn deserialize_plan(json: &str) -> Plan {
-        serde_json::from_str::<SavedPlan>(json).unwrap().into_live()
+    fn deserialize_plan(json: &str) -> SavedPlan {
+        serde_json::from_str::<SavedPlan>(json).unwrap()
     }
 
-    fn deserialize_plan_value(value: serde_json::Value) -> Plan {
-        serde_json::from_value::<SavedPlan>(value)
-            .unwrap()
-            .into_live()
+    fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
+        serde_json::from_value::<SavedPlan>(value).unwrap()
     }
 
     fn changed_create_only() -> ChangedCreateOnly {
@@ -1339,37 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn modular_plan_from_plan() {
-        let mut plan = Plan::new();
-
-        // Root resource
-        plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
-
-        // Module resource
-        let module_source = ModuleSource::expanded_module(
-            "web_tier",
-            "web",
-            ModuleInstanceScope::for_call("web_tier", Some("web"), "web"),
-            CompositionCallPath::direct(CompositionCall {
-                id: crate::parser::ModuleCallId::test_dummy_in("web.crn"),
-                module_name: "web_tier".to_string(),
-                binding: Some("web".to_string()),
-                instance: "web".to_string(),
-                module_source: Some("./web".to_string()),
-                module_directory: None,
-            }),
-        );
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(module_source.clone());
-        plan.add(Effect::Create(resolved(module_resource)));
-
-        let modular = ModularPlan::from_plan(plan);
-
-        assert_eq!(modular.source_of(0), &ModuleSource::Root);
-        assert_eq!(modular.source_of(1), &module_source);
-    }
-
-    #[test]
     fn plan_add_replacement_registers_create_delete_and_display_atomically() {
         let consumer_updates = HashSet::from([ResourceIdentity::new("subnet_update")]);
         let group = replacement_group(consumer_updates.clone());
@@ -1623,7 +1455,7 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
 
-        assert_eq!(deserialized, plan);
+        assert_eq!(deserialized, SavedPlan::from(plan));
     }
 
     #[test]
@@ -1701,6 +1533,7 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
         assert_eq!(plan.effects().len(), deserialized.effects().len());
-        assert_eq!(plan.effects(), deserialized.effects());
+        let saved = SavedPlan::from(plan);
+        assert_eq!(saved.effects(), deserialized.effects());
     }
 }

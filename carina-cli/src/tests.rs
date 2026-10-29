@@ -16,7 +16,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, State, Value,
+    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedValue;
@@ -634,9 +634,24 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
-    assert!(
-        deserialized.sorted_resources[0].module_source.is_none(),
-        "saved display metadata must not become a live module source"
+    assert_eq!(
+        deserialized.sorted_resources[0].module_source,
+        Some(SavedModuleSource::Module {
+            name: "web_tier".to_string(),
+            instance: "web".to_string(),
+        }),
+        "a decoded plan must keep module metadata attached to its saved resource",
+    );
+    let Effect::Create(resource) = &deserialized.plan.effects()[0] else {
+        panic!("fixture effect must remain a create");
+    };
+    assert_eq!(
+        resource.module_source,
+        Some(SavedModuleSource::Module {
+            name: "web_tier".to_string(),
+            instance: "web".to_string(),
+        }),
+        "a decoded plan effect must retain its saved module-source type",
     );
     let reserialized = serde_json::to_value(&deserialized).unwrap();
     assert_eq!(
@@ -1890,7 +1905,8 @@ async fn lock_released_on_write_state_failure() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -2036,7 +2052,8 @@ async fn finalize_apply_uses_write_state_locked() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -2363,7 +2380,8 @@ async fn finalize_apply_without_lock_uses_write_state() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: state_lock.as_ref(),
             export_params: Some(&checked_exports(&[])),
@@ -2445,7 +2463,8 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &data_source_values,
+            data_source_values: Some(&data_source_values),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),
@@ -2668,7 +2687,9 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &[],
         &carina_core::provider::ProviderRouter::new(),
         carina_core::differ::PlanPriorStates::new(
-            &carina_core::resource::into_plan_input_current_map(
+            &carina_core::resource::into_plan_input_current_map::<
+                carina_core::resource::ModuleSource,
+            >(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
                 &[],
@@ -3358,7 +3379,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
     assert!(error.contains("sorted_resources[0]"), "got: {error}");
 }
 
-fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
+fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     use std::time::Duration;
 
     use carina_core::wait::ManagedWaitTarget;
@@ -3385,33 +3406,35 @@ fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
         interval: Duration::from_secs(5),
         explicit_dependencies: HashSet::new(),
     });
+    PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        source_path: "main.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test("mock")]),
+        backend_config: None,
+        plan,
+        sorted_resources: vec![managed_target.into_inner()],
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: vec![CurrentStateEntry::managed(
+            target_id.clone(),
+            State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
+        )],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    }
+}
+
+fn plan_file_with_unchanged_managed_wait_target() -> PlanFile {
     record_test_plan(
-        PlanFileContents {
-            version: PlanFile::CURRENT_VERSION,
-            carina_version: "test".to_string(),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
-            state_lineage: None,
-            state_serial: None,
-            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
-                "mock",
-            )]),
-            backend_config: None,
-            plan,
-            sorted_resources: vec![managed_target.into_inner()],
-            unresolved_resources: Vec::new(),
-            compositions: Vec::new(),
-            data_sources: Vec::new(),
-            data_source_origins: Vec::new(),
-            data_source_values: Vec::new(),
-            current_states: vec![CurrentStateEntry::managed(
-                target_id.clone(),
-                State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
-            )],
-            upstream_snapshot: HashMap::new(),
-            upstream_sources: Vec::new(),
-            wait_bindings: Vec::new(),
-        },
+        plan_file_contents_with_unchanged_managed_wait_target(),
         &["mock"],
     )
 }
@@ -3445,7 +3468,7 @@ fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFi
 fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
     let data_source =
         DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
-    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.data_sources.push(data_source.clone());
     contents.data_source_values.push(SavedDataSourceValue {
         id: data_source.id.clone(),
@@ -3730,7 +3753,7 @@ fn builtin_mock_recording_context() -> WiringContext {
 
 #[test]
 fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
-    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
         .record(&builtin_mock_recording_context())
@@ -3835,7 +3858,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
 
 #[test]
 fn zero_referenced_provider_plan_round_trips() {
-    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(Vec::new());
     contents.plan = Plan::new();
     contents.sorted_resources.clear();
@@ -3864,7 +3887,7 @@ fn zero_referenced_provider_plan_round_trips() {
 #[test]
 fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
     let retired = ResourceId::with_provider_identity("retired", "legacy.Widget", "gone", None);
-    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(Vec::new());
     contents.plan = Plan::new();
     contents.plan.add(Effect::Remove {
@@ -3918,7 +3941,7 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     };
-    let mut contents = plan_file_with_unchanged_managed_wait_target().into_contents();
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![configured.clone()]);
     contents.plan = Plan::new();
     contents.plan.add(Effect::Remove {
@@ -4187,7 +4210,8 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
                 Some(state_in),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&[])),
@@ -4251,7 +4275,8 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
                 Some(state_in),
             ),
             state_save_inputs: final_state_save_inputs(&[]),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&[]),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: None,
@@ -4294,6 +4319,10 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
     resource_b.binding = Some("b".to_string());
     let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
+    let export_resources = sorted_resources
+        .iter()
+        .map(|resource| resource.as_resource().clone())
+        .collect::<Vec<_>>();
 
     let a_id = resource_a.id.clone();
     let mut a_attrs = HashMap::new();
@@ -4343,7 +4372,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&sorted_resources),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&export_resources),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),
@@ -4407,6 +4437,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
     resource.binding = Some("created".to_string());
     let sorted_resources = vec![resolved(resource.clone())];
+    let export_resources = vec![resource.clone()];
     let resource_id = resource.id.clone();
     let state = State::existing(
         resource_id.clone(),
@@ -4444,7 +4475,8 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
                 Some(StateFile::new()),
             ),
             state_save_inputs: final_state_save_inputs(&sorted_resources),
-            data_source_values: &DataSourceValues::empty(),
+            data_source_values: Some(&DataSourceValues::empty()),
+            export_resources: Some(&export_resources),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
             export_params: Some(&checked_exports(&export_params)),

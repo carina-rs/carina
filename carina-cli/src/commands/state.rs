@@ -3337,7 +3337,7 @@ mod tests {
     impl ProviderNormalizer for DeposedRefreshTestProvider {
         fn normalize_desired<'a>(
             &'a self,
-            _resources: &'a mut [Resource],
+            _resources: &'a mut [carina_core::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }

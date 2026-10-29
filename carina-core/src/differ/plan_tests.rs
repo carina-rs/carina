@@ -1855,7 +1855,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     );
     let mut orphans: Orphans = [orphan].into_iter().collect();
 
-    let move_effect = Effect::Move {
+    let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
         to: ResolvedResourceId::new(new_id.clone()),
     };

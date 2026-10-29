@@ -19,13 +19,13 @@ pub(super) struct SchedulerDeps {
     pub(super) unresolved: Vec<UnresolvedRequiredDependency>,
 }
 
-pub(super) struct PureMetaStep<'a> {
-    effect: &'a Effect,
-    template: &'a DeferredForExpression,
+pub(super) struct PureMetaStep<'a, S> {
+    effect: &'a Effect<S>,
+    template: &'a DeferredForExpression<S>,
 }
 
-impl<'a> PureMetaStep<'a> {
-    fn from_effect(effect: &'a Effect) -> Option<Self> {
+impl<'a, S> PureMetaStep<'a, S> {
+    fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         match effect {
             Effect::DeferredCreate { template, .. } => Some(Self { effect, template }),
             Effect::DeferredReplace(payload) => Some(Self {
@@ -45,17 +45,17 @@ impl<'a> PureMetaStep<'a> {
     }
 }
 
-pub(super) enum PureMetaOutcome {
+pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
-    Materialized(Vec<Effect>),
+    Materialized(Vec<Effect<S>>),
     Failed,
 }
 
-pub(super) fn try_dispatch_pure_meta(
-    effect: &Effect,
+pub(super) fn try_dispatch_pure_meta<S: Clone>(
+    effect: &Effect<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_>,
-) -> PureMetaOutcome {
+    ctx: &PureMetaCtx<'_, S>,
+) -> PureMetaOutcome<S> {
     let Some(step) = PureMetaStep::from_effect(effect) else {
         return PureMetaOutcome::NotPureMeta;
     };
@@ -66,7 +66,7 @@ pub(super) fn try_dispatch_pure_meta(
     }
 }
 
-pub(super) fn failure_binding_name(effect: &Effect) -> Option<String> {
+pub(super) fn failure_binding_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::DeferredCreate { template, .. } => Some(template.binding_name.clone()),
         Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
@@ -74,9 +74,9 @@ pub(super) fn failure_binding_name(effect: &Effect) -> Option<String> {
     }
 }
 
-pub(super) fn build_scheduler_deps(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+pub(super) fn build_scheduler_deps<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
     compositions: &[crate::resource::LiveComposition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
@@ -92,9 +92,9 @@ pub(super) fn build_scheduler_deps(
     )
 }
 
-pub(super) fn build_saved_scheduler_deps(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+pub(super) fn build_saved_scheduler_deps<S>(
+    effects: &[Effect<S>],
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
     compositions: &[crate::resource::SavedComposition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
@@ -129,8 +129,8 @@ pub(super) fn build_scheduler_deps_from_resources(
     )
 }
 
-fn finish_scheduler_deps(
-    effects: &[Effect],
+fn finish_scheduler_deps<S>(
+    effects: &[Effect<S>],
     analysis: Result<DependencyAnalysis, DependencyAnalysisFailure>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
@@ -197,16 +197,16 @@ pub(super) enum FailedDependency {
 /// A snapshot of cumulative cross-phase failure state, paired with the
 /// dependency graph and effect list. Dispatch-time failure detection and
 /// Wait terminal checks share this view so their visibility cannot drift.
-pub(super) struct FailureView<'a> {
-    pub(super) effects: &'a [Effect],
+pub(super) struct FailureView<'a, S> {
+    pub(super) effects: &'a [Effect<S>],
     pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
     pub(super) failed_indices: &'a HashSet<usize>,
     failed_binding_names: HashSet<String>,
 }
 
-impl<'a> FailureView<'a> {
+impl<'a, S> FailureView<'a, S> {
     pub(super) fn new(
-        effects: &'a [Effect],
+        effects: &'a [Effect<S>],
         deps_of: &'a HashMap<usize, HashSet<usize>>,
         failed_indices: &'a HashSet<usize>,
     ) -> Self {

@@ -64,7 +64,8 @@ use std::collections::HashMap;
 use crate::parser::ProviderConfig;
 use crate::provider::{ProviderNormalizer, ProviderResult, merge_default_tags};
 use crate::resource::{
-    ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, value_contains_unknown,
+    ConcreteValue, DeferredValue, ModuleSource, Resource, ResourceId, State, Value,
+    value_contains_unknown,
 };
 use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
 
@@ -76,27 +77,27 @@ use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
 /// they introduce one again. Consequently every schema-known map behind this
 /// wrapper uses canonical attribute names.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NormalizedResource(Resource);
+pub struct NormalizedResource<S = ModuleSource>(Resource<S>);
 
-impl NormalizedResource {
+impl<S> NormalizedResource<S> {
     /// Borrow the normalized resource for read-only consumers.
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &Resource<S> {
         &self.0
     }
 
-    pub(super) fn into_resource(self) -> Resource {
+    pub(super) fn into_resource(self) -> Resource<S> {
         self.0
     }
 }
 
 /// Normalize one desired resource and return the typestate proof consumed by
 /// executor patch builders.
-pub async fn apply_desired_normalization(
-    resource: Resource,
+pub async fn apply_desired_normalization<S: Clone>(
+    resource: Resource<S>,
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
-) -> ProviderResult<NormalizedResource> {
+) -> ProviderResult<NormalizedResource<S>> {
     let mut one = [resource];
     apply_desired_normalization_slice(&mut one, provider_configs, normalizer, schemas).await?;
     let [resource] = one;
@@ -114,14 +115,30 @@ pub async fn apply_desired_normalization(
 /// 5. Run [`merge_default_tags`] for each provider instance.
 ///
 /// An error stops the pipeline before later stages run.
-pub async fn apply_desired_normalization_slice(
-    resources: &mut [Resource],
+pub async fn apply_desired_normalization_slice<S: Clone>(
+    resources: &mut [Resource<S>],
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
-    normalizer.normalize_desired(resources).await?;
+    let mut provider_resources = resources
+        .iter()
+        .cloned()
+        .map(Resource::into_provider_resource)
+        .collect::<Vec<_>>();
+    normalizer
+        .normalize_desired(&mut provider_resources)
+        .await?;
+    for (resource, provider_resource) in resources.iter_mut().zip(provider_resources) {
+        if resource.id != provider_resource.id {
+            return Err(crate::provider::ProviderError::invalid_input(format!(
+                "provider normalizer changed resource identity from `{}` to `{}`",
+                resource.id, provider_resource.id
+            )));
+        }
+        resource.apply_provider_resource(provider_resource);
+    }
     reject_provider_boundary_block_aliases(resources, schemas)?;
     crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
     for config in provider_configs {
@@ -130,8 +147,8 @@ pub async fn apply_desired_normalization_slice(
     Ok(())
 }
 
-fn reject_provider_boundary_block_aliases(
-    resources: &[Resource],
+fn reject_provider_boundary_block_aliases<S>(
+    resources: &[Resource<S>],
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
     for resource in resources {

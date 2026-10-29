@@ -17,11 +17,11 @@ use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
-use carina_core::plan::{Plan, SavedPlan, SavedPlanModuleSources};
+use carina_core::plan::{Plan, SavedPlan};
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
-    CompositionSourceIdentityResolver, ConcreteValue, Current, DataSource, LiveComposition,
+    CompositionSourceIdentityResolver, ConcreteValue, Current, LiveComposition, ModuleSource,
     Resource, ResourceId, SavedComposition, SavedCompositionOriginId, SavedDataSource,
     SavedModuleSource, SavedResource, State, Value,
 };
@@ -300,7 +300,7 @@ mod recorded_provider_artifact_tests {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct PlanFileContents {
+pub struct PlanFileContents<S = ModuleSource> {
     /// Plan file format version.
     ///
     /// `PlanFileHeader` in `commands/apply/mod.rs` relies on this field and
@@ -341,17 +341,17 @@ pub struct PlanFileContents {
     /// Backend configuration
     pub backend_config: Option<BackendConfig>,
     /// The plan (effects)
-    pub plan: Plan,
+    pub plan: Plan<S>,
     /// Pre-resolution resources sorted by dependencies and keyed with their
     /// paired resolved IDs (for post-apply state saving).
-    pub sorted_resources: Vec<Resource>,
+    pub sorted_resources: Vec<Resource<S>>,
     /// Pre-resolution resources captured before ResourceRef substitution and
     /// stored in the same order as `sorted_resources`.
     ///
     /// The saved-plan apply path zips this snapshot with `sorted_resources`
     /// and keys by the sorted resource ID for dependency analysis and
     /// apply-time reference re-resolution.
-    pub unresolved_resources: Vec<Resource>,
+    pub unresolved_resources: Vec<Resource<S>>,
     /// Virtual resources (module-call attribute containers) emitted
     /// by module expansion at plan time (carina#3248). Persisted so
     /// the saved-plan apply path builds the same `ResolvedBindings`
@@ -388,12 +388,12 @@ pub struct PlanFileContents {
     ///
     /// Empty when the configuration declares no `read`-bound
     /// bindings.
-    pub data_sources: Vec<carina_core::resource::DataSource>,
+    pub data_sources: Vec<carina_core::resource::DataSource<S>>,
     /// Authored, pre-normalization counterparts of `data_sources`, paired by
     /// index and rewritten to the resolved IDs above. Apply uses these to
     /// derive which input attributes became known at runtime without
     /// rechecking canonicalized literals as authored values.
-    pub data_source_origins: Vec<carina_core::resource::DataSource>,
+    pub data_source_origins: Vec<carina_core::resource::DataSource<S>>,
     /// One plan-time phase-2 outcome for every entry in `data_sources`.
     ///
     /// Format 25 persists this total collection so saved-plan apply never
@@ -431,6 +431,65 @@ pub struct PlanFileContents {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
+    fn from(contents: PlanFileContents) -> Self {
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        Self {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan: plan.into(),
+            sorted_resources: sorted_resources
+                .into_iter()
+                .map(SavedResource::from)
+                .collect(),
+            unresolved_resources: unresolved_resources
+                .into_iter()
+                .map(SavedResource::from)
+                .collect(),
+            compositions,
+            data_sources: data_sources
+                .into_iter()
+                .map(SavedDataSource::from)
+                .collect(),
+            data_source_origins: data_source_origins
+                .into_iter()
+                .map(SavedDataSource::from)
+                .collect(),
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        }
+    }
+}
+
 /// Provider evidence captured atomically from the wiring context used to plan.
 ///
 /// The fields are private so production code cannot assemble stale, partial,
@@ -459,52 +518,8 @@ struct ProviderEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
 pub struct PlanFile {
-    contents: PlanFileContents,
+    contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
-    saved_module_sources: PlanFileSavedModuleSources,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PlanFileSavedModuleSources {
-    plan: SavedPlanModuleSources,
-    sorted_resources: Vec<Option<SavedModuleSource>>,
-    unresolved_resources: Vec<Option<SavedModuleSource>>,
-    data_sources: Vec<Option<SavedModuleSource>>,
-    data_source_origins: Vec<Option<SavedModuleSource>>,
-}
-
-fn into_saved_resources(
-    resources: Vec<Resource>,
-    retained: &[Option<SavedModuleSource>],
-) -> Vec<SavedResource> {
-    resources
-        .into_iter()
-        .enumerate()
-        .map(|(index, resource)| {
-            let mut saved = SavedResource::from(resource);
-            if saved.module_source.is_none() {
-                saved.module_source = retained.get(index).cloned().flatten();
-            }
-            saved
-        })
-        .collect()
-}
-
-fn into_saved_data_sources(
-    data_sources: Vec<DataSource>,
-    retained: &[Option<SavedModuleSource>],
-) -> Vec<SavedDataSource> {
-    data_sources
-        .into_iter()
-        .enumerate()
-        .map(|(index, data_source)| {
-            let mut saved = SavedDataSource::from(data_source);
-            if saved.module_source.is_none() {
-                saved.module_source = retained.get(index).cloned().flatten();
-            }
-            saved
-        })
-        .collect()
 }
 
 /// Private format-27 wire representation.
@@ -761,11 +776,7 @@ impl ProviderEvidence {
 
 impl From<PlanFile> for PlanFileWire {
     fn from(plan_file: PlanFile) -> Self {
-        let PlanFile {
-            contents,
-            evidence,
-            saved_module_sources,
-        } = plan_file;
+        let PlanFile { contents, evidence } = plan_file;
         let PlanFileContents {
             version,
             carina_version,
@@ -800,21 +811,12 @@ impl From<PlanFile> for PlanFileWire {
             state_serial,
             provider_configs,
             backend_config,
-            plan: plan.into_saved_with_module_sources(&saved_module_sources.plan),
-            sorted_resources: into_saved_resources(
-                sorted_resources,
-                &saved_module_sources.sorted_resources,
-            ),
-            unresolved_resources: into_saved_resources(
-                unresolved_resources,
-                &saved_module_sources.unresolved_resources,
-            ),
+            plan,
+            sorted_resources,
+            unresolved_resources,
             compositions,
-            data_sources: into_saved_data_sources(data_sources, &saved_module_sources.data_sources),
-            data_source_origins: into_saved_data_sources(
-                data_source_origins,
-                &saved_module_sources.data_source_origins,
-            ),
+            data_sources,
+            data_source_origins,
             data_source_values,
             current_states,
             upstream_snapshot,
@@ -853,30 +855,6 @@ impl TryFrom<PlanFileWire> for PlanFile {
             schema_fingerprints,
             provider_artifacts,
         } = wire;
-        let sorted_resource_sources = sorted_resources
-            .iter()
-            .map(|resource| resource.module_source.clone())
-            .collect();
-        let unresolved_resource_sources = unresolved_resources
-            .iter()
-            .map(|resource| resource.module_source.clone())
-            .collect();
-        let data_source_sources = data_sources
-            .iter()
-            .map(|data_source| data_source.module_source.clone())
-            .collect();
-        let data_source_origin_sources = data_source_origins
-            .iter()
-            .map(|data_source| data_source.module_source.clone())
-            .collect();
-        let (plan, plan_sources) = plan.into_live_with_module_sources();
-        let saved_module_sources = PlanFileSavedModuleSources {
-            plan: plan_sources,
-            sorted_resources: sorted_resource_sources,
-            unresolved_resources: unresolved_resource_sources,
-            data_sources: data_source_sources,
-            data_source_origins: data_source_origin_sources,
-        };
         let contents = PlanFileContents {
             version,
             carina_version,
@@ -887,23 +865,11 @@ impl TryFrom<PlanFileWire> for PlanFile {
             provider_configs,
             backend_config,
             plan,
-            sorted_resources: sorted_resources
-                .into_iter()
-                .map(SavedResource::into_live)
-                .collect(),
-            unresolved_resources: unresolved_resources
-                .into_iter()
-                .map(SavedResource::into_live)
-                .collect(),
+            sorted_resources,
+            unresolved_resources,
             compositions,
-            data_sources: data_sources
-                .into_iter()
-                .map(SavedDataSource::into_live)
-                .collect(),
-            data_source_origins: data_source_origins
-                .into_iter()
-                .map(SavedDataSource::into_live)
-                .collect(),
+            data_sources,
+            data_source_origins,
             data_source_values,
             current_states,
             upstream_snapshot,
@@ -917,16 +883,12 @@ impl TryFrom<PlanFileWire> for PlanFile {
             &references,
             &contents.provider_configs,
         )?;
-        Ok(Self {
-            contents,
-            evidence,
-            saved_module_sources,
-        })
+        Ok(Self { contents, evidence })
     }
 }
 
 impl Deref for PlanFile {
-    type Target = PlanFileContents;
+    type Target = PlanFileContents<SavedModuleSource>;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
@@ -940,12 +902,13 @@ impl PlanFileContents {
         let references = self.referenced_schema_types();
         let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
         Ok(PlanFile {
-            contents: self,
+            contents: self.into(),
             evidence,
-            saved_module_sources: PlanFileSavedModuleSources::default(),
         })
     }
+}
 
+impl<S> PlanFileContents<S> {
     pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
         fn insert(
             references: &mut BTreeSet<PlanSchemaReference>,
@@ -1069,11 +1032,6 @@ impl PlanFileContents {
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 27;
 
-    #[cfg(test)]
-    pub(crate) fn into_contents(self) -> PlanFileContents {
-        self.contents
-    }
-
     pub fn schema_fingerprints(&self) -> &PlanSchemaFingerprints {
         &self.evidence.schema_fingerprints
     }
@@ -1092,7 +1050,6 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
-            saved_module_sources: _,
         } = self;
         let moved_origins = MovedOrigins::from_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents
@@ -1199,7 +1156,7 @@ impl PlanFile {
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
         use carina_core::resource::{DataSource, SavedComposition};
 
-        fn resource_contains(resource: &Resource) -> bool {
+        fn resource_contains<S>(resource: &Resource<S>) -> bool {
             let Resource {
                 id: _id,
                 attributes,
@@ -1216,7 +1173,7 @@ impl PlanFile {
                 .any(carina_core::value::contains_redacted_secret)
         }
 
-        fn data_source_contains(data_source: &DataSource) -> bool {
+        fn data_source_contains<S>(data_source: &DataSource<S>) -> bool {
             let DataSource {
                 id: _id,
                 attributes,
@@ -1843,8 +1800,8 @@ mod schema_fingerprint_tests {
     }
 }
 
-pub(crate) fn collect_historical_display_attributes(
-    plan: &Plan,
+pub(crate) fn collect_historical_display_attributes<S>(
+    plan: &Plan<S>,
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
 ) -> HistoricalDisplayAttributes {
@@ -1919,7 +1876,7 @@ pub(crate) struct MovedOrigins {
 }
 
 impl MovedOrigins {
-    pub(crate) fn from_plan(plan: &Plan) -> Self {
+    pub(crate) fn from_plan<S>(plan: &Plan<S>) -> Self {
         let by_destination = plan
             .effects()
             .iter()
@@ -2127,7 +2084,7 @@ impl ReloadedCurrentStateEntry {
 /// inconsistent with its evidence.
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
-    contents: PlanFileContents,
+    contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
 }
@@ -2169,27 +2126,27 @@ impl ReloadedPlanFile {
         Ok(())
     }
 
-    pub(crate) fn plan(&self) -> &Plan {
+    pub(crate) fn plan(&self) -> &SavedPlan {
         &self.contents.plan
     }
 
-    pub(crate) fn plan_mut(&mut self) -> &mut Plan {
+    pub(crate) fn plan_mut(&mut self) -> &mut SavedPlan {
         &mut self.contents.plan
     }
 
-    pub(crate) fn sorted_resources(&self) -> &[Resource] {
+    pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
         &self.contents.sorted_resources
     }
 
-    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource> {
+    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<SavedResource> {
         &mut self.contents.sorted_resources
     }
 
-    pub(crate) fn unresolved_resources(&self) -> &[Resource] {
+    pub(crate) fn unresolved_resources(&self) -> &[SavedResource] {
         &self.contents.unresolved_resources
     }
 
-    pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<Resource> {
+    pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<SavedResource> {
         &mut self.contents.unresolved_resources
     }
 
@@ -2239,19 +2196,19 @@ impl ReloadedPlanFile {
         Ok(())
     }
 
-    pub(crate) fn data_sources(&self) -> &[DataSource] {
+    pub(crate) fn data_sources(&self) -> &[SavedDataSource] {
         &self.contents.data_sources
     }
 
-    pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<DataSource> {
+    pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<SavedDataSource> {
         &mut self.contents.data_sources
     }
 
-    pub(crate) fn data_source_origins(&self) -> &[DataSource] {
+    pub(crate) fn data_source_origins(&self) -> &[SavedDataSource] {
         &self.contents.data_source_origins
     }
 
-    pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
+    pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<SavedDataSource> {
         &mut self.contents.data_source_origins
     }
 
@@ -2637,18 +2594,14 @@ mod managed_current_serde_tests {
         locked
             .upsert_resource(row)
             .expect("state fixture must be valid");
-        let mut contents = plan_file_with_current(
+        let mut plan = plan_file_with_current(
             destination.clone(),
             SavedManagedCurrent::create_in_flight_marker(),
-        )
-        .into_contents();
-        contents.plan.add(Effect::Move {
+        );
+        plan.contents.plan.add(Effect::Move {
             from: ResolvedResourceId::new(source),
             to: ResolvedResourceId::new(destination.clone()),
         });
-        let plan = contents
-            .record(&crate::wiring::WiringContext::new_for_test(Vec::new(), &[]))
-            .expect("test plan provider evidence must be valid");
 
         let plan = plan
             .reload_in_flight_from_locked_state(Some(&locked))

@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
-use carina_core::plan::Plan;
+use carina_core::plan::SavedPlan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
 use carina_core::resource::{
-    Current, DataSource, Resource, ResourceId, SavedComposition, State, Value,
+    Current, DataSource, Resource, ResourceId, SavedComposition, SavedDataSource, SavedResource,
+    State, Value,
 };
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
@@ -22,7 +23,7 @@ use crate::wiring::{ExpandedCanonicalResources, WiringContext};
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
-fn planned_secret_hashes(resources: &[Resource]) -> PlannedSecretHashes {
+fn planned_secret_hashes(resources: &[SavedResource]) -> PlannedSecretHashes {
     resources
         .iter()
         .filter(|resource| {
@@ -162,7 +163,7 @@ impl InspectedPlanFile {
         }
     }
 
-    pub(super) fn data_source_origins(&self) -> &[DataSource] {
+    pub(super) fn data_source_origins(&self) -> &[SavedDataSource] {
         match self {
             Self::Verified(plan) => &plan.plan_file.data_source_origins,
             Self::NeedsSecretVerification(plan) => &plan.plan_file.data_source_origins,
@@ -422,11 +423,11 @@ impl SchemaCheckedPendingPlanFile {
         }
     }
 
-    pub(super) fn data_source_values(&self) -> Result<DataSourceValues, AppError> {
-        super::data_source_values_from_saved_plan(
-            self.plan_file.data_sources(),
-            self.plan_file.data_source_values(),
-        )
+    pub(super) fn data_source_values(
+        &self,
+        data_sources: &[DataSource],
+    ) -> Result<DataSourceValues, AppError> {
+        super::data_source_values_from_saved_plan(data_sources, self.plan_file.data_source_values())
     }
     pub(super) fn verify_desired(
         self,
@@ -460,7 +461,7 @@ impl DesiredPlanFile {
         }
     }
 
-    pub(super) fn sorted_resources(&self) -> &[Resource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
         match self {
             Self::Verified(plan) => plan.sorted_resources(),
             Self::NeedsHistoricalVerification(plan) => plan.sorted_resources(),
@@ -522,7 +523,7 @@ impl DesiredVerifiedPlanFile {
         self.plan_file.provider_configs()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[Resource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
         self.plan_file.sorted_resources()
     }
 
@@ -632,7 +633,7 @@ pub(super) struct RehydratedPlanFile {
 }
 
 impl RehydratedPlanFile {
-    fn plan(&self) -> &Plan {
+    fn plan(&self) -> &SavedPlan {
         self.plan_file.plan()
     }
 
@@ -640,7 +641,7 @@ impl RehydratedPlanFile {
         self.plan_file.provider_configs()
     }
 
-    fn sorted_resources(&self) -> &[Resource] {
+    fn sorted_resources(&self) -> &[SavedResource] {
         self.plan_file.sorted_resources()
     }
 
@@ -648,7 +649,7 @@ impl RehydratedPlanFile {
         &self.planned_secret_hashes
     }
 
-    fn unresolved_resources(&self) -> &[Resource] {
+    fn unresolved_resources(&self) -> &[SavedResource] {
         self.plan_file.unresolved_resources()
     }
 
@@ -656,11 +657,11 @@ impl RehydratedPlanFile {
         self.plan_file.compositions()
     }
 
-    fn data_sources(&self) -> &[DataSource] {
+    fn data_sources(&self) -> &[SavedDataSource] {
         self.plan_file.data_sources()
     }
 
-    fn data_source_origins(&self) -> &[DataSource] {
+    fn data_source_origins(&self) -> &[SavedDataSource] {
         self.plan_file.data_source_origins()
     }
 
@@ -693,11 +694,11 @@ pub(super) struct ExecutablePlanFile {
 }
 
 impl ExecutablePlanFile {
-    pub(super) fn plan(&self) -> &Plan {
+    pub(super) fn plan(&self) -> &SavedPlan {
         self.plan.plan()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[Resource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
         self.plan.sorted_resources()
     }
 
@@ -705,7 +706,7 @@ impl ExecutablePlanFile {
         self.plan.planned_secret_hashes()
     }
 
-    pub(super) fn unresolved_resources(&self) -> &[Resource] {
+    pub(super) fn unresolved_resources(&self) -> &[SavedResource] {
         self.plan.unresolved_resources()
     }
 
@@ -713,11 +714,11 @@ impl ExecutablePlanFile {
         self.plan.compositions()
     }
 
-    pub(super) fn data_sources(&self) -> &[DataSource] {
+    pub(super) fn data_sources(&self) -> &[SavedDataSource] {
         self.plan.data_sources()
     }
 
-    pub(super) fn data_source_origins(&self) -> &[DataSource] {
+    pub(super) fn data_source_origins(&self) -> &[SavedDataSource] {
         self.plan.data_source_origins()
     }
 

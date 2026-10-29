@@ -15,8 +15,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Directives, ModuleSource, ResourceId, ResourceIdentity, ResourceIdentityState,
-    SavedModuleSource, Value,
+    Directives, ModuleSource, ProviderModuleSource, ResourceId, ResourceIdentity,
+    ResourceIdentityState, SavedModuleSource, Value,
 };
 
 /// A read-only resource (data source).
@@ -81,6 +81,9 @@ pub struct DataSource<S = ModuleSource> {
 /// Persisted data-source representation used by saved plans.
 pub type SavedDataSource = DataSource<SavedModuleSource>;
 
+/// Source-neutral data-source payload exposed to providers.
+pub type ProviderDataSource = DataSource<ProviderModuleSource>;
+
 impl From<DataSource> for SavedDataSource {
     fn from(data_source: DataSource) -> Self {
         let DataSource {
@@ -99,29 +102,6 @@ impl From<DataSource> for SavedDataSource {
             binding,
             dependency_bindings,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
-            quoted_string_attrs,
-        }
-    }
-}
-
-impl DataSource<SavedModuleSource> {
-    pub fn into_live(self) -> DataSource {
-        let Self {
-            id,
-            attributes,
-            directives,
-            binding,
-            dependency_bindings,
-            module_source,
-            quoted_string_attrs,
-        } = self;
-        DataSource {
-            id,
-            attributes,
-            directives,
-            binding,
-            dependency_bindings,
-            module_source: module_source.and_then(SavedModuleSource::into_live_root),
             quoted_string_attrs,
         }
     }
@@ -202,7 +182,9 @@ impl DataSource {
             quoted_string_attrs: HashSet::new(),
         }
     }
+}
 
+impl<S: Clone> DataSource<S> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -213,6 +195,30 @@ impl DataSource {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_with_identity(identity);
         data_source
+    }
+}
+
+impl<S> DataSource<S> {
+    /// Remove module provenance while crossing into provider-owned code.
+    pub(crate) fn into_provider_data_source(self) -> ProviderDataSource {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source: _,
+            quoted_string_attrs,
+        } = self;
+        ProviderDataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source: None,
+            quoted_string_attrs,
+        }
     }
 
     /// Get an attribute value by key.
@@ -270,12 +276,6 @@ impl From<ResolvedDataSource> for SavedResolvedDataSource {
     }
 }
 
-impl ResolvedDataSource<SavedModuleSource> {
-    pub fn into_live(self) -> ResolvedDataSource {
-        ResolvedDataSource::new(self.into_inner().into_live())
-    }
-}
-
 impl<S> ResolvedDataSource<S> {
     /// Construct from a [`DataSource`], panicking if identity is pending.
     pub fn new(resource: DataSource<S>) -> Self {
@@ -300,10 +300,6 @@ impl<S> ResolvedDataSource<S> {
     /// Borrow the inner [`DataSource`].
     pub fn as_inner(&self) -> &DataSource<S> {
         &self.0
-    }
-
-    pub(crate) fn as_inner_mut(&mut self) -> &mut DataSource<S> {
-        &mut self.0
     }
 
     /// Consume and return the inner [`DataSource`].

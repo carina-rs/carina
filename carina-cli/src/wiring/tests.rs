@@ -1064,7 +1064,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     impl ProviderNormalizer for FailingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            _resources: &'a mut [Resource],
+            _resources: &'a mut [carina_core::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("plan normalization failed")) })
         }
@@ -1161,7 +1161,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     impl ProviderNormalizer for TransformingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            _resources: &'a mut [Resource],
+            _resources: &'a mut [carina_core::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             carina_core::provider::ready_noop()
         }
@@ -1312,7 +1312,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     );
     assert!(data_source_state.identifier.is_none());
 
-    let move_effect = Effect::Move {
+    let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
         to: ResolvedResourceId::new(target_id.clone()),
     };
@@ -1349,7 +1349,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         resources.resources(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map(
+        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
             current_states,
             &SchemaRegistry::new(),
             resources.resources(),
@@ -2207,7 +2207,7 @@ struct SavedAttrsHydratingNormalizer;
 impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        _resources: &'a mut [Resource],
+        _resources: &'a mut [carina_core::resource::ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         carina_core::provider::ready_noop()
     }
@@ -2499,7 +2499,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map(
+        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -2524,7 +2524,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map(
+        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -3170,22 +3170,21 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         Some("retired")
     );
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map(
-            current_states,
-            &SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &state_file.build_directives(),
-        &SchemaRegistry::new(),
-        &crate::empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &carina_core::provider::ProviderRouter::new(),
+            &carina_core::resource::into_plan_input_current_map::<
+                carina_core::resource::ModuleSource,
+            >(current_states, &SchemaRegistry::new(), &[]),
+            &state_file.build_directives(),
+            &SchemaRegistry::new(),
+            &crate::empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     assert!(matches!(
         plan.effects(),
@@ -8726,7 +8725,7 @@ mod resolved_value_constraint_gate {
     impl ProviderNormalizer for RewritingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [carina_core::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             self.desired_calls.fetch_add(1, Ordering::SeqCst);
             for resource in resources {
