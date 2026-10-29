@@ -7,19 +7,73 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
 ---
 {tocHeadings.length > 0 && (
   <nav class="toc" aria-label="On this page">
-    <p class="toc-label">On this page</p>
-    <ul class="toc-list">
-      {tocHeadings.map(h => (
-        <li class:list={['toc-item', `toc-depth-${h.depth}`]}>
-          <a href={`#${h.slug}`} class="toc-link" data-toc-slug={h.slug}>{h.text}</a>
-        </li>
-      ))}
-    </ul>
+    <button
+      type="button"
+      class="toc-toggle"
+      aria-expanded="true"
+      aria-controls="doc-toc-content"
+      aria-label="Hide on this page"
+      data-toc-toggle
+    >
+      <span class="toc-toggle-icon" aria-hidden="true"></span>
+    </button>
+    <div id="doc-toc-content" class="toc-content">
+      <p class="toc-label">On this page</p>
+      <ul class="toc-list">
+        {tocHeadings.map(h => (
+          <li class:list={['toc-item', `toc-depth-${h.depth}`]}>
+            <a href={`#${h.slug}`} class="toc-link" data-toc-slug={h.slug}>{h.text}</a>
+          </li>
+        ))}
+      </ul>
+    </div>
   </nav>
 )}
 
 <style>
-  .toc { font-size: var(--text-sm); }
+  .toc {
+    padding: var(--space-2) 0;
+    font-size: var(--text-sm);
+  }
+
+  .toc-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    margin: 0 0 var(--space-4) auto;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--toc-link-color);
+    cursor: pointer;
+  }
+
+  .toc-toggle:hover {
+    border-color: var(--toc-link-hover-color);
+    color: var(--toc-link-hover-color);
+  }
+
+  .toc-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .toc-toggle-icon {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(-45deg);
+  }
+
+  :global(html[data-toc-collapsed]) .toc-toggle-icon {
+    transform: rotate(135deg);
+  }
+
+  :global(html[data-toc-collapsed]) .toc-content { display: none; }
 
   .toc-label {
     font-family: var(--font-sans);
@@ -53,6 +107,10 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
   .toc-link[data-current="true"] { color: var(--toc-link-current-color); }
 
   .toc-depth-3 { padding-left: var(--space-4); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .toc-link { transition: none; }
+  }
 </style>
 
 <script>

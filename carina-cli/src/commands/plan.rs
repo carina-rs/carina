@@ -1174,7 +1174,7 @@ impl<S> PlanFileContents<S> {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 27;
+    pub const CURRENT_VERSION: u32 = 28;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
@@ -3023,6 +3023,9 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
+        // typed reason shared with state markers. V27 plans carry the removed
+        // untyped unknown shape and must be regenerated.
         // carina#4045: bumped 25→26 — saved plans persist the exact loaded
         // provider artifacts used to compute the plan. carina#4060 keeps the
         // format at 26 because it only tightens validation.
