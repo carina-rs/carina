@@ -1004,8 +1004,11 @@ fn parse_with_seeded_bindings_inner(
             }
             ParseBinding::Value {
                 value,
+                shared_value: _,
                 source_line: _,
-                ..
+                declaration: _,
+                declared_type: _,
+                scope: _,
             } => {
                 if let Some(metadata) = value.structural_handle_metadata() {
                     parser_binding_metadata
