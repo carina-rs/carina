@@ -482,9 +482,8 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
+async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classification() {
     let path = skip_if_no_http_wasm!();
-    let body = http_probe_body();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
         .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
@@ -496,17 +495,117 @@ async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
         "wasi-http-denied",
         None,
     );
-    let resource =
-        http_send_phase_resource("wasi-http-denied", "http://example.invalid/", "POST", &body);
+    let resource = http_send_phase_resource(
+        "wasi-http-denied",
+        "http://example.invalid/",
+        "POST",
+        "denied",
+    );
 
-    let state = create_state_for_writeback(
+    let error = create_failure_error(
         provider
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
-            .expect("the mock transport probe should report its phase"),
+            .expect_err("the host egress policy must trap the guest"),
+    );
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("mock_http")
+            && rendered.contains("file:///test-providers/mock_http.wasm")
+            && rendered.contains("example.invalid")
+            && rendered.contains("host is not in the allow-list")
+            && rendered.contains("WASM guest call stopped by the host egress policy")
+            && rendered.contains("create call:"),
+        "unexpected host-policy denial: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("host egress policy").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("not_sent") && !rendered.contains("WASM guest trapped"),
+        "the denial must not be classified by the guest or use generic trap wording: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instance() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-metadata-denied",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-metadata-denied",
+        "http://169.254.169.254/latest/api/token",
+        "PUT",
+        "",
+    );
+    let request = create_request_for_test(resource).await;
+
+    let started = Instant::now();
+    let failure = provider
+        .create_for_test(&id, request)
+        .await
+        .expect_err("an untrusted provider must trap on an IMDS request");
+    let elapsed = started.elapsed();
+    let error = create_failure_error(failure);
+    let rendered = error.to_string();
+    eprintln!("untrusted metadata create denial elapsed={elapsed:?}: {rendered}");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "create denial took {elapsed:?}"
+    );
+    assert!(
+        rendered.contains("mock_http")
+            && rendered.contains("untrusted")
+            && rendered.contains("169.254.169.254")
+            && rendered.contains("--trust-local-provider")
+            && rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
+            && rendered.contains("create call"),
+        "unexpected metadata denial: {rendered}"
+    );
+    assert!(
+        !rendered.contains("WASM guest trapped")
+            && !rendered.contains("timed out")
+            && !rendered.contains('\n'),
+        "the denial must retain its dedicated non-timeout diagnostic: {rendered}"
     );
 
-    assert_eq!(http_probe_outcome(&state), "not_sent:HttpRequestDenied");
+    let followup_id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "after-metadata-denial",
+        None,
+    );
+    let followup_started = Instant::now();
+    let followup_error = provider
+        .read(&followup_id, &mock_identifier(), ReadRequest)
+        .await
+        .expect_err("the trapping metadata denial must poison the shared instance");
+    let followup_elapsed = followup_started.elapsed();
+    let followup_rendered = followup_error.to_string();
+
+    assert!(
+        followup_elapsed < Duration::from_secs(1),
+        "poisoned provider did not fail fast: {followup_elapsed:?}"
+    );
+    assert!(
+        followup_rendered.contains("provider instance unusable after trap in create")
+            && followup_rendered.contains("mock_http")
+            && followup_rendered.contains("169.254.169.254"),
+        "poisoned-provider error lost the denial root cause: {followup_rendered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -95,10 +95,28 @@ fn remote_trust_shape(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderLoadSource {
+    LocalFile { path: PathBuf },
+    Remote { source: RemoteSourceKey },
+}
+
+impl fmt::Display for ProviderLoadSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProviderLoadSource::LocalFile { path } => {
+                write!(formatter, "file://{}", path.display())
+            }
+            ProviderLoadSource::Remote { source } => source.fmt(formatter),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProviderLoadIdentity {
     configured_name: String,
     trust: ProviderTrust,
+    source: ProviderLoadSource,
 }
 
 impl ProviderLoadIdentity {
@@ -110,9 +128,14 @@ impl ProviderLoadIdentity {
         &self.trust
     }
 
+    pub fn source(&self) -> &ProviderLoadSource {
+        &self.source
+    }
+
     pub(crate) fn new(
         configured_name: String,
         trust: ProviderTrust,
+        source: ProviderLoadSource,
     ) -> Result<Self, ProviderLoadIdentityError> {
         let expected = match trust.name_requirement {
             ProviderNameRequirement::Any => None,
@@ -136,17 +159,23 @@ impl ProviderLoadIdentity {
         Ok(Self {
             configured_name,
             trust,
+            source,
         })
     }
 
     #[cfg(feature = "test-utils")]
     pub fn for_test(configured_name: impl Into<String>, class: ProviderTrustClass) -> Self {
+        let configured_name = configured_name.into();
+        let source = ProviderLoadSource::LocalFile {
+            path: PathBuf::from(format!("/test-providers/{configured_name}.wasm")),
+        };
         Self {
-            configured_name: configured_name.into(),
+            configured_name,
             trust: ProviderTrust {
                 class,
                 name_requirement: ProviderNameRequirement::Any,
             },
+            source,
         }
     }
 }
@@ -471,20 +500,26 @@ mod tests {
 
     #[test]
     fn trusted_remote_identity_rejects_disagreeing_configured_name() {
-        let trust = classify_verified_remote(
-            &source_key("github.com/carina-rs/carina-provider-aws"),
-            None,
-        )
-        .unwrap();
+        let source = source_key("github.com/carina-rs/carina-provider-aws");
+        let trust = classify_verified_remote(&source, None).unwrap();
 
-        let error = ProviderLoadIdentity::new("foo".into(), trust).unwrap_err();
+        let error =
+            ProviderLoadIdentity::new("foo".into(), trust, ProviderLoadSource::Remote { source })
+                .unwrap_err();
 
         assert_eq!(error.name_mismatch(), Some(("foo", "aws")));
     }
 
     #[test]
     fn untrusted_identity_accepts_any_configured_name_without_gaining_privilege() {
-        let identity = ProviderLoadIdentity::new("aws".into(), ProviderTrust::untrusted()).unwrap();
+        let identity = ProviderLoadIdentity::new(
+            "aws".into(),
+            ProviderTrust::untrusted(),
+            ProviderLoadSource::LocalFile {
+                path: PathBuf::from("/tmp/aws.wasm"),
+            },
+        )
+        .unwrap();
 
         assert_eq!(identity.configured_name(), "aws");
         assert_eq!(identity.trust().class(), ProviderTrustClass::Untrusted);

@@ -53,7 +53,9 @@ use carina_core::schema::{
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
-use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
+use carina_provider_resolver::{
+    ProviderLoadIdentity, ProviderLoadSource, ProviderTrustClass, VerifiedLoad,
+};
 
 use crate::{secret_seal, wasm_convert};
 use carina_provider_protocol::types as proto;
@@ -161,6 +163,15 @@ impl fmt::Display for WasmGuestCallError {
 impl std::error::Error for WasmGuestCallError {}
 
 fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> ProviderError {
+    let error = match error.downcast::<EgressDenied>() {
+        Ok(denial) => {
+            return ProviderError::internal_caused_by(
+                "WASM guest call stopped by the host egress policy",
+                EgressDeniedCall { operation, denial },
+            );
+        }
+        Err(error) => error,
+    };
     let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
     if timed_out {
         ProviderError::timeout_caused_by(
@@ -901,26 +912,130 @@ impl Drop for EpochTicker {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DestinationDenied {
     HostNotAllowed,
-    NoResolvedAddresses,
-    ResolvedAddressDenied(IpAddr),
+    MetadataWithheld(IpAddr),
+    LinkLocalAddressDenied(IpAddr),
 }
 
 impl fmt::Display for DestinationDenied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DestinationDenied::HostNotAllowed => f.write_str("host is not in the allow-list"),
-            DestinationDenied::NoResolvedAddresses => {
-                f.write_str("host resolution returned no addresses")
+            DestinationDenied::MetadataWithheld(address) => {
+                write!(
+                    f,
+                    "instance-metadata address {address} is not available to this provider"
+                )
             }
-            DestinationDenied::ResolvedAddressDenied(address) => {
-                write!(f, "resolved address {address} is denied")
+            DestinationDenied::LinkLocalAddressDenied(address) => {
+                write!(f, "link-local resolved address {address} is denied")
             }
         }
     }
 }
+
+#[derive(Debug)]
+struct EgressDenied {
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
+    destination: String,
+    reason: DestinationDenied,
+}
+
+impl EgressDenied {
+    fn new(
+        label: Arc<ProviderLabel>,
+        kind: Option<ProviderKind>,
+        destination: String,
+        reason: DestinationDenied,
+    ) -> Self {
+        Self {
+            label,
+            kind,
+            destination,
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for EgressDenied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.kind, &self.label.source, &self.reason) {
+            (
+                Some(ProviderKind::Untrusted),
+                ProviderLoadSource::LocalFile { path },
+                DestinationDenied::MetadataWithheld(_address),
+            ) => write!(
+                formatter,
+                "provider '{}' ({}) is untrusted, so it gets no credentials and no \
+                 instance-metadata access; its request to {} was denied. Grant this local build \
+                 with --trust-local-provider {}=aws (or \
+                 CARINA_TRUST_LOCAL_PROVIDER={}=aws); if it is already granted, re-run `carina \
+                 init` so the installed bytes match the granted file",
+                self.label.name,
+                self.label.source,
+                self.destination,
+                path.display(),
+                path.display(),
+            ),
+            (
+                Some(ProviderKind::Untrusted),
+                ProviderLoadSource::Remote { source: _ },
+                DestinationDenied::MetadataWithheld(_address),
+            ) => write!(
+                formatter,
+                "provider '{}' ({}) is untrusted, so it gets no credentials and no \
+                 instance-metadata access; its request to {} was denied because its source is \
+                 not a verified carina-rs provider",
+                self.label.name, self.label.source, self.destination,
+            ),
+            (
+                None | Some(ProviderKind::Aws) | Some(ProviderKind::GitHub),
+                ProviderLoadSource::LocalFile { path: _ }
+                | ProviderLoadSource::Remote { source: _ },
+                DestinationDenied::HostNotAllowed
+                | DestinationDenied::MetadataWithheld(_)
+                | DestinationDenied::LinkLocalAddressDenied(_),
+            )
+            | (
+                Some(ProviderKind::Untrusted),
+                ProviderLoadSource::LocalFile { path: _ }
+                | ProviderLoadSource::Remote { source: _ },
+                DestinationDenied::HostNotAllowed | DestinationDenied::LinkLocalAddressDenied(_),
+            ) => write!(
+                formatter,
+                "provider '{}' ({}) request to {} was denied: {}",
+                self.label.name, self.label.source, self.destination, self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EgressDenied {}
+
+#[derive(Debug)]
+struct EgressDeniedCall {
+    operation: &'static str,
+    denial: EgressDenied,
+}
+
+impl EgressDeniedCall {
+    fn denial(&self) -> &EgressDenied {
+        &self.denial
+    }
+}
+
+impl fmt::Display for EgressDeniedCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} call: {}", self.operation, self.denial())
+    }
+}
+
+// `Display` embeds the denial, so exposing it again through `source()` would
+// duplicate the diagnostic in error-chain renderers.
+impl std::error::Error for EgressDeniedCall {}
 
 /// A host that passed the request URI's host-string policy.
 ///
@@ -931,6 +1046,32 @@ struct AllowedHost {
     target: AllowedHostTarget,
 }
 
+impl AllowedHost {
+    fn denied_destination(&self) -> String {
+        match &self.target {
+            AllowedHostTarget::Name(host) => host.clone(),
+            AllowedHostTarget::Literal(address) => address.to_string(),
+        }
+    }
+
+    fn into_vetted_destination(
+        self,
+        first: SocketAddr,
+        rest: &[SocketAddr],
+        is_metadata: bool,
+    ) -> VettedDestination {
+        VettedDestination {
+            host: match self.target {
+                AllowedHostTarget::Name(host) => host,
+                AllowedHostTarget::Literal(address) => address.to_string(),
+            },
+            first,
+            rest: rest.to_vec(),
+            is_metadata,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AllowedHostTarget {
     Name(String),
@@ -939,8 +1080,8 @@ enum AllowedHostTarget {
 
 /// The only destination type accepted by the TCP connection handler.
 ///
-/// Instances are created by [`vet_resolved_destination`] after every resolved
-/// address has passed the link-local and metadata policy.
+/// Instances are created by [`AllowedHost::into_vetted_destination`] after
+/// [`vet_resolved_addresses`] accepts every resolved address.
 struct VettedDestination {
     host: String,
     first: SocketAddr,
@@ -1003,8 +1144,19 @@ fn provider_permits_metadata(kind: Option<ProviderKind>, address: IpAddr) -> boo
 
 fn check_host(kind: Option<ProviderKind>, host: &str) -> Result<AllowedHost, DestinationDenied> {
     let target = match ip_literal(host) {
-        Some(address) if provider_permits_metadata(kind, address) => {
-            AllowedHostTarget::Literal(address)
+        Some(address) if is_metadata_host(address) => {
+            if provider_permits_metadata(kind, address) {
+                AllowedHostTarget::Literal(address)
+            } else {
+                return Err(DestinationDenied::MetadataWithheld(
+                    canonical_policy_address(address),
+                ));
+            }
+        }
+        Some(address) if is_link_local(address) => {
+            return Err(DestinationDenied::LinkLocalAddressDenied(
+                canonical_policy_address(address),
+            ));
         }
         Some(_) => return Err(DestinationDenied::HostNotAllowed),
         None if HTTP_ALLOWED_HOST_SUFFIXES
@@ -1031,35 +1183,25 @@ fn is_link_local(address: IpAddr) -> bool {
     }
 }
 
-fn vet_resolved_destination(
-    allowed_host: AllowedHost,
-    resolved: &[SocketAddr],
-) -> Result<VettedDestination, DestinationDenied> {
-    let (first, rest) = resolved
-        .split_first()
-        .ok_or(DestinationDenied::NoResolvedAddresses)?;
-
+fn vet_resolved_addresses(
+    allowed_host: &AllowedHost,
+    first: SocketAddr,
+    rest: &[SocketAddr],
+) -> Result<bool, DestinationDenied> {
     let mut destination_is_metadata = false;
-    for address in resolved {
+    for address in std::iter::once(&first).chain(rest) {
         let canonical_ip = canonical_policy_address(address.ip());
         let metadata = is_metadata_host(canonical_ip);
-        if (metadata || is_link_local(canonical_ip))
-            && !(metadata && provider_permits_metadata(allowed_host.kind, canonical_ip))
-        {
-            return Err(DestinationDenied::ResolvedAddressDenied(canonical_ip));
+        if metadata && !provider_permits_metadata(allowed_host.kind, canonical_ip) {
+            return Err(DestinationDenied::MetadataWithheld(canonical_ip));
+        }
+        if !metadata && is_link_local(canonical_ip) {
+            return Err(DestinationDenied::LinkLocalAddressDenied(canonical_ip));
         }
         destination_is_metadata |= metadata;
     }
 
-    Ok(VettedDestination {
-        host: match allowed_host.target {
-            AllowedHostTarget::Name(host) => host,
-            AllowedHostTarget::Literal(address) => address.to_string(),
-        },
-        first: *first,
-        rest: rest.to_vec(),
-        is_metadata: destination_is_metadata,
-    })
+    Ok(destination_is_metadata)
 }
 
 /// Apply both the URI host-string policy and the post-resolution address
@@ -1070,7 +1212,12 @@ fn check_destination(
     host: &str,
     resolved: &[SocketAddr],
 ) -> Result<VettedDestination, DestinationDenied> {
-    vet_resolved_destination(check_host(kind, host)?, resolved)
+    let (first, rest) = resolved
+        .split_first()
+        .expect("test resolution must contain at least one address");
+    let allowed_host = check_host(kind, host)?;
+    let is_metadata = vet_resolved_addresses(&allowed_host, *first, rest)?;
+    Ok(allowed_host.into_vetted_destination(*first, rest, is_metadata))
 }
 
 /// Memoizes metadata endpoint availability for a single probe owner.
@@ -1152,28 +1299,47 @@ impl DestinationResolver for TokioDestinationResolver {
     }
 }
 
+fn dns_error_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode {
+    use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, ErrorCode};
+
+    ErrorCode::DnsError(DnsErrorPayload {
+        rcode: Some("address not available".to_string()),
+        info_code: Some(0),
+    })
+}
+
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to the
 /// existing AWS hostname suffixes and this store's typed metadata policy.
 ///
 /// Metadata requests are capped at [`METADATA_PROBE_TIMEOUT`] so that non-EC2/ECS
 /// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks {
+    label: Arc<ProviderLabel>,
     kind: Option<ProviderKind>,
     resolver: Arc<dyn DestinationResolver>,
     test_route: Option<HttpTestRoute>,
 }
 
 impl AllowListHttpHooks {
-    fn with_resolver(kind: Option<ProviderKind>, resolver: Arc<dyn DestinationResolver>) -> Self {
+    fn with_resolver(
+        label: Arc<ProviderLabel>,
+        kind: Option<ProviderKind>,
+        resolver: Arc<dyn DestinationResolver>,
+    ) -> Self {
         Self {
+            label,
             kind,
             resolver,
             test_route: None,
         }
     }
 
-    fn with_test_route(kind: Option<ProviderKind>, test_route: Option<HttpTestRoute>) -> Self {
-        let mut hooks = Self::with_resolver(kind, Arc::new(TokioDestinationResolver));
+    fn with_test_route(
+        label: Arc<ProviderLabel>,
+        kind: Option<ProviderKind>,
+        test_route: Option<HttpTestRoute>,
+    ) -> Self {
+        let mut hooks = Self::with_resolver(label, kind, Arc::new(TokioDestinationResolver));
         hooks.test_route = test_route;
         hooks
     }
@@ -1186,7 +1352,7 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
-        use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, ErrorCode};
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
         let host = match request.uri().host() {
             Some(host) => host,
@@ -1212,14 +1378,17 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 kind: self.kind,
                 target: AllowedHostTarget::Name(host.to_string()),
             },
-            None => check_host(self.kind, host).map_err(|_| {
-                log::warn!(
-                    "WASM plugin HTTP request blocked: host {:?} is not in the allow-list",
-                    host,
-                );
-                ErrorCode::HttpRequestDenied
+            None => check_host(self.kind, host).map_err(|reason| {
+                wasmtime_wasi_http::p2::HttpError::trap(EgressDenied::new(
+                    Arc::clone(&self.label),
+                    self.kind,
+                    host.to_string(),
+                    reason,
+                ))
             })?,
         };
+        let label = Arc::clone(&self.label);
+        let kind = self.kind;
         let resolver = Arc::clone(&self.resolver);
         let trace_state = trace_http_enabled().then(|| {
             (
@@ -1231,8 +1400,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
         let handle = wasmtime_wasi::runtime::spawn(async move {
             let handler_start = std::time::Instant::now();
             let trace = trace_state.is_some();
-            let result = async {
-                let resolved = match test_destination {
+            let resolved = async {
+                Ok::<_, ErrorCode>(match test_destination {
                     Some(destination) => vec![destination],
                     None => match &allowed_host.target {
                         AllowedHostTarget::Name(host) => tokio::time::timeout(
@@ -1253,37 +1422,50 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                                 host,
                                 error,
                             );
-                            ErrorCode::DnsError(DnsErrorPayload {
-                                rcode: Some("address not available".to_string()),
-                                info_code: Some(0),
-                            })
+                            dns_error_code()
                         })?,
                         AllowedHostTarget::Literal(address) => {
                             vec![SocketAddr::new(*address, port)]
                         }
                     },
-                };
-                let vetted =
-                    vet_resolved_destination(allowed_host, &resolved).map_err(|denied| {
-                        log::warn!(
-                            "WASM plugin HTTP request blocked after resolution: {}",
-                            denied,
-                        );
-                        ErrorCode::HttpRequestDenied
-                    })?;
-                let mut config = config;
-                let cap = if vetted.is_metadata {
-                    METADATA_PROBE_TIMEOUT
-                } else {
-                    HTTP_API_REQUEST_TIMEOUT
-                };
-                config.connect_timeout = config.connect_timeout.min(cap);
-                config.first_byte_timeout = config.first_byte_timeout.min(cap);
-                config.between_bytes_timeout = config.between_bytes_timeout.min(cap);
-
-                send_request_handler(request, config, vetted, trace).await
+                })
             }
             .await;
+            let result = match resolved {
+                Err(error) => Ok(Err(error)),
+                Ok(resolved) => match resolved.split_first() {
+                    None => Ok(Err(dns_error_code())),
+                    Some((first, rest)) => {
+                        match vet_resolved_addresses(&allowed_host, *first, rest) {
+                            Err(reason) => {
+                                let destination = allowed_host.denied_destination();
+                                Err(wasmtime::Error::new(EgressDenied::new(
+                                    label,
+                                    kind,
+                                    destination,
+                                    reason,
+                                )))
+                            }
+                            Ok(is_metadata) => {
+                                let vetted =
+                                    allowed_host.into_vetted_destination(*first, rest, is_metadata);
+                                let mut config = config;
+                                let cap = if vetted.is_metadata {
+                                    METADATA_PROBE_TIMEOUT
+                                } else {
+                                    HTTP_API_REQUEST_TIMEOUT
+                                };
+                                config.connect_timeout = config.connect_timeout.min(cap);
+                                config.first_byte_timeout = config.first_byte_timeout.min(cap);
+                                config.between_bytes_timeout =
+                                    config.between_bytes_timeout.min(cap);
+
+                                Ok(send_request_handler(request, config, vetted, trace).await)
+                            }
+                        }
+                    }
+                },
+            };
             if let Some((method, uri, spawn_start)) = trace_state {
                 let queue_ms = handler_start.duration_since(spawn_start).as_millis();
                 let handler_ms = handler_start.elapsed().as_millis();
@@ -1294,12 +1476,13 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                     queue_ms,
                     handler_ms,
                     match &result {
-                        Ok(resp) => format!("{}", resp.resp.status().as_u16()),
-                        Err(e) => format!("err:{:?}", e),
+                        Ok(Ok(response)) => format!("{}", response.resp.status().as_u16()),
+                        Ok(Err(error)) => format!("err:{error:?}"),
+                        Err(error) => format!("trap:{error}"),
                     },
                 );
             }
-            Ok(result)
+            result
         });
 
         Ok(wasmtime_wasi_http::p2::types::HostFutureIncomingResponse::pending(handle))
@@ -2214,10 +2397,11 @@ fn add_wasi_sans_sockets_to_linker<T: WasiView>(linker: &mut Linker<T>) -> wasmt
 async fn create_instance(
     engine: &Engine,
     component: &Component,
-    provider_kind: Option<ProviderKind>,
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut store = GuestStore::new(engine, provider_kind, None, build_store_limits(), budget);
+    let mut store = GuestStore::new(engine, label, kind, None, build_store_limits(), budget);
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
@@ -2265,8 +2449,14 @@ const AWS_ENV_ALLOWLIST: &[&str] = &[
 /// Environment variables exposed only to the GitHub provider.
 const GITHUB_ENV_ALLOWLIST: &[&str] = &["GITHUB_TOKEN"];
 
-struct ConfiguredProvider {
+#[derive(Debug)]
+struct ProviderLabel {
     name: String,
+    source: ProviderLoadSource,
+}
+
+struct ConfiguredProvider {
+    label: Arc<ProviderLabel>,
     kind: ProviderKind,
 }
 
@@ -2277,12 +2467,11 @@ impl ConfiguredProvider {
             ProviderTrustClass::GitHub => ProviderKind::GitHub,
             ProviderTrustClass::Untrusted => ProviderKind::Untrusted,
         };
-        let name = identity.configured_name().to_string();
-        Self { name, kind }
-    }
-
-    fn initialized_instance_kind(&self) -> Option<ProviderKind> {
-        Some(self.kind)
+        let label = Arc::new(ProviderLabel {
+            name: identity.configured_name().to_string(),
+            source: identity.source().clone(),
+        });
+        Self { label, kind }
     }
 }
 
@@ -2382,13 +2571,15 @@ fn build_sandboxed_wasi_ctx_with(
 async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
-    provider_kind: Option<ProviderKind>,
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
     let mut store = GuestStore::new_with_http_test_route(
         engine,
-        provider_kind,
+        label,
+        kind,
         Some(WasiHttpCtx::new()),
         build_store_limits(),
         budget,
@@ -2419,19 +2610,17 @@ async fn create_instance_with_http(
 async fn create_instance_for_world(
     engine: &Engine,
     component: &Component,
-    provider_kind: Option<ProviderKind>,
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<LiveInstance, WasmBindingCreationError> {
     let (store, bindings) = match world {
         InstantiationWorld::HttpEnabled => {
-            create_instance_with_http(engine, component, provider_kind, budget, http_test_route)
-                .await
+            create_instance_with_http(engine, component, label, kind, budget, http_test_route).await
         }
-        InstantiationWorld::Basic => {
-            create_instance(engine, component, provider_kind, budget).await
-        }
+        InstantiationWorld::Basic => create_instance(engine, component, label, kind, budget).await,
     }?;
     Ok(LiveInstance::new(store, bindings, world))
 }
@@ -2439,7 +2628,8 @@ async fn create_instance_for_world(
 async fn create_runtime_instance(
     engine: &Engine,
     component: &Component,
-    provider_kind: Option<ProviderKind>,
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
@@ -2447,7 +2637,8 @@ async fn create_runtime_instance(
     let result = create_instance_for_world(
         engine,
         component,
-        provider_kind,
+        label,
+        kind,
         world,
         budget,
         http_test_route,
@@ -3104,18 +3295,25 @@ impl Drop for RebuildableLiveInstanceGuard<'_> {
 struct RebuildContext {
     engine: Engine,
     component: Component,
-    provider_kind: Option<ProviderKind>,
+    label: Arc<ProviderLabel>,
+    kind: Option<ProviderKind>,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 }
 
 impl RebuildContext {
-    fn new(engine: Engine, component: Component, budget: GuestCallBudget) -> Self {
+    fn new(
+        engine: Engine,
+        component: Component,
+        label: Arc<ProviderLabel>,
+        budget: GuestCallBudget,
+    ) -> Self {
         Self {
             engine,
             component,
-            provider_kind: None,
+            label,
+            kind: None,
             world: InstantiationWorld::HttpEnabled,
             budget,
             http_test_route: None,
@@ -3126,7 +3324,8 @@ impl RebuildContext {
         create_instance_for_world(
             &self.engine,
             &self.component,
-            self.provider_kind,
+            Arc::clone(&self.label),
+            self.kind,
             self.world,
             self.budget,
             self.http_test_route.clone(),
@@ -3563,7 +3762,12 @@ impl WasmProviderFactory {
         configured: ConfiguredProvider,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
-        let mut rebuild = RebuildContext::new(engine.clone(), component.clone(), budget);
+        let mut rebuild = RebuildContext::new(
+            engine.clone(),
+            component.clone(),
+            Arc::clone(&configured.label),
+            budget,
+        );
         let mut live = create_instance_auto(&mut rebuild).await?;
         let enable_http = live.world == InstantiationWorld::HttpEnabled;
         let info_json = live.bindings.info_json().to_owned();
@@ -3572,13 +3776,13 @@ impl WasmProviderFactory {
             wasm_convert::json_to_provider_info(&info_json).map_err(|source| {
                 WasmProviderLoadError::metadata("Failed to decode provider info", source)
             })?;
-        if reported_name != configured.name {
+        if reported_name != configured.label.name {
             return Err(WasmProviderLoadError::ProviderNameMismatch {
-                configured: configured.name.clone(),
+                configured: configured.label.name.clone(),
                 reported: reported_name,
             });
         }
-        let name = configured.name.as_str();
+        let name = configured.label.name.as_str();
 
         let schemas_json = live
             .store
@@ -3794,7 +3998,6 @@ impl WasmProviderFactory {
         // `initialize` and then read/create/update/delete). The kind was
         // classified from resolver-owned source identity before
         // guest metadata was read, so the guest receives only that partition.
-        let kind = self.configured.initialized_instance_kind();
         let world = if self.enable_http {
             InstantiationWorld::HttpEnabled
         } else {
@@ -3803,7 +4006,8 @@ impl WasmProviderFactory {
         let mut live = create_runtime_instance(
             &self.engine,
             &self.component,
-            kind,
+            Arc::clone(&self.configured.label),
+            Some(self.configured.kind),
             world,
             self.budget,
             self.http_test_route.clone(),
@@ -3919,7 +4123,7 @@ impl WasmProviderFactory {
         let actual = semver::Version::parse(&self.version).map_err(|e| {
             format!(
                 "Provider '{}' reports invalid version '{}': {}",
-                self.configured.name.as_str(),
+                self.configured.label.name.as_str(),
                 self.version,
                 e
             )
@@ -3927,7 +4131,7 @@ impl WasmProviderFactory {
         if !req.matches(&actual) {
             return Err(format!(
                 "Provider '{}' version {} does not satisfy constraint '{}'",
-                self.configured.name.as_str(),
+                self.configured.label.name.as_str(),
                 actual,
                 constraint_raw
             ));
@@ -3938,7 +4142,7 @@ impl WasmProviderFactory {
 
 impl ProviderFactory for WasmProviderFactory {
     fn name(&self) -> &str {
-        self.configured.name.as_str()
+        self.configured.label.name.as_str()
     }
 
     fn display_name(&self) -> &str {
@@ -4032,7 +4236,7 @@ impl ProviderFactory for WasmProviderFactory {
                 })?;
             Ok(Box::new(WasmProvider {
                 instance,
-                name: self.configured.name.clone(),
+                name: self.configured.label.name.clone(),
                 schemas: Arc::clone(&self.schemas),
             }) as Box<dyn Provider>)
         })
@@ -6165,6 +6369,29 @@ mod tests {
         ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
     }
 
+    fn local_provider_label(name: &str) -> Arc<ProviderLabel> {
+        Arc::new(ProviderLabel {
+            name: name.to_string(),
+            source: ProviderLoadSource::LocalFile {
+                path: PathBuf::from(format!("/test-providers/{name}.wasm")),
+            },
+        })
+    }
+
+    fn remote_provider_label(name: &str, source: &str) -> Arc<ProviderLabel> {
+        let source = match source.parse::<carina_core::provider_source::ProviderSource>() {
+            Ok(carina_core::provider_source::ProviderSource::Remote(source)) => source.source_key(),
+            Ok(carina_core::provider_source::ProviderSource::File(_)) => {
+                panic!("test source must be remote")
+            }
+            Err(error) => panic!("invalid test provider source: {error}"),
+        };
+        Arc::new(ProviderLabel {
+            name: name.to_string(),
+            source: ProviderLoadSource::Remote { source },
+        })
+    }
+
     async fn rebuildable_state_test_factory() -> Option<WasmProviderFactory> {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -7239,6 +7466,40 @@ mod tests {
     }
 
     #[test]
+    fn shared_trap_mapper_preserves_typed_egress_denial_without_timeout_or_generic_wording() {
+        let denial = EgressDenied::new(
+            local_provider_label("mock_http"),
+            Some(ProviderKind::Untrusted),
+            "169.254.169.254".to_string(),
+            DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+        );
+        let expected = denial.to_string();
+
+        let mapped = wasm_trap_provider_error("create", wasmtime::Error::new(denial));
+
+        assert_eq!(
+            mapped.kind(),
+            carina_core::provider::ProviderErrorKind::Internal
+        );
+        assert_eq!(
+            mapped.detail().context(),
+            "WASM guest call stopped by the host egress policy"
+        );
+        assert_eq!(
+            mapped.to_string(),
+            format!("WASM guest call stopped by the host egress policy: create call: {expected}")
+        );
+        let call = mapped
+            .detail()
+            .cause()
+            .and_then(|cause| cause.downcast_ref::<EgressDeniedCall>())
+            .expect("the ProviderError must retain the typed egress call");
+        assert_eq!(call.operation, "create");
+        assert_eq!(call.denial().to_string(), expected);
+        assert!(std::error::Error::source(call).is_none());
+    }
+
+    #[test]
     fn timeout_classification_uses_the_typed_trap_not_message_text() {
         let nested = wasmtime::Error::msg("epoch deadline reached").context("outer guest trap");
 
@@ -7714,7 +7975,7 @@ mod tests {
 
         fn guest_env_keys(configured: &ConfiguredProvider) -> HashSet<String> {
             let ctx = build_sandboxed_wasi_ctx_with(
-                configured.initialized_instance_kind(),
+                Some(configured.kind),
                 |_| Some("test-value".to_string()),
                 || panic!("an explicit AWS_EC2_METADATA_DISABLED value skips the probe"),
             );
@@ -7839,6 +8100,143 @@ mod tests {
         assert!(check_host(None, "fakeamazonaws.com").is_err());
         // Bare domain without service prefix is not a valid AWS endpoint
         assert!(check_host(None, "amazonaws.com").is_err());
+    }
+
+    #[test]
+    fn metadata_denials_have_a_distinct_variant_before_and_after_resolution() {
+        let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+        let literal_denial = match check_host(Some(ProviderKind::Untrusted), "169.254.169.254") {
+            Ok(_) => panic!("an untrusted provider must not reach an IP-literal metadata host"),
+            Err(denial) => denial,
+        };
+        assert!(matches!(
+            literal_denial,
+            DestinationDenied::MetadataWithheld(address) if address == metadata
+        ));
+
+        let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
+            .expect("the AWS hostname should pass the pre-resolution allow-list");
+        let resolved_denial =
+            match vet_resolved_addresses(&allowed, SocketAddr::new(metadata, 443), &[]) {
+                Ok(_) => panic!("an untrusted provider must not reach resolved metadata"),
+                Err(denial) => denial,
+            };
+        assert!(matches!(
+            resolved_denial,
+            DestinationDenied::MetadataWithheld(address) if address == metadata
+        ));
+
+        let link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
+        let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
+            .expect("the AWS hostname should pass the pre-resolution allow-list");
+        let link_local_denial =
+            match vet_resolved_addresses(&allowed, SocketAddr::new(link_local, 443), &[]) {
+                Ok(_) => panic!("a resolved link-local address must remain denied"),
+                Err(denial) => denial,
+            };
+        assert!(matches!(
+            link_local_denial,
+            DestinationDenied::LinkLocalAddressDenied(address) if address == link_local
+        ));
+    }
+
+    #[test]
+    fn egress_denied_display_explains_local_untrusted_metadata_policy_and_grant() {
+        let error = EgressDenied::new(
+            Arc::new(ProviderLabel {
+                name: "mock_http".to_string(),
+                source: ProviderLoadSource::LocalFile {
+                    path: PathBuf::from("/opt/providers/mock_http.wasm"),
+                },
+            }),
+            Some(ProviderKind::Untrusted),
+            "169.254.169.254".to_string(),
+            DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "provider 'mock_http' (file:///opt/providers/mock_http.wasm) is untrusted, so it gets \
+             no credentials and no instance-metadata access; its request to 169.254.169.254 was \
+             denied. Grant this local build with --trust-local-provider \
+             /opt/providers/mock_http.wasm=aws (or \
+             CARINA_TRUST_LOCAL_PROVIDER=/opt/providers/mock_http.wasm=aws); if it is already \
+             granted, re-run `carina init` so the installed bytes match the granted file"
+        );
+        assert!(!error.to_string().contains('\n'));
+    }
+
+    #[test]
+    fn egress_denied_display_explains_remote_untrusted_metadata_policy_without_local_hint() {
+        let error = EgressDenied::new(
+            remote_provider_label("widget", "github.com/example/provider-widget"),
+            Some(ProviderKind::Untrusted),
+            "169.254.169.254".to_string(),
+            DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+        );
+        let rendered = error.to_string();
+
+        assert_eq!(
+            rendered,
+            "provider 'widget' (github.com/example/provider-widget) is untrusted, so it gets no \
+             credentials and no instance-metadata access; its request to 169.254.169.254 was \
+             denied because its source is not a verified carina-rs provider"
+        );
+        assert!(!rendered.contains("--trust-local-provider"));
+        assert!(!rendered.contains("CARINA_TRUST_LOCAL_PROVIDER"));
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn egress_denied_display_names_every_generic_reason_and_validation_instance() {
+        let label = remote_provider_label("aws", "carina-rs/aws");
+        let cases = [
+            (
+                DestinationDenied::HostNotAllowed,
+                "host is not in the allow-list",
+            ),
+            (
+                DestinationDenied::LinkLocalAddressDenied(IpAddr::V4(Ipv4Addr::new(
+                    169, 254, 1, 1,
+                ))),
+                "link-local resolved address 169.254.1.1 is denied",
+            ),
+            (
+                DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
+                "instance-metadata address 169.254.169.254 is not available to this provider",
+            ),
+        ];
+
+        for (reason, expected_reason) in cases {
+            let rendered = EgressDenied::new(
+                Arc::clone(&label),
+                Some(ProviderKind::Aws),
+                "service.amazonaws.com".to_string(),
+                reason,
+            )
+            .to_string();
+            assert!(
+                rendered.contains("provider 'aws' (carina-rs/aws)")
+                    && rendered.contains("service.amazonaws.com")
+                    && rendered.contains(expected_reason)
+                    && rendered.contains("was denied:"),
+                "unexpected generic denial: {rendered}"
+            );
+            assert!(!rendered.contains('\n'));
+        }
+
+        let validation_instance = EgressDenied::new(
+            remote_provider_label("awscc", "carina-rs/awscc"),
+            None,
+            "example.invalid".to_string(),
+            DestinationDenied::HostNotAllowed,
+        )
+        .to_string();
+        assert_eq!(
+            validation_instance,
+            "provider 'awscc' (carina-rs/awscc) request to example.invalid was denied: host is not \
+             in the allow-list"
+        );
     }
 
     #[tokio::test]
@@ -7986,6 +8384,7 @@ mod tests {
             "http://[fd00:ec2::254]:0/latest/meta-data/",
         ] {
             let mut hooks = AllowListHttpHooks::with_resolver(
+                local_provider_label("aws"),
                 Some(ProviderKind::Aws),
                 Arc::new(CountingResolver {
                     calls: Arc::clone(&calls),
@@ -8114,10 +8513,11 @@ mod tests {
     }
 
     #[test]
-    fn denied_and_invalid_requests_are_reported_as_pre_send() {
+    fn pre_spawn_policy_denial_traps_but_invalid_uri_remains_an_error_code() {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
         let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
             Some(ProviderKind::Untrusted),
             Arc::new(StubResolver {
                 addresses: HashMap::new(),
@@ -8134,10 +8534,13 @@ mod tests {
             test_outgoing_request_config(false),
         )
         .expect_err("a denied host should fail before spawning a request");
-        assert!(matches!(
-            denied.downcast_ref(),
-            Some(ErrorCode::HttpRequestDenied)
-        ));
+        let trap = denied
+            .downcast()
+            .expect_err("a host-policy denial must trap instead of returning an ErrorCode");
+        let denial = trap
+            .downcast_ref::<EgressDenied>()
+            .expect("the trap must retain the typed egress denial");
+        assert!(matches!(denial.reason, DestinationDenied::HostNotAllowed));
 
         let invalid = hyper::Request::builder()
             .uri("/relative")
@@ -8155,12 +8558,49 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn post_resolution_policy_denial_is_an_outer_trap() {
+        use wasmtime_wasi::p2::Pollable;
+
+        let metadata = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 443);
+        let resolver = StubResolver {
+            addresses: HashMap::from([("service.amazonaws.com".to_string(), vec![metadata])]),
+        };
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
+            Some(ProviderKind::Untrusted),
+            Arc::new(resolver),
+        );
+        let request = hyper::Request::builder()
+            .uri("https://service.amazonaws.com/")
+            .body(empty_outgoing_body())
+            .unwrap();
+
+        let mut response = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            request,
+            test_outgoing_request_config(true),
+        )
+        .expect("the allow-listed hostname should reach the spawned resolver task");
+        response.ready().await;
+        let trap = response
+            .unwrap_ready()
+            .expect_err("post-resolution policy denial must be an outer trap");
+        let denial = trap
+            .downcast_ref::<EgressDenied>()
+            .expect("the task trap must retain the typed egress denial");
+        assert!(matches!(
+            denial.reason,
+            DestinationDenied::MetadataWithheld(address)
+                if address == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        ));
+    }
+
     #[test]
     fn http_test_route_does_not_override_https_policy() {
-        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
-
         let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 4443));
         let mut hooks = AllowListHttpHooks::with_test_route(
+            local_provider_label("mock_http"),
             Some(ProviderKind::Untrusted),
             Some(HttpTestRoute {
                 host: "phase-test.invalid".to_string(),
@@ -8176,10 +8616,10 @@ mod tests {
         let error =
             wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
                 .expect_err("an HTTP-only test route must not bypass HTTPS host policy");
-        assert!(matches!(
-            error.downcast_ref(),
-            Some(ErrorCode::HttpRequestDenied)
-        ));
+        let trap = error
+            .downcast()
+            .expect_err("the HTTPS policy denial must trap instead of returning an ErrorCode");
+        assert!(trap.downcast_ref::<EgressDenied>().is_some());
     }
 
     #[tokio::test]
@@ -8188,6 +8628,7 @@ mod tests {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
         let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
             Some(ProviderKind::Untrusted),
             Arc::new(NeverResolver),
         );
@@ -8222,6 +8663,7 @@ mod tests {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
         let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
             Some(ProviderKind::Untrusted),
             Arc::new(StubResolver {
                 addresses: HashMap::new(),
@@ -8240,6 +8682,37 @@ mod tests {
         let result = response
             .unwrap_ready()
             .expect("a DNS failure should not trap the request task");
+
+        assert!(matches!(result, Err(ErrorCode::DnsError(..))));
+    }
+
+    #[tokio::test]
+    async fn empty_dns_resolution_is_reported_as_the_guest_dns_error() {
+        use wasmtime_wasi::p2::Pollable;
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
+            None,
+            Arc::new(StubResolver {
+                addresses: HashMap::from([("service.amazonaws.com".to_string(), Vec::new())]),
+            }),
+        );
+        let request = hyper::Request::builder()
+            .uri("http://service.amazonaws.com/")
+            .body(empty_outgoing_body())
+            .unwrap();
+
+        let mut response = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            request,
+            test_outgoing_request_config(false),
+        )
+        .expect("an allow-listed hostname should reach resolution");
+        response.ready().await;
+        let result = response
+            .unwrap_ready()
+            .expect("an empty DNS answer must not trap the request task");
 
         assert!(matches!(result, Err(ErrorCode::DnsError(..))));
     }
@@ -8268,8 +8741,11 @@ mod tests {
         let resolver = StubResolver {
             addresses: HashMap::from([("closed.amazonaws.com".to_string(), vec![closed_address])]),
         };
-        let mut hooks =
-            AllowListHttpHooks::with_resolver(Some(ProviderKind::Untrusted), Arc::new(resolver));
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
+            Some(ProviderKind::Untrusted),
+            Arc::new(resolver),
+        );
         let request = hyper::Request::builder()
             .uri(format!(
                 "http://closed.amazonaws.com:{}/",
@@ -8366,7 +8842,6 @@ mod tests {
     #[tokio::test]
     async fn redirect_response_is_surfaced_and_follow_up_is_rechecked() {
         use wasmtime_wasi::p2::Pollable;
-        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .expect("failed to bind loopback test server");
@@ -8408,8 +8883,11 @@ mod tests {
                 vec![server_address],
             )]),
         };
-        let mut hooks =
-            AllowListHttpHooks::with_resolver(Some(ProviderKind::Untrusted), Arc::new(resolver));
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("mock_http"),
+            Some(ProviderKind::Untrusted),
+            Arc::new(resolver),
+        );
         let request = hyper::Request::builder()
             .uri(format!(
                 "http://redirector.amazonaws.com:{}/start",
@@ -8461,6 +8939,7 @@ mod tests {
             None,
         ] {
             let mut hooks = AllowListHttpHooks::with_resolver(
+                local_provider_label("redirect-test"),
                 kind,
                 Arc::new(CountingResolver {
                     calls: Arc::clone(&resolver_calls),
@@ -8477,27 +8956,19 @@ mod tests {
                 between_bytes_timeout: std::time::Duration::from_secs(2),
             };
 
-            match wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config) {
-                Err(error) => assert!(
-                    matches!(error.downcast_ref(), Some(ErrorCode::HttpRequestDenied)),
-                    "follow-up metadata request returned the wrong error for {kind:?}: {error}"
-                ),
-                Ok(mut response) => {
-                    response.ready().await;
-                    match response.unwrap_ready() {
-                        Ok(Err(ErrorCode::HttpRequestDenied)) => {}
-                        Ok(Err(error)) => panic!(
-                            "follow-up metadata request returned the wrong error for {kind:?}: {error:?}"
-                        ),
-                        Ok(Ok(_)) => {
-                            panic!("follow-up metadata request unexpectedly passed for {kind:?}")
-                        }
-                        Err(error) => panic!(
-                            "follow-up metadata request trapped instead of being denied for {kind:?}: {error}"
-                        ),
-                    }
-                }
-            }
+            let error =
+                wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
+                    .expect_err("the follow-up metadata request must trap before resolution");
+            let trap = error
+                .downcast()
+                .expect_err("the follow-up metadata denial must not reach the guest");
+            let denial = trap
+                .downcast_ref::<EgressDenied>()
+                .expect("the trap must retain the typed metadata denial");
+            assert!(
+                matches!(denial.reason, DestinationDenied::MetadataWithheld(_)),
+                "follow-up metadata request returned the wrong denial for {kind:?}: {denial}"
+            );
         }
         assert_eq!(resolver_calls.load(Ordering::Relaxed), 0);
     }
@@ -8528,6 +8999,7 @@ mod tests {
         let engine = Engine::new(&config).unwrap();
         let mut store = GuestStore::new(
             &engine,
+            local_provider_label("epoch-test"),
             None,
             None,
             build_store_limits(),
@@ -8550,6 +9022,7 @@ mod tests {
         // advanced past 1, this deadline is already expired.
         let mut store = GuestStore::new(
             &engine,
+            local_provider_label("epoch-test"),
             None,
             None,
             build_store_limits(),
@@ -8853,6 +9326,7 @@ mod tests {
         let error = match create_runtime_instance(
             &engine,
             &component,
+            local_provider_label("runtime-test"),
             None,
             InstantiationWorld::HttpEnabled,
             GuestCallBudget::PRODUCTION,
@@ -8894,6 +9368,7 @@ mod tests {
         let error = match create_runtime_instance(
             &engine,
             &component,
+            local_provider_label("runtime-test"),
             None,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
@@ -9073,6 +9548,7 @@ mod tests {
         let engine = Engine::new(&config).unwrap();
         let mut store = GuestStore::new(
             &engine,
+            local_provider_label("wall-budget-test"),
             None,
             None,
             build_store_limits(),
@@ -9623,6 +10099,7 @@ mod tests {
         let initial = match create_instance_for_world(
             &engine,
             &component,
+            local_provider_label("mock"),
             None,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
@@ -9639,7 +10116,8 @@ mod tests {
             RebuildContext {
                 engine,
                 component,
-                provider_kind: None,
+                label: local_provider_label("mock"),
+                kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
                 http_test_route: None,
@@ -9687,7 +10165,8 @@ mod tests {
             rebuild: RebuildContext {
                 engine,
                 component,
-                provider_kind: None,
+                label: local_provider_label("rebuild-test"),
+                kind: None,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
                 http_test_route: None,
@@ -9765,6 +10244,7 @@ mod tests {
         let engine = Engine::new(&config).expect("test engine should be valid");
         let mut store = GuestStore::new(
             &engine,
+            local_provider_label("wall-budget-test"),
             None,
             None,
             build_store_limits(),

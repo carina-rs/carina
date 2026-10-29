@@ -35,7 +35,9 @@ use crate::install_lock::{
 };
 #[cfg(test)]
 use crate::provider_trust::ProviderTrustClass;
-use crate::provider_trust::{ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust};
+use crate::provider_trust::{
+    ProviderLoadIdentity, ProviderLoadIdentityError, ProviderLoadSource, ProviderTrust,
+};
 use crate::signing;
 use crate::trusted_local::TrustedLocalGrants;
 use crate::user_trust::{load_user_verified_identity, user_trust_record_exists};
@@ -4638,18 +4640,26 @@ impl InstalledProvider {
         grants: &TrustedLocalGrants,
         notice_sink: &mut impl FnMut(&str),
     ) -> Result<ProviderLoadIdentity, ProviderLoadIdentityError> {
-        let (trust, notice) = match &self.artifact {
-            InstalledArtifact::LockFile(artifact) => {
-                (remote_provider_trust(user_dirs, artifact)?, None)
-            }
+        let (trust, notice, source) = match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => (
+                remote_provider_trust(user_dirs, artifact)?,
+                None,
+                ProviderLoadSource::Remote {
+                    source: artifact.source().clone(),
+                },
+            ),
             InstalledArtifact::File {
                 path: _,
                 bytes,
                 source,
                 project_dir,
-            } => local_provider_trust(source, bytes, project_dir, grants, notice_sink),
+            } => {
+                let (trust, notice, path) =
+                    local_provider_trust(source, bytes, project_dir, grants, notice_sink);
+                (trust, notice, ProviderLoadSource::LocalFile { path })
+            }
         };
-        let identity = ProviderLoadIdentity::new(self.provider_name.clone(), trust)?;
+        let identity = ProviderLoadIdentity::new(self.provider_name.clone(), trust, source)?;
         if let Some(notice) = notice {
             notice_sink(&notice);
         }
@@ -4762,12 +4772,12 @@ fn local_provider_trust(
     project_dir: &Path,
     grants: &TrustedLocalGrants,
     notice_sink: &mut impl FnMut(&str),
-) -> (ProviderTrust, Option<String>) {
-    let Ok(canonical_path) = fs::canonicalize(source.path()) else {
-        return (ProviderTrust::untrusted(), None);
-    };
+) -> (ProviderTrust, Option<String>, PathBuf) {
+    let canonical_path = fs::canonicalize(source.path())
+        .or_else(|_canonicalize_error| std::path::absolute(source.path()))
+        .unwrap_or_else(|_absolute_error| PathBuf::from(source.path()));
     let Some(grant) = grants.matching(&canonical_path) else {
-        return (ProviderTrust::untrusted(), None);
+        return (ProviderTrust::untrusted(), None, canonical_path);
     };
     let installed_sha256 = format!("{:x}", Sha256::digest(installed_bytes.as_bytes()));
     let current_sha256 = sha256_file(&canonical_path).ok();
@@ -4777,9 +4787,9 @@ fn local_provider_trust(
             canonical_path.display(),
             ProjectCommand::new("init", project_dir),
         ));
-        return (ProviderTrust::untrusted(), None);
+        return (ProviderTrust::untrusted(), None, canonical_path);
     }
-    (grant.trust(), Some(grant.notice()))
+    (grant.trust(), Some(grant.notice()), canonical_path)
 }
 
 /// Where an installed provider artifact came from. Locked variants cannot
@@ -23176,22 +23186,56 @@ future_protection_field = "retain-me"
     }
 
     #[tokio::test]
-    async fn file_provider_without_grant_is_untrusted() {
+    async fn file_provider_without_grant_is_untrusted_and_has_canonical_local_source() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
+        let canonical_source_path = fs::canonicalize(&source_path).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
         let installed = find_file_provider_source(project.path(), &config).unwrap();
 
-        let class = installed
+        let (class, source) = installed
             .load_with(&user_dirs, &no_local_grants(), |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                Ok::<_, std::convert::Infallible>((
+                    verified.identity().trust().class(),
+                    verified.identity().source().clone(),
+                ))
             })
             .await
             .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert!(matches!(
+            source,
+            crate::ProviderLoadSource::LocalFile { path } if path == canonical_source_path
+        ));
+    }
+
+    #[test]
+    fn missing_relative_local_source_falls_back_to_an_absolute_label_path() {
+        let relative_root = tempfile::tempdir_in(".").unwrap();
+        let missing_source = relative_root.path().join("removed-provider.wasm");
+        let cached_source = relative_root.path().join("cached-provider.wasm");
+        fs::write(&cached_source, b"resolver-owned provider bytes").unwrap();
+        let installed_bytes = ProviderArtifactBytes::read(&cached_source).unwrap();
+        let source = local_file_source(&missing_source);
+        let expected = std::path::absolute(source.path()).unwrap();
+        let mut notices = Vec::new();
+
+        let (trust, notice, label_path) = local_provider_trust(
+            &source,
+            &installed_bytes,
+            relative_root.path(),
+            &no_local_grants(),
+            &mut |line| notices.push(line.to_string()),
+        );
+
+        assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
+        assert!(notice.is_none());
+        assert!(notices.is_empty());
+        assert!(label_path.is_absolute());
+        assert_eq!(label_path, expected);
     }
 
     #[tokio::test]
