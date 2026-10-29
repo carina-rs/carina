@@ -4124,6 +4124,18 @@ removed {
     );
 }
 
+fn detected_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
+    moves
+        .iter()
+        .map(|resolved_move| {
+            (
+                resolved_move.from().identity_str().to_string(),
+                resolved_move.to().identity_str().to_string(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn test_plan_fails_on_two_moves_to_same_target() {
     let desired = Vec::new();
@@ -4183,7 +4195,7 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         "subnet_id".to_string(),
         Value::Concrete(ConcreteValue::String("subnet-current".into())),
     );
-    let mut desired = vec![resource];
+    let desired = vec![resource];
     let mut state = StateFile::new();
     state
         .upsert_resource(association_state(
@@ -4204,15 +4216,16 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", desired_name),
     }];
     let resolution = resolve_state_blocks(&blocks, &state_file, &desired, ctx.schemas());
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut desired,
+        &desired,
         &[],
-        &mut state,
+        &state_view,
         &resolution.claims,
-    )
-    .expect("test state identities must remain unique");
+    );
 
+    assert!(moves.is_empty());
     assert_eq!(desired[0].id.identity_str(), Some(desired_name));
 
     assert_collision_contains(
@@ -4489,7 +4502,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
     state_file
         .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
         .expect("test state setup must be valid");
-    let mut resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
+    let resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
     let state_blocks = vec![StateBlock::Removed {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", old_name),
     }];
@@ -4513,9 +4526,11 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         "effective removed block must claim its state entry"
     );
 
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
 
+    assert!(moves.is_empty());
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
         desired_name,
@@ -4530,13 +4545,94 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
 }
 
 #[test]
-fn claimed_state_entry_survives_orphan_reconcile_for_destroy_and_refresh() {
-    // Both command shapes reach the same
-    // `reconcile_anonymous_identifiers_with_ctx` exclusion seam:
-    // destroy sends the claimed entry through the orphan-delete path under
-    // its old name, while state refresh refreshes it in place under that
-    // old name.
+fn claimed_state_entry_is_excluded_from_automatic_move_detection() {
     assert_claimed_association_stays_orphaned_after_reconcile();
+}
+
+#[test]
+fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses() {
+    use carina_core::parser::InferredFile;
+    use carina_core::schema::ValidatedResourceSchema;
+    use carina_state::state::StateFile;
+
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let fresh_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let desired = || {
+        Resource::with_provider(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            test_identity(fresh_name),
+            None,
+        )
+        .with_attribute(
+            "route_table_id",
+            Value::Concrete(ConcreteValue::String("rtb-private".into())),
+        )
+        .with_attribute(
+            "subnet_id",
+            Value::Concrete(ConcreteValue::String("subnet-a".into())),
+        )
+    };
+    let state = || {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
+            .expect("test state setup must be valid");
+        Some(state)
+    };
+    let config = || {
+        ValidatedConfig::from_factories_with_additional_schemas_for_test(
+            InferredFile {
+                resources: vec![desired()],
+                ..Default::default()
+            },
+            vec![Box::new(AssociationCreateOnlyFactory)],
+            &[],
+            Vec::<(String, ValidatedResourceSchema)>::new(),
+        )
+    };
+
+    let mut destroy_config = config();
+    let mut destroy_state = state();
+    destroy_config
+        .reconcile_for_destroy(&mut destroy_state)
+        .expect("destroy identity preparation must succeed");
+    assert!(
+        destroy_state
+            .as_ref()
+            .and_then(|state| {
+                state.find_resource("awscc", "ec2.SubnetRouteTableAssociation", old_name)
+            })
+            .is_some(),
+        "destroy must leave the persisted row at its old address for orphan deletion"
+    );
+    assert_eq!(
+        destroy_config.evaluated_resources_for_test().resources[0]
+            .id
+            .identity_str(),
+        Some(fresh_name)
+    );
+
+    let mut refresh_config = config();
+    let mut refresh_state = state();
+    refresh_config
+        .reconcile_for_state_refresh(&mut refresh_state)
+        .expect("state refresh identity preparation must succeed");
+    assert!(
+        refresh_state
+            .as_ref()
+            .and_then(|state| {
+                state.find_resource("awscc", "ec2.SubnetRouteTableAssociation", old_name)
+            })
+            .is_some(),
+        "state refresh must keep the persisted row at its old address"
+    );
+    assert_eq!(
+        refresh_config.evaluated_resources_for_test().resources[0]
+            .id
+            .identity_str(),
+        Some(fresh_name)
+    );
 }
 
 #[test]
@@ -4573,7 +4669,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         ))
         .expect("test state setup must be valid");
 
-    let mut resources = vec![
+    let resources = vec![
         desired_association(
             "ec2_subnet_route_table_association_aaaaaaaa",
             "private_rtb",
@@ -4591,14 +4687,14 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         ),
     ];
 
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut resources,
+        &resources,
         &[],
-        &mut state_file,
+        &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
-    )
-    .expect("test state identities must remain unique");
+    );
 
     let names: Vec<_> = resources
         .iter()
@@ -4607,11 +4703,29 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
     assert_eq!(
         names,
         vec![
-            "ec2_subnet_route_table_association_11111111",
-            "ec2_subnet_route_table_association_22222222",
-            "ec2_subnet_route_table_association_33333333",
+            "ec2_subnet_route_table_association_aaaaaaaa",
+            "ec2_subnet_route_table_association_bbbbbbbb",
+            "ec2_subnet_route_table_association_cccccccc",
         ],
-        "desired anonymous associations must adopt state names by resolved create-only values",
+        "desired anonymous associations must retain their freshly computed identities",
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![
+            (
+                "ec2_subnet_route_table_association_11111111".to_string(),
+                "ec2_subnet_route_table_association_aaaaaaaa".to_string(),
+            ),
+            (
+                "ec2_subnet_route_table_association_22222222".to_string(),
+                "ec2_subnet_route_table_association_bbbbbbbb".to_string(),
+            ),
+            (
+                "ec2_subnet_route_table_association_33333333".to_string(),
+                "ec2_subnet_route_table_association_cccccccc".to_string(),
+            ),
+        ],
+        "resolved create-only values must produce state-row moves",
     );
 }
 
@@ -4650,7 +4764,7 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
         .upsert_resource(prior)
         .expect("test state setup must be valid");
 
-    let mut managed = vec![
+    let managed = vec![
         Resource::with_provider(
             "aws",
             "s3.Bucket",
@@ -4665,15 +4779,16 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
             .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
     ];
 
-    reconcile_anonymous_identifiers_with_ctx(
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut managed,
+        &managed,
         &data_sources,
-        &mut state_file,
+        &state_view,
         &StateBlockClaims::empty(),
-    )
-    .expect("test state identities must remain unique");
+    );
 
+    assert!(moves.is_empty());
     assert_ne!(
         managed[0].id, data_sources[0].id,
         "anonymous managed resource must not adopt a data-source binding's ResourceId",
@@ -4697,7 +4812,7 @@ fn test_stale_moved_block_releases_claims() {
         ))
         .expect("test state setup must be valid");
 
-    let mut resources = vec![desired_association(
+    let resources = vec![desired_association(
         "ec2_subnet_route_table_association_aaaaaaaa",
         "private_rtb",
         "subnet-a",
@@ -4721,13 +4836,22 @@ fn test_stale_moved_block_releases_claims() {
         !claims.claims_to(&resources[0].id),
         "ineffective moved block must not pin its to address"
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        "ec2_subnet_route_table_association_11111111",
-        "stale moved block must release claims so meaning-based matching can preserve the no-op"
+        "ec2_subnet_route_table_association_aaaaaaaa",
+        "reconciliation must not rewrite the desired identity"
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![(
+            "ec2_subnet_route_table_association_11111111".to_string(),
+            "ec2_subnet_route_table_association_aaaaaaaa".to_string(),
+        )],
+        "stale moved block must release claims so meaning-based matching can move the row"
     );
 }
 
@@ -4784,8 +4908,10 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &resources,
         ctx.schemas(),
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &[], &mut state_file, &claims)
-        .expect("test state identities must remain unique");
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &resources, &[], &state_view, &claims);
+    assert!(moves.is_empty());
     assert_eq!(
         resources
             .iter()
@@ -6117,11 +6243,19 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
     )
     .expect("schema-less test resource has no references to resolve");
     let claims = StateBlockClaims::empty();
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
         LateAnonymousIdentityInputs {
             resources: &mut resources,
+            addressed: &mut addressed,
             data_sources: &[],
             state_file: None,
             state_block_claims: &claims,
@@ -6145,6 +6279,125 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             .iter()
             .all(|resource| resource.id.identity_str().is_none()),
         "the error path must leave every anonymous identity pending",
+    );
+}
+
+#[test]
+fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let desired = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity("fresh_late_identity"),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![desired], ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("late-reconciliation fixture has no unresolved live references");
+
+    let early_source_name = "ec2_subnet_route_table_association_11111111";
+    let other_orphan_name = "ec2_subnet_route_table_association_22222222";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(association_state(
+            early_source_name,
+            "rtb-private",
+            "subnet-a",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            other_orphan_name,
+            "rtb-private",
+            "subnet-b",
+        ))
+        .expect("test state setup must be valid");
+
+    let desired_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let early_source_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(early_source_name),
+        None,
+    );
+    let other_orphan_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(other_orphan_name),
+        None,
+    );
+    let desired_ids = HashSet::from([desired_id.as_inner().clone()]);
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let early_moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        resources.resources(),
+        &[],
+        &state_view,
+        &claims,
+    );
+    assert_eq!(
+        detected_move_identity_pairs(&early_moves),
+        vec![(
+            early_source_name.to_string(),
+            desired_id.identity_str().to_string(),
+        )],
+        "the unique full match must win over the partial-match orphan",
+    );
+    apply_detected_resource_moves(&mut addressed, early_moves)
+        .expect("early move must re-key its orphan state");
+    let early_pair = (early_source_id, desired_id.clone());
+    assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
+    assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: Some(&state_file),
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    )
+    .expect("late anonymous identity must resolve");
+
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![early_pair],
+        "the projected early destination must make late reconciliation a no-op"
+    );
+    assert!(
+        addressed.orphans.contains_key(other_orphan_id.as_inner()),
+        "the other matching row must remain an orphan and therefore a Delete candidate",
     );
 }
 
@@ -6183,7 +6436,7 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
 }
 
 #[test]
-fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums() {
+fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums() {
     use carina_state::state::{ResourceState, StateFile};
 
     let ctx = region_identity_ctx();
@@ -6215,27 +6468,27 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
                 .expect("fixture identifier is non-empty"),
         )
         .expect("test state setup must be valid");
-    let mut current_states = HashMap::new();
     let desired_ids = HashSet::from([named.id.clone()]);
-    let mut orphans = state_file.build_orphans(&desired_ids).into_plan_orphans();
-    let mut prev_explicit = HashMap::new();
-    let mut saved_attrs = crate::empty_lifted_saved_attrs();
-
-    let renames = apply_anonymous_to_named_renames(
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        prev_explicit: HashMap::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        moved_pairs: Vec::new(),
+    };
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
         &resources,
         &providers_aws,
-        &mut current_states,
-        &mut orphans,
-        &mut prev_explicit,
-        &mut saved_attrs,
-        &Some(state_file),
+        &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
     )
     .unwrap();
+    apply_detected_resource_moves(&mut addressed, moves).unwrap();
 
     assert_eq!(
-        renames,
+        addressed.moved_pairs,
         vec![(
             ResolvedResourceId::with_provider_identity(
                 "awscc",
@@ -6247,8 +6500,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         )],
         "provider config region spelling must canonicalize before rename simhash"
     );
-    assert!(orphans.is_empty());
-    let current = current_states.get(&named.id).expect("renamed state");
+    assert!(addressed.orphans.is_empty());
+    let current = addressed
+        .managed_current
+        .get(&named.id)
+        .expect("renamed state");
     let state = match current {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),

@@ -637,6 +637,37 @@ fn snapshot_replace_create_only() {
 }
 
 #[test]
+fn snapshot_anonymous_create_only_rekey() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("anonymous_create_only_rekey");
+    assert_eq!(
+        plan.summary().replace,
+        1,
+        "partial create-only match must remain a Replace"
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Move { .. })),
+        "anonymous state re-key must emit a Move"
+    );
+    assert_eq!(moved_origins.len(), 1);
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert!(output.contains("(moved from: test_test_widget_11111111)"));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_replace_with_non_forcing_diffs() {
     let (plan, schemas, _moved) = build_plan_from_fixture("replace_with_non_forcing_diffs");
     let output = strip_ansi(&format_plan(

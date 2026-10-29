@@ -26,10 +26,9 @@ use carina_state::{PublishedExports, StateFile, check_and_migrate};
 use crate::commands::plan::compute_export_diffs;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LateAnonymousIdentityInputs, LoadedProviderFactory, OverrideAwareBuildMode,
-    OverrideAwareResources, PlanPreparationError, PlanPreprocessor, ProviderLoad,
-    RebuildBindingsInputs, ValidatedConfig, add_deferred_create_effects,
-    reconcile_late_anonymous_identities,
+    LoadedProviderFactory, OverrideAwareBuildMode, OverrideAwareResources, PlanPreparationError,
+    PlanPreprocessor, ProviderLoad, RebuildBindingsInputs, ValidatedConfig,
+    add_deferred_create_effects,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -559,18 +558,6 @@ where
             expansion_trace: parsed.expansion_trace.clone(),
         };
     }
-    let resolved_desired_ids = reconcile_late_anonymous_identities(
-        wiring,
-        LateAnonymousIdentityInputs {
-            resources: &mut override_aware_resources,
-            data_sources: &data_sources_for_plan,
-            state_file: state_file.as_ref(),
-            state_block_claims: &state_block_claims,
-            providers: raw_provider_configs,
-        },
-    )
-    .expect("fixture late anonymous identities must resolve uniquely");
-
     let managed_bindings: HashSet<String> = expansion_prelude
         .sorted_resources()
         .iter()
@@ -587,7 +574,7 @@ where
         })
         .cloned()
         .collect::<Vec<_>>();
-    let reconciled_expansion = expansion_prelude
+    let mut reconciled_expansion = expansion_prelude
         .reconcile_addresses(
             crate::wiring::ReconcileDeferredForExpansionInputs {
                 ctx: wiring,
@@ -601,6 +588,16 @@ where
             crate::wiring::DeferredForWarningPolicy::Print,
         )
         .expect("fixture move routes must match their loaded current states");
+    let resolved_desired_ids = reconciled_expansion
+        .reconcile_late_anonymous_identities(
+            wiring,
+            &mut override_aware_resources,
+            &data_sources_for_plan,
+            state_file.as_ref(),
+            &state_block_claims,
+            raw_provider_configs,
+        )
+        .expect("fixture late anonymous identities must resolve uniquely");
     crate::wiring::validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
         reconciled_expansion.moved_pairs(),
@@ -650,14 +647,17 @@ where
         )
         .expect("fixture deferred-for expansion failed");
     let crate::wiring::PreparedDeferredForExpansionParts {
-        mut managed_current,
+        addressed,
         data_source_values,
+        wait_aliases: _,
+    } = prepared_expansion.into_parts();
+    let crate::wiring::AddressedStateParts {
+        mut managed_current,
         orphans,
         saved_attrs,
         prev_explicit,
-        wait_aliases: _,
         moved_pairs,
-    } = prepared_expansion.into_parts();
+    } = addressed.into_parts();
     let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
     let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
@@ -780,7 +780,9 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
             Some("plan_image_module_cascade" | "plan_image_reference_layout") => {
                 vec![Box::new(PlanImageFixtureFactory)]
             }
-            Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
+            Some("anonymous_create_only_rekey")
+            | Some("replace_create_only")
+            | Some("replace_with_non_forcing_diffs") => {
                 vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
             }
             Some("route53_hosted_zone_name_strip_suffix_no_diff") => {

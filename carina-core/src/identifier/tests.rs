@@ -72,11 +72,11 @@ fn unavailable_identifier_material_matches_function_call_and_ignores_diagnostics
 }
 
 fn reconcile_anonymous_identifiers(
-    resources: &mut [Resource],
+    resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Vec<(String, String)> {
+) -> Vec<ResolvedMove> {
     let claims = StateBlockClaims::empty();
     let find_screened_state_by_type = |provider: &str, resource_type: &str| {
         claims.screen_entries(
@@ -94,6 +94,18 @@ fn reconcile_anonymous_identifiers(
         find_state_by_binding,
         &claims,
     )
+}
+
+fn resolved_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
+    moves
+        .iter()
+        .map(|resolved_move| {
+            (
+                resolved_move.from().identity_str().to_string(),
+                resolved_move.to().identity_str().to_string(),
+            )
+        })
+        .collect()
 }
 
 fn detect_anonymous_to_named_renames_for_test(
@@ -1003,8 +1015,13 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut desired_resources,
+    let fresh_name = desired_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let moves = reconcile_anonymous_identifiers(
+        &desired_resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1015,7 +1032,11 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
             .id
             .identity_str()
             .expect("resolved identity"),
-        state_name
+        fresh_name
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name, fresh_name)]
     );
 }
 
@@ -1113,8 +1134,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut desired_resources,
+    let fresh_name = desired_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let moves = reconcile_anonymous_identifiers(
+        &desired_resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1125,7 +1151,11 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
             .id
             .identity_str()
             .expect("resolved identity"),
-        state_name
+        fresh_name
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name, fresh_name)]
     );
 }
 
@@ -1223,8 +1253,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut desired_resources,
+    let fresh_name = desired_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let moves = reconcile_anonymous_identifiers(
+        &desired_resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1235,7 +1270,11 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
             .id
             .identity_str()
             .expect("resolved identity"),
-        state_name
+        fresh_name
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name, fresh_name)]
     );
 }
 
@@ -1281,7 +1320,7 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     let create_only_values: HashMap<String, String> = vec![
         (
@@ -1303,7 +1342,7 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
         },
     ];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1355,9 +1394,14 @@ fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribu
         .into_iter()
         .collect(),
     }];
-    let mut resources = vec![resource];
-    reconcile_anonymous_identifiers(
-        &mut resources,
+    let resources = vec![resource];
+    let fresh_name = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1365,7 +1409,11 @@ fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribu
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        state_name
+        fresh_name
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name, fresh_name)]
     );
 }
 
@@ -1557,7 +1605,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
 #[test]
 fn test_reconcile_anonymous_id_partial_create_only_match() {
     // When one create-only property changes but another stays the same,
-    // reconciliation should restore the state's identifier.
+    // reconciliation should move the state row to the fresh identifier.
     let schema = ResourceSchema::new("iam.role")
         .attribute(
             AttributeSchema::optional("role_name", AttributeType::string())
@@ -1637,18 +1685,124 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources2,
+    let moves = reconcile_anonymous_identifiers(
+        &resources2,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
-    // After reconciliation, step2 resource should have step1's identifier
+    // Reconciliation preserves the freshly computed identity and migrates state to it.
     assert_eq!(
         resources2[0].id.identity_str().expect("resolved identity"),
-        step1_id
+        step2_id
     );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(step1_id, step2_id)]
+    );
+}
+
+#[test]
+fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids() {
+    let schema = ResourceSchema::new("iam.role")
+        .attribute(
+            AttributeSchema::optional("role_name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("path", AttributeType::string())
+                .create_only()
+                .build(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let resource = |identity: &str, role_name: &str, path: &str, instance: Option<&str>| {
+        let mut resource = Resource::with_provider(
+            "awscc",
+            "iam.role",
+            ResourceIdentity::new(identity.to_string()),
+            instance.map(str::to_string),
+        );
+        resource.set_attr(
+            "role_name".to_string(),
+            Value::Concrete(ConcreteValue::String(role_name.into())),
+        );
+        resource.set_attr(
+            "path".to_string(),
+            Value::Concrete(ConcreteValue::String(path.into())),
+        );
+        resource
+    };
+
+    let resources = vec![
+        resource("iam_role_aabbccdd", "full-role", "/full/", None),
+        resource(
+            "iam_role_eeff0011",
+            "partial-role",
+            "/partial-new/",
+            Some("west"),
+        ),
+    ];
+    let original_ids: Vec<ResourceId> = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
+    let state_entries = vec![
+        AnonymousIdStateInfo {
+            name: "iam_role_11223344".to_string(),
+            create_only_values: [
+                ("role_name".to_string(), "full-role".to_string()),
+                ("path".to_string(), "/full/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+        AnonymousIdStateInfo {
+            name: "iam_role_55667788".to_string(),
+            create_only_values: [
+                ("role_name".to_string(), "partial-role".to_string()),
+                ("path".to_string(), "/partial-old/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    ];
+
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    );
+
+    assert_eq!(
+        resources
+            .iter()
+            .map(|resource| resource.id.clone())
+            .collect::<Vec<_>>(),
+        original_ids
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![
+            (
+                "iam_role_11223344".to_string(),
+                "iam_role_aabbccdd".to_string(),
+            ),
+            (
+                "iam_role_55667788".to_string(),
+                "iam_role_eeff0011".to_string(),
+            ),
+        ]
+    );
+    assert_eq!(moves[1].from().provider_instance(), Some("west"));
+    assert_eq!(moves[1].to().provider_instance(), Some("west"));
 }
 
 #[test]
@@ -1686,7 +1840,7 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     // State has completely different values
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1699,7 +1853,7 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
         .collect(),
     }];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1713,7 +1867,7 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
 }
 
 #[test]
-fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
+fn test_reconcile_anonymous_id_unique_full_match_emits_move() {
     // A unique full match covers no-edit upgrades where the anonymous hash input
     // changed across Carina versions but all create-only values are unchanged.
     let schema = ResourceSchema::new("iam.role")
@@ -1743,7 +1897,7 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
         Value::Concrete(ConcreteValue::String("/".into())),
     );
 
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     // State has the same values but a different ID from a previous hash scheme.
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1755,8 +1909,8 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -1764,7 +1918,14 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        "iam_role_11223344"
+        "iam_role_aabbccdd"
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(
+            "iam_role_11223344".to_string(),
+            "iam_role_aabbccdd".to_string()
+        )]
     );
 }
 
@@ -1794,7 +1955,7 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
         name: "ec2_vpc_11223344".to_string(),
@@ -1803,7 +1964,7 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
             .collect(),
     }];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -2150,26 +2311,49 @@ fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
         old_state_name
     );
 
+    let original_names: Vec<String> = resources
+        .iter()
+        .map(|resource| {
+            resource
+                .id
+                .identity_str()
+                .expect("resolved identity")
+                .to_string()
+        })
+        .collect();
     let state_entries = vec![route53_state_entry(old_state_name)];
-    reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
-    let names: HashSet<&str> = resources
+    let names: Vec<String> = resources
         .iter()
-        .map(|r| r.id.identity_str().expect("resolved identity"))
+        .map(|resource| {
+            resource
+                .id
+                .identity_str()
+                .expect("resolved identity")
+                .to_string()
+        })
         .collect();
-    assert_eq!(names.len(), 2, "reconcile must not duplicate ResourceIds");
     assert_eq!(
-        resources
-            .iter()
-            .filter(|r| r.id.identity_str().expect("resolved identity") == old_state_name)
-            .count(),
+        names, original_names,
+        "reconcile must not change ResourceIds"
+    );
+    assert_eq!(
+        moves.len(),
         1,
-        "only one resource may claim the migrated state entry"
+        "only one resource may claim the state entry"
+    );
+    assert_eq!(moves[0].from().identity_str(), old_state_name);
+    assert!(
+        original_names
+            .iter()
+            .any(|name| name == moves[0].to().identity_str()),
+        "the claimed state entry must move to one of the desired identities"
     );
 }
 
@@ -2205,7 +2389,7 @@ fn test_reconcile_anonymous_id_full_match_does_not_steal_live_entry() {
     let state_entries = vec![route53_state_entry(&live_a_name)];
 
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -2424,7 +2608,7 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
         "awscc_ec2_subnet_route_table_association_bbbbbbbb",
         "awscc_ec2_subnet_route_table_association_cccccccc",
     ];
-    let mut resources = vec![
+    let resources = vec![
         subnet_route_table_association_resource(original_names[0], "private_rtb", "private_subnet"),
         subnet_route_table_association_resource(original_names[1], "db_rtb", "db_subnet"),
         subnet_route_table_association_resource(original_names[2], "public_rtb", "public_subnet"),
@@ -2445,16 +2629,16 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
         },
     ];
 
-    let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
     assert!(
-        renames.is_empty(),
-        "8-hex standard hashes must never be used for SimHash Hamming renames"
+        moves.is_empty(),
+        "8-hex standard hashes must never be used for SimHash Hamming moves"
     );
     assert_eq!(
         resources
@@ -2485,7 +2669,7 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
         "awscc_ec2_subnet_route_table_association_22222222",
         "awscc_ec2_subnet_route_table_association_33333333",
     ];
-    let mut resources = vec![
+    let resources = vec![
         subnet_route_table_association_resource(desired_names[0], "private_rtb", "private_subnet"),
         subnet_route_table_association_resource(desired_names[1], "db_rtb", "db_subnet"),
         subnet_route_table_association_resource(desired_names[2], "public_rtb", "public_subnet"),
@@ -2508,8 +2692,8 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
         binding_state_entry("public_subnet", "public_subnet", &[("id", "subnet-public")]),
     ];
 
-    let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2521,13 +2705,20 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
         },
     );
 
-    assert!(renames.is_empty());
     assert_eq!(
         resources
             .iter()
             .map(|resource| resource.id.identity_str().expect("resolved identity"))
             .collect::<Vec<_>>(),
+        desired_names
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
         state_names
+            .into_iter()
+            .zip(desired_names)
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2540,7 +2731,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
             .validate()
             .expect("simhash EIP schema must be valid"),
     );
-    let mut simhash_resources = vec![Resource::with_provider(
+    let simhash_resources = vec![Resource::with_provider(
         "awscc",
         "ec2.eip",
         "awscc_ec2_eip_0000000000000002",
@@ -2562,7 +2753,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     );
 
     let simhash_renames = super::reconcile_anonymous_identifiers(
-        &mut simhash_resources,
+        &simhash_resources,
         &[],
         &simhash_schemas,
         &|provider, resource_type| {
@@ -2585,7 +2776,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
             .validate()
             .expect("route schema must be valid"),
     );
-    let mut create_only_resources = vec![route_with_deferred_route_table(
+    let create_only_resources = vec![route_with_deferred_route_table(
         "awscc_ec2_route_aaaaaaaa",
         "private_rtb",
     )];
@@ -2607,7 +2798,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     );
 
     let create_only_renames = super::reconcile_anonymous_identifiers(
-        &mut create_only_resources,
+        &create_only_resources,
         &[],
         &create_only_schemas,
         &|provider, resource_type| {
@@ -2648,7 +2839,7 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
             .expect("schema fixture must be valid"),
     );
     let desired_name = "awscc_ec2_route_aaaaaaaa";
-    let mut resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
+    let resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
     let state_entries = vec![route_state_entry("awscc_ec2_route_11111111", "rtb-private")];
     let binding_entries = [binding_state_entry(
         "private_rtb",
@@ -2663,7 +2854,7 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     );
 
     super::reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &[],
         &schemas,
         &|provider, resource_type| {
@@ -2699,7 +2890,7 @@ fn test_reconcile_deferred_create_only_ambiguous_refuses() {
     );
 
     let original_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
-    let mut resources = vec![subnet_route_table_association_resource(
+    let resources = vec![subnet_route_table_association_resource(
         original_name,
         "private_rtb",
         "private_subnet",
@@ -2725,8 +2916,8 @@ fn test_reconcile_deferred_create_only_ambiguous_refuses() {
         ),
     ];
 
-    let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2738,7 +2929,7 @@ fn test_reconcile_deferred_create_only_ambiguous_refuses() {
         },
     );
 
-    assert!(renames.is_empty());
+    assert!(moves.is_empty());
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
         original_name
@@ -2763,7 +2954,7 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
             path: crate::resource::AccessPath::new("private_rtb", "id"),
         }),
     );
-    let mut resources = vec![resource];
+    let resources = vec![resource];
     let state_entries = vec![association_state_entry(
         "awscc_ec2_route_11111111",
         "rtb-private",
@@ -2775,7 +2966,7 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
     ];
 
     let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2806,7 +2997,7 @@ fn test_reconcile_module_argument_passed_root_binding_resolves() {
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
-    let mut resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
+    let resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
     let state_entries = vec![route_state_entry(state_name, "rtb-private")];
     let binding_entries = [binding_state_entry(
         "private_rtb",
@@ -2814,8 +3005,8 @@ fn test_reconcile_module_argument_passed_root_binding_resolves() {
         &[("id", "rtb-private")],
     )];
 
-    let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2827,10 +3018,13 @@ fn test_reconcile_module_argument_passed_root_binding_resolves() {
         },
     );
 
-    assert!(renames.is_empty());
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name.to_string(), desired_name.to_string())]
+    );
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        state_name
+        desired_name
     );
 }
 
@@ -2846,7 +3040,7 @@ fn test_reconcile_module_intra_module_binding_resolves() {
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
-    let mut resources = vec![route_with_deferred_route_table(desired_name, "inst.x")];
+    let resources = vec![route_with_deferred_route_table(desired_name, "inst.x")];
     let state_entries = vec![route_state_entry(state_name, "rtb-private")];
     let binding_entries = [binding_state_entry(
         "inst.x",
@@ -2854,8 +3048,8 @@ fn test_reconcile_module_intra_module_binding_resolves() {
         &[("id", "rtb-private")],
     )];
 
-    let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2867,10 +3061,13 @@ fn test_reconcile_module_intra_module_binding_resolves() {
         },
     );
 
-    assert!(renames.is_empty());
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(state_name.to_string(), desired_name.to_string())]
+    );
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        state_name
+        desired_name
     );
 }
 
@@ -2886,7 +3083,7 @@ fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
 
     let desired_name = "inst.awscc_ec2_route_aaaaaaaa";
     let state_name = "inst.awscc_ec2_route_11111111";
-    let mut resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
+    let resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
     let state_entries = vec![route_state_entry(state_name, "rtb-private")];
     let binding_entries = [binding_state_entry(
         "private_rtb",
@@ -2895,7 +3092,7 @@ fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
     )];
 
     let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|binding| {
@@ -2924,7 +3121,7 @@ fn test_reconcile_simhash_tie_refused() {
         schema.validate().expect("schema fixture must be valid"),
     );
     let original_name = "awscc_ec2_eip_0000000000000000";
-    let mut resources = vec![Resource::with_provider(
+    let resources = vec![Resource::with_provider(
         "awscc",
         "ec2.eip",
         original_name,
@@ -2942,7 +3139,7 @@ fn test_reconcile_simhash_tie_refused() {
     ];
 
     let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3133,14 +3330,14 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         create_only_values: HashMap::new(),
     }];
     let renames = reconcile_anonymous_identifiers(
-        &mut resources2,
+        &resources2,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
     // After reconciliation: the resource keeps its freshly-computed
-    // (new) identifier and a rename pair is emitted so the wiring
+    // (new) identifier and a move is emitted so the wiring
     // layer can re-key the state entry. Previous behavior (overwriting
     // resource.id with the state's old name) was changed when the
     // provider prefix was introduced — the rename path is now the
@@ -3149,7 +3346,10 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         resources2[0].id.identity_str().expect("resolved identity"),
         new_id
     );
-    assert_eq!(renames, vec![(old_id.clone(), new_id.clone())]);
+    assert_eq!(
+        resolved_move_identity_pairs(&renames),
+        vec![(old_id.clone(), new_id.clone())]
+    );
 }
 
 #[test]
@@ -3186,7 +3386,7 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
         create_only_values: HashMap::new(),
     }];
     let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3263,7 +3463,7 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
         create_only_values: HashMap::new(),
     }];
     let renames = reconcile_anonymous_identifiers(
-        &mut nearby_resources,
+        &nearby_resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3274,7 +3474,7 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
         1,
         "only one resource may claim a SimHash-matched state row"
     );
-    assert_eq!(renames[0].0, old_name);
+    assert_eq!(renames[0].from().identity_str(), old_name);
 }
 
 #[test]
@@ -3301,7 +3501,7 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     // State has a very different hash (flipped many bits)
     let state_entries = vec![AnonymousIdStateInfo {
@@ -3309,7 +3509,7 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
         create_only_values: HashMap::new(),
     }];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3388,7 +3588,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         create_only_values: HashMap::new(),
     }];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3637,13 +3837,13 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         .unwrap_or("")
         .to_string();
     let renames = reconcile_anonymous_identifiers(
-        &mut resources_current,
+        &resources_current,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
-    // Resource keeps its freshly-computed identifier; the rename pair (if any)
+    // Resource keeps its freshly-computed identifier; the move (if any)
     // points from the closest state entry to the new identifier so the wiring
     // layer can re-key the legacy state row.
     assert_eq!(
@@ -3662,12 +3862,12 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     let dist_to_distant = current_hash.distance(distant_hash);
 
     if dist_to_orig < SIMHASH_HAMMING_THRESHOLD && dist_to_orig <= dist_to_distant {
-        // Orig is within threshold and at least as close as distant: rename pair
+        // Orig is within threshold and at least as close as distant: the move
         // should reference orig as the source name.
         assert_eq!(
-            renames,
+            resolved_move_identity_pairs(&renames),
             vec![(orig_id.clone(), current_id_before.clone())],
-            "Closest state entry (orig) should drive the rename pair",
+            "Closest state entry (orig) should drive the move",
         );
     }
     if dist_to_orig < dist_to_distant {
@@ -3722,7 +3922,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
         create_only_values: HashMap::new(),
     }];
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -3757,10 +3957,10 @@ fn test_reconcile_no_create_only_empty_state() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| vec![],
         &|_binding| Vec::new(),
@@ -3971,7 +4171,7 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![resource];
+    let resources = vec![resource];
 
     // State with partial match (role_name matches, path differs)
     let state_entries = vec![AnonymousIdStateInfo {
@@ -3984,21 +4184,21 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
         .collect(),
     }];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
+    let moves = reconcile_anonymous_identifiers(
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
-    // Should reconcile via partial create-only match (not Hamming distance)
+    // Should reconcile via a partial create-only move (not Hamming distance).
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
-        "iam_role_11223344"
-    );
-    assert_ne!(
-        resources[0].id.identity_str().expect("resolved identity"),
         original_id
+    );
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![("iam_role_11223344".to_string(), original_id)]
     );
 }
 
@@ -4146,7 +4346,7 @@ fn test_reconcile_skips_let_bound_resources() {
         Value::Concrete(ConcreteValue::String("Allow HTTPS".into())),
     );
 
-    let mut resources = vec![ingress_new];
+    let resources = vec![ingress_new];
 
     // State has an unrelated entry that partially matches (same cidr_ip + ip_protocol,
     // different description). Without the fix, the named resource would be rebound.
@@ -4162,7 +4362,7 @@ fn test_reconcile_skips_let_bound_resources() {
     }];
 
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -4228,7 +4428,7 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
         .identity_str()
         .expect("resolved identity")
         .to_string();
-    let mut resources = vec![new_rule];
+    let resources = vec![new_rule];
 
     // State has TWO entries that partially match (same cidr_ip + ip_protocol,
     // different description). Both are valid partial matches.
@@ -4256,7 +4456,7 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     ];
 
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -4390,14 +4590,14 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         create_only_values: HashMap::new(), // No create-only values in state either
     }];
     let renames = reconcile_anonymous_identifiers(
-        &mut resources2,
+        &resources2,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
     );
 
     // After reconciliation, step2 keeps its freshly-computed identifier
-    // and emits a rename pair so the wiring layer re-keys the state
+    // and emits a move so the wiring layer re-keys the state
     // entry from step1's name to step2's name. This produces an
     // in-place update on the same state row instead of delete+create.
     assert_eq!(
@@ -4406,9 +4606,9 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         "Resource should retain its freshly-computed identifier"
     );
     assert_eq!(
-        renames,
+        resolved_move_identity_pairs(&renames),
         vec![(step1_id.clone(), step2_id.clone())],
-        "Reconcile should emit rename pair for re-keying the state entry"
+        "Reconcile should emit a move for re-keying the state entry"
     );
 }
 
@@ -4473,7 +4673,7 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
         Value::Concrete(ConcreteValue::String("Allow HTTPS".into())),
     );
 
-    let mut resources = vec![ingress_http, ingress_https];
+    let resources = vec![ingress_http, ingress_https];
 
     // State has both resources with matching names
     let state_entries = vec![
@@ -4500,7 +4700,7 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     ];
 
     reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_provider, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -4665,7 +4865,7 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
             .validate()
             .expect("schema fixture must be valid"),
     );
-    let mut resources = vec![route_with_deferred_route_table(
+    let resources = vec![route_with_deferred_route_table(
         "awscc_ec2_route_aaaaaaaa",
         "private_rtb",
     )];
@@ -4684,7 +4884,7 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     );
 
     super::reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &[],
         &schemas,
         &|provider, resource_type| {
@@ -4734,7 +4934,7 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
         "subnet_id".to_string(),
         Value::Concrete(ConcreteValue::String("subnet-current".into())),
     );
-    let mut resources = vec![resource];
+    let resources = vec![resource];
     let state_entries = vec![
         association_state_entry(desired_name, "rtb-private", "subnet-current"),
         association_state_entry(orphan_name, "rtb-private", "subnet-orphan"),
@@ -4751,7 +4951,7 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
     );
 
     let renames = super::reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &[],
         &schemas,
         &|provider, resource_type| {
@@ -5354,7 +5554,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
 }
 
 #[test]
-fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
+fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
     // Schema with NO create-only attrs forces the SimHash-distance branch.
     let schema = ResourceSchema::new("iam.RolePolicy")
         .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
@@ -5404,7 +5604,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     }];
 
     let renames = reconcile_anonymous_identifiers(
-        &mut resources,
+        &resources,
         &schemas,
         &|_p, _rt| state_entries.clone(),
         &|_binding| Vec::new(),
@@ -5416,8 +5616,8 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
         "resource id should retain the new-format identifier",
     );
     assert_eq!(
-        renames,
+        resolved_move_identity_pairs(&renames),
         vec![(old_name, new_name)],
-        "should emit a rename pair from the old state name to the new identifier",
+        "should emit a move from the old state identity to the new identifier",
     );
 }

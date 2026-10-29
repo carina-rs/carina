@@ -170,33 +170,6 @@ impl<E> CanonicalResourcePair<E> {
         );
     }
 
-    /// Reconcile anonymous resource identities against state without
-    /// releasing the canonical evaluated resource set.
-    pub fn reconcile_anonymous_identifiers(
-        &mut self,
-        registry: &carina_core::schema::SchemaRegistry,
-        find_state_by_type: &dyn Fn(
-            &str,
-            &str,
-        ) -> carina_core::identifier::ScreenedStateEntries<
-            carina_core::identifier::AnonymousIdStateInfo,
-        >,
-        find_state_by_binding: &dyn Fn(
-            &str,
-        )
-            -> Vec<carina_core::identifier::AnonymousIdBindingStateInfo>,
-        claims: &carina_core::identifier::StateBlockClaims,
-    ) -> Vec<(String, String)> {
-        carina_core::identifier::reconcile_anonymous_identifiers(
-            &mut self.parsed.resources,
-            &self.parsed.data_sources,
-            registry,
-            find_state_by_type,
-            find_state_by_binding,
-            claims,
-        )
-    }
-
     /// Partition and materialize this pair's own deferred-for templates as one
     /// atomic update of the owned evaluated file. Generated children and
     /// retained templates both inherit canonical attribute names from the

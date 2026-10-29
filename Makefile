@@ -26,6 +26,8 @@ plan-image-anonymous:
 	$(PLAN_FIXTURE) plan_image_anonymous
 plan-replace-create-only:
 	$(PLAN_FIXTURE) replace_create_only
+plan-anonymous-create-only-rekey:
+	$(PLAN_FIXTURE) anonymous_create_only_rekey
 plan-replace-with-non-forcing-diffs:
 	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:

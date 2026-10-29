@@ -1332,13 +1332,16 @@ pub(crate) async fn run_state_refresh_locked(
     let (ctx, parsed) = validated_config.context_and_resources();
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
-        mut managed_current,
+        addressed,
         mut data_source_values,
+        wait_aliases,
+    } = prepared_expansion.into_parts();
+    let crate::wiring::AddressedStateParts {
+        mut managed_current,
         orphans,
         saved_attrs: saved_attrs_for_expansion,
-        wait_aliases,
         ..
-    } = prepared_expansion.into_parts();
+    } = addressed.into_parts();
     data_source_values = crate::wiring::read_expanded_data_sources_phase2(
         data_source_values,
         crate::wiring::ExpandedDataSourceReadInputs {
@@ -3689,11 +3692,13 @@ mod tests {
             })
             .await
             .expect("refresh expansion should succeed");
-        let crate::wiring::PreparedDeferredForExpansionParts {
+        let crate::wiring::PreparedDeferredForExpansionParts { addressed, .. } =
+            prepared_expansion.into_parts();
+        let crate::wiring::AddressedStateParts {
             managed_current: current_states,
             orphans,
             ..
-        } = prepared_expansion.into_parts();
+        } = addressed.into_parts();
         assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
         assert!(
             !current_states.contains_key(&child.id),

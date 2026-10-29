@@ -17,9 +17,9 @@ use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
 
-/// Addresses claimed by operator-written state blocks. Heuristic rename
-/// passes must not consume a claimed `from` state entry nor synthesize a
-/// rename onto a claimed `to` name — operator intent always wins over
+/// Addresses claimed by operator-written state blocks. Heuristic move
+/// detectors must not consume a claimed `from` state entry nor synthesize a
+/// move onto a claimed `to` name — operator intent always wins over
 /// similarity heuristics.
 ///
 /// `from` claims: `moved.from`, `removed.from`.
@@ -1154,9 +1154,11 @@ fn canonical_or_resolved_create_only_value_string(
 ///
 /// When a create-only property changes on an anonymous resource, the computed
 /// hash-based identifier changes. This function detects such cases by comparing
-/// create-only property values and restores the original identifier from state
-/// when at least one create-only property matches (partial match), allowing the
-/// differ to generate a Replace effect instead of Create+Delete.
+/// create-only property values and returns a resolved move from the old state
+/// row to the resource's freshly computed identifier when at least one
+/// create-only property matches (partial match). The desired resource identity
+/// is immutable at this boundary, so every match preserves the invariant that
+/// an anonymous identity is derived from its current identity inputs.
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns screened
 /// state entries for that resource type with their create-only attribute
@@ -1180,21 +1182,19 @@ fn canonical_or_resolved_create_only_value_string(
 /// `provider_instance`, matching reconciliation candidate lookup and
 /// `StateFile::find_resource`.
 ///
-/// Returns a list of `(old_state_name, new_resource_name)` pairs that the
-/// caller should apply to state-keyed maps. These are emitted when a SimHash
-/// match identifies a state entry under an older identifier format (e.g.
-/// `iam_role_policy_<hash>` from before the provider prefix was added) — the
-/// resource keeps its freshly-computed new-format name and the wiring layer
-/// re-keys the state entry instead of destroy+recreate.
+/// Every matching branch returns a [`ResolvedMove`] from the matched state row
+/// to the resource's resolved current address. This includes SimHash matches
+/// for older identifier formats and unique full or partial create-only
+/// matches. The move carries the desired resource's provider-instance route.
 pub fn reconcile_anonymous_identifiers(
-    resources: &mut [Resource],
+    resources: &[Resource],
     data_sources: &[DataSource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
-) -> Vec<(String, String)> {
-    let mut renames: Vec<(String, String)> = Vec::new();
+) -> Vec<ResolvedMove> {
+    let mut moves = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for id in resources
         .iter()
@@ -1213,10 +1213,11 @@ pub fn reconcile_anonymous_identifiers(
 
     let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
-    for resource in resources.iter_mut() {
-        let Some(resource_identity) = resource.id.identity_str().map(str::to_string) else {
+    for resource in resources {
+        let Some(resolved_resource_id) = ResolvedResourceId::try_new(resource.id.clone()) else {
             continue;
         };
+        let resource_identity = resolved_resource_id.identity_str().to_string();
 
         // Skip let-bound (named) resources entirely. Reconciliation is only
         // meaningful for anonymous hash-derived identifiers. Named resources
@@ -1287,9 +1288,18 @@ pub fn reconcile_anonymous_identifiers(
             {
                 // The state entry may use an older identifier format (e.g.
                 // pre-provider-prefix). Keep our freshly-computed new-format
-                // name on the resource and record a rename so the wiring
+                // name on the resource and record a move so the wiring
                 // layer can re-key the state entry.
-                renames.push((state_name.to_string(), resource_identity.clone()));
+                let from = ResolvedResourceId::with_provider_identity(
+                    resolved_resource_id.provider(),
+                    resolved_resource_id.resource_type(),
+                    ResourceIdentity::new(state_name.to_string()),
+                    resolved_resource_id.provider_instance().map(str::to_string),
+                );
+                moves.push(ResolvedMove::from_detected_rename(
+                    from,
+                    resolved_resource_id.clone(),
+                ));
                 claimed_names
                     .entry(key)
                     .or_default()
@@ -1353,19 +1363,23 @@ pub fn reconcile_anonymous_identifiers(
         };
 
         if let Some(matched_name) = matched_name {
-            resource.id = ResourceId::with_provider_identity(
-                &resource.id.provider,
-                &resource.id.resource_type,
+            let from = ResolvedResourceId::with_provider_identity(
+                resolved_resource_id.provider(),
+                resolved_resource_id.resource_type(),
                 ResourceIdentity::new(matched_name.to_string()),
-                resource.id.provider_instance.clone(),
+                resolved_resource_id.provider_instance().map(str::to_string),
             );
+            moves.push(ResolvedMove::from_detected_rename(
+                from,
+                resolved_resource_id,
+            ));
             claimed_names
                 .entry(key)
                 .or_default()
                 .insert(matched_name.to_string());
         }
     }
-    renames
+    moves
 }
 
 /// Detect let-bound (named) resources that were previously anonymous.
@@ -1376,9 +1390,8 @@ pub fn reconcile_anonymous_identifiers(
 /// detection the differ treats the change as delete + create, which for
 /// destructive resources (e.g., `awscc.sso.Instance`) can wipe out live data.
 ///
-/// Returns a list of `(old_anonymous_name, new_binding_name)` pairs for each
-/// matched rename. Callers should transfer state entries from the old name to
-/// the new name before running the differ (similar to `materialize_moved_states`).
+/// Returns resolved moves from each old anonymous state row to the matched
+/// named resource. The wiring layer applies them before running the differ.
 ///
 /// Matching rules:
 /// 1. Only `let`-bound resources are candidates (those with `binding.is_some()`)

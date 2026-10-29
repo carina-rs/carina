@@ -1893,8 +1893,8 @@ async fn run_apply_locked_owned(
             }
 
             // Refresh orphaned resources (#844, #1685). Must run before the
-            // rename transfer below so old-name entries are present for
-            // `apply_anonymous_to_named_renames` to transfer.
+            // automatic move transfer below so old-address entries are present
+            // for the shared resolved-move path to transfer.
             let mut orphans = Orphans::new();
             // Ids the orphan pass already live-read this run. A for-loop child
             // applied previously is in state but not yet a desired resource at
@@ -1942,8 +1942,8 @@ async fn run_apply_locked_owned(
                 orphans = refreshed_orphans.into_plan_orphans();
             }
 
-            // Hydrate, transfer state for moved blocks and anonymous → let-bound
-            // renames (#1685), then run phase 2 against the consolidated state.
+            // Hydrate, transfer explicit and detected anonymous address moves
+            // (#1685), then run phase 2 against the consolidated state.
             crate::wiring::hydrate_prior_managed_states(
                 &mut managed_current,
                 &mut orphans,
@@ -2023,13 +2023,9 @@ async fn run_apply_locked_owned(
             let (ctx, expanded_canonical_resources) = validated_expansion.context_and_resources();
             let sorted_resources = resorted;
             let crate::wiring::PreparedDeferredForExpansionParts {
-                mut managed_current,
+                mut addressed,
                 mut data_source_values,
-                mut orphans,
-                saved_attrs,
-                prev_explicit,
                 wait_aliases,
-                moved_pairs,
             } = prepared_expansion.into_parts();
             let parsed = expanded_canonical_resources.parsed();
             drop(refresh_phase);
@@ -2060,18 +2056,18 @@ async fn run_apply_locked_owned(
                 parsed.compositions.clone();
 
             let pre_apply_current = carina_core::resource::into_plan_input_current_map(
-                managed_current.clone(),
+                addressed.managed_current().clone(),
                 ctx.schemas(),
                 &sorted_resources,
             );
             let managed_stability = crate::wiring::derive_managed_binding_stability(
                 parsed,
                 &sorted_resources,
-                &managed_current,
+                addressed.managed_current(),
                 &data_source_values,
                 ctx.schemas(),
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
                 remote_bindings,
                 &wait_aliases,
             )?;
@@ -2113,6 +2109,7 @@ async fn run_apply_locked_owned(
                 &pre_resolve_compositions,
             );
             let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
+            let (managed_current, orphans) = addressed.managed_current_and_orphans_mut();
             let preparation = if let Some(errors) = refresh_module_constraint_errors {
                 Err(crate::wiring::PlanPreparationError::Plan(errors))
             } else {
@@ -2121,9 +2118,9 @@ async fn run_apply_locked_owned(
                         &mut override_aware_resources,
                         &constraint_origin_resources,
                         &module_gate,
-                        &mut managed_current,
+                        managed_current,
                         &mut data_source_values,
-                        &mut orphans,
+                        orphans,
                         raw_provider_configs,
                         &mut data_sources_for_plan,
                         &data_sources,
@@ -2148,6 +2145,7 @@ async fn run_apply_locked_owned(
                 ctx,
                 LateAnonymousIdentityInputs {
                     resources: &mut override_aware_resources,
+                    addressed: &mut addressed,
                     data_sources: &data_sources_for_plan,
                     state_file: state_file.as_ref(),
                     state_block_claims: &state_block_claims,
@@ -2156,13 +2154,13 @@ async fn run_apply_locked_owned(
             )?;
             crate::wiring::validate_plan_time_state_block_collisions(
                 &resolved_desired_ids,
-                &moved_pairs,
+                addressed.moved_pairs(),
                 &resolved_state_block_targets,
                 &state_file,
             )?;
             let reconciled_provider_states = provider_states_for(
-                &managed_current,
-                &orphans,
+                addressed.managed_current(),
+                addressed.orphans(),
                 override_aware_resources.resources(),
             );
             let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
@@ -2177,8 +2175,8 @@ async fn run_apply_locked_owned(
                 &stability_resources,
                 &reconciled_input_current,
                 ctx.schemas(),
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
             );
             override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
                 RebuildBindingsInputs {
@@ -2200,7 +2198,7 @@ async fn run_apply_locked_owned(
             let resolved_unresolved_resources =
                 ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
             let plan_input_current = carina_core::resource::into_plan_input_current_map(
-                managed_current.clone(),
+                addressed.managed_current().clone(),
                 ctx.schemas(),
                 override_aware_resources.resources(),
             );
@@ -2214,14 +2212,18 @@ async fn run_apply_locked_owned(
                 &resolved_unresolved_resources,
                 &data_sources_for_plan,
                 &provider,
-                PlanPriorStates::new(&plan_input_current, &orphans),
+                PlanPriorStates::new(&plan_input_current, addressed.orphans()),
                 &directives_map,
                 schemas,
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
                 &wait_bindings,
             )?;
-            crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
+            crate::wiring::add_deposed_delete_effects(
+                &mut plan,
+                &state_file,
+                addressed.moved_pairs(),
+            );
             block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
             override_aware_resources.apply_plan_stability(&plan_input_current, &plan, schemas);
             // Add state block effects (import/removed/moved) only after both
@@ -2244,18 +2246,24 @@ async fn run_apply_locked_owned(
                 &mut plan,
                 &parsed.state_blocks,
                 &state_file,
-                &moved_pairs,
+                addressed.moved_pairs(),
                 override_aware_resources.resources(),
                 override_aware_resources.bindings(),
                 &no_unresolved_upstreams,
             );
             crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
-            managed_current = into_all_prior_states(orphans, managed_current);
-
-            let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+            let moved_origins: HashMap<ResourceId, ResourceId> = addressed
+                .moved_pairs()
                 .iter()
                 .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
                 .collect();
+            let crate::wiring::AddressedStateParts {
+                managed_current,
+                orphans,
+                prev_explicit,
+                ..
+            } = addressed.into_parts();
+            let mut managed_current = into_all_prior_states(orphans, managed_current);
 
             render_plan_errors_and_abort(&plan)?;
             let executable_data_source_values = data_source_values

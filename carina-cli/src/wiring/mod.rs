@@ -138,7 +138,7 @@ use carina_core::schema::{
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
-use carina_state::{BackendError, LoadedOrphans, StateFile};
+use carina_state::{LoadedOrphans, StateFile};
 
 #[cfg(test)]
 use crate::commands::shared::progress::RecordedProgressLines;
@@ -1238,14 +1238,6 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
                 &state_blocks.claims,
             );
         }
-        if let Some(state) = state_file.as_mut() {
-            reconcile_canonical_anonymous_identifiers_with_ctx(
-                ctx,
-                resources,
-                state,
-                &state_blocks.claims,
-            )?;
-        }
         Ok(state_blocks)
     }
 
@@ -1318,15 +1310,6 @@ impl ValidatedConfig<carina_core::parser::InferredFile> {
                 },
                 &state_block_claims,
             );
-        }
-        if let Some(state) = state_file.as_mut() {
-            reconcile_anonymous_identifiers_with_ctx(
-                ctx,
-                &mut resources.resources,
-                &resources.data_sources,
-                state,
-                &state_block_claims,
-            )?;
         }
         crate::commands::shared::state_writeback::apply_name_overrides(
             &mut resources.resources,
@@ -2173,243 +2156,171 @@ fn provider_config_schema_for(
         .map(|factory| factory.provider_config_attribute_types())
 }
 
-/// Detect and apply anonymous → let-bound resource renames.
-///
-/// Mirrors `materialize_moved_states` but for synthetic rename pairs produced
-/// by `identifier::detect_anonymous_to_named_renames`. Transfers state,
-/// `prev_explicit`, and `saved_attrs` from the old anonymous name to the
-/// new binding name so the differ sees the resource under its new identity.
-#[allow(clippy::too_many_arguments)]
-pub fn apply_anonymous_to_named_renames(
-    ctx: &WiringContext,
-    resources: &[Resource],
-    providers: &[ProviderConfig],
-    managed_current: &mut HashMap<ResourceId, Current>,
-    orphans: &mut Orphans,
-    prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    saved_attrs: &mut LiftedSavedAttrs,
-    state_file: &Option<StateFile>,
-    claims: &StateBlockClaims,
-) -> Result<Vec<(ResolvedResourceId, ResolvedResourceId)>, AppError> {
-    let Some(sf) = state_file.as_ref() else {
-        return Ok(Vec::new());
-    };
+/// Persisted rows indexed at their effective addresses after every move that
+/// has already been applied to [`AddressedState`].
+struct AnonymousReconciliationStateView {
+    by_type: HashMap<(String, String), Vec<AnonymousIdStateInfo>>,
+    by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>>,
+}
 
-    let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
-        providers,
-        &|provider_name| provider_config_schema_for(ctx, provider_name),
-    )?;
+impl AnonymousReconciliationStateView {
+    fn new(
+        ctx: &WiringContext,
+        state_file: &StateFile,
+        moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    ) -> Self {
+        let mut by_type = HashMap::<_, Vec<_>>::new();
+        let mut by_binding = HashMap::<_, Vec<_>>::new();
 
-    let renames = identifier::detect_anonymous_to_named_renames(
-        resources,
-        ctx.schemas(),
-        &|provider, resource_type| {
-            let create_only_attrs = ctx
+        for state_resource in state_file.resources() {
+            let projected_target = moved_pairs
+                .iter()
+                .find(|(from, _to)| {
+                    from.provider() == state_resource.provider
+                        && from.resource_type() == state_resource.resource_type
+                        && from.identity() == &state_resource.identity
+                })
+                .map(|(_from, to)| to);
+            let projected_id = projected_target.cloned().unwrap_or_else(|| {
+                resolved_state_row_id(
+                    state_resource,
+                    state_resource.directives.provider_instance.clone(),
+                )
+            });
+            let attribute_values = match state_resource.persisted_attributes() {
+                Some(persisted) => persisted
+                    .to_values()
+                    .into_iter()
+                    .filter_map(|(attribute, value)| {
+                        identifier::canonical_create_only_value_string(&value)
+                            .map(|value| (attribute, value))
+                    })
+                    .collect::<HashMap<_, _>>(),
+                None if projected_target.is_some() => HashMap::new(),
+                None => continue,
+            };
+            let create_only_values = ctx
                 .schemas()
                 .get(
-                    provider,
-                    resource_type,
+                    projected_id.provider(),
+                    projected_id.resource_type(),
                     carina_core::schema::SchemaKind::Resource,
                 )
                 .map(|schema| schema.schema().as_schema().create_only_attributes())
-                .unwrap_or_default();
-            let state_entries = sf
-                .resources_by_type(provider, resource_type)
+                .unwrap_or_default()
                 .into_iter()
-                .filter_map(|sr| {
-                    let persisted = sr.persisted_attributes()?;
-                    let create_only_values = create_only_attrs
-                        .iter()
-                        .filter_map(|attr| {
-                            persisted.get(attr).and_then(|value| {
-                                identifier::canonical_create_only_value_string(&value)
-                                    .map(|s| (attr.to_string(), s))
-                            })
-                        })
-                        .collect();
-                    Some(AnonymousIdStateInfo {
-                        name: sr.identity.to_string(),
-                        create_only_values,
-                    })
-                });
-            claims.screen_entries(provider, resource_type, state_entries, |entry| {
-                entry.name.as_str()
-            })
-        },
-        &canonical_providers,
-        &|name| identity_attributes_for_provider(ctx, name),
-        claims,
-    );
+                .filter_map(|attribute| {
+                    attribute_values
+                        .get(attribute)
+                        .cloned()
+                        .map(|value| (attribute.to_string(), value))
+                })
+                .collect();
+            let projected_name = projected_id.identity_str().to_string();
 
-    for resolved_move in &renames {
-        let from = resolved_move.from();
-        let to = resolved_move.to();
-        let authority = resolved_move.authority();
-        promote_orphan_or_move_current_state(managed_current, orphans, &authority)?;
-        if let Some(keys) = prev_explicit.remove(from.as_inner()) {
-            prev_explicit.insert(to.as_inner().clone(), keys);
+            by_type
+                .entry((
+                    projected_id.provider().to_string(),
+                    projected_id.resource_type().to_string(),
+                ))
+                .or_default()
+                .push(AnonymousIdStateInfo {
+                    name: projected_name.clone(),
+                    create_only_values,
+                });
+            if let Some(binding) = &state_resource.binding {
+                by_binding
+                    .entry(binding.clone())
+                    .or_default()
+                    .push(AnonymousIdBindingStateInfo {
+                        name: projected_name,
+                        attribute_values,
+                    });
+            }
         }
-        saved_attrs.remap_resource_id(from.as_inner(), to.as_inner().clone());
+
+        Self {
+            by_type,
+            by_binding,
+        }
     }
 
-    Ok(renames.into_iter().map(ResolvedMove::into_parts).collect())
+    fn entries_by_type(
+        &self,
+        claims: &StateBlockClaims,
+        provider: &str,
+        resource_type: &str,
+    ) -> identifier::ScreenedStateEntries<AnonymousIdStateInfo> {
+        let entries = self
+            .by_type
+            .get(&(provider.to_string(), resource_type.to_string()))
+            .into_iter()
+            .flatten()
+            .cloned();
+        claims.screen_entries(provider, resource_type, entries, |entry| {
+            entry.name.as_str()
+        })
+    }
+
+    fn entries_by_binding(&self, binding: &str) -> Vec<AnonymousIdBindingStateInfo> {
+        self.by_binding.get(binding).cloned().unwrap_or_default()
+    }
 }
 
-pub fn reconcile_anonymous_identifiers_with_ctx(
-    ctx: &WiringContext,
-    resources: &mut [Resource],
-    data_sources: &[DataSource],
-    state_file: &mut StateFile,
+fn anonymous_id_state_entries(
+    state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Result<(), BackendError> {
-    let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
-        .resources()
-        .iter()
-        .filter_map(|sr| {
-            let binding = sr.binding.as_ref()?;
-            let persisted = sr.persisted_attributes()?;
-            Some((
-                binding.clone(),
-                AnonymousIdBindingStateInfo {
-                    name: sr.identity.to_string(),
-                    attribute_values: persisted
-                        .to_values()
-                        .into_iter()
-                        .filter_map(|(attr, value)| {
-                            identifier::canonical_create_only_value_string(&value)
-                                .map(|s| (attr.clone(), s))
-                        })
-                        .collect(),
-                },
-            ))
-        })
-        .fold(HashMap::new(), |mut acc, (binding, info)| {
-            acc.entry(binding).or_default().push(info);
-            acc
-        });
+    provider: &str,
+    resource_type: &str,
+) -> identifier::ScreenedStateEntries<AnonymousIdStateInfo> {
+    state_view.entries_by_type(claims, provider, resource_type)
+}
 
-    let renames = identifier::reconcile_anonymous_identifiers(
+fn reconcile_anonymous_identifiers_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    data_sources: &[DataSource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+) -> Vec<ResolvedMove> {
+    identifier::reconcile_anonymous_identifiers(
         resources,
         data_sources,
         ctx.schemas(),
         &|provider, resource_type| {
-            let create_only_attrs = ctx
-                .schemas()
-                .get(
-                    provider,
-                    resource_type,
-                    carina_core::schema::SchemaKind::Resource,
-                )
-                .map(|schema| schema.schema().as_schema().create_only_attributes())
-                .unwrap_or_default();
-
-            let state_entries = state_file
-                .resources_by_type(provider, resource_type)
-                .into_iter()
-                .filter_map(|sr| {
-                    let persisted = sr.persisted_attributes()?;
-                    let create_only_values = create_only_attrs
-                        .iter()
-                        .filter_map(|attr| {
-                            persisted.get(attr).and_then(|value| {
-                                identifier::canonical_create_only_value_string(&value)
-                                    .map(|s| (attr.to_string(), s))
-                            })
-                        })
-                        .collect();
-                    Some(AnonymousIdStateInfo {
-                        name: sr.identity.to_string(),
-                        create_only_values,
-                    })
-                });
-            claims.screen_entries(provider, resource_type, state_entries, |entry| {
-                entry.name.as_str()
-            })
+            anonymous_id_state_entries(state_view, claims, provider, resource_type)
         },
-        &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
+        &|binding| state_view.entries_by_binding(binding),
         claims,
-    );
-
-    state_file.rename_resource_identities(&renames)
+    )
 }
 
-pub(crate) fn reconcile_canonical_anonymous_identifiers_with_ctx<E>(
+fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
-    resources: &mut CanonicalResourcePair<E>,
-    state_file: &mut StateFile,
+    resources: &[Resource],
+    providers: &[ProviderConfig],
+    state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Result<(), BackendError> {
-    let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
-        .resources()
-        .iter()
-        .filter_map(|sr| {
-            let binding = sr.binding.as_ref()?;
-            let persisted = sr.persisted_attributes()?;
-            Some((
-                binding.clone(),
-                AnonymousIdBindingStateInfo {
-                    name: sr.identity.to_string(),
-                    attribute_values: persisted
-                        .to_values()
-                        .into_iter()
-                        .filter_map(|(attr, value)| {
-                            identifier::canonical_create_only_value_string(&value)
-                                .map(|s| (attr.clone(), s))
-                        })
-                        .collect(),
-                },
-            ))
-        })
-        .fold(HashMap::new(), |mut acc, (binding, info)| {
-            acc.entry(binding).or_default().push(info);
-            acc
-        });
-
-    let renames = resources.reconcile_anonymous_identifiers(
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
+        providers,
+        &|provider_name| provider_config_schema_for(ctx, provider_name),
+    )?;
+    Ok(identifier::detect_anonymous_to_named_renames(
+        resources,
         ctx.schemas(),
         &|provider, resource_type| {
-            let create_only_attrs = ctx
-                .schemas()
-                .get(
-                    provider,
-                    resource_type,
-                    carina_core::schema::SchemaKind::Resource,
-                )
-                .map(|schema| schema.schema().as_schema().create_only_attributes())
-                .unwrap_or_default();
-
-            let state_entries = state_file
-                .resources_by_type(provider, resource_type)
-                .into_iter()
-                .filter_map(|sr| {
-                    let persisted = sr.persisted_attributes()?;
-                    let create_only_values = create_only_attrs
-                        .iter()
-                        .filter_map(|attr| {
-                            persisted.get(attr).and_then(|value| {
-                                identifier::canonical_create_only_value_string(&value)
-                                    .map(|s| (attr.to_string(), s))
-                            })
-                        })
-                        .collect();
-                    Some(AnonymousIdStateInfo {
-                        name: sr.identity.to_string(),
-                        create_only_values,
-                    })
-                });
-            claims.screen_entries(provider, resource_type, state_entries, |entry| {
-                entry.name.as_str()
-            })
+            anonymous_id_state_entries(state_view, claims, provider, resource_type)
         },
-        &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
+        &canonical_providers,
+        &|name| identity_attributes_for_provider(ctx, name),
         claims,
-    );
-
-    state_file.rename_resource_identities(&renames)
+    ))
 }
 
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub resources: &'a mut OverrideAwareResources,
+    pub addressed: &'a mut AddressedState,
     pub data_sources: &'a [DataSource],
     pub state_file: Option<&'a StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
@@ -2444,16 +2355,17 @@ pub(crate) fn reconcile_late_anonymous_identities(
         return Err(error);
     }
 
-    if let Some(sf) = inputs.state_file {
-        let mut state_for_late_reconcile = sf.clone();
+    let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
+        let state_view =
+            AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
         reconcile_anonymous_identifiers_with_ctx(
             ctx,
-            inputs.resources.resources_mut(),
+            inputs.resources.resources(),
             inputs.data_sources,
-            &mut state_for_late_reconcile,
+            &state_view,
             inputs.state_block_claims,
-        )?;
-    }
+        )
+    });
 
     let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
         inputs.resources.resources(),
@@ -2476,7 +2388,9 @@ pub(crate) fn reconcile_late_anonymous_identities(
     // execution as duplicates.
     inputs.resources.unresolved_by_resolved_id()?;
 
-    ResolvedDesiredIds::from_resources(inputs.resources.resources())
+    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources())?;
+    apply_detected_resource_moves(inputs.addressed, moves)?;
+    Ok(desired)
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
@@ -3566,7 +3480,7 @@ impl DeferredCreateTarget {
 /// [`PreparedDeferredForExpansion`]:
 ///
 /// - [`DeferredForExpansionPrelude::reconcile_addresses`] for planning/apply
-///   views, which applies explicit moves and anonymous-to-named renames;
+///   views, which applies explicit moves and detected anonymous-address moves;
 /// - [`DeferredForExpansionPrelude::preserve_addresses`] for `state refresh`,
 ///   which must refresh the rows at their persisted addresses without applying
 ///   pending configuration transitions.
@@ -3574,6 +3488,107 @@ impl DeferredCreateTarget {
 /// Both transitions own the exact state/metadata view accepted by expansion,
 /// so a future caller cannot silently choose the wrong behavior with a flag or
 /// substitute independently keyed maps.
+pub(crate) struct AddressedState {
+    managed_current: HashMap<ResourceId, Current>,
+    orphans: Orphans,
+    saved_attrs: LiftedSavedAttrs,
+    prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
+}
+
+pub(crate) struct AddressedStateParts {
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub orphans: Orphans,
+    pub saved_attrs: LiftedSavedAttrs,
+    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    pub moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
+}
+
+impl AddressedState {
+    pub(crate) fn managed_current(&self) -> &HashMap<ResourceId, Current> {
+        &self.managed_current
+    }
+
+    pub(crate) fn orphans(&self) -> &Orphans {
+        &self.orphans
+    }
+
+    pub(crate) fn saved_attrs(&self) -> &LiftedSavedAttrs {
+        &self.saved_attrs
+    }
+
+    pub(crate) fn prev_explicit(
+        &self,
+    ) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
+        &self.prev_explicit
+    }
+
+    pub(crate) fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
+        &self.moved_pairs
+    }
+
+    pub(crate) fn managed_current_and_orphans_mut(
+        &mut self,
+    ) -> (&mut HashMap<ResourceId, Current>, &mut Orphans) {
+        (&mut self.managed_current, &mut self.orphans)
+    }
+
+    pub(crate) fn into_parts(self) -> AddressedStateParts {
+        AddressedStateParts {
+            managed_current: self.managed_current,
+            orphans: self.orphans,
+            saved_attrs: self.saved_attrs,
+            prev_explicit: self.prev_explicit,
+            moved_pairs: self.moved_pairs,
+        }
+    }
+}
+
+fn apply_detected_resource_moves(
+    addressed: &mut AddressedState,
+    moves: Vec<ResolvedMove>,
+) -> Result<(), AppError> {
+    for resolved_move in moves {
+        let authority = resolved_move.authority();
+        promote_orphan_or_move_current_state(
+            &mut addressed.managed_current,
+            &mut addressed.orphans,
+            &authority,
+        )?;
+        if let Some(keys) = addressed.prev_explicit.remove(authority.from()) {
+            addressed.prev_explicit.insert(authority.to().clone(), keys);
+        }
+        addressed
+            .saved_attrs
+            .remap_resource_id(authority.from(), authority.to().clone());
+        addressed.moved_pairs.push(resolved_move.into_parts());
+    }
+    Ok(())
+}
+
+fn detect_and_apply_automatic_resource_moves(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    data_sources: &[DataSource],
+    providers: &[ProviderConfig],
+    state_file: &Option<StateFile>,
+    claims: &StateBlockClaims,
+    addressed: &mut AddressedState,
+) -> Result<(), AppError> {
+    let Some(state_file) = state_file.as_ref() else {
+        return Ok(());
+    };
+    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &addressed.moved_pairs);
+    let moves =
+        reconcile_anonymous_identifiers_with_ctx(ctx, resources, data_sources, &state_view, claims);
+    apply_detected_resource_moves(addressed, moves)?;
+
+    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &addressed.moved_pairs);
+    let moves =
+        detect_anonymous_to_named_moves_with_ctx(ctx, resources, providers, &state_view, claims)?;
+    apply_detected_resource_moves(addressed, moves)
+}
+
 pub struct DeferredForExpansionPrelude<'state> {
     state_file: &'state Option<StateFile>,
     sorted_resources: Vec<Resource>,
@@ -3699,7 +3714,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             DeferredForWarningPolicy::Print => &mut print_warning,
             DeferredForWarningPolicy::Suppress => &mut suppress_warning,
         };
-        let mut moved_pairs = materialize_moved_states_with_warning_sink(
+        let moved_pairs = materialize_moved_states_with_warning_sink(
             &mut inputs.managed_current,
             &mut inputs.orphans,
             &mut self.prev_explicit,
@@ -3708,27 +3723,28 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             self.state_file,
             warning_sink,
         )?;
-        moved_pairs.extend(apply_anonymous_to_named_renames(
+        let mut addressed = AddressedState {
+            managed_current: inputs.managed_current,
+            orphans: inputs.orphans,
+            saved_attrs: self.saved_attrs,
+            prev_explicit: self.prev_explicit,
+            moved_pairs,
+        };
+        detect_and_apply_automatic_resource_moves(
             inputs.ctx,
             &self.sorted_resources,
+            &inputs.parsed.data_sources,
             inputs.provider_configs,
-            &mut inputs.managed_current,
-            &mut inputs.orphans,
-            &mut self.prev_explicit,
-            &mut self.saved_attrs,
             self.state_file,
             inputs.state_block_claims,
-        )?);
+            &mut addressed,
+        )?;
         Ok(ReconciledDeferredForExpansion(
             AddressedDeferredForExpansionInputs {
                 sorted_resources: self.sorted_resources,
-                saved_attrs: self.saved_attrs,
-                prev_explicit: self.prev_explicit,
                 wait_aliases: self.wait_aliases,
-                moved_pairs,
                 already_refreshed: inputs.already_refreshed,
-                managed_current: inputs.managed_current,
-                orphans: inputs.orphans,
+                state: addressed,
             },
         ))
     }
@@ -3742,26 +3758,24 @@ impl<'state> DeferredForExpansionPrelude<'state> {
     ) -> AddressPreservingDeferredForExpansion {
         AddressPreservingDeferredForExpansion(AddressedDeferredForExpansionInputs {
             sorted_resources: self.sorted_resources,
-            saved_attrs: self.saved_attrs,
-            prev_explicit: self.prev_explicit,
             wait_aliases: self.wait_aliases,
-            moved_pairs: Vec::new(),
             already_refreshed: inputs.already_refreshed,
-            managed_current: inputs.managed_current,
-            orphans: inputs.orphans,
+            state: AddressedState {
+                managed_current: inputs.managed_current,
+                orphans: inputs.orphans,
+                saved_attrs: self.saved_attrs,
+                prev_explicit: self.prev_explicit,
+                moved_pairs: Vec::new(),
+            },
         })
     }
 }
 
 struct AddressedDeferredForExpansionInputs {
     sorted_resources: Vec<Resource>,
-    saved_attrs: LiftedSavedAttrs,
-    prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     wait_aliases: Vec<WaitAliasSpec>,
-    moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
     already_refreshed: HashSet<ResourceId>,
-    managed_current: HashMap<ResourceId, Current>,
-    orphans: Orphans,
+    state: AddressedState,
 }
 
 struct DeferredForExpansionInputs {
@@ -3810,7 +3824,7 @@ async fn read_addressed_data_sources_phase2(
         .filter_map(|resource| resource.binding.clone())
         .collect::<HashSet<_>>();
     let mut orphan_resources = Vec::new();
-    for (id, orphan) in &addressed.orphans {
+    for (id, orphan) in &addressed.state.orphans {
         if !managed_ids.insert(id.clone()) {
             continue;
         }
@@ -3835,8 +3849,8 @@ async fn read_addressed_data_sources_phase2(
             compositions: inputs.compositions,
             data_sources: inputs.data_sources,
             managed_current: ManagedCurrentView::with_orphans(
-                &addressed.managed_current,
-                &addressed.orphans,
+                &addressed.state.managed_current,
+                &addressed.state.orphans,
             ),
             remote_bindings: inputs.remote_bindings,
             schemas: inputs.schemas,
@@ -3856,19 +3870,19 @@ impl ReconciledDeferredForExpansion {
     }
 
     pub fn saved_attrs(&self) -> &LiftedSavedAttrs {
-        &self.0.saved_attrs
+        &self.0.state.saved_attrs
     }
 
     pub fn prev_explicit(&self) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
-        &self.0.prev_explicit
+        &self.0.state.prev_explicit
     }
 
     pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
-        &self.0.managed_current
+        &self.0.state.managed_current
     }
 
     pub fn orphans(&self) -> &Orphans {
-        &self.0.orphans
+        &self.0.state.orphans
     }
 
     pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
@@ -3876,7 +3890,29 @@ impl ReconciledDeferredForExpansion {
     }
 
     pub fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
-        &self.0.moved_pairs
+        &self.0.state.moved_pairs
+    }
+
+    pub(crate) fn reconcile_late_anonymous_identities(
+        &mut self,
+        ctx: &WiringContext,
+        resources: &mut OverrideAwareResources,
+        data_sources: &[DataSource],
+        state_file: Option<&StateFile>,
+        state_block_claims: &StateBlockClaims,
+        providers: &[ProviderConfig],
+    ) -> Result<ResolvedDesiredIds, AppError> {
+        reconcile_late_anonymous_identities(
+            ctx,
+            LateAnonymousIdentityInputs {
+                resources,
+                addressed: &mut self.0.state,
+                data_sources,
+                state_file,
+                state_block_claims,
+                providers,
+            },
+        )
     }
 
     pub(crate) async fn read_data_sources_phase2(
@@ -3905,7 +3941,7 @@ impl AddressPreservingDeferredForExpansion {
     }
 
     pub fn managed_current(&self) -> &HashMap<ResourceId, Current> {
-        &self.0.managed_current
+        &self.0.state.managed_current
     }
 
     pub fn wait_aliases(&self) -> &[WaitAliasSpec] {
@@ -3937,25 +3973,17 @@ pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs);
 /// consumed. This type cannot be converted back into an expansion witness;
 /// callers that need both must expand first, then consume the preparation.
 pub(crate) struct PreparedDeferredForExpansionParts {
-    pub managed_current: HashMap<ResourceId, Current>,
+    pub addressed: AddressedState,
     pub data_source_values: DataSourceValues,
-    pub orphans: Orphans,
-    pub saved_attrs: LiftedSavedAttrs,
-    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub wait_aliases: Vec<WaitAliasSpec>,
-    pub moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
 }
 
 impl PreparedDeferredForExpansion {
     pub(crate) fn into_parts(self) -> PreparedDeferredForExpansionParts {
         PreparedDeferredForExpansionParts {
-            managed_current: self.0.addressed.managed_current,
+            addressed: self.0.addressed.state,
             data_source_values: self.0.data_source_values,
-            orphans: self.0.addressed.orphans,
-            saved_attrs: self.0.addressed.saved_attrs,
-            prev_explicit: self.0.addressed.prev_explicit,
             wait_aliases: self.0.addressed.wait_aliases,
-            moved_pairs: self.0.addressed.moved_pairs,
         }
     }
 }
@@ -4138,14 +4166,14 @@ impl PreparedDeferredForExpansion {
         let expansion = expand_same_config_deferred_for_target(
             &mut resources,
             &self.0.addressed.sorted_resources,
-            &self.0.addressed.managed_current,
+            &self.0.addressed.state.managed_current,
             &self.0.data_source_values,
             schemas,
-            &self.0.addressed.saved_attrs,
-            &self.0.addressed.prev_explicit,
+            &self.0.addressed.state.saved_attrs,
+            &self.0.addressed.state.prev_explicit,
             remote_bindings,
             &self.0.addressed.wait_aliases,
-            &self.0.addressed.moved_pairs,
+            &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
         )?;
@@ -4165,14 +4193,14 @@ impl PreparedDeferredForExpansion {
         expand_same_config_deferred_for_target(
             parsed,
             &self.0.addressed.sorted_resources,
-            &self.0.addressed.managed_current,
+            &self.0.addressed.state.managed_current,
             &self.0.data_source_values,
             schemas,
-            &self.0.addressed.saved_attrs,
-            &self.0.addressed.prev_explicit,
+            &self.0.addressed.state.saved_attrs,
+            &self.0.addressed.state.prev_explicit,
             remote_bindings,
             &self.0.addressed.wait_aliases,
-            &self.0.addressed.moved_pairs,
+            &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
         )
@@ -4466,13 +4494,15 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     let prepared = PreparedDeferredForExpansion(DeferredForExpansionInputs {
         addressed: AddressedDeferredForExpansionInputs {
             sorted_resources: sorted_resources.to_vec(),
-            saved_attrs: saved_attrs.clone(),
-            prev_explicit: prev_explicit.clone(),
             wait_aliases: wait_aliases.to_vec(),
-            moved_pairs,
             already_refreshed: already_refreshed.clone(),
-            managed_current: managed_current.clone(),
-            orphans: Orphans::new(),
+            state: AddressedState {
+                managed_current: managed_current.clone(),
+                orphans: Orphans::new(),
+                saved_attrs: saved_attrs.clone(),
+                prev_explicit: prev_explicit.clone(),
+                moved_pairs,
+            },
         },
         data_source_values: data_source_values.clone(),
     });
@@ -4666,9 +4696,13 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
     let DeferredForExpansionInputs {
         addressed:
             AddressedDeferredForExpansionInputs {
-                managed_current,
-                orphans,
-                saved_attrs,
+                state:
+                    AddressedState {
+                        managed_current,
+                        orphans,
+                        saved_attrs,
+                        ..
+                    },
                 ..
             },
         data_source_values,
@@ -4843,9 +4877,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
 
         // Refresh orphaned resources (#844). These are tracked in state
         // but removed from the .crn config — they're looked up by their
-        // *old* name, which includes the pre-rename anonymous name of a
-        // let-bound resource. Must run before the rename transfer below
-        // so that transfer has the old-name state entries to move.
+        // *old* address. Must run before automatic address reconciliation so
+        // the transfer has the source state entries to move.
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -4884,13 +4917,10 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         )
         .await?;
 
-        // Transfer state for explicit `moved` blocks and anonymous →
-        // let-bound renames (#1685). Must run before phase 2 so the ref
-        // resolver sees state entries under their *new* binding name.
-        // Detection operates on `sorted_resources` (pre-resolved), which
-        // is sufficient for the common case of literal create-only
-        // attributes; resources with ResourceRef create-only values are
-        // an orthogonal edge case that pre-dates this fix.
+        // Transfer state for explicit `moved` blocks and every anonymous
+        // address move detectable before phase 2, including anonymous →
+        // let-bound moves (#1685). ResourceRef-derived anonymous identities
+        // use the typed late-reconciliation pass after plan preparation.
         expansion_prelude.reconcile_addresses(
             ReconcileDeferredForExpansionInputs {
                 ctx,
@@ -4916,10 +4946,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
             orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
 
-            // Transfer state for moved blocks and anonymous → let-bound
-            // renames so the later `resolve_refs_with_state_and_remote`
-            // call (and data-source-input resolution) sees entries
-            // under their current binding names (#1685).
+            // Transfer state for explicit and detected anonymous address
+            // moves so later ref and data-source-input resolution sees the
+            // reconciled state view (#1685).
             hydrate_prior_managed_states(
                 &mut managed_current,
                 &mut orphans,
@@ -4995,13 +5024,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     } = expansion;
     let sorted_resources = resorted;
     let PreparedDeferredForExpansionParts {
-        mut managed_current,
+        mut addressed,
         mut data_source_values,
-        mut orphans,
-        saved_attrs,
-        prev_explicit,
         wait_aliases,
-        moved_pairs,
     } = prepared_expansion.into_parts();
     let parsed = expanded_canonical_resources.parsed();
 
@@ -5023,7 +5048,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // `not_found`. `select` is the only constructor for the refresh
         // set — the apply path uses the same one, so the moved-exclusion
         // cannot diverge between the two paths (compile-time parity).
-        let children = || refreshable_child_ids.select(&sorted_resources, &orphans);
+        let children = || refreshable_child_ids.select(&sorted_resources, &addressed.orphans);
         if let Some(refresh_phase) = refresh_phase.as_ref() {
             refresh_resource_set(
                 &provider,
@@ -5032,15 +5057,15 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
                 state_file,
                 ctx.schemas(),
                 &HashMap::new(),
-                &mut managed_current,
+                &mut addressed.managed_current,
             )
             .await?;
             hydrate_prior_data_source_values(
-                &mut managed_current,
+                &mut addressed.managed_current,
                 &mut data_source_values,
-                &mut orphans,
+                &mut addressed.orphans,
                 &provider,
-                &saved_attrs,
+                &addressed.saved_attrs,
                 state_file.as_ref(),
             )
             .await?;
@@ -5051,20 +5076,24 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             // non-loop ref's behavior under --refresh=false).
             for resource in children() {
                 let current = sf.build_state_for_resource(&resource.id);
-                managed_current.insert(resource.id.clone(), current);
+                addressed
+                    .managed_current
+                    .insert(resource.id.clone(), current);
             }
             hydrate_prior_data_source_values(
-                &mut managed_current,
+                &mut addressed.managed_current,
                 &mut data_source_values,
-                &mut orphans,
+                &mut addressed.orphans,
                 &provider,
-                &saved_attrs,
+                &addressed.saved_attrs,
                 state_file.as_ref(),
             )
             .await?;
         } else {
             for resource in children() {
-                managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
+                addressed
+                    .managed_current
+                    .insert(resource.id.clone(), Current::absent(resource.id.clone()));
             }
         }
     }
@@ -5084,16 +5113,16 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     let managed_stability = derive_managed_binding_stability(
         parsed,
         &sorted_resources,
-        &managed_current,
+        &addressed.managed_current,
         &data_source_values,
         ctx.schemas(),
-        &saved_attrs,
-        &prev_explicit,
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
         remote_bindings,
         &wait_aliases,
     )?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
-        managed_current.clone(),
+        addressed.managed_current.clone(),
         ctx.schemas(),
         &sorted_resources,
     );
@@ -5144,9 +5173,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
                 &mut override_aware_resources,
                 &constraint_origin_resources,
                 &module_gate,
-                &mut managed_current,
+                &mut addressed.managed_current,
                 &mut data_source_values,
-                &mut orphans,
+                &mut addressed.orphans,
                 raw_provider_configs,
                 &mut data_sources_for_plan,
                 &data_sources,
@@ -5162,11 +5191,12 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         for error in errors {
             plan.add_error(error);
         }
-        let moved_origins = moved_pairs
+        let moved_origins = addressed
+            .moved_pairs
             .iter()
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
-        let managed_current = into_all_prior_states(orphans, managed_current);
+        let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
         return Ok(ExpandedPlanContext::new(
             PlanContext {
                 plan,
@@ -5182,7 +5212,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
                 data_source_values,
                 moved_origins,
                 upstream_snapshot: remote_bindings.clone(),
-                prev_explicit,
+                prev_explicit: addressed.prev_explicit,
                 residual_deferred_for,
                 expansion_trace: parsed.expansion_trace.clone(),
             },
@@ -5192,13 +5222,14 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
 
     // Anonymous resources whose identity attributes include ResourceRefs can
     // only be named and matched after plan-time refs and provider normalization
-    // have made those create-only values concrete. Keep this late pass local to
-    // the desired resources; the earlier mutable-state reconciliation still
-    // owns state-file rename migration.
+    // have made those create-only values concrete. The late pass owns the
+    // addressed state bundle, so a detected move cannot be returned without
+    // also transferring the current/orphan and persisted metadata views.
     let resolved_desired_ids = reconcile_late_anonymous_identities(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
+            addressed: &mut addressed,
             data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims,
@@ -5207,14 +5238,14 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     )?;
     validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
-        &moved_pairs,
+        &addressed.moved_pairs,
         resolved_state_block_targets,
         state_file,
     )?;
 
     let reconciled_provider_states = provider_states_for(
-        &managed_current,
-        &orphans,
+        &addressed.managed_current,
+        &addressed.orphans,
         override_aware_resources.resources(),
     );
     let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
@@ -5228,8 +5259,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         &stability_resources,
         &reconciled_input_current,
         ctx.schemas(),
-        &saved_attrs,
-        &prev_explicit,
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
     );
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
@@ -5255,7 +5286,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     let resolved_unresolved_resources =
         ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        managed_current.clone(),
+        addressed.managed_current.clone(),
         ctx.schemas(),
         override_aware_resources.resources(),
     );
@@ -5264,14 +5295,14 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
-        PlanPriorStates::new(&plan_input_current, &orphans),
+        PlanPriorStates::new(&plan_input_current, &addressed.orphans),
         &directives_map,
         ctx.schemas(),
-        &saved_attrs,
-        &prev_explicit,
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
         &wait_bindings,
     )?;
-    add_deposed_delete_effects(&mut plan, state_file, &moved_pairs);
+    add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
     override_aware_resources.apply_plan_stability(&plan_input_current, &plan, ctx.schemas());
 
@@ -5289,19 +5320,20 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         &mut plan,
         &parsed.state_blocks,
         state_file,
-        &moved_pairs,
+        &addressed.moved_pairs,
         override_aware_resources.resources(),
         override_aware_resources.bindings(),
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
 
-    let managed_current = into_all_prior_states(orphans, managed_current);
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+    let moved_origins: HashMap<ResourceId, ResourceId> = addressed
+        .moved_pairs
         .iter()
         .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
+    let prev_explicit = addressed.prev_explicit;
+    let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
     let unresolved_resources = resolved_unresolved_resources
         .into_iter()
         .map(ResolvedResource::into_inner)
