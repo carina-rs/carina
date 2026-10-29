@@ -1,6 +1,8 @@
-//! Integration tests: load MockProvider .wasm via WasmProviderFactory and perform CRUD.
+//! Integration tests for the general mock and the isolated wasi:http probe guests.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +32,13 @@ fn mock_identity() -> ProviderLoadIdentity {
 
 fn mock_load(bytes: &[u8]) -> VerifiedLoad {
     VerifiedLoad::for_test(bytes, mock_identity())
+}
+
+fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
+    VerifiedLoad::for_test(
+        bytes,
+        ProviderLoadIdentity::for_test("mock_http", ProviderTrustClass::Untrusted),
+    )
 }
 
 fn mock_identifier() -> AppliedIdentifier {
@@ -179,6 +188,20 @@ fn wasm_path() -> Option<PathBuf> {
     None
 }
 
+fn http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http.wasm",
+        "carina-provider-mock-http.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 macro_rules! skip_if_no_wasm {
     () => {
         match wasm_path() {
@@ -187,6 +210,21 @@ macro_rules! skip_if_no_wasm {
                 eprintln!(
                     "SKIP: WASM binary not found. Build with: \
                      cargo build -p carina-provider-mock --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! skip_if_no_http_wasm {
+    () => {
+        match http_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --target wasm32-wasip2"
                 );
                 return;
             }
@@ -211,6 +249,16 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     (factory, cache)
 }
 
+async fn load_http_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
+    let factory =
+        WasmProviderFactory::from_bytes_with_cache_dir(mock_http_load(&wasm_bytes), cache.path())
+            .await
+            .expect("Failed to load HTTP probe WASM provider");
+    (factory, cache)
+}
+
 fn resource_with_int_attribute(
     resource_type: &str,
     identity: &str,
@@ -232,14 +280,59 @@ fn resource_with_string_attribute(
     attribute: &str,
     value: &str,
 ) -> Resource {
+    resource_with_provider_string_attribute("mock", resource_type, identity, attribute, value)
+}
+
+fn resource_with_provider_string_attribute(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+    attribute: &str,
+    value: &str,
+) -> Resource {
     let identity = carina_core::resource::ResourceIdentity::try_from(identity.to_string())
         .expect("test identity must be non-empty");
-    let mut resource = Resource::with_provider("mock", resource_type, identity, None);
+    let mut resource = Resource::with_provider(provider, resource_type, identity, None);
     resource.attributes.insert(
         attribute.into(),
         Value::Concrete(ConcreteValue::String(value.to_string().into())),
     );
     resource
+}
+
+fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str) -> Resource {
+    let mut resource = resource_with_provider_string_attribute(
+        "mock_http",
+        "test.send_phase",
+        identity,
+        "url",
+        url,
+    );
+    resource.attributes.insert(
+        "method".to_string(),
+        Value::Concrete(ConcreteValue::String(method.to_string().into())),
+    );
+    resource.attributes.insert(
+        "body".to_string(),
+        Value::Concrete(ConcreteValue::String(body.to_string().into())),
+    );
+    resource
+}
+
+fn http_probe_body() -> String {
+    // Exceed the two-chunk host body buffer so the closed-port case can close
+    // the receiver while the guest is still writing, exercising the
+    // future-error recovery path. The denied-host case fails synchronously in
+    // outgoing_handler::handle instead.
+    "x".repeat(16 * 1024)
+}
+
+fn http_probe_outcome(state: &State) -> &str {
+    let Some(Value::Concrete(ConcreteValue::String(outcome))) = state.attributes.get("send_phase")
+    else {
+        panic!("HTTP probe state must contain a string send_phase attribute");
+    };
+    outcome.expose_plaintext()
 }
 
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
@@ -380,6 +473,251 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
             .to_string()
             .contains("intentional SDK schema validator rejection")),
         "unexpected errors: {errors:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_denied_http_request_as_not_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-denied",
+        None,
+    );
+    let resource =
+        http_send_phase_resource("wasi-http-denied", "http://example.invalid/", "POST", &body);
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+
+    assert_eq!(http_probe_outcome(&state), "not_sent:HttpRequestDenied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let reserved_socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        Ok(socket)
+    }) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot reserve a closed loopback port: {error}");
+            return;
+        }
+    };
+    let closed_address = reserved_socket
+        .local_addr()
+        .expect("reserved socket has an address");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", closed_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-connect-failure",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-connect-failure",
+        &format!("http://phase-test.invalid:{}/", closed_address.port()),
+        "POST",
+        &body,
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+    drop(reserved_socket);
+
+    assert!(
+        matches!(
+            http_probe_outcome(&state),
+            "not_sent:ConnectionRefused" | "not_sent:ConnectionTimeout"
+        ),
+        "unexpected closed-port outcome: {}",
+        http_probe_outcome(&state)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-closed",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-closed",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
+    );
+
+    // Component compilation and provider initialization can be slow under
+    // parallel load, so start the accept deadline only once the guest is ready.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = [0_u8; 4096];
+        stream
+            .read(&mut request)
+            .expect("read request bytes before closing")
+    });
+
+    let state = create_state_for_writeback(
+        provider
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the mock transport probe should report its phase"),
+    );
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the server must receive request bytes");
+    assert_eq!(http_probe_outcome(&state), "maybe_sent:HttpProtocolError");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
+    let path = skip_if_no_http_wasm!();
+    let body = http_probe_body();
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-first-byte-timeout",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-first-byte-timeout",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &body,
+    );
+
+    let (release_server, wait_for_release) = std::sync::mpsc::channel();
+    // Start both the accept deadline and the silent-server lifetime only after
+    // component compilation and provider initialization have completed.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = [0_u8; 4096];
+        let bytes_read = stream
+            .read(&mut request)
+            .expect("read request bytes before waiting");
+        assert!(bytes_read > 0, "the server must receive request bytes");
+        wait_for_release
+            .recv_timeout(Duration::from_secs(10))
+            .expect("guest did not finish before the silent-server deadline");
+        bytes_read
+    });
+
+    let outcome = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await;
+    release_server
+        .send(())
+        .expect("silent server should still be waiting");
+    let bytes_read = server.join().expect("loopback server should finish");
+    let state = create_state_for_writeback(
+        outcome.expect("the mock transport probe should report its phase"),
+    );
+
+    assert!(bytes_read > 0, "the server must receive request bytes");
+    assert_eq!(
+        http_probe_outcome(&state),
+        "maybe_sent:ConnectionReadTimeout"
     );
 }
 
