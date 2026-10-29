@@ -6201,16 +6201,34 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
 
     let path = fixture.path().join("main.crn");
     let document = create_document_at(source, path.clone());
-    let mut resolver_input = document.parsed().expect("root parse").clone();
+    let resolver_input = document.parsed().expect("root parse").clone();
     let report = carina_core::module_resolver::resolve_modules_with_diagnostics(
-        &mut resolver_input,
+        &resolver_input,
         fixture.path(),
         &engine.provider_context,
         &engine.schemas,
     );
-    let residual = report
-        .status
-        .unowned_error()
+    let residuals = match report {
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            panic!(
+                "missing module unexpectedly expanded to {} compositions",
+                graph.compositions.len()
+            )
+        }
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+            findings,
+            errors,
+        } => panic!(
+            "unexpected constraint outcome: {} findings and {} residuals",
+            findings.len(),
+            errors.len()
+        ),
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+            errors
+        }
+    };
+    let residual = residuals
+        .first()
         .expect("resolver fixture must retain the uncovered nested call error");
     assert!(
         matches!(

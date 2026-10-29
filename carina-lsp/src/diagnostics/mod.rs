@@ -708,16 +708,42 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            let expanded_graph_available = merged_result
-                .as_ref()
-                .is_some_and(|result| result.module_resolution_status.expanded_graph_available());
-            let expanded_compositions = expanded_graph_available
-                .then_some(merged)
-                .flatten()
-                .map(|expanded| expanded.compositions.as_slice());
-            let constraint_reports = merged_result
-                .as_ref()
-                .map(|result| &result.module_constraint_reports);
+            let expanded_compositions = match merged_result.as_ref() {
+                Some(result) => match &result.module_resolution {
+                    checks::MergedModuleResolution::Expanded => {
+                        Some(result.directory.parsed.compositions.as_slice())
+                    }
+                    checks::MergedModuleResolution::ConstraintFailed {
+                        findings: _findings,
+                        errors: _errors,
+                    } => None,
+                    checks::MergedModuleResolution::Unowned { errors: _errors } => None,
+                },
+                None => None,
+            };
+            let resolver_constraint_findings = match merged_result.as_ref() {
+                Some(result) => match &result.module_resolution {
+                    checks::MergedModuleResolution::Expanded => Vec::new(),
+                    checks::MergedModuleResolution::ConstraintFailed {
+                        findings,
+                        errors: _errors,
+                    } => findings.clone(),
+                    checks::MergedModuleResolution::Unowned { errors: _errors } => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            let residual_errors: &[carina_core::module_resolver::ResidualModuleResolutionError] =
+                match merged_result.as_ref() {
+                    Some(result) => match &result.module_resolution {
+                        checks::MergedModuleResolution::Expanded => &[],
+                        checks::MergedModuleResolution::ConstraintFailed {
+                            findings: _findings,
+                            errors,
+                        } => errors.as_slice(),
+                        checks::MergedModuleResolution::Unowned { errors } => errors.as_slice(),
+                    },
+                    None => &[],
+                };
             let authored_findings = carina_core::validation::check_module_calls(
                 carina_core::validation::ModuleCallCheckInput {
                     authored: parsed,
@@ -745,28 +771,29 @@ impl DiagnosticEngine {
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
                     compositions,
                     bindings: &binding_index,
-                    constraint_reports,
+                    constraint_reports: None,
                 },
             );
             let findings = carina_core::validation::merge_module_call_findings([
                 authored_findings,
                 expanded_binding_findings,
                 expanded_reference_findings,
+                resolver_constraint_findings,
             ]);
             diagnostics.extend(render_module_call_findings(doc, diagnostic_file, &findings));
-            if let (Some(base_path), Some(error)) = (
-                base_path,
-                merged_result
-                    .as_ref()
-                    .and_then(|result| result.module_resolution_status.uncovered_error(&findings)),
-            ) {
-                diagnostics.extend(self.module_resolver_error_diagnostics(
-                    doc,
-                    parsed,
-                    error,
-                    base_path,
-                    current_file_path,
-                ));
+            if let Some(base_path) = base_path {
+                for error in residual_errors {
+                    if error.is_covered_by(&findings) {
+                        continue;
+                    }
+                    diagnostics.extend(self.module_resolver_error_diagnostics(
+                        doc,
+                        parsed,
+                        error,
+                        base_path,
+                        current_file_path,
+                    ));
+                }
             }
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with

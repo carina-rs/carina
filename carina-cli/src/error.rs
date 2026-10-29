@@ -691,6 +691,10 @@ pub enum AppError {
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
 
+    /// A type-resolution failure without parser location metadata.
+    #[error(transparent)]
+    TypeResolution(Box<carina_core::validation::TypeResolutionDiagnostic>),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),

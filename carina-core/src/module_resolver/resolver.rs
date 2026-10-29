@@ -66,27 +66,22 @@ impl ModuleCallConstraintReport {
 
 pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
-/// Module resolution result for editor diagnostics.
+/// Diagnostic module-resolution outcome.
 ///
-/// Normal CLI resolution uses [`resolve_modules_with_config`] and never
-/// allocates or clones `constraint_reports`.
-pub struct ModuleResolutionDiagnosticReport {
-    pub constraint_reports: ModuleCallConstraintReports,
-    pub status: ModuleResolutionDiagnosticStatus,
-}
-
-/// Completion state after resolver-owned diagnostics have claimed their
-/// failures. A constraint failure remains incomplete even though its concrete
-/// diagnostic is carried by `constraint_reports` rather than a residual
-/// [`ModuleError`].
-pub enum ModuleResolutionDiagnosticStatus {
-    Complete,
-    Failed(ModuleResolutionDiagnosticFailure),
-}
-
-pub enum ModuleResolutionDiagnosticFailure {
-    ConstraintReports,
-    Unowned(ResidualModuleResolutionError),
+/// The expanded graph is owned exclusively by [`Self::Expanded`]. Constraint
+/// and residual failures retain their typed diagnostics but cannot expose the
+/// scratch graph that produced them.
+pub enum ModuleResolutionDiagnosticResult<E> {
+    Expanded {
+        graph: Box<crate::parser::File<E>>,
+    },
+    ConstraintFailed {
+        findings: Vec<crate::validation::ModuleCallFinding>,
+        errors: Vec<ResidualModuleResolutionError>,
+    },
+    Unowned {
+        errors: Vec<ResidualModuleResolutionError>,
+    },
 }
 
 /// Resolver failure left after typed source diagnostics have claimed every
@@ -245,8 +240,62 @@ impl ResidualModuleResolutionError {
                 message: _,
             } => false,
             ModuleError::Io(_) => false,
-            ModuleError::Parse(_) => false,
-            ModuleError::ParseInFile { path: _, error: _ } => false,
+            ModuleError::Parse(error) => match error {
+                ParseError::Located { path, error } => findings.iter().any(|finding| {
+                    finding
+                        .message()
+                        .covers_type_resolution_parser_error(path, error)
+                }),
+                ParseError::Syntax(_)
+                | ParseError::InvalidExpression {
+                    line: _,
+                    message: _,
+                }
+                | ParseError::UnknownFunction {
+                    name: _,
+                    line: _,
+                    column: _,
+                }
+                | ParseError::ReservedResourceAttribute {
+                    attribute: _,
+                    line: _,
+                    column: _,
+                    end_line: _,
+                    end_column: _,
+                }
+                | ParseError::SecretDerivedBackendAttribute {
+                    backend_type: _,
+                    attribute: _,
+                    line: _,
+                    start_column: _,
+                    end_column: _,
+                }
+                | ParseError::InterpolationNotAllowedInLiteralString { line: _ }
+                | ParseError::InvalidResourceIdentity { line: _, error: _ }
+                | ParseError::UndefinedVariable(_)
+                | ParseError::InvalidResourceType(_)
+                | ParseError::DuplicateModule(_)
+                | ParseError::DuplicateBinding { name: _, line: _ }
+                | ParseError::UndefinedIdentifier {
+                    name: _,
+                    line: _,
+                    suggestion: _,
+                    in_scope: _,
+                }
+                | ParseError::ModuleNotFound(_)
+                | ParseError::InternalError {
+                    expected: _,
+                    context: _,
+                }
+                | ParseError::RecursiveFunction(_)
+                | ParseError::CyclicLetBinding { chain: _ }
+                | ParseError::UserFunctionError(_) => false,
+            },
+            ModuleError::ParseInFile { path, error } => findings.iter().any(|finding| {
+                finding
+                    .message()
+                    .covers_type_resolution_parser_error(path, error)
+            }),
             ModuleError::UnknownModule(_) => false,
             ModuleError::ProviderInModule => false,
             ModuleError::StateBlockInModule => false,
@@ -256,6 +305,29 @@ impl ResidualModuleResolutionError {
             ModuleError::Constraint(_) => false,
             ModuleError::NotADirectory { path: _ } => false,
         }
+    }
+
+    pub fn is_covered_by_module_call_findings(
+        &self,
+        findings: &[crate::validation::ModuleCallFinding],
+    ) -> bool {
+        if let ModuleError::ReferenceType(errors) = self.0.root_cause() {
+            let mut errors = errors.iter().peekable();
+            return errors.peek().is_some()
+                && errors.all(|error| match error {
+                    crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) => {
+                        findings
+                            .iter()
+                            .any(|finding| finding.message().covers_reference_type(error))
+                    }
+                    crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
+                        false
+                    }
+                });
+        }
+        self.is_covered_by(findings)
     }
 
     fn finding_owns_error(&self, finding: &crate::validation::ModuleCallFinding) -> bool {
@@ -277,82 +349,70 @@ impl ResidualModuleResolutionError {
     }
 }
 
-impl ModuleResolutionDiagnosticStatus {
-    pub fn is_complete(&self) -> bool {
-        match self {
-            Self::Complete => true,
-            Self::Failed(_failure) => false,
-        }
-    }
-
-    pub fn expanded_graph_available(&self) -> bool {
-        match self {
-            Self::Complete | Self::Failed(ModuleResolutionDiagnosticFailure::ConstraintReports) => {
-                true
-            }
-            Self::Failed(ModuleResolutionDiagnosticFailure::Unowned(_error)) => false,
-        }
-    }
-
-    pub fn unowned_error(&self) -> Option<&ResidualModuleResolutionError> {
-        match self {
-            Self::Complete | Self::Failed(ModuleResolutionDiagnosticFailure::ConstraintReports) => {
-                None
-            }
-            Self::Failed(ModuleResolutionDiagnosticFailure::Unowned(error)) => Some(error),
-        }
-    }
-
-    pub fn uncovered_error(
-        &self,
-        findings: &[crate::validation::ModuleCallFinding],
-    ) -> Option<&ResidualModuleResolutionError> {
-        self.unowned_error()
-            .filter(|error| !error.is_covered_by(findings))
-    }
-}
-
-fn module_resolution_diagnostic_status(
-    error: Option<ModuleError>,
-    constraint_reports: &ModuleCallConstraintReports,
-) -> ModuleResolutionDiagnosticStatus {
-    let has_failed_constraint_report = constraint_reports.iter().any(|report| {
-        report.outcomes.iter().any(|outcome| match &outcome.status {
-            ResolvedModuleConstraintStatus::Satisfied | ResolvedModuleConstraintStatus::Pending => {
-                false
-            }
-            ResolvedModuleConstraintStatus::Failed {
-                diagnostic: _diagnostic,
-                origin: _origin,
-            } => true,
-        })
-    });
-    let Some(error) = error else {
-        return if has_failed_constraint_report {
-            ModuleResolutionDiagnosticStatus::Failed(
-                ModuleResolutionDiagnosticFailure::ConstraintReports,
-            )
-        } else {
-            ModuleResolutionDiagnosticStatus::Complete
-        };
-    };
-    let constraint_report_owns_error =
-        matches!(error.root_cause(), ModuleError::Constraint(_diagnostic))
-            && has_failed_constraint_report;
-    if constraint_report_owns_error {
-        ModuleResolutionDiagnosticStatus::Failed(
-            ModuleResolutionDiagnosticFailure::ConstraintReports,
-        )
-    } else {
-        ModuleResolutionDiagnosticStatus::Failed(ModuleResolutionDiagnosticFailure::Unowned(
-            ResidualModuleResolutionError::new(error),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod diagnostic_status_tests {
     use super::*;
+
+    #[test]
+    fn constraint_failure_does_not_publish_the_expanded_directory_graph() {
+        let fixture = tempfile::tempdir().expect("constraint typestate fixture");
+        let checked = fixture.path().join("checked");
+        std::fs::create_dir_all(&checked).expect("create checked module");
+        std::fs::write(
+            fixture.path().join("imports.crn"),
+            "let checked = use { source = './checked' }\n",
+        )
+        .expect("write root import");
+        std::fs::write(
+            fixture.path().join("calls.crn"),
+            "let instance = checked {\n  name = \"too-long\"\n}\n",
+        )
+        .expect("write root call");
+        std::fs::write(
+            checked.join("arguments.crn"),
+            r#"arguments {
+  name: String {
+    validation {
+      condition = length(name) <= 3
+      error_message = "name is too long"
+    }
+  }
+}
+"#,
+        )
+        .expect("write module arguments");
+        std::fs::write(
+            checked.join("attributes.crn"),
+            "attributes {\n  name = name\n}\n",
+        )
+        .expect("write module attributes");
+
+        let config = ProviderContext::default();
+        let schemas = SchemaRegistry::new();
+        let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
+            .expect("parse directory fixture");
+        let result = resolve_modules_with_diagnostics(&parsed, fixture.path(), &config, &schemas);
+
+        let graph = match result {
+            ModuleResolutionDiagnosticResult::Expanded { graph } => Some(graph),
+            ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } => {
+                assert_eq!(findings.len(), 1);
+                assert!(errors.is_empty());
+                None
+            }
+            ModuleResolutionDiagnosticResult::Unowned { errors } => {
+                panic!("unexpected residual errors: {}", errors.len())
+            }
+        };
+        assert!(
+            graph.is_none(),
+            "only the Expanded variant may make a graph reachable"
+        );
+        assert!(
+            parsed.compositions.is_empty(),
+            "the authored input is immutable"
+        );
+    }
 
     #[test]
     fn source_ownership_requires_a_covering_module_call_finding() {
@@ -409,25 +469,24 @@ mod diagnostic_status_tests {
             argument: "required".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let status = module_resolution_diagnostic_status(Some(error), &Vec::new());
+        let residual = ResidualModuleResolutionError::new(error);
 
         assert!(
-            status.unowned_error().is_some(),
+            !residual.is_covered_by(&[]),
             "a resolver error cannot be hidden before a concrete finding covers it",
         );
-        assert!(status.uncovered_error(&[]).is_some());
         let unrelated = ModuleError::MissingArgument {
             module: "child".to_string(),
             argument: "different".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let unrelated_status = module_resolution_diagnostic_status(Some(unrelated), &Vec::new());
+        let unrelated_residual = ResidualModuleResolutionError::new(unrelated);
         assert!(
-            unrelated_status.uncovered_error(&findings).is_some(),
+            !unrelated_residual.is_covered_by(&findings),
             "a finding for another argument must not claim this resolver error",
         );
         assert!(
-            status.uncovered_error(&findings).is_none(),
+            residual.is_covered_by(&findings),
             "the exact call-owner finding must cover the resolver backstop",
         );
     }
@@ -835,6 +894,32 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         Ok(())
     }
 
+    fn process_imports_collecting(
+        &mut self,
+        imports: &[UseStatement],
+        module_calls: &[crate::parser::ModuleCall],
+    ) -> Vec<ModuleError> {
+        let mut errors = Vec::new();
+        for import in imports {
+            match self.load_module(&import.path) {
+                Ok(module) => {
+                    self.imported_modules.insert(import.alias.clone(), module);
+                    self.module_paths
+                        .insert(import.alias.clone(), import.path.clone());
+                }
+                Err(error) => {
+                    let owning_calls = module_calls
+                        .iter()
+                        .filter(|call| call.module_name == import.alias)
+                        .map(|call| call.id().clone())
+                        .collect();
+                    errors.push(error.with_owning_calls(owning_calls));
+                }
+            }
+        }
+        errors
+    }
+
     /// Resolve nested module imports within a parsed module.
     ///
     /// This processes the module's own imports and module_calls, expanding any
@@ -935,16 +1020,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
         Self::check_with_resolver(parsed, resolver)
     }
 
-    fn check_with_reporting(
-        parsed: &'parsed mut crate::parser::File<E>,
-        base_dir: &Path,
-        config: &'cfg ProviderContext,
-        schemas: &'cfg SchemaRegistry,
-    ) -> Result<Self, ModuleError> {
-        let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
-        Self::check_with_resolver(parsed, resolver)
-    }
-
     fn check_with_resolver(
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
@@ -961,22 +1036,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
     /// Consume the checked graph and expand its root configuration.
     pub fn expand(mut self) -> Result<(), ModuleError> {
         resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
-    }
-
-    fn expand_with_diagnostics(mut self) -> ModuleResolutionDiagnosticReport {
-        let error =
-            resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
-                .err();
-        let constraint_reports = self
-            .resolver
-            .constraint_reports
-            .into_inner()
-            .expect("diagnostic resolver always records constraint reports");
-        let status = module_resolution_diagnostic_status(error, &constraint_reports);
-        ModuleResolutionDiagnosticReport {
-            constraint_reports,
-            status,
-        }
     }
 }
 
@@ -1050,23 +1109,91 @@ pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParam
 
 /// Resolve modules while retaining the expander's own per-call constraint
 /// outcomes and source locations for editor diagnostics.
-pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clone>(
+    parsed: &crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> ModuleResolutionDiagnosticReport {
-    match RefCheckedModuleGraph::check_with_reporting(parsed, base_dir, config, schemas) {
-        Ok(checked) => checked.expand_with_diagnostics(),
-        Err(error) => {
-            let constraint_reports = Vec::new();
-            let status = module_resolution_diagnostic_status(Some(error), &constraint_reports);
-            ModuleResolutionDiagnosticReport {
-                constraint_reports,
-                status,
+) -> ModuleResolutionDiagnosticResult<E> {
+    let mut graph = parsed.clone();
+    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
+    match resolver.validate_reference_types(&graph) {
+        Ok(root_witness) => errors.extend(resolve_modules_with_resolver_collecting(
+            &mut graph,
+            &mut resolver,
+            &root_witness,
+        )),
+        Err(error) => errors.push(error),
+    }
+    let constraint_reports = resolver
+        .constraint_reports
+        .into_inner()
+        .expect("diagnostic resolver always records constraint reports");
+    let findings = crate::validation::check_expanded_module_calls(
+        crate::validation::ExpandedModuleCallCheckInput::Constraints {
+            compositions: &graph.compositions,
+            constraint_reports: &constraint_reports,
+        },
+    );
+    let errors = errors
+        .into_iter()
+        .map(ResidualModuleResolutionError::new)
+        .collect::<Vec<_>>();
+    if !findings.is_empty() {
+        ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
+    } else if errors.is_empty() {
+        ModuleResolutionDiagnosticResult::Expanded {
+            graph: Box::new(graph),
+        }
+    } else {
+        ModuleResolutionDiagnosticResult::Unowned { errors }
+    }
+}
+
+fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
+    parsed: &mut crate::parser::File<E>,
+    resolver: &mut ModuleResolver<'_, P>,
+    ref_check: &RefCheckWitness,
+) -> Vec<ModuleError> {
+    let module_calls = parsed.module_calls.clone();
+    let signatures = resolver.resolved_module_signatures();
+    let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
+        parsed,
+        resolver.schemas,
+        &signatures,
+    );
+    let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
+    let mut expanded_calls = Vec::with_capacity(module_calls.len());
+    let mut errors = Vec::new();
+    for call in &module_calls {
+        let import_failed = parsed
+            .uses
+            .iter()
+            .any(|import| import.alias == call.module_name)
+            && !resolver.imported_modules.contains_key(&call.module_name);
+        if import_failed {
+            continue;
+        }
+        let instance_prefix = instance_prefix_for_call(call);
+        match resolver.expand_module_call_checked(
+            call,
+            &instance_prefix,
+            ref_check,
+            Some(&binding_index),
+            Some(&resolved_bindings),
+        ) {
+            Ok(expanded) => {
+                expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
             }
+            Err(error) => errors.push(error),
         }
     }
+    drop(binding_index);
+    for expanded in expanded_calls {
+        crate::config_loader::merge_parsed_file(parsed, expanded);
+    }
+    errors
 }
 
 fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
@@ -1144,6 +1271,10 @@ mod type_resolution_policy_tests {
         assert!(
             error.is_covered_by(&[]),
             "coverage must use a typed error variant rather than a rendered string prefix",
+        );
+        assert!(
+            !error.is_covered_by_module_call_findings(&[]),
+            "CLI module-call coverage must retain non-call reference failures",
         );
     }
 }

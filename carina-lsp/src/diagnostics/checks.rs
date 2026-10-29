@@ -19,16 +19,21 @@ use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
 
-/// Directory parse plus the module-expansion error, if expansion stopped.
-///
-/// Most diagnostics can still use the partially expanded parse after a
-/// resolver failure, but concrete module constraint failures must not be
-/// discarded: they are actionable editor diagnostics in their own right.
+/// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
     pub(super) directory: DirectoryParseResult,
-    pub(super) module_resolution_status:
-        carina_core::module_resolver::ModuleResolutionDiagnosticStatus,
-    pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
+    pub(super) module_resolution: MergedModuleResolution,
+}
+
+pub(super) enum MergedModuleResolution {
+    Expanded,
+    ConstraintFailed {
+        findings: Vec<carina_core::validation::ModuleCallFinding>,
+        errors: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
+    },
+    Unowned {
+        errors: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
+    },
 }
 
 fn source_span_position(span: SourceSpan) -> (u32, u32) {
@@ -1147,19 +1152,27 @@ impl DiagnosticEngine {
                 &overrides,
             )?;
         // Module expansion is a no-op for configs without `module_call`.
-        // Retain an error while continuing with the partially expanded parse:
-        // source-level checks still have useful work to do, and concrete
-        // value-constraint failures are surfaced at the owning call site.
+        // Failures retain the authored parse for source-level checks; only the
+        // successful outcome can replace it with the expanded graph.
         let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
-            &mut result.parsed,
+            &result.parsed,
             base_path,
             &self.provider_context,
             &self.schemas,
         );
-        let carina_core::module_resolver::ModuleResolutionDiagnosticReport {
-            constraint_reports,
-            status,
-        } = module_resolution;
+        let module_resolution = match module_resolution {
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+                result.parsed = *graph;
+                MergedModuleResolution::Expanded
+            }
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+                findings,
+                errors,
+            } => MergedModuleResolution::ConstraintFailed { findings, errors },
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+                MergedModuleResolution::Unowned { errors }
+            }
+        };
         let _ = carina_core::parser::resolve_provider_unresolved_attributes(
             &mut result.parsed,
             &self.provider_context,
@@ -1167,8 +1180,7 @@ impl DiagnosticEngine {
         let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
         Ok(MergedParseResult {
             directory: result,
-            module_resolution_status: status,
-            module_constraint_reports: constraint_reports,
+            module_resolution,
         })
     }
 

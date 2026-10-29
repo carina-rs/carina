@@ -690,6 +690,248 @@ fn uncalled_import_type_resolution_error_has_cli_lsp_parity_and_declaration_rang
 }
 
 #[test]
+fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
+    let fixture = tempfile::tempdir().expect("standalone type-resolution parity fixture");
+    let module = fixture.path().join("module");
+    std::fs::create_dir_all(&module).expect("create standalone module");
+    let declaration_source = "arguments {\n  x: NoSuchType\n}\n";
+    std::fs::write(module.join("arguments.crn"), declaration_source)
+        .expect("write module arguments");
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  loaded: Bool = true\n}\n",
+    )
+    .expect("write module attributes");
+
+    let schemas = module_call_parity_schemas();
+    let cli = cli_diagnostics_at(factories_for(&schemas), &module);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(schemas),
+        &fixture,
+        "module/arguments.crn",
+    );
+    let message = "argument 'x': unknown custom type 'NoSuchType'";
+    let cli_diagnostic = cli
+        .iter()
+        .find(|diagnostic| diagnostic.contains(message))
+        .unwrap_or_else(|| panic!("missing CLI type-resolution diagnostic: {cli:#?}"));
+    let lsp_diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("missing LSP type-resolution diagnostic: {lsp:#?}"));
+
+    assert!(
+        cli_diagnostic.contains("module/arguments.crn at line 2\n"),
+        "CLI must retain the declaration file and one-based line: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_diagnostic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 5),
+            tower_lsp::lsp_types::Position::new(1, 15),
+        ),
+        "LSP must underline the same line-two declaration named by the CLI",
+    );
+}
+
+#[test]
+fn nested_constraint_keeps_cli_location_and_lsp_owner_range() {
+    let fixture = tempfile::tempdir().expect("nested located-constraint parity fixture");
+    let outer = fixture.path().join("outer");
+    let checked = fixture.path().join("checked");
+    for directory in [&outer, &checked] {
+        std::fs::create_dir_all(directory).expect("create module directory");
+    }
+    let root_source = r#"let outer = use { source = "./outer" }
+
+let instance = outer {}
+"#;
+    let outer_source = r#"let checked = use { source = "../checked" }
+
+checked {
+  name = ""
+}
+
+attributes { loaded: Bool = true }
+"#;
+    std::fs::write(fixture.path().join("main.crn"), root_source).expect("write root call");
+    std::fs::write(outer.join("main.crn"), outer_source).expect("write nested call");
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition = length(name) > 0
+      error_message = "nested name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .expect("write checked arguments");
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .expect("write checked attributes");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let engine = engine_with_schemas(SchemaRegistry::new());
+    let root_lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let nested_lsp = lsp_diagnostics(&engine, &fixture, "outer/main.crn");
+    let message = "anonymous call to module 'checked': argument 'name': nested name must not be empty (got '')";
+    let cli_diagnostic = cli
+        .iter()
+        .find(|diagnostic| diagnostic.contains(message))
+        .unwrap_or_else(|| panic!("missing CLI nested constraint: {cli:#?}"));
+    let root_diagnostic = root_lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("missing routed root LSP constraint: {root_lsp:#?}"));
+    let nested_diagnostic = nested_lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("missing nested-file LSP constraint: {nested_lsp:#?}"));
+
+    assert!(
+        cli_diagnostic.contains("outer/main.crn at line 4\n"),
+        "CLI must retain the immediate nested argument location: {cli:#?}",
+    );
+    assert_eq!(
+        nested_diagnostic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(3, 2),
+            tower_lsp::lsp_types::Position::new(3, 6),
+        ),
+        "the CLI line-four anchor and nested LSP range must name the same argument",
+    );
+    assert_eq!(
+        root_diagnostic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(2, 15),
+            tower_lsp::lsp_types::Position::new(2, 23),
+        ),
+        "the typed finding must retain its root owner for editor routing",
+    );
+}
+
+#[test]
+fn constraint_and_later_unknown_argument_are_collected_by_cli_and_lsp() {
+    let fixture = tempfile::tempdir().expect("collect-all module-call parity fixture");
+    let checked = fixture.path().join("checked");
+    let other = fixture.path().join("other");
+    let leaf = fixture.path().join("leaf");
+    for directory in [&checked, &other, &leaf] {
+        std::fs::create_dir_all(directory).expect("create module directory");
+    }
+    std::fs::write(
+        fixture.path().join("imports.crn"),
+        r#"let checked = use { source = "./checked" }
+let other = use { source = "./other" }
+"#,
+    )
+    .expect("write root imports");
+    let calls_source = r#"checked {
+  name = ""
+}
+
+other {
+}
+"#;
+    std::fs::write(fixture.path().join("calls.crn"), calls_source).expect("write root calls");
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .expect("write checked arguments");
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .expect("write checked attributes");
+    std::fs::write(
+        other.join("arguments.crn"),
+        "attributes {\n  loaded: Bool = true\n}\n",
+    )
+    .expect("write other attributes");
+    std::fs::write(
+        other.join("imports.crn"),
+        "let leaf = use { source = '../leaf' }\n",
+    )
+    .expect("write nested import");
+    std::fs::write(
+        other.join("calls.crn"),
+        "leaf {\n  known = true\n  bogus = true\n}\n",
+    )
+    .expect("write nested invalid call");
+    std::fs::write(
+        leaf.join("arguments.crn"),
+        "arguments {\n  known: Bool\n}\n",
+    )
+    .expect("write leaf arguments");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "calls.crn",
+    );
+    let constraint =
+        "anonymous call to module 'checked': argument 'name': name must not be empty (got '')";
+    let unknown = "Unknown argument 'bogus' for module 'leaf'";
+    let expected = canonical_error_multiset([constraint.to_string(), unknown.to_string()]);
+
+    assert_eq!(
+        cli_located_error_multiset(&cli),
+        expected,
+        "CLI must report the constraint and later resolver failure together: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_error_multiset(&lsp),
+        expected,
+        "LSP must report the same two typed findings: {lsp:#?}",
+    );
+    let cli_unknown = cli
+        .iter()
+        .find(|diagnostic| diagnostic.contains(unknown))
+        .unwrap_or_else(|| panic!("missing CLI nested unknown argument: {cli:#?}"));
+    assert!(
+        cli_unknown.contains("other/calls.crn at line 3\n"),
+        "CLI must retain the nested argument anchor: {cli:#?}",
+    );
+    for (message, range) in [
+        (
+            constraint,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(1, 2),
+                tower_lsp::lsp_types::Position::new(1, 6),
+            ),
+        ),
+        (
+            unknown,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(4, 0),
+                tower_lsp::lsp_types::Position::new(5, 1),
+            ),
+        ),
+    ] {
+        let diagnostic = lsp
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .unwrap_or_else(|| panic!("missing LSP diagnostic {message:?}: {lsp:#?}"));
+        assert_eq!(diagnostic.range, range);
+    }
+}
+
+#[test]
 fn nested_constraint_failure_routes_each_instance_message_to_its_root_call() {
     let fixture = tempfile::tempdir().expect("nested repeated-constraint parity fixture");
     let outer = fixture.path().join("outer");
@@ -1289,11 +1531,10 @@ let instance = checked {
         .filter(|diagnostic| diagnostic.message.contains("x must be greater than five"))
         .map(|diagnostic| diagnostic.message.as_str())
         .collect::<Vec<_>>();
-    let cli_constraint_messages = cli_diags
-        .iter()
-        .filter(|diagnostic| diagnostic.contains("x must be greater than five"))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let cli_constraint_messages = cli_located_message_multiset(&cli_diags)
+        .into_iter()
+        .filter(|(message, _count)| message.contains("x must be greater than five"))
+        .collect::<BTreeMap<_, _>>();
 
     assert_eq!(
         lsp_constraint_messages.len(),
@@ -1305,7 +1546,10 @@ let instance = checked {
         1,
         "CLI must report the evaluator error once: {cli_constraint_messages:#?}; all diagnostics: {cli_diags:#?}"
     );
-    assert_eq!(lsp_constraint_messages, cli_constraint_messages);
+    assert_eq!(
+        cli_constraint_messages.get(lsp_constraint_messages[0]),
+        Some(&1),
+    );
     assert_eq!(
         lsp_constraint_messages,
         [
@@ -1456,15 +1700,11 @@ checked {
         .filter(|diagnostic| diagnostic.message.contains("name must not be empty"))
         .map(|diagnostic| diagnostic.message.as_str())
         .collect::<Vec<_>>();
-    let cli_messages = cli_diags
-        .iter()
-        .filter(|diagnostic| diagnostic.contains("name must not be empty"))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let cli_messages = cli_located_message_multiset(&cli_diags);
 
     assert_eq!(lsp_messages.len(), 1, "LSP diagnostics: {lsp_diags:#?}");
     assert_eq!(cli_messages.len(), 1, "CLI diagnostics: {cli_diags:#?}");
-    assert_eq!(lsp_messages, cli_messages);
+    assert_eq!(cli_messages.get(lsp_messages[0]), Some(&1));
     assert_eq!(
         lsp_messages,
         ["anonymous call to module 'checked': argument 'name': name must not be empty (got '')"]

@@ -449,6 +449,28 @@ fn extend_module_call_errors(
     );
 }
 
+fn extend_uncovered_module_resolution_errors(
+    errors: &mut Vec<AppError>,
+    residuals: &[carina_core::module_resolver::ResidualModuleResolutionError],
+    findings: &[carina_core::validation::ModuleCallFinding],
+    base_dir: &Path,
+) {
+    for residual in residuals {
+        if residual.is_covered_by_module_call_findings(findings) {
+            continue;
+        }
+        let message = if residual.is_constraint() {
+            residual.display_relative_to(base_dir)
+        } else {
+            format!(
+                "Module resolution error: {}",
+                residual.display_relative_to(base_dir)
+            )
+        };
+        errors.push(AppError::Config(message));
+    }
+}
+
 fn extend_expanded_binding_use_errors(
     errors: &mut Vec<AppError>,
     report: &carina_core::validation::BindingUseReport,
@@ -581,9 +603,14 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // standalone-module-validate path so a typo or renamed-then-
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
-    for finding in carina_core::validation::resolve_file_type_exprs(parsed, &enriched_context) {
-        errors.push(AppError::Validation(finding.to_string()));
+    let mut root_type_resolution_findings = Vec::new();
+    for diagnostic in carina_core::validation::resolve_file_type_exprs(parsed, &enriched_context) {
+        match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
+            Ok(finding) => root_type_resolution_findings.push(finding),
+            Err(diagnostic) => errors.push(AppError::TypeResolution(Box::new(diagnostic))),
+        }
     }
+    extend_module_call_errors(&mut errors, root_type_resolution_findings);
     if let Err(error) =
         carina_core::parser::resolve_resource_refs_with_config(parsed, &enriched_context)
     {
@@ -637,7 +664,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         extend_binding_use_errors(&mut errors, &report);
     }
 
-    {
+    let authored_module_call_findings = {
         let module_call_bindings =
             carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
                 parsed,
@@ -649,23 +676,18 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         } else {
             carina_core::validation::ModuleCallReferenceChecks::Enabled
         };
-        extend_module_call_errors(
-            &mut errors,
-            carina_core::validation::check_module_calls(
-                carina_core::validation::ModuleCallCheckInput {
-                    authored: parsed,
-                    semantic: Some(parsed),
-                    base_dir: Some(base_dir),
-                    imported_signatures: &imported_module_signatures,
-                    provider_context: &enriched_context,
-                    schemas: ctx.schemas(),
-                    binding_use_report: &binding_use_report,
-                    bindings: &module_call_bindings,
-                    reference_checks,
-                },
-            ),
-        );
-    }
+        carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base_dir),
+            imported_signatures: &imported_module_signatures,
+            provider_context: &enriched_context,
+            schemas: ctx.schemas(),
+            binding_use_report: &binding_use_report,
+            bindings: &module_call_bindings,
+            reference_checks,
+        })
+    };
 
     // User-facing checks for root-owned blocks inside modules run on the
     // recursive module walk so validate/plan/apply can collect path-prefixed
@@ -685,10 +707,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         errors.extend(validate_no_exports_in_modules(&module_walk));
     }
 
-    // Module expansion assumes the checks above succeeded — feeding
-    // broken module calls into the diagnostic resolver can
-    // surface confusing secondary errors, so gate it here.
+    // Non-module-call failures do not have a sound expansion path. Authored
+    // module-call findings remain separate so diagnostic resolution can
+    // collect concrete constraint outcomes before all typed findings are
+    // merged below.
     if !errors.is_empty() {
+        extend_module_call_errors(&mut errors, authored_module_call_findings);
         return Err(errors);
     }
 
@@ -698,44 +722,52 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         &enriched_context,
         ctx.schemas(),
     );
-    let module_resolver::ModuleResolutionDiagnosticReport {
-        constraint_reports,
-        status: module_resolution_status,
-    } = module_resolution;
-    errors.extend(
-        carina_core::validation::check_expanded_module_calls(
-            carina_core::validation::ExpandedModuleCallCheckInput::Constraints {
-                compositions: &parsed.compositions,
-                constraint_reports: &constraint_reports,
-            },
-        )
-        .into_iter()
-        .map(|finding| AppError::Validation(finding.message().to_string())),
-    );
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    if let Some(error) = module_resolution_status.unowned_error() {
-        // A cycle or other expansion failure leaves no complete composition
-        // graph for the unified boundary pass. Preserve source-local
-        // `attributes {}` diagnostics that do not depend on expansion; this
-        // fallback never runs on the successful path, so it cannot duplicate
-        // composition diagnostics.
-        errors.extend(validate_module_attribute_refs_after_expansion_failure(
-            ctx,
-            &module_walk,
-            &enriched_context,
-        ));
-        let message = if error.is_constraint() {
-            error.display_relative_to(base_dir)
-        } else {
-            format!(
-                "Module resolution error: {}",
-                error.display_relative_to(base_dir)
-            )
-        };
-        errors.push(AppError::Config(message));
-        return Err(errors);
+    match module_resolution {
+        module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            *parsed = *graph;
+            extend_module_call_errors(&mut errors, authored_module_call_findings);
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+        }
+        module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+            findings: constraint_findings,
+            errors: residuals,
+        } => {
+            let findings = carina_core::validation::merge_module_call_findings([
+                authored_module_call_findings,
+                constraint_findings,
+            ]);
+            let has_uncovered_residual = residuals
+                .iter()
+                .any(|residual| !residual.is_covered_by_module_call_findings(&findings));
+            extend_module_call_errors(&mut errors, findings.clone());
+            if has_uncovered_residual {
+                errors.extend(validate_module_attribute_refs_after_expansion_failure(
+                    ctx,
+                    &module_walk,
+                    &enriched_context,
+                ));
+            }
+            extend_uncovered_module_resolution_errors(&mut errors, &residuals, &findings, base_dir);
+            return Err(errors);
+        }
+        module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
+            let findings = authored_module_call_findings;
+            let has_uncovered_residual = residuals
+                .iter()
+                .any(|residual| !residual.is_covered_by_module_call_findings(&findings));
+            extend_module_call_errors(&mut errors, findings.clone());
+            if has_uncovered_residual {
+                errors.extend(validate_module_attribute_refs_after_expansion_failure(
+                    ctx,
+                    &module_walk,
+                    &enriched_context,
+                ));
+            }
+            extend_uncovered_module_resolution_errors(&mut errors, &residuals, &findings, base_dir);
+            return Err(errors);
+        }
     }
 
     // Module expansion produces composition resources for module-call

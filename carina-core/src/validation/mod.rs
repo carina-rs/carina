@@ -4544,6 +4544,44 @@ impl ModuleCallFindingMessage {
             | Self::Constraint(_) => false,
         }
     }
+
+    pub(crate) fn covers_type_resolution_parser_error(
+        &self,
+        source_file: &std::path::Path,
+        parse_error: &crate::parser::ParseError,
+    ) -> bool {
+        match self {
+            Self::TypeResolution(diagnostic) => {
+                diagnostic.covers_parser_error(source_file, parse_error)
+            }
+            Self::UnknownArgument {
+                module: _,
+                argument: _,
+                suggestion: _,
+            }
+            | Self::MissingRequiredArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::ValueType {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::HandleSink {
+                call_label: _,
+                argument: _,
+                error: _,
+            }
+            | Self::BindingUse {
+                argument: _,
+                error: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::AttributeReference(_)
+            | Self::Constraint(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ModuleCallFindingMessage {
@@ -4645,6 +4683,28 @@ pub struct ModuleCallFinding {
 }
 
 impl ModuleCallFinding {
+    pub fn try_from_type_resolution(
+        diagnostic: TypeResolutionDiagnostic,
+    ) -> Result<Self, TypeResolutionDiagnostic> {
+        let Some(location) = diagnostic.source_location().cloned() else {
+            return Err(diagnostic);
+        };
+        let anchor = ModuleCallFindingAnchor {
+            source_file: location.source_file().clone(),
+            span: location.span(),
+        };
+        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
+        Ok(Self {
+            kind: ModuleCallFindingKind::TypeResolution,
+            owners: vec![ModuleCallFindingOwner {
+                root: owner.clone(),
+                immediate: owner,
+            }],
+            anchor,
+            message: ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
+        })
+    }
+
     pub fn kind(&self) -> ModuleCallFindingKind {
         self.kind
     }
