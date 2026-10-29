@@ -10,10 +10,23 @@ pub(crate) fn render_plan_errors_and_abort<S>(plan: &Plan<S>) -> Result<(), AppE
         return Ok(());
     }
 
+    Err(render_plan_errors(errors))
+}
+
+fn render_plan_errors(errors: &[PlanError]) -> AppError {
     for err in errors {
         eprintln!("{} {}", "Error:".red().bold(), err);
     }
-    Err(AppError::Validation(plan_error_summary(errors)))
+    AppError::Validation(plan_error_summary(errors))
+}
+
+impl<R> crate::wiring::PostExpansionDiagnostics<R> {
+    /// Render this diagnostic outcome in plan-error order and return the
+    /// command error that must abort apply. There is deliberately no success
+    /// branch: receiving this type already selected the diagnostic outcome.
+    pub(crate) fn render_and_abort(&self) -> AppError {
+        render_plan_errors(self.plan().errors())
+    }
 }
 
 fn plan_error_summary(errors: &[PlanError]) -> String {

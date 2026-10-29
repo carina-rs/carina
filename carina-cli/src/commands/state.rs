@@ -1311,7 +1311,6 @@ pub(crate) async fn run_state_refresh_locked(
     }
     let mut prepared_expansion = addressed_expansion.seal(data_source_values);
     let crate::wiring::ExpandedRefreshState {
-        canonical_resources: _,
         sorted_resources: resorted,
         new_child_ids: _,
         refreshable_child_ids: _,

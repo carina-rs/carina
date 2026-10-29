@@ -36,14 +36,32 @@ impl Project {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_carina"))
-            .current_dir(&self.root)
-            .env("NO_COLOR", "1")
-            .env_remove("CLICOLOR_FORCE")
-            .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+        self.run_in(&self.root, args)
+    }
+
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        let mut command = self.command_in(&self.root);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.args(args).output().expect("run carina")
+    }
+
+    fn run_in(&self, directory: &Path, args: &[&str]) -> Output {
+        self.command_in(directory)
             .args(args)
             .output()
             .expect("run carina")
+    }
+
+    fn command_in(&self, directory: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+        command
+            .current_dir(directory)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state);
+        command
     }
 
     fn assert_success(&self, label: &str, output: &Output) {
@@ -68,6 +86,50 @@ impl Project {
             .unwrap_or_else(|| panic!("missing mock provider resource {source_name:?}"));
         source["generated_rules"] = serde_json::json!([{ "action": action }]);
         write_json(&self.mock_state, &provider);
+    }
+
+    fn write_upstream(&self, name: &str, main: &str) -> PathBuf {
+        let directory = self
+            .root
+            .parent()
+            .expect("downstream project has a parent")
+            .join(name);
+        fs::create_dir_all(&directory).expect("create upstream project");
+        fs::write(
+            directory.join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .expect("write upstream backend configuration");
+        fs::write(directory.join("providers.crn"), "provider mock {}\n")
+            .expect("write upstream provider configuration");
+        fs::write(directory.join("main.crn"), main).expect("write upstream configuration");
+        directory
+    }
+
+    fn add_upstream(&self, name: &str, main: &str) -> PathBuf {
+        let directory = self.write_upstream(name, main);
+        let init = self.run_in(&directory, &["init", "."]);
+        self.assert_success("upstream carina init", &init);
+        let apply = self.run_in(
+            &directory,
+            &["apply", "--auto-approve", "--lock=false", "."],
+        );
+        self.assert_success("upstream carina apply", &apply);
+        directory
+    }
+
+    fn state_resource_attributes(&self, identity: &str) -> serde_json::Map<String, Value> {
+        let state: Value = read_json(&self.root.join("carina.state.json"));
+        let resource = state["resources"]
+            .as_array()
+            .expect("state resources")
+            .iter()
+            .find(|resource| resource["identity"] == identity)
+            .unwrap_or_else(|| panic!("missing state resource {identity:?}"));
+        resource["current"]["attributes"]
+            .as_object()
+            .expect("state resource attributes")
+            .clone()
     }
 }
 
@@ -156,6 +218,135 @@ let validation_records = for rule in cert.generated_rules {
             "{label} did not produce the same child update:\n{rendered}",
         );
     }
+    assert_eq!(
+        project.state_resource_attributes("validation_records[0]")["comment"],
+        "after",
+        "live apply must persist the materialized child's updated value",
+    );
+    let follow_up = project.run(&["plan", "."]);
+    project.assert_success("follow-up plan", &follow_up);
+    let follow_up_text = output_text(&follow_up);
+    assert!(
+        follow_up_text.contains("No changes"),
+        "follow-up plan must converge:\n{follow_up_text}",
+    );
+}
+
+#[test]
+fn live_apply_uses_apply_mode_for_upstream_value_on_materialized_child() {
+    let temp = tempfile::tempdir().expect("create temporary project root");
+    let root = temp.path().join("downstream");
+    fs::create_dir_all(&root).expect("create downstream project");
+    fs::write(
+        root.join("backend.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .expect("write backend configuration");
+    fs::write(root.join("providers.crn"), "provider mock {}\n")
+        .expect("write provider configuration");
+    fs::write(
+        root.join("main.crn"),
+        r#"let cert = mock.test.deferred_source {
+  name = "certificate"
+}
+"#,
+    )
+    .expect("write initial configuration");
+    let project = Project {
+        mock_state: root.join("mock-provider-state.json"),
+        root,
+        _temp: temp,
+    };
+    project.assert_success("carina init", &project.run(&["init", "."]));
+    let initial_apply = project.run(&["apply", "--auto-approve", "--lock=false", "."]);
+    project.assert_success("initial apply", &initial_apply);
+    project.inject_generated_rule("certificate", "validation-record");
+
+    project.write_main(
+        r#"let cert = mock.test.deferred_source {
+  name = "certificate"
+}
+
+let validation_records = for rule in cert.generated_rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = "before"
+  }
+}
+"#,
+    );
+    let materialize = project.run(&["apply", "--auto-approve", "--lock=false", "."]);
+    project.assert_success("materialize deferred-for child", &materialize);
+
+    let upstream = project.add_upstream(
+        "upstream",
+        r#"let seed = mock.test.resource {
+  name = "upstream-seed"
+}
+
+exports {}
+"#,
+    );
+    fs::write(
+        upstream.join("main.crn"),
+        r#"exports {
+  child_comment: String = "unused-until-upstream-apply"
+}
+"#,
+    )
+    .expect("declare an export missing from upstream state");
+    project.write_main(
+        r#"let up = upstream_state {
+  source = "../upstream"
+}
+
+let cert = mock.test.deferred_source {
+  name = "certificate"
+}
+
+let imported = mock.test.resource {
+  name = "imported-name"
+}
+
+import {
+  to = mock.test.resource 'imported'
+  id = "${up.child_comment}"
+}
+
+let validation_records = for rule in cert.generated_rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = "after"
+  }
+}
+"#,
+    );
+
+    let captured_plan = project.root.join("live-apply-plan.json");
+    let apply = project.run_with_env(
+        &["apply", "--lock=false", "."],
+        &[(
+            "CARINA_TEST_CAPTURE_LIVE_APPLY_PLAN",
+            captured_plan.as_path(),
+        )],
+    );
+    project.assert_success("live apply with unresolved upstream import", &apply);
+    let apply_text = output_text(&apply);
+    assert!(
+        apply_text.contains("mock.test.resource validation_records[0]")
+            && apply_text.contains("'before' → 'after'"),
+        "ApplyMode must still build the materialized-child update:\n{apply_text}",
+    );
+    let captured = read_json(&captured_plan);
+    let encoded_plan = captured.to_string();
+    assert!(
+        encoded_plan.contains("ResourceRef") && encoded_plan.contains("child_comment"),
+        "ApplyMode must preserve the strict unresolved import identifier: {captured:#?}",
+    );
+    assert!(
+        !encoded_plan.contains("UpstreamRef") && !encoded_plan.contains("upstream_ref"),
+        "ApplyMode must not stamp PlanMode's upstream marker: {captured:#?}",
+    );
 }
 
 #[test]
@@ -195,4 +386,64 @@ fn plan_json_prints_moved_hint_only_to_stderr() {
         !stdout.contains("Warning: this plan destroys") && !stdout.contains("moved {"),
         "moved hint contaminated JSON stdout:\n{stdout}",
     );
+}
+
+fn project_with_moved_hint() -> Project {
+    let project = Project::new(
+        r#"let old_resource = mock.test.resource {
+  name = "stable-name"
+}
+"#,
+    );
+    let initial_apply = project.run(&["apply", "--auto-approve", "--lock=false", "."]);
+    project.assert_success("initial apply", &initial_apply);
+    project.write_main(
+        r#"let new_resource = mock.test.resource {
+  name = "stable-name"
+}
+"#,
+    );
+    project
+}
+
+fn assert_moved_hint(stderr: &[u8], label: &str) {
+    let stderr = String::from_utf8_lossy(stderr);
+    assert!(
+        stderr.contains("Warning: this plan destroys mock.test.resource 'old_resource'")
+            && stderr.contains("  moved {")
+            && stderr.contains("from = mock.test.resource 'old_resource'")
+            && stderr.contains("to   = mock.test.resource 'new_resource'"),
+        "{label} did not print the complete moved-block hint on stderr:\n{stderr}",
+    );
+}
+
+#[test]
+fn live_apply_prints_moved_hint_to_stderr() {
+    let project = project_with_moved_hint();
+
+    let apply = project.run(&["apply", "--auto-approve", "--lock=false", "."]);
+    project.assert_success("live apply", &apply);
+    assert_moved_hint(&apply.stderr, "live apply");
+}
+
+#[test]
+fn saved_plan_apply_prints_moved_hint_to_stderr() {
+    let project = project_with_moved_hint();
+    let plan = project.run(&["plan", "--refresh=false", "--out", "moved.plan.json", "."]);
+    project.assert_success("save plan", &plan);
+
+    let saved_plan: Value = read_json(&project.root.join("moved.plan.json"));
+    let current_states = saved_plan["current_states"]
+        .as_array()
+        .expect("saved plan current_states");
+    assert!(
+        current_states.iter().any(|entry| {
+            entry["kind"] == "managed" && entry["id"]["identity"] == "old_resource"
+        }),
+        "saved plan must retain the orphan row needed by the hint: {current_states:#?}",
+    );
+
+    let apply = project.run(&["apply", "--auto-approve", "--lock=false", "moved.plan.json"]);
+    project.assert_success("saved-plan apply", &apply);
+    assert_moved_hint(&apply.stderr, "saved-plan apply");
 }

@@ -1454,6 +1454,20 @@ fn snapshot_moved_let_to_for_unbound() {
     assert_pure_move_snapshot("moved_let_to_for_unbound", "_for0[0]");
 }
 
+/// Map iteration uses the canonical dot-form element address when the key is
+/// a valid identifier.
+#[test]
+fn snapshot_moved_let_to_for_map() {
+    assert_pure_move_snapshot("moved_let_to_for_map", "vpcs.a");
+}
+
+/// An unbound loop over `a.b` derives its positional address from the final
+/// reference field, rather than from the generic `_for{N}` counter.
+#[test]
+fn snapshot_moved_let_to_for_unbound_reference() {
+    assert_pure_move_snapshot("moved_let_to_for_unbound_reference", "_b[0]");
+}
+
 /// A loop expanded from a list held in live resource state accepts the same
 /// explicit move and remains a pure state operation.
 #[test]

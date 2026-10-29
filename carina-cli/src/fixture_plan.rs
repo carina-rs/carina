@@ -194,7 +194,14 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                 .attribute(create_only_string("target_id"))
                 .attribute(create_only_string("target_type")),
         ),
-        awscc(ResourceSchema::new("test.Widget").attribute(create_only_string("external_name"))),
+        awscc(
+            ResourceSchema::new("test.Widget")
+                .attribute(create_only_string("external_name"))
+                .attribute(
+                    AttributeSchema::optional("b", AttributeType::list(AttributeType::string()))
+                        .build(),
+                ),
+        ),
     ];
     schemas
         .into_iter()
@@ -528,6 +535,15 @@ where
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for post-expansion plan construction");
+        let validated_expansion = match state_file.as_ref() {
+            Some(state_file) => rt
+                .block_on(
+                    validated_expansion
+                        .settle_expanded_children_from_cache(&provider_router, state_file),
+                )
+                .expect("fixture expanded-child cached-state restore must succeed"),
+            None => validated_expansion.settle_expanded_children_absent(),
+        };
         rt.block_on(
             validated_expansion.finish_post_expansion_plan::<crate::wiring::PlanMode>(
                 crate::wiring::PostExpansionPlanEnvironment {

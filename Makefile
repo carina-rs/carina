@@ -120,6 +120,10 @@ plan-moved-let-to-for-bound:
 	$(PLAN_FIXTURE) moved_let_to_for_bound
 plan-moved-let-to-for-unbound:
 	$(PLAN_FIXTURE) moved_let_to_for_unbound
+plan-moved-let-to-for-map:
+	$(PLAN_FIXTURE) moved_let_to_for_map
+plan-moved-let-to-for-unbound-reference:
+	$(PLAN_FIXTURE) moved_let_to_for_unbound_reference
 plan-moved-let-to-for-read-loop:
 	$(PLAN_FIXTURE) moved_let_to_for_read_loop
 plan-moved-let-to-for-read-loop-module:
@@ -254,6 +258,12 @@ plan-fixtures:
 	@echo ""
 	@echo "=== moved_let_to_for_unbound ==="
 	@$(MAKE) plan-moved-let-to-for-unbound
+	@echo ""
+	@echo "=== moved_let_to_for_map ==="
+	@$(MAKE) plan-moved-let-to-for-map
+	@echo ""
+	@echo "=== moved_let_to_for_unbound_reference ==="
+	@$(MAKE) plan-moved-let-to-for-unbound-reference
 	@echo ""
 	@echo "=== moved_let_to_for_read_loop ==="
 	@$(MAKE) plan-moved-let-to-for-read-loop
@@ -404,7 +414,9 @@ plan-multi-instance-module:
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
         plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-nested-write-only plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
-        plan-moved-let-to-for-bound plan-moved-let-to-for-unbound plan-moved-let-to-for-read-loop \
+        plan-moved-let-to-for-bound plan-moved-let-to-for-unbound \
+        plan-moved-let-to-for-map plan-moved-let-to-for-unbound-reference \
+        plan-moved-let-to-for-read-loop \
         plan-moved-let-to-for-read-loop-module \
         plan-moved-hint-let-to-for plan-moved-hint-read-loop plan-moved-hint-read-loop-module \
         plan-moved-hint-ambiguous \

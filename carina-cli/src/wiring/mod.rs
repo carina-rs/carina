@@ -1495,7 +1495,7 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
             P,
             PreparedAddressPreservingDeferredForExpansion,
         >,
-    ) -> Result<ExpandedRefreshState<()>, AppError> {
+    ) -> Result<ExpandedRefreshState, AppError> {
         let Self { wiring, resources } = self;
         let ValidatedExpandRefreshAndLiftInputs {
             provider,
@@ -1582,7 +1582,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         prepared: PreparedDeferredForExpansion,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
-    ) -> Result<ValidatedConfig<PostExpansionPlanView<E>>, AppError> {
+    ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>>, AppError> {
         let Self { wiring, resources } = self;
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
@@ -4459,7 +4459,7 @@ impl<'state> DetectedDeferredForExpansionPrelude<'state> {
             RefreshResourceSetInputs {
                 provider: inputs.provider,
                 refresh_phase: inputs.refresh_phase,
-                state_file: self.prelude.state_file,
+                state_file: self.prelude.state_file.as_ref(),
                 schemas: inputs.schemas,
                 saved_dep_bindings: &saved_dep_bindings,
             },
@@ -4704,25 +4704,16 @@ pub struct PreparedDeferredForExpansion(DeferredForExpansionInputs, RefreshedPre
 pub struct PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs);
 
 trait PreparedExpansionInputs {
-    fn inputs(&self) -> &DeferredForExpansionInputs;
     fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs;
 }
 
 impl PreparedExpansionInputs for PreparedDeferredForExpansion {
-    fn inputs(&self) -> &DeferredForExpansionInputs {
-        &self.0
-    }
-
     fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs {
         &mut self.0
     }
 }
 
 impl PreparedExpansionInputs for PreparedAddressPreservingDeferredForExpansion {
-    fn inputs(&self) -> &DeferredForExpansionInputs {
-        &self.0
-    }
-
     fn inputs_mut(&mut self) -> &mut DeferredForExpansionInputs {
         &mut self.0
     }
@@ -4921,12 +4912,25 @@ pub fn derive_managed_binding_stability<E>(
     Ok(stability)
 }
 
+/// Expanded children whose prior-state transition has not run yet.
+pub(crate) struct ChildrenPending {
+    new_child_ids: HashSet<ResourceId>,
+    refreshable_child_ids: RefreshableChildIds,
+    printed_warnings: bool,
+}
+
+/// Proof that every expanded child was refreshed, restored from cached state,
+/// or explicitly marked absent.
+pub(crate) struct ChildrenSettled;
+
 /// Canonical resources, state, and expansion metadata produced together by
 /// [`PreparedDeferredForExpansion::expand_for_plan`].
 ///
 /// The fields are private so a pre-expansion resource order cannot be paired
-/// with a post-expansion canonical resource witness at the plan seam.
-pub(crate) struct PostExpansionPlanView<E> {
+/// with a post-expansion canonical resource witness at the plan seam. The
+/// `C` marker additionally prevents that seam from accepting expanded loop
+/// children before their prior-state transition has completed.
+struct PostExpansionPlanData<E> {
     expanded_resources: ExpandedCanonicalResources<E>,
     sorted_resources: Vec<Resource>,
     addressed: AddressedState,
@@ -4934,15 +4938,71 @@ pub(crate) struct PostExpansionPlanView<E> {
     wait_aliases: Vec<WaitAliasSpec>,
     residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     deferred_create_targets: Vec<DeferredCreateTarget>,
-    new_child_ids: HashSet<ResourceId>,
-    refreshable_child_ids: RefreshableChildIds,
-    printed_warnings: bool,
+}
+
+pub(crate) struct PostExpansionPlanView<E, C> {
+    data: PostExpansionPlanData<E>,
+    children: C,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-impl<E> PostExpansionPlanView<E> {
+impl<E, C> PostExpansionPlanView<E, C> {
     pub(crate) fn parsed(&self) -> &carina_core::parser::File<E> {
-        self.expanded_resources.parsed()
+        self.data.expanded_resources.parsed()
+    }
+}
+
+struct LiveExpandedChildrenInputs<'a, 'backend> {
+    provider: &'a dyn Provider,
+    normalizer: &'a dyn ProviderNormalizer,
+    state_file: &'a StateFile,
+    saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    refresh_phase: &'a RefreshPhase<'backend>,
+    schemas: &'a SchemaRegistry,
+}
+
+struct CachedExpandedChildrenInputs<'a> {
+    normalizer: &'a dyn ProviderNormalizer,
+    state_file: &'a StateFile,
+    schemas: &'a SchemaRegistry,
+}
+
+impl<E> PostExpansionPlanView<E, ChildrenPending> {
+    async fn settle_children_live(
+        self,
+        inputs: LiveExpandedChildrenInputs<'_, '_>,
+    ) -> Result<PostExpansionPlanView<E, ChildrenSettled>, AppError> {
+        let Self { mut data, children } = self;
+        settle_expanded_children_live(&mut data, children, inputs).await?;
+        Ok(PostExpansionPlanView {
+            data,
+            children: ChildrenSettled,
+        })
+    }
+
+    async fn settle_children_from_cache(
+        self,
+        inputs: CachedExpandedChildrenInputs<'_>,
+    ) -> Result<PostExpansionPlanView<E, ChildrenSettled>, AppError> {
+        let Self { mut data, children } = self;
+        settle_expanded_children_from_cache(&mut data, children, inputs).await?;
+        Ok(PostExpansionPlanView {
+            data,
+            children: ChildrenSettled,
+        })
+    }
+
+    fn settle_children_absent(
+        self,
+        schemas: &SchemaRegistry,
+        refresh_phase: Option<&RefreshPhase<'_>>,
+    ) -> PostExpansionPlanView<E, ChildrenSettled> {
+        let Self { mut data, children } = self;
+        settle_expanded_children_absent(&mut data, children, schemas, refresh_phase);
+        PostExpansionPlanView {
+            data,
+            children: ChildrenSettled,
+        }
     }
 }
 
@@ -4997,7 +5057,7 @@ pub(crate) trait PostExpansionMode: post_expansion_mode::Sealed + Sized {
 /// two traits; this seam itself has no fixture-specific branches.
 pub(crate) struct PostExpansionPlanInput<'a, E> {
     pub context: &'a WiringContext,
-    pub expansion: PostExpansionPlanView<E>,
+    pub expansion: PostExpansionPlanView<E, ChildrenSettled>,
     pub environment: PostExpansionPlanEnvironment<'a>,
 }
 
@@ -5154,20 +5214,15 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
     pub resources: M::Resources,
 }
 
-/// A preparation failure. Private construction retains proof that its plan has
-/// at least one diagnostic, so consumers can render-and-abort without an
-/// optional resource payload or a runtime assertion.
+/// A preparation failure with a diagnostic plan and the artifacts callers
+/// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
-    _error_count: std::num::NonZeroUsize,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>, error_count: std::num::NonZeroUsize) -> Self {
-        Self {
-            artifacts,
-            _error_count: error_count,
-        }
+    fn new(artifacts: PostExpansionArtifacts<R>) -> Self {
+        Self { artifacts }
     }
 
     pub(crate) fn plan(&self) -> &Plan {
@@ -5197,10 +5252,8 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
                 resources,
             }),
             Self::Diagnostics(diagnostics) => {
-                let error_count = diagnostics._error_count;
                 PostExpansionOutcome::Diagnostics(PostExpansionDiagnostics::new(
                     diagnostics.into_artifacts().map_expanded_resources(map),
-                    error_count,
                 ))
             }
         }
@@ -5229,6 +5282,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         preparation_errors,
     } = environment;
     let PostExpansionPlanView {
+        data,
+        children: ChildrenSettled,
+    } = expansion;
+    let PostExpansionPlanData {
         expanded_resources,
         sorted_resources,
         mut addressed,
@@ -5236,10 +5293,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         wait_aliases,
         residual_deferred_for,
         deferred_create_targets,
-        new_child_ids: _,
-        refreshable_child_ids: _,
-        printed_warnings: _,
-    } = expansion;
+    } = data;
     let parsed = expanded_resources.parsed();
 
     // awscc#251 (follow-up to #3055): data sources do not flow through
@@ -5321,9 +5375,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             PlanPreparationError::Plan(errors) => errors,
             PlanPreparationError::Provider(error) => return Err(AppError::Provider(error)),
         };
-        let error_count = std::num::NonZeroUsize::new(errors.len()).ok_or_else(|| {
-            AppError::Config("plan preparation failed without diagnostics".to_string())
-        })?;
         let mut plan = Plan::new();
         for error in errors {
             plan.add_error(error);
@@ -5346,7 +5397,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             wait_aliases,
         };
         return Ok(PostExpansionOutcome::Diagnostics(
-            PostExpansionDiagnostics::new(artifacts, error_count),
+            PostExpansionDiagnostics::new(artifacts),
         ));
     }
 
@@ -5478,7 +5529,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     }))
 }
 
-impl<E> ValidatedConfig<PostExpansionPlanView<E>> {
+impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn retain_fixture_deferred_for(
         &mut self,
@@ -5487,6 +5538,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E>> {
     ) {
         self.resources
             .inner
+            .data
             .deferred_create_targets
             .retain(|target| {
                 target
@@ -5497,10 +5549,53 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E>> {
             });
         self.resources
             .inner
+            .data
             .residual_deferred_for
             .extend(non_managed);
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) async fn settle_expanded_children_from_cache(
+        self,
+        normalizer: &dyn ProviderNormalizer,
+        state_file: &StateFile,
+    ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>>, AppError> {
+        let Self { wiring, resources } = self;
+        let ValidationReady { inner, origin } = resources;
+        let settled = inner
+            .settle_children_from_cache(CachedExpandedChildrenInputs {
+                normalizer,
+                state_file,
+                schemas: wiring.context().schemas(),
+            })
+            .await?;
+        Ok(ValidatedConfig {
+            wiring,
+            resources: ValidationReady {
+                inner: settled,
+                origin,
+            },
+        })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn settle_expanded_children_absent(
+        self,
+    ) -> ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>> {
+        let Self { wiring, resources } = self;
+        let ValidationReady { inner, origin } = resources;
+        let settled = inner.settle_children_absent(wiring.context().schemas(), None);
+        ValidatedConfig {
+            wiring,
+            resources: ValidationReady {
+                inner: settled,
+                origin,
+            },
+        }
+    }
+}
+
+impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>> {
     /// Run the shared plan seam while retaining the exact wiring that validated
     /// and expanded the canonical resource pair.
     pub(crate) async fn finish_post_expansion_plan<M: PostExpansionMode>(
@@ -5575,7 +5670,7 @@ impl PreparedDeferredForExpansion {
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
-    ) -> Result<PostExpansionPlanView<E>, AppError> {
+    ) -> Result<PostExpansionPlanView<E, ChildrenPending>, AppError> {
         let (expanded_resources, expansion) =
             self.expand(resources, schemas, remote_bindings, warning_policy)?;
         let PreparedDeferredForExpansionParts {
@@ -5595,16 +5690,20 @@ impl PreparedDeferredForExpansion {
             _expanded: _,
         } = expansion;
         Ok(PostExpansionPlanView {
-            expanded_resources,
-            sorted_resources,
-            addressed,
-            data_source_values,
-            wait_aliases,
-            residual_deferred_for,
-            deferred_create_targets,
-            new_child_ids,
-            refreshable_child_ids,
-            printed_warnings,
+            data: PostExpansionPlanData {
+                expanded_resources,
+                sorted_resources,
+                addressed,
+                data_source_values,
+                wait_aliases,
+                residual_deferred_for,
+                deferred_create_targets,
+            },
+            children: ChildrenPending {
+                new_child_ids,
+                refreshable_child_ids,
+                printed_warnings,
+            },
         })
     }
 }
@@ -5944,15 +6043,16 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     )
 }
 
-/// Result of the deferred-for expansion, materialised-child read,
-/// prior-state hydration, and enum-lift stages shared by every refresh path.
+/// Result of the address-preserving deferred-for expansion used by state
+/// refresh after materialised children have been read, hydrated, and lifted.
 ///
 /// Closes the bug class behind carina#3266 / #3271 / #3272 at the type
 /// level — same closure pattern as
 /// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
-/// Every call site that needs a post-expansion view of `sorted_resources`
-/// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) must obtain it
-/// through the corresponding [`ValidatedConfig`] owner transition. Those
+/// State refresh obtains this through its [`ValidatedConfig`] owner
+/// transition. Plan and apply instead use
+/// [`PostExpansionPlanView<E, ChildrenSettled>`], whose marker proves the same
+/// child-state transition occurred before plan construction. The live
 /// transitions perform the complete post-expansion sequence:
 ///
 /// 1. `expand_same_config_deferred_for` — synthesise for-loop children
@@ -5968,13 +6068,10 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 ///    children are not surfaced as phantom case diffs (carina#3272).
 ///
 /// The constructor mutates all three prior-state owners in place. Keeping them
-/// inside this operation prevents a refresh path from transforming only one
+/// inside this operation prevents state refresh from transforming only one
 /// part of prior state.
 #[non_exhaustive]
-pub struct ExpandedRefreshState<R> {
-    /// The resource witness selected by the constructor: `()` for raw-file
-    /// state refresh, or [`ExpandedCanonicalResources`] for plan/apply.
-    pub(crate) canonical_resources: R,
+pub struct ExpandedRefreshState {
     pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -6043,18 +6140,18 @@ pub(crate) struct ValidatedCanonicalExpandRefreshAndLiftInputs<
 async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
     parsed: &mut carina_core::parser::File<E>,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, PreparedAddressPreservingDeferredForExpansion>,
-) -> Result<ExpandedRefreshState<()>, AppError> {
+) -> Result<ExpandedRefreshState, AppError> {
     let expansion = inputs.expansion.expand_parsed(
         parsed,
         inputs.schemas,
         inputs.remote_bindings,
         inputs.warning_policy,
     )?;
-    finish_expanded_refresh_state((), expansion, inputs).await
+    finish_expanded_refresh_state(expansion, inputs).await
 }
 
 /// Run the expand → child-refresh → hydrate → lift quartet in lock-step for a
-/// canonical live-apply resource pair.
+/// canonical live-plan or live-apply resource pair.
 ///
 /// The returned validated owner contains the complete post-expansion plan
 /// view, so the refreshed state and resource order cannot be recombined by its
@@ -6065,14 +6162,14 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
     inputs: ValidatedCanonicalExpandRefreshAndLiftInputs<'_, '_, P>,
-) -> Result<ValidatedConfig<PostExpansionPlanView<E>>, AppError> {
+) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>>, AppError> {
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
     } = validated;
     let ValidatedCanonicalExpandRefreshAndLiftInputs {
         provider,
-        mut expansion,
+        expansion,
         warning_policy,
         remote_bindings,
         state_file,
@@ -6083,59 +6180,202 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
         let schemas = wiring.context().schemas();
         canonical_resources
             .try_map_async_preserving_binding_use_resolution(|canonical_resources| async move {
-                let (expanded_resources, expanded) = expansion.expand(
+                let pending = expansion.expand_for_plan(
                     canonical_resources,
                     schemas,
                     remote_bindings,
                     warning_policy,
                 )?;
-                let state = finish_expanded_refresh_state(
-                    expanded_resources,
-                    expanded,
-                    ExpandRefreshAndLiftInputs {
-                        provider,
-                        expansion: &mut expansion,
-                        warning_policy,
-                        remote_bindings,
-                        state_file,
-                        saved_dep_bindings,
-                        refresh_phase,
-                        schemas,
-                    },
-                )
-                .await?;
-                let PreparedDeferredForExpansionParts {
-                    addressed,
-                    data_source_values,
-                    wait_aliases,
-                } = expansion.into_parts();
-                Ok::<_, AppError>(PostExpansionPlanView {
-                    expanded_resources: state.canonical_resources,
-                    sorted_resources: state.sorted_resources,
-                    addressed,
-                    data_source_values,
-                    wait_aliases,
-                    residual_deferred_for: state.residual_deferred_for,
-                    deferred_create_targets: state.deferred_create_targets,
-                    new_child_ids: state.new_child_ids,
-                    refreshable_child_ids: state.refreshable_child_ids,
-                    printed_warnings: state.printed_warnings,
-                })
+                let settled = if let Some(state_file) = state_file.as_ref() {
+                    pending
+                        .settle_children_live(LiveExpandedChildrenInputs {
+                            provider,
+                            state_file,
+                            saved_dep_bindings,
+                            refresh_phase,
+                            schemas,
+                            normalizer: provider,
+                        })
+                        .await?
+                } else {
+                    pending.settle_children_absent(schemas, Some(refresh_phase))
+                };
+                Ok::<_, AppError>(settled)
             })
             .await?
     };
     Ok(ValidatedConfig { wiring, resources })
 }
 
+async fn settle_expanded_children_live<E>(
+    data: &mut PostExpansionPlanData<E>,
+    children: ChildrenPending,
+    inputs: LiveExpandedChildrenInputs<'_, '_>,
+) -> Result<(), AppError> {
+    refresh_expanded_children_live(
+        &data.sorted_resources,
+        &mut data.addressed,
+        &mut data.data_source_values,
+        &children,
+        inputs,
+    )
+    .await
+}
+
+async fn settle_expanded_children_from_cache<E>(
+    data: &mut PostExpansionPlanData<E>,
+    children: ChildrenPending,
+    inputs: CachedExpandedChildrenInputs<'_>,
+) -> Result<(), AppError> {
+    restore_expanded_children_from_cache(
+        &data.sorted_resources,
+        &mut data.addressed,
+        &mut data.data_source_values,
+        &children,
+        inputs,
+    )
+    .await
+}
+
+fn settle_expanded_children_absent<E>(
+    data: &mut PostExpansionPlanData<E>,
+    children: ChildrenPending,
+    schemas: &SchemaRegistry,
+    refresh_phase: Option<&RefreshPhase<'_>>,
+) {
+    mark_expanded_children_absent(
+        &data.sorted_resources,
+        &mut data.addressed,
+        &children,
+        schemas,
+        refresh_phase,
+    );
+}
+
+async fn refresh_expanded_children_live(
+    sorted_resources: &[Resource],
+    addressed: &mut AddressedState,
+    data_source_values: &mut DataSourceValues,
+    children: &ChildrenPending,
+    inputs: LiveExpandedChildrenInputs<'_, '_>,
+) -> Result<(), AppError> {
+    if children.printed_warnings {
+        inputs.refresh_phase.note_external_line();
+    }
+    if !children.new_child_ids.is_empty() {
+        // Phase 2: read materialised children that were neither moved targets
+        // nor already refreshed orphan rows.
+        let projected_state = addressed.projected_state(Some(inputs.state_file));
+        let selected = children
+            .refreshable_child_ids
+            .select(sorted_resources, &addressed.orphans);
+        refresh_resource_set(
+            RefreshResourceSetInputs {
+                provider: inputs.provider,
+                refresh_phase: inputs.refresh_phase,
+                state_file: Some(inputs.state_file),
+                schemas: inputs.schemas,
+                saved_dep_bindings: inputs.saved_dep_bindings,
+            },
+            selected,
+            &mut addressed.managed_current,
+        )
+        .await?;
+
+        // Phase 2.5: carry saved attributes into newly read children. This is
+        // the same hydration step used by `run_apply_locked_owned`; keeping it
+        // inside this transition prevents plan and apply from diverging.
+        hydrate_prior_data_source_values(
+            &mut addressed.managed_current,
+            data_source_values,
+            &mut addressed.orphans,
+            inputs.normalizer,
+            &addressed.saved_attrs,
+            &projected_state,
+        )
+        .await?;
+    }
+    lift_prior_state_enum_leaves(
+        &mut addressed.managed_current,
+        &mut addressed.orphans,
+        sorted_resources,
+        inputs.schemas,
+    );
+    Ok(())
+}
+
+async fn restore_expanded_children_from_cache(
+    sorted_resources: &[Resource],
+    addressed: &mut AddressedState,
+    data_source_values: &mut DataSourceValues,
+    children: &ChildrenPending,
+    inputs: CachedExpandedChildrenInputs<'_>,
+) -> Result<(), AppError> {
+    if !children.new_child_ids.is_empty() {
+        let projected_state = addressed.projected_state(Some(inputs.state_file));
+        for resource in children
+            .refreshable_child_ids
+            .select(sorted_resources, &addressed.orphans)
+        {
+            let current = inputs.state_file.build_state_for_resource(&resource.id);
+            addressed
+                .managed_current
+                .insert(resource.id.clone(), current);
+        }
+        hydrate_prior_data_source_values(
+            &mut addressed.managed_current,
+            data_source_values,
+            &mut addressed.orphans,
+            inputs.normalizer,
+            &addressed.saved_attrs,
+            &projected_state,
+        )
+        .await?;
+    }
+    lift_prior_state_enum_leaves(
+        &mut addressed.managed_current,
+        &mut addressed.orphans,
+        sorted_resources,
+        inputs.schemas,
+    );
+    Ok(())
+}
+
+fn mark_expanded_children_absent(
+    sorted_resources: &[Resource],
+    addressed: &mut AddressedState,
+    children: &ChildrenPending,
+    schemas: &SchemaRegistry,
+    refresh_phase: Option<&RefreshPhase<'_>>,
+) {
+    if children.printed_warnings
+        && let Some(refresh_phase) = refresh_phase
+    {
+        refresh_phase.note_external_line();
+    }
+    for resource in children
+        .refreshable_child_ids
+        .select(sorted_resources, &addressed.orphans)
+    {
+        addressed
+            .managed_current
+            .insert(resource.id.clone(), Current::absent(resource.id.clone()));
+    }
+    lift_prior_state_enum_leaves(
+        &mut addressed.managed_current,
+        &mut addressed.orphans,
+        sorted_resources,
+        schemas,
+    );
+}
+
 async fn finish_expanded_refresh_state<
-    R,
     P: Provider + ProviderNormalizer,
     E: PreparedExpansionInputs,
 >(
-    canonical_resources: R,
     expansion: DeferredForExpansion,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, E>,
-) -> Result<ExpandedRefreshState<R>, AppError> {
+) -> Result<ExpandedRefreshState, AppError> {
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
@@ -6147,71 +6387,50 @@ async fn finish_expanded_refresh_state<
         printed_warnings,
         _expanded: _,
     } = expansion;
-    if printed_warnings {
-        inputs.refresh_phase.note_external_line();
-    }
-    // Phase 2: read materialised children that weren't already refreshed.
-    // Moved targets are excluded by `refreshable_child_ids`; orphan-owned
-    // children are excluded structurally by `select`.
-    //
-    // Phase 2.5: carry forward saved_attrs to the newly-read children
-    // so create-only / API-unreturned fields survive. Mirrors the
-    // 2nd `hydrate_read_state` call apply ran by hand
-    // (apply/mod.rs ~1098); collapsing it into this constructor stops
-    // the next caller from forgetting it.
-    let projected_state = inputs
-        .expansion
-        .inputs()
-        .addressed
-        .state
-        .projected_state(inputs.state_file.as_ref());
+    let children = ChildrenPending {
+        new_child_ids,
+        refreshable_child_ids,
+        printed_warnings,
+    };
+    let state_file = inputs.state_file.as_ref();
     let DeferredForExpansionInputs {
-        addressed:
-            AddressedDeferredForExpansionInputs {
-                state:
-                    AddressedState {
-                        managed_current,
-                        orphans,
-                        saved_attrs,
-                        ..
-                    },
-                ..
-            },
+        addressed,
         data_source_values,
     } = inputs.expansion.inputs_mut();
-    if !new_child_ids.is_empty() {
-        let children = refreshable_child_ids.select(&sorted_resources, orphans);
-        refresh_resource_set(
-            RefreshResourceSetInputs {
-                provider: inputs.provider,
-                refresh_phase: inputs.refresh_phase,
-                state_file: inputs.state_file,
-                schemas: inputs.schemas,
-                saved_dep_bindings: inputs.saved_dep_bindings,
-            },
-            children,
-            managed_current,
-        )
-        .await?;
-        hydrate_prior_data_source_values(
-            managed_current,
+    let addressed = &mut addressed.state;
+    if let Some(state_file) = state_file {
+        refresh_expanded_children_live(
+            &sorted_resources,
+            addressed,
             data_source_values,
-            orphans,
-            inputs.provider,
-            saved_attrs,
-            &projected_state,
+            &children,
+            LiveExpandedChildrenInputs {
+                provider: inputs.provider,
+                normalizer: inputs.provider,
+                state_file,
+                saved_dep_bindings: inputs.saved_dep_bindings,
+                refresh_phase: inputs.refresh_phase,
+                schemas: inputs.schemas,
+            },
         )
         .await?;
+    } else {
+        mark_expanded_children_absent(
+            &sorted_resources,
+            addressed,
+            &children,
+            inputs.schemas,
+            Some(inputs.refresh_phase),
+        );
     }
 
-    // Phase 3: lift Enums on the post-expansion slice. Both
-    // pre-existing managed resources and the new for-loop children
-    // need this so enum-typed attrs aren't surfaced as phantom case
-    // diffs (carina#3272).
-    lift_prior_state_enum_leaves(managed_current, orphans, &sorted_resources, inputs.schemas);
+    let ChildrenPending {
+        new_child_ids,
+        refreshable_child_ids,
+        printed_warnings,
+    } = children;
 
     Ok(ExpandedRefreshState {
-        canonical_resources,
         sorted_resources,
         residual_deferred_for,
         deferred_create_targets,
@@ -6445,101 +6664,42 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     let data_source_values = phase2.values;
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
-    // carina#3132: expand same-config deferred-for loops after refresh,
-    // against the same post-refresh `ResolvedBindings` view every
-    // non-loop `ResourceRef` resolves against. Pure expand+re-sort is
-    // factored into `expand_same_config_deferred_for` (see its doc);
-    // here we perform the I/O half — targeted-refresh of the children
-    // so a re-plan after they were applied sees their live state
-    // instead of a phantom Create.
-    let mut plan_expansion = prepared_expansion.expand_for_plan(
+    // Expansion yields a pending child-state witness. The plan seam accepts
+    // only the settled witness produced by one of the three exhaustive prior-
+    // state transitions below.
+    let pending_expansion = prepared_expansion.expand_for_plan(
         canonical_resources,
         ctx.schemas(),
         remote_bindings,
         DeferredForWarningPolicy::Print,
     )?;
-
-    // A printed `⚠` warning is newline-terminated and is written on top of
-    // indicatif's open spinner bar line, so it closes the bar region the
-    // refresh phases above left open — the cursor is no longer parked on an
-    // unterminated `✓` line. Tell the phase guard so its eventual close does
-    // not add a second, spurious blank line on the deferred-for-with-warnings
-    // TTY path (#3150 Round-4 finding). A child refresh below may re-open it.
-    if plan_expansion.printed_warnings
-        && let Some(refresh_phase) = refresh_phase.as_ref()
-    {
-        refresh_phase.note_external_line();
-    }
-
-    if !plan_expansion.new_child_ids.is_empty() {
-        let PostExpansionPlanView {
-            sorted_resources,
-            addressed,
-            data_source_values,
-            refreshable_child_ids,
-            ..
-        } = &mut plan_expansion;
-        // Refresh only `refreshable_child_ids` (carina#3141): a child
-        // that is also a `moved` target keeps the migrated state from
-        // `materialize_moved_states`; re-reading it here (any of the
-        // three branches below) would clobber that state with
-        // `not_found`. `select` is the only constructor for the refresh
-        // set — the apply path uses the same one, so the moved-exclusion
-        // cannot diverge between the two paths (compile-time parity).
-        let children = || refreshable_child_ids.select(sorted_resources, &addressed.orphans);
-        if let Some(refresh_phase) = refresh_phase.as_ref() {
-            let projected_state = addressed.projected_state(state_file.as_ref());
-            let child_saved_dep_bindings = HashMap::new();
-            refresh_resource_set(
-                RefreshResourceSetInputs {
+    let child_saved_dep_bindings = HashMap::new();
+    let plan_expansion = match (refresh_phase.as_ref(), state_file.as_ref()) {
+        (Some(refresh_phase), Some(state_file)) => {
+            pending_expansion
+                .settle_children_live(LiveExpandedChildrenInputs {
                     provider: &provider,
+                    normalizer: &provider,
+                    state_file,
+                    saved_dep_bindings: &child_saved_dep_bindings,
                     refresh_phase,
+                    schemas: ctx.schemas(),
+                })
+                .await?
+        }
+        (None, Some(state_file)) => {
+            pending_expansion
+                .settle_children_from_cache(CachedExpandedChildrenInputs {
+                    normalizer: &provider,
                     state_file,
                     schemas: ctx.schemas(),
-                    saved_dep_bindings: &child_saved_dep_bindings,
-                },
-                children(),
-                &mut addressed.managed_current,
-            )
-            .await?;
-            hydrate_prior_data_source_values(
-                &mut addressed.managed_current,
-                data_source_values,
-                &mut addressed.orphans,
-                &provider,
-                &addressed.saved_attrs,
-                &projected_state,
-            )
-            .await?;
-        } else if let Some(sf) = state_file.as_ref() {
-            let projected_state = addressed.projected_state(Some(sf));
-            // --refresh=false: restore children's state from the cached
-            // state file, same as the original resources. A child not in
-            // cached state stays `not_found` → Create (mirrors the
-            // non-loop ref's behavior under --refresh=false).
-            for resource in children() {
-                let current = sf.build_state_for_resource(&resource.id);
-                addressed
-                    .managed_current
-                    .insert(resource.id.clone(), current);
-            }
-            hydrate_prior_data_source_values(
-                &mut addressed.managed_current,
-                data_source_values,
-                &mut addressed.orphans,
-                &provider,
-                &addressed.saved_attrs,
-                &projected_state,
-            )
-            .await?;
-        } else {
-            for resource in children() {
-                addressed
-                    .managed_current
-                    .insert(resource.id.clone(), Current::absent(resource.id.clone()));
-            }
+                })
+                .await?
         }
-    }
+        (_, None) => {
+            pending_expansion.settle_children_absent(ctx.schemas(), refresh_phase.as_ref())
+        }
+    };
 
     drop(refresh_phase);
     let outcome = build_post_expansion_plan::<PlanMode, E>(PostExpansionPlanInput {
@@ -7512,7 +7672,7 @@ async fn refresh_loaded_orphans(
 pub(crate) struct RefreshResourceSetInputs<'a, 'backend> {
     pub provider: &'a dyn Provider,
     pub refresh_phase: &'a RefreshPhase<'backend>,
-    pub state_file: &'a Option<StateFile>,
+    pub state_file: Option<&'a StateFile>,
     pub schemas: &'a SchemaRegistry,
     pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
 }
@@ -7522,7 +7682,7 @@ struct DirectManagedStateReads;
 trait ManagedStateReads {
     fn build_current(
         &self,
-        state_file: &Option<StateFile>,
+        state_file: Option<&StateFile>,
         desired: &ResourceId,
     ) -> (ResourceId, Current);
 }
@@ -7530,11 +7690,10 @@ trait ManagedStateReads {
 impl ManagedStateReads for DirectManagedStateReads {
     fn build_current(
         &self,
-        state_file: &Option<StateFile>,
+        state_file: Option<&StateFile>,
         desired: &ResourceId,
     ) -> (ResourceId, Current) {
         let current = state_file
-            .as_ref()
             .map(|state_file| state_file.build_state_for_resource(desired))
             .unwrap_or_else(|| Current::absent(desired.clone()));
         (desired.clone(), current)
@@ -7544,7 +7703,7 @@ impl ManagedStateReads for DirectManagedStateReads {
 impl ManagedStateReads for ProjectedStateRead<'_> {
     fn build_current(
         &self,
-        _state_file: &Option<StateFile>,
+        _state_file: Option<&StateFile>,
         desired: &ResourceId,
     ) -> (ResourceId, Current) {
         ProjectedStateRead::build_current(self, desired)
@@ -7587,7 +7746,7 @@ async fn refresh_resource_set_with_state_reads<'a>(
                     let mut current = refresh_loaded_resource_with_retry(
                         inputs.provider,
                         loaded,
-                        inputs.state_file.as_ref(),
+                        inputs.state_file,
                         inputs.schemas,
                     )
                     .await

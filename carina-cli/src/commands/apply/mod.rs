@@ -1987,8 +1987,7 @@ async fn run_apply_locked_owned(
             } = match post_expansion {
                 crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
                 crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
-                    return render_plan_errors_and_abort(diagnostics.plan())
-                        .map(|()| SourceApplyAfterHeartbeat::Done(None));
+                    return Err(diagnostics.render_and_abort());
                 }
             };
             let crate::wiring::PostExpansionArtifacts {
@@ -2004,6 +2003,8 @@ async fn run_apply_locked_owned(
                 wait_aliases,
             } = artifacts;
             render_plan_errors_and_abort(&plan)?;
+            #[cfg(any(test, feature = "test-utils"))]
+            capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
                 resolved: resolved_resources,
                 paired_unresolved: paired_unresolved_resources,
@@ -2342,6 +2343,17 @@ async fn run_apply_locked_owned(
         result: op_result,
         lock,
     }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn capture_live_apply_plan_for_test(plan: &Plan) -> Result<(), AppError> {
+    let Ok(path) = std::env::var("CARINA_TEST_CAPTURE_LIVE_APPLY_PLAN") else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_vec_pretty(plan)
+        .map_err(|error| AppError::Config(format!("serialize live apply plan: {error}")))?;
+    std::fs::write(&path, encoded)
+        .map_err(|error| AppError::Config(format!("write live apply plan to {path}: {error}")))
 }
 
 #[cfg(test)]
