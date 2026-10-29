@@ -14,7 +14,7 @@ use carina_plugin_sdk::{
     Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ struct DeleteToken {
 }
 
 struct MockProcessProvider {
-    states: Mutex<HashMap<String, HashMap<String, Value>>>,
+    states: Mutex<HashMap<String, BTreeMap<String, Value>>>,
 }
 
 impl Default for MockProcessProvider {
@@ -152,7 +152,7 @@ impl MockProcessProvider {
         }
     }
 
-    fn pending_polls(attributes: &HashMap<String, Value>, operation_key: &str) -> u32 {
+    fn pending_polls(attributes: &BTreeMap<String, Value>, operation_key: &str) -> u32 {
         attributes
             .get(operation_key)
             .or_else(|| attributes.get("pending_polls"))
@@ -168,7 +168,7 @@ impl MockProcessProvider {
             .unwrap_or(0)
     }
 
-    fn create_mode(attributes: &HashMap<String, Value>) -> CreateMode {
+    fn create_mode(attributes: &BTreeMap<String, Value>) -> CreateMode {
         let Some(value) = attributes.get("create_mode") else {
             return CreateMode::Normal;
         };
@@ -213,7 +213,7 @@ impl MockProcessProvider {
         }
     }
 
-    fn sent_attributes(attributes: &HashMap<String, Value>) -> Sent {
+    fn sent_attributes(attributes: &BTreeMap<String, Value>) -> Sent {
         let Some(value) = attributes.get("create_sent") else {
             return Sent::AllRequestAttributes;
         };
@@ -249,7 +249,7 @@ impl MockProcessProvider {
         }
     }
 
-    fn canonical_identifier(attributes: &HashMap<String, Value>) -> Option<AppliedIdentifier> {
+    fn canonical_identifier(attributes: &BTreeMap<String, Value>) -> Option<AppliedIdentifier> {
         let value = attributes.get("canonical_identifier")?;
         match value {
             Value::String(value) => AppliedIdentifier::new(value.clone()).ok(),
@@ -280,7 +280,7 @@ impl MockProcessProvider {
         }
     }
 
-    fn found_read(id: &ResourceId, attributes: HashMap<String, Value>) -> FoundRead {
+    fn found_read(id: &ResourceId, attributes: BTreeMap<String, Value>) -> FoundRead {
         FoundRead::from_applied_state(AppliedState {
             id: id.clone(),
             identifier: AppliedIdentifier::new("mock-read-id")
@@ -334,7 +334,7 @@ impl MockProcessProvider {
         id: &ResourceId,
         mut request: CreateRequest,
         polls_served: Option<u32>,
-    ) -> HashMap<String, Value> {
+    ) -> BTreeMap<String, Value> {
         if let Some(polls_served) = polls_served {
             request.resource.attributes.insert(
                 "__mock_create_polls_served__".to_string(),
@@ -529,7 +529,7 @@ impl CarinaProvider for MockProcessProvider {
         CoreValidatedConfigSchema::default()
     }
 
-    fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         if attrs.contains_key("__mock_validate_config_trap__") {
             panic!("intentional mock validate_config trap");
         }
@@ -541,7 +541,7 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
-    fn initialize(&mut self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         if attrs.contains_key("__mock_initialize_error__") {
             return Err("intentional mock initialization failure".to_string());
         }
@@ -562,7 +562,7 @@ impl CarinaProvider for MockProcessProvider {
                 state: AppliedState {
                     id: id.clone(),
                     identifier: identifier.clone(),
-                    attributes: HashMap::from([(
+                    attributes: BTreeMap::from([(
                         "values".to_string(),
                         Value::List(vec![Value::Float(f64::NAN)]),
                     )]),
@@ -1274,7 +1274,7 @@ impl CarinaProvider for MockProcessProvider {
     fn hydrate_read_state(
         &self,
         states: &mut HashMap<String, PersistedState>,
-        saved_attrs: &HashMap<String, HashMap<String, PersistedValue>>,
+        saved_attrs: &HashMap<String, BTreeMap<String, PersistedValue>>,
     ) -> Result<(), ProviderError> {
         let rekey_single_result = states
             .values()

@@ -1,6 +1,6 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -171,7 +171,7 @@ impl CarinaProvider for MockHttpProvider {
         CoreValidatedConfigSchema::default()
     }
 
-    fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         Ok(())
     }
 

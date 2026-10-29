@@ -58,7 +58,7 @@ use carina_provider_protocol::types::{
     PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId,
     State, TypeIdentity, UpdateRequest, Value,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Failure while projecting validated SDK schemas onto version-12 JSON.
 #[derive(Debug)]
@@ -107,11 +107,11 @@ pub fn schemas_to_json(
 /// A raw attribute-type map is intentionally not accepted:
 ///
 /// ```compile_fail
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 /// use carina_core::schema::AttributeType;
 /// use carina_plugin_sdk::provider_config_schema_to_json;
 ///
-/// let draft = HashMap::<String, AttributeType>::new();
+/// let draft = BTreeMap::<String, AttributeType>::new();
 /// let _ = provider_config_schema_to_json(&draft);
 /// ```
 pub fn provider_config_schema_to_json(
@@ -341,7 +341,7 @@ impl IssuedCreate {
         ))
     }
 
-    pub fn succeeded<T>(self, attributes: HashMap<String, Value>) -> CreateStep<T> {
+    pub fn succeeded<T>(self, attributes: BTreeMap<String, Value>) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Success {
             identifier: self.identifier,
             attributes,
@@ -350,7 +350,7 @@ impl IssuedCreate {
 
     pub fn partial<T>(
         self,
-        attributes: HashMap<String, Value>,
+        attributes: BTreeMap<String, Value>,
         diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
     ) -> CreateStep<T> {
         CreateStep(
@@ -393,7 +393,7 @@ pub struct FinishingCreate {
 }
 
 impl FinishingCreate {
-    pub fn succeeded<T>(self, attributes: HashMap<String, Value>) -> CreateStep<T> {
+    pub fn succeeded<T>(self, attributes: BTreeMap<String, Value>) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Success {
             identifier: self.identifier,
             attributes,
@@ -402,7 +402,7 @@ impl FinishingCreate {
 
     pub fn partial<T>(
         self,
-        attributes: HashMap<String, Value>,
+        attributes: BTreeMap<String, Value>,
         diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
     ) -> CreateStep<T> {
         CreateStep(
@@ -485,13 +485,13 @@ impl ResumeAttempt {
 ///
 /// ```compile_fail
 /// use carina_plugin_sdk::FoundRead;
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 ///
-/// let _ = FoundRead { attributes: HashMap::new() };
+/// let _ = FoundRead { attributes: BTreeMap::new() };
 /// ```
 #[derive(Debug)]
 pub struct FoundRead {
-    attributes: HashMap<String, Value>,
+    attributes: BTreeMap<String, Value>,
 }
 
 impl FoundRead {
@@ -621,7 +621,7 @@ pub enum Resume<T> {
 }
 
 pub type ProtocolCreateStep<T> = carina_provider_protocol::types::CreateStep<
-    HashMap<String, Value>,
+    BTreeMap<String, Value>,
     carina_provider_protocol::types::PartialReadDiagnostic,
     T,
 >;
@@ -631,12 +631,12 @@ pub type ProtocolCreateStep<T> = carina_provider_protocol::types::CreateStep<
 ///
 /// ```compile_fail
 /// use carina_plugin_sdk::{CreateStep, types::{AppliedIdentifier, Value}};
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 ///
 /// fn bypass(identifier: AppliedIdentifier) -> CreateStep<()> {
 ///     CreateStep::Success {
 ///         identifier,
-///         attributes: HashMap::<String, Value>::new(),
+///         attributes: BTreeMap::<String, Value>::new(),
 ///     }
 /// }
 /// ```
@@ -723,7 +723,7 @@ impl From<CreateVerdict> for PollVerdict {
 }
 
 pub type ProtocolResumeStep<T> = carina_provider_protocol::types::ResumeStep<
-    HashMap<String, Value>,
+    BTreeMap<String, Value>,
     carina_provider_protocol::types::PartialReadDiagnostic,
     T,
 >;
@@ -844,11 +844,11 @@ pub trait CarinaProvider {
     /// Validate provider-specific configuration semantics not expressible
     /// in the attribute type schema. Host-side type validation has
     /// already run by the time this is called.
-    fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String>;
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String>;
 
     /// Initialize the provider with configuration.
     /// Called once before any CRUD operations.
-    fn initialize(&mut self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         let _ = attrs;
         Ok(())
     }
@@ -1007,7 +1007,7 @@ pub trait CarinaProvider {
     fn hydrate_read_state(
         &self,
         states: &mut HashMap<String, PersistedState>,
-        saved_attrs: &HashMap<String, HashMap<String, PersistedValue>>,
+        saved_attrs: &HashMap<String, BTreeMap<String, PersistedValue>>,
     ) -> Result<(), ProviderError> {
         let _ = (states, saved_attrs);
         Ok(())

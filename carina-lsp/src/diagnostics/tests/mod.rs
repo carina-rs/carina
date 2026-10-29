@@ -34,7 +34,7 @@ impl ProviderFactory for RegionConfigFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -125,7 +125,7 @@ impl ProviderFactory for SuspendedValidationFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::string(),
         )]))

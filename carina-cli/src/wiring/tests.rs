@@ -370,7 +370,7 @@ fn parse(
 }
 
 fn pathless_test_type(attr_type: AttributeType) -> carina_core::schema::RootlessType {
-    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+    carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
         "value".to_string(),
         attr_type,
     )]))
@@ -1750,7 +1750,7 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
             "role_arn".to_string(),
             AttributeType::refined_string(
                 None,
@@ -5833,7 +5833,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),

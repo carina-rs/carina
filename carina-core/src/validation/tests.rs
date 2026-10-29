@@ -8,7 +8,7 @@ use crate::resource::{
     DataSource, Resource, Signature,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
@@ -6487,7 +6487,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         }
 
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
                 AttributeType::enum_(
                     crate::schema::enum_identity("Region", Some("aws")),

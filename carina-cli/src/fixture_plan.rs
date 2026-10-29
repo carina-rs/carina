@@ -5,7 +5,7 @@
 //! performing live provider reads, so rendering works without installed
 //! providers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
@@ -849,7 +849,7 @@ fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, Validate
 }
 
 fn fixture_region_attribute_types(provider: &str) -> carina_core::schema::ValidatedConfigSchema {
-    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+    carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
         "region".to_string(),
         AttributeType::enum_(
             TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),

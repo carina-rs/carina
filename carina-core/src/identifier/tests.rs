@@ -746,7 +746,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         )],
     )];
     let config_schema = || {
-        ValidatedConfigSchema::validate(std::collections::HashMap::from([(
+        ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
             "region".to_string(),
             region_type("aws"),
         )]))

@@ -3,7 +3,7 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use indexmap::IndexMap;
@@ -4932,16 +4932,15 @@ pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry
 
 /// Collect custom type identities from a registry for completion display.
 pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity> {
-    let mut names = HashSet::new();
+    let mut names = BTreeSet::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
-        let schema = schema.as_schema();
-        for attr_schema in schema.attributes.values() {
-            collect_type_names_from_type(&attr_schema.attr_type, &mut names);
+        for attribute in schema.effective_attributes() {
+            collect_type_names_from_type(attribute.field_type(), &mut names);
         }
         // Definitions are visited once; `Ref` edges are not followed, so
         // cyclic generated schemas terminate.
-        for def in schema.defs.values() {
+        for def in schema.parts().defs.values() {
             collect_type_names_from_type(def, &mut names);
         }
     }
@@ -4953,7 +4952,7 @@ pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity>
 /// (identities only, no closures).
 fn collect_type_names_from_type(
     attr_type: &crate::schema::AttributeType,
-    names: &mut std::collections::HashSet<TypeIdentity>,
+    names: &mut BTreeSet<TypeIdentity>,
 ) {
     use crate::schema::RawShape;
 
@@ -5079,6 +5078,15 @@ fn visit_identified_types(
     }
 }
 
+/// Enumerate identified declarations in a stable schema-defined order.
+///
+/// Resource schemas retain caller slice order. Within each resource, roots are
+/// read from the schema's canonical-name `BTreeMap`, nested
+/// list/map/struct/union members retain their structural declaration order,
+/// and named definitions follow in their `BTreeMap` order. Provider-config
+/// roots come last in their canonical-name `BTreeMap` order. The returned
+/// `Vec` is the ordered authority for dispatch and owner indexes; callers must
+/// not reconstruct this walk from other containers.
 fn identified_types_from_witnesses(
     schemas: &[ValidatedResourceSchema],
     config: &ValidatedConfigSchema,
@@ -5088,11 +5096,10 @@ fn identified_types_from_witnesses(
         declarations.push((identity.clone(), attribute_type.clone()));
     };
     for schema in schemas {
-        let schema = schema.as_schema();
-        for attribute in schema.attributes.values() {
-            visit_identified_types(&attribute.attr_type, &mut collect);
+        for attribute in schema.effective_attributes() {
+            visit_identified_types(attribute.field_type(), &mut collect);
         }
-        for definition in schema.defs.values() {
+        for definition in schema.parts().defs.values() {
             visit_identified_types(definition, &mut collect);
         }
     }
@@ -5381,7 +5388,7 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 
 struct OwnerCustomTypeIndex {
     factory_index: usize,
-    declarations: HashMap<TypeIdentity, Vec<AttributeType>>,
+    declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
 }
 
 pub(crate) trait ProviderFactorySource: Send + Sync {
@@ -5405,7 +5412,7 @@ impl ProviderFactorySource for &[Box<dyn ProviderFactory>] {
 /// but both forms execute the same owner/declaration logic below.
 pub(crate) struct FactoryCustomTypeResolver<F> {
     factories: F,
-    index: HashMap<String, OwnerCustomTypeIndex>,
+    index: BTreeMap<String, OwnerCustomTypeIndex>,
 }
 
 impl<F> FactoryCustomTypeResolver<F>
@@ -5417,9 +5424,9 @@ where
         Self { factories, index }
     }
 
-    fn known_custom_types(&self) -> HashSet<crate::parser::OwnedTypeIdentity> {
+    fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
         let mut owners_by_identity =
-            HashMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
+            BTreeMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
         for (owner, indexed) in &self.index {
             let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
                 crate::parser::SchemaTypeOwner::Provider(owner.clone()),
@@ -5474,21 +5481,21 @@ impl<F> crate::parser::ProviderCustomTypeSource for FactoryCustomTypeResolver<F>
 where
     F: ProviderFactorySource + 'static,
 {
-    fn known_custom_types(&self) -> HashSet<crate::parser::OwnedTypeIdentity> {
+    fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
         FactoryCustomTypeResolver::known_custom_types(self)
     }
 }
 
 fn build_owner_custom_type_index(
     factories: &[Box<dyn ProviderFactory>],
-) -> HashMap<String, OwnerCustomTypeIndex> {
+) -> BTreeMap<String, OwnerCustomTypeIndex> {
     factories
         .iter()
         .enumerate()
         .map(|(factory_index, factory)| {
             let schemas = factory.schemas();
             let config = factory.provider_config_attribute_types();
-            let mut declarations = HashMap::<TypeIdentity, Vec<AttributeType>>::new();
+            let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
             for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
                 declarations.entry(identity).or_default().push(declaration);
             }
@@ -5515,7 +5522,7 @@ pub fn provider_custom_types_from_factories(
 
 fn validate_custom_type_annotation(
     factories: &[Box<dyn ProviderFactory>],
-    index: &HashMap<String, OwnerCustomTypeIndex>,
+    index: &BTreeMap<String, OwnerCustomTypeIndex>,
     owned: &crate::parser::OwnedTypeIdentity,
     value: &Value,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
@@ -5810,6 +5817,35 @@ mod tests {
     }
 
     #[test]
+    fn custom_type_names_for_completion_are_in_identity_order() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let alpha = TypeIdentity::new(Some("test"), ["value"], "Alpha");
+        let zed = TypeIdentity::new(Some("test"), ["value"], "Zed");
+        let schema = ResourceSchema::new("test.Values")
+            .attribute(
+                AttributeSchema::optional(
+                    "z_declared_first",
+                    AttributeType::refined_string(Some(zed.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "a_declared_second",
+                    AttributeType::refined_string(Some(alpha.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("completion fixture schema must validate");
+        let mut registry = SchemaRegistry::new();
+        registry.insert("test", schema);
+
+        assert_eq!(collect_custom_type_names(&registry), [alpha, zed]);
+    }
+
+    #[test]
     fn aggregate_dispatch_validation_rejects_cross_schema_scalar_kind_reuse() {
         use crate::schema::{AttributeSchema, ResourceSchema};
 
@@ -5846,57 +5882,88 @@ mod tests {
     #[test]
     fn aggregate_dispatch_runs_distinct_validators_for_one_identity() {
         use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
 
         let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
-        let first_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let second_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let first_counter = first_calls.clone();
-        let second_counter = second_calls.clone();
-        let schema = ResourceSchema::new("test.Values")
-            .attribute(
-                AttributeSchema::optional(
-                    "first",
-                    AttributeType::refined_string_with_validator(
-                        identity.clone(),
-                        None,
-                        None,
-                        legacy_validator(move |_| {
-                            first_counter.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        }),
-                        None,
-                    ),
-                )
-                .build(),
-            )
-            .attribute(
-                AttributeSchema::optional(
-                    "second",
-                    AttributeType::refined_string_with_validator(
-                        identity.clone(),
-                        None,
-                        None,
-                        legacy_validator(move |_| {
-                            second_counter.fetch_add(1, Ordering::SeqCst);
-                            Err("second declaration rejected".to_string())
-                        }),
-                        None,
-                    ),
-                )
-                .build(),
-            )
-            .validate()
-            .expect("same-kind declarations remain a valid resource schema");
+        for iteration in 0..200 {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let record = |name: &'static str, error: Option<&'static str>| {
+                let calls = Arc::clone(&calls);
+                legacy_validator(move |_| {
+                    calls
+                        .lock()
+                        .expect("callback log mutex poisoned")
+                        .push(name);
+                    match error {
+                        Some(message) => Err(message.to_string()),
+                        None => Ok(()),
+                    }
+                })
+            };
 
-        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
-            .expect("v12 dispatch combines every callback attached to one identity");
-        let error = table
-            .dispatch(&identity, "value")
-            .expect_err("every callback must run conjunctively");
-        assert_eq!(error, "second declaration rejected");
-        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+            // Deliberately declare roots in a different order from their
+            // canonical names. A raw HashMap walk can run either failing
+            // callback first; the ordered declaration walk must always run
+            // `a`, then `m`, and short-circuit before `z`.
+            let schema = ResourceSchema::new("test.Values")
+                .attribute(
+                    AttributeSchema::optional(
+                        "z_declared_first",
+                        AttributeType::refined_string_with_validator(
+                            identity.clone(),
+                            None,
+                            None,
+                            record("z_declared_first", Some("last declaration rejected")),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "a_declared_second",
+                        AttributeType::refined_string_with_validator(
+                            identity.clone(),
+                            None,
+                            None,
+                            record("a_declared_second", None),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "m_declared_third",
+                        AttributeType::refined_string_with_validator(
+                            identity.clone(),
+                            None,
+                            None,
+                            record("m_declared_third", Some("middle declaration rejected")),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("same-kind declarations remain a valid resource schema");
+
+            let table =
+                CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+                    .expect("v12 dispatch combines every callback attached to one identity");
+            let error = table
+                .dispatch(&identity, "value")
+                .expect_err("the first rejecting callback must stop dispatch");
+            assert_eq!(
+                error, "middle declaration rejected",
+                "iteration {iteration}"
+            );
+            assert_eq!(
+                *calls.lock().expect("callback log mutex poisoned"),
+                ["a_declared_second", "m_declared_third"],
+                "iteration {iteration}"
+            );
+        }
     }
 
     #[test]
@@ -6009,7 +6076,7 @@ mod tests {
         }
 
         fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::validate(HashMap::from([(
+            ValidatedConfigSchema::validate(BTreeMap::from([(
                 "endpoint".to_string(),
                 AttributeType::refined_string(
                     Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
