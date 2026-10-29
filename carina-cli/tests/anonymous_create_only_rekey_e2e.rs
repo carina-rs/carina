@@ -154,11 +154,23 @@ mock.compute.Instance {{
                     && row.binding.is_none()
             })
             .collect();
+        let resource_identifiers: Vec<_> = state
+            .resources()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}.{} {}",
+                    row.provider,
+                    row.resource_type,
+                    row.identity.as_str()
+                )
+            })
+            .collect();
         assert_eq!(
             rows.len(),
             1,
-            "state must contain exactly one anonymous mock.compute.Instance row: {:#?}",
-            state.resources(),
+            "state must contain exactly one anonymous mock.compute.Instance row: \
+             {resource_identifiers:#?}",
         );
         rows[0].clone()
     }
@@ -174,11 +186,23 @@ mock.compute.Instance {{
                     && row.binding.is_none()
             })
             .collect();
+        let resource_identifiers: Vec<_> = state
+            .resources()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}.{} {}",
+                    row.provider,
+                    row.resource_type,
+                    row.identity.as_str()
+                )
+            })
+            .collect();
         assert_eq!(
             rows.len(),
             1,
-            "state must contain exactly one anonymous mock.test.resource row: {:#?}",
-            state.resources(),
+            "state must contain exactly one anonymous mock.test.resource row: \
+             {resource_identifiers:#?}",
         );
         rows[0].clone()
     }
