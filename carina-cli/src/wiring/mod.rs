@@ -497,7 +497,7 @@ pub struct ValidatedWiring {
 
 #[derive(Debug)]
 enum ValidationReadyOrigin {
-    Parsed(carina_core::validation::ResolvedBindingUses),
+    Parsed,
     SavedPlanArtifact,
     #[cfg(any(test, feature = "test-utils"))]
     Fixture,
@@ -506,8 +506,8 @@ enum ValidationReadyOrigin {
 /// Sealed payload accepted by [`ValidatedConfig`].
 ///
 /// Production parsed configurations can enter this wrapper only with the
-/// proof returned by the core bare-binding authority. Saved plans use a
-/// separate private constructor because serialized artifacts contain no
+/// resolved file returned by the core bare-binding authority. Saved plans use
+/// a separate private constructor because serialized artifacts contain no
 /// parser-authored side data.
 pub struct ValidationReady<R> {
     inner: R,
@@ -515,16 +515,6 @@ pub struct ValidationReady<R> {
 }
 
 impl<R> ValidationReady<R> {
-    fn from_binding_uses(
-        inner: R,
-        binding_uses: carina_core::validation::ResolvedBindingUses,
-    ) -> Self {
-        Self {
-            inner,
-            origin: ValidationReadyOrigin::Parsed(binding_uses),
-        }
-    }
-
     fn from_saved_plan_artifact(inner: R) -> Self {
         Self {
             inner,
@@ -543,6 +533,74 @@ impl<R> ValidationReady<R> {
     fn into_inner(self) -> R {
         self.inner
     }
+
+    fn try_map_with_output_preserving_binding_use_resolution<T, O, E>(
+        self,
+        transform: impl FnOnce(R) -> Result<(T, O), E>,
+    ) -> Result<(ValidationReady<T>, O), E> {
+        let (inner, output) = transform(self.inner)?;
+        Ok((
+            ValidationReady {
+                inner,
+                origin: self.origin,
+            },
+            output,
+        ))
+    }
+
+    async fn try_map_async_preserving_binding_use_resolution<T, E, F, Fut>(
+        self,
+        transform: F,
+    ) -> Result<ValidationReady<T>, E>
+    where
+        F: FnOnce(R) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let inner = transform(self.inner).await?;
+        Ok(ValidationReady {
+            inner,
+            origin: self.origin,
+        })
+    }
+
+    async fn try_map_async_with_output_preserving_binding_use_resolution<T, O, E, F, Fut>(
+        self,
+        transform: F,
+    ) -> Result<(ValidationReady<T>, O), E>
+    where
+        F: FnOnce(R) -> Fut,
+        Fut: std::future::Future<Output = Result<(T, O), E>>,
+    {
+        let (inner, output) = transform(self.inner).await?;
+        Ok((
+            ValidationReady {
+                inner,
+                origin: self.origin,
+            },
+            output,
+        ))
+    }
+}
+
+impl<E> ValidationReady<carina_core::parser::File<E>> {
+    fn from_resolved_file(file: carina_core::validation::ResolvedFile<E>) -> Self {
+        Self {
+            inner: file.into_file(),
+            origin: ValidationReadyOrigin::Parsed,
+        }
+    }
+}
+
+impl<E> ValidationReady<CanonicalResourcePair<E>> {
+    fn from_resolved_pair(
+        parsed: carina_core::validation::ResolvedFile<E>,
+        unresolved: Vec<Resource>,
+    ) -> Self {
+        Self {
+            inner: CanonicalResourcePair::from_resolved_file(parsed, unresolved),
+            origin: ValidationReadyOrigin::Parsed,
+        }
+    }
 }
 
 impl<R> std::ops::Deref for ValidationReady<R> {
@@ -550,12 +608,6 @@ impl<R> std::ops::Deref for ValidationReady<R> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl<R> std::ops::DerefMut for ValidationReady<R> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
@@ -653,7 +705,6 @@ impl<R: fmt::Debug> fmt::Debug for ValidatedConfig<R> {
 pub(crate) struct ValidationReport<'a> {
     errors: Vec<AppError>,
     schemas: &'a SchemaRegistry,
-    binding_uses: Option<carina_core::validation::ResolvedBindingUses>,
 }
 
 impl ValidationReport<'_> {
@@ -680,7 +731,7 @@ fn validation_report_from<'a>(
     prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
-    let (errors, binding_uses) = match crate::commands::validate_and_resolve_errors_inner(
+    let errors = match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed,
         base_dir,
@@ -691,18 +742,15 @@ fn validation_report_from<'a>(
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
     ) {
-        Ok(crate::commands::ResolvedConfig::Evaluated { binding_uses, .. }) => {
-            (Vec::new(), Some(binding_uses))
-        }
+        Ok(crate::commands::ResolvedConfig::Evaluated { .. }) => Vec::new(),
         Ok(crate::commands::ResolvedConfig::Paired { .. }) => {
             unreachable!("evaluated-only validation returned pair")
         }
-        Err(errors) => (errors, None),
+        Err(errors) => errors,
     };
     ValidationReport {
         errors,
         schemas: context.schemas(),
-        binding_uses,
     }
 }
 
@@ -725,13 +773,7 @@ fn resolve_config_pair_errors_with_context(
     skip_resource_validation: bool,
     prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-) -> Result<
-    (
-        CanonicalResourcePair<carina_core::parser::InferredExportParam>,
-        carina_core::validation::ResolvedBindingUses,
-    ),
-    Vec<AppError>,
-> {
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, Vec<AppError>> {
     match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         &mut parsed,
@@ -743,10 +785,7 @@ fn resolve_config_pair_errors_with_context(
         duplicate_declarations,
         crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
     )? {
-        crate::commands::ResolvedConfig::Paired {
-            resources,
-            binding_uses,
-        } => Ok((*resources, binding_uses)),
+        crate::commands::ResolvedConfig::Paired { resources } => Ok(*resources),
         crate::commands::ResolvedConfig::Evaluated { .. } => {
             unreachable!("paired validation returned evaluated-only")
         }
@@ -763,13 +802,7 @@ fn resolve_config_pair_with_context(
     skip_resource_validation: bool,
     prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-) -> Result<
-    (
-        CanonicalResourcePair<carina_core::parser::InferredExportParam>,
-        carina_core::validation::ResolvedBindingUses,
-    ),
-    AppError,
-> {
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
     resolve_config_pair_errors_with_context(
         context,
         load_errors,
@@ -781,6 +814,48 @@ fn resolve_config_pair_with_context(
         duplicate_declarations,
     )
     .map_err(crate::commands::collapse_errors)
+}
+
+fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
+    let mut errors = report
+        .findings()
+        .iter()
+        .map(|finding| AppError::Validation(finding.error.to_string()))
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        errors.push(AppError::Validation(
+            "bare binding validation left an unconsumed pending value slot".to_string(),
+        ));
+    }
+    crate::commands::collapse_errors(errors)
+}
+
+fn resolve_file_binding_uses<E>(
+    file: carina_core::parser::File<E>,
+    base_dir: &Path,
+    context: &WiringContext,
+) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
+    let provider_context =
+        crate::commands::enrich_provider_context(context.schemas(), context.factories_arc());
+    let module_signatures =
+        module_resolver::load_resolved_module_signatures(&file, base_dir, &provider_context);
+    carina_core::validation::resolve_bare_binding_uses(
+        file,
+        context.schemas(),
+        &provider_context,
+        &module_signatures,
+    )
+    .map_err(binding_use_report_error)
+}
+
+fn resolve_pair_binding_uses<E>(
+    pair: CanonicalResourcePair<E>,
+    base_dir: &Path,
+    context: &WiringContext,
+) -> Result<(carina_core::validation::ResolvedFile<E>, Vec<Resource>), AppError> {
+    let (parsed, unresolved) = pair.into_parts();
+    let parsed = resolve_file_binding_uses(parsed, base_dir, context)?;
+    Ok((parsed, unresolved))
 }
 
 impl ProviderLoad {
@@ -878,7 +953,6 @@ impl ProviderLoad {
     ) -> Result<ValidatedConfig<carina_core::parser::InferredFile>, AppError> {
         let ValidationReport {
             mut errors,
-            binding_uses,
             schemas: _,
         } = validation_report_from(
             &self.context,
@@ -897,14 +971,13 @@ impl ProviderLoad {
         if !errors.is_empty() {
             return Err(crate::commands::collapse_errors(errors));
         }
-        let binding_uses =
-            binding_uses.expect("successful evaluated validation must carry its binding-use proof");
+        let parsed = resolve_file_binding_uses(parsed, base_dir, &self.context)?;
 
         Ok(ValidatedConfig {
             wiring: ValidatedWiring {
                 load: self.into_complete()?,
             },
-            resources: ValidationReady::from_binding_uses(parsed, binding_uses),
+            resources: ValidationReady::from_resolved_file(parsed),
         })
     }
 
@@ -920,7 +993,7 @@ impl ProviderLoad {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
-        let (canonical_resources, binding_uses) = match resolve_config_pair_errors_with_context(
+        let canonical_resources = match resolve_config_pair_errors_with_context(
             &self.context,
             &self.load_errors,
             parsed,
@@ -949,11 +1022,13 @@ impl ProviderLoad {
                 return Err(crate::commands::collapse_errors(errors));
             }
         };
+        let (parsed, unresolved) =
+            resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
         Ok(ValidatedConfig {
             wiring: ValidatedWiring {
                 load: self.into_complete()?,
             },
-            resources: ValidationReady::from_binding_uses(canonical_resources, binding_uses),
+            resources: ValidationReady::from_resolved_pair(parsed, unresolved),
         })
     }
 
@@ -1010,7 +1085,7 @@ impl CompleteProviderLoad {
         prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
-        let (canonical_resources, binding_uses) = resolve_config_pair_with_context(
+        let canonical_resources = resolve_config_pair_with_context(
             &self.context,
             &HashMap::new(),
             parsed,
@@ -1020,12 +1095,11 @@ impl CompleteProviderLoad {
             prior_inference_errors,
             duplicate_declarations,
         )?;
+        let (parsed, unresolved) =
+            resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
         Ok(CheckedSavedPlanInputs {
             load: self,
-            canonical_resources: Box::new(ValidationReady::from_binding_uses(
-                canonical_resources,
-                binding_uses,
-            )),
+            canonical_resources: Box::new(ValidationReady::from_resolved_pair(parsed, unresolved)),
         })
     }
 
@@ -1306,7 +1380,7 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
             wiring,
             resources: _,
         } = self;
-        let (resources, binding_uses) = resolve_config_pair_with_context(
+        let resources = resolve_config_pair_with_context(
             wiring.context(),
             &HashMap::new(),
             parsed,
@@ -1316,9 +1390,11 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
             prior_inference_errors,
             duplicate_declarations,
         )?;
+        let (parsed, unresolved) =
+            resolve_pair_binding_uses(resources, base_dir, wiring.context())?;
         Ok(ValidatedConfig {
             wiring,
-            resources: ValidationReady::from_binding_uses(resources, binding_uses),
+            resources: ValidationReady::from_resolved_pair(parsed, unresolved),
         })
     }
 }
@@ -1332,7 +1408,7 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
     ) -> Result<StateBlockResolution, AppError> {
         let Self { wiring, resources } = self;
         let ctx = wiring.context();
-        reconcile_canonical_prefixed_names(resources, state_file);
+        reconcile_canonical_prefixed_names(&mut resources.inner, state_file);
         let parsed = resources.parsed();
         let state_blocks = resolve_state_blocks(
             &parsed.state_blocks,
@@ -1341,7 +1417,7 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
             ctx.schemas(),
         );
         if let Some(state) = state_file.as_ref() {
-            resources.reconcile_anonymous_module_instances(
+            resources.inner.reconcile_anonymous_module_instances(
                 &|provider, resource_type| {
                     state
                         .resources_by_type(provider, resource_type)
@@ -1355,7 +1431,7 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
         if let Some(state) = state_file.as_mut() {
             reconcile_canonical_anonymous_identifiers_with_ctx(
                 ctx,
-                resources,
+                &mut resources.inner,
                 state,
                 &state_blocks.claims,
             )?;
@@ -1372,7 +1448,7 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
         let Self { wiring, resources } = self;
         compute_canonical_pair_anonymous_identifiers_with_ctx(
             wiring.context(),
-            resources,
+            &mut resources.inner,
             providers,
         )
     }
@@ -1469,7 +1545,7 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
             refresh_phase,
         } = inputs;
         expand_refresh_and_lift_states(
-            resources,
+            &mut resources.inner,
             ExpandRefreshAndLiftInputs {
                 provider,
                 expansion,
@@ -1495,6 +1571,7 @@ impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
     ) -> carina_core::provider::ProviderResult<()> {
         let Self { wiring, resources } = self;
         resources
+            .inner
             .prepare_desired_side_for_plan(provider_configs, normalizer, wiring.context().schemas())
             .await
     }
@@ -1522,26 +1599,17 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         ),
         AppError,
     > {
-        let ValidationReady {
-            inner: resources,
-            origin,
-        } = self.resources;
-        let (resources, expansion) = prepared.expand(
-            resources,
-            self.wiring.context().schemas(),
-            remote_bindings,
-            warning_policy,
-        )?;
-        Ok((
-            ValidatedConfig {
-                wiring: self.wiring,
-                resources: ValidationReady {
-                    inner: resources,
-                    origin,
-                },
-            },
-            expansion,
-        ))
+        let Self { wiring, resources } = self;
+        let (resources, expansion) = resources
+            .try_map_with_output_preserving_binding_use_resolution(|resources| {
+                prepared.expand(
+                    resources,
+                    wiring.context().schemas(),
+                    remote_bindings,
+                    warning_policy,
+                )
+            })?;
+        Ok((ValidatedConfig { wiring, resources }, expansion))
     }
 }
 
@@ -3098,11 +3166,13 @@ pub(crate) fn validate_module_calls_with_imported<E>(
     parsed: &carina_core::parser::File<E>,
     imported_modules: &module_resolver::ResolvedModuleSignatures,
     config: &carina_core::parser::ProviderContext,
+    binding_use_report: &carina_core::validation::BindingUseReport,
 ) -> Vec<AppError> {
-    lift_validation_result(validation::validate_module_calls(
-        &parsed.module_calls,
+    lift_validation_result(validation::validate_module_calls_with_binding_uses(
+        parsed,
         imported_modules,
         config,
+        binding_use_report,
     ))
 }
 
@@ -4724,43 +4794,58 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
         wiring,
         resources: canonical_resources,
     } = validated;
-    let ValidationReady {
-        inner: canonical_resources,
-        origin,
-    } = canonical_resources;
-    let schemas = wiring.context().schemas();
-    let (canonical_resources, expansion) = inputs.expansion.expand(
-        canonical_resources,
-        schemas,
-        inputs.remote_bindings,
-        inputs.warning_policy,
-    )?;
-    let state = finish_expanded_refresh_state(
-        canonical_resources,
+    let ValidatedExpandRefreshAndLiftInputs {
+        provider,
         expansion,
-        ExpandRefreshAndLiftInputs {
-            provider: inputs.provider,
-            expansion: inputs.expansion,
-            warning_policy: inputs.warning_policy,
-            remote_bindings: inputs.remote_bindings,
-            state_file: inputs.state_file,
-            saved_dep_bindings: inputs.saved_dep_bindings,
-            refresh_phase: inputs.refresh_phase,
-            schemas,
-        },
-    )
-    .await?;
+        warning_policy,
+        remote_bindings,
+        state_file,
+        saved_dep_bindings,
+        refresh_phase,
+    } = inputs;
+    let (resources, (sorted_resources, residual_deferred_for, deferred_create_targets)) = {
+        let schemas = wiring.context().schemas();
+        canonical_resources
+            .try_map_async_with_output_preserving_binding_use_resolution(
+                |canonical_resources| async move {
+                    let (canonical_resources, expanded) = expansion.expand(
+                        canonical_resources,
+                        schemas,
+                        remote_bindings,
+                        warning_policy,
+                    )?;
+                    let state = finish_expanded_refresh_state(
+                        canonical_resources,
+                        expanded,
+                        ExpandRefreshAndLiftInputs {
+                            provider,
+                            expansion,
+                            warning_policy,
+                            remote_bindings,
+                            state_file,
+                            saved_dep_bindings,
+                            refresh_phase,
+                            schemas,
+                        },
+                    )
+                    .await?;
+                    Ok::<_, AppError>((
+                        state.canonical_resources,
+                        (
+                            state.sorted_resources,
+                            state.residual_deferred_for,
+                            state.deferred_create_targets,
+                        ),
+                    ))
+                },
+            )
+            .await?
+    };
     Ok(ValidatedExpandedRefreshState {
-        validated: ValidatedConfig {
-            wiring,
-            resources: ValidationReady {
-                inner: state.canonical_resources,
-                origin,
-            },
-        },
-        sorted_resources: state.sorted_resources,
-        residual_deferred_for: state.residual_deferred_for,
-        deferred_create_targets: state.deferred_create_targets,
+        validated: ValidatedConfig { wiring, resources },
+        sorted_resources,
+        residual_deferred_for,
+        deferred_create_targets,
     })
 }
 
@@ -4857,29 +4942,26 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         wiring,
         resources: canonical_resources,
     } = validated;
-    let ValidationReady {
-        inner: canonical_resources,
-        origin,
-    } = canonical_resources;
-    let resources = create_plan_from_parsed_with_upstream_with_ctx_inner(
-        wiring.context(),
-        canonical_resources,
-        provider_configs,
-        state_file,
-        refresh,
-        progress_sink,
-        remote_bindings,
-        state_block_claims,
-        resolved_state_block_targets,
-    )
-    .await?;
-    Ok(ValidatedConfig {
-        wiring,
-        resources: ValidationReady {
-            inner: resources,
-            origin,
-        },
-    })
+    let resources = {
+        let context = wiring.context();
+        canonical_resources
+            .try_map_async_preserving_binding_use_resolution(|canonical_resources| async move {
+                create_plan_from_parsed_with_upstream_with_ctx_inner(
+                    context,
+                    canonical_resources,
+                    provider_configs,
+                    state_file,
+                    refresh,
+                    progress_sink,
+                    remote_bindings,
+                    state_block_claims,
+                    resolved_state_block_targets,
+                )
+                .await
+            })
+            .await?
+    };
+    Ok(ValidatedConfig { wiring, resources })
 }
 
 #[allow(clippy::too_many_arguments)]

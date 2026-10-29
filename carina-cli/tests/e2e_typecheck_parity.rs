@@ -19,7 +19,7 @@
 //! the acceptance-test suite that exercises the real provider plugins
 //! against `carina-rs/infra/`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use carina_core::provider::{
@@ -123,6 +123,17 @@ fn cli_diagnostics_at(
         path,
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
     )
+}
+
+fn cli_message_set(diagnostics: &[String]) -> BTreeSet<String> {
+    diagnostics.iter().cloned().collect()
+}
+
+fn lsp_message_set(diagnostics: &[tower_lsp::lsp_types::Diagnostic]) -> BTreeSet<String> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect()
 }
 
 #[test]
@@ -422,6 +433,59 @@ inner { x = a }
                     .contains("cannot assign mock.test.resource to 'x'")
             }),
         "Ref -> String must preserve id-string compatibility; root={root_cli:#?}, module={module_cli:#?}, lsp={lsp:#?}"
+    );
+}
+
+#[test]
+fn nested_module_accepts_resource_typed_argument_through_composition_signature() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let outer = fixture.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).expect("nested module directories");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"provider mock {}
+let resource = mock.test.resource { name = 'r' }
+let outer = use { source = './outer' }
+outer { resource = resource }
+"#,
+    )
+    .expect("root configuration");
+    let outer_source = r#"let inner = use { source = './inner' }
+arguments { resource: mock.test.resource }
+inner { resource = resource }
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).expect("outer module");
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments { resource: mock.test.resource }\n",
+    )
+    .expect("inner module");
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+
+    let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
+    let outer_path = outer.join("main.crn");
+    let lsp = engine_with_schemas(schemas).analyze(
+        &Document::new_with_path(
+            outer_source.to_string(),
+            outer_path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        ),
+        Some(&outer_path),
+    );
+
+    assert!(
+        root_cli.is_empty() && module_cli.is_empty() && lsp.is_empty(),
+        "the nested composition signature must accept the resource handle; root={root_cli:#?}, module={module_cli:#?}, lsp={lsp:#?}",
     );
 }
 
@@ -1478,25 +1542,16 @@ inner {
 
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-    assert!(
-        cli.iter()
-            .any(|diagnostic| diagnostic.contains(ENUM_SHADOW_MESSAGE)),
-        "CLI must descend the recorded list index to the enum sink: {cli:#?}",
+    let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
+    assert_eq!(
+        cli_message_set(&cli),
+        expected,
+        "CLI must emit only the shared binding-use finding: {cli:#?}",
     );
-    assert!(
-        lsp.iter()
-            .any(|diagnostic| diagnostic.message == ENUM_SHADOW_MESSAGE),
-        "LSP must use the same nested module-argument sink: {lsp:#?}",
-    );
-    assert!(
-        lsp.iter()
-            .all(|diagnostic| !diagnostic.message.contains("Missing required parameter")),
-        "the pending slot must suppress the secondary missing-argument error: {lsp:#?}",
-    );
-    assert!(
-        lsp.iter()
-            .all(|diagnostic| !diagnostic.message.contains("Unused let binding")),
-        "out-of-band provenance must still count as a binding use: {lsp:#?}",
+    assert_eq!(
+        lsp_message_set(&lsp),
+        expected,
+        "LSP must suppress missing-argument and unused-binding secondaries: {lsp:#?}",
     );
 }
 
@@ -1568,24 +1623,50 @@ inner {
 
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
     assert_eq!(
-        cli.iter()
-            .filter(|diagnostic| diagnostic.contains(ENUM_SHADOW_MESSAGE))
-            .count(),
-        1,
-        "CLI must emit the shared nested shadow finding once: {cli:#?}",
+        cli_message_set(&cli),
+        expected,
+        "the CLI authority must replace its legacy argument diagnostic: {cli:#?}",
     );
     assert_eq!(
-        lsp.iter()
-            .filter(|diagnostic| diagnostic.message == ENUM_SHADOW_MESSAGE)
-            .count(),
-        1,
-        "LSP must emit the shared nested shadow finding once: {lsp:#?}",
+        lsp_message_set(&lsp),
+        expected,
+        "the LSP must expose exactly the same diagnostic set: {lsp:#?}",
+    );
+}
+
+#[test]
+fn module_value_binding_type_mismatch_has_exact_cli_lsp_diagnostic_parity() {
+    let fixture = tempfile::tempdir().expect("module value mismatch fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let count = "not-an-int"
+let inner = use { source = "./modules/inner" }
+inner { count = count }
+"#,
+    )
+    .expect("write caller fixture");
+    std::fs::write(module.join("main.crn"), "arguments { count: Int }\n")
+        .expect("write module signature");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
     );
     assert_eq!(
-        lsp.len(),
+        cli_message_set(&cli),
+        lsp_message_set(&lsp),
+        "the binding-use authority must suppress the CLI-only legacy duplicate; CLI={cli:#?}; LSP={lsp:#?}",
+    );
+    assert_eq!(
+        cli.len(),
         1,
-        "the shared finding must replace the legacy argument diagnostic: {lsp:#?}",
+        "one authored mismatch must yield one diagnostic"
     );
 }
 
@@ -1699,7 +1780,7 @@ awscc.cloudfront.Distribution {
 }
 
 #[test]
-fn fully_qualified_enum_escape_works_when_provider_segment_is_a_binding() {
+fn fully_qualified_shape_preserves_a_bound_provider_head() {
     let schemas = enum_shadow_schemas();
     let fixture = write_fixture(&[
         (
@@ -1717,9 +1798,13 @@ fn fully_qualified_enum_escape_works_when_provider_segment_is_a_binding() {
     ]);
 
     let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
-    assert!(
-        diagnostics.is_empty(),
-        "the fully-qualified enum spelling must remain an unconditional escape: {diagnostics:#?}",
+    assert_eq!(
+        diagnostics,
+        vec![
+            "awscc.cloudfront.Distribution.<pending>: unknown attribute 'cloudfront' on 'awscc' in reference awscc.cloudfront"
+                .to_string(),
+        ],
+        "the resource binding must retain precedence over enum-shaped spelling",
     );
 }
 

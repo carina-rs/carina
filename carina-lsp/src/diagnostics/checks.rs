@@ -1973,20 +1973,12 @@ impl DiagnosticEngine {
                         .lookup(call)
                         .and_then(|semantic_call| semantic_call.argument(arg_name))
                         .unwrap_or(authored_argument);
-                    if parsed.bare_binding_uses().uses().any(|use_site| {
-                        matches!(
-                            &use_site.owner,
-                            carina_core::parser::BindingUseOwner::ModuleArgument {
-                                call: owner,
-                                argument,
-                            } if owner == call.id() && argument == arg_name
-                        ) && (use_site.path.segments().len() == 1
-                            || binding_use_report.findings().iter().any(|finding| {
-                                finding.use_site.source_file == use_site.source_file
-                                    && finding.use_site.span == use_site.span
-                                    && finding.use_site.name == use_site.name
-                            }))
-                    }) {
+                    if carina_core::validation::binding_use_authority_owns_module_argument(
+                        parsed,
+                        binding_use_report,
+                        call.id(),
+                        arg_name,
+                    ) {
                         continue;
                     }
                     if let Some(result) = carina_core::validation::check_module_argument_handle_sink(
@@ -2036,19 +2028,11 @@ impl DiagnosticEngine {
                 // Check for missing required parameters
                 for arg in module_args {
                     let pending_slot =
-                        parsed
-                            .bare_binding_uses()
-                            .pending_slots()
-                            .iter()
-                            .any(|slot| {
-                                matches!(
-                                    &slot.owner,
-                                    carina_core::parser::BindingUseOwner::ModuleArgument {
-                                        call: owner,
-                                        argument,
-                                    } if owner == call.id() && argument == &arg.name
-                                )
-                            });
+                        carina_core::validation::module_argument_has_pending_binding_use(
+                            parsed,
+                            call.id(),
+                            &arg.name,
+                        );
                     if arg.default.is_none() && !call.contains_argument(&arg.name) && !pending_slot
                     {
                         let (line, col) = module_call_position(call);

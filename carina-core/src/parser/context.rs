@@ -35,9 +35,11 @@ pub(super) enum ParseBinding {
         source_line: usize,
         declaration: crate::schema::BindingKind,
         declared_type: Option<TypeExpr>,
+        scope: BindingScopeId,
     },
     Structural {
         handle: StructuralHandle,
+        scope: BindingScopeId,
     },
 }
 
@@ -262,6 +264,7 @@ impl<'cfg> ParseContext<'cfg> {
                 source_line,
                 declaration: crate::schema::BindingKind::Let,
                 declared_type: None,
+                scope: self.binding_scope.clone(),
             },
         );
     }
@@ -279,13 +282,19 @@ impl<'cfg> ParseContext<'cfg> {
                 source_line: 0,
                 declaration: crate::schema::BindingKind::Argument,
                 declared_type,
+                scope: self.binding_scope.clone(),
             },
         );
     }
 
     pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
-        self.bindings
-            .insert(name, ParseBinding::Structural { handle });
+        self.bindings.insert(
+            name,
+            ParseBinding::Structural {
+                handle,
+                scope: self.binding_scope.clone(),
+            },
+        );
     }
 
     pub(super) fn set_structural_alias(&mut self, name: String, handle: StructuralHandle) {
@@ -293,6 +302,7 @@ impl<'cfg> ParseContext<'cfg> {
             name.clone(),
             ParseBinding::Structural {
                 handle: handle.with_alias(name),
+                scope: self.binding_scope.clone(),
             },
         );
     }
@@ -318,6 +328,15 @@ impl<'cfg> ParseContext<'cfg> {
             },
             Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
             None => ParseBindingRef::Unbound,
+        }
+    }
+
+    fn binding_scope(&self, name: &str) -> Option<&BindingScopeId> {
+        match self.bindings.get(name) {
+            Some(ParseBinding::Value { scope, .. } | ParseBinding::Structural { scope, .. }) => {
+                Some(scope)
+            }
+            None => None,
         }
     }
 
@@ -516,7 +535,10 @@ impl<'a> ExpressionMode<'a> {
         };
         let authored = BareBindingUse {
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
-            scope: ctx.binding_scope.clone(),
+            scope: ctx
+                .binding_scope(name)
+                .expect("a recorded binding use has a declaration scope")
+                .clone(),
             owner: sink.owner.clone(),
             path: sink.path.clone(),
             name: name.to_string(),

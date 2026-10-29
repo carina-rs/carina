@@ -633,6 +633,111 @@ fn resource_reference_preserves_namespaced_id() {
 }
 
 #[test]
+fn fully_qualified_shape_keeps_bound_value_head_semantics_in_every_value_position() {
+    let parsed = parse(
+        r#"
+            let cfg = {
+                envs = {
+                    Prod = {
+                        cidr = "10.0.0.0/16"
+                    }
+                }
+            }
+            let direct = cfg.envs.Prod.cidr
+            let interpolated = "${cfg.envs.Prod.cidr}"
+            let called = upper(cfg.envs.Prod.cidr)
+            exports {
+                exported: String = cfg.envs.Prod.cidr
+            }
+            mock.test.Consumer {
+                name = cfg.envs.Prod.cidr
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a PascalCase path segment must not override a bound value head");
+
+    let expected = Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()));
+    assert_eq!(parsed.variables.get("direct"), Some(&expected));
+    assert_eq!(parsed.variables.get("interpolated"), Some(&expected));
+    assert!(matches!(
+        parsed.variables.get("called"),
+        Some(Value::Deferred(DeferredValue::FunctionCall { args, .. }))
+            if args.len() == 1 && args[0].walker_value() == &expected
+    ));
+    assert_eq!(
+        parsed
+            .export_params
+            .iter()
+            .find(|export| export.name == "exported")
+            .and_then(|export| export.value.as_ref()),
+        Some(&expected),
+    );
+    assert_eq!(parsed.resources[0].get_attr("name"), Some(&expected),);
+}
+
+#[test]
+fn fully_qualified_shape_keeps_bound_structural_head_semantics_in_every_value_position() {
+    for declaration in [
+        r#"let network = mock.test.Network { name = "main" }"#,
+        r#"let network = upstream_state { source = "../network" }"#,
+    ] {
+        let parsed = parse(
+            &format!(
+                r#"
+                    {declaration}
+                    let direct = network.vpcs.Main.id
+                    let interpolated = "${{network.vpcs.Main.id}}"
+                    let called = upper(network.vpcs.Main.id)
+                    exports {{
+                        exported: String = network.vpcs.Main.id
+                    }}
+                    mock.test.Consumer {{
+                        name = network.vpcs.Main.id
+                    }}
+                "#,
+            ),
+            &ProviderContext::default(),
+        )
+        .expect("a PascalCase path segment must not override a structural binding head");
+
+        let expected = Value::resource_ref(
+            "network".to_string(),
+            "vpcs".to_string(),
+            vec!["Main".to_string(), "id".to_string()],
+        );
+        assert_eq!(parsed.variables.get("direct"), Some(&expected));
+        assert_eq!(
+            parsed.variables.get("interpolated"),
+            Some(&Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(expected.clone()),
+            ]))),
+        );
+        assert!(matches!(
+            parsed.variables.get("called"),
+            Some(Value::Deferred(DeferredValue::FunctionCall { args, .. }))
+                if args.len() == 1 && args[0].walker_value() == &expected
+        ));
+        assert_eq!(
+            parsed
+                .export_params
+                .iter()
+                .find(|export| export.name == "exported")
+                .and_then(|export| export.value.as_ref()),
+            Some(&expected),
+        );
+        assert_eq!(
+            parsed
+                .resources
+                .iter()
+                .find(|resource| resource.id.resource_type == "test.Consumer")
+                .and_then(|resource| resource.get_attr("name")),
+            Some(&expected),
+        );
+    }
+}
+
+#[test]
 fn namespaced_id_with_digit_segment() {
     // Enum values containing dots (e.g., "ipsec.1") should be parsed
     // as part of a namespaced_id when written as an identifier
@@ -5664,6 +5769,73 @@ fn parse_if_value_expr_no_else_false_errors() {
         "Expected error about missing else clause, got: {}",
         err
     );
+}
+
+#[test]
+fn if_value_expr_rejects_structural_handle_as_a_module_argument() {
+    let error = parse(
+        r#"
+            let primary = mock.test.Network { name = "primary" }
+            let fallback = mock.test.Network { name = "fallback" }
+            let child_module = use { source = "./child" }
+            child_module {
+                vpc = if true { primary } else { fallback }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("an if value branch must cross the ordinary Value boundary");
+
+    assert!(
+        error.to_string().contains("not a value"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn postfix_if_value_expr_rejects_structural_handle_before_field_access() {
+    let error = parse(
+        r#"
+            let primary = mock.test.Network { name = "primary" }
+            let fallback = mock.test.Network { name = "fallback" }
+            let selected = (if true { primary } else { fallback }).id
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("postfix access must not make a structural if branch into a value");
+
+    assert!(
+        error.to_string().contains("not a value"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn if_value_expr_preserves_pending_bare_use_in_a_typed_resource_sink() {
+    let parsed = parse(
+        r#"
+            let network = mock.test.Network { name = "primary" }
+            mock.test.Consumer {
+                name = if true { network } else { "fallback" }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("typed structural branches stay pending for the binding-use authority");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer resource");
+    assert!(consumer.get_attr("name").is_none());
+    assert!(
+        parsed
+            .bare_binding_uses()
+            .uses()
+            .any(|use_site| { use_site.name == "network" && use_site.path.root_name() == "name" })
+    );
+    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
 }
 
 #[test]
@@ -14289,6 +14461,59 @@ let child = child_module { values = [vpc] }"#,
             if argument == "values"
     ));
     assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
+}
+
+#[test]
+fn pending_nested_blocks_keep_authored_list_indices() {
+    let parsed = parse(
+        r#"
+            let structural = mock.test.Source { name = "source" }
+            let scalar = "second"
+            mock.test.Consumer {
+                item {
+                    name = structural
+                }
+                item {
+                    name = scalar
+                }
+                settings = {
+                    item {
+                        name = structural
+                    }
+                    item {
+                        name = scalar
+                    }
+                }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("pending blocks must not disturb later authored paths");
+
+    let scalar_paths = parsed
+        .bare_binding_uses()
+        .uses()
+        .filter(|use_site| use_site.name == "scalar")
+        .map(|use_site| use_site.path.segments().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(scalar_paths.len(), 2);
+    assert!(scalar_paths.iter().any(|segments| matches!(
+        segments.as_slice(),
+        [
+            AttributePathSegment::Attribute(attribute),
+            AttributePathSegment::ListIndex(1),
+            AttributePathSegment::StructField(field),
+        ] if attribute == "item" && field == "name"
+    )));
+    assert!(scalar_paths.iter().any(|segments| matches!(
+        segments.as_slice(),
+        [
+            AttributePathSegment::Attribute(attribute),
+            AttributePathSegment::StructField(block),
+            AttributePathSegment::ListIndex(1),
+            AttributePathSegment::StructField(field),
+        ] if attribute == "settings" && block == "item" && field == "name"
+    )));
 }
 
 #[test]

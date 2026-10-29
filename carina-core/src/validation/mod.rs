@@ -319,14 +319,42 @@ pub struct BindingUseReport {
     pending_slots: Vec<crate::parser::PendingValueSlot>,
 }
 
-/// Sealed proof that every parser-authored bare binding use was consumed by
-/// [`resolve_bare_binding_uses`] and that no typed pending slot survived.
+/// The exact parsed file whose bare binding uses were resolved successfully.
 ///
-/// The fields are private so downstream crates can carry this proof through a
-/// typestate transition but cannot manufacture it from a raw [`File`](crate::parser::File).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedBindingUses {
-    _sealed: (),
+/// This owner is deliberately neither `Clone` nor `Copy`: validation readiness
+/// follows the checked file instead of being a detachable proof token.
+///
+/// ```compile_fail,E0382
+/// use carina_core::parser::InferredExportParam;
+/// use carina_core::validation::ResolvedFile;
+///
+/// fn duplicate(resolved: ResolvedFile<InferredExportParam>) {
+///     let first = resolved;
+///     let second = resolved;
+///     drop((first, second));
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ResolvedFile<E> {
+    inner: crate::parser::File<E>,
+}
+
+impl<E> ResolvedFile<E> {
+    pub fn as_file(&self) -> &crate::parser::File<E> {
+        &self.inner
+    }
+
+    pub fn into_file(self) -> crate::parser::File<E> {
+        self.inner
+    }
+}
+
+impl<E> std::ops::Deref for ResolvedFile<E> {
+    type Target = crate::parser::File<E>;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_file()
+    }
 }
 
 impl BindingUseReport {
@@ -346,17 +374,6 @@ impl BindingUseReport {
 
     pub fn pending_slots(&self) -> &[crate::parser::PendingValueSlot] {
         &self.pending_slots
-    }
-
-    /// Consume a successful report into the sealed production-transition
-    /// proof. The original report is returned unchanged when any finding,
-    /// unconsumed use, or pending slot remains.
-    pub fn into_resolved(self) -> Result<ResolvedBindingUses, Self> {
-        if self.is_ready() {
-            Ok(ResolvedBindingUses { _sealed: () })
-        } else {
-            Err(self)
-        }
     }
 }
 
@@ -883,14 +900,63 @@ fn resolve_record_against_module(
 }
 
 fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) -> bool {
-    left.use_site.source_file == right.use_site.source_file
-        && left.use_site.span == right.use_site.span
-        && left.use_site.name == right.use_site.name
-        && left.error == right.error
+    same_authored_use(&left.use_site, &right.use_site) && left.error == right.error
 }
 
-/// Single schema-aware authority for every parser-recorded bare binding use.
-pub fn resolve_bare_binding_uses<E>(
+fn same_authored_use(
+    left: &crate::parser::BareBindingUse,
+    right: &crate::parser::BareBindingUse,
+) -> bool {
+    left.source_file == right.source_file && left.span == right.span && left.name == right.name
+}
+
+/// Whether the typed binding-use authority owns validation of an authored
+/// module argument. A direct bare binding is the complete argument. For a
+/// nested use, ordinary container validation remains active unless the typed
+/// authority produced the diagnostic for that leaf.
+pub fn binding_use_authority_owns_module_argument<E>(
+    file: &crate::parser::File<E>,
+    report: &BindingUseReport,
+    call: &crate::parser::ModuleCallId,
+    argument: &str,
+) -> bool {
+    file.bare_binding_uses().uses().any(|use_site| {
+        matches!(
+            &use_site.owner,
+            crate::parser::BindingUseOwner::ModuleArgument {
+                call: owner,
+                argument: owner_argument,
+            } if owner == call && owner_argument == argument
+        ) && (use_site.path.segments().len() == 1
+            || report
+                .findings()
+                .iter()
+                .any(|finding| same_authored_use(&finding.use_site, use_site)))
+    })
+}
+
+/// Whether parsing reserved this entire module argument because a structural
+/// leaf could not be represented in the runtime `Value` tree.
+pub fn module_argument_has_pending_binding_use<E>(
+    file: &crate::parser::File<E>,
+    call: &crate::parser::ModuleCallId,
+    argument: &str,
+) -> bool {
+    file.bare_binding_uses().pending_slots().iter().any(|slot| {
+        matches!(
+            &slot.owner,
+            crate::parser::BindingUseOwner::ModuleArgument {
+                call: owner,
+                argument: owner_argument,
+            } if owner == call && owner_argument == argument
+        )
+    })
+}
+
+/// Report-only schema-aware authority for every parser-recorded bare binding
+/// use. Editor and collect-all validation paths borrow the file through this
+/// function; they do not mint production readiness.
+pub fn check_bare_binding_uses<E>(
     file: &crate::parser::File<E>,
     context: &ValidationTypeContext<'_>,
 ) -> BindingUseReport {
@@ -965,6 +1031,31 @@ pub fn resolve_bare_binding_uses<E>(
     }
 
     report
+}
+
+/// Consume the exact file checked by the bare-binding authority.
+///
+/// Success removes the parser-only provenance and pending-slot channel before
+/// returning [`ResolvedFile`], so no later caller can pair an unrelated file
+/// with a detached proof. On failure the report contains every authored
+/// finding and any unconsumed pending slot.
+pub fn resolve_bare_binding_uses<E>(
+    mut file: crate::parser::File<E>,
+    schemas: &SchemaRegistry,
+    provider_context: &ProviderContext,
+    module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
+) -> Result<ResolvedFile<E>, BindingUseReport> {
+    let report = {
+        let context =
+            ValidationTypeContext::new(&file, schemas, provider_context, module_signatures);
+        check_bare_binding_uses(&file, &context)
+    };
+    if !report.is_ready() {
+        return Err(report);
+    }
+
+    file.parsed_binding_uses = Default::default();
+    Ok(ResolvedFile { inner: file })
 }
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let value = values.next()?;
@@ -3699,6 +3790,38 @@ pub fn validate_module_calls(
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     config: &ProviderContext,
 ) -> Result<(), String> {
+    validate_module_calls_inner(module_calls, imported_modules, config, |_, _| false)
+}
+
+/// Validate ordinary module-argument values while deferring binding-owned
+/// arguments to [`check_bare_binding_uses`].
+pub fn validate_module_calls_with_binding_uses<E>(
+    file: &crate::parser::File<E>,
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    config: &ProviderContext,
+    binding_use_report: &BindingUseReport,
+) -> Result<(), String> {
+    validate_module_calls_inner(
+        &file.module_calls,
+        imported_modules,
+        config,
+        |call, argument| {
+            binding_use_authority_owns_module_argument(
+                file,
+                binding_use_report,
+                call.id(),
+                argument,
+            )
+        },
+    )
+}
+
+fn validate_module_calls_inner(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    config: &ProviderContext,
+    should_skip: impl Fn(&ModuleCall, &str) -> bool,
+) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for call in module_calls {
@@ -3710,6 +3833,9 @@ pub fn validate_module_calls(
                 let arg_value = authored.argument();
                 let value_span = authored.value_span();
                 if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
+                    if should_skip(call, arg_name) {
+                        continue;
+                    }
                     let line = value_span.start_line();
                     let context = format!(
                         "module {} argument '{}' in {} at line {line}",
@@ -3949,6 +4075,8 @@ pub fn check_unused_bindings(view: &crate::config_loader::AuthoredBindingView) -
 
 fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<String> {
     let mut referenced: HashSet<String> = HashSet::new();
+    let mut scoped_bare_references: HashSet<(crate::parser::BindingScopeId, String)> =
+        HashSet::new();
     let mut state_block_targets = Vec::new();
     for state_block in &parsed.state_blocks {
         match state_block {
@@ -3971,13 +4099,17 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // `for` template are also tracked. State-block targets count as uses only
     // for the top-level managed-resource arm, matching plan's `parsed.resources`
     // target-resolution set.
-    let mut defined_bindings: Vec<String> = Vec::new();
+    let mut defined_bindings: Vec<(String, Option<crate::parser::BindingScopeId>)> = Vec::new();
     for rref in parsed.iter_all_resources() {
         if let Some(binding_name) = rref.binding() {
             if binding_name == "_" {
                 continue;
             }
-            defined_bindings.push(binding_name.to_string());
+            let scope = parsed
+                .parser_binding_metadata
+                .resource_source_file(rref.id())
+                .map(crate::parser::BindingScopeId::root);
+            defined_bindings.push((binding_name.to_string(), scope));
             if matches!(rref, ResourceRef::Resource(_))
                 && state_block_targets
                     .iter()
@@ -4018,11 +4150,11 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // pending structural leaf is deliberately omitted from that Value tree.
     // Their authored names live only in parser side data, so preserve the
     // existing unused-binding semantics by consuming that provenance here.
-    referenced.extend(
+    scoped_bare_references.extend(
         parsed
             .bare_binding_uses()
             .uses()
-            .map(|use_site| use_site.name.clone()),
+            .map(|use_site| (use_site.scope.clone(), use_site.name.clone())),
     );
     for attr_param in &parsed.attribute_params {
         if let Some(value) = &attr_param.value {
@@ -4049,11 +4181,15 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
     defined_bindings
         .into_iter()
-        .filter(|binding| {
+        .filter(|(binding, scope)| {
             !referenced.contains(binding)
+                && !scope.as_ref().is_some_and(|scope| {
+                    scoped_bare_references.contains(&(scope.clone(), binding.clone()))
+                })
                 && !parsed.structural_bindings.contains(binding)
                 && !binding.contains('[')
         })
+        .map(|(binding, _)| binding)
         .collect()
 }
 

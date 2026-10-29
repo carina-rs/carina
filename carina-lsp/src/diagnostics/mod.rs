@@ -609,7 +609,7 @@ impl DiagnosticEngine {
                 &self.provider_context,
                 &module_signatures,
             );
-            let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+            let binding_use_report = carina_core::validation::check_bare_binding_uses(
                 binding_input,
                 &binding_type_context,
             );

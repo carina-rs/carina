@@ -6272,10 +6272,21 @@ fn module_and_provider_wrappers_return_vec_app_error() {
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
+    let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        &parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            &parsed,
+            ctx.schemas(),
+            &provider_ctx,
+            &module_signatures,
+        ),
+    );
     let errors = validate_module_calls_with_imported(
         &parsed,
-        &carina_core::module_resolver::ResolvedModuleSignatures::new(),
+        &module_signatures,
         &provider_ctx,
+        &binding_use_report,
     );
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 

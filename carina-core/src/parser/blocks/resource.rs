@@ -121,6 +121,7 @@ fn parse_block_contents_with_quoted(
     // (formatter, plan display, diagnostics) sees a stable order.
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
     let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+    let mut authored_nested_blocks: HashMap<String, usize> = HashMap::new();
     let mut directives = None;
 
     // Local scope extends the parent context with block-scoped let bindings
@@ -183,7 +184,11 @@ fn parse_block_contents_with_quoted(
                             continue;
                         }
                         // Recursively parse nested block contents (supports arbitrary depth)
-                        let block_index = nested_blocks.get(&block_name).map_or(0, Vec::len);
+                        let authored_count = authored_nested_blocks
+                            .entry(block_name.clone())
+                            .or_default();
+                        let block_index = *authored_count;
+                        *authored_count += 1;
                         let block_mode = mode
                             .at_named_child(block_name.clone())
                             .at_list_index(block_index);

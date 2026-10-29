@@ -282,12 +282,13 @@ fn parse_namespaced_id_value(
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
-    // A fully-qualified enum identifier is the explicit escape from a
-    // colliding lexical binding. Its grammar-level classification is known
-    // before schema validation, so do not reinterpret its provider segment as
-    // a binding head. Type and membership are still checked by the enum
-    // resolver at the expected sink.
-    if trailing_segments.is_empty()
+    let head_binding = ctx.lookup_binding(parts[0]);
+
+    // Only an unbound dotted name can use the fully-qualified enum spelling.
+    // A lexical value or structural head keeps the same access semantics as
+    // every other dotted path, including when a later segment is PascalCase.
+    if matches!(head_binding, ParseBindingRef::Unbound)
+        && trailing_segments.is_empty()
         && matches!(
             crate::resource::RawEnumIdentifier::parse(full_str).parsed(),
             crate::resource::RawEnumIdentifierParts::FullyQualified { .. }
@@ -298,7 +299,7 @@ fn parse_namespaced_id_value(
         )));
     }
 
-    match ctx.lookup_binding(parts[0]) {
+    match head_binding {
         ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {
             return Ok(as_resource_ref(trailing_segments));
         }
@@ -441,6 +442,7 @@ pub(crate) fn parse_primary_eval_with_mode(
         Rule::map => {
             let mut map: IndexMap<String, Value> = IndexMap::new();
             let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+            let mut authored_nested_blocks: IndexMap<String, usize> = IndexMap::new();
             let mut structural_handles = IndexMap::new();
             let mut pending = None;
             for entry in inner.into_inner() {
@@ -471,7 +473,11 @@ pub(crate) fn parse_primary_eval_with_mode(
                             next_pair(&mut block_inner, "block name", "nested block in map")?
                                 .as_str()
                                 .to_string();
-                        let block_index = nested_blocks.get(&block_name).map_or(0, Vec::len);
+                        let authored_count = authored_nested_blocks
+                            .entry(block_name.clone())
+                            .or_default();
+                        let block_index = *authored_count;
+                        *authored_count += 1;
                         let block_mode = mode
                             .at_struct_field(block_name.clone())
                             .at_list_index(block_index);

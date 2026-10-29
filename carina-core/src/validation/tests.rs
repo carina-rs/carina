@@ -1003,6 +1003,66 @@ let vpc = awscc.ec2.Vpc {
 }
 
 #[test]
+fn block_local_shadow_use_does_not_mark_root_binding_used() {
+    let input = r#"
+        let shared = mock.test.Source {
+            name = "root"
+        }
+        mock.test.Consumer {
+            let shared = "local"
+            name = shared
+        }
+    "#;
+
+    assert_eq!(
+        check_unused_bindings(&authored_binding_view(input)),
+        vec!["shared"],
+        "the bare use resolves to the block-local declaration, not the root resource",
+    );
+}
+
+#[test]
+fn module_internal_use_does_not_mark_same_named_root_binding_used() {
+    let fixture = tempfile::tempdir().expect("module scope fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let shared = mock.test.Source { name = "root" }
+let inner_module = use { source = "./modules/inner" }
+inner_module {}
+"#,
+    )
+    .expect("write root fixture");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"let shared = "module-local"
+attributes { result: String = "ok" }
+mock.test.Consumer { name = shared }
+"#,
+    )
+    .expect("write module fixture");
+
+    let config = ProviderContext::default();
+    let schemas = SchemaRegistry::new();
+    let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
+        .expect("load module fixture");
+    crate::module_resolver::resolve_modules_with_config(
+        &mut parsed,
+        fixture.path(),
+        &config,
+        &schemas,
+    )
+    .expect("expand nested module");
+
+    assert_eq!(
+        check_unused_bindings_in_file(&parsed),
+        vec!["shared"],
+        "module-local provenance must not count as a use of the root binding",
+    );
+}
+
+#[test]
 fn schema_less_resource_binding_is_conservatively_identity_required() {
     let input = r#"
 provider foo {}

@@ -242,7 +242,7 @@ pub fn ensure_backend_lock(
 
 /// Create a `ProviderContext` with custom type validators extracted from
 /// the already-collected schema map and factory-based validation for WASM providers.
-fn enrich_provider_context(
+pub(crate) fn enrich_provider_context(
     schemas: &carina_core::schema::SchemaRegistry,
     factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>>,
 ) -> ProviderContext {
@@ -388,11 +388,9 @@ pub(crate) enum ConfigNameResolution {
 pub(crate) enum ResolvedConfig<'a> {
     Evaluated {
         parsed: &'a mut carina_core::parser::InferredFile,
-        binding_uses: carina_core::validation::ResolvedBindingUses,
     },
     Paired {
         resources: Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
-        binding_uses: carina_core::validation::ResolvedBindingUses,
     },
 }
 
@@ -593,7 +591,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // argument error. This authority is mandatory even for destroy/state
     // recovery paths (`skip_resource_validation`): the flag may skip provider
     // resource checks, but it cannot mint validation readiness.
-    let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
         parsed,
         &carina_core::validation::ValidationTypeContext::new(
             parsed,
@@ -610,7 +608,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
             module.module_path(),
             &enriched_context,
         );
-        let report = carina_core::validation::resolve_bare_binding_uses(
+        let report = carina_core::validation::check_bare_binding_uses(
             module_parsed,
             &carina_core::validation::ValidationTypeContext::new(
                 module_parsed,
@@ -639,6 +637,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         parsed,
         &imported_module_signatures,
         &enriched_context,
+        &binding_use_report,
     ));
 
     // User-facing checks for root-owned blocks inside modules run on the
@@ -713,12 +712,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     // Expansion carries module-internal side data in parallel with each
-    // expanded resource and remaps its owner. Re-run the same authority over
-    // that final graph, then retain its sealed success proof for the
-    // ValidatedConfig transition. This is not a second interpretation path:
-    // both passes use resolve_bare_binding_uses and the same mandatory
-    // provider context.
-    let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+    // expanded resource and remaps its owner. Re-run the report-only form of
+    // the same authority over that final graph. The wiring transition later
+    // consumes this exact file through `resolve_bare_binding_uses`; both calls
+    // use the same mandatory provider context.
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
         parsed,
         &carina_core::validation::ValidationTypeContext::new(
             parsed,
@@ -728,10 +726,9 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         ),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
-    let binding_uses = match binding_use_report.into_resolved() {
-        Ok(binding_uses) => binding_uses,
-        Err(_) => return Err(errors),
-    };
+    if !binding_use_report.is_ready() {
+        return Err(errors);
+    }
 
     let parsed: &mut carina_core::parser::InferredFile = &mut *parsed;
 
@@ -745,16 +742,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 errors.extend(name_errors);
                 return Err(errors);
             }
-            ResolvedConfig::Evaluated {
-                parsed,
-                binding_uses,
-            }
+            ResolvedConfig::Evaluated { parsed }
         }
         ConfigNameResolution::Paired(unresolved) => {
             match access.resolve_config_names(ctx, std::mem::take(parsed), *unresolved) {
                 Ok(resources) => ResolvedConfig::Paired {
                     resources: Box::new(resources),
-                    binding_uses,
                 },
                 Err(name_errors) => {
                     errors.extend(name_errors);

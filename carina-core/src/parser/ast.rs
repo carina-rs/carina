@@ -1240,7 +1240,7 @@ pub struct BindingScopeId {
 }
 
 impl BindingScopeId {
-    pub(in crate::parser) fn root(source_file: &Path) -> Self {
+    pub(crate) fn root(source_file: &Path) -> Self {
         Self {
             directory: source_file
                 .parent()

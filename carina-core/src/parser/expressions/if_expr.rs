@@ -333,7 +333,16 @@ fn parse_if_body_value_with_mode(
                 local_ctx.set_variable(name, value);
             }
             Rule::expression => {
-                return crate::parser::parse_expression_eval_with_mode(inner, &local_ctx, mode);
+                let line = inner.line_col().0;
+                let value =
+                    crate::parser::parse_expression_eval_with_mode(inner, &local_ctx, mode)?;
+                if matches!(value, EvalValue::PendingValue(_)) {
+                    return Ok(value);
+                }
+                return value
+                    .into_value()
+                    .map(EvalValue::from_value)
+                    .map_err(|error| ParseError::from_eval_value(error, line));
             }
             Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
                 return Err(ParseError::InvalidExpression {

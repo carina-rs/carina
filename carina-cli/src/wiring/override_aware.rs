@@ -87,6 +87,17 @@ impl<E> CanonicalResourcePair<E> {
         Self { parsed, unresolved }
     }
 
+    pub(super) fn from_resolved_file(
+        parsed: carina_core::validation::ResolvedFile<E>,
+        unresolved: Vec<Resource>,
+    ) -> Self {
+        Self::new(parsed.into_file(), unresolved)
+    }
+
+    pub(super) fn into_parts(self) -> (File<E>, Vec<Resource>) {
+        (self.parsed, self.unresolved)
+    }
+
     pub(super) fn resolve_block_names(
         _access: &super::ValidationPipelineAccess,
         parsed: File<E>,
