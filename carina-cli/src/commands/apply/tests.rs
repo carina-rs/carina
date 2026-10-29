@@ -31,7 +31,8 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    CanonicalResourcePair, OverrideAwareResources, resolve_config_block_names_for_test,
+    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources,
+    resolve_config_block_names_for_test,
 };
 
 fn validate_with_test_factories(

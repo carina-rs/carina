@@ -7,11 +7,12 @@ Execution Plan:
   + aws.acm.Certificate cert
       domain_name: 'registry.example.com'
       validation_method: 'DNS'
+      domain_validation_options: (known after apply)
   + aws.route53.RecordSet validation_record
       hosted_zone_id: 'Z123'
       name: '_acme.registry.example.com'
       resource_records: ['validation.example.com']
       ttl: 60
-      type: 'CNAME'
+      type: CNAME
 
 Plan: 2 to add, 0 to change, 0 to destroy.

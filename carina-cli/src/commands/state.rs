@@ -1311,13 +1311,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
     let mut prepared_expansion = addressed_expansion.seal(data_source_values);
     let crate::wiring::ExpandedRefreshState {
-        canonical_resources: _,
         sorted_resources: resorted,
-        new_child_ids: _,
-        refreshable_child_ids: _,
-        residual_deferred_for: _,
-        deferred_create_targets: _,
-        printed_warnings: _,
     } = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
@@ -3681,7 +3675,7 @@ mod tests {
             &[],
             [("aws".to_string(), widget_schema)],
         );
-        let expanded = validated_config
+        validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
                 expansion: &mut prepared_expansion,
@@ -3700,7 +3694,6 @@ mod tests {
             orphans,
             ..
         } = addressed.into_parts();
-        assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
         assert!(
             !current_states.contains_key(&child.id),
             "expansion must not duplicate an orphan-owned child into current states"

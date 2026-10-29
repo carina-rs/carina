@@ -7,6 +7,7 @@ Execution Plan:
   + aws.acm.Certificate cert
       domain_name: 'registry.example.com'
       validation_method: 'DNS'
+      domain_validation_options: (known after apply)
         │
         └─ +/- aws.route53.RecordSet validation_records[*] (N records after cert applies)
               <- for opt in cert.domain_validation_options

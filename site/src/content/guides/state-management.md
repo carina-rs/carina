@@ -193,6 +193,41 @@ let main_vpc = awscc.ec2.Vpc {
 
 Here the resource was previously bound as `let vpc` and is now bound as `let main_vpc`. `from` and `to` must use the same provider and resource type; changing either is not a move (use `removed` plus `import` instead). After the move is applied, you can remove the `moved` block from your code.
 
+When `carina plan` or `carina apply` sees a destroy and create whose configured
+create-only values match, it warns about a possible move. A unique match
+includes the exact `moved` block to add; an ambiguous group lists every
+destroyed and created address without choosing pairs. Resources with no
+configured create-only values cannot be matched this way. Carina never rebinds
+a named resource automatically, so the effects remain destroy and create until
+you add the block explicitly.
+
+### Moving a let-bound resource into a `for` loop
+
+When a named resource becomes an element of a bound loop, move its state to
+the expanded element address:
+
+```crn
+moved {
+  from = awscc.ec2.Vpc 'vpc'
+  to   = awscc.ec2.Vpc 'vpcs[0]'
+}
+
+let vpcs = for cidr in ['10.0.0.0/16'] {
+  awscc.ec2.Vpc {
+    cidr_block = cidr
+  }
+}
+```
+
+A map loop uses `'vpcs.key'` for an identifier-safe key, or
+`"vpcs['key with space']"` when the key needs quoting. For an unbound loop over
+a literal or function call, the address is positional, such as `'_for0[0]'`.
+An unbound loop over a reference uses its final path segment instead: `for x in
+a.b` produces `'_b[0]'`. Copy the exact address from the plan output or moved
+warning. Positional addresses may change when
+[carina#4109](https://github.com/carina-rs/carina/issues/4109) changes the
+address scheme.
+
 ## Removing resources from state
 
 To stop managing a resource without destroying it in the cloud, use the `removed` block:

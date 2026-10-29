@@ -1,0 +1,25 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  - awscc.ec2.Vpc old_a
+      cidr_block: '10.0.0.0/16'
+  - awscc.ec2.Vpc old_b
+      cidr_block: '10.0.0.0/16'
+  + awscc.ec2.Vpc vpcs[0]
+      cidr_block: '10.0.0.0/16'
+  + awscc.ec2.Vpc vpcs[1]
+      cidr_block: '10.0.0.0/16'
+
+Plan: 2 to add, 0 to change, 2 to destroy.
+
+Warning: the following destroyed and created resources have matching create-only values, but Carina cannot tell which pairs belong together:
+Destroyed:
+  - awscc.ec2.Vpc 'old_a'
+  - awscc.ec2.Vpc 'old_b'
+Created:
+  - awscc.ec2.Vpc 'vpcs[0]'
+  - awscc.ec2.Vpc 'vpcs[1]'
+Add a moved block for each pair that is the same resource to keep those resources.

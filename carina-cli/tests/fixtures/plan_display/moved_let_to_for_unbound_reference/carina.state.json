@@ -1,0 +1,62 @@
+{
+  "version": 19,
+  "exports_version": 1,
+  "serial": 1,
+  "lineage": "test-moved-let-to-for-unbound-reference",
+  "carina_version": "0.7.1",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "identity": "a",
+      "provider": "awscc",
+      "current": {
+        "kind": "applied",
+        "identifier": "widget-source",
+        "attributes": {
+          "external_name": "source",
+          "b": ["10.0.0.0/16"]
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": { "kind": "leaf" },
+          "b": { "kind": "leaf" }
+        }
+      },
+      "binding": "a",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "old_vpc",
+      "provider": "awscc",
+      "current": {
+        "kind": "applied",
+        "identifier": "vpc-old-reference",
+        "attributes": {
+          "cidr_block": "10.0.0.0/16"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": { "kind": "leaf" }
+        }
+      },
+      "binding": "old_vpc",
+      "dependency_bindings": []
+    }
+  ],
+  "exports": {}
+}
