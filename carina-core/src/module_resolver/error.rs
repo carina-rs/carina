@@ -72,7 +72,7 @@ pub enum ModuleError {
     },
 
     #[error("Reference type validation failed: {0}")]
-    ReferenceType(String),
+    ReferenceType(crate::validation::ExpansionBoundaryReferenceErrors),
 
     // An I/O error is a terminal leaf here. Keep its diagnostic in Display
     // and do not expose it a second time through Error::source.

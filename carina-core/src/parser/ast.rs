@@ -1112,6 +1112,35 @@ pub enum StateBlock {
 pub struct UseStatement {
     pub path: String,
     pub alias: String,
+    source: DeclarationSource,
+}
+
+impl UseStatement {
+    pub(crate) fn new_in_source(
+        path: String,
+        alias: String,
+        source_span: SourceSpan,
+        source_file: PathBuf,
+    ) -> Self {
+        Self {
+            path,
+            alias,
+            source: DeclarationSource::authored(source_span, source_file),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dummy(path: String, alias: String) -> Self {
+        Self::new_in_source(path, alias, SourceSpan::dummy(), PathBuf::from("test.crn"))
+    }
+
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
+    }
+
+    pub fn source_file(&self) -> &Path {
+        &self.source.file
+    }
 }
 
 /// Parameter for a user-defined function
@@ -1232,7 +1261,7 @@ impl From<Value> for ModuleArgument {
 pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
-    pub(in crate::parser) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self(Arc::from(path.into_boxed_path()))
     }
 
@@ -1937,6 +1966,7 @@ pub struct ParserBindingMetadata {
     structural_aliases: IndexMap<String, StructuralHandle>,
     value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
+    argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
 }
 
@@ -1989,6 +2019,22 @@ impl ParserBindingMetadata {
         self.resource_source_files.get(id).map(PathBuf::as_path)
     }
 
+    pub(crate) fn insert_argument_type_source(
+        &mut self,
+        name: String,
+        source_file: PathBuf,
+        span: SourceSpan,
+    ) {
+        self.argument_type_sources
+            .insert(name, (SourceFileId::new(source_file), span));
+    }
+
+    pub(crate) fn argument_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
+        self.argument_type_sources
+            .get(name)
+            .map(|(source_file, span)| (source_file, *span))
+    }
+
     pub(crate) fn insert_pending_function_type_check(&mut self, check: PendingFunctionTypeCheck) {
         if !self.pending_function_type_checks.contains(&check) {
             self.pending_function_type_checks.push(check);
@@ -2022,6 +2068,8 @@ impl ParserBindingMetadata {
             .extend(other.value_structural_handles);
         self.resource_source_files
             .extend(other.resource_source_files);
+        self.argument_type_sources
+            .extend(other.argument_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
         }
@@ -3344,10 +3392,10 @@ mod substitute_placeholder_tests {
             depends_on: Vec::new(),
             line: 1,
         });
-        parsed.uses.push(UseStatement {
-            path: "./module".to_string(),
-            alias: "use_alias".to_string(),
-        });
+        parsed.uses.push(UseStatement::dummy(
+            "./module".to_string(),
+            "use_alias".to_string(),
+        ));
         parsed.user_functions.insert(
             "function_name".to_string(),
             UserFunction {

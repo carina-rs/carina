@@ -7,7 +7,7 @@ use super::ProviderContext;
 use super::Rule;
 use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
 use super::blocks::attributes::{
-    parse_arguments_block, parse_attributes_block, parse_exports_block,
+    ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
 use super::blocks::backend::parse_backend_block;
 use super::blocks::module_call::parse_module_call;
@@ -644,6 +644,7 @@ fn parse_with_seeded_bindings_inner(
     let mut uses = Vec::new();
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
+    let mut argument_type_sources = Vec::new();
     let mut attribute_params = Vec::new();
     let mut export_params = Vec::new();
     let mut backend = None;
@@ -673,7 +674,7 @@ fn parse_with_seeded_bindings_inner(
                                 // lexical binding inside `ctx` as it is parsed, so a
                                 // later argument's default expression can reference
                                 // earlier arguments (#2393).
-                                let parsed_arguments = {
+                                let parsed_arguments_block = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
                                     let result = parse_arguments_block(
@@ -687,7 +688,12 @@ fn parse_with_seeded_bindings_inner(
                                     ctx.warnings = warnings;
                                     result?
                                 };
-                                arguments.extend(parsed_arguments);
+                                let ParsedArgumentsBlock {
+                                    parameters,
+                                    type_sources,
+                                } = parsed_arguments_block;
+                                arguments.extend(parameters);
+                                argument_type_sources.extend(type_sources);
                             }
                             Rule::attributes_block => {
                                 let parsed_attribute_params = {
@@ -1019,6 +1025,9 @@ fn parse_with_seeded_bindings_inner(
     }
     for check in ctx.pending_function_type_checks.borrow().iter().cloned() {
         parser_binding_metadata.insert_pending_function_type_check(check);
+    }
+    for (name, span) in argument_type_sources {
+        parser_binding_metadata.insert_argument_type_source(name, source_file.to_path_buf(), span);
     }
     let seeded_bindings = ctx.seeded_bindings.clone();
     let mut variables = IndexMap::new();

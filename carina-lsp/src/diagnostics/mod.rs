@@ -57,10 +57,10 @@ fn render_module_call_findings(
                 spans.push(finding.anchor().span);
             } else {
                 for owner in finding.owners() {
-                    if owner.root.source_file() == current_file
-                        && !spans.contains(&owner.root.call_span())
+                    if owner.root.source_file().path() == current_file
+                        && !spans.contains(&owner.root.span())
                     {
-                        spans.push(owner.root.call_span());
+                        spans.push(owner.root.span());
                     }
                 }
             }
@@ -282,8 +282,24 @@ impl DiagnosticEngine {
         {
             // The directory parse has the classified sibling bindings and is
             // therefore more authoritative than the buffer-only parse (which
-            // may have treated a sibling name as an enum identifier).
-            diagnostics.push(parse_error_to_diagnostic(parse_error));
+            // may have treated a sibling name as an enum identifier). One
+            // exception is an unresolved declaration type: the bootstrap AST
+            // retains that declaration and the typed walker below can attach
+            // its context and exact token span. In that case the typed finding
+            // covers this coarse parser backstop.
+            let covered_by_typed_resolution = self.provider_context.custom_types_loaded()
+                && doc.parsed().is_some_and(|parsed| {
+                    let mut parsed = parsed.clone();
+                    carina_core::validation::resolve_file_type_exprs(
+                        &mut parsed,
+                        &self.provider_context,
+                    )
+                    .iter()
+                    .any(|finding| finding.covers_parser_error(current_file_path, parse_error))
+                });
+            if !covered_by_typed_resolution {
+                diagnostics.push(parse_error_to_diagnostic(parse_error));
+            }
             true
         } else {
             false
@@ -432,60 +448,48 @@ impl DiagnosticEngine {
         //    `doc.parsed()` is `Some`, letting the walker still run
         //    against the user's in-flight edits.
         //
-        // Both paths walk the same `arguments` set when the edited
-        // file is the one declaring them, so the merged path is the
-        // strict preference and the fallback only fires on its
-        // failure — no double-report.
-        //
-        // Position note: the diagnostic uses `Range::default()`
-        // (line 0). The AST parameter structs do not carry a source
-        // span, so threading a precise location requires a wider
-        // change (extend `ArgumentParameter` / `AttributeParameter`
-        // / `ParsedExportParam` with a `line: usize` field and update
-        // every constructor). The CLI emits the same message without
-        // a span — we accept the same trade-off here so the LSP
-        // reaches CLI parity in this PR; precise spans can land as a
-        // follow-up.
-        // Gate on the custom-type load state. The walker itself is unconditional
-        // by design (the carina-core helper "always reports unknowns;
-        // gating is the caller's choice"); the orphaned-file
-        // fallback context turns this flag off so its diagnostics
-        // don't over-fire for `arguments {}` blocks in files outside
-        // any known project root.
+        // Both paths walk the same declaration set when the edited file owns
+        // it. The merged path is preferred; on failure, the buffer fallback's
+        // parser metadata retains the authored type-token span. The earlier
+        // directory-error path recognizes this same typed finding and omits
+        // its coarser line-wide backstop, avoiding a duplicate diagnostic.
+        // Gate on the custom-type load state so the orphaned-file fallback
+        // does not report unresolved declarations in files outside any known
+        // project root, where no provider catalog is authoritative.
         if self.provider_context.custom_types_loaded() {
             let custom_type_findings = match merged {
                 Some(m) => {
                     let mut parsed = m.clone();
-                    let mut findings = carina_core::validation::resolve_file_type_exprs(
+                    carina_core::validation::resolve_file_type_exprs(
                         &mut parsed,
                         &self.provider_context,
-                    );
-                    findings.extend(carina_core::validation::validate_argument_custom_types(
-                        &parsed,
-                        &self.provider_context,
-                    ));
-                    findings
+                    )
                 }
                 None => current_parsed
                     .map(|p| {
                         let mut parsed = p.clone();
-                        let mut findings = carina_core::validation::resolve_file_type_exprs(
+                        carina_core::validation::resolve_file_type_exprs(
                             &mut parsed,
                             &self.provider_context,
-                        );
-                        findings.extend(carina_core::validation::validate_argument_custom_types(
-                            &parsed,
-                            &self.provider_context,
-                        ));
-                        findings
+                        )
                     })
                     .unwrap_or_default(),
             };
-            for msg in custom_type_findings {
+            for finding in custom_type_findings {
+                let range = match finding.source_location() {
+                    Some(source)
+                        if current_file_path
+                            .is_none_or(|current| current == source.source_file().path()) =>
+                    {
+                        parser_span_range(doc, source.span()).unwrap_or_default()
+                    }
+                    Some(_source) => continue,
+                    None => tower_lsp::lsp_types::Range::default(),
+                };
                 diagnostics.push(carina_diagnostic_range(
-                    tower_lsp::lsp_types::Range::default(),
+                    range,
                     tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                    msg,
+                    finding.to_string(),
                 ));
             }
         }
@@ -704,10 +708,10 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            let expansion_succeeded = merged_result
+            let expanded_graph_available = merged_result
                 .as_ref()
-                .is_some_and(|result| result.module_resolution_status.is_complete());
-            let expanded_compositions = expansion_succeeded
+                .is_some_and(|result| result.module_resolution_status.expanded_graph_available());
+            let expanded_compositions = expanded_graph_available
                 .then_some(merged)
                 .flatten()
                 .map(|expanded| expanded.compositions.as_slice());

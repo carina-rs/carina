@@ -579,16 +579,10 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // could not fire there. This post-parse walk re-applies the same
     // predicate against the now-enriched context, closing the
     // standalone-module-validate path so a typo or renamed-then-
-    // removed type cannot ride into apply. Imported modules
-    // re-parsed below by `resolve_modules_with_config` see the
-    // enriched context directly and the parser gate covers them.
+    // removed type cannot ride into apply. The recursive module-call checker
+    // below runs this same typed resolver over every imported module.
     for finding in carina_core::validation::resolve_file_type_exprs(parsed, &enriched_context) {
-        errors.push(AppError::Validation(finding));
-    }
-    for finding in
-        carina_core::validation::validate_argument_custom_types(parsed, &enriched_context)
-    {
-        errors.push(AppError::Validation(finding));
+        errors.push(AppError::Validation(finding.to_string()));
     }
     if let Err(error) =
         carina_core::parser::resolve_resource_refs_with_config(parsed, &enriched_context)
@@ -679,7 +673,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // checks established in #3711, the directory unit includes every imported
     // nested module, even when that import is never called. The `errors`
     // return immediately below happens before
-    // `resolve_modules_with_config`, so the same run cannot also emit the
+    // module resolver, so the same run cannot also emit the
     // resolver's expansion-phase backstops. Destroy and state refresh set
     // `skip_resource_validation = true`, bypass this walk, and rely on those
     // backstops while still expanding modules.
@@ -692,18 +686,36 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     // Module expansion assumes the checks above succeeded — feeding
-    // broken module calls into `resolve_modules_with_config` can
+    // broken module calls into the diagnostic resolver can
     // surface confusing secondary errors, so gate it here.
     if !errors.is_empty() {
         return Err(errors);
     }
 
-    if let Err(e) = module_resolver::resolve_modules_with_config(
+    let module_resolution = module_resolver::resolve_modules_with_diagnostics(
         parsed,
         base_dir,
         &enriched_context,
         ctx.schemas(),
-    ) {
+    );
+    let module_resolver::ModuleResolutionDiagnosticReport {
+        constraint_reports,
+        status: module_resolution_status,
+    } = module_resolution;
+    errors.extend(
+        carina_core::validation::check_expanded_module_calls(
+            carina_core::validation::ExpandedModuleCallCheckInput::Constraints {
+                compositions: &parsed.compositions,
+                constraint_reports: &constraint_reports,
+            },
+        )
+        .into_iter()
+        .map(|finding| AppError::Validation(finding.message().to_string())),
+    );
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if let Some(error) = module_resolution_status.unowned_error() {
         // A cycle or other expansion failure leaves no complete composition
         // graph for the unified boundary pass. Preserve source-local
         // `attributes {}` diagnostics that do not depend on expansion; this
@@ -714,12 +726,13 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
             &module_walk,
             &enriched_context,
         ));
-        let message = match e.root_cause() {
-            module_resolver::ModuleError::Constraint(_) => e.to_string(),
-            _ => format!(
+        let message = if error.is_constraint() {
+            error.display_relative_to(base_dir)
+        } else {
+            format!(
                 "Module resolution error: {}",
-                e.display_relative_to(base_dir)
-            ),
+                error.display_relative_to(base_dir)
+            )
         };
         errors.push(AppError::Config(message));
         return Err(errors);

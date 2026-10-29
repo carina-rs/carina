@@ -7426,3 +7426,152 @@ fn parameter_handle_classification_requires_a_resolved_type() {
         ResolvedParameterType::Handle(ResourceTypePath::new("aws", "ec2.Vpc")),
     );
 }
+
+fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAttributeRefError {
+    CompositionAttributeRefError {
+        error: AttributeParamRefError {
+            attribute: "bad".to_string(),
+            path: ReferencePath::Binding("source".to_string()),
+            kind: ModuleCallRefErrorKind::TypeMismatch {
+                expected: "String".to_string(),
+                actual: "Int".to_string(),
+                declared: None,
+            },
+        },
+        module_name: "shared".to_string(),
+        module_source: Some("../shared".to_string()),
+        module_directory: Some(std::path::PathBuf::from(module_directory)),
+        call_paths: Vec::new(),
+        reference_position: 0,
+    }
+}
+
+#[test]
+fn module_call_type_resolution_message_exposes_its_typed_source() {
+    let message = ModuleCallFindingMessage::type_resolution_for_test(
+        "module declaration".to_string(),
+        "unknown custom type 'Missing'".to_string(),
+    );
+
+    let source = std::error::Error::source(&message)
+        .expect("type-resolution findings must expose their typed source");
+    assert!(
+        source.downcast_ref::<TypeResolutionDiagnostic>().is_some(),
+        "type-resolution findings must retain TypeResolutionDiagnostic, not rendered text",
+    );
+}
+
+#[test]
+fn module_attribute_reference_message_exposes_its_typed_source() {
+    let message = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/one"),
+    );
+
+    let source = std::error::Error::source(&message)
+        .expect("attribute-reference findings must expose their typed source");
+    assert!(
+        source
+            .downcast_ref::<CompositionAttributeRefError>()
+            .is_some(),
+        "attribute-reference findings must retain CompositionAttributeRefError",
+    );
+}
+
+#[test]
+fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
+    let source = "let child = use { source = './child' }\nchild { value = 1 }\n";
+    let first = crate::parser::parse_file(
+        source,
+        std::path::Path::new("first.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("first fixture parse");
+    let second = crate::parser::parse_file(
+        source,
+        std::path::Path::new("second.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("second fixture parse");
+    let kind = ModuleCallRefErrorKind::TypeMismatch {
+        expected: "String".to_string(),
+        actual: "Int".to_string(),
+        declared: None,
+    };
+    let path = ReferencePath::Binding("source".to_string());
+    let finding =
+        ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
+            call_label: "child".to_string(),
+            identity: ModuleCallReferenceIdentity {
+                call: first.module_calls[0].id().clone(),
+                argument: "value".to_string(),
+                path: path.clone(),
+                kind: kind.clone(),
+            },
+        }));
+    let resolver_error = ModuleCallRefError {
+        call_label: "child".to_string(),
+        identity: ModuleCallReferenceIdentity {
+            call: second.module_calls[0].id().clone(),
+            argument: "value".to_string(),
+            path,
+            kind,
+        },
+        argument_span: second.module_calls[0].source_span(),
+    };
+
+    assert_eq!(
+        finding.to_string(),
+        resolver_error.to_string(),
+        "the fixture must render identically despite distinct authored call identities",
+    );
+    assert!(
+        !finding.covers_reference_type(&resolver_error),
+        "coverage must compare ModuleCallId as part of the typed identity",
+    );
+}
+
+#[test]
+fn module_attribute_reference_dedup_uses_typed_identity_not_display_text() {
+    let first = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/one"),
+    );
+    let second = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/two"),
+    );
+
+    assert_eq!(
+        first.to_string(),
+        second.to_string(),
+        "the fixture must isolate identities that intentionally render alike",
+    );
+    assert_ne!(
+        first, second,
+        "deduplication must not merge distinct typed attribute-reference failures",
+    );
+}
+
+#[test]
+fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
+    let diagnostic = |source_file| {
+        ModuleCallFindingMessage::TypeResolution(Box::new(TypeResolutionDiagnostic::description(
+            "module declaration".to_string(),
+            "unknown custom type 'Missing'".into(),
+            Some(TypeResolutionSource::new(
+                SourceFileId::new(std::path::PathBuf::from(source_file)),
+                SourceSpan::dummy(),
+            )),
+        )))
+    };
+    let first = diagnostic("first.crn");
+    let second = diagnostic("second.crn");
+
+    assert_eq!(
+        first.to_string(),
+        second.to_string(),
+        "the fixture must isolate source identities that intentionally render alike",
+    );
+    assert_ne!(
+        first, second,
+        "deduplication must retain distinct typed type-resolution failures",
+    );
+}

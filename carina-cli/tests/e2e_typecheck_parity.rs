@@ -519,6 +519,260 @@ attributes { loaded: Bool = true }
 }
 
 #[test]
+fn nested_call_below_uncalled_import_routes_to_the_root_call_with_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("nested uncalled-import parity fixture");
+    let outer = fixture.path().join("outer");
+    let inner = fixture.path().join("inner");
+    let leaf = fixture.path().join("leaf");
+    for directory in [&outer, &inner, &leaf] {
+        std::fs::create_dir_all(directory).expect("create module directory");
+    }
+    let root_source = r#"let outer = use { source = "./outer" }
+
+outer {}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), root_source).expect("write root call fixture");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"let inner = use { source = "../inner" }
+
+attributes { loaded: Bool = true }
+"#,
+    )
+    .expect("write outer module");
+    std::fs::write(
+        inner.join("main.crn"),
+        r#"let leaf = use { source = "../leaf" }
+
+leaf { bogus = 1 }
+
+attributes { loaded: Bool = true }
+"#,
+    )
+    .expect("write inner module");
+    std::fs::write(leaf.join("main.crn"), "arguments { expected: Int = 0 }\n")
+        .expect("write leaf module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let expected =
+        canonical_error_multiset([String::from("Unknown argument 'bogus' for module 'leaf'")]);
+
+    assert_eq!(
+        cli_located_error_multiset(&cli),
+        expected,
+        "CLI must retain the nested call failure exactly once: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_error_multiset(&lsp),
+        expected,
+        "LSP must route the same nested failure to the root call: {lsp:#?}",
+    );
+    assert_eq!(
+        lsp[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
+    assert_eq!(
+        lsp[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(2, 0),
+            tower_lsp::lsp_types::Position::new(2, "outer {}".len() as u32),
+        ),
+        "the nested finding must underline the authored root call",
+    );
+}
+
+#[test]
+fn nested_call_below_root_uncalled_import_routes_to_the_use_statement() {
+    let fixture = tempfile::tempdir().expect("root uncalled-import parity fixture");
+    let outer = fixture.path().join("outer");
+    let leaf = fixture.path().join("leaf");
+    for directory in [&outer, &leaf] {
+        std::fs::create_dir_all(directory).expect("create module directory");
+    }
+    let root_source = "let outer = use { source = \"./outer\" }\n";
+    std::fs::write(fixture.path().join("main.crn"), root_source)
+        .expect("write root import fixture");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"let leaf = use { source = "../leaf" }
+
+leaf { bogus = 1 }
+
+attributes { loaded: Bool = true }
+"#,
+    )
+    .expect("write outer module");
+    std::fs::write(leaf.join("main.crn"), "arguments { expected: Int = 0 }\n")
+        .expect("write leaf module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let expected =
+        canonical_error_multiset([String::from("Unknown argument 'bogus' for module 'leaf'")]);
+
+    assert_eq!(cli_located_error_multiset(&cli), expected, "CLI={cli:#?}");
+    assert_eq!(lsp_error_multiset(&lsp), expected, "LSP={lsp:#?}");
+    assert_eq!(
+        lsp[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
+    assert_eq!(
+        lsp[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(0, 0),
+            tower_lsp::lsp_types::Position::new(
+                0,
+                root_source.trim_end_matches('\n').chars().count() as u32,
+            ),
+        ),
+        "an uncalled root import must retain an authored editor anchor",
+    );
+}
+
+#[test]
+fn uncalled_import_type_resolution_error_has_cli_lsp_parity_and_declaration_range() {
+    let fixture = tempfile::tempdir().expect("uncalled type-resolution parity fixture");
+    let invalid = fixture.path().join("invalid");
+    std::fs::create_dir_all(&invalid).expect("create invalid module directory");
+    let root_source = "let invalid = use { source = \"./invalid\" }\n";
+    let declaration_source = "arguments {\n  x: NoSuchType\n}\n";
+    std::fs::write(fixture.path().join("main.crn"), root_source).expect("write uncalled import");
+    std::fs::write(invalid.join("arguments.crn"), declaration_source)
+        .expect("write invalid argument declaration");
+
+    let schemas = module_call_parity_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let engine = engine_with_schemas(schemas);
+    let root_lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let declaration_lsp = lsp_diagnostics(&engine, &fixture, "invalid/arguments.crn");
+    let expected = canonical_error_multiset([String::from(
+        "argument 'x': unknown custom type 'NoSuchType'",
+    )]);
+
+    assert_eq!(cli_located_error_multiset(&cli), expected, "CLI={cli:#?}");
+    assert_eq!(
+        lsp_error_multiset(&root_lsp),
+        expected,
+        "root LSP must route the declaration failure to the uncalled use: {root_lsp:#?}",
+    );
+    assert_eq!(
+        lsp_error_multiset(&declaration_lsp),
+        expected,
+        "module-file LSP must render the same typed failure: {declaration_lsp:#?}",
+    );
+    assert_eq!(
+        root_lsp[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(0, 0),
+            tower_lsp::lsp_types::Position::new(
+                0,
+                root_source.trim_end_matches('\n').chars().count() as u32,
+            ),
+        ),
+    );
+    assert_eq!(
+        declaration_lsp[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 5),
+            tower_lsp::lsp_types::Position::new(1, 15),
+        ),
+        "the authored parameter type, not an unrelated module call, must be underlined",
+    );
+}
+
+#[test]
+fn nested_constraint_failure_routes_each_instance_message_to_its_root_call() {
+    let fixture = tempfile::tempdir().expect("nested repeated-constraint parity fixture");
+    let outer = fixture.path().join("outer");
+    let checked = fixture.path().join("checked");
+    for directory in [&outer, &checked] {
+        std::fs::create_dir_all(directory).expect("create module directory");
+    }
+    let first_line = "let a = outer { name = \"first-too-long\" }";
+    let second_line = "let b = outer { name = \"second-too-long\" }";
+    let root_source =
+        format!("let outer = use {{ source = \"./outer\" }}\n\n{first_line}\n{second_line}\n");
+    std::fs::write(fixture.path().join("main.crn"), &root_source)
+        .expect("write repeated root calls");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments { name: String }
+
+let checked = use { source = "../checked" }
+checked { name = name }
+
+attributes { loaded: Bool = true }
+"#,
+    )
+    .expect("write outer module");
+    std::fs::write(
+        checked.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition = length(name) <= 3
+      error_message = "name is too long"
+    }
+  }
+}
+"#,
+    )
+    .expect("write checked module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let first_message = "anonymous call to module 'checked': argument 'name': name is too long (got 'first-too-long')";
+    let second_message = "anonymous call to module 'checked': argument 'name': name is too long (got 'second-too-long')";
+    let expected =
+        canonical_error_multiset([first_message.to_string(), second_message.to_string()]);
+
+    assert_eq!(
+        cli_located_error_multiset(&cli),
+        expected,
+        "CLI must retain both concrete constraint outcomes: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_error_multiset(&lsp),
+        expected,
+        "LSP must retain both concrete constraint outcomes: {lsp:#?}",
+    );
+    for (message, line, source_line) in [
+        (first_message, 2, first_line),
+        (second_message, 3, second_line),
+    ] {
+        let diagnostic = lsp
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .unwrap_or_else(|| panic!("missing per-instance diagnostic {message:?}: {lsp:#?}"));
+        assert_eq!(
+            diagnostic.severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        );
+        assert_eq!(
+            diagnostic.range,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(line, "let a = ".len() as u32),
+                tower_lsp::lsp_types::Position::new(line, source_line.len() as u32),
+            ),
+            "each concrete constraint message must underline its own root call",
+        );
+    }
+}
+
+#[test]
 fn postfix_wrong_shape_access_has_cli_lsp_parity_for_local_and_wait_bindings() {
     let fixture = write_fixture(&[
         ("providers.crn", "provider mock {}\n"),

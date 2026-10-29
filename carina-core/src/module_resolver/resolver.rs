@@ -6,10 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use indexmap::IndexMap;
-
 use crate::parser::{
-    ModuleCallDiagnosticSource, ModuleCallId, ParseError, ParsedFile, ProviderContext, UseStatement,
+    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, UseStatement,
 };
 use crate::resource::ModuleConstraintId;
 use crate::schema::SchemaRegistry;
@@ -48,19 +46,25 @@ pub enum ResolvedModuleConstraintOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleCallConstraintReport {
     pub source: ModuleCallDiagnosticSource,
+    pub instance: String,
     pub outcomes: Vec<ResolvedModuleConstraintOutcome>,
 }
 
 impl ModuleCallConstraintReport {
     pub(crate) fn new(
         source: ModuleCallDiagnosticSource,
+        instance: String,
         outcomes: Vec<ResolvedModuleConstraintOutcome>,
-    ) -> (ModuleCallId, Self) {
-        (source.id.clone(), Self { source, outcomes })
+    ) -> Self {
+        Self {
+            source,
+            instance,
+            outcomes,
+        }
     }
 }
 
-pub type ModuleCallConstraintReports = IndexMap<ModuleCallId, ModuleCallConstraintReport>;
+pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
 /// Module resolution result for editor diagnostics.
 ///
@@ -109,6 +113,10 @@ impl ResidualModuleResolutionError {
 
     pub fn display_relative_to(&self, root: &Path) -> String {
         self.0.display_relative_to(root)
+    }
+
+    pub fn is_constraint(&self) -> bool {
+        matches!(self.0.root_cause(), ModuleError::Constraint(_diagnostic))
     }
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
@@ -207,19 +215,20 @@ impl ResidualModuleResolutionError {
                 self.finding_owns_error(finding)
                     && finding.message().covers_bare_handle_argument(argument)
             }),
-            ModuleError::ReferenceType(joined) => {
-                let mut lines = joined.lines().filter(|line| !line.is_empty()).peekable();
-                lines.peek().is_some()
-                    && lines.all(|line| {
-                        // Non-call lines belong to declaration/resource/function
-                        // reference checks. A call-boundary line is covered only
-                        // by the concrete core finding for its owning call.
-                        !line.starts_with("module call '")
-                            || findings.iter().any(|finding| {
-                                self.finding_owns_error(finding)
-                                    && finding.message().covers_reference_type_line(line)
-                            })
-                    })
+            ModuleError::ReferenceType(errors) => {
+                let mut errors = errors.iter().peekable();
+                errors.peek().is_some() && errors.all(|error| match error {
+                    crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) => {
+                        findings
+                            .iter()
+                            .any(|finding| finding.message().covers_reference_type(error))
+                    }
+                    crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
+                        true
+                    }
+                })
             }
             ModuleError::UnknownArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
@@ -254,12 +263,15 @@ impl ResidualModuleResolutionError {
             return finding
                 .owners()
                 .iter()
-                .any(|owner| owner.immediate == *failing_call);
+                .any(|owner| owner.immediate.module_call() == Some(failing_call));
         }
         let call_source = self.0.call_source();
         finding.owners().iter().any(|owner| match call_source {
-            ModuleErrorCallSource::Failing(call) => owner.immediate == *call,
-            ModuleErrorCallSource::Owners(calls) => calls.contains(&owner.root),
+            ModuleErrorCallSource::Failing(call) => owner.immediate.module_call() == Some(call),
+            ModuleErrorCallSource::Owners(calls) => owner
+                .root
+                .module_call()
+                .is_some_and(|root| calls.contains(root)),
             ModuleErrorCallSource::Unavailable => false,
         })
     }
@@ -270,6 +282,15 @@ impl ModuleResolutionDiagnosticStatus {
         match self {
             Self::Complete => true,
             Self::Failed(_failure) => false,
+        }
+    }
+
+    pub fn expanded_graph_available(&self) -> bool {
+        match self {
+            Self::Complete | Self::Failed(ModuleResolutionDiagnosticFailure::ConstraintReports) => {
+                true
+            }
+            Self::Failed(ModuleResolutionDiagnosticFailure::Unowned(_error)) => false,
         }
     }
 
@@ -295,24 +316,29 @@ fn module_resolution_diagnostic_status(
     error: Option<ModuleError>,
     constraint_reports: &ModuleCallConstraintReports,
 ) -> ModuleResolutionDiagnosticStatus {
+    let has_failed_constraint_report = constraint_reports.iter().any(|report| {
+        report.outcomes.iter().any(|outcome| match &outcome.status {
+            ResolvedModuleConstraintStatus::Satisfied | ResolvedModuleConstraintStatus::Pending => {
+                false
+            }
+            ResolvedModuleConstraintStatus::Failed {
+                diagnostic: _diagnostic,
+                origin: _origin,
+            } => true,
+        })
+    });
     let Some(error) = error else {
-        return ModuleResolutionDiagnosticStatus::Complete;
+        return if has_failed_constraint_report {
+            ModuleResolutionDiagnosticStatus::Failed(
+                ModuleResolutionDiagnosticFailure::ConstraintReports,
+            )
+        } else {
+            ModuleResolutionDiagnosticStatus::Complete
+        };
     };
     let constraint_report_owns_error =
-        if let ModuleError::Constraint(_diagnostic) = error.root_cause() {
-            constraint_reports.values().any(|report| {
-                report.outcomes.iter().any(|outcome| match &outcome.status {
-                    ResolvedModuleConstraintStatus::Satisfied
-                    | ResolvedModuleConstraintStatus::Pending => false,
-                    ResolvedModuleConstraintStatus::Failed {
-                        diagnostic: _diagnostic,
-                        origin: _origin,
-                    } => true,
-                })
-            })
-        } else {
-            false
-        };
+        matches!(error.root_cause(), ModuleError::Constraint(_diagnostic))
+            && has_failed_constraint_report;
     if constraint_report_owns_error {
         ModuleResolutionDiagnosticStatus::Failed(
             ModuleResolutionDiagnosticFailure::ConstraintReports,
@@ -346,7 +372,7 @@ mod diagnostic_status_tests {
                     description: None,
                     validations: Vec::new(),
                 }],
-                attributes: IndexMap::new(),
+                attributes: indexmap::IndexMap::new(),
                 requires: Vec::new(),
             },
         )]);
@@ -383,7 +409,7 @@ mod diagnostic_status_tests {
             argument: "required".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let status = module_resolution_diagnostic_status(Some(error), &IndexMap::new());
+        let status = module_resolution_diagnostic_status(Some(error), &Vec::new());
 
         assert!(
             status.unowned_error().is_some(),
@@ -395,8 +421,7 @@ mod diagnostic_status_tests {
             argument: "different".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let unrelated_status =
-            module_resolution_diagnostic_status(Some(unrelated), &IndexMap::new());
+        let unrelated_status = module_resolution_diagnostic_status(Some(unrelated), &Vec::new());
         assert!(
             unrelated_status.uncovered_error(&findings).is_some(),
             "a finding for another argument must not claim this resolver error",
@@ -481,8 +506,10 @@ impl TypeResolutionPolicy for StrictTypeResolution {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
         if let Some(first) = type_errors.into_iter().next() {
             return Err(ModuleError::Parse(ParseError::InvalidExpression {
-                line: 0,
-                message: first,
+                line: first
+                    .source_location()
+                    .map_or(0, |source| source.span().start_line()),
+                message: first.to_string(),
             }));
         }
         Ok(())
@@ -563,7 +590,7 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
         let resolver = Self::with_config_and_schemas(base_dir, config, schemas);
-        *resolver.constraint_reports.borrow_mut() = Some(IndexMap::new());
+        *resolver.constraint_reports.borrow_mut() = Some(Vec::new());
         resolver
     }
 }
@@ -597,13 +624,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
     }
 
-    pub(super) fn record_constraint_report(
-        &self,
-        identity: ModuleCallId,
-        report: ModuleCallConstraintReport,
-    ) {
+    pub(super) fn record_constraint_report(&self, report: ModuleCallConstraintReport) {
         if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
-            reports.insert(identity, report);
+            reports.push(report);
         }
     }
 
@@ -1036,7 +1059,7 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike>(
     match RefCheckedModuleGraph::check_with_reporting(parsed, base_dir, config, schemas) {
         Ok(checked) => checked.expand_with_diagnostics(),
         Err(error) => {
-            let constraint_reports = IndexMap::new();
+            let constraint_reports = Vec::new();
             let status = module_resolution_diagnostic_status(Some(error), &constraint_reports);
             ModuleResolutionDiagnosticReport {
                 constraint_reports,
@@ -1108,5 +1131,19 @@ mod type_resolution_policy_tests {
 
         assert_strict(&strict);
         assert_upstream(&upstream);
+    }
+
+    #[test]
+    fn non_call_reference_error_is_not_classified_by_its_rendered_prefix() {
+        let error = ResidualModuleResolutionError::new(ModuleError::ReferenceType(
+            crate::validation::ExpansionBoundaryReferenceErrors::function_for_test(
+                "module call 'is only user-authored diagnostic text'",
+            ),
+        ));
+
+        assert!(
+            error.is_covered_by(&[]),
+            "coverage must use a typed error variant rather than a rendered string prefix",
+        );
     }
 }

@@ -1578,14 +1578,20 @@ pub fn suppress_coalesce_existence_error(
 ///
 /// `Display` is the stable CLI message. The LSP consumes the named fields and
 /// never has to recover source identity by parsing that message.
-#[derive(Debug, Clone)]
-pub struct ModuleCallRefError {
-    call_label: String,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallReferenceIdentity {
+    pub call: ModuleCallId,
     pub argument: String,
-    /// Parser-authored key span for `argument`.
-    pub argument_span: SourceSpan,
     pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleCallRefError {
+    call_label: String,
+    pub identity: ModuleCallReferenceIdentity,
+    /// Parser-authored key span for `argument`.
+    pub argument_span: SourceSpan,
 }
 
 fn format_module_call_ref_error(
@@ -1622,7 +1628,13 @@ fn format_module_call_ref_error(
 
 impl std::fmt::Display for ModuleCallRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        format_module_call_ref_error(f, &self.call_label, &self.argument, &self.path, &self.kind)
+        format_module_call_ref_error(
+            f,
+            &self.call_label,
+            &self.identity.argument,
+            &self.identity.path,
+            &self.identity.kind,
+        )
     }
 }
 
@@ -1687,10 +1699,13 @@ fn validate_module_call_argument_ref_types_inner(
                     };
                     errors.push(ModuleCallRefError {
                         call_label: call_name.to_string(),
-                        argument: argument_name.to_string(),
+                        identity: ModuleCallReferenceIdentity {
+                            call: call.id().clone(),
+                            argument: argument_name.to_string(),
+                            path: path.to_owned(),
+                            kind,
+                        },
                         argument_span,
-                        path: path.to_owned(),
-                        kind,
                     });
                 },
             );
@@ -1700,7 +1715,7 @@ fn validate_module_call_argument_ref_types_inner(
     errors
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeParamRefError {
     pub attribute: String,
     pub path: ReferencePath,
@@ -1769,7 +1784,7 @@ impl std::fmt::Display for CompositionModuleCallRefError {
 /// A module-output declaration failure. The module identity remains attached
 /// after expansion so repeated instances collapse to one authored error and
 /// CLI output can identify the declaration's source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionAttributeRefError {
     pub error: AttributeParamRefError,
     pub module_name: String,
@@ -1798,6 +1813,8 @@ impl std::fmt::Display for CompositionAttributeRefError {
         write!(f, "module '{}': {}", self.module_label(), self.error)
     }
 }
+
+impl std::error::Error for CompositionAttributeRefError {}
 
 impl std::fmt::Display for CompositionRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3214,13 +3231,66 @@ fn check_export_ref(
 /// Missing schemas and unknown attributes are likewise deferred here, while a
 /// known source and sink still use BindingIndex + TypeInSchema as the sole
 /// declared-type assignability authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpansionBoundaryReferenceError {
+    Attribute(String),
+    Export(String),
+    ModuleCall(Box<ModuleCallRefError>),
+    Function(String),
+}
+
+impl std::fmt::Display for ExpansionBoundaryReferenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Attribute(message) | Self::Export(message) | Self::Function(message) => {
+                formatter.write_str(message)
+            }
+            Self::ModuleCall(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpansionBoundaryReferenceErrors {
+    errors: Vec<ExpansionBoundaryReferenceError>,
+}
+
+impl ExpansionBoundaryReferenceErrors {
+    pub fn iter(&self) -> impl Iterator<Item = &ExpansionBoundaryReferenceError> {
+        self.errors.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn function_for_test(message: &str) -> Self {
+        Self {
+            errors: vec![ExpansionBoundaryReferenceError::Function(
+                message.to_string(),
+            )],
+        }
+    }
+}
+
+impl std::fmt::Display for ExpansionBoundaryReferenceErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.errors.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            error.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ExpansionBoundaryReferenceErrors {}
+
 pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
     E: crate::parser::ExportParamLike,
 >(
     parsed: &crate::parser::File<E>,
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
+) -> Result<(), ExpansionBoundaryReferenceErrors> {
     let mut errors = Vec::new();
 
     if let Err(message) = validate_attribute_param_ref_types_inner(
@@ -3228,7 +3298,11 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
         bindings,
         UnknownReferencePolicy::Defer,
     ) {
-        errors.extend(message.lines().map(str::to_string));
+        errors.extend(
+            message
+                .lines()
+                .map(|line| ExpansionBoundaryReferenceError::Attribute(line.to_string())),
+        );
     }
     if let Err(message) = validate_export_param_ref_types_inner(
         &parsed.export_params,
@@ -3236,7 +3310,11 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
         None,
         UnknownReferencePolicy::Defer,
     ) {
-        errors.extend(message.lines().map(str::to_string));
+        errors.extend(
+            message
+                .lines()
+                .map(|line| ExpansionBoundaryReferenceError::Export(line.to_string())),
+        );
     }
     errors.extend(
         validate_module_call_argument_ref_types_inner(
@@ -3246,18 +3324,22 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
             UnknownReferencePolicy::Defer,
         )
         .into_iter()
-        .map(|error| error.to_string()),
+        .map(|error| ExpansionBoundaryReferenceError::ModuleCall(Box::new(error))),
     );
     if let Err(message) =
         validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Defer)
     {
-        errors.extend(message.lines().map(str::to_string));
+        errors.extend(
+            message
+                .lines()
+                .map(|line| ExpansionBoundaryReferenceError::Function(line.to_string())),
+        );
     }
 
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("\n"))
+        Err(ExpansionBoundaryReferenceErrors { errors })
     }
 }
 
@@ -3609,55 +3691,286 @@ pub fn resolve_parameter_type_for_check(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct TypeResolutionError {
+    message: String,
+}
+
+impl From<String> for TypeResolutionError {
+    fn from(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl From<&str> for TypeResolutionError {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeResolutionDeclarationKind {
+    Argument,
+    Attribute,
+    Export,
+    FunctionParameter,
+    FunctionReturn,
+}
+
+impl std::fmt::Display for TypeResolutionDeclarationKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Argument => formatter.write_str("argument"),
+            Self::Attribute => formatter.write_str("attribute"),
+            Self::Export => formatter.write_str("export"),
+            Self::FunctionParameter => formatter.write_str("function parameter"),
+            Self::FunctionReturn => formatter.write_str("function return type"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeResolutionContext {
+    Declaration {
+        kind: TypeResolutionDeclarationKind,
+        name: String,
+    },
+    Description(String),
+}
+
+impl std::fmt::Display for TypeResolutionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Declaration { kind, name } => write!(formatter, "{kind} '{name}'"),
+            Self::Description(description) => formatter.write_str(description),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypeResolutionSource {
+    source_file: SourceFileId,
+    span: SourceSpan,
+}
+
+impl TypeResolutionSource {
+    fn new(source_file: SourceFileId, span: SourceSpan) -> Self {
+        Self { source_file, span }
+    }
+
+    pub fn source_file(&self) -> &SourceFileId {
+        &self.source_file
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{context}: {error}")]
+pub struct TypeResolutionDiagnostic {
+    context: TypeResolutionContext,
+    error: TypeResolutionError,
+    location: Option<TypeResolutionSource>,
+}
+
+impl TypeResolutionDiagnostic {
+    fn declaration(
+        kind: TypeResolutionDeclarationKind,
+        name: String,
+        error: TypeResolutionError,
+        location: Option<TypeResolutionSource>,
+    ) -> Self {
+        Self {
+            context: TypeResolutionContext::Declaration { kind, name },
+            error,
+            location,
+        }
+    }
+
+    fn description(
+        description: String,
+        error: TypeResolutionError,
+        location: Option<TypeResolutionSource>,
+    ) -> Self {
+        Self {
+            context: TypeResolutionContext::Description(description),
+            error,
+            location,
+        }
+    }
+
+    pub fn source_location(&self) -> Option<&TypeResolutionSource> {
+        self.location.as_ref()
+    }
+
+    /// Whether this typed declaration failure supersedes the parser's
+    /// location-only backstop for the same unresolved type.
+    pub fn covers_parser_error(
+        &self,
+        source_file: &std::path::Path,
+        parse_error: &crate::parser::ParseError,
+    ) -> bool {
+        let crate::parser::ParseError::InvalidExpression { line, message } = parse_error else {
+            return false;
+        };
+        let parser_error = TypeResolutionError::from(message.as_str());
+        self.location.as_ref().is_some_and(|location| {
+            location.source_file.path() == source_file
+                && location.span.start_line() == *line
+                && self.error == parser_error
+        })
+    }
+}
+
+fn unresolved_bare_type_errors(
+    ty: &TypeExpr,
+    config: &ProviderContext,
+    errors: &mut Vec<TypeResolutionError>,
+) {
+    match ty {
+        TypeExpr::Simple(name)
+            if config.custom_types_loaded()
+                && !crate::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) =>
+        {
+            errors.push(
+                crate::parser::unknown_custom_type_message(
+                    &crate::parser::snake_to_pascal(name),
+                    config,
+                )
+                .into(),
+            );
+        }
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => {
+            unresolved_bare_type_errors(inner, config, errors);
+        }
+        TypeExpr::Union(members) => {
+            for member in members {
+                unresolved_bare_type_errors(member, config, errors);
+            }
+        }
+        TypeExpr::Struct { fields } => {
+            for (name, field_type) in fields {
+                let _ = name;
+                unresolved_bare_type_errors(field_type, config, errors);
+            }
+        }
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::SchemaType { owned: _ }
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::Unknown
+        | TypeExpr::Simple(_) => {}
+    }
+}
+
+fn resolve_declaration_type(
+    ty: &mut TypeExpr,
+    config: &ProviderContext,
+) -> Vec<TypeResolutionError> {
+    match resolve_type_expr(ty, config) {
+        Ok(resolved) => {
+            *ty = resolved;
+            let mut errors = Vec::new();
+            unresolved_bare_type_errors(ty, config, &mut errors);
+            errors
+        }
+        Err(error) => vec![error.into()],
+    }
+}
+
 /// Resolve every module-boundary type declaration in place. Diagnostics
 /// include the declaration kind/name so callers can report the same surface
 /// as [`validate_argument_custom_types`].
 pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
     config: &ProviderContext,
-) -> Vec<String> {
+) -> Vec<TypeResolutionDiagnostic> {
     let mut errors = Vec::new();
+    let argument_sources = parsed
+        .arguments
+        .iter()
+        .filter_map(|argument| {
+            parsed
+                .parser_binding_metadata
+                .argument_type_source(&argument.name)
+                .map(|(source_file, span)| {
+                    (
+                        argument.name.clone(),
+                        TypeResolutionSource::new(source_file.clone(), span),
+                    )
+                })
+        })
+        .collect::<IndexMap<_, _>>();
     for arg in &mut parsed.arguments {
-        match resolve_type_expr(&arg.type_expr, config) {
-            Ok(resolved) => arg.type_expr = resolved,
-            Err(e) => errors.push(format!("argument '{}': {e}", arg.name)),
+        for error in resolve_declaration_type(&mut arg.type_expr, config) {
+            errors.push(TypeResolutionDiagnostic::declaration(
+                TypeResolutionDeclarationKind::Argument,
+                arg.name.clone(),
+                error,
+                argument_sources.get(&arg.name).cloned(),
+            ));
         }
     }
     for ap in &mut parsed.attribute_params {
-        if let Some(ty) = &ap.type_expr {
-            match resolve_type_expr(ty, config) {
-                Ok(resolved) => ap.type_expr = Some(resolved),
-                Err(e) => errors.push(format!("attribute '{}': {e}", ap.name)),
+        let source = TypeResolutionSource::new(
+            SourceFileId::new(ap.source_file().to_path_buf()),
+            ap.source_span(),
+        );
+        if let Some(ty) = &mut ap.type_expr {
+            for error in resolve_declaration_type(ty, config) {
+                errors.push(TypeResolutionDiagnostic::declaration(
+                    TypeResolutionDeclarationKind::Attribute,
+                    ap.name.clone(),
+                    error,
+                    Some(source.clone()),
+                ));
             }
         }
     }
     for ep in &mut parsed.export_params {
         let export_name = ep.name().to_string();
         if let Some(ty) = ep.type_expr_opt_mut() {
-            match resolve_type_expr(ty, config) {
-                Ok(resolved) => *ty = resolved,
-                Err(e) => errors.push(format!("export '{export_name}': {e}")),
+            for error in resolve_declaration_type(ty, config) {
+                errors.push(TypeResolutionDiagnostic::declaration(
+                    TypeResolutionDeclarationKind::Export,
+                    export_name.clone(),
+                    error,
+                    None,
+                ));
             }
         }
     }
     for function in parsed.user_functions.values_mut() {
         for parameter in &mut function.params {
-            if let Some(ty) = &parameter.param_type {
-                match resolve_type_expr(ty, config) {
-                    Ok(resolved) => parameter.param_type = Some(resolved),
-                    Err(error) => errors.push(format!(
-                        "function '{}' parameter '{}': {error}",
-                        function.name, parameter.name
-                    )),
+            if let Some(ty) = &mut parameter.param_type {
+                for error in resolve_declaration_type(ty, config) {
+                    errors.push(TypeResolutionDiagnostic::declaration(
+                        TypeResolutionDeclarationKind::FunctionParameter,
+                        format!("{}' parameter '{}", function.name, parameter.name),
+                        error,
+                        None,
+                    ));
                 }
             }
         }
-        if let Some(ty) = &function.return_type {
-            match resolve_type_expr(ty, config) {
-                Ok(resolved) => function.return_type = Some(resolved),
-                Err(error) => {
-                    errors.push(format!("function '{}' return type: {error}", function.name))
-                }
+        if let Some(ty) = &mut function.return_type {
+            for error in resolve_declaration_type(ty, config) {
+                errors.push(TypeResolutionDiagnostic::declaration(
+                    TypeResolutionDeclarationKind::FunctionReturn,
+                    function.name.clone(),
+                    error,
+                    None,
+                ));
             }
         }
     }
@@ -3916,13 +4229,6 @@ pub enum ModuleCallFindingKind {
     Constraint,
 }
 
-/// The outermost authored call and the immediate call whose boundary failed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ModuleCallFindingOwner {
-    pub root: ModuleCallId,
-    pub immediate: ModuleCallId,
-}
-
 /// Parser-authored location retained without converting it to frontend
 /// coordinates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3931,14 +4237,68 @@ pub struct ModuleCallFindingAnchor {
     pub span: SourceSpan,
 }
 
+/// Authored source identity that owns a module-graph diagnostic.
+///
+/// A reachable graph can be owned by a concrete module call or by an uncalled
+/// `use` declaration. Keeping those cases distinct prevents editor routing
+/// from inventing a module-call identity for an import-only path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModuleCallFindingOwnerSource {
+    ModuleCall(ModuleCallId),
+    Authored(ModuleCallFindingAnchor),
+}
+
+impl ModuleCallFindingOwnerSource {
+    pub fn source_file(&self) -> &SourceFileId {
+        match self {
+            Self::ModuleCall(call) => call.source_file_id(),
+            Self::Authored(anchor) => &anchor.source_file,
+        }
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            Self::ModuleCall(call) => call.call_span(),
+            Self::Authored(anchor) => anchor.span,
+        }
+    }
+
+    pub fn module_call(&self) -> Option<&ModuleCallId> {
+        match self {
+            Self::ModuleCall(call) => Some(call),
+            Self::Authored(_anchor) => None,
+        }
+    }
+}
+
+/// The outermost authored owner and the immediate source whose boundary
+/// failed. Either position may be a call or an authored declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallFindingOwner {
+    pub root: ModuleCallFindingOwnerSource,
+    pub immediate: ModuleCallFindingOwnerSource,
+}
+
 /// Typed reference-boundary diagnostic shared by authored and expanded calls.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleCallReferenceDiagnostic {
     call_label: String,
-    argument: String,
-    path: ReferencePath,
-    kind: ModuleCallRefErrorKind,
+    identity: ModuleCallReferenceIdentity,
 }
+
+impl std::fmt::Display for ModuleCallReferenceDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_module_call_ref_error(
+            formatter,
+            &self.call_label,
+            &self.identity.argument,
+            &self.identity.path,
+            &self.identity.kind,
+        )
+    }
+}
+
+impl std::error::Error for ModuleCallReferenceDiagnostic {}
 
 /// The sole message-rendering authority for module-call findings.
 #[derive(Debug, Clone, PartialEq)]
@@ -3967,15 +4327,26 @@ pub enum ModuleCallFindingMessage {
         error: Box<BindingResolutionError>,
     },
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
-    TypeResolution {
-        context: String,
-        error: String,
-    },
-    AttributeReference(String),
+    TypeResolution(Box<TypeResolutionDiagnostic>),
+    AttributeReference(Box<CompositionAttributeRefError>),
     Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
 impl ModuleCallFindingMessage {
+    #[cfg(test)]
+    fn type_resolution_for_test(context: String, error: String) -> Self {
+        Self::TypeResolution(Box::new(TypeResolutionDiagnostic::description(
+            context,
+            error.into(),
+            None,
+        )))
+    }
+
+    #[cfg(test)]
+    fn attribute_reference_for_test(error: CompositionAttributeRefError) -> Self {
+        Self::AttributeReference(Box::new(error))
+    }
+
     /// Schema enum detail retained for editor code actions without changing
     /// this message's canonical rendering or diagnostic ownership.
     pub fn type_error(&self) -> Option<&TypeError> {
@@ -4004,11 +4375,8 @@ impl ModuleCallFindingMessage {
                 error: _error,
             } => None,
             Self::ReferenceType(_diagnostic) => None,
-            Self::TypeResolution {
-                context: _context,
-                error: _error,
-            } => None,
-            Self::AttributeReference(_message) => None,
+            Self::TypeResolution(_error) => None,
+            Self::AttributeReference(_error) => None,
             Self::Constraint(_diagnostic) => None,
         }
     }
@@ -4039,10 +4407,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::ReferenceType(_)
-            | Self::TypeResolution {
-                context: _,
-                error: _,
-            }
+            | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
         }
@@ -4078,10 +4443,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::ReferenceType(_)
-            | Self::TypeResolution {
-                context: _,
-                error: _,
-            }
+            | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
         }
@@ -4113,10 +4475,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::ReferenceType(_)
-            | Self::TypeResolution {
-                context: _,
-                error: _,
-            }
+            | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
         }
@@ -4148,21 +4507,15 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::ReferenceType(_)
-            | Self::TypeResolution {
-                context: _,
-                error: _,
-            }
+            | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
         }
     }
 
-    pub(crate) fn covers_reference_type_line(&self, line: &str) -> bool {
+    pub(crate) fn covers_reference_type(&self, error: &ModuleCallRefError) -> bool {
         match self {
-            Self::ReferenceType(_diagnostic) => {
-                let rendered = self.to_string();
-                rendered == line || rendered.replace(" (anonymous call)", "") == line
-            }
+            Self::ReferenceType(diagnostic) => diagnostic.identity == error.identity,
             Self::UnknownArgument {
                 module: _,
                 argument: _,
@@ -4186,10 +4539,7 @@ impl ModuleCallFindingMessage {
                 argument: _,
                 error: _,
             }
-            | Self::TypeResolution {
-                context: _,
-                error: _,
-            }
+            | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
         }
@@ -4240,20 +4590,50 @@ impl std::fmt::Display for ModuleCallFindingMessage {
             Self::ReferenceType(error) => format_module_call_ref_error(
                 formatter,
                 &error.call_label,
-                &error.argument,
-                &error.path,
-                &error.kind,
+                &error.identity.argument,
+                &error.identity.path,
+                &error.identity.kind,
             ),
-            Self::TypeResolution { context, error } => {
-                write!(formatter, "{context}: {error}")
-            }
-            Self::AttributeReference(message) => formatter.write_str(message),
+            Self::TypeResolution(error) => error.fmt(formatter),
+            Self::AttributeReference(error) => error.fmt(formatter),
             Self::Constraint(diagnostic) => diagnostic.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for ModuleCallFindingMessage {}
+impl std::error::Error for ModuleCallFindingMessage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TypeResolution(error) => Some(error.as_ref()),
+            Self::AttributeReference(error) => Some(error.as_ref()),
+            Self::UnknownArgument {
+                module: _module,
+                argument: _argument,
+                suggestion: _suggestion,
+            } => None,
+            Self::MissingRequiredArgument {
+                module: _module,
+                argument: _argument,
+            } => None,
+            Self::ValueType {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => None,
+            Self::HandleSink {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => None,
+            Self::BindingUse {
+                argument: _argument,
+                error: _error,
+            } => None,
+            Self::ReferenceType(_error) => None,
+            Self::Constraint(_diagnostic) => None,
+        }
+    }
+}
 
 /// One module-call result with typed ownership and source.
 #[derive(Debug, Clone, PartialEq)]
@@ -4295,7 +4675,35 @@ impl std::fmt::Display for ModuleCallFinding {
 
 impl std::error::Error for ModuleCallFinding {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.message)
+        match &self.message {
+            ModuleCallFindingMessage::TypeResolution(error) => Some(error.as_ref()),
+            ModuleCallFindingMessage::AttributeReference(error) => Some(error.as_ref()),
+            ModuleCallFindingMessage::UnknownArgument {
+                module: _module,
+                argument: _argument,
+                suggestion: _suggestion,
+            } => Some(&self.message),
+            ModuleCallFindingMessage::MissingRequiredArgument {
+                module: _module,
+                argument: _argument,
+            } => Some(&self.message),
+            ModuleCallFindingMessage::ValueType {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => Some(&self.message),
+            ModuleCallFindingMessage::HandleSink {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => Some(&self.message),
+            ModuleCallFindingMessage::BindingUse {
+                argument: _argument,
+                error: _error,
+            } => Some(&self.message),
+            ModuleCallFindingMessage::ReferenceType(_error) => Some(&self.message),
+            ModuleCallFindingMessage::Constraint(_diagnostic) => Some(&self.message),
+        }
     }
 }
 
@@ -4332,6 +4740,10 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings> {
         bindings: &'a BindingIndex<'bindings>,
         constraint_reports: Option<&'a crate::module_resolver::ModuleCallConstraintReports>,
     },
+    Constraints {
+        compositions: &'a [crate::resource::LiveComposition],
+        constraint_reports: &'a crate::module_resolver::ModuleCallConstraintReports,
+    },
 }
 
 struct ModuleCallChecker<'a> {
@@ -4347,7 +4759,7 @@ struct ModuleFileCheckContext<'a, 'bindings, E> {
     signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
-    root_owner: Option<&'a ModuleCallId>,
+    root_owner: Option<&'a ModuleCallFindingOwnerSource>,
     reference_checks: ModuleCallReferenceChecks,
 }
 
@@ -4423,10 +4835,12 @@ impl ModuleCallChecker<'_> {
                 }
             };
             let checked_call = semantic_call.unwrap_or(authored_call);
-            let root = root_owner.unwrap_or_else(|| authored_call.id()).clone();
+            let root = root_owner.cloned().unwrap_or_else(|| {
+                ModuleCallFindingOwnerSource::ModuleCall(authored_call.id().clone())
+            });
             let owner = ModuleCallFindingOwner {
                 root,
-                immediate: authored_call.id().clone(),
+                immediate: ModuleCallFindingOwnerSource::ModuleCall(authored_call.id().clone()),
             };
 
             self.check_binding_use_findings(authored_call, binding_use_report, &owner);
@@ -4457,12 +4871,7 @@ impl ModuleCallChecker<'_> {
                             owner: owner.clone(),
                         },
                     );
-                    self.check_nested_module(
-                        authority_file,
-                        checked_call,
-                        base_dir,
-                        Some(&owner.root),
-                    );
+                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root);
                 }
                 ModuleCallReferenceChecks::Skipped => {}
             }
@@ -4475,7 +4884,10 @@ impl ModuleCallChecker<'_> {
                     .iter()
                     .any(|call| call.module_name == import.alias);
                 if !called {
-                    self.check_nested_import(authored, import, base_dir, None);
+                    let root = root_owner.cloned().unwrap_or_else(|| {
+                        ModuleCallFindingOwnerSource::Authored(module_use_anchor(import))
+                    });
+                    self.check_nested_import(import, base_dir, &root);
                 }
             }
         }
@@ -4547,12 +4959,19 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingMessage::ReferenceType(Box::new(
                         ModuleCallReferenceDiagnostic {
                             call_label: call_label.to_string(),
-                            argument: argument.to_string(),
-                            path: error.path.clone(),
-                            kind: ModuleCallRefErrorKind::TypeMismatch {
-                                expected: error.expected.clone(),
-                                actual: error.actual.clone(),
-                                declared: error.declared.clone(),
+                            identity: ModuleCallReferenceIdentity {
+                                call: owner
+                                    .immediate
+                                    .module_call()
+                                    .expect("a module-argument binding use has a call owner")
+                                    .clone(),
+                                argument: argument.to_string(),
+                                path: error.path.clone(),
+                                kind: ModuleCallRefErrorKind::TypeMismatch {
+                                    expected: error.expected.clone(),
+                                    actual: error.actual.clone(),
+                                    declared: error.declared.clone(),
+                                },
                             },
                         },
                     )),
@@ -4638,19 +5057,25 @@ impl ModuleCallChecker<'_> {
                     Err(error) => {
                         let source_file = authored_call.id().source_file();
                         let line = authored.value_span().start_line();
+                        let anchor = module_call_anchor(authored_call.id(), authored.key_span());
+                        let diagnostic = TypeResolutionDiagnostic::description(
+                            format!(
+                                "module {} argument '{}' in {} at line {line}",
+                                authored_call.module_name,
+                                argument,
+                                source_file.display(),
+                            ),
+                            error.into(),
+                            Some(TypeResolutionSource::new(
+                                anchor.source_file.clone(),
+                                anchor.span,
+                            )),
+                        );
                         self.push(
                             ModuleCallFindingKind::TypeResolution,
                             owner.clone(),
-                            module_call_anchor(authored_call.id(), authored.key_span()),
-                            ModuleCallFindingMessage::TypeResolution {
-                                context: format!(
-                                    "module {} argument '{}' in {} at line {line}",
-                                    authored_call.module_name,
-                                    argument,
-                                    source_file.display(),
-                                ),
-                                error,
-                            },
+                            anchor,
+                            ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
                         );
                         continue;
                     }
@@ -4756,23 +5181,23 @@ impl ModuleCallChecker<'_> {
                     !signature
                         .arguments
                         .iter()
-                        .any(|parameter| parameter.name == error.argument)
+                        .any(|parameter| parameter.name == error.identity.argument)
                 })
                 || binding_use_authority_owns_module_argument(
                     authority_file,
                     binding_use_report,
                     authored_call.id(),
-                    &error.argument,
+                    &error.identity.argument,
                 )
                 || reference_call
-                    .argument(&error.argument)
+                    .argument(&error.identity.argument)
                     .is_some_and(|argument| argument.handle().is_some())
             {
                 continue;
             }
             let argument_span = authored_call
                 .arguments_with_source_spans()
-                .find(|argument| argument.name() == error.argument)
+                .find(|argument| argument.name() == error.identity.argument)
                 .map(|argument| argument.key_span())
                 .unwrap_or(error.argument_span);
             self.push(
@@ -4781,9 +5206,7 @@ impl ModuleCallChecker<'_> {
                 module_call_anchor(authored_call.id(), argument_span),
                 ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
                     call_label: module_call_label(authored_call),
-                    argument: error.argument,
-                    path: error.path,
-                    kind: error.kind,
+                    identity: error.identity,
                 })),
             );
         }
@@ -4794,7 +5217,7 @@ impl ModuleCallChecker<'_> {
         file: &crate::parser::File<E>,
         call: &ModuleCall,
         base_dir: Option<&std::path::Path>,
-        root_owner: Option<&ModuleCallId>,
+        root_owner: &ModuleCallFindingOwnerSource,
     ) {
         let Some(import) = file
             .uses
@@ -4803,15 +5226,14 @@ impl ModuleCallChecker<'_> {
         else {
             return;
         };
-        self.check_nested_import(file, import, base_dir, root_owner);
+        self.check_nested_import(import, base_dir, root_owner);
     }
 
-    fn check_nested_import<E>(
+    fn check_nested_import(
         &mut self,
-        file: &crate::parser::File<E>,
         import: &crate::parser::UseStatement,
         base_dir: Option<&std::path::Path>,
-        root_owner: Option<&ModuleCallId>,
+        root_owner: &ModuleCallFindingOwnerSource,
     ) {
         let Some(base_dir) = base_dir else {
             return;
@@ -4843,27 +5265,23 @@ impl ModuleCallChecker<'_> {
                     &signatures,
                 ),
             );
-            let boundary_call = file
-                .module_calls
-                .iter()
-                .find(|call| call.module_name == import.alias);
-            let diagnostic_call = boundary_call.or_else(|| module.module_calls.first());
-            if let Some(diagnostic_call) = diagnostic_call {
-                let root = root_owner.unwrap_or_else(|| diagnostic_call.id()).clone();
-                for error in resolution_errors {
-                    self.push(
-                        ModuleCallFindingKind::TypeResolution,
-                        ModuleCallFindingOwner {
-                            root: root.clone(),
-                            immediate: diagnostic_call.id().clone(),
-                        },
-                        module_call_anchor(diagnostic_call.id(), diagnostic_call.source_span()),
-                        ModuleCallFindingMessage::TypeResolution {
-                            context: module_dir.display().to_string(),
-                            error,
-                        },
-                    );
-                }
+            for error in resolution_errors {
+                let anchor = error
+                    .source_location()
+                    .map(|source| ModuleCallFindingAnchor {
+                        source_file: source.source_file().clone(),
+                        span: source.span(),
+                    })
+                    .unwrap_or_else(|| module_use_anchor(import));
+                self.push(
+                    ModuleCallFindingKind::TypeResolution,
+                    ModuleCallFindingOwner {
+                        root: root_owner.clone(),
+                        immediate: ModuleCallFindingOwnerSource::Authored(anchor.clone()),
+                    },
+                    anchor,
+                    ModuleCallFindingMessage::TypeResolution(Box::new(error)),
+                );
             }
             self.check_file(
                 &module,
@@ -4873,7 +5291,7 @@ impl ModuleCallChecker<'_> {
                     signatures: &signatures,
                     binding_use_report: &binding_use_report,
                     bindings: &bindings,
-                    root_owner,
+                    root_owner: Some(root_owner),
                     reference_checks: ModuleCallReferenceChecks::Enabled,
                 },
             );
@@ -4902,16 +5320,21 @@ impl ModuleCallChecker<'_> {
                     self.push(
                         ModuleCallFindingKind::ReferenceType,
                         ModuleCallFindingOwner {
-                            root: root.id.clone(),
-                            immediate: immediate.id.clone(),
+                            root: ModuleCallFindingOwnerSource::ModuleCall(root.id.clone()),
+                            immediate: ModuleCallFindingOwnerSource::ModuleCall(
+                                immediate.id.clone(),
+                            ),
                         },
                         module_call_anchor(&immediate.id, span),
                         ModuleCallFindingMessage::ReferenceType(Box::new(
                             ModuleCallReferenceDiagnostic {
                                 call_label: immediate.display_label(),
-                                argument: error.argument,
-                                path: error.path,
-                                kind: error.kind,
+                                identity: ModuleCallReferenceIdentity {
+                                    call: immediate.id.clone(),
+                                    argument: error.argument,
+                                    path: error.path,
+                                    kind: error.kind,
+                                },
                             },
                         )),
                     );
@@ -4923,16 +5346,19 @@ impl ModuleCallChecker<'_> {
                     let first_immediate = first_path.immediate();
                     let anchor =
                         module_call_anchor(&first_immediate.id, first_immediate.id.call_span());
-                    let message = error.to_string();
                     for call_path in &error.call_paths {
                         self.push(
                             ModuleCallFindingKind::ReferenceType,
                             ModuleCallFindingOwner {
-                                root: call_path.root().id.clone(),
-                                immediate: call_path.immediate().id.clone(),
+                                root: ModuleCallFindingOwnerSource::ModuleCall(
+                                    call_path.root().id.clone(),
+                                ),
+                                immediate: ModuleCallFindingOwnerSource::ModuleCall(
+                                    call_path.immediate().id.clone(),
+                                ),
                             },
                             anchor.clone(),
-                            ModuleCallFindingMessage::AttributeReference(message.clone()),
+                            ModuleCallFindingMessage::AttributeReference(Box::new(error.clone())),
                         );
                     }
                 }
@@ -4956,8 +5382,8 @@ impl ModuleCallChecker<'_> {
                 let path = composition.call_path();
                 if let Some(immediate) = path.calls().find(|candidate| candidate.id == *call) {
                     let owner = ModuleCallFindingOwner {
-                        root: path.root().id.clone(),
-                        immediate: immediate.id.clone(),
+                        root: ModuleCallFindingOwnerSource::ModuleCall(path.root().id.clone()),
+                        immediate: ModuleCallFindingOwnerSource::ModuleCall(immediate.id.clone()),
                     };
                     if !owners.iter().any(|(existing, _label)| existing == &owner) {
                         owners.push((owner, immediate.display_label()));
@@ -4967,8 +5393,8 @@ impl ModuleCallChecker<'_> {
             if owners.is_empty() {
                 owners.push((
                     ModuleCallFindingOwner {
-                        root: call.clone(),
-                        immediate: call.clone(),
+                        root: ModuleCallFindingOwnerSource::ModuleCall(call.clone()),
+                        immediate: ModuleCallFindingOwnerSource::ModuleCall(call.clone()),
                     },
                     "anonymous module call".to_string(),
                 ));
@@ -4994,7 +5420,7 @@ impl ModuleCallChecker<'_> {
         reports: &crate::module_resolver::ModuleCallConstraintReports,
         compositions: &[crate::resource::LiveComposition],
     ) {
-        for report in reports.values() {
+        for report in reports {
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -5017,32 +5443,71 @@ impl ModuleCallChecker<'_> {
                         report.source.call_span()
                     }
                 };
-                let (root, immediate) = compositions
+                let mut owners = compositions
                     .iter()
-                    .find_map(|composition| {
+                    .filter_map(|composition| {
                         let path = composition.call_path();
-                        (path.immediate().id == report.source.id)
-                            .then(|| (path.root().id.clone(), path.immediate().id.clone()))
+                        (path.immediate().id == report.source.id
+                            && constraint_report_instance_matches(
+                                &path.immediate().instance,
+                                &report.instance,
+                            ))
+                        .then(|| ModuleCallFindingOwner {
+                            root: ModuleCallFindingOwnerSource::ModuleCall(path.root().id.clone()),
+                            immediate: ModuleCallFindingOwnerSource::ModuleCall(
+                                path.immediate().id.clone(),
+                            ),
+                        })
                     })
-                    .unwrap_or_else(|| (report.source.id.clone(), report.source.id.clone()));
-                self.push(
-                    ModuleCallFindingKind::Constraint,
-                    ModuleCallFindingOwner { root, immediate },
-                    ModuleCallFindingAnchor {
-                        source_file: report.source.id.source_file_id().clone(),
-                        span,
-                    },
-                    ModuleCallFindingMessage::Constraint(diagnostic.clone()),
-                );
+                    .collect::<Vec<_>>();
+                owners.dedup();
+                if owners.is_empty() {
+                    owners.push(ModuleCallFindingOwner {
+                        root: ModuleCallFindingOwnerSource::ModuleCall(report.source.id.clone()),
+                        immediate: ModuleCallFindingOwnerSource::ModuleCall(
+                            report.source.id.clone(),
+                        ),
+                    });
+                }
+                for owner in owners {
+                    self.push(
+                        ModuleCallFindingKind::Constraint,
+                        owner,
+                        ModuleCallFindingAnchor {
+                            source_file: report.source.id.source_file_id().clone(),
+                            span,
+                        },
+                        ModuleCallFindingMessage::Constraint(diagnostic.clone()),
+                    );
+                }
             }
         }
     }
+}
+
+/// A constraint evaluated while loading an imported module carries that
+/// module-local instance path. Each outer expansion prefixes the path but does
+/// not change the concrete outcome; match the exact instance or a dot-delimited
+/// expansion of it. Constraints that depended on outer arguments are evaluated
+/// later and therefore take the exact branch with their fully prefixed path.
+fn constraint_report_instance_matches(expanded: &str, reported: &str) -> bool {
+    expanded == reported
+        || expanded
+            .strip_suffix(reported)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn module_call_anchor(call: &ModuleCallId, span: SourceSpan) -> ModuleCallFindingAnchor {
     ModuleCallFindingAnchor {
         source_file: call.source_file_id().clone(),
         span,
+    }
+}
+
+fn module_use_anchor(import: &crate::parser::UseStatement) -> ModuleCallFindingAnchor {
+    ModuleCallFindingAnchor {
+        source_file: SourceFileId::new(import.source_file().to_path_buf()),
+        span: import.source_span(),
     }
 }
 
@@ -5169,6 +5634,10 @@ pub fn check_expanded_module_calls(
                 checker.check_constraints(reports, compositions);
             }
         }
+        ExpandedModuleCallCheckInput::Constraints {
+            compositions,
+            constraint_reports,
+        } => checker.check_constraints(constraint_reports, compositions),
     }
     checker.findings
 }
