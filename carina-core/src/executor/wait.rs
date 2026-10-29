@@ -19,7 +19,9 @@ use tokio::time::Instant;
 use crate::effect::Effect;
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver, ProgressInfo};
-use crate::provider::{AppliedIdentifier, Provider, ProviderError, ReadRequest};
+use crate::provider::{
+    AppliedIdentifier, PartialReadDiagnostic, Provider, ProviderError, ReadRequest,
+};
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
 #[cfg(test)]
@@ -33,6 +35,71 @@ use crate::wait::{ManagedWaitTarget, WaitObservation};
 pub(crate) type WaitIdentifierResolver<'a> =
     dyn Fn(&ResourceId) -> Option<AppliedIdentifier> + Send + Sync + 'a;
 pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<AppliedIdentifier>>>>;
+
+/// Proof that an [`ExecutionEvent::EffectStarted`] event was emitted through
+/// the executor's registered in-flight start path.
+///
+/// The constructor is private to this module, where it is paired with the
+/// in-flight registry update in [`InFlightStart::emit_started`].
+pub struct StartMarker {
+    _private: (),
+}
+
+impl StartMarker {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) fn effect_started_for_test<S>(effect: &Effect<S>) -> ExecutionEvent<'_, S> {
+    ExecutionEvent::EffectStarted {
+        effect,
+        start: StartMarker::new(),
+    }
+}
+
+/// Borrowed, internally consistent view of one [`Effect::Wait`].
+pub(super) struct WaitEffectRef<'a, S> {
+    effect: &'a Effect<S>,
+    identity: &'a crate::resource::ResourceIdentity,
+    target: &'a ManagedWaitTarget,
+    until: &'a WaitPredicate,
+    timeout: Duration,
+    interval: Duration,
+}
+
+impl<'a, S> WaitEffectRef<'a, S> {
+    pub(super) fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
+        let Effect::Wait {
+            identity,
+            target_id,
+            until,
+            timeout,
+            interval,
+            ..
+        } = effect
+        else {
+            return None;
+        };
+        Some(Self {
+            effect,
+            identity,
+            target: target_id,
+            until,
+            timeout: *timeout,
+            interval: *interval,
+        })
+    }
+
+    pub(super) fn identity(&self) -> &crate::resource::ResourceIdentity {
+        self.identity
+    }
+
+    pub(super) fn target(&self) -> &ManagedWaitTarget {
+        self.target
+    }
+}
 
 pub(super) fn initial_wait_identifiers(
     managed_current: &HashMap<ResourceId, Current>,
@@ -235,28 +302,116 @@ pub(super) struct WaitAwareInFlight<'fut, R> {
     inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
     kinds: HashMap<usize, InFlightKind>,
     cancellers: HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
-    started: Arc<Mutex<HashMap<usize, ProgressInfo>>>,
+    interrupted: Arc<Mutex<Vec<usize>>>,
 }
 
 /// Records the progress value at the same point an in-flight effect emits its
 /// `EffectStarted` event.
 pub(super) struct InFlightStart {
     idx: usize,
-    started: Arc<Mutex<HashMap<usize, ProgressInfo>>>,
+    interrupted: Arc<Mutex<Vec<usize>>>,
 }
 
 impl InFlightStart {
-    pub(super) fn emit_started<S>(
+    pub(super) fn emit_started<'a, S: Clone>(
         self,
-        observer: &dyn ExecutionObserver<S>,
+        observer: &'a dyn ExecutionObserver<S>,
         effect: &Effect<S>,
         progress: ProgressInfo,
+    ) -> StartedEffect<'a, S> {
+        observer.on_event(&ExecutionEvent::EffectStarted {
+            effect,
+            start: StartMarker::new(),
+        });
+        StartedEffect {
+            idx: self.idx,
+            progress,
+            interrupted: self.interrupted,
+            observer,
+            effect: effect.clone(),
+            terminal_emitted: false,
+        }
+    }
+}
+
+/// Linear proof that an effect emitted `EffectStarted` and still owes exactly
+/// one terminal event.
+pub(super) struct StartedEffect<'a, S> {
+    idx: usize,
+    progress: ProgressInfo,
+    interrupted: Arc<Mutex<Vec<usize>>>,
+    observer: &'a dyn ExecutionObserver<S>,
+    effect: Effect<S>,
+    terminal_emitted: bool,
+}
+
+impl<S> StartedEffect<'_, S> {
+    fn finish(&mut self) -> ProgressInfo {
+        self.terminal_emitted = true;
+        self.progress
+    }
+
+    pub(super) fn succeeded(mut self, state: Option<&State>, duration: Duration) {
+        let progress = self.finish();
+        self.observer.on_event(&ExecutionEvent::EffectSucceeded {
+            effect: &self.effect,
+            state,
+            duration,
+            progress,
+        });
+    }
+
+    pub(super) fn partially_succeeded(
+        mut self,
+        state: &State,
+        diagnostic: &PartialReadDiagnostic,
+        duration: Duration,
     ) {
-        self.started
+        let progress = self.finish();
+        self.observer
+            .on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                effect: &self.effect,
+                state,
+                diagnostic,
+                duration,
+                progress,
+            });
+    }
+
+    pub(super) fn failed(mut self, error: &str, duration: Duration) {
+        let progress = self.finish();
+        self.observer.on_event(&ExecutionEvent::EffectFailed {
+            effect: &self.effect,
+            error,
+            duration,
+            progress,
+        });
+    }
+
+    pub(super) fn skipped(mut self, reason: &str) {
+        let progress = self.finish();
+        self.observer.on_event(&ExecutionEvent::EffectSkipped {
+            effect: &self.effect,
+            reason,
+            progress,
+        });
+    }
+}
+
+impl<S> Drop for StartedEffect<'_, S> {
+    fn drop(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        let progress = self.finish();
+        self.observer.on_event(&ExecutionEvent::EffectInterrupted {
+            effect: &self.effect,
+            progress,
+        });
+        self.interrupted
             .lock()
-            .expect("in-flight start registry poisoned")
-            .insert(self.idx, progress);
-        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+            .expect("interrupted effect registry poisoned")
+            .push(self.idx);
     }
 }
 
@@ -267,7 +422,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
             inner: FuturesUnordered::new(),
             kinds: HashMap::new(),
             cancellers: HashMap::new(),
-            started: Arc::new(Mutex::new(HashMap::new())),
+            interrupted: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -294,7 +449,7 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     {
         let start = InFlightStart {
             idx,
-            started: Arc::clone(&self.started),
+            interrupted: Arc::clone(&self.interrupted),
         };
         self.inner.push(Box::pin(make_future(start)));
         self.kinds.insert(idx, InFlightKind::NonWait);
@@ -311,29 +466,24 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(WaitSignal::Continue);
         let start = InFlightStart {
             idx,
-            started: Arc::clone(&self.started),
+            interrupted: Arc::clone(&self.interrupted),
         };
         self.cancellers.insert(idx, cancel_tx);
         self.kinds.insert(idx, InFlightKind::Wait);
         self.inner.push(mk_fut(cancel_rx, start));
     }
 
-    /// Drop every unresolved future and return only effects that had emitted
-    /// `EffectStarted`, paired with the progress value used by their terminal
-    /// event siblings.
-    pub(super) fn abandon(self) -> Vec<(usize, ProgressInfo)> {
-        let mut interrupted = {
-            let started = self
-                .started
+    /// Drop every unresolved future and return how many started tokens emitted
+    /// `EffectInterrupted` while being dropped.
+    pub(super) fn abandon(self) -> usize {
+        let interrupted_registry = Arc::clone(&self.interrupted);
+        drop(self);
+        std::mem::take(
+            &mut *interrupted_registry
                 .lock()
-                .expect("in-flight start registry poisoned");
-            self.kinds
-                .keys()
-                .filter_map(|idx| started.get(idx).copied().map(|progress| (*idx, progress)))
-                .collect::<Vec<_>>()
-        };
-        interrupted.sort_by_key(|(idx, _)| *idx);
-        interrupted
+                .expect("interrupted effect registry poisoned"),
+        )
+        .len()
     }
 
     /// Begin the required terminal wait cancellation check before awaiting.
@@ -382,11 +532,6 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
         let (idx, result) = self.parent.inner.next().await?;
         self.parent.kinds.remove(&idx);
         self.parent.cancellers.remove(&idx);
-        self.parent
-            .started
-            .lock()
-            .expect("in-flight start registry poisoned")
-            .remove(&idx);
         Some((idx, result))
     }
 
@@ -408,51 +553,47 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 /// A missing target or provider read error returns immediately rather than
 /// waiting for another interval.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_wait_effect<S>(
+pub(super) async fn execute_wait_effect<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
-    effect: &Effect<S>,
-    target: &ManagedWaitTarget,
+    wait: WaitEffectRef<'_, S>,
     identifier_resolver: &WaitIdentifierResolver<'_>,
-    until: &WaitPredicate,
-    timeout: Duration,
-    interval: Duration,
     cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver<S>,
 ) -> WaitOutcome {
-    let target_id = target.id();
+    let heartbeat_cadence = default_heartbeat_cadence(wait.interval);
     execute_wait_effect_with_heartbeat_cadence(
         cleanup_loop,
         provider,
-        effect,
-        target_id.identity_str(),
-        target_id,
+        wait,
         identifier_resolver,
-        until,
-        timeout,
-        interval,
         cancel,
         observer,
-        default_heartbeat_cadence(interval),
+        heartbeat_cadence,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_wait_effect_with_heartbeat_cadence<S>(
+pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
-    effect: &Effect<S>,
-    binding: &str,
-    target_id: &ResourceId,
+    wait: WaitEffectRef<'_, S>,
     identifier_resolver: &WaitIdentifierResolver<'_>,
-    until: &WaitPredicate,
-    timeout: Duration,
-    interval: Duration,
     mut cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver<S>,
     heartbeat_cadence: Duration,
 ) -> WaitOutcome {
+    let WaitEffectRef {
+        effect,
+        identity: _,
+        target,
+        until,
+        timeout,
+        interval,
+    } = wait;
+    let binding = target.id().identity_str();
+    let target_id: &ResourceId = target.id();
     let start = Instant::now();
     let mut last_heartbeat_at: Option<Instant> = None;
     loop {
@@ -572,14 +713,14 @@ mod tests {
         )))
     }
 
-    fn wait_effect() -> Effect {
+    fn wait_effect(timeout: Duration, interval: Duration) -> Effect {
         Effect::Wait {
             identity: crate::resource::ResourceIdentity::new("cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
-            timeout: Duration::from_secs(60),
-            interval: Duration::from_secs(1),
+            timeout,
+            interval,
             explicit_dependencies: HashSet::new(),
         }
     }
@@ -821,9 +962,7 @@ mod tests {
     async fn wait_abandons_in_flight_provider_read_when_cleanup_is_prioritized() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::pending();
-            let pred = equals_status("ISSUED");
-            let target = managed_wait_target();
-            let effect = wait_effect();
+            let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -832,12 +971,8 @@ mod tests {
             let wait = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
-                &effect,
-                &target,
+                WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
-                &pred,
-                Duration::from_secs(60),
-                Duration::from_secs(60),
                 cancel_rx,
                 &observer,
             );
@@ -878,9 +1013,7 @@ mod tests {
     async fn wait_abandons_while_parked_in_sleep_interval() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING")]);
-            let pred = equals_status("ISSUED");
-            let target = managed_wait_target();
-            let effect = wait_effect();
+            let effect = wait_effect(Duration::from_secs(600), Duration::from_secs(30));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -889,12 +1022,8 @@ mod tests {
             let wait = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
-                &effect,
-                &target,
+                WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
-                &pred,
-                Duration::from_secs(600),
-                Duration::from_secs(30),
                 cancel_rx,
                 &observer,
             );
@@ -950,9 +1079,7 @@ mod tests {
                 .build()
                 .expect("failed to build wait-test runtime");
             let result = runtime.block_on(async move {
-                let pred = equals_status("ISSUED");
-                let target = managed_wait_target();
-                let effect = wait_effect();
+                let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
                 let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
                 let observer = NoopWaitObserver;
                 let cleanup_loop = shutdown.cleanup_aware_loop();
@@ -960,12 +1087,8 @@ mod tests {
                 execute_wait_effect(
                     &cleanup_loop,
                     worker_provider.as_ref(),
-                    &effect,
-                    &target,
+                    WaitEffectRef::from_effect(&effect).unwrap(),
                     &provider_identifier,
-                    &pred,
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
                     cancel_rx,
                     &observer,
                 )
@@ -997,9 +1120,7 @@ mod tests {
     async fn wait_reaches_satisfied_during_graceful_shutdown() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
-            let pred = equals_status("ISSUED");
-            let target = managed_wait_target();
-            let effect = wait_effect();
+            let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(30));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -1014,12 +1135,8 @@ mod tests {
             let result = execute_wait_effect(
                 &cleanup_loop,
                 &provider,
-                &effect,
-                &target,
+                WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
-                &pred,
-                Duration::from_secs(60),
-                Duration::from_secs(30),
                 cancel_rx,
                 &observer,
             )
@@ -1042,9 +1159,7 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_immediately_when_until_already_true() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
-        let pred = equals_status("ISSUED");
-        let target = managed_wait_target();
-        let effect = wait_effect();
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(10));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1052,12 +1167,8 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
-            &effect,
-            &target,
+            WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
-            &pred,
-            Duration::from_secs(60),
-            Duration::from_millis(10),
             cancel_rx,
             &observer,
         )
@@ -1079,9 +1190,7 @@ mod tests {
             state_with_status("PENDING_VALIDATION"),
             state_with_status("ISSUED"),
         ]);
-        let pred = equals_status("ISSUED");
-        let target = managed_wait_target();
-        let effect = wait_effect();
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(1));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1089,12 +1198,8 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
-            &effect,
-            &target,
+            WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
-            &pred,
-            Duration::from_secs(60),
-            Duration::from_millis(1),
             cancel_rx,
             &observer,
         )
@@ -1109,9 +1214,7 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
-        let pred = equals_status("ISSUED");
-        let target = managed_wait_target();
-        let effect = wait_effect();
+        let effect = wait_effect(Duration::from_millis(10), Duration::from_millis(2));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1119,12 +1222,8 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
-            &effect,
-            &target,
+            WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
-            &pred,
-            Duration::from_millis(10),
-            Duration::from_millis(2),
             cancel_rx,
             &observer,
         )
@@ -1225,9 +1324,7 @@ mod tests {
             state_with_status("PENDING_VALIDATION"),
             State::not_found(ResourceId::with_identity("acm.Certificate", "cert")),
         ]);
-        let pred = equals_status("ISSUED");
-        let target = managed_wait_target();
-        let effect = wait_effect();
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(1));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1235,12 +1332,8 @@ mod tests {
         let result = execute_wait_effect(
             &cleanup_loop,
             &provider,
-            &effect,
-            &target,
+            WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
-            &pred,
-            Duration::from_secs(60),
-            Duration::from_millis(1),
             cancel_rx,
             &observer,
         )
@@ -1254,9 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
-        let pred = equals_status("ISSUED");
-        let target = managed_wait_target();
-        let effect = wait_effect();
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(1));
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
@@ -1277,12 +1368,8 @@ mod tests {
             execute_wait_effect(
                 &cleanup_loop,
                 &provider,
-                &effect,
-                &target,
+                WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
-                &pred,
-                Duration::from_secs(60),
-                Duration::from_millis(1),
                 cancel_rx,
                 &observer,
             )
@@ -1305,8 +1392,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wait_emits_exact_heartbeat_count_for_cadence() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
-        let pred = equals_status("ISSUED");
-        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1324,13 +1409,8 @@ mod tests {
         let result = execute_wait_effect_with_heartbeat_cadence(
             &cleanup_loop,
             &provider,
-            &effect,
-            "cert_issued",
-            &target,
+            WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
-            &pred,
-            Duration::from_millis(100),
-            Duration::from_millis(1),
             cancel_rx,
             &observer,
             Duration::from_millis(5),

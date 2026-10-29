@@ -143,6 +143,7 @@ struct PlainInFlight {
     label: String,
     started: Instant,
     last_reported: Instant,
+    self_reporting: bool,
     sequence: u64,
 }
 
@@ -168,7 +169,14 @@ fn emit_heartbeats<K>(state: &PlainState<K>, now: Instant) {
     let mut active = state.active.lock().unwrap();
     let mut entries: Vec<_> = active
         .values_mut()
-        .filter(|entry| now.saturating_duration_since(entry.last_reported) >= state.interval)
+        .filter(|entry| {
+            let silence_limit = if entry.self_reporting {
+                state.interval.saturating_mul(2)
+            } else {
+                state.interval
+            };
+            now.saturating_duration_since(entry.last_reported) >= silence_limit
+        })
         .collect();
     if entries.is_empty() {
         return;
@@ -553,6 +561,7 @@ where
                         label,
                         started,
                         last_reported: started,
+                        self_reporting: false,
                         sequence: state.next_sequence.fetch_add(1, Ordering::Relaxed),
                     },
                 );
@@ -614,6 +623,10 @@ where
     /// In plain mode the line also postpones the entry's next generic
     /// heartbeat because the operation has just reported useful progress.
     pub(crate) fn in_flight_line(&self, key: &K, line: impl AsRef<str>) {
+        self.in_flight_line_at(key, line, Instant::now());
+    }
+
+    fn in_flight_line_at(&self, key: &K, line: impl AsRef<str>, now: Instant) {
         match &self.inner {
             ProgressBackendInner::Tty { multi, bars, .. } => {
                 let mut bars = bars.lock().unwrap();
@@ -623,7 +636,8 @@ where
             ProgressBackendInner::Plain { state, .. } => {
                 let mut active = state.active.lock().unwrap();
                 if let Some(entry) = active.get_mut(key) {
-                    entry.last_reported = Instant::now();
+                    entry.last_reported = now;
+                    entry.self_reporting = true;
                 }
                 let mut writer = state.writer.lock().unwrap();
                 let _ = writeln!(writer, "  {}", line.as_ref());
@@ -754,8 +768,52 @@ impl<S> ProgressBackend<EffectProgressKey<S>> {
 
 impl ProgressBackend<usize> {
     /// Start an indexed non-refresh operation spinner.
-    pub(crate) fn start_indexed(&self, key: usize, label: impl Into<String>) {
+    pub(crate) fn start_indexed(
+        &self,
+        key: usize,
+        label: impl Into<String>,
+    ) -> ProgressGuard<'_, usize> {
         self.start(key, label);
+        ProgressGuard {
+            backend: self,
+            key: Some(key),
+        }
+    }
+}
+
+/// RAII owner for one keyed progress entry.
+#[must_use = "keep the progress guard alive until the operation has finished"]
+pub(crate) struct ProgressGuard<'backend, K>
+where
+    K: Eq + Hash,
+{
+    backend: &'backend ProgressBackend<K>,
+    key: Option<K>,
+}
+
+impl<K> ProgressGuard<'_, K>
+where
+    K: Eq + Hash,
+{
+    pub(crate) fn finish(mut self, outcome: NonFailureOutcome) {
+        let key = self.key.take().expect("progress key already taken");
+        self.backend.finish(key, outcome);
+    }
+
+    pub(crate) fn finish_failed(mut self, outcome: FailedOutcome) {
+        let key = self.key.take().expect("progress key already taken");
+        self.backend.finish_failed(key, outcome);
+    }
+}
+
+impl<K> Drop for ProgressGuard<'_, K>
+where
+    K: Eq + Hash,
+{
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.backend.abandon(&key);
+        }
     }
 }
 
@@ -789,8 +847,11 @@ impl<'backend> RefreshPhase<'backend> {
         let label = id.human().to_string();
         self.backend.start(key.clone(), label.clone());
         RefreshProgress {
-            phase: self,
-            key: Some(key),
+            _phase: self,
+            progress: ProgressGuard {
+                backend: self.backend,
+                key: Some(key),
+            },
             label,
             start: std::time::Instant::now(),
         }
@@ -844,28 +905,19 @@ fn spinner_style() -> ProgressStyle {
 /// when done. Uses `indicatif` for animated terminal output with a shared
 /// `MultiProgress` to support concurrent spinners.
 pub(crate) struct RefreshProgress<'phase, 'backend> {
-    phase: &'phase RefreshPhase<'backend>,
-    key: Option<ResourceId>,
+    _phase: &'phase RefreshPhase<'backend>,
+    progress: ProgressGuard<'backend, ResourceId>,
     label: String,
     start: std::time::Instant,
 }
 
 impl RefreshProgress<'_, '_> {
     /// Finish the spinner with a success checkmark and elapsed time.
-    pub fn finish(mut self) {
+    pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let timing = format!("took {}", format_duration(elapsed)).dimmed();
         let outcome = NonFailureOutcome::success(format!("{} {}", self.label, timing));
-        let key = self.key.take().expect("refresh progress key already taken");
-        self.phase.backend.finish(key, outcome);
-    }
-}
-
-impl Drop for RefreshProgress<'_, '_> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.phase.backend.abandon(&key);
-        }
+        self.progress.finish(outcome);
     }
 }
 
@@ -1099,6 +1151,20 @@ mod tests {
     }
 
     #[test]
+    fn dropped_indexed_progress_guard_abandons_without_output() {
+        let output = SharedWriter::default();
+        let backend = ProgressBackend::plain(output.clone());
+
+        let progress = backend.start_indexed(7, "Delete r.abandoned");
+        assert_eq!(backend.active_count(), 1);
+        drop(progress);
+
+        assert_eq!(backend.active_count(), 0);
+        backend.emit_heartbeats_at(Instant::now() + Duration::from_secs(3_600));
+        assert!(output.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn each_refresh_phase_on_one_backend_closes_once() {
         let output = SharedWriter::default();
         let backend = ProgressBackend::<ResourceId>::plain(output.clone());
@@ -1195,6 +1261,33 @@ mod tests {
         let after_first_heartbeat = output.0.lock().unwrap().clone();
         emit_heartbeats(state, started + interval);
         assert_eq!(*output.0.lock().unwrap(), after_first_heartbeat);
+    }
+
+    #[test]
+    fn self_reporting_entry_waits_two_intervals_for_generic_fallback() {
+        let output = SharedWriter::default();
+        let interval = Duration::from_secs(30);
+        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        backend.start(1, "Wait certificate");
+        let previous_poll = backend.plain_last_reported(&1).unwrap();
+        backend.in_flight_line_at(&1, "~ certificate: still pending", previous_poll);
+
+        backend.emit_heartbeats_at(previous_poll + interval + Duration::from_millis(1_100));
+        backend.in_flight_line_at(
+            &1,
+            "~ certificate: still pending again",
+            previous_poll + interval + Duration::from_millis(1_200),
+        );
+
+        assert_eq!(
+            output.0.lock().unwrap().as_slice(),
+            concat!(
+                "  ~ certificate: still pending\n",
+                "  ~ certificate: still pending again\n",
+            )
+            .as_bytes(),
+            "a slightly late self-report must arrive before the generic fallback",
+        );
     }
 
     #[test]

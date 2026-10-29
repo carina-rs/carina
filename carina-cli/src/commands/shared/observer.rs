@@ -63,7 +63,7 @@ fn handle_event<S>(
             // Dynamic display: don't show waiting resources.
             // They will appear when they start executing.
         }
-        ExecutionEvent::EffectStarted { effect } => {
+        ExecutionEvent::EffectStarted { effect, start: _ } => {
             progress_backend.start_effect(EffectProgressKey::new(effect), format_effect(effect));
         }
         ExecutionEvent::EffectInterrupted { effect, progress } => {
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn plain_started_and_waiting_write_nothing_immediately() {
         let effect = dummy_create_effect();
-        assert!(plain_output(&ExecutionEvent::EffectStarted { effect: &effect }).is_empty());
+        assert!(plain_output(&ExecutionEvent::effect_started_for_test(&effect)).is_empty());
         assert!(
             plain_output(&ExecutionEvent::Waiting {
                 effect: &effect,
@@ -456,7 +456,7 @@ mod tests {
         let effect = dummy_create_effect();
         let label = format_effect(&effect);
 
-        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
         wait_for_output_contains(&output.0, &format!("Still running: {label}"));
 
         handle_event(
@@ -488,7 +488,7 @@ mod tests {
         let backend = ProgressBackend::plain(output.clone());
         let effect = dummy_create_effect();
 
-        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
         handle_event(
             &backend,
             &ExecutionEvent::EffectInterrupted {
@@ -526,7 +526,7 @@ mod tests {
         )]);
         let observation = wait_observation(&target_id, &predicate, &attrs);
 
-        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &effect });
+        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
         handle_event(
             &backend,
             &ExecutionEvent::WaitPolling {
@@ -670,8 +670,8 @@ mod tests {
             std::io::sink(),
             std::io::sink(),
         );
-        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &first });
-        handle_event(&backend, &ExecutionEvent::EffectStarted { effect: &second });
+        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&first));
+        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&second));
 
         assert_eq!(
             backend.active_count(),

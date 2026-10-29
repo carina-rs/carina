@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::differ::{
@@ -26,7 +26,7 @@ use crate::resource::{
 };
 use crate::value::{SerializationContext, SerializationError};
 
-use super::wait::InFlightStart;
+use super::wait::{InFlightStart, StartedEffect};
 use super::{
     AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
     ExecutionObserver, ProgressInfo,
@@ -56,6 +56,7 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     Failure {
+        error: String,
         refresh: Option<(ResourceId, AppliedIdentifier)>,
     },
     ResumeSuccess {
@@ -65,12 +66,61 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     ClassifiedFailure {
+        error: String,
         resource_id: ResourceId,
         applied: Applied,
     },
     Deleted {
         instance_key: DeletedInstanceKey,
     },
+}
+
+/// A completed basic provider future that still owns the obligation to emit
+/// its one terminal effect event.
+pub(super) struct StartedBasicEffectResult<'a, S> {
+    started: StartedEffect<'a, S>,
+    duration: Duration,
+    outcome: BasicEffectResult,
+}
+
+impl<'a, S> StartedBasicEffectResult<'a, S> {
+    fn new(started: StartedEffect<'a, S>, began: Instant, outcome: BasicEffectResult) -> Self {
+        Self {
+            started,
+            duration: began.elapsed(),
+            outcome,
+        }
+    }
+
+    fn emit_terminal(self) -> BasicEffectResult {
+        let Self {
+            started,
+            duration,
+            outcome,
+        } = self;
+        match &outcome {
+            BasicEffectResult::Success { completed, .. } => {
+                started.succeeded(Some(&completed.state), duration)
+            }
+            BasicEffectResult::PartialSuccess {
+                completed,
+                diagnostic,
+                ..
+            } => started.partially_succeeded(&completed.state, diagnostic, duration),
+            BasicEffectResult::Failure { error, .. }
+            | BasicEffectResult::ClassifiedFailure { error, .. } => {
+                started.failed(error, duration);
+            }
+            BasicEffectResult::ResumeSuccess { completed, .. } => {
+                let state = completed.observed_state();
+                started.succeeded(Some(&state), duration);
+            }
+            BasicEffectResult::Deleted { .. } => {
+                started.succeeded(None, duration);
+            }
+        }
+        outcome
+    }
 }
 
 /// Mutable execution state shared across effect processing.
@@ -543,9 +593,13 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 /// This helper is used by both sequential and phased execution paths to avoid
 /// duplicating the result-processing logic for Create/Update/Delete effects.
 pub(super) fn process_basic_result<S: Clone>(
-    result: BasicEffectResult,
+    result: StartedBasicEffectResult<'_, S>,
     exec: &mut ExecutionState<'_, S>,
 ) {
+    process_basic_outcome(result.emit_terminal(), exec);
+}
+
+fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut ExecutionState<'_, S>) {
     let idx = exec.idx;
     let failed_indices = &mut *exec.failed_indices;
     let pending_refreshes = &mut *exec.pending_refreshes;
@@ -575,7 +629,7 @@ pub(super) fn process_basic_result<S: Clone>(
                 &state,
             );
         }
-        BasicEffectResult::Failure { refresh } => {
+        BasicEffectResult::Failure { error: _, refresh } => {
             exec.accumulator
                 .mutate(|accumulated| accumulated.failure_count += 1);
             failed_indices.insert(idx);
@@ -603,6 +657,7 @@ pub(super) fn process_basic_result<S: Clone>(
             );
         }
         BasicEffectResult::ClassifiedFailure {
+            error: _,
             resource_id,
             applied,
         } => {
@@ -682,14 +737,14 @@ pub(super) struct BasicEffectCtx<'a, S> {
 /// (carina#3164) panicked apply with `execute_basic_effect called
 /// with non-basic effect`. The type now enforces it.
 ///
-/// Returns a `BasicEffectResult` that callers map to their path-specific
-/// result types.
-pub(super) async fn execute_basic_effect<'a, S: Clone>(
-    basic: BasicEffect<'a, S>,
-    ctx: &BasicEffectCtx<'a, S>,
+/// Returns a started result whose token must be consumed to emit the terminal
+/// event before callers process its state changes.
+pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
+    basic: BasicEffect<'effect, S>,
+    ctx: &BasicEffectCtx<'_, S>,
     in_flight_start: InFlightStart,
-    observer: &'a dyn ExecutionObserver<S>,
-) -> BasicEffectResult {
+    observer: &'observer dyn ExecutionObserver<S>,
+) -> StartedBasicEffectResult<'observer, S> {
     let provider = ctx.provider;
     let preparation = ctx.preparation;
     let completed = ctx.completed;
@@ -701,9 +756,9 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
         total,
     };
     let effect = basic.as_effect();
-    in_flight_start.emit_started(observer, effect, progress);
+    let started_effect = in_flight_start.emit_started(observer, effect, progress);
 
-    match basic {
+    let outcome = match basic {
         BasicEffect::Create { resource, .. } => {
             let check_input = ctx
                 .provider_check_inputs
@@ -712,13 +767,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &e,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error: e,
+                            refresh: None,
+                        },
+                    );
                 }
             };
             match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
@@ -729,13 +785,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                         super::complete_create_for_writeback(outcome);
                     let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
-                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
-                            effect,
-                            state: &state,
-                            diagnostic: &diagnostic,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -747,12 +796,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                             binding: resource.binding.clone(),
                         }
                     } else {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::Success {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -767,25 +810,17 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 Err(failure) => match failure.into_kind() {
                     CreateFailureKind::Untracked(error) => {
                         let error_str = error.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        BasicEffectResult::Failure { refresh: None }
+                        BasicEffectResult::Failure {
+                            error: error_str,
+                            refresh: None,
+                        }
                     }
                     CreateFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error_str = format!("{error}\n{}", created.post_error_note());
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::ClassifiedFailure {
+                            error: error_str,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -793,13 +828,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                     CreateFailureKind::InFlight { pending, error } => {
                         let error_str =
                             format!("{error}\ncreate still in progress; the next apply resumes it");
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::ClassifiedFailure {
+                            error: error_str,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }
@@ -815,13 +845,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error,
+                            refresh: None,
+                        },
+                    );
                 }
             };
             let pending = match &ctx.resume_create {
@@ -831,13 +862,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                         "saved create continuation for {} changed before dispatch",
                         resource.id
                     );
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error,
+                            refresh: None,
+                        },
+                    );
                 }
             };
             let request = match ResumeCreateRequest::new(pending, CreateRequest::checked(resolved))
@@ -845,13 +877,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 Ok(request) => request,
                 Err(error) => {
                     let error = error.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error,
+                            refresh: None,
+                        },
+                    );
                 }
             };
             match super::dispatch_resume_create(provider, request)
@@ -861,13 +894,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 Ok(ResumeOutcomeKind::Resumed(completed)) => {
                     let completed =
                         completed.with_resolved_desired_attributes(resolved_attrs.clone());
-                    let state = completed.observed_state();
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
-                        state: Some(&state),
-                        duration: started.elapsed(),
-                        progress,
-                    });
                     BasicEffectResult::ResumeSuccess {
                         completed,
                         resource_id: resource.id.clone(),
@@ -880,13 +906,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                         super::complete_create_for_writeback(*outcome);
                     let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
                     if let Some(diagnostic) = diagnostic {
-                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
-                            effect,
-                            state: &state,
-                            diagnostic: &diagnostic,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -898,12 +917,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                             binding: resource.binding.clone(),
                         }
                     } else {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::Success {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -918,13 +931,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 Err(failure) => match failure.into_kind() {
                     ResumeFailureKind::Ended(error) => {
                         let error = error.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::ClassifiedFailure {
+                            error,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateEnded,
                         }
@@ -933,13 +941,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error = format!("{error}\n{}", created.post_error_note());
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::ClassifiedFailure {
+                            error,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -947,13 +950,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                     ResumeFailureKind::InFlight { pending, error } => {
                         let error =
                             format!("{error}\ncreate still in progress; the next apply resumes it");
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::ClassifiedFailure {
+                            error,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }
@@ -984,13 +982,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 match resolve_resource(check_input, preparation).await {
                     Ok(r) => r,
                     Err(e) => {
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &e,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        return BasicEffectResult::Failure { refresh: None };
+                        return StartedBasicEffectResult::new(
+                            started_effect,
+                            started,
+                            BasicEffectResult::Failure {
+                                error: e,
+                                refresh: None,
+                            },
+                        );
                     }
                 };
             // Augment plan-time `changed_attributes` with any
@@ -1009,13 +1008,14 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 Ok(schema) => schema,
                 Err(error) => {
                     let error = error.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure { refresh: None };
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error,
+                            refresh: None,
+                        },
+                    );
                 }
             };
             for (key, new_value) in &resolved_resource.attributes {
@@ -1063,13 +1063,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                     };
                     let state = outcome.into_state_for_writeback();
                     if let Some(diagnostic) = diagnostic {
-                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
-                            effect,
-                            state: &state,
-                            diagnostic: &diagnostic,
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -1081,12 +1074,6 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                             binding: to.binding.clone(),
                         }
                     } else {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
                         BasicEffectResult::Success {
                             completed: CompletedEffect {
                                 state: Box::new(state),
@@ -1100,13 +1087,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 }
                 Err(e) => {
                     let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
                     BasicEffectResult::Failure {
+                        error: error_str,
                         refresh: Some((id.clone(), identifier.clone())),
                     }
                 }
@@ -1129,30 +1111,17 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 )
                 .await
             {
-                Ok(()) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
-                        state: None,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    BasicEffectResult::Deleted {
-                        instance_key: DeletedInstanceKey::new(
-                            id.clone(),
-                            generation.clone(),
-                            identifier.to_string(),
-                        ),
-                    }
-                }
+                Ok(()) => BasicEffectResult::Deleted {
+                    instance_key: DeletedInstanceKey::new(
+                        id.clone(),
+                        generation.clone(),
+                        identifier.to_string(),
+                    ),
+                },
                 Err(e) => {
                     let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
                     BasicEffectResult::Failure {
+                        error: error_str,
                         refresh: match generation {
                             EffectGeneration::Current => Some((id.clone(), identifier.clone())),
                             EffectGeneration::Deposed(_) => None,
@@ -1161,7 +1130,8 @@ pub(super) async fn execute_basic_effect<'a, S: Clone>(
                 }
             }
         }
-    }
+    };
+    StartedBasicEffectResult::new(started_effect, started, outcome)
 }
 
 #[cfg(test)]
@@ -1179,6 +1149,7 @@ mod process_basic_result_tests {
             partial_count: 0,
             partial_diagnostics: Vec::new(),
             skip_count: 0,
+            interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
             successfully_deleted: HashSet::new(),
@@ -1256,7 +1227,7 @@ mod process_basic_result_tests {
             pending_refreshes: &mut pending_refreshes,
         };
 
-        process_basic_result(
+        process_basic_outcome(
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
                     state: Box::new(writeback_state),

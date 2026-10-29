@@ -51,7 +51,8 @@ use crate::commands::shared::lock_heartbeat::{
 };
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
-    FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressSink, RefreshPhase, format_duration,
+    FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressGuard, ProgressSink, RefreshPhase,
+    format_duration,
 };
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
@@ -799,6 +800,7 @@ async fn run_destroy_locked_owned(
     let mut retry_pending: HashSet<usize> = HashSet::new();
 
     let mut in_flight = FuturesUnordered::new();
+    let mut active_progress: HashMap<usize, ProgressGuard<'_, usize>> = HashMap::new();
     let cleanup_loop = cancel.cleanup_aware_loop();
 
     'destroy: loop {
@@ -865,14 +867,14 @@ async fn run_destroy_locked_owned(
                         effect,
                         format!("- skipped (dependent {failed_dep} failed)"),
                     ));
-                    progress.finish(idx, outcome);
+                    progress.outcome_line(outcome);
                     skip_count += 1;
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                progress.start_indexed(idx, format_effect(effect));
+                active_progress.insert(idx, progress.start_indexed(idx, format_effect(effect)));
 
                 // Spawn the deletion as a concurrent future
                 let Effect::Delete {
@@ -925,7 +927,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         "- skipped (destroy cancelled)",
                     ));
-                    progress.finish(idx, outcome);
+                    progress.outcome_line(outcome);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     skip_count += 1;
@@ -953,7 +955,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         "- retries exhausted (no progress possible)",
                     ));
-                    progress.finish_failed(idx, outcome);
+                    progress.failed_line(outcome);
                     failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
@@ -970,7 +972,7 @@ async fn run_destroy_locked_owned(
                     effect,
                     "- dependency cycle (no progress possible)",
                 ));
-                progress.finish_failed(idx, outcome);
+                progress.failed_line(outcome);
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
                 failure_count += 1;
@@ -1022,7 +1024,10 @@ async fn run_destroy_locked_owned(
                     effect,
                     timing,
                 ));
-                progress.finish(finished_idx, outcome);
+                active_progress
+                    .remove(&finished_idx)
+                    .expect("completed destroy effect must own progress")
+                    .finish(outcome);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
@@ -1052,7 +1057,10 @@ async fn run_destroy_locked_owned(
                         retry_num,
                         max_retries
                     ));
-                    progress.finish(finished_idx, outcome);
+                    active_progress
+                        .remove(&finished_idx)
+                        .expect("retrying destroy effect must own progress")
+                        .finish(outcome);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     let outcome = FailedOutcome::new(
@@ -1064,7 +1072,10 @@ async fn run_destroy_locked_owned(
                         ),
                         [e.to_string()],
                     );
-                    progress.finish_failed(finished_idx, outcome);
+                    active_progress
+                        .remove(&finished_idx)
+                        .expect("failed destroy effect must own progress")
+                        .finish_failed(outcome);
                     failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
@@ -1082,6 +1093,7 @@ async fn run_destroy_locked_owned(
         cancelled = true;
         let interrupted = finish_interrupted_destroy_outcomes(
             &progress,
+            &mut active_progress,
             &all_indices,
             &completed_indices,
             &dispatched,
@@ -1664,6 +1676,7 @@ struct InterruptedDestroyCounts {
 
 fn finish_interrupted_destroy_outcomes(
     progress: &ProgressBackend<usize>,
+    active_progress: &mut HashMap<usize, ProgressGuard<'_, usize>>,
     all_indices: &[usize],
     completed_indices: &HashSet<usize>,
     dispatched: &HashSet<usize>,
@@ -1674,14 +1687,22 @@ fn finish_interrupted_destroy_outcomes(
         if completed_indices.contains(&idx) {
             continue;
         }
-        let outcome = if dispatched.contains(&idx) {
+        let kind = if dispatched.contains(&idx) {
             counts.unknown += 1;
             InterruptedDestroyOutcome::Unknown
         } else {
             counts.skipped += 1;
             InterruptedDestroyOutcome::Skipped
         };
-        progress.finish(idx, outcome_for(idx, outcome));
+        let outcome = outcome_for(idx, kind);
+        if kind == InterruptedDestroyOutcome::Unknown {
+            active_progress
+                .remove(&idx)
+                .expect("dispatched destroy effect must own progress")
+                .finish(outcome);
+        } else {
+            progress.outcome_line(outcome);
+        }
     }
     counts
 }
@@ -1971,12 +1992,14 @@ mod tests {
     fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
         let output = SharedProgressWriter::default();
         let progress = ProgressBackend::plain(output.clone());
-        progress.start_indexed(0, "Delete in-flight");
+        let mut active_progress =
+            HashMap::from([(0, progress.start_indexed(0, "Delete in-flight"))]);
         let completed = HashSet::from([2]);
         let dispatched = HashSet::from([0]);
 
         let counts = finish_interrupted_destroy_outcomes(
             &progress,
+            &mut active_progress,
             &[0, 1, 2],
             &completed,
             &dispatched,

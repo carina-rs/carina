@@ -714,7 +714,7 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
                 pending_dependencies.join(",")
             )
         }
-        ExecutionEvent::EffectStarted { effect } => {
+        ExecutionEvent::EffectStarted { effect, start: _ } => {
             format!("started:{}", effect.resource_id())
         }
         ExecutionEvent::EffectInterrupted { effect, progress } => {
@@ -1222,6 +1222,7 @@ fn empty_execution_result() -> ExecutionResult {
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
+        interrupted_count: 0,
         applied_states: Default::default(),
         runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
@@ -1573,6 +1574,7 @@ impl ExecutionObserver for CancelsWhenWaitStarted {
     fn on_event(&self, event: &ExecutionEvent) {
         if let ExecutionEvent::EffectStarted {
             effect: Effect::Wait { identity, .. },
+            start: _,
         } = event
             && identity.as_str() == self.binding
         {
@@ -1616,6 +1618,7 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
             .push(format_execution_event(event));
         if let ExecutionEvent::EffectStarted {
             effect: Effect::Wait { identity, .. },
+            start: _,
         } = event
             && identity.as_str() == self.binding
         {
@@ -1630,7 +1633,7 @@ impl ExecutionObserver for CancelsWhenStarted {
             .lock()
             .unwrap()
             .push(format_execution_event(event));
-        if let ExecutionEvent::EffectStarted { effect } = event
+        if let ExecutionEvent::EffectStarted { effect, start: _ } = event
             && effect
                 .resource_id()
                 .identity_str()
@@ -5080,6 +5083,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         "the abandoned in-flight effect has no trustworthy completion result"
     );
     assert_eq!(provider.started_names(), vec!["r1", "r2"]);
+    assert_eq!(result.interrupted_count, 1);
     let interrupted: Vec<_> = observer
         .events()
         .into_iter()
