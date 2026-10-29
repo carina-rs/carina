@@ -280,7 +280,7 @@ let item = test.thing {
         );
         let canonical_resources = canonical_pair(
             &parsed,
-            parsed.resources.clone(),
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
             wiring.context().schemas(),
         );
         let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
