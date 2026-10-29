@@ -1023,6 +1023,11 @@ impl LeafPath {
     pub fn from_segments(segments: impl IntoIterator<Item = LeafPathSegment>) -> Self {
         Self(segments.into_iter().collect())
     }
+
+    /// Borrow the typed steps from the containing attribute to this leaf.
+    pub fn segments(&self) -> &[LeafPathSegment] {
+        &self.0
+    }
 }
 
 /// Attribute type — opaque public type wrapping an internal
