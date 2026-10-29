@@ -3707,7 +3707,6 @@ pub(crate) struct AddressedStateParts {
     pub orphans: Orphans,
     pub saved_attrs: LiftedSavedAttrs,
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    pub moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
 }
 
 impl AddressedState {
@@ -3752,7 +3751,6 @@ impl AddressedState {
             orphans: self.orphans,
             saved_attrs: self.saved_attrs,
             prev_explicit: self.prev_explicit,
-            moved_pairs: self.moved_pairs,
         }
     }
 }
@@ -4295,21 +4293,6 @@ impl<'state> DetectedDeferredForExpansionPrelude<'state> {
         &self.prelude.saved_attrs
     }
 
-    pub(crate) fn prev_explicit(
-        &self,
-    ) -> &HashMap<ResourceId, carina_core::explicit::ExplicitFields> {
-        &self.prelude.prev_explicit
-    }
-
-    pub(crate) fn wait_aliases(&self) -> &[WaitAliasSpec] {
-        &self.prelude.wait_aliases
-    }
-
-    pub(crate) fn projected_state(&self) -> ProjectedStateRead<'state> {
-        self.automatic_moves
-            .state_read_projection(self.prelude.state_file.as_ref())
-    }
-
     pub(crate) fn saved_dependency_bindings(&self) -> HashMap<ResourceId, BTreeSet<String>> {
         self.automatic_moves
             .state_read_projection(self.prelude.state_file.as_ref())
@@ -4600,35 +4583,6 @@ impl ReconciledDeferredForExpansion {
         &self.0.state.moved_pairs
     }
 
-    pub(crate) fn projected_state<'state>(
-        &self,
-        state_file: Option<&'state StateFile>,
-    ) -> ProjectedStateRead<'state> {
-        self.0.state.projected_state(state_file)
-    }
-
-    pub(crate) fn reconcile_late_anonymous_identities(
-        &mut self,
-        ctx: &WiringContext,
-        resources: &mut OverrideAwareResources,
-        data_sources: &[DataSource],
-        state_file: Option<&StateFile>,
-        state_block_claims: &StateBlockClaims,
-        providers: &[ProviderConfig],
-    ) -> Result<ResolvedDesiredIds, AppError> {
-        reconcile_late_anonymous_identities(
-            ctx,
-            LateAnonymousIdentityInputs {
-                resources,
-                addressed: &mut self.0.state,
-                data_sources,
-                state_file,
-                state_block_claims,
-                providers,
-            },
-        )
-    }
-
     pub(crate) async fn read_data_sources_phase2(
         &self,
         inputs: AddressedDataSourceReadInputs<'_, '_>,
@@ -4864,6 +4818,302 @@ pub fn derive_managed_binding_stability<E>(
     );
     stability.extend(pending_stability);
     Ok(stability)
+}
+
+/// Inputs available after deferred-`for` expansion and any child refreshes.
+///
+/// This is the single plan-construction seam shared by production planning and
+/// the provider-less fixture planner. Provider behavior is supplied through
+/// the two traits; the seam itself has no fixture-specific branches.
+pub(crate) struct PostExpansionPlanInput<'a, E> {
+    pub context: &'a WiringContext,
+    pub expanded_resources: &'a ExpandedCanonicalResources<E>,
+    pub sorted_resources: Vec<Resource>,
+    pub addressed: AddressedState,
+    pub data_source_values: DataSourceValues,
+    pub wait_aliases: Vec<WaitAliasSpec>,
+    pub data_sources: &'a [DataSource],
+    pub provider: &'a dyn Provider,
+    pub normalizer: &'a dyn ProviderNormalizer,
+    pub provider_configs: &'a [ProviderConfig],
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub state_file: &'a Option<StateFile>,
+    pub state_block_claims: &'a StateBlockClaims,
+    pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
+    pub module_gate: &'a carina_core::executor::ModuleConstraintGate,
+    pub preparation_errors: Option<Vec<PlanError>>,
+    pub deferred_create_targets: Vec<DeferredCreateTarget>,
+}
+
+/// Successfully resolved resource views retained for plan consumers.
+pub(crate) struct PostExpansionResolvedResources {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub override_aware: OverrideAwareResources,
+    pub resolved: Vec<ResolvedResource>,
+    pub unresolved: Vec<UnresolvedResource>,
+}
+
+/// Result of the shared post-expansion plan-construction seam.
+pub(crate) struct PostExpansionPlan {
+    pub plan: Plan,
+    /// `None` only when preprocessing produced plan diagnostics. Those plans
+    /// abort before any resolved-resource consumer.
+    pub resources: Option<PostExpansionResolvedResources>,
+    pub compositions: Vec<LiveComposition>,
+    pub data_sources: Vec<DataSource>,
+    pub managed_current: HashMap<ResourceId, Current>,
+    pub data_source_values: DataSourceValues,
+    pub moved_origins: HashMap<ResourceId, ResourceId>,
+    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+}
+
+/// Build a plan from the exact resource/state view that crossed deferred-`for`
+/// expansion.
+pub(crate) async fn build_post_expansion_plan<E>(
+    input: PostExpansionPlanInput<'_, E>,
+) -> Result<PostExpansionPlan, AppError> {
+    let PostExpansionPlanInput {
+        context,
+        expanded_resources,
+        sorted_resources,
+        mut addressed,
+        mut data_source_values,
+        wait_aliases,
+        data_sources,
+        provider,
+        normalizer,
+        provider_configs,
+        remote_bindings,
+        state_file,
+        state_block_claims,
+        resolved_state_block_targets,
+        module_gate,
+        preparation_errors,
+        deferred_create_targets,
+    } = input;
+    let parsed = expanded_resources.parsed();
+
+    // awscc#251 (follow-up to #3055): data sources do not flow through
+    // `into_plan_input_current_map`, so lift them explicitly at this seam.
+    lift_data_source_value_enum_leaves(&mut data_source_values, data_sources, context.schemas());
+    let upstream_binding_names = parsed.upstream_binding_names();
+    let managed_stability = derive_managed_binding_stability(
+        parsed,
+        &sorted_resources,
+        &addressed.managed_current,
+        &data_source_values,
+        context.schemas(),
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
+        remote_bindings,
+        &wait_aliases,
+    )?;
+    let pre_apply_current = carina_core::resource::into_plan_input_current_map(
+        addressed.managed_current.clone(),
+        context.schemas(),
+        &sorted_resources,
+    );
+    let projected_state = addressed.projected_state(state_file.as_ref());
+    let (mut override_aware_resources, unresolved_override_aware_resources) =
+        OverrideAwareResources::build_pair_with_stability(
+            expanded_resources.as_pair(),
+            &projected_state,
+            LivePreApplyInputs {
+                managed: &[],
+                compositions: &parsed.compositions,
+                managed_current: &pre_apply_current,
+                data_source_values: &data_source_values,
+                remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+            &managed_stability,
+            OverrideAwareBuildMode::Plan {
+                unresolved_upstream_bindings: &upstream_binding_names,
+            },
+        )?;
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        &projected_state,
+    );
+
+    // Refresh-time reads get concrete inputs. Apply-time deferred reads retain
+    // structural refs so saved-plan apply can rebuild their dependency graph.
+    let mut data_sources_for_plan = prepare_data_sources_for_plan(
+        &data_source_values,
+        override_aware_resources.bindings(),
+        Some(&upstream_binding_names),
+    )?;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let compositions = parsed.compositions.clone();
+    let wait_bindings = parsed.wait_bindings.clone();
+    let preparation = if let Some(errors) = preparation_errors {
+        Err(PlanPreparationError::Plan(errors))
+    } else {
+        PlanPreprocessor::new(normalizer, context)
+            .prepare(
+                &mut override_aware_resources,
+                &constraint_origin_resources,
+                module_gate,
+                &mut addressed.managed_current,
+                &mut data_source_values,
+                &mut addressed.orphans,
+                provider_configs,
+                &mut data_sources_for_plan,
+                data_sources,
+            )
+            .await
+    };
+    if let Err(error) = preparation {
+        let errors = match error {
+            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Provider(error) => return Err(AppError::Provider(error)),
+        };
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        let moved_origins = addressed
+            .moved_pairs
+            .iter()
+            .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
+            .collect();
+        return Ok(PostExpansionPlan {
+            plan,
+            resources: None,
+            compositions,
+            data_sources: data_sources_for_plan,
+            managed_current: into_all_prior_states(addressed.orphans, addressed.managed_current),
+            data_source_values,
+            moved_origins,
+            prev_explicit: addressed.prev_explicit,
+        });
+    }
+
+    // Anonymous identities that depend on normalized ResourceRefs become
+    // concrete only here. State transfer and collision validation therefore
+    // share this same addressed-state owner.
+    let resolved_desired_ids = reconcile_late_anonymous_identities(
+        context,
+        LateAnonymousIdentityInputs {
+            resources: &mut override_aware_resources,
+            addressed: &mut addressed,
+            data_sources: &data_sources_for_plan,
+            state_file: state_file.as_ref(),
+            state_block_claims,
+            providers: provider_configs,
+        },
+    )?;
+    validate_plan_time_state_block_collisions(
+        &resolved_desired_ids,
+        &addressed.moved_pairs,
+        resolved_state_block_targets,
+        state_file,
+    )?;
+
+    let reconciled_provider_states = provider_states_for(
+        &addressed.managed_current,
+        &addressed.orphans,
+        override_aware_resources.resources(),
+    );
+    let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
+        reconciled_provider_states,
+        context.schemas(),
+        override_aware_resources.resources(),
+    );
+    let stability_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let managed_stability = carina_core::differ::managed_binding_stability(
+        &stability_resources,
+        &reconciled_input_current,
+        context.schemas(),
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
+    );
+    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
+        RebuildBindingsInputs {
+            compositions: &parsed.compositions,
+            managed_current: &reconciled_input_current,
+            data_source_values: &data_source_values,
+            remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+        &managed_stability,
+    );
+
+    // Update ordering looks directives up only for Update effects. Orphan
+    // directives stay paired with their typed orphan state for Delete effects.
+    let directives_map = addressed
+        .projected_state(state_file.as_ref())
+        .build_directives();
+    let paired_unresolved_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let resolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let resolved_unresolved_resources =
+        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        addressed.managed_current.clone(),
+        context.schemas(),
+        override_aware_resources.resources(),
+    );
+    let mut plan = create_plan_with_cascades(
+        &resolved_resources,
+        &resolved_unresolved_resources,
+        &data_sources_for_plan,
+        provider,
+        PlanPriorStates::new(&plan_input_current, &addressed.orphans),
+        &directives_map,
+        context.schemas(),
+        &addressed.saved_attrs,
+        &addressed.prev_explicit,
+        &wait_bindings,
+    )?;
+    add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
+    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
+    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, context.schemas());
+
+    // State blocks run after differ/deposed identifier errors so `removed`
+    // remains the explicit recovery that can suppress those diagnostics.
+    add_state_block_effects(
+        &mut plan,
+        &parsed.state_blocks,
+        state_file,
+        &addressed.moved_pairs,
+        override_aware_resources.resources(),
+        override_aware_resources.bindings(),
+        &upstream_binding_names,
+    );
+    add_deferred_create_effects(&mut plan, &deferred_create_targets);
+
+    let moved_origins = addressed
+        .moved_pairs
+        .iter()
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
+        .collect();
+    let prev_explicit = addressed.prev_explicit;
+    let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
+    let unresolved = resolved_unresolved_resources
+        .into_iter()
+        .map(ResolvedResource::into_inner)
+        .map(UnresolvedResource::from_pre_resolve)
+        .collect();
+
+    Ok(PostExpansionPlan {
+        plan,
+        resources: Some(PostExpansionResolvedResources {
+            #[cfg(any(test, feature = "test-utils"))]
+            override_aware: override_aware_resources,
+            resolved: resolved_resources,
+            unresolved,
+        }),
+        compositions,
+        data_sources: data_sources_for_plan,
+        managed_current,
+        data_source_values,
+        moved_origins,
+        prev_explicit,
+    })
 }
 
 impl PreparedDeferredForExpansion {
@@ -5823,246 +6073,40 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     }
 
     drop(refresh_phase);
-
-    // awscc#251 (follow-up to #3055): data-source lifting stays here
-    // because data sources do not flow through `into_plan_input_current_map`.
-    lift_data_source_value_enum_leaves(&mut data_source_values, &data_sources, ctx.schemas());
-    // Build the unified pre-apply bindings view once (carina#3248):
-    // every kind of binding the configuration declares (managed,
-    // composition, data source) is in the same view, so a managed
-    // attribute referencing `<module_instance>.<attr>` (a composition)
-    // chains through to the managed sibling literal instead of
-    // surviving as an unresolved `ResourceRef` (carina#3246).
-    let upstream_binding_names = parsed.upstream_binding_names();
-    let managed_stability = derive_managed_binding_stability(
-        parsed,
-        &sorted_resources,
-        &addressed.managed_current,
-        &data_source_values,
-        ctx.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
+    let expansion_trace = parsed.expansion_trace.clone();
+    let PostExpansionPlan {
+        plan,
+        resources,
+        compositions,
+        data_sources,
+        managed_current,
+        data_source_values,
+        moved_origins,
+        prev_explicit,
+    } = build_post_expansion_plan(PostExpansionPlanInput {
+        context: ctx,
+        expanded_resources: &expanded_canonical_resources,
+        sorted_resources,
+        addressed,
+        data_source_values,
+        wait_aliases,
+        data_sources: &data_sources,
+        provider: &provider,
+        normalizer: &provider,
+        provider_configs: raw_provider_configs,
         remote_bindings,
-        &wait_aliases,
-    )?;
-    let pre_apply_current = carina_core::resource::into_plan_input_current_map(
-        addressed.managed_current.clone(),
-        ctx.schemas(),
-        &sorted_resources,
-    );
-    let projected_state = addressed.projected_state(state_file.as_ref());
-    let (mut override_aware_resources, unresolved_override_aware_resources) =
-        OverrideAwareResources::build_pair_with_stability(
-            expanded_canonical_resources.as_pair(),
-            &projected_state,
-            LivePreApplyInputs {
-                managed: &[],
-                compositions: &parsed.compositions,
-                managed_current: &pre_apply_current,
-                data_source_values: &data_source_values,
-                remote_bindings,
-                wait_aliases: &wait_aliases,
-            },
-            &managed_stability,
-            OverrideAwareBuildMode::Plan {
-                unresolved_upstream_bindings: &upstream_binding_names,
-            },
-        )?;
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        &projected_state,
-    );
-    // Resolve and canonicalize only refresh-time data sources. Deferred
-    // reads keep their original input refs so the plan/executor dependency
-    // graph still contains the upstream create edge.
-    let mut data_sources_for_plan = prepare_data_sources_for_plan(
-        &data_source_values,
-        override_aware_resources.bindings(),
-        Some(&upstream_binding_names),
-    )?;
-    let constraint_origin_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let prepared_compositions = parsed.compositions.clone();
-
-    // Run the normalization pipeline: host desired canonicalization → guest
-    // desired normalization → host provider-output canonicalization/default tags →
-    // guest state normalization. Host state lifting follows at the differ
-    // seam. `create_plan` resolves typed wait RHS values itself.
-    let wait_bindings = parsed.wait_bindings.clone();
-    let preprocessor = PlanPreprocessor::new(&provider, ctx);
-    let preparation = if let Some(errors) = refresh_module_constraint_errors {
-        Err(PlanPreparationError::Plan(errors))
-    } else {
-        preprocessor
-            .prepare(
-                &mut override_aware_resources,
-                &constraint_origin_resources,
-                &module_gate,
-                &mut addressed.managed_current,
-                &mut data_source_values,
-                &mut addressed.orphans,
-                raw_provider_configs,
-                &mut data_sources_for_plan,
-                &data_sources,
-            )
-            .await
-    };
-    if let Err(error) = preparation {
-        let errors = match error {
-            PlanPreparationError::Plan(errors) => errors,
-            PlanPreparationError::Provider(error) => return Err(AppError::Provider(error)),
-        };
-        let mut plan = Plan::new();
-        for error in errors {
-            plan.add_error(error);
-        }
-        let moved_origins = addressed
-            .moved_pairs
-            .iter()
-            .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-            .collect();
-        let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
-        return Ok(ExpandedPlanContext::new(
-            PlanContext {
-                plan,
-                provider,
-                // Error plans are aborted before any resolved-resource consumer,
-                // including plan-image rendering. Do not weaken the successful
-                // path's type invariant to retain unusable pending resources.
-                sorted_resources: Vec::new(),
-                unresolved_resources: Vec::new(),
-                compositions: prepared_compositions,
-                data_sources: data_sources_for_plan,
-                managed_current,
-                data_source_values,
-                moved_origins,
-                upstream_snapshot: remote_bindings.clone(),
-                prev_explicit: addressed.prev_explicit,
-                residual_deferred_for,
-                expansion_trace: parsed.expansion_trace.clone(),
-            },
-            expanded_canonical_resources,
-        ));
-    }
-
-    // Anonymous resources whose identity attributes include ResourceRefs can
-    // only be named and matched after plan-time refs and provider normalization
-    // have made those create-only values concrete. The late pass owns the
-    // addressed state bundle, so a detected move cannot be returned without
-    // also transferring the current/orphan and persisted metadata views.
-    let resolved_desired_ids = reconcile_late_anonymous_identities(
-        ctx,
-        LateAnonymousIdentityInputs {
-            resources: &mut override_aware_resources,
-            addressed: &mut addressed,
-            data_sources: &data_sources_for_plan,
-            state_file: state_file.as_ref(),
-            state_block_claims,
-            providers: raw_provider_configs,
-        },
-    )?;
-    validate_plan_time_state_block_collisions(
-        &resolved_desired_ids,
-        &addressed.moved_pairs,
+        state_file,
+        state_block_claims,
         resolved_state_block_targets,
-        state_file,
-    )?;
-
-    let reconciled_provider_states = provider_states_for(
-        &addressed.managed_current,
-        &addressed.orphans,
-        override_aware_resources.resources(),
+        module_gate: &module_gate,
+        preparation_errors: refresh_module_constraint_errors,
+        deferred_create_targets,
+    })
+    .await?;
+    let (sorted_resources, unresolved_resources) = resources.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |resources| (resources.resolved, resources.unresolved),
     );
-    let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
-        reconciled_provider_states,
-        ctx.schemas(),
-        override_aware_resources.resources(),
-    );
-    let stability_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
-    let managed_stability = carina_core::differ::managed_binding_stability(
-        &stability_resources,
-        &reconciled_input_current,
-        ctx.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-    );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
-        RebuildBindingsInputs {
-            compositions: &parsed.compositions,
-            managed_current: &reconciled_input_current,
-            data_source_values: &data_source_values,
-            remote_bindings,
-            wait_aliases: &wait_aliases,
-        },
-        &managed_stability,
-    );
-
-    // Update ordering looks directives up only for Update effects. Orphan
-    // directives stay paired with their typed orphan state for Delete effects.
-    let directives_map = addressed
-        .projected_state(state_file.as_ref())
-        .build_directives();
-    let paired_unresolved_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        addressed.managed_current.clone(),
-        ctx.schemas(),
-        override_aware_resources.resources(),
-    );
-    let mut plan = create_plan_with_cascades(
-        &resolved_resources,
-        &resolved_unresolved_resources,
-        &data_sources_for_plan,
-        &provider,
-        PlanPriorStates::new(&plan_input_current, &addressed.orphans),
-        &directives_map,
-        ctx.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-        &wait_bindings,
-    )?;
-    add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
-    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
-    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, ctx.schemas());
-
-    // Add state block effects (import/removed/moved) only after both the
-    // differ and deposed-generation pass have emitted identifier errors.
-    // `removed` is the explicit recovery that suppresses those errors; the
-    // missing-provider-identifier E2E pins this ordering for live planning.
-    // carina#3329: pass the same override-aware bindings + upstream_binding_names
-    // the resource-attribute resolver uses so an `import { id = "${…}|…" }`
-    // expression is folded into a concrete cloud identifier (when the
-    // referenced binding is in scope) or stamped for display as
-    // `(known after upstream apply: …)` when the referenced upstream
-    // state has not been published yet.
-    add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        state_file,
-        &addressed.moved_pairs,
-        override_aware_resources.resources(),
-        override_aware_resources.bindings(),
-        &upstream_binding_names,
-    );
-    add_deferred_create_effects(&mut plan, &deferred_create_targets);
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = addressed
-        .moved_pairs
-        .iter()
-        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-        .collect();
-    let prev_explicit = addressed.prev_explicit;
-    let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
-    let unresolved_resources = resolved_unresolved_resources
-        .into_iter()
-        .map(ResolvedResource::into_inner)
-        .map(UnresolvedResource::from_pre_resolve)
-        .collect();
     Ok(ExpandedPlanContext::new(
         PlanContext {
             plan,
@@ -6074,17 +6118,17 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             // restored unevaluated calls such as `secret("...")`. Anonymous
             // resources have no binding and kept this evaluated view, producing
             // the bound/anonymous saved-plan divergence.
-            sorted_resources: resolved_resources,
+            sorted_resources,
             unresolved_resources,
-            compositions: prepared_compositions,
-            data_sources: data_sources_for_plan,
+            compositions,
+            data_sources,
             managed_current,
             data_source_values,
             moved_origins,
             upstream_snapshot: remote_bindings.clone(),
             prev_explicit,
             residual_deferred_for,
-            expansion_trace: parsed.expansion_trace.clone(),
+            expansion_trace,
         },
         expanded_canonical_resources,
     ))

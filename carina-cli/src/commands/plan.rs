@@ -3644,6 +3644,11 @@ pub async fn run_plan(
     // detailed exit code 2 means a managed-resource mutation, not merely
     // displayable work such as reads, waits, exports, or deferred loops.
     let has_changes = ctx.plan.mutation_count() > 0;
+    let moved_hints = crate::moved_hint::detect_moved_block_hints(
+        &ctx.plan,
+        &ctx.managed_current,
+        ctx_wiring.schemas(),
+    );
 
     if json {
         if let Some(note) = drift_note.as_ref() {
@@ -3663,6 +3668,7 @@ pub async fn run_plan(
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
+        moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
         }
@@ -3674,6 +3680,7 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
         )
         .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
         }
@@ -3692,6 +3699,7 @@ pub async fn run_plan(
             println!();
             println!("{}", note.yellow());
         }
+        moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::print_warnings(result);
         }

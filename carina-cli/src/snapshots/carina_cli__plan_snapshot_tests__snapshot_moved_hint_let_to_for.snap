@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  - awscc.ec2.Vpc old_vpc
+      cidr_block: '10.0.0.0/16'
+  + awscc.ec2.Vpc vpcs[0]
+      cidr_block: '10.0.0.0/16'
+
+Plan: 1 to add, 0 to change, 1 to destroy.
+
+Warning: awscc.ec2.Vpc 'old_vpc' is destroyed and awscc.ec2.Vpc 'vpcs[0]' is created with matching create-only values; this replaces the existing resource.
+To keep it, add:
+
+  moved {
+    from = awscc.ec2.Vpc 'old_vpc'
+    to   = awscc.ec2.Vpc 'vpcs[0]'
+  }

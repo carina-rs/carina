@@ -23,7 +23,8 @@ use crate::display::{
     format_destroy_plan_with_delete_instances as format_destroy_plan,
     format_plan_with_delete_instances,
 };
-use crate::fixture_plan::build_plan_from_fixture_name;
+use crate::fixture_plan::{FixturePlan, build_plan_from_fixture_name};
+use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
 #[allow(clippy::too_many_arguments)]
@@ -1313,6 +1314,152 @@ fn snapshot_moved_pure() {
         None,
     ));
     insta::assert_snapshot!(output);
+}
+
+fn assert_pure_move_snapshot(fixture: &str) -> FixturePlan {
+    let fp = build_plan_from_fixture_name(fixture);
+    let summary = fp.plan.summary();
+    assert_eq!(summary.create, 0, "{fixture} unexpectedly creates");
+    assert_eq!(summary.delete, 0, "{fixture} unexpectedly deletes");
+    assert_eq!(summary.moved, 1, "{fixture} must contain one move");
+    assert!(
+        fp.moved_hints.is_empty(),
+        "an explicit move must not produce a hint: {:?}",
+        fp.moved_hints
+    );
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(format!("snapshot_{fixture}"), output);
+    fp
+}
+
+fn moved_hint_snapshot_output(fp: &FixturePlan) -> String {
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.managed_current,
+        fp.state_file.as_ref(),
+    );
+    let plan_output = format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        Some(&fp.prev_explicit),
+        None,
+    );
+    strip_ansi(&format!("{plan_output}{}", fp.moved_hints))
+}
+
+/// Moving a named resource into one element of a bound `for` expression is a
+/// state-only move when the user supplies the exact expanded address.
+#[test]
+fn snapshot_moved_let_to_for_bound() {
+    assert_pure_move_snapshot("moved_let_to_for_bound");
+}
+
+/// The `_for{N}` address is positional and tracked in carina-rs/carina#4109.
+/// Update this test target when that address scheme changes; do not change the
+/// counter merely to make the fixture pass.
+#[test]
+fn snapshot_moved_let_to_for_unbound() {
+    assert_pure_move_snapshot("moved_let_to_for_unbound");
+}
+
+/// A loop expanded from a list held in live resource state accepts the same
+/// explicit move and remains a pure state operation.
+#[test]
+fn snapshot_moved_let_to_for_read_loop() {
+    let fp = assert_pure_move_snapshot("moved_let_to_for_read_loop");
+    assert!(
+        fp.desired_resources.iter().any(|resource| {
+            let id = resource.resolved_id();
+            id.provider() == "aws"
+                && id.resource_type() == "route53.RecordSet"
+                && id.identity_str() == "validation_records[0]"
+        }),
+        "read-loop fixture must materialize validation_records[0] in desired resources"
+    );
+}
+
+/// Without a `moved` block the same rewrite remains a destroy plus create;
+/// the diagnostic is appended to the ordinary plan output without changing
+/// those effects.
+#[test]
+fn snapshot_moved_hint_let_to_for() {
+    let fp = build_plan_from_fixture_name("moved_hint_let_to_for");
+    let summary = fp.plan.summary();
+    assert_eq!(summary.create, 1);
+    assert_eq!(summary.delete, 1);
+    assert_eq!(summary.moved, 0);
+    let output = moved_hint_snapshot_output(&fp);
+    insta::assert_snapshot!(output);
+    assert!(matches!(
+        fp.moved_hints.as_slice(),
+        [MovedBlockHint::Suggest { .. }]
+    ));
+}
+
+/// Multiple matching destroys and creates form one connected component. The
+/// warning must list the whole component and must not invent a pairing.
+#[test]
+fn snapshot_moved_hint_ambiguous() {
+    let fp = build_plan_from_fixture_name("moved_hint_ambiguous");
+    let summary = fp.plan.summary();
+    assert_eq!(summary.create, 2);
+    assert_eq!(summary.delete, 2);
+    assert_eq!(summary.moved, 0);
+    let output = moved_hint_snapshot_output(&fp);
+    insta::assert_snapshot!(output);
+    assert!(matches!(
+        fp.moved_hints.as_slice(),
+        [MovedBlockHint::Ambiguous { .. }]
+    ));
+    assert!(
+        !output.contains("moved {"),
+        "ambiguous hint must not print a guessed moved block:\n{output}"
+    );
+}
+
+/// The certificate-validation rewrite without a `moved` block must materialize
+/// its loop child, replace the old record, and suggest the exact state move.
+#[test]
+fn snapshot_moved_hint_read_loop() {
+    let fp = build_plan_from_fixture_name("moved_hint_read_loop");
+    assert!(
+        fp.desired_resources.iter().any(|resource| {
+            let id = resource.resolved_id();
+            id.provider() == "aws"
+                && id.resource_type() == "route53.RecordSet"
+                && id.identity_str() == "validation_records[0]"
+        }),
+        "read-loop hint fixture must materialize validation_records[0]"
+    );
+    let summary = fp.plan.summary();
+    assert_eq!(summary.create, 1);
+    assert_eq!(summary.delete, 1);
+    assert_eq!(summary.moved, 0);
+    let [MovedBlockHint::Suggest { from, to }] = fp.moved_hints.as_slice() else {
+        panic!(
+            "expected one read-loop move suggestion: {:?}",
+            fp.moved_hints
+        );
+    };
+    assert_eq!(from.identity_str(), "validation_record");
+    assert_eq!(to.identity_str(), "validation_records[0]");
+
+    insta::assert_snapshot!(moved_hint_snapshot_output(&fp));
 }
 
 /// Production-ordered fixture for RC2 claims precedence: the state row's

@@ -2283,6 +2283,9 @@ async fn run_apply_locked_owned(
                     None,
                     None,
                 );
+                // This fast path has no managed-resource mutations, so it
+                // cannot contain the Delete + Create pair required for a
+                // moved-block hint.
 
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
                 if confirm_apply(stdin, cancel.clone(), auto_approve).await?
@@ -2357,6 +2360,9 @@ async fn run_apply_locked_owned(
                 Some(&prev_explicit),
                 None,
             );
+            let moved_hints =
+                crate::moved_hint::detect_moved_block_hints(&plan, &managed_current, ctx.schemas());
+            moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(stdin, cancel.clone(), auto_approve).await?
@@ -3532,6 +3538,12 @@ async fn run_apply_from_plan_locked_owned(
                 None,
                 None,
             );
+            let moved_hints = crate::moved_hint::detect_moved_block_hints(
+                plan,
+                &managed_current,
+                wiring.schemas(),
+            );
+            moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(stdin, cancel.clone(), auto_approve).await?
