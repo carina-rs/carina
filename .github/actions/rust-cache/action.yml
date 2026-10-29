@@ -1,0 +1,19 @@
+name: Rust cache
+description: Restore and save the Rust build cache with all build-affecting workspace settings
+
+inputs:
+  shared-key:
+    description: Optional shared cache key passed through to Swatinem/rust-cache
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # rust-cache does not automatically hash the root virtual manifest, including
+    # its [profile.*] settings. It already hashes .cargo/config.toml,
+    # rust-toolchain(.toml), and Cargo.lock.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ hashFiles('Cargo.toml') }}
+        shared-key: ${{ inputs.shared-key }}
