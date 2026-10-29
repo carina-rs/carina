@@ -544,11 +544,11 @@ macro_rules! export_provider {
 
             fn get_provider_schema_cache() -> Result<
                 &'static $crate::ProviderSchemaCache,
-                &'static $crate::core::provider::CustomTypeDispatchTableError,
+                &'static $crate::core::schema::ProviderSchemaValidationError,
             > {
                 static CACHE: ::std::sync::OnceLock<Result<
                     $crate::ProviderSchemaCache,
-                    $crate::core::provider::CustomTypeDispatchTableError,
+                    $crate::core::schema::ProviderSchemaValidationError,
                 >> = ::std::sync::OnceLock::new();
                 CACHE.get_or_init(|| {
                     let provider = get_provider().lock().unwrap();
@@ -1792,7 +1792,7 @@ macro_rules! export_provider {
                             );
                         }
                     };
-                    match $crate::schemas_to_json(cache.schemas()) {
+                    match $crate::provider_schema_to_json(cache.witness()) {
                         Ok(json) => json,
                         Err(error) => {
                             schema_metadata_error_json("schema serialization failed", &error)

@@ -925,6 +925,15 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
         schema_drafts
@@ -970,6 +979,15 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1026,6 +1044,15 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1101,6 +1128,15 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
             vec![replace_create_only_widget_schema()];
@@ -1167,6 +1203,15 @@ impl ProviderFactory for PlanImageFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
@@ -1223,6 +1268,15 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
@@ -1276,6 +1330,15 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1341,6 +1404,15 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![ResourceSchema::new("network.Subnet").attribute(
@@ -1390,6 +1462,15 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

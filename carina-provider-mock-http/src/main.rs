@@ -167,6 +167,10 @@ impl CarinaProvider for MockHttpProvider {
         ]
     }
 
+    fn reference_forms(&self) -> carina_plugin_sdk::core::schema::ReferenceForms {
+        BTreeMap::new()
+    }
+
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
         CoreValidatedConfigSchema::default()
     }

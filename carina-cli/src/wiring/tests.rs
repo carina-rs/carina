@@ -793,6 +793,15 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             unreachable!("plan canonicalization test does not create providers")
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
                 let mode = AttributeType::enum_(
@@ -1665,6 +1674,15 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
             schema_drafts
@@ -1772,6 +1790,15 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }
@@ -1844,6 +1871,15 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
                     ),
                 )
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1932,6 +1968,15 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2108,6 +2153,15 @@ impl ProviderFactory for CascadeAwsccFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2451,6 +2505,15 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
@@ -2759,6 +2822,15 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             Box::pin(async { unreachable!("state normalization does not create providers") })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
             schema_drafts
@@ -2869,6 +2941,15 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             unreachable!("config selection test does not construct a provider")
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -4723,6 +4804,15 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
             Ok(Box::new(carina_core::provider::NoopNormalizer)
                 as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -6909,6 +6999,15 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
             Ok(Box::new(carina_core::provider::NoopNormalizer)
                 as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -9738,6 +9837,15 @@ mod resolved_value_constraint_gate {
             })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
                 let pattern_type =
@@ -9830,6 +9938,15 @@ mod resolved_value_constraint_gate {
             Box::pin(async move {
                 Ok(Box::new(RecordingDataSourceProvider { reads }) as Box<dyn Provider>)
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

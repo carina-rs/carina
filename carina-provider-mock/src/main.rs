@@ -525,6 +525,10 @@ impl CarinaProvider for MockProcessProvider {
         ]
     }
 
+    fn reference_forms(&self) -> carina_core::schema::ReferenceForms {
+        BTreeMap::new()
+    }
+
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
         CoreValidatedConfigSchema::default()
     }

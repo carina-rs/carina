@@ -36,6 +36,159 @@ pub struct TypeIdentity {
     pub kind: String,
 }
 
+/// A validated long-form reference template.
+///
+/// The only placeholders accepted by protocol v13 are `{partition}`,
+/// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
+/// exactly once and denotes the short form of the reference.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceTemplate(String);
+
+/// Why a reference template could not be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceTemplateError {
+    NamePlaceholderCount { actual: usize },
+    UnknownPlaceholder { placeholder: String },
+    StrayOpeningBrace,
+    StrayClosingBrace,
+}
+
+impl std::fmt::Display for ReferenceTemplateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NamePlaceholderCount { actual } => write!(
+                formatter,
+                "reference template must contain exactly one `{{name}}` placeholder; found {actual}"
+            ),
+            Self::UnknownPlaceholder { placeholder } => write!(
+                formatter,
+                "reference template contains unknown placeholder `{{{placeholder}}}`"
+            ),
+            Self::StrayOpeningBrace => {
+                formatter.write_str("reference template contains a stray opening brace")
+            }
+            Self::StrayClosingBrace => {
+                formatter.write_str("reference template contains a stray closing brace")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReferenceTemplateError {}
+
+impl ReferenceTemplate {
+    pub fn new(value: impl Into<String>) -> Result<Self, ReferenceTemplateError> {
+        let value = value.into();
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        let mut name_count = 0;
+
+        while index < bytes.len() {
+            if bytes[index] == b'{' {
+                let start = index + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'}' {
+                    if bytes[end] == b'{' {
+                        return Err(ReferenceTemplateError::StrayOpeningBrace);
+                    }
+                    end += 1;
+                }
+                if end == bytes.len() {
+                    return Err(ReferenceTemplateError::StrayOpeningBrace);
+                }
+                let placeholder = &value[start..end];
+                match placeholder {
+                    "partition" | "region" | "account" => {}
+                    "name" => name_count += 1,
+                    placeholder => {
+                        return Err(ReferenceTemplateError::UnknownPlaceholder {
+                            placeholder: placeholder.to_string(),
+                        });
+                    }
+                }
+                index = end + 1;
+            } else if bytes[index] == b'}' {
+                return Err(ReferenceTemplateError::StrayClosingBrace);
+            } else {
+                index += 1;
+            }
+        }
+
+        if name_count != 1 {
+            return Err(ReferenceTemplateError::NamePlaceholderCount { actual: name_count });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ReferenceTemplate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ReferenceTemplate {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<String> for ReferenceTemplate {
+    type Error = ReferenceTemplateError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for ReferenceTemplate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReferenceTemplate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+/// Declared equivalence form for one refined String identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ReferenceForm {
+    Template { long: ReferenceTemplate },
+}
+
+/// One structured identity/form pair in the provider schema envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceFormDeclaration {
+    pub identity: TypeIdentity,
+    pub form: ReferenceForm,
+}
+
+/// Resource schemas and provider-wide reference-form declarations.
+///
+/// `reference_forms` is a list because JSON object keys cannot retain the
+/// structured [`TypeIdentity`]. Core encoding sorts the list and core decoding
+/// rejects duplicate identities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSchemaEnvelope {
+    pub resources: Vec<ResourceSchema>,
+    pub reference_forms: Vec<ReferenceFormDeclaration>,
+}
+
 /// Values an initialized provider instance exposes for expanding short
 /// provider references into their long form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1499,6 +1652,108 @@ mod tests {
                 serde_json::from_str(&encoded).expect("scope must deserialize");
             assert_eq!(decoded, scope);
         }
+    }
+
+    #[test]
+    fn reference_template_accepts_the_four_declared_placeholders() {
+        let raw = "arn:{partition}:lambda:{region}:{account}:function:{name}";
+        let template = ReferenceTemplate::new(raw).expect("declared template must validate");
+
+        assert_eq!(template.as_str(), raw);
+    }
+
+    #[test]
+    fn reference_template_requires_exactly_one_name_placeholder() {
+        for (raw, actual) in [
+            ("arn:{partition}:lambda:{region}:{account}:function", 0),
+            ("arn:{partition}:lambda:{name}:function:{name}", 2),
+        ] {
+            assert_eq!(
+                ReferenceTemplate::new(raw).expect_err("invalid name count must be rejected"),
+                ReferenceTemplateError::NamePlaceholderCount { actual },
+            );
+        }
+    }
+
+    #[test]
+    fn reference_template_rejects_unknown_placeholders() {
+        assert_eq!(
+            ReferenceTemplate::new("arn:{partition}:lambda:{zone}:{account}:function:{name}")
+                .expect_err("unknown placeholder must be rejected"),
+            ReferenceTemplateError::UnknownPlaceholder {
+                placeholder: "zone".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn reference_template_rejects_stray_braces() {
+        for (raw, expected) in [
+            (
+                "arn:{partition:lambda:{region}:{account}:function:{name}",
+                ReferenceTemplateError::StrayOpeningBrace,
+            ),
+            (
+                "arn:{partition}:lambda:{region}}:{account}:function:{name}",
+                ReferenceTemplateError::StrayClosingBrace,
+            ),
+        ] {
+            assert_eq!(
+                ReferenceTemplate::new(raw).expect_err("stray brace must be rejected"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn reference_template_serde_cannot_bypass_validation() {
+        let raw = "arn:{partition}:lambda:{region}:{account}:function:{name}";
+        let template = ReferenceTemplate::new(raw).expect("declared template must validate");
+        assert_eq!(
+            serde_json::to_string(&template).expect("template must serialize as a string"),
+            serde_json::to_string(raw).unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceTemplate>(&serde_json::to_string(raw).unwrap())
+                .expect("valid template must deserialize"),
+            template,
+        );
+
+        let invalid = serde_json::to_string("arn:{partition}:lambda:{name}:{name}").unwrap();
+        assert!(
+            serde_json::from_str::<ReferenceTemplate>(&invalid).is_err(),
+            "Deserialize must enter through ReferenceTemplate::new",
+        );
+    }
+
+    #[test]
+    fn provider_schema_envelope_roundtrips_reference_form_records() {
+        let identity = TypeIdentity {
+            provider: "aws".to_string(),
+            segments: vec!["lambda".to_string(), "Function".to_string()],
+            kind: "Name".to_string(),
+        };
+        let form = ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .unwrap(),
+        };
+        let envelope = ProviderSchemaEnvelope {
+            resources: Vec::new(),
+            reference_forms: vec![ReferenceFormDeclaration {
+                identity: identity.clone(),
+                form: form.clone(),
+            }],
+        };
+
+        let json = serde_json::to_string(&envelope).expect("envelope must serialize");
+        let decoded: ProviderSchemaEnvelope =
+            serde_json::from_str(&json).expect("envelope must deserialize");
+        assert!(decoded.resources.is_empty());
+        assert_eq!(decoded.reference_forms.len(), 1);
+        assert_eq!(decoded.reference_forms[0].identity, identity);
+        assert_eq!(decoded.reference_forms[0].form, form);
     }
 
     #[test]

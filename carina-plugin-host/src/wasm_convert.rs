@@ -28,6 +28,7 @@ use carina_core::schema::{
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedProviderSchemaWitness as CoreValidatedProviderSchemaWitness,
     ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
@@ -1900,6 +1901,18 @@ pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, S
         .map_err(SchemaDecodeError::protocol_conversion)
 }
 
+/// Deserialize the provider schema envelope and admit it together with the
+/// separately exported provider-config witness.
+pub fn json_to_provider_schema(
+    json: &str,
+    config: CoreValidatedConfigSchema,
+) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
+    let envelope: proto::ProviderSchemaEnvelope =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
 /// Deserialize a JSON-encoded `BTreeMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
 pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
@@ -2401,11 +2414,20 @@ mod tests {
                 )
                 .validate()
                 .expect("generated portable witness must validate");
-            let guest_json = carina_plugin_sdk::schemas_to_json(&[schema])
+            let guest_witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+                vec![schema],
+                carina_core::schema::ValidatedConfigSchema::default(),
+                Default::default(),
+            )
+            .unwrap();
+            let guest_json = carina_plugin_sdk::provider_schema_to_json(&guest_witness)
                 .expect("typed SDK witness must serialize");
-            let host_witnesses =
-                json_to_schemas(&guest_json).expect("host must decode SDK schema JSON");
-            let host_json = carina_plugin_sdk::schemas_to_json(&host_witnesses)
+            let host_witness = json_to_provider_schema(
+                &guest_json,
+                carina_core::schema::ValidatedConfigSchema::default(),
+            )
+            .expect("host must decode SDK schema JSON");
+            let host_json = carina_plugin_sdk::provider_schema_to_json(&host_witness)
                 .expect("host witness must serialize through the same seam");
 
             assert_eq!(
@@ -2414,6 +2436,42 @@ mod tests {
                 "portable JSON projection changed for generated case {index}"
             );
         }
+    }
+
+    #[test]
+    fn host_provider_schema_decode_retains_reference_forms() {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ReferenceForm, ReferenceForms, ReferenceTemplate,
+            ResourceSchema, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let form = ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        };
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::from([(identity.clone(), form.clone())]),
+        )
+        .unwrap();
+        let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+
+        let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
+        assert_eq!(decoded.reference_forms().get(&identity), Some(&form));
     }
 
     #[test]
@@ -2461,9 +2519,16 @@ mod tests {
             .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
             .validate()
             .expect("SDK resource fixture must validate");
-        let schema_json = carina_plugin_sdk::schemas_to_json(&[schema]).unwrap();
-        let decoded = json_to_schemas(&schema_json).expect("typed resource witness must load");
-        let resource_record = decoded[0]
+        let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let schema_json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+        let decoded = json_to_provider_schema(&schema_json, ValidatedConfigSchema::default())
+            .expect("typed resource witness must load");
+        let resource_record = decoded.resources()[0]
             .effective_node_at_path(&[
                 "domain_validation_options".to_string(),
                 "resource_record".to_string(),

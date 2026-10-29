@@ -48,7 +48,8 @@ use carina_core::resource::{
     value_contains_unknown,
 };
 use carina_core::schema::{
-    CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedResourceSchema,
+    CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
@@ -3479,14 +3480,9 @@ pub struct WasmProviderFactory {
     budget: GuestCallBudget,
     display_name: String,
     version: String,
-    schemas: Arc<Vec<ValidatedResourceSchema>>,
+    schema_witness: Arc<ValidatedProviderSchemaWitness>,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
-    /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
-    /// Used by `ProviderFactory::provider_config_attribute_types()` so the host
-    /// validates provider attributes against these types using its own carina-core,
-    /// catching format bugs without requiring a provider rebuild.
-    cached_provider_config_types: ValidatedConfigSchema,
     enable_http: bool,
     http_test_route: Option<HttpTestRoute>,
     /// Reusable, rebuildable WASM instance for editor-facing validation.
@@ -3786,11 +3782,11 @@ impl WasmProviderFactory {
             .map_err(|source| wall_budget_load_error("schemas", source))?
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
-        let schemas = wasm_convert::json_to_schemas(&schemas_json)
-            .map_err(|e| provider_schema_decode_error(name, &version, e))?;
-
-        let (cached_config_completions, cached_identity_attributes, cached_provider_config_types) =
+        let (cached_config_completions, cached_identity_attributes, provider_config_types) =
             Self::load_metadata(&live.bindings, &mut live.store, name, &version).await?;
+        let schema_witness =
+            wasm_convert::json_to_provider_schema(&schemas_json, provider_config_types)
+                .map_err(|error| provider_schema_decode_error(name, &version, error))?;
         let init_instance = RebuildableInstance::new(live, rebuild);
 
         Ok(Self {
@@ -3800,10 +3796,9 @@ impl WasmProviderFactory {
             budget,
             display_name,
             version,
-            schemas: Arc::new(schemas),
+            schema_witness: Arc::new(schema_witness),
             cached_config_completions,
             cached_identity_attributes,
-            cached_provider_config_types,
             enable_http,
             http_test_route: None,
             init_instance,
@@ -4162,7 +4157,7 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        self.cached_provider_config_types.clone()
+        self.schema_witness.config().clone()
     }
 
     fn validate_config(
@@ -4250,7 +4245,7 @@ impl ProviderFactory for WasmProviderFactory {
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.configured.label.name.clone(),
-                schemas: Arc::clone(&self.schemas),
+                schema_witness: Arc::clone(&self.schema_witness),
                 _reference_scope: reference_scope,
             }) as Box<dyn Provider>)
         })
@@ -4275,7 +4270,11 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
-        self.schemas.as_ref().clone()
+        self.schema_witness.resources().to_vec()
+    }
+
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        self.schema_witness.as_ref().clone()
     }
 }
 
@@ -4284,7 +4283,7 @@ impl ProviderFactory for WasmProviderFactory {
 pub struct WasmProvider {
     instance: Arc<FailFastInstance>,
     name: String,
-    schemas: Arc<Vec<ValidatedResourceSchema>>,
+    schema_witness: Arc<ValidatedProviderSchemaWitness>,
     _reference_scope: proto::ReferenceScope,
 }
 
@@ -4488,7 +4487,8 @@ impl WasmProvider {
         id: &ResourceId,
         kind: carina_provider_protocol::OperationKind,
     ) -> std::time::Duration {
-        self.schemas
+        self.schema_witness
+            .resources()
             .iter()
             .find(|schema| schema.as_schema().resource_type() == id.resource_type)
             .and_then(|schema| schema.as_schema().operation_config())

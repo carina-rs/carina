@@ -183,6 +183,22 @@ impl DiagnosticEngine {
         } else {
             carina_core::parser::ProviderCustomTypes::default()
         };
+        Self::new_with_known_providers_and_custom_types(
+            schemas,
+            provider_names,
+            factories,
+            known_provider_names,
+            custom_types,
+        )
+    }
+
+    pub(crate) fn new_with_known_providers_and_custom_types(
+        schemas: Arc<SchemaRegistry>,
+        provider_names: Vec<String>,
+        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+        known_provider_names: HashSet<String>,
+        custom_types: carina_core::parser::ProviderCustomTypes,
+    ) -> Self {
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
             custom_types,

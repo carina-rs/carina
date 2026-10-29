@@ -6581,6 +6581,15 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         unimplemented!("RecordingFactory::create_provider is not used in these tests")
     }
 
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+        crate::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
         Vec::new()
     }
@@ -6706,6 +6715,15 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
         > {
             unimplemented!("EnumRecordingFactory::create_provider is not used in this test")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {

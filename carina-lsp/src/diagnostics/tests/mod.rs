@@ -86,6 +86,15 @@ impl ProviderFactory for RegionConfigFactory {
         unimplemented!("RegionConfigFactory::create_provider is not used in diagnostics tests")
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         Vec::new()
     }
@@ -218,6 +227,15 @@ impl ProviderFactory for SuspendedValidationFactory {
         )
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
@@ -312,6 +330,15 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         unimplemented!(
             "EnumDeclaredCustomTypeFactory::create_provider is not used in diagnostics tests"
         )
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -412,6 +439,15 @@ impl ProviderFactory for SharedRoleArnFactory {
         unimplemented!("diagnostics tests do not construct providers")
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
@@ -506,6 +542,15 @@ impl ProviderFactory for BareTypeFactory {
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -876,6 +921,15 @@ impl ProviderFactory for SchemaFixtureFactory {
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
     > {
         unimplemented!("schema fixture factories do not construct providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

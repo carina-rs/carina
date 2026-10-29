@@ -86,6 +86,44 @@ fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
 }
 
 #[test]
+fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let forms = ReferenceForms::from([(
+        identity.clone(),
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry.insert_provider_witness("actual-owner", &witness);
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("registered schema");
+    assert_eq!(bound.reference_forms(), &forms);
+    assert_eq!(bound.reference_forms().get(&identity), forms.get(&identity));
+}
+
+#[test]
 fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
     let identity = TypeIdentity::new(Some("test"), Vec::<String>::new(), "Identifier");
     let root = RootlessType::new(AttributeType::list(AttributeType::refined_string(

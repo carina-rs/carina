@@ -1661,7 +1661,7 @@ impl PlanSchemaFingerprints {
                     reference.kind,
                 )
                 .map_or(TypeSchemaFingerprint::Absent, |schema| {
-                    TypeSchemaFingerprint::Present(schema.as_schema().semantic_fingerprint())
+                    TypeSchemaFingerprint::Present(schema.semantic_fingerprint())
                 });
             grouped.entry(reference.provider.clone()).or_default().push(
                 PlanSchemaTypeFingerprint {
@@ -1757,7 +1757,7 @@ impl PlanSchemaFingerprints {
                         reference.resource_type,
                     )),
                     (TypeSchemaFingerprint::Present(recorded), Some(current))
-                        if current.as_schema().semantic_fingerprint() != *recorded =>
+                        if current.semantic_fingerprint() != *recorded =>
                     {
                         changed_types.push(format!(
                             "{} `{}` (changed)",

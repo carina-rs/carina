@@ -1169,6 +1169,15 @@ impl ProviderFactory for AliasFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
         unreachable!("test factory does not create providers")
     }
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+        crate::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
         vec![
             alias_resource_schema()

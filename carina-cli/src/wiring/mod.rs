@@ -830,8 +830,10 @@ fn resolve_file_binding_uses<E>(
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
-    let provider_context =
-        crate::commands::enrich_provider_context(context.schemas(), context.factories_arc());
+    let provider_context = crate::commands::enrich_provider_context(
+        context.schemas(),
+        context.provider_custom_types_snapshot(),
+    );
     let module_signatures =
         module_resolver::load_resolved_module_signatures(&file, base_dir, &provider_context);
     carina_core::validation::resolve_bare_binding_uses(
@@ -1705,15 +1707,16 @@ impl WiringContext {
             .into_iter()
             .map(LoadedProviderFactory::into_factory)
             .collect::<Vec<_>>();
+        let factories = Arc::new(factories);
+        let (factory_schemas, custom_types) =
+            carina_core::provider::schema_registry_and_custom_types_from_factories(Arc::clone(
+                &factories,
+            ));
         let mut schemas = SchemaRegistry::new();
         for (provider, schema) in additional_schemas {
             schemas.insert(provider, schema);
         }
-        for factory in &factories {
-            for schema in factory.schemas() {
-                schemas.insert(factory.name(), schema);
-            }
-        }
+        schemas.extend(factory_schemas);
         if uses_builtin_mock {
             for schema in carina_provider_mock::builtin_schemas() {
                 let parts = schema.parts();
@@ -1734,9 +1737,6 @@ impl WiringContext {
         if uses_builtin_mock {
             known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
-        let factories = Arc::new(factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
         Self {
             factories,
             custom_types,
@@ -1778,6 +1778,12 @@ impl WiringContext {
 
     pub fn custom_type_resolver(&self) -> &dyn carina_core::parser::CustomTypeResolver {
         &self.custom_types
+    }
+
+    pub(crate) fn provider_custom_types_snapshot(
+        &self,
+    ) -> carina_core::parser::ProviderCustomTypes {
+        self.custom_types.clone()
     }
 
     pub fn schemas(&self) -> &SchemaRegistry {

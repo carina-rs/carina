@@ -1095,6 +1095,15 @@ mod tests {
             })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }

@@ -30,7 +30,7 @@ use crate::resource::{
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
     AttributeType, LeafPath, RawShape, RefinedScalarKind, ResourceSchema, SchemaRegistry, Shape,
-    TypeIdentity, ValidatedConfigSchema, ValidatedResourceSchema,
+    TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -4984,6 +4984,13 @@ pub trait ProviderFactory: Send + Sync {
     /// Get all resource schemas for this provider.
     fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema>;
 
+    /// Return the provider-level aggregate schema witness.
+    ///
+    /// Registry ownership, custom-type recognition, and reference forms must
+    /// all be derived from this one snapshot rather than reloading the three
+    /// declaration sources independently.
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness;
+
     /// Attribute names (beyond schema create-only properties) that contribute
     /// to anonymous resource identity. For example, AWS providers return
     /// `["region"]` because the same resource type in different regions must
@@ -5021,9 +5028,8 @@ pub fn find_factory<'a>(
 pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
     for factory in factories {
-        for schema in factory.schemas() {
-            registry.insert(factory.name(), schema);
-        }
+        let witness = factory.schema_witness();
+        registry.insert_provider_witness(factory.name(), &witness);
     }
     registry
 }
@@ -5102,109 +5108,6 @@ fn collect_type_names_from_type(
         RawShape::Ref(_) => {}
         RawShape::Bool | RawShape::Duration => {}
     }
-}
-
-fn visit_identified_types(
-    attribute_type: &AttributeType,
-    visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
-) {
-    match attribute_type.raw_shape() {
-        RawShape::String {
-            identity: Some(identity),
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
-        }
-        | RawShape::Int {
-            identity: Some(identity),
-            range: _,
-            validate: _,
-        }
-        | RawShape::Float {
-            identity: Some(identity),
-            range: _,
-            validate: _,
-        }
-        | RawShape::Enum {
-            identity,
-            base: _,
-            values: _,
-            dsl_aliases: _,
-            validate: _,
-            to_dsl: _,
-        } => visitor(identity, attribute_type),
-        RawShape::List {
-            element_type,
-            ordered: _,
-            length: _,
-        } => visit_identified_types(element_type, visitor),
-        RawShape::Map { key, value } => {
-            visit_identified_types(key, visitor);
-            visit_identified_types(value, visitor);
-        }
-        RawShape::Struct { name: _, fields } => {
-            for field in fields {
-                visit_identified_types(&field.field_type, visitor);
-            }
-        }
-        RawShape::Union(members) => {
-            for member in members {
-                visit_identified_types(member, visitor);
-            }
-        }
-        RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
-        }
-        | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
-        }
-        | RawShape::Float {
-            identity: None,
-            range: _,
-            validate: _,
-        }
-        | RawShape::Bool
-        | RawShape::Duration
-        | RawShape::Ref(_) => {}
-    }
-}
-
-/// Enumerate identified declarations in a stable schema-defined order.
-///
-/// Resource schemas retain caller slice order. Within each resource, roots are
-/// read from the schema's canonical-name `BTreeMap`, nested
-/// list/map/struct/union members retain their structural declaration order,
-/// and named definitions follow in their `BTreeMap` order. Provider-config
-/// roots come last in their canonical-name `BTreeMap` order. The returned
-/// `Vec` is the ordered authority for dispatch and owner indexes; callers must
-/// not reconstruct this walk from other containers.
-fn identified_types_from_witnesses(
-    schemas: &[ValidatedResourceSchema],
-    config: &ValidatedConfigSchema,
-) -> Vec<(TypeIdentity, AttributeType)> {
-    let mut declarations = Vec::new();
-    let mut collect = |identity: &TypeIdentity, attribute_type: &AttributeType| {
-        declarations.push((identity.clone(), attribute_type.clone()));
-    };
-    for schema in schemas {
-        for attribute in schema.effective_attributes() {
-            visit_identified_types(attribute.field_type(), &mut collect);
-        }
-        for definition in schema.parts().defs.values() {
-            visit_identified_types(definition, &mut collect);
-        }
-    }
-    for attribute_type in config.parts().values() {
-        visit_identified_types(attribute_type, &mut collect);
-    }
-    declarations
 }
 
 fn local_custom_validator(
@@ -5379,12 +5282,51 @@ impl fmt::Debug for CustomTypeDispatchTable {
 }
 
 impl CustomTypeDispatchTable {
+    /// Build guest dispatch from an aggregate provider-schema witness.
+    ///
+    /// Scalar-kind conflicts and missing bridge kinds cannot reach this seam:
+    /// they are rejected before the witness can be constructed.
+    pub fn from_provider_schema(witness: &ValidatedProviderSchemaWitness) -> Self {
+        let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
+        for (identity, declaration) in witness.identified_declarations() {
+            let kind = identified_custom_type_scalar_kind(&declaration)
+                .expect("validated provider schema guarantees a scalar bridge kind");
+            let callback = local_custom_validator(&declaration).cloned();
+            match bindings.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CustomTypeDispatchBinding {
+                        scalar_kind: kind,
+                        callbacks: callback.into_iter().collect(),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let binding = entry.get_mut();
+                    assert_eq!(
+                        binding.scalar_kind, kind,
+                        "validated provider schema guarantees one scalar kind per identity"
+                    );
+                    if let Some(callback) = callback
+                        && !binding
+                            .callbacks
+                            .iter()
+                            .any(|existing| std::sync::Arc::ptr_eq(existing, &callback))
+                    {
+                        binding.callbacks.push(callback);
+                    }
+                }
+            }
+        }
+        Self { bindings }
+    }
+
     pub fn build(
         schemas: &[ValidatedResourceSchema],
         config: &ValidatedConfigSchema,
     ) -> Result<Self, CustomTypeDispatchTableError> {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
-        for (identity, declaration) in identified_types_from_witnesses(schemas, config) {
+        for (identity, declaration) in
+            crate::schema::identified_declarations_from_witnesses(schemas, config)
+        {
             let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
@@ -5632,10 +5574,9 @@ fn build_owner_custom_type_index(
         .iter()
         .enumerate()
         .map(|(factory_index, factory)| {
-            let schemas = factory.schemas();
-            let config = factory.provider_config_attribute_types();
+            let witness = factory.schema_witness();
             let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
-            for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
+            for (identity, declaration) in witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
             (
@@ -5657,6 +5598,33 @@ pub fn provider_custom_types_from_factories(
 ) -> crate::parser::ProviderCustomTypes {
     let resolver = FactoryCustomTypeResolver::new(factories);
     crate::parser::ProviderCustomTypes::from_source(resolver)
+}
+
+/// Capture each factory's aggregate witness once and derive both the registry
+/// and opaque custom-type resolver from that same snapshot.
+pub fn schema_registry_and_custom_types_from_factories(
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+) -> (SchemaRegistry, crate::parser::ProviderCustomTypes) {
+    let mut registry = SchemaRegistry::new();
+    let mut index = BTreeMap::new();
+    for (factory_index, factory) in factories.iter().enumerate() {
+        let witness = factory.schema_witness();
+        registry.insert_provider_witness(factory.name(), &witness);
+        let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
+        for (identity, declaration) in witness.identified_declarations() {
+            declarations.entry(identity).or_default().push(declaration);
+        }
+        index.insert(
+            factory.name().to_string(),
+            OwnerCustomTypeIndex {
+                factory_index,
+                declarations,
+            },
+        );
+    }
+    let resolver = FactoryCustomTypeResolver { factories, index };
+    let custom_types = crate::parser::ProviderCustomTypes::from_source(resolver);
+    (registry, custom_types)
 }
 
 fn validate_custom_type_annotation(
@@ -6208,6 +6176,15 @@ mod tests {
 
         fn display_name(&self) -> &str {
             "config-only custom type fixture"
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
@@ -9045,6 +9022,15 @@ mod tests {
                     ))
                 })
             }
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
             fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }
@@ -9128,6 +9114,15 @@ mod tests {
                     .push(binding.map(|s| s.to_string()));
                 Box::pin(async { Ok(Box::new(MockProvider) as Box<dyn Provider>) })
             }
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
             fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }

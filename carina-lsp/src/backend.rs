@@ -78,7 +78,9 @@ impl ProviderState {
                     .any(|factory| factory.name() == provider_name)
             },
         );
-        let mut schemas = provider_mod::collect_schemas(&factories);
+        let factories = Arc::new(factories);
+        let (mut schemas, custom_types) =
+            provider_mod::schema_registry_and_custom_types_from_factories(Arc::clone(&factories));
         let mut provider_names: Vec<String> =
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
@@ -102,14 +104,14 @@ impl ProviderState {
             .iter()
             .map(|id| id.to_string())
             .collect();
-        let factories_arc = Arc::new(factories);
         Self {
             schemas: Arc::clone(&schemas),
-            diagnostic_engine: DiagnosticEngine::new_with_known_providers(
+            diagnostic_engine: DiagnosticEngine::new_with_known_providers_and_custom_types(
                 Arc::clone(&schemas),
                 provider_names.clone(),
-                factories_arc,
+                factories,
                 known_provider_names,
+                custom_types,
             )
             .with_provider_errors(provider_errors),
             completion_provider: CompletionProvider::new(
@@ -926,6 +928,15 @@ mod tests {
             _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

@@ -58,7 +58,9 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
     }
 }
 
-use carina_core::schema::{ValidatedConfigSchema, ValidatedResourceSchema};
+use carina_core::schema::{
+    ReferenceForms, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+};
 use carina_provider_protocol::types::{
     AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
     PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, ReferenceScope,
@@ -91,20 +93,20 @@ impl std::error::Error for SchemaSerializationError {
     }
 }
 
-/// Serialize validated resource schemas through the core protocol seam.
-/// Raw drafts cannot enter this API:
+/// Serialize one aggregate provider-schema witness through the core protocol
+/// seam. Raw drafts or independently sourced tables cannot enter this API:
 ///
 /// ```compile_fail
 /// use carina_core::schema::ResourceSchema;
-/// use carina_plugin_sdk::schemas_to_json;
+/// use carina_plugin_sdk::provider_schema_to_json;
 ///
 /// let drafts = vec![ResourceSchema::new("test.Widget")];
-/// let _ = schemas_to_json(&drafts);
+/// let _ = provider_schema_to_json(&drafts);
 /// ```
-pub fn schemas_to_json(
-    schemas: &[ValidatedResourceSchema],
+pub fn provider_schema_to_json(
+    witness: &ValidatedProviderSchemaWitness,
 ) -> Result<String, SchemaSerializationError> {
-    let protocol = carina_core::protocol_convert::resource_schemas_to_protocol(schemas.iter())
+    let protocol = carina_core::protocol_convert::provider_schema_to_protocol(witness)
         .map_err(SchemaSerializationError::Convert)?;
     serde_json::to_string(&protocol).map_err(SchemaSerializationError::Json)
 }
@@ -134,32 +136,36 @@ pub fn provider_config_schema_to_json(
 /// different primitive scalar kind anywhere in the provider's resource or
 /// config schemas.
 pub struct ProviderSchemaCache {
-    schemas: Vec<ValidatedResourceSchema>,
-    config: ValidatedConfigSchema,
+    witness: ValidatedProviderSchemaWitness,
     custom_type_dispatch: carina_core::provider::CustomTypeDispatchTable,
 }
 
 impl ProviderSchemaCache {
     pub fn from_provider<P: CarinaProvider + ?Sized>(
         provider: &P,
-    ) -> Result<Self, carina_core::provider::CustomTypeDispatchTableError> {
-        let schemas = provider.schemas();
+    ) -> Result<Self, carina_core::schema::ProviderSchemaValidationError> {
+        let resources = provider.schemas();
         let config = provider.provider_config_attribute_types();
+        let reference_forms = provider.reference_forms();
+        let witness = ValidatedProviderSchemaWitness::new(resources, config, reference_forms)?;
         let custom_type_dispatch =
-            carina_core::provider::CustomTypeDispatchTable::build(&schemas, &config)?;
+            carina_core::provider::CustomTypeDispatchTable::from_provider_schema(&witness);
         Ok(Self {
-            schemas,
-            config,
+            witness,
             custom_type_dispatch,
         })
     }
 
     pub fn schemas(&self) -> &[ValidatedResourceSchema] {
-        &self.schemas
+        self.witness.resources()
     }
 
     pub fn config(&self) -> &ValidatedConfigSchema {
-        &self.config
+        self.witness.config()
+    }
+
+    pub fn witness(&self) -> &ValidatedProviderSchemaWitness {
+        &self.witness
     }
 }
 
@@ -935,6 +941,11 @@ pub trait CarinaProvider {
     /// Return all resource schemas this provider supports.
     fn schemas(&self) -> Vec<ValidatedResourceSchema>;
 
+    /// Return provider-wide reference forms keyed by refined String identity.
+    /// Resource schemas, config, and this table are admitted together before
+    /// any schema metadata is emitted.
+    fn reference_forms(&self) -> ReferenceForms;
+
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
     /// against their declared types *before* calling [`validate_config`].
@@ -1165,6 +1176,208 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct SchemaOnlyProvider {
+        resources: Vec<ValidatedResourceSchema>,
+        forms: carina_core::schema::ReferenceForms,
+        reference_form_calls: Cell<usize>,
+    }
+
+    impl CarinaProvider for SchemaOnlyProvider {
+        type CreateToken = Never;
+        type UpdateToken = Never;
+        type DeleteToken = Never;
+
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                name: "test".to_string(),
+                display_name: "Test".to_string(),
+                capabilities: Vec::new(),
+                version: "test".to_string(),
+            }
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            self.resources.clone()
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::default()
+        }
+
+        fn reference_forms(&self) -> carina_core::schema::ReferenceForms {
+            self.reference_form_calls
+                .set(self.reference_form_calls.get() + 1);
+            self.forms.clone()
+        }
+
+        fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn initialize(
+            &mut self,
+            _attrs: &BTreeMap<String, Value>,
+        ) -> Result<ReferenceScope, String> {
+            Ok(ReferenceScope::Unavailable)
+        }
+
+        fn read(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: ReadRequest,
+        ) -> Result<ReadOutcome, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn read_data_source(&self, _resource: &Resource) -> Result<State, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _attempt: CreateAttempt,
+        ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _poll: Poll<Self::CreateToken>,
+        ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn resume_create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _resume: Resume<Self::CreateToken>,
+        ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: UpdateRequest,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: UpdateRequest,
+            _pending: Pending<Self::UpdateToken>,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: DeleteRequest,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: DeleteRequest,
+            _pending: Pending<Self::DeleteToken>,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn reference_identity() -> carina_core::schema::TypeIdentity {
+        carina_core::schema::TypeIdentity::new(Some("test"), ["widget"], "Name")
+    }
+
+    fn reference_form() -> carina_core::schema::ReferenceForm {
+        carina_core::schema::ReferenceForm::Template {
+            long: carina_core::schema::ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn provider_schema_cache_rejects_a_form_for_an_undeclared_identity() {
+        let identity = reference_identity();
+        let provider = SchemaOnlyProvider {
+            resources: Vec::new(),
+            forms: BTreeMap::from([(identity.clone(), reference_form())]),
+            reference_form_calls: Cell::new(0),
+        };
+
+        let error = match ProviderSchemaCache::from_provider(&provider) {
+            Ok(_) => panic!("an undeclared reference form must not be emitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            carina_core::schema::ProviderSchemaValidationError::DanglingReferenceForm {
+                identity: actual,
+            } if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_cache_captures_and_projects_reference_forms_once() {
+        let identity = reference_identity();
+        let schema = carina_core::schema::ResourceSchema::new("test.Widget")
+            .attribute(
+                carina_core::schema::AttributeSchema::optional(
+                    "name",
+                    carina_core::schema::AttributeType::refined_string(
+                        Some(identity.clone()),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let provider = SchemaOnlyProvider {
+            resources: vec![schema],
+            forms: BTreeMap::from([(identity, reference_form())]),
+            reference_form_calls: Cell::new(0),
+        };
+
+        let cache = ProviderSchemaCache::from_provider(&provider).unwrap();
+        assert_eq!(provider.reference_form_calls.get(), 1);
+        for _ in 0..2 {
+            let json = provider_schema_to_json(cache.witness()).unwrap();
+            let envelope: protocol::types::ProviderSchemaEnvelope =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(envelope.reference_forms.len(), 1);
+        }
+        assert_eq!(provider.reference_form_calls.get(), 1);
+    }
 
     #[test]
     fn schema_admission_rejects_a_closed_enum_transform_before_guest_serialization() {

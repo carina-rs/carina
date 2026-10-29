@@ -40,7 +40,8 @@ use crate::schema::{
     AttributeSchema, AttributeSchemaParts, AttributeType, ConfigSchemaValidationError, InputMode,
     RawShape, ResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
     ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField, StructFieldParts,
-    TypeIdentity, UniqueNameSpec, ValidatedConfigSchema, ValidatedResourceSchema,
+    TypeIdentity, UniqueNameSpec, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 
 /// A core value or type cannot be represented by the provider protocol.
@@ -209,17 +210,23 @@ impl ProtocolConvertError {
 
 /// Typed failure while decoding untrusted provider schema records.
 #[derive(Debug)]
-pub struct SchemaDecodeError {
-    detail: String,
-    resource_type: Option<String>,
-    attribute_path: Vec<String>,
-    schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
-    source: Option<Box<dyn Error + Send + Sync>>,
+pub enum SchemaDecodeError {
+    InvalidSchema {
+        detail: String,
+        resource_type: Option<String>,
+        attribute_path: Vec<String>,
+        schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+    DuplicateReferenceForm {
+        identity: TypeIdentity,
+    },
+    InvalidProviderSchema(crate::schema::ProviderSchemaValidationError),
 }
 
 impl SchemaDecodeError {
     fn new(detail: impl Into<String>) -> Self {
-        Self {
+        Self::InvalidSchema {
             detail: detail.into(),
             resource_type: None,
             attribute_path: Vec::new(),
@@ -229,7 +236,7 @@ impl SchemaDecodeError {
     }
 
     fn from_default(error: ProtocolConvertError) -> Self {
-        Self {
+        Self::InvalidSchema {
             detail: "schema default value conversion error".to_string(),
             resource_type: None,
             attribute_path: Vec::new(),
@@ -239,7 +246,7 @@ impl SchemaDecodeError {
     }
 
     fn config_schema_validation(error: ConfigSchemaValidationError) -> Self {
-        Self {
+        Self::InvalidSchema {
             detail: "provider config schema is invalid".to_string(),
             resource_type: None,
             attribute_path: Vec::new(),
@@ -256,7 +263,7 @@ impl SchemaDecodeError {
             .located_issues()
             .next()
             .map(|(location, _message)| location.clone());
-        Self {
+        Self::InvalidSchema {
             detail: "resource schema is invalid".to_string(),
             resource_type: Some(resource_type.to_string()),
             attribute_path: Vec::new(),
@@ -285,7 +292,7 @@ impl SchemaDecodeError {
     }
 
     fn empty_custom_enum_namespace(name: &str) -> Self {
-        Self {
+        Self::InvalidSchema {
             detail: "custom enum namespace is invalid".to_string(),
             resource_type: None,
             attribute_path: Vec::new(),
@@ -303,7 +310,7 @@ impl SchemaDecodeError {
     }
 
     fn protocol(error: ProtocolConvertError, detail: &'static str) -> Self {
-        Self {
+        Self::InvalidSchema {
             detail: detail.to_string(),
             resource_type: None,
             attribute_path: Vec::new(),
@@ -329,45 +336,78 @@ impl SchemaDecodeError {
     }
 
     fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.to_string());
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source: _source,
+            } => {
+                attribute_path.insert(0, name.to_string());
+            }
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
         self
     }
 
     fn with_resource_type(mut self, resource_type: &str) -> Self {
-        self.resource_type = Some(resource_type.to_string());
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: current,
+                attribute_path: _attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source: _source,
+            } => *current = Some(resource_type.to_string()),
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
         self
     }
 }
 
 impl fmt::Display for SchemaDecodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(resource_type) = &self.resource_type {
-            write!(formatter, "resource '{resource_type}'")?;
-            if !self.attribute_path.is_empty() {
-                write!(formatter, " attribute '{}'", self.attribute_path.join("."))?;
-            } else if let Some(attribute_path) = self
-                .schema_issue_location
-                .as_deref()
-                .and_then(SchemaValidationIssueLocation::attribute_path)
-            {
-                write!(formatter, " attribute '{attribute_path}'")?;
+        match self {
+            Self::InvalidSchema {
+                detail,
+                resource_type,
+                attribute_path,
+                schema_issue_location,
+                source: _source,
+            } => {
+                if let Some(resource_type) = resource_type {
+                    write!(formatter, "resource '{resource_type}'")?;
+                    if !attribute_path.is_empty() {
+                        write!(formatter, " attribute '{}'", attribute_path.join("."))?;
+                    } else if let Some(attribute_path) = schema_issue_location
+                        .as_deref()
+                        .and_then(SchemaValidationIssueLocation::attribute_path)
+                    {
+                        write!(formatter, " attribute '{attribute_path}'")?;
+                    }
+                    formatter.write_str(": ")?;
+                    if let Some(location) = schema_issue_location
+                        && location.attribute_path().is_none()
+                    {
+                        write!(formatter, "{location}: ")?;
+                    }
+                    formatter.write_str(detail)?;
+                } else if attribute_path.is_empty() {
+                    formatter.write_str(detail)?;
+                } else {
+                    write!(
+                        formatter,
+                        "attribute '{}': {}",
+                        attribute_path.join("."),
+                        detail
+                    )?;
+                }
             }
-            formatter.write_str(": ")?;
-            if let Some(location) = &self.schema_issue_location
-                && location.attribute_path().is_none()
-            {
-                write!(formatter, "{location}: ")?;
+            Self::DuplicateReferenceForm { identity } => {
+                write!(formatter, "duplicate reference form identity `{identity}`")?;
             }
-            formatter.write_str(&self.detail)?;
-        } else if self.attribute_path.is_empty() {
-            formatter.write_str(&self.detail)?;
-        } else {
-            write!(
-                formatter,
-                "attribute '{}': {}",
-                self.attribute_path.join("."),
-                self.detail
-            )?;
+            Self::InvalidProviderSchema(error) => error.fmt(formatter)?,
         }
         Ok(())
     }
@@ -375,9 +415,19 @@ impl fmt::Display for SchemaDecodeError {
 
 impl Error for SchemaDecodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn Error + 'static))
+        match self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path: _attribute_path,
+                schema_issue_location: _schema_issue_location,
+                source,
+            } => source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static)),
+            Self::DuplicateReferenceForm { identity: _ } => None,
+            Self::InvalidProviderSchema(error) => Some(error),
+        }
     }
 }
 
@@ -456,6 +506,86 @@ pub fn resource_schemas_to_protocol<'a>(
         .into_iter()
         .map(resource_schema_to_protocol)
         .collect()
+}
+
+fn type_identity_to_protocol(identity: &TypeIdentity) -> protocol::TypeIdentity {
+    let TypeIdentity {
+        provider,
+        segments,
+        kind,
+    } = identity;
+    protocol::TypeIdentity {
+        provider: provider.clone().unwrap_or_default(),
+        segments: segments.clone(),
+        kind: kind.clone(),
+    }
+}
+
+fn protocol_to_type_identity(identity: &protocol::TypeIdentity) -> TypeIdentity {
+    let protocol::TypeIdentity {
+        provider,
+        segments,
+        kind,
+    } = identity;
+    TypeIdentity {
+        provider: (!provider.is_empty()).then(|| provider.clone()),
+        segments: segments.clone(),
+        kind: kind.clone(),
+    }
+}
+
+/// Project one aggregate provider-schema witness onto the version-13 envelope.
+pub fn provider_schema_to_protocol(
+    witness: &ValidatedProviderSchemaWitness,
+) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
+    let resources = resource_schemas_to_protocol(witness.resources())?;
+    let reference_forms = witness
+        .reference_forms()
+        .iter()
+        .map(|(identity, form)| {
+            let form = match form {
+                protocol::ReferenceForm::Template { long } => {
+                    protocol::ReferenceForm::Template { long: long.clone() }
+                }
+            };
+            protocol::ReferenceFormDeclaration {
+                identity: type_identity_to_protocol(identity),
+                form,
+            }
+        })
+        .collect();
+    Ok(protocol::ProviderSchemaEnvelope {
+        resources,
+        reference_forms,
+    })
+}
+
+/// Decode the version-13 provider-schema envelope and jointly admit resource,
+/// config, and reference-form declarations.
+pub fn protocol_to_provider_schema_witness(
+    envelope: &protocol::ProviderSchemaEnvelope,
+    config: ValidatedConfigSchema,
+) -> Result<ValidatedProviderSchemaWitness, SchemaDecodeError> {
+    let protocol::ProviderSchemaEnvelope {
+        resources,
+        reference_forms,
+    } = envelope;
+    let resources = protocol_to_resource_schemas(resources)?;
+    let mut forms = crate::schema::ReferenceForms::new();
+    for declaration in reference_forms {
+        let protocol::ReferenceFormDeclaration { identity, form } = declaration;
+        let identity = protocol_to_type_identity(identity);
+        let form = match form {
+            protocol::ReferenceForm::Template { long } => {
+                protocol::ReferenceForm::Template { long: long.clone() }
+            }
+        };
+        if forms.insert(identity.clone(), form).is_some() {
+            return Err(SchemaDecodeError::DuplicateReferenceForm { identity });
+        }
+    }
+    ValidatedProviderSchemaWitness::new(resources, config, forms)
+        .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
 /// Convert a validated provider-config schema to protocol attribute types.
@@ -2264,7 +2394,209 @@ mod tests {
     use super::*;
     use crate::provider::UpdatePatch;
     use crate::resource::{ModuleSource, ProviderResource, RedactedSecretHash};
-    use crate::schema::{CompletionValue, ValidatorType};
+    use crate::schema::{
+        CompletionValue, ProviderSchemaValidationError, ReferenceForm, ReferenceForms,
+        ReferenceTemplate, ValidatedProviderSchemaWitness, ValidatorType,
+    };
+
+    fn reference_identity(kind: &str) -> TypeIdentity {
+        TypeIdentity::new(Some("aws"), ["lambda", "Function"], kind)
+    }
+
+    fn reference_form() -> ReferenceForm {
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn schema_with_identified_type(
+        identity: &TypeIdentity,
+        attribute_type: AttributeType,
+    ) -> ValidatedResourceSchema {
+        ResourceSchema::new("aws.lambda.Function")
+            .attribute(AttributeSchema::optional("function", attribute_type).build())
+            .validate()
+            .unwrap_or_else(|error| panic!("fixture for {identity} must validate: {error}"))
+    }
+
+    fn protocol_identity(identity: &TypeIdentity) -> protocol::TypeIdentity {
+        protocol::TypeIdentity {
+            provider: identity.provider.clone().unwrap_or_default(),
+            segments: identity.segments.clone(),
+            kind: identity.kind.clone(),
+        }
+    }
+
+    fn envelope_with_form(
+        identity: &TypeIdentity,
+        schema: Option<ValidatedResourceSchema>,
+    ) -> protocol::ProviderSchemaEnvelope {
+        protocol::ProviderSchemaEnvelope {
+            resources: schema
+                .iter()
+                .map(resource_schema_to_protocol)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            reference_forms: vec![protocol::ReferenceFormDeclaration {
+                identity: protocol_identity(identity),
+                form: reference_form(),
+            }],
+        }
+    }
+
+    #[test]
+    fn provider_schema_envelope_round_trips_the_aggregate_witness() {
+        let first = reference_identity("Alias");
+        let second = reference_identity("Name");
+        let schema = ResourceSchema::new("aws.lambda.Function")
+            .attribute(
+                AttributeSchema::optional(
+                    "alias",
+                    AttributeType::refined_string(Some(first.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::refined_string(Some(second.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let forms = ReferenceForms::from([
+            (second.clone(), reference_form()),
+            (first.clone(), reference_form()),
+        ]);
+        let config = ValidatedConfigSchema::default();
+        let witness = ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms)
+            .expect("refined String forms must be admitted");
+
+        let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
+        assert_eq!(
+            wire.reference_forms
+                .iter()
+                .map(|record| record.identity.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["Alias", "Name"],
+            "BTreeMap order is the wire order",
+        );
+        let json = serde_json::to_string(&wire).expect("envelope must serialize");
+        let decoded_wire: protocol::ProviderSchemaEnvelope =
+            serde_json::from_str(&json).expect("envelope must deserialize");
+        let decoded = protocol_to_provider_schema_witness(&decoded_wire, config)
+            .expect("envelope must regain its aggregate witness");
+
+        assert_eq!(decoded.resources().len(), 1);
+        assert_eq!(decoded.reference_forms().len(), 2);
+        assert_eq!(
+            decoded.reference_forms().get(&first),
+            Some(&reference_form())
+        );
+        assert_eq!(
+            decoded.reference_forms().get(&second),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_duplicate_reference_form_identities() {
+        let identity = reference_identity("Name");
+        let schema = schema_with_identified_type(
+            &identity,
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        );
+        let mut wire = envelope_with_form(&identity, Some(schema));
+        wire.reference_forms.push(wire.reference_forms[0].clone());
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::DuplicateReferenceForm { identity: actual })
+                if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_dangling_reference_form_identities() {
+        let identity = reference_identity("Name");
+        let wire = envelope_with_form(&identity, None);
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::DanglingReferenceForm { identity: actual }
+            )) if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_accepts_a_form_declared_by_provider_config() {
+        let identity = reference_identity("Endpoint");
+        let config = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "endpoint".to_string(),
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        )]))
+        .expect("config fixture must validate");
+        let wire = envelope_with_form(&identity, None);
+
+        let decoded = protocol_to_provider_schema_witness(&wire, config)
+            .expect("config identities belong to the same aggregate witness");
+
+        assert_eq!(
+            decoded.reference_forms().get(&identity),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_int_reference_form_identities() {
+        let identity = reference_identity("Count");
+        let schema = schema_with_identified_type(
+            &identity,
+            AttributeType::refined_int(Some(identity.clone()), None),
+        );
+        let wire = envelope_with_form(&identity, Some(schema));
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::NonStringReferenceForm {
+                    identity: actual,
+                    declaration: crate::schema::IdentifiedDeclarationKind::Int,
+                }
+            )) if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_decode_rejects_enum_reference_form_identities() {
+        let identity = reference_identity("Mode");
+        let schema = schema_with_identified_type(
+            &identity,
+            AttributeType::enum_(
+                identity.clone(),
+                Some(vec!["enabled".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        );
+        let wire = envelope_with_form(&identity, Some(schema));
+
+        assert!(matches!(
+            protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default()),
+            Err(SchemaDecodeError::InvalidProviderSchema(
+                ProviderSchemaValidationError::NonStringReferenceForm {
+                    identity: actual,
+                    declaration: crate::schema::IdentifiedDeclarationKind::Enum,
+                }
+            )) if actual == identity
+        ));
+    }
 
     #[test]
     fn provider_resource_encodes_identically_to_live_resource() {

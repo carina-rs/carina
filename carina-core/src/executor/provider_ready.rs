@@ -990,6 +990,15 @@ mod provider_config_tests {
             unreachable!("config preparation tests do not create providers")
         }
 
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
             Vec::new()
         }
@@ -1066,6 +1075,15 @@ mod provider_config_tests {
             _config: &ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             unreachable!("routing tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1786,6 +1804,15 @@ mod provider_config_tests {
             unreachable!("config preparation tests do not create providers")
         }
 
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
             Vec::new()
         }
@@ -1888,6 +1915,15 @@ mod provider_config_tests {
             _config: &ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {

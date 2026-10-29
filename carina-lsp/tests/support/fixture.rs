@@ -53,6 +53,15 @@ impl ProviderFactory for SchemaFixtureFactory {
         unimplemented!("schema fixture factories are never instantiated")
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         self.schemas.clone()
     }

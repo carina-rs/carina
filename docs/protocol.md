@@ -2,13 +2,27 @@
 
 ## Version 13
 
-Protocol v13 makes initialized reference scope and recoverable create failures
-explicit transport data.
+Protocol v13 makes initialized reference scope, provider-declared reference
+forms, and recoverable create failures explicit transport data.
 
 `initialize` now returns an `initialize-result` containing a closed
 `reference-scope`: either the provider instance's `partition`, `region`, and
 `account`, or `unavailable`. The scope belongs to the initialized instance, so
 two named instances of one provider kind may report different values.
+
+The `schemas` JSON is now a provider-schema envelope containing `resources`
+and `reference_forms`. Reference forms are a sorted list of `{identity, form}`
+records on the wire and a map in validated Rust witnesses. A form is currently
+the closed `template` variant, whose `long` value must contain `{name}` exactly
+once and may otherwise contain only `{partition}`, `{region}`, and `{account}`
+placeholders. Stray braces and unknown placeholders fail typed validation.
+
+The host admits resources, provider config, and forms as one provider-wide
+witness. Every form identity must be declared by that provider as a refined
+String; duplicate records, dangling identities, Int identities, and Enum
+identities are rejected while decoding. The registry retains one table per
+schema owner rather than one global identity table. Owner forms also contribute
+to semantic schema fingerprint encoding v5.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

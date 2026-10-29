@@ -97,6 +97,15 @@ impl ProviderFactory for SnapshotSchemaFactory {
         unimplemented!("snapshot tests do not construct providers")
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         vec![self.schema.clone()]
     }

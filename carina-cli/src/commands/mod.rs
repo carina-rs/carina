@@ -17,7 +17,7 @@ pub mod validate;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
@@ -244,11 +244,11 @@ pub fn ensure_backend_lock(
 /// the already-collected schema map and factory-based validation for WASM providers.
 pub(crate) fn enrich_provider_context(
     schemas: &carina_core::schema::SchemaRegistry,
-    factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>>,
+    custom_types: carina_core::parser::ProviderCustomTypes,
 ) -> ProviderContext {
     ProviderContext {
         decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(factories),
+        custom_types,
         resource_types: ProviderContext::resource_types_from_schema_registry(schemas),
     }
 }
@@ -543,7 +543,8 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     // Enrich provider context with custom type validators from loaded schemas
-    let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
+    let enriched_context =
+        enrich_provider_context(ctx.schemas(), ctx.provider_custom_types_snapshot());
 
     // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
     // unknown bare custom-type names in the root parse. The root
@@ -1399,6 +1400,15 @@ exports {
                 Ok(Box::new(carina_core::provider::NoopNormalizer)
                     as Box<dyn carina_core::provider::ProviderNormalizer>)
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

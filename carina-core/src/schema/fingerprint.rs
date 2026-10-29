@@ -10,12 +10,13 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, InputMode, ResourceSchema,
-    ResourceValidation, SchemaKind, StructField, TypeIdentity, UniqueNameSpec, ValidatorType,
+    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, InputMode,
+    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceSchema, ResourceValidation,
+    SchemaKind, StructField, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v4";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v5";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -85,15 +86,43 @@ impl ResourceSchema {
     /// not affect planning or provider calls. Executable validator callbacks
     /// have no portable cross-process identity, so a fixed marker is encoded;
     /// all declarative validator inputs and refinements are encoded normally.
-    pub fn semantic_fingerprint(&self) -> String {
-        hex::encode(Sha256::digest(self.semantic_encoding()))
+    #[cfg(test)]
+    pub(crate) fn semantic_fingerprint(&self) -> String {
+        hex::encode(Sha256::digest(semantic_encoding(
+            self,
+            &ReferenceForms::new(),
+        )))
     }
+}
 
-    fn semantic_encoding(&self) -> Vec<u8> {
-        let mut encoder = CanonicalEncoder::default();
-        encoder.string(ENCODING_VERSION);
-        encode_resource_schema(&mut encoder, self);
-        encoder.finish()
+impl OwnerBoundResourceSchema<'_> {
+    /// SHA-256 of the resource semantics and its owner's complete forms table.
+    pub fn semantic_fingerprint(self) -> String {
+        hex::encode(Sha256::digest(semantic_encoding(
+            self.schema().as_schema(),
+            self.reference_forms(),
+        )))
+    }
+}
+
+fn semantic_encoding(schema: &ResourceSchema, reference_forms: &ReferenceForms) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(ENCODING_VERSION);
+    encode_resource_schema(&mut encoder, schema);
+    encode_reference_forms(&mut encoder, reference_forms);
+    encoder.finish()
+}
+
+fn encode_reference_forms(encoder: &mut CanonicalEncoder, forms: &ReferenceForms) {
+    encoder.usize(forms.len());
+    for (identity, form) in forms {
+        encode_type_identity(encoder, identity);
+        match form {
+            ReferenceForm::Template { long } => {
+                encoder.tag(0);
+                encoder.string(long.as_str());
+            }
+        }
     }
 }
 
@@ -514,6 +543,7 @@ fn encode_json(encoder: &mut CanonicalEncoder, value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ReferenceTemplate;
 
     fn attribute_type_encoding(attribute_type: AttributeType) -> Vec<u8> {
         let mut encoder = CanonicalEncoder::default();
@@ -565,5 +595,51 @@ mod tests {
         ]);
 
         assert_eq!(once.semantic_fingerprint(), repeated.semantic_fingerprint());
+    }
+
+    #[test]
+    fn owner_reference_forms_change_the_resource_fingerprint() {
+        let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+        let schema = ResourceSchema::new("aws.lambda.Function")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let empty = ReferenceForms::new();
+        let first = ReferenceForms::from([(
+            identity.clone(),
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .unwrap(),
+            },
+        )]);
+        let changed = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function-alias:{name}",
+                )
+                .unwrap(),
+            },
+        )]);
+
+        let without = OwnerBoundResourceSchema::new("aws", &schema, &empty).semantic_fingerprint();
+        let with = OwnerBoundResourceSchema::new("aws", &schema, &first).semantic_fingerprint();
+        let changed =
+            OwnerBoundResourceSchema::new("aws", &schema, &changed).semantic_fingerprint();
+
+        assert_ne!(without, with, "adding a form must change the fingerprint");
+        assert_ne!(with, changed, "changing a form must change the fingerprint");
+        assert_ne!(
+            without, changed,
+            "removing a form must change the fingerprint"
+        );
     }
 }

@@ -203,7 +203,9 @@ mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
-pub use carina_provider_protocol::types::DslTransform;
+pub use carina_provider_protocol::types::{
+    DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
+};
 /// Per-resource operational configuration for provider timeouts and retries.
 pub use carina_provider_protocol::{OperationConfig, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
@@ -8215,6 +8217,404 @@ impl ValidatedConfigSchema {
     }
 }
 
+/// Provider-wide reference-form declarations keyed by semantic type identity.
+pub type ReferenceForms = BTreeMap<TypeIdentity, ReferenceForm>;
+
+/// The declaration shape attached to an identified provider type.
+///
+/// This is distinct from [`RefinedScalarKind`]: an enum with a String base is
+/// transported through the String scalar bridge, but it is not a refined
+/// String and therefore cannot declare a reference form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdentifiedDeclarationKind {
+    String,
+    Int,
+    Float,
+    Enum,
+}
+
+impl fmt::Display for IdentifiedDeclarationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "refined String",
+            Self::Int => "refined Int",
+            Self::Float => "refined Float",
+            Self::Enum => "Enum",
+        })
+    }
+}
+
+/// Failure to build one provider's aggregate schema witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderSchemaValidationError {
+    MissingScalarKind {
+        identity: TypeIdentity,
+    },
+    ConflictingScalarKinds {
+        identity: TypeIdentity,
+        first_kind: RefinedScalarKind,
+        second_kind: RefinedScalarKind,
+    },
+    DanglingReferenceForm {
+        identity: TypeIdentity,
+    },
+    NonStringReferenceForm {
+        identity: TypeIdentity,
+        declaration: IdentifiedDeclarationKind,
+    },
+}
+
+impl fmt::Display for ProviderSchemaValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingScalarKind { identity } => {
+                write!(
+                    formatter,
+                    "custom type `{identity}` has no scalar bridge kind"
+                )
+            }
+            Self::ConflictingScalarKinds {
+                identity,
+                first_kind,
+                second_kind,
+            } => write!(
+                formatter,
+                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider"
+            ),
+            Self::DanglingReferenceForm { identity } => write!(
+                formatter,
+                "reference form identity `{identity}` is not declared by this provider"
+            ),
+            Self::NonStringReferenceForm {
+                identity,
+                declaration,
+            } => write!(
+                formatter,
+                "reference form identity `{identity}` is declared as {declaration}, not refined String"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderSchemaValidationError {}
+
+/// Resource schemas, provider config, and reference forms admitted together.
+///
+/// The fields are private so no consumer can pair a provider's resource
+/// schemas with a separately sourced config or reference-form table.
+#[derive(Debug, Clone)]
+pub struct ValidatedProviderSchemaWitness {
+    resources: Vec<ValidatedResourceSchema>,
+    config: ValidatedConfigSchema,
+    reference_forms: ReferenceForms,
+}
+
+impl ValidatedProviderSchemaWitness {
+    pub fn new(
+        resources: Vec<ValidatedResourceSchema>,
+        config: ValidatedConfigSchema,
+        reference_forms: ReferenceForms,
+    ) -> Result<Self, ProviderSchemaValidationError> {
+        let declarations = identified_declarations_from_witnesses(&resources, &config);
+        let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
+        let mut declaration_kinds =
+            BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
+
+        for (identity, attribute_type) in &declarations {
+            let declaration = identified_declaration_kind(attribute_type)
+                .expect("identified declaration walk only yields identified scalar types");
+            let scalar_kind =
+                identified_declaration_scalar_kind(attribute_type).ok_or_else(|| {
+                    ProviderSchemaValidationError::MissingScalarKind {
+                        identity: identity.clone(),
+                    }
+                })?;
+            if let Some(first_kind) = scalar_kinds.get(identity)
+                && *first_kind != scalar_kind
+            {
+                return Err(ProviderSchemaValidationError::ConflictingScalarKinds {
+                    identity: identity.clone(),
+                    first_kind: *first_kind,
+                    second_kind: scalar_kind,
+                });
+            }
+            scalar_kinds.entry(identity.clone()).or_insert(scalar_kind);
+            declaration_kinds
+                .entry(identity.clone())
+                .or_default()
+                .insert(declaration);
+        }
+
+        for identity in reference_forms.keys() {
+            let Some(kinds) = declaration_kinds.get(identity) else {
+                return Err(ProviderSchemaValidationError::DanglingReferenceForm {
+                    identity: identity.clone(),
+                });
+            };
+            if let Some(declaration) = kinds
+                .iter()
+                .copied()
+                .find(|kind| *kind != IdentifiedDeclarationKind::String)
+            {
+                return Err(ProviderSchemaValidationError::NonStringReferenceForm {
+                    identity: identity.clone(),
+                    declaration,
+                });
+            }
+        }
+
+        Ok(Self {
+            resources,
+            config,
+            reference_forms,
+        })
+    }
+
+    pub fn resources(&self) -> &[ValidatedResourceSchema] {
+        &self.resources
+    }
+
+    pub fn config(&self) -> &ValidatedConfigSchema {
+        &self.config
+    }
+
+    pub fn reference_forms(&self) -> &ReferenceForms {
+        &self.reference_forms
+    }
+
+    pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, AttributeType)> {
+        identified_declarations_from_witnesses(&self.resources, &self.config)
+    }
+}
+
+fn identified_declaration_kind(
+    attribute_type: &AttributeType,
+) -> Option<IdentifiedDeclarationKind> {
+    match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(_identity),
+            pattern: _pattern,
+            length: _length,
+            validate: _validate,
+            to_dsl: _to_dsl,
+        } => Some(IdentifiedDeclarationKind::String),
+        RawShape::Int {
+            identity: Some(_identity),
+            range: _range,
+            validate: _validate,
+        } => Some(IdentifiedDeclarationKind::Int),
+        RawShape::Float {
+            identity: Some(_identity),
+            range: _range,
+            validate: _validate,
+        } => Some(IdentifiedDeclarationKind::Float),
+        RawShape::Enum {
+            identity: _identity,
+            base: _base,
+            values: _values,
+            dsl_aliases: _dsl_aliases,
+            validate: _validate,
+            to_dsl: _to_dsl,
+        } => Some(IdentifiedDeclarationKind::Enum),
+        RawShape::String {
+            identity: None,
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: None,
+            range: _,
+            validate: _,
+        } => None,
+        RawShape::Bool | RawShape::Duration => None,
+        RawShape::List {
+            element_type: _element_type,
+            ordered: _ordered,
+            length: _length,
+        } => None,
+        RawShape::Map {
+            key: _key,
+            value: _value,
+        } => None,
+        RawShape::Struct {
+            name: _name,
+            fields: _fields,
+        } => None,
+        RawShape::Union(_members) => None,
+        RawShape::Ref(_name) => None,
+    }
+}
+
+fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
+    match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(_identity),
+            pattern: _pattern,
+            length: _length,
+            validate: _validate,
+            to_dsl: _to_dsl,
+        } => Some(RefinedScalarKind::String),
+        RawShape::Int {
+            identity: Some(_identity),
+            range: _range,
+            validate: _validate,
+        } => Some(RefinedScalarKind::Int),
+        RawShape::Float {
+            identity: Some(_identity),
+            range: _range,
+            validate: _validate,
+        } => Some(RefinedScalarKind::Float),
+        RawShape::Enum {
+            identity: _identity,
+            base,
+            values: _values,
+            dsl_aliases: _dsl_aliases,
+            validate: _validate,
+            to_dsl: _to_dsl,
+        } => scalar_kind_for_schema_base(base),
+        RawShape::String {
+            identity: None,
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: None,
+            range: _,
+            validate: _,
+        } => None,
+        RawShape::Bool | RawShape::Duration => None,
+        RawShape::List {
+            element_type: _element_type,
+            ordered: _ordered,
+            length: _length,
+        } => None,
+        RawShape::Map {
+            key: _key,
+            value: _value,
+        } => None,
+        RawShape::Struct {
+            name: _name,
+            fields: _fields,
+        } => None,
+        RawShape::Union(_members) => None,
+        RawShape::Ref(_name) => None,
+    }
+}
+
+fn visit_identified_declarations(
+    attribute_type: &AttributeType,
+    visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
+) {
+    match attribute_type.raw_shape() {
+        RawShape::String {
+            identity: Some(identity),
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: Some(identity),
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: Some(identity),
+            range: _,
+            validate: _,
+        }
+        | RawShape::Enum {
+            identity,
+            base: _,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => visitor(identity, attribute_type),
+        RawShape::List {
+            element_type,
+            ordered: _,
+            length: _,
+        } => visit_identified_declarations(element_type, visitor),
+        RawShape::Map { key, value } => {
+            visit_identified_declarations(key, visitor);
+            visit_identified_declarations(value, visitor);
+        }
+        RawShape::Struct { name: _, fields } => {
+            for field in fields {
+                visit_identified_declarations(&field.field_type, visitor);
+            }
+        }
+        RawShape::Union(members) => {
+            for member in members {
+                visit_identified_declarations(member, visitor);
+            }
+        }
+        RawShape::String {
+            identity: None,
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+        }
+        | RawShape::Int {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Float {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Ref(_) => {}
+    }
+}
+
+/// Enumerate identified declarations in stable schema-defined order.
+///
+/// Resource schemas retain caller slice order. Roots and named definitions use
+/// their canonical `BTreeMap` order, nested shapes retain declaration order,
+/// and provider-config roots come last. Provider dispatch and aggregate
+/// admission share this traversal rather than reconstructing identity tables.
+pub(crate) fn identified_declarations_from_witnesses(
+    resources: &[ValidatedResourceSchema],
+    config: &ValidatedConfigSchema,
+) -> Vec<(TypeIdentity, AttributeType)> {
+    let mut declarations = Vec::new();
+    let mut collect = |identity: &TypeIdentity, attribute_type: &AttributeType| {
+        declarations.push((identity.clone(), attribute_type.clone()));
+    };
+    for schema in resources {
+        for attribute in schema.effective_attributes() {
+            visit_identified_declarations(attribute.field_type(), &mut collect);
+        }
+        for definition in schema.parts().defs.values() {
+            visit_identified_declarations(definition, &mut collect);
+        }
+    }
+    for attribute_type in config.parts().values() {
+        visit_identified_declarations(attribute_type, &mut collect);
+    }
+    declarations
+}
+
 fn normalize_issues(issues: &mut Vec<SchemaDefinitionIssue>) {
     issues.sort_by(|left, right| {
         left.path
@@ -11413,11 +11813,20 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 pub struct OwnerBoundResourceSchema<'a> {
     owner: &'a str,
     schema: &'a ValidatedResourceSchema,
+    reference_forms: &'a ReferenceForms,
 }
 
 impl<'a> OwnerBoundResourceSchema<'a> {
-    fn new(owner: &'a str, schema: &'a ValidatedResourceSchema) -> Self {
-        Self { owner, schema }
+    fn new(
+        owner: &'a str,
+        schema: &'a ValidatedResourceSchema,
+        reference_forms: &'a ReferenceForms,
+    ) -> Self {
+        Self {
+            owner,
+            schema,
+            reference_forms,
+        }
     }
 
     pub fn owner(self) -> &'a str {
@@ -11426,6 +11835,12 @@ impl<'a> OwnerBoundResourceSchema<'a> {
 
     pub fn schema(self) -> &'a ValidatedResourceSchema {
         self.schema
+    }
+
+    /// Return the complete reference-form table declared by this schema's
+    /// owner. Forms are provider-wide rather than per resource occurrence.
+    pub fn reference_forms(self) -> &'a ReferenceForms {
+        self.reference_forms
     }
 
     /// Validate authored resource values with custom-type routing derived from
@@ -11494,6 +11909,7 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 pub struct SchemaRegistry {
     managed: HashMap<(String, String), ValidatedResourceSchema>,
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
+    reference_forms: BTreeMap<String, ReferenceForms>,
 }
 
 impl SchemaRegistry {
@@ -11512,7 +11928,9 @@ impl SchemaRegistry {
     /// registry.insert("test", ResourceSchema::new("test.Widget"));
     /// ```
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
-        let key = (provider.into(), schema.as_schema().resource_type.clone());
+        let provider = provider.into();
+        self.reference_forms.entry(provider.clone()).or_default();
+        let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
             SchemaKind::Resource => {
                 self.managed.insert(key, schema);
@@ -11521,6 +11939,42 @@ impl SchemaRegistry {
                 self.data_sources.insert(key, schema);
             }
         }
+    }
+
+    /// Insert every resource schema and the one provider-wide forms table from
+    /// the same validated aggregate witness.
+    pub fn insert_provider_witness(
+        &mut self,
+        provider: impl Into<String>,
+        witness: &ValidatedProviderSchemaWitness,
+    ) {
+        let provider = provider.into();
+        self.reference_forms
+            .insert(provider.clone(), witness.reference_forms().clone());
+        for schema in witness.resources() {
+            let key = (provider.clone(), schema.as_schema().resource_type.clone());
+            match schema.as_schema().kind {
+                SchemaKind::Resource => {
+                    self.managed.insert(key, schema.clone());
+                }
+                SchemaKind::DataSource => {
+                    self.data_sources.insert(key, schema.clone());
+                }
+            }
+        }
+    }
+
+    /// Merge another registry, with the incoming registry winning on duplicate
+    /// resource keys and owner form tables.
+    pub fn extend(&mut self, other: SchemaRegistry) {
+        let SchemaRegistry {
+            managed,
+            data_sources,
+            reference_forms,
+        } = other;
+        self.managed.extend(managed);
+        self.data_sources.extend(data_sources);
+        self.reference_forms.extend(reference_forms);
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.
@@ -11536,7 +11990,13 @@ impl SchemaRegistry {
             SchemaKind::DataSource => &self.data_sources,
         };
         map.get_key_value(&key)
-            .map(|((owner, _resource_type), schema)| OwnerBoundResourceSchema::new(owner, schema))
+            .map(|((owner, _resource_type), schema)| {
+                let reference_forms = self
+                    .reference_forms
+                    .get(owner)
+                    .expect("every registered owner carries a reference-form table");
+                OwnerBoundResourceSchema::new(owner, schema, reference_forms)
+            })
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].

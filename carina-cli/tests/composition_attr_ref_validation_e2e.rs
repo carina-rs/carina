@@ -66,6 +66,15 @@ impl ProviderFactory for AwsccTestFactory {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
             vec![target_group_schema(), consumer_schema(), policy_schema()];
