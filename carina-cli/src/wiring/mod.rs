@@ -127,8 +127,8 @@ use carina_core::provider::{
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, LiveComposition, ModuleSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    ResourceIdentityError, State, Value,
+    PartialReadMarker, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+    ResourceIdentity, ResourceIdentityError, State, Value,
 };
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
@@ -2271,11 +2271,11 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
             .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value)))
             .collect::<HashMap<_, _>>();
         if let Some(marker) = sr.partial_read() {
-            for attribute in &marker.missing_attributes {
+            for attribute in marker.missing_attributes() {
                 attribute_values
                     .entry(attribute.clone())
-                    .or_insert_with(|| identifier::PrefixStateValue::PostCreateReadIncomplete {
-                        detail: marker.detail.clone(),
+                    .or_insert_with(|| {
+                        identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
                     });
             }
         }
@@ -2303,11 +2303,11 @@ pub(crate) fn reconcile_canonical_prefixed_names<E>(
             .map(|(name, value)| (name, identifier::PrefixStateValue::Known(value)))
             .collect::<HashMap<_, _>>();
         if let Some(marker) = sr.partial_read() {
-            for attribute in &marker.missing_attributes {
+            for attribute in marker.missing_attributes() {
                 attribute_values
                     .entry(attribute.clone())
-                    .or_insert_with(|| identifier::PrefixStateValue::PostCreateReadIncomplete {
-                        detail: marker.detail.clone(),
+                    .or_insert_with(|| {
+                        identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
                     });
             }
         }
@@ -2316,6 +2316,78 @@ pub(crate) fn reconcile_canonical_prefixed_names<E>(
             attribute_values,
         })
     });
+}
+
+type PrefixStateKey = (String, String, String);
+
+fn prefix_state_key(provider: &str, resource_type: &str, identity: &str) -> PrefixStateKey {
+    (
+        provider.to_string(),
+        resource_type.to_string(),
+        identity.to_string(),
+    )
+}
+
+/// Build prefix reconciliation inputs from the hydrated current snapshot.
+/// Persisted rows remain the authority for which prefix was originally used;
+/// current state is the sole authority for the value and pending re-read
+/// marker after refresh.
+fn refreshed_prefix_state_info(
+    resources: &[Resource],
+    state_file: &Option<StateFile>,
+    managed_current: &HashMap<ResourceId, Current>,
+) -> HashMap<PrefixStateKey, PrefixStateInfo> {
+    let Some(state_file) = state_file.as_ref() else {
+        return HashMap::new();
+    };
+    resources
+        .iter()
+        .filter(|resource| !resource.prefixes.is_empty())
+        .filter_map(|resource| {
+            let identity = resource.id.identity_str()?;
+            let persisted = state_file.find_resource(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                identity,
+            )?;
+            let current_state =
+                managed_current
+                    .get(&resource.id)
+                    .and_then(|current| match current {
+                        Current::Absent(state) => Some(state.state()),
+                        Current::Present(present) => Some(present.state()),
+                        Current::CreateInFlight(_pending) => None,
+                        Current::MissingIdentifier(state) => Some(state.state()),
+                    });
+            let mut attribute_values = current_state
+                .into_iter()
+                .flat_map(|state| &state.attributes)
+                .filter_map(|(name, value)| match value {
+                    Value::Concrete(ConcreteValue::String(value)) => Some((
+                        name.clone(),
+                        identifier::PrefixStateValue::Known(value.expose_plaintext().to_string()),
+                    )),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>();
+            if let Some(marker) = current_state.and_then(|state| state.partial_read.as_ref()) {
+                for attribute in marker.missing_attributes() {
+                    attribute_values
+                        .entry(attribute.clone())
+                        .or_insert_with(|| {
+                            identifier::PrefixStateValue::PendingReRead(marker.pending().clone())
+                        });
+                }
+            }
+            Some((
+                prefix_state_key(&resource.id.provider, &resource.id.resource_type, identity),
+                PrefixStateInfo {
+                    prefixes: persisted.prefixes.clone(),
+                    attribute_values,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Look up a provider's identity attributes through its factory.
@@ -3901,15 +3973,10 @@ impl<'state> ProjectedStateRead<'state> {
                 .and_then(|state_file| state_file.find_resource_for_id(self.source_for(desired)))
                 .and_then(carina_state::ResourceState::partial_read)
                 .cloned();
-            if let Some(mut marker) = marker {
-                marker
-                    .missing_attributes
-                    .retain(|attribute| !current.attributes.contains_key(attribute));
-                if marker.missing_attributes.is_empty() {
-                    current.partial_read = None;
-                } else {
-                    current.partial_read = Some(marker);
-                }
+            if let Some(marker) = marker {
+                let (pending, mut missing_attributes) = marker.into_parts();
+                missing_attributes.retain(|attribute| !current.attributes.contains_key(attribute));
+                current.partial_read = PartialReadMarker::new(pending, missing_attributes);
             }
         }
     }
@@ -4276,6 +4343,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 prev_explicit: self.prev_explicit,
                 moved_pairs: Vec::new(),
             },
+            prefix_state_info: HashMap::new(),
         })
     }
 }
@@ -4444,6 +4512,11 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
             mut orphans,
             already_refreshed,
         } = self;
+        let prefix_state_info = refreshed_prefix_state_info(
+            &prelude.sorted_resources,
+            prelude.state_file,
+            &managed_current,
+        );
         let mut print_warning = |warning: String| eprintln!("{}", warning.yellow());
         let mut suppress_warning = |_: String| {};
         let warning_sink: &mut dyn FnMut(String) = match warning_policy {
@@ -4473,6 +4546,7 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
                 wait_aliases: prelude.wait_aliases,
                 already_refreshed,
                 state: addressed,
+                prefix_state_info,
             },
         ))
     }
@@ -4483,6 +4557,7 @@ struct AddressedDeferredForExpansionInputs {
     wait_aliases: Vec<WaitAliasSpec>,
     already_refreshed: HashSet<ResourceId>,
     state: AddressedState,
+    prefix_state_info: HashMap<PrefixStateKey, PrefixStateInfo>,
 }
 
 struct DeferredForExpansionInputs {
@@ -4877,9 +4952,17 @@ impl PreparedDeferredForExpansion {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
+        resources.reconcile_refreshed_prefixed_names(&|provider, resource_type, identity| {
+            self.0
+                .addressed
+                .prefix_state_info
+                .get(&prefix_state_key(provider, resource_type, identity))
+                .cloned()
+        });
+        let sorted_resources = resources.sorted_resources().map_err(AppError::Validation)?;
         let expansion = expand_same_config_deferred_for_target(
             &mut resources,
-            &self.0.addressed.sorted_resources,
+            &sorted_resources,
             &self.0.addressed.state.managed_current,
             &self.0.data_source_values,
             schemas,
@@ -5217,6 +5300,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
                 prev_explicit: prev_explicit.clone(),
                 moved_pairs,
             },
+            prefix_state_info: HashMap::new(),
         },
         data_source_values: data_source_values.clone(),
     });

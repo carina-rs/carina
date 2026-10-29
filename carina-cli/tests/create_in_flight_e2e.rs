@@ -1008,7 +1008,7 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         cached_plan.sorted_resources[0].attributes.get("name"),
         Some(carina_core::resource::Value::Deferred(
             carina_core::resource::DeferredValue::Unknown(
-                carina_core::resource::UnknownReason::PostCreateReadIncomplete { .. }
+                carina_core::resource::UnknownReason::PendingReRead(_)
             )
         ))
     ));
@@ -1046,5 +1046,18 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         )),
         "the refreshed resource must not be replaced: {:#?}",
         live_plan.plan.effects()
+    );
+    let refreshed_name = live_plan.sorted_resources[0]
+        .attributes
+        .get("name")
+        .expect("the refreshed desired resource keeps its generated name");
+    assert!(
+        matches!(
+            refreshed_name,
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(name)
+            ) if name.expose_plaintext().starts_with("resume-read-failed-")
+        ),
+        "a successful refresh must replace the stale prefix unknown with the refreshed name, got {refreshed_name:?}"
     );
 }

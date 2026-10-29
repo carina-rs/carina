@@ -61,6 +61,11 @@ use super::ProjectedStateRead;
 pub struct CanonicalResourcePair<E> {
     parsed: File<E>,
     unresolved: Vec<Resource>,
+    /// Generated prefix values captured before persisted state can replace
+    /// them with a pending re-read unknown. A post-refresh reconciliation
+    /// restores these fallbacks first, then overlays only the refreshed
+    /// current value or refreshed marker.
+    prefix_fallbacks: Vec<HashMap<String, Value>>,
 }
 
 /// Selects how a deferred-for expression owned by a
@@ -86,7 +91,11 @@ pub enum CanonicalResourceIdentityError {
 
 impl<E> CanonicalResourcePair<E> {
     fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
-        Self { parsed, unresolved }
+        Self {
+            parsed,
+            unresolved,
+            prefix_fallbacks: Vec::new(),
+        }
     }
 
     pub(super) fn from_resolved_file(
@@ -165,6 +174,44 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,
     ) {
+        let resource_count = self.parsed.resources.len(); // allow: direct — plan-time reconciliation
+        if self.prefix_fallbacks.len() != resource_count {
+            self.prefix_fallbacks = self
+                .parsed
+                .resources
+                .iter()
+                .map(|resource| {
+                    resource
+                        .prefixes
+                        .keys()
+                        .filter_map(|attribute| {
+                            resource
+                                .attributes
+                                .get(attribute)
+                                .cloned()
+                                .map(|value| (attribute.clone(), value))
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        carina_core::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
+    }
+
+    /// Rebuild prefix-owned desired values from the post-hydration current
+    /// snapshot. Restoring the generated fallback before overlaying current
+    /// state guarantees that clearing a marker cannot retain an unknown that
+    /// came from the earlier identity pass.
+    pub fn reconcile_refreshed_prefixed_names(
+        &mut self,
+        find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,
+    ) {
+        let resources = &mut self.parsed.resources; // allow: direct — plan-time reconciliation
+        for (resource, fallbacks) in resources.iter_mut().zip(&self.prefix_fallbacks) {
+            for (attribute, value) in fallbacks {
+                resource.set_attr(attribute.clone(), value.clone());
+            }
+        }
         carina_core::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
     }
 

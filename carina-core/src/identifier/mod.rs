@@ -10,8 +10,8 @@ use crate::effect::ResolvedMove;
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, UnknownReason, Value, ValueString,
+    ConcreteValue, DataSource, DeferredValue, PendingReRead, ResolvedResourceId, Resource,
+    ResourceId, ResourceIdentity, UnknownReason, Value, ValueString,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
@@ -482,6 +482,7 @@ pub fn resolve_attr_prefixes(
 }
 
 /// State information needed for prefix reconciliation.
+#[derive(Clone)]
 pub struct PrefixStateInfo {
     /// Attribute prefixes stored in state (e.g., {"bucket_name": "my-app-"})
     pub prefixes: HashMap<String, String>,
@@ -491,9 +492,10 @@ pub struct PrefixStateInfo {
 
 /// Persisted prefix value, including the typed case where a completed create
 /// could not read the generated name back yet.
+#[derive(Clone)]
 pub enum PrefixStateValue {
     Known(String),
-    PostCreateReadIncomplete { detail: String },
+    PendingReRead(PendingReRead),
 }
 
 /// Reconcile prefixed names with existing state.
@@ -532,11 +534,9 @@ pub fn reconcile_prefixed_names(
                             PrefixStateValue::Known(name) => {
                                 Value::Concrete(ConcreteValue::String(name.clone().into()))
                             }
-                            PrefixStateValue::PostCreateReadIncomplete { detail } => {
+                            PrefixStateValue::PendingReRead(pending) => {
                                 Value::Deferred(DeferredValue::Unknown(
-                                    UnknownReason::PostCreateReadIncomplete {
-                                        detail: detail.clone(),
-                                    },
+                                    UnknownReason::PendingReRead(pending.clone()),
                                 ))
                             }
                         };
@@ -672,9 +672,17 @@ fn deterministic_value_string(value: &Value) -> String {
                     format!("Unknown(FnLocal({name}))")
                 }
                 UnknownReason::EmptyInterpolation => "Unknown(EmptyInterpolation)".to_string(),
-                UnknownReason::PostCreateReadIncomplete { detail } => {
-                    format!("Unknown(PostCreateReadIncomplete({detail}))")
-                }
+                UnknownReason::PendingReRead(pending) => match pending.reason() {
+                    crate::resource::ReReadReason::Incomplete { detail } => {
+                        format!("Unknown(PendingReRead(Incomplete({detail:?})))")
+                    }
+                    crate::resource::ReReadReason::ReadFailed { detail } => {
+                        format!("Unknown(PendingReRead(ReadFailed({detail:?})))")
+                    }
+                    crate::resource::ReReadReason::NotFound => {
+                        "Unknown(PendingReRead(NotFound))".to_string()
+                    }
+                },
             }
         }
     }

@@ -1004,9 +1004,9 @@ mod tests {
 
     #[test]
     fn coalesce_does_not_treat_explicit_unknown_as_absent() {
-        let unknown_reason = crate::resource::UnknownReason::PostCreateReadIncomplete {
-            detail: "provider read incomplete".to_string(),
-        };
+        let unknown_reason = crate::resource::UnknownReason::PendingReRead(
+            crate::resource::PendingReRead::incomplete("provider read incomplete"),
+        );
         let expression = coalesce(
             Value::Deferred(DeferredValue::Unknown(unknown_reason)),
             Value::Concrete(ConcreteValue::String("fallback".into())),
@@ -1026,9 +1026,9 @@ mod tests {
             name: crate::builtins::BuiltinFunction::upper,
             args: vec![
                 Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::PostCreateReadIncomplete {
-                        detail: "producer still running".to_string(),
-                    },
+                    crate::resource::UnknownReason::PendingReRead(
+                        crate::resource::PendingReRead::incomplete("producer still running"),
+                    ),
                 ))
                 .into(),
             ],

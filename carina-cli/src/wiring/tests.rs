@@ -1538,10 +1538,11 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
 #[tokio::test]
 async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "orphan", None);
-    let marker = carina_core::resource::PartialReadMarker {
-        detail: "provider read omitted token".to_string(),
-        missing_attributes: BTreeSet::from(["token".to_string()]),
-    };
+    let marker = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("provider read omitted token"),
+        BTreeSet::from(["token".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
     let mut row = carina_state::ResourceState::try_applied(
         &id.resource_type,
         id.identity().expect("resolved test id").clone(),
@@ -2499,10 +2500,11 @@ let shared = read test.shared.Type {}
         "managed_saved",
         serde_json::json!("managed-write-only-value"),
     );
-    let partial_read = carina_core::resource::PartialReadMarker {
-        detail: "managed read omitted an attribute".to_string(),
-        missing_attributes: BTreeSet::from(["managed_missing".to_string()]),
-    };
+    let partial_read = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("managed read omitted an attribute"),
+        BTreeSet::from(["managed_missing".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
     prior_row = crate::fixture_resource_state_metadata(
         prior_row,
         Some(vec!["managed_saved".to_string()]),

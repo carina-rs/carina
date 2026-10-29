@@ -3157,8 +3157,8 @@ mod resolved_bindings_tests {
     use super::*;
     use crate::data_source_value::{DataSourceValue, DataSourceValues};
     use crate::resource::{
-        ConcreteValue, DataSource, DeferredValue, PartialReadMarker, Resource, ResourceId, State,
-        UnknownReason, Value,
+        ConcreteValue, DataSource, DeferredValue, PartialReadMarker, PendingReRead, Resource,
+        ResourceId, State, UnknownReason, Value,
     };
     use std::collections::BTreeSet;
 
@@ -3301,10 +3301,10 @@ mod resolved_bindings_tests {
         );
         let mut partial_a =
             State::existing(id_a.clone(), HashMap::new()).with_identifier("aws-id-A");
-        partial_a.partial_read = Some(PartialReadMarker {
-            detail: "read after create did not return dns_name".to_string(),
-            missing_attributes: ["dns_name".to_string()].into_iter().collect(),
-        });
+        partial_a.partial_read = PartialReadMarker::new(
+            PendingReRead::incomplete("read after create did not return dns_name"),
+            ["dns_name".to_string()].into_iter().collect(),
+        );
         let states: HashMap<ResourceId, State> = [
             (id_a, partial_a),
             (id_b.clone(), State::existing(id_b, HashMap::new())),
@@ -3332,12 +3332,11 @@ mod resolved_bindings_tests {
             .get("a")
             .and_then(|attrs| attrs.get("dns_name"))
             .expect("partial-read missing attribute must be materialized");
-        match a_dns_name {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
-                detail,
-            })) => assert_eq!(detail, "read after create did not return dns_name"),
-            other => panic!("expected PostCreateReadIncomplete unknown, got {other:?}"),
-        }
+        assert!(matches!(
+            a_dns_name,
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+                if pending == &PendingReRead::incomplete("read after create did not return dns_name")
+        ));
 
         crate::resolver::resolve_refs_with_state_and_remote(&mut resources, &resolved)
             .expect("sibling ref should resolve through the binding view");
@@ -3345,14 +3344,11 @@ mod resolved_bindings_tests {
             .attributes
             .get("target")
             .expect("target attribute should remain present");
-        match target {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
-                detail,
-            })) => assert_eq!(detail, "read after create did not return dns_name"),
-            other => {
-                panic!("expected sibling ref to resolve to partial-read unknown, got {other:?}")
-            }
-        }
+        assert!(matches!(
+            target,
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+                if pending == &PendingReRead::incomplete("read after create did not return dns_name")
+        ));
     }
 
     #[test]
