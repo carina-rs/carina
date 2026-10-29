@@ -29,19 +29,17 @@ fn resolved(resource: Resource) -> ResolvedResource {
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
-    let parsed = carina_core::parser::InferredFile {
-        providers: vec![ProviderConfig {
-            name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        }],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = vec![ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }];
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),

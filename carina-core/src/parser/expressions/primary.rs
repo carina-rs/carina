@@ -6,13 +6,14 @@
 //! access chains, and value-position `if` expressions.
 
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
-use crate::parser::context::ParseBindingRef;
-use crate::parser::expressions::if_expr::parse_if_value_expr;
+use crate::parser::context::{ExpressionMode, ParseBindingRef};
+use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::functions::{evaluate_user_function_eval, reject_builtin_handle_arguments};
 use crate::parser::{
     ParseContext, ParseError, Rule, extract_key_string, first_inner, is_static_eval, next_pair,
-    parse_block_contents, parse_expression, parse_expression_eval,
+    parse_block_contents_with_mode, parse_expression, parse_expression_eval,
+    parse_expression_eval_with_mode,
 };
 use crate::resource::{
     AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value,
@@ -140,6 +141,7 @@ pub(crate) fn apply_postfix_path_segment(
             }
             handle.access_base_value()
         }
+        EvalValue::PendingValue(slot) => return Ok(EvalValue::pending_value(slot)),
         EvalValue::ProvisionalReference { binding } => {
             Value::Deferred(DeferredValue::BindingRef { binding })
         }
@@ -216,8 +218,16 @@ pub(crate) fn parse_postfix_eval(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
+    parse_postfix_eval_with_mode(pair, ctx, &ExpressionMode::untyped())
+}
+
+pub(crate) fn parse_postfix_eval_with_mode(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
     if !matches!(pair.as_rule(), Rule::postfix_expr | Rule::for_iterable) {
-        return parse_primary_eval(pair, ctx);
+        return parse_primary_eval_with_mode(pair, ctx, mode);
     }
 
     let context = if pair.as_rule() == Rule::for_iterable {
@@ -227,8 +237,15 @@ pub(crate) fn parse_postfix_eval(
     };
     let mut inner = pair.into_inner();
     let base = next_pair(&mut inner, "primary expression", context)?;
-    let value = parse_primary_eval(base, ctx)?;
-    apply_postfix_steps(value, inner, ctx)
+    let steps = inner.collect::<Vec<_>>();
+    let untyped_mode = (!steps.is_empty()).then(ExpressionMode::untyped);
+    // The expected sink describes the result of a postfix expression, not
+    // values inside its intermediate base. In particular, `[resource][0].id`
+    // must retain the established bare-handle rejection instead of treating
+    // the resource as an enum candidate merely because the final expression
+    // occurs in a typed attribute.
+    let value = parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
+    apply_postfix_steps(value, steps, ctx)
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -265,7 +282,9 @@ fn parse_namespaced_id_value(
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
-    match ctx.lookup_binding(parts[0]) {
+    let head_binding = ctx.lookup_binding(parts[0]);
+
+    match head_binding {
         ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {
             return Ok(as_resource_ref(trailing_segments));
         }
@@ -286,7 +305,7 @@ fn parse_namespaced_id_value(
                 DeferredValue::ResourceRef { path },
             )));
         }
-        ParseBindingRef::Value(bound) => {
+        ParseBindingRef::Value { value: bound, .. } => {
             // A dotted name whose head is an ordinary bound variable is value
             // access, not a resource path. Apply every `.field` and trailing
             // subscript through the same postfix primitive used by
@@ -352,6 +371,14 @@ pub(crate) fn parse_primary_eval(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
+    parse_primary_eval_with_mode(pair, ctx, &ExpressionMode::untyped())
+}
+
+pub(crate) fn parse_primary_eval_with_mode(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
     // For primary, get inner content; otherwise process directly
     let inner = if pair.as_rule() == Rule::primary {
         first_inner(pair, "value", "primary expression")?
@@ -370,14 +397,23 @@ pub(crate) fn parse_primary_eval(
         Rule::list => {
             let mut items = Vec::new();
             let mut item_metadata = Vec::new();
-            for item in inner.into_inner() {
+            let mut pending = None;
+            for (index, item) in inner.into_inner().enumerate() {
                 let line = item.line_col().0;
-                let eval = parse_expression_eval(item, ctx)?;
+                let item_mode = mode.at_list_index(index);
+                let eval = parse_expression_eval_with_mode(item, ctx, &item_mode)?;
+                if let EvalValue::PendingValue(slot) = eval {
+                    pending.get_or_insert(slot);
+                    continue;
+                }
                 let (value, metadata) = eval
                     .into_collection_element()
                     .map_err(|error| ParseError::from_eval_value(error, line))?;
                 items.push(value);
                 item_metadata.push(metadata);
+            }
+            if let Some(slot) = pending {
+                return Ok(EvalValue::pending_value(slot));
             }
             let metadata = item_metadata
                 .iter()
@@ -391,7 +427,9 @@ pub(crate) fn parse_primary_eval(
         Rule::map => {
             let mut map: IndexMap<String, Value> = IndexMap::new();
             let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+            let mut authored_nested_blocks: IndexMap<String, usize> = IndexMap::new();
             let mut structural_handles = IndexMap::new();
+            let mut pending = None;
             for entry in inner.into_inner() {
                 match entry.as_rule() {
                     Rule::map_entry => {
@@ -400,7 +438,12 @@ pub(crate) fn parse_primary_eval(
                         let key = extract_key_string(key_pair)?;
                         let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
                         let line = value_pair.line_col().0;
-                        let value = parse_expression_eval(value_pair, ctx)?;
+                        let entry_mode = mode.at_key(key.clone());
+                        let value = parse_expression_eval_with_mode(value_pair, ctx, &entry_mode)?;
+                        if let EvalValue::PendingValue(slot) = value {
+                            pending.get_or_insert(slot);
+                            continue;
+                        }
                         let (value, metadata) = value
                             .into_collection_element()
                             .map_err(|error| ParseError::from_eval_value(error, line))?;
@@ -415,7 +458,23 @@ pub(crate) fn parse_primary_eval(
                             next_pair(&mut block_inner, "block name", "nested block in map")?
                                 .as_str()
                                 .to_string();
-                        let block_attrs = parse_block_contents(block_inner, ctx)?;
+                        let authored_count = authored_nested_blocks
+                            .entry(block_name.clone())
+                            .or_default();
+                        let block_index = *authored_count;
+                        *authored_count += 1;
+                        let block_mode = mode
+                            .at_struct_field(block_name.clone())
+                            .at_list_index(block_index);
+                        let block_attrs =
+                            parse_block_contents_with_mode(block_inner, ctx, &block_mode)?;
+                        let Some(block_attrs) = block_attrs else {
+                            pending.get_or_insert_with(|| {
+                                mode.pending_slot()
+                                    .expect("a pending nested block has a typed sink")
+                            });
+                            continue;
+                        };
                         nested_blocks
                             .entry(block_name)
                             .or_default()
@@ -423,6 +482,9 @@ pub(crate) fn parse_primary_eval(
                     }
                     _ => {}
                 }
+            }
+            if let Some(slot) = pending {
+                return Ok(EvalValue::pending_value(slot));
             }
             for (name, blocks) in nested_blocks {
                 map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
@@ -606,6 +668,9 @@ pub(crate) fn parse_primary_eval(
 
             if access_steps.is_empty() {
                 // Simple variable reference (no access chain)
+                if let Some(slot) = mode.record_bare_binding(ctx, first_ident, &first_ident_pair) {
+                    return Ok(EvalValue::pending_value(slot));
+                }
                 //
                 // Bare identifiers (`dedicated`, `enabled`) are emitted as
                 // `ConcreteValue::EnumIdentifier` short form. The validator
@@ -617,7 +682,7 @@ pub(crate) fn parse_primary_eval(
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value(value) => {
+                    ParseBindingRef::Value { value, .. } => {
                         Ok(value.clone().with_reference_source_line(line))
                     }
                     ParseBindingRef::Structural(handle) => {
@@ -629,7 +694,7 @@ pub(crate) fn parse_primary_eval(
                 }
             } else {
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value(bound) => {
+                    ParseBindingRef::Value { value: bound, .. } => {
                         return apply_postfix_steps(
                             bound.clone().with_reference_source_line(line),
                             access_steps,
@@ -741,7 +806,7 @@ pub(crate) fn parse_primary_eval(
                         )));
                     }
                     match ctx.lookup_binding(binding_name.expose_plaintext()) {
-                        ParseBindingRef::Value(value) => Ok(value.clone()),
+                        ParseBindingRef::Value { value, .. } => Ok(value.clone()),
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound
                             if binding_name.is_diagnostic_sensitive() =>
                         {
@@ -771,8 +836,8 @@ pub(crate) fn parse_primary_eval(
                 }
             }
         }
-        Rule::if_expr => parse_if_value_expr(inner, ctx).map(EvalValue::from_value),
-        Rule::expression => parse_expression_eval(inner, ctx),
+        Rule::if_expr => parse_if_value_expr_with_mode(inner, ctx, mode),
+        Rule::expression => parse_expression_eval_with_mode(inner, ctx, mode),
         _ => Ok(EvalValue::from_value(Value::Concrete(
             ConcreteValue::String(inner.as_str().to_string().into()),
         ))),

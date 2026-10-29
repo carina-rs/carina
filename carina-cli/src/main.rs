@@ -742,7 +742,7 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
         error::AppError::StateBucketSeed(seed_error) => {
             let stderr = format!(
                 "{}\nimport {{\n  to = {}\n  id = {}\n}}\n",
-                format_error_with_source_chain(seed_error.as_ref()),
+                format_error_lines(&error::format_error_with_source_chain(seed_error.as_ref())),
                 seed_error.resource_address(),
                 carina_core::parser::display_string_literal(seed_error.identifier()),
             );
@@ -752,7 +752,7 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
             }
         }
         _ => AppErrorRendering {
-            stderr: format_error_lines(&e.to_string()),
+            stderr: format_error_lines(&error::format_error_with_source_chain(e)),
             exit_code: 1,
         },
     }
@@ -781,22 +781,48 @@ fn format_error_lines(msg: &str) -> String {
         .collect()
 }
 
-fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut rendered = format_error_lines(&error.to_string());
-    let mut source = error.source();
-    while let Some(current) = source {
-        rendered.push_str(&format_error_lines(&current.to_string()));
-        source = current.source();
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod cli_version_tests;
 
 #[cfg(test)]
 mod error_format_tests {
     use super::*;
+
+    fn binding_use_app_error() -> error::AppError {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let parsed = carina_core::parser::parse_file(
+            "let source = mock.test.Source { name = \"source\" }\n\
+             mock.test.Consumer { name = source }\n",
+            std::path::Path::new("test.crn"),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("binding-use fixture must parse");
+        let mut schemas = SchemaRegistry::new();
+        for resource_type in ["test.Source", "test.Consumer"] {
+            schemas.insert(
+                "mock",
+                ResourceSchema::new(resource_type)
+                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                    .validate()
+                    .expect("valid fixture schema"),
+            );
+        }
+        let provider_context = carina_core::parser::ProviderContext::default();
+        let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
+        let context = carina_core::validation::ValidationTypeContext::new(
+            &parsed,
+            &schemas,
+            &provider_context,
+            &module_signatures,
+        );
+        let finding = carina_core::validation::check_bare_binding_uses(&parsed, &context)
+            .into_findings()
+            .into_iter()
+            .next()
+            .expect("binding-use finding");
+        error::AppError::BindingUse(Box::new(finding))
+    }
 
     #[test]
     fn single_line_error_has_prefix() {
@@ -810,6 +836,40 @@ mod error_format_tests {
         colored::control::set_override(false);
         let result = format_error_lines("first error\nsecond error");
         assert_eq!(result, "Error: first error\nError: second error\n");
+    }
+
+    #[test]
+    fn binding_use_error_renders_context_and_typed_source_once() {
+        colored::control::set_override(false);
+        let rendered = render_app_error(&binding_use_app_error());
+
+        assert!(
+            rendered.stderr.contains("Error: test.crn at line 2\n"),
+            "located context missing: {}",
+            rendered.stderr,
+        );
+        assert_eq!(
+            rendered.stderr.matches("test.crn at line 2").count(),
+            1,
+            "located context must not be duplicated: {}",
+            rendered.stderr,
+        );
+        assert!(
+            rendered
+                .stderr
+                .contains("Error: 'source' is a resource, not a value"),
+            "typed source missing: {}",
+            rendered.stderr,
+        );
+        assert_eq!(
+            rendered
+                .stderr
+                .matches("'source' is a resource, not a value")
+                .count(),
+            1,
+            "typed source must not be duplicated: {}",
+            rendered.stderr,
+        );
     }
 
     #[test]

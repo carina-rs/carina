@@ -7,7 +7,8 @@
 //! final `EvalValue` to a `Value` at the type boundary.
 
 use crate::eval_value::EvalValue;
-use crate::parser::expressions::primary::parse_postfix_eval;
+use crate::parser::context::ExpressionMode;
+use crate::parser::expressions::primary::parse_postfix_eval_with_mode;
 use crate::parser::functions::{
     apply_parser_closure, evaluate_user_function_eval, lower_function_arguments,
     record_deferred_function_type_check, reject_builtin_handle_arguments,
@@ -119,10 +120,18 @@ pub(crate) fn parse_coalesce_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
+    parse_coalesce_expr_with_mode(pair, ctx, &ExpressionMode::untyped())
+}
+
+pub(crate) fn parse_coalesce_expr_with_mode(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
     let line = pair.line_col().0;
     let mut values = pair
         .into_inner()
-        .map(|pair| parse_pipe_expr(pair, ctx))
+        .map(|pair| parse_pipe_expr_with_mode(pair, ctx, mode))
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = values
         .pop()
@@ -142,6 +151,12 @@ fn combine_coalesce_operands(
     default: EvalValue,
     line: usize,
 ) -> Result<EvalValue, ParseError> {
+    if matches!(value, EvalValue::PendingValue(_)) {
+        return Ok(value);
+    }
+    if matches!(default, EvalValue::PendingValue(_)) {
+        return Ok(default);
+    }
     match value {
         // A concrete user value is present by construction. Do not fold a
         // computed structural value merely because its payload currently
@@ -187,17 +202,21 @@ fn combine_coalesce_operands(
     }
 }
 
-pub(crate) fn parse_compose_expr(
+fn parse_compose_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
+    let has_composition = inner.clone().count() > 1;
     let first = next_pair(&mut inner, "postfix expression", "compose expression")?;
-    let mut value = parse_postfix_eval(first, ctx)?;
+    let operand_mode = has_composition.then(ExpressionMode::untyped);
+    let operand_mode = operand_mode.as_ref().unwrap_or(mode);
+    let mut value = parse_postfix_eval_with_mode(first, ctx, operand_mode)?;
 
     // Collect remaining primaries for >> composition
     for rhs_pair in inner {
-        let rhs = parse_postfix_eval(rhs_pair, ctx)?;
+        let rhs = parse_postfix_eval_with_mode(rhs_pair, ctx, operand_mode)?;
 
         // Both sides must be Closures
         if !value.is_closure() {
@@ -241,13 +260,17 @@ pub(crate) fn parse_compose_expr(
     Ok(value)
 }
 
-pub(crate) fn parse_pipe_expr(
+fn parse_pipe_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
+    let has_pipe = inner.clone().count() > 1;
     let compose = next_pair(&mut inner, "compose expression", "pipe expression")?;
-    let mut value = parse_compose_expr(compose, ctx)?;
+    let operand_mode = has_pipe.then(ExpressionMode::untyped);
+    let mut value =
+        parse_compose_expr_with_mode(compose, ctx, operand_mode.as_ref().unwrap_or(mode))?;
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {

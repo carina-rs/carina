@@ -20,7 +20,7 @@
 //!
 //! See #2230 for the design discussion.
 
-use crate::parser::ResourceTypePath;
+use crate::parser::{PendingValueSlot, ResourceTypePath};
 use crate::resource::{PathSegment, Subscript, Value};
 use indexmap::IndexMap;
 
@@ -38,7 +38,7 @@ pub(crate) struct StructuralHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StructuralHandleKind {
+pub enum StructuralHandleKind {
     Resource(ResourceTypePath),
     For,
     If,
@@ -272,6 +272,12 @@ pub(crate) enum EvalValue {
     /// A structural operand that has not crossed the public `Value` boundary.
     StructuralHandle(StructuralHandle),
 
+    /// A typed value sink reserved by the parser because a bare structural
+    /// binding occurred somewhere below it. The owning resource attribute or
+    /// module argument consumes this marker instead of manufacturing a public
+    /// [`Value`] placeholder.
+    PendingValue(PendingValueSlot),
+
     /// A directory-scoped name whose declaration kind is not known yet.
     /// This is deliberately distinct from `StructuralHandle`: the fixed-point
     /// pass may prove that it names either an ordinary value or a structure.
@@ -318,6 +324,7 @@ pub(crate) struct ClosureLeak {
 pub(crate) enum EvalValueError {
     Closure(ClosureLeak),
     BareStructuralHandle(BareStructuralHandle),
+    PendingValue(Box<PendingValueSlot>),
 }
 
 impl std::fmt::Display for EvalValueError {
@@ -330,8 +337,19 @@ impl std::fmt::Display for EvalValueError {
                 leak.name, leak.remaining_arity,
             ),
             Self::BareStructuralHandle(error) => error.fmt(f),
+            Self::PendingValue(_) => {
+                f.write_str("a parser pending value escaped its typed attribute or argument sink")
+            }
         }
     }
+}
+
+/// Result of lowering an expression at a typed resource-attribute or
+/// module-argument boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParsedSinkValue {
+    Ready(Value),
+    Pending(PendingValueSlot),
 }
 
 impl EvalValue {
@@ -356,6 +374,10 @@ impl EvalValue {
 
     pub(crate) fn structural_handle(handle: StructuralHandle) -> Self {
         Self::StructuralHandle(handle)
+    }
+
+    pub(crate) fn pending_value(slot: PendingValueSlot) -> Self {
+        Self::PendingValue(slot)
     }
 
     pub(crate) fn provisional_reference(binding: impl Into<String>) -> Self {
@@ -408,6 +430,7 @@ impl EvalValue {
             Self::ComputedWithStructuralHandles { metadata, .. } => Some(metadata),
             Self::User(_)
             | Self::StructuralHandle(_)
+            | Self::PendingValue(_)
             | Self::ProvisionalReference { .. }
             | Self::DeferredForValue { .. }
             | Self::Closure { .. } => None,
@@ -431,6 +454,7 @@ impl EvalValue {
             Self::StructuralHandle(handle) => {
                 Err(EvalValueError::BareStructuralHandle(handle.bare_error()))
             }
+            Self::PendingValue(slot) => Err(EvalValueError::PendingValue(Box::new(slot))),
             Self::ProvisionalReference { binding } => {
                 let value = Value::Deferred(crate::resource::DeferredValue::BindingRef { binding });
                 Ok((
@@ -463,6 +487,7 @@ impl EvalValue {
     pub(crate) fn module_argument_access_base(&self) -> Option<Value> {
         match self {
             Self::StructuralHandle(handle) => Some(handle.access_base_value()),
+            Self::PendingValue(_) => None,
             Self::ProvisionalReference { binding } => Some(Value::Deferred(
                 crate::resource::DeferredValue::BindingRef {
                     binding: binding.clone(),
@@ -486,6 +511,13 @@ impl EvalValue {
         }
     }
 
+    pub(crate) fn into_sink_value(self) -> Result<ParsedSinkValue, EvalValueError> {
+        match self {
+            Self::PendingValue(slot) => Ok(ParsedSinkValue::Pending(slot)),
+            other => other.into_value().map(ParsedSinkValue::Ready),
+        }
+    }
+
     /// True when this value is a `Closure`.
     pub(crate) fn is_closure(&self) -> bool {
         matches!(self, Self::Closure { .. })
@@ -502,6 +534,7 @@ impl EvalValue {
             Self::StructuralHandle(handle) => {
                 Err(EvalValueError::BareStructuralHandle(handle.bare_error()))
             }
+            Self::PendingValue(slot) => Err(EvalValueError::PendingValue(Box::new(slot))),
             Self::ProvisionalReference { binding } => Ok(Value::Deferred(
                 crate::resource::DeferredValue::BindingRef { binding },
             )),

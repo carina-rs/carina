@@ -67,6 +67,7 @@ fn empty_parsed() -> ParsedFile {
         requires: Vec::new(),
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
         deferred_for_expressions: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -91,7 +92,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     visit_refs_with_sink(
         &value,
         Some(RefSink::TypeExpr(&result_type)),
-        &mut |path, sink, _usage| visited.push((path.to_dot_string(), sink.is_none())),
+        &mut |path, sink, _usage, _candidate| visited.push((path.to_dot_string(), sink.is_none())),
     );
 
     assert_eq!(
@@ -698,7 +699,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
 }
 
 #[test]
-fn seeded_bare_structural_binding_is_rejected_as_a_value() {
+fn seeded_bare_structural_binding_is_a_typed_pending_slot() {
     let src = r#"
         let _ = aws.s3.Bucket {
             bucket_name = role
@@ -714,20 +715,72 @@ fn seeded_bare_structural_binding_is_rejected_as_a_value() {
         )),
         "role",
     );
-    let error = crate::parser::parse_with_seeded_bindings(
+    let parsed = crate::parser::parse_with_seeded_bindings(
         src,
         &crate::parser::ProviderContext::default(),
         &[crate::parser::BindingSeed::typed_structural(
             "role", &handle,
         )],
     )
-    .expect_err("a seeded structural handle is not a value");
+    .expect("a seeded structural handle reaches typed validation");
 
     assert!(
-        error
-            .to_string()
-            .contains("'role' is a resource, not a value"),
-        "unexpected error: {error}",
+        parsed.resources[0].attributes.get("bucket_name").is_none(),
+        "a pending structural leaf must not manufacture a runtime Value",
+    );
+    let use_site = parsed
+        .bare_binding_uses()
+        .uses()
+        .find(|use_site| use_site.name == "role")
+        .expect("seeded structural use");
+    assert!(matches!(
+        use_site.binding,
+        crate::parser::BareBindingKind::Structural { .. }
+    ));
+    assert_eq!(use_site.path.root_name(), "bucket_name");
+    assert_eq!(parsed.bare_binding_uses().pending_slots().count(), 1);
+}
+
+#[test]
+fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
+    let src = r#"
+        let _ = aws.s3.Bucket {
+            bucket_name = role
+        }
+    "#;
+    let handle = crate::eval_value::StructuralHandle::new(
+        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
+            "aws", "iam.Role",
+        )),
+        "role",
+    );
+    let parsed = crate::parser::parse_with_seeded_bindings(
+        src,
+        &crate::parser::ProviderContext::default(),
+        &[crate::parser::BindingSeed::typed_structural(
+            "role", &handle,
+        )],
+    )
+    .expect("a seeded structural handle reaches typed validation");
+    let schemas = SchemaRegistry::new();
+    let provider_context = ProviderContext::default();
+    let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let context =
+        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+    let report = check_bare_binding_uses(&parsed, &context);
+    let finding = report.findings().first().expect("binding-use finding");
+    let detail = finding.error.to_string();
+
+    assert!(finding.to_string().contains("at line 3"));
+    assert!(
+        !finding.to_string().contains(&detail),
+        "Display must not duplicate its Error::source(): {finding}",
+    );
+    let source = std::error::Error::source(finding).expect("typed resolution source");
+    assert_eq!(source.to_string(), detail);
+    assert!(
+        source.source().is_none(),
+        "a terminal resolution diagnostic must not repeat its own Display",
     );
 }
 
@@ -989,6 +1042,66 @@ let vpc = awscc.ec2.Vpc {
         unused,
         vec!["vpc"],
         "genuinely unused binding should still be warned"
+    );
+}
+
+#[test]
+fn block_local_shadow_use_does_not_mark_root_binding_used() {
+    let input = r#"
+        let shared = mock.test.Source {
+            name = "root"
+        }
+        mock.test.Consumer {
+            let shared = "local"
+            name = shared
+        }
+    "#;
+
+    assert_eq!(
+        check_unused_bindings(&authored_binding_view(input)),
+        vec!["shared"],
+        "the bare use resolves to the block-local declaration, not the root resource",
+    );
+}
+
+#[test]
+fn module_internal_use_does_not_mark_same_named_root_binding_used() {
+    let fixture = tempfile::tempdir().expect("module scope fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let shared = mock.test.Source { name = "root" }
+let inner_module = use { source = "./modules/inner" }
+inner_module {}
+"#,
+    )
+    .expect("write root fixture");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"let shared = "module-local"
+attributes { result: String = "ok" }
+mock.test.Consumer { name = shared }
+"#,
+    )
+    .expect("write module fixture");
+
+    let config = ProviderContext::default();
+    let schemas = SchemaRegistry::new();
+    let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
+        .expect("load module fixture");
+    crate::module_resolver::resolve_modules_with_config(
+        &mut parsed,
+        fixture.path(),
+        &config,
+        &schemas,
+    )
+    .expect("expand nested module");
+
+    assert_eq!(
+        check_unused_bindings_in_file(&parsed),
+        vec!["shared"],
+        "module-local provenance must not count as a use of the root binding",
     );
 }
 

@@ -17,17 +17,21 @@ mod static_eval;
 mod types;
 mod util;
 
+pub use crate::eval_value::StructuralHandleKind;
 pub use ast::{
-    ArgumentOrigin, ArgumentParameter, AttributeParameter, AuthoredArgumentRef, BackendConfig,
-    BindingName, CallExpansion, DeferredForExpansionError, DeferredForExpression, ExpansionKey,
-    ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile,
-    ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses,
-    ParsedExportParam, ParsedFile, ParserBindingMetadata, ProviderConfig, RequireBlock,
+    ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
+    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
+    BindingScopeId, BindingUseOwner, CallExpansion, DeferredForExpansionError,
+    DeferredForExpression, ExpansionKey, ExportParamLike, ExportParameter, File, FnParam,
+    InferredExportParam, InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
+    ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam, ParsedFile,
+    ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress,
     ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
     SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
     UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
     WaitBinding, expand_deferred_children,
 };
+pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
@@ -47,7 +51,10 @@ pub(crate) use entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::{parse, parse_and_resolve, parse_with_seeded_bindings};
-pub(crate) use entry::{parse_expression, parse_expression_eval};
+pub(crate) use entry::{
+    parse_expression, parse_expression_eval, parse_expression_eval_with_mode,
+    parse_expression_in_sink,
+};
 pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
@@ -87,7 +94,7 @@ pub(crate) use grammar::{PreprocessedFile, preprocess_file};
 
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{
-    parse_block_contents, parse_read_resource_expr, parse_resource_expr,
+    parse_block_contents_with_mode, parse_read_resource_expr, parse_resource_expr,
 };
 pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pair};
 pub use expressions::for_expr::ForBinding;

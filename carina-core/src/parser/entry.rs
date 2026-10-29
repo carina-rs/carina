@@ -14,20 +14,22 @@ use super::blocks::module_call::parse_module_call;
 use super::blocks::provider::{parse_provider_block, parse_require_statement};
 use super::blocks::resource::parse_anonymous_resource;
 use super::blocks::state::{parse_import_state_block, parse_moved_block, parse_removed_block};
-use super::context::{ParseBinding, ParseContext, first_inner};
+use super::context::{ExpressionMode, ParseBinding, ParseContext, first_inner};
 use super::error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
 use super::expressions::for_expr::{extract_for_iterable_name, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
-use super::expressions::pipe::parse_coalesce_expr;
+use super::expressions::pipe::{parse_coalesce_expr, parse_coalesce_expr_with_mode};
 use super::functions::parse_fn_def;
 use super::let_binding::{LetBindingKind, parse_let_binding_extended};
 use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
-use crate::eval_value::{EvalValue, EvalValueError, StructuralHandle, StructuralHandleMetadata};
+use crate::eval_value::{
+    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
+};
 use crate::resource::{DataSource, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -629,6 +631,7 @@ fn parse_with_seeded_bindings_inner(
     };
 
     let mut ctx = ParseContext::new(config);
+    ctx.set_source_scope(source_file);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
@@ -950,7 +953,12 @@ fn parse_with_seeded_bindings_inner(
                                 module_calls.push(call);
                             }
                             Rule::anonymous_resource => {
-                                let resource = parse_anonymous_resource(stmt, &ctx)?;
+                                let resource = parse_anonymous_resource(
+                                    stmt,
+                                    &ctx,
+                                    &preprocessed_file,
+                                    source_file,
+                                )?;
                                 resources.push(resource);
                             }
                             _ => {}
@@ -996,7 +1004,11 @@ fn parse_with_seeded_bindings_inner(
             }
             ParseBinding::Value {
                 value,
+                shared_value: _,
                 source_line: _,
+                declaration: _,
+                declared_type: _,
+                scope: _,
             } => {
                 if let Some(metadata) = value.structural_handle_metadata() {
                     parser_binding_metadata
@@ -1017,11 +1029,12 @@ fn parse_with_seeded_bindings_inner(
         let ParseBinding::Value {
             value: eval,
             source_line,
+            ..
         } = binding
         else {
             continue;
         };
-        match eval.into_value() {
+        match (*eval).into_value() {
             Ok(value) => {
                 variables.insert(name, value);
             }
@@ -1030,6 +1043,9 @@ fn parse_with_seeded_bindings_inner(
                 // pipe/call already consumed them if they were used.
             }
             Err(error @ EvalValueError::BareStructuralHandle(_)) => {
+                return Err(ParseError::from_eval_value(error, source_line));
+            }
+            Err(error @ EvalValueError::PendingValue(_)) => {
                 return Err(ParseError::from_eval_value(error, source_line));
             }
         }
@@ -1041,37 +1057,35 @@ fn parse_with_seeded_bindings_inner(
     // synthesizes composition resources (that is the module expander's job),
     // so `compositions` is empty here.
 
+    let parsed_binding_uses = ctx.take_parsed_binding_uses();
     let mut user_functions = Arc::unwrap_or_clone(ctx.user_functions);
     user_functions.retain(|name, _| !ctx.seeded_user_functions.contains(name));
 
-    Ok(ParsedFile {
-        providers,
-        resources,
-        data_sources,
-        // Virtual resources are synthesized by module-call expansion,
-        // not the parser — left empty here, populated in `expander.rs`.
-        compositions: Vec::new(),
-        variables,
-        uses,
-        module_calls,
-        arguments,
-        attribute_params,
-        export_params,
-        backend,
-        state_blocks,
-        user_functions,
-        upstream_states,
-        wait_bindings,
-        requires,
-        structural_bindings: ctx.structural_bindings,
-        parser_binding_metadata,
-        warnings: ctx.warnings,
-        deferred_for_expressions: ctx.deferred_for_expressions,
-        // The parser never synthesizes composition resources, so it
-        // never records lineage — the trace starts empty here and is
-        // populated by `module_resolver::expander` (#3306).
-        expansion_trace: crate::resource::ExpansionTrace::new(),
-    })
+    let mut parsed = ParsedFile::empty_with_parsed_binding_uses(parsed_binding_uses);
+    parsed.providers = providers;
+    parsed.resources = resources;
+    parsed.data_sources = data_sources;
+    // Virtual resources are synthesized by module-call expansion, not the
+    // parser; `ParsedFile::default()` leaves compositions empty here.
+    parsed.variables = variables;
+    parsed.uses = uses;
+    parsed.module_calls = module_calls;
+    parsed.arguments = arguments;
+    parsed.attribute_params = attribute_params;
+    parsed.export_params = export_params;
+    parsed.backend = backend;
+    parsed.state_blocks = state_blocks;
+    parsed.user_functions = user_functions;
+    parsed.upstream_states = upstream_states;
+    parsed.wait_bindings = wait_bindings;
+    parsed.requires = requires;
+    parsed.structural_bindings = ctx.structural_bindings;
+    parsed.parser_binding_metadata = parser_binding_metadata;
+    parsed.warnings = ctx.warnings;
+    parsed.deferred_for_expressions = ctx.deferred_for_expressions;
+    // The parser never synthesizes composition resources, so its default
+    // expansion trace remains empty until module expansion (#3306).
+    Ok(parsed)
 }
 
 fn collect_single_quoted_interpolation_warnings(
@@ -1217,6 +1231,17 @@ pub(crate) fn parse_expression(
         .map_err(|error| ParseError::from_eval_value(error, line))
 }
 
+pub(crate) fn parse_expression_in_sink(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<ParsedSinkValue, ParseError> {
+    let line = pair.line_col().0;
+    parse_expression_eval_with_mode(pair, ctx, mode)?
+        .into_sink_value()
+        .map_err(|error| ParseError::from_eval_value(error, line))
+}
+
 /// Parse an expression and return the raw `EvalValue`, preserving any
 /// closure produced during partial application. Only the pipe/compose
 /// paths and the let-binding RHS need this; everything else should
@@ -1228,6 +1253,15 @@ pub(crate) fn parse_expression_eval(
 ) -> Result<EvalValue, ParseError> {
     let inner = first_inner(pair, "expression body", "expression")?;
     parse_coalesce_expr(inner, ctx)
+}
+
+pub(crate) fn parse_expression_eval_with_mode(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
+    let inner = first_inner(pair, "expression body", "expression")?;
+    parse_coalesce_expr_with_mode(inner, ctx, mode)
 }
 
 /// Parse a .crn file and resolve resource references.

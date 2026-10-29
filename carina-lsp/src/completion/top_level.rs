@@ -428,6 +428,7 @@ impl CompletionProvider {
         arg_name: &str,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
             return Vec::new();
@@ -440,11 +441,29 @@ impl CompletionProvider {
         if !literal_items.is_empty() {
             return literal_items;
         }
+        // Provider schema types carry an owner-qualified identity. Resolve
+        // that identity through the same owner index used by validation so
+        // an enum parameter retains its member declaration instead of being
+        // flattened into a generic refined string.
+        let resolved_type =
+            carina_core::validation::resolve_type_expr(&arg.type_expr, provider_ctx)
+                .unwrap_or_else(|_| arg.type_expr.clone());
+        if let parser::TypeExpr::SchemaType { owned } = &resolved_type
+            && let Ok(Some(declaration)) = provider_ctx.enum_declaration(owned)
+        {
+            return self.value_completions_for_attribute_type(
+                &declaration,
+                &std::collections::BTreeMap::new(),
+                text,
+                base_path,
+            );
+        }
+
         // Type-driven path: lift to AttributeType and delegate to the
         // shared value-completion entry point so module-call values
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
-        if let Some(attr_type) = carina_core::validation::lift_type_expr(&arg.type_expr) {
+        if let Some(attr_type) = carina_core::validation::lift_type_expr(&resolved_type) {
             // Synthetic `attr_type` is built directly from a `TypeExpr`,
             // which never lowers to `AttributeType::Ref`; an empty map is
             // sufficient for compatibility checks that still accept defs.

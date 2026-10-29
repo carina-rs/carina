@@ -3,11 +3,13 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{AuthoredModuleArgument, ModuleArgument, ModuleCall, SourceSpan};
-use crate::parser::context::{ParseContext, next_pair};
+use crate::parser::ast::{
+    AuthoredModuleArgument, ModuleArgument, ModuleCall, ModuleCallId, SourceSpan,
+};
+use crate::parser::context::{ExpressionMode, ParseContext, StructuralSinkMode, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::grammar::PreprocessedFile;
-use crate::parser::parse_expression_eval;
+use crate::parser::parse_expression_eval_with_mode;
 use std::collections::HashMap;
 
 /// Parse module call
@@ -19,6 +21,7 @@ pub(crate) fn parse_module_call(
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
     let call_span = SourceSpan::from_pest(&pair, preprocessed_file);
+    let call_id = ModuleCallId::direct(source_file.to_path_buf(), call_span);
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -41,7 +44,17 @@ pub(crate) fn parse_module_call(
             let value_pair = next_pair(&mut arg_inner, "argument value", "module call argument")?;
             let value_source_span = SourceSpan::from_pest(&value_pair, preprocessed_file);
             let value_line = value_pair.line_col().0;
-            let eval = parse_expression_eval(value_pair, ctx)?;
+            let mode = ExpressionMode::module_argument(
+                call_id.clone(),
+                key.clone(),
+                source_file,
+                preprocessed_file,
+                StructuralSinkMode::DirectHandle,
+            );
+            let eval = parse_expression_eval_with_mode(value_pair, ctx, &mode)?;
+            if matches!(eval, crate::eval_value::EvalValue::PendingValue(_)) {
+                continue;
+            }
             let argument = match &eval {
                 crate::eval_value::EvalValue::StructuralHandle(handle) => {
                     ModuleArgument::from_handle(handle.clone())

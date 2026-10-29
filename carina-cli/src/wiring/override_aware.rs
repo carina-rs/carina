@@ -87,6 +87,17 @@ impl<E> CanonicalResourcePair<E> {
         Self { parsed, unresolved }
     }
 
+    pub(super) fn from_resolved_file(
+        parsed: carina_core::validation::ResolvedFile<E>,
+        unresolved: Vec<Resource>,
+    ) -> Self {
+        Self::new(parsed.into_file(), unresolved)
+    }
+
+    pub(super) fn into_parts(self) -> (File<E>, Vec<Resource>) {
+        (self.parsed, self.unresolved)
+    }
+
     pub(super) fn resolve_block_names(
         _access: &super::ValidationPipelineAccess,
         parsed: File<E>,
@@ -710,13 +721,9 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let canonical = CanonicalResourcePair::new(
-            carina_core::parser::ParsedFile {
-                resources: resources.clone(),
-                ..Default::default()
-            },
-            resources,
-        );
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        parsed.resources = resources.clone();
+        let canonical = CanonicalResourcePair::new(parsed, resources);
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
             Some(overrides),
