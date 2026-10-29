@@ -891,7 +891,7 @@ fn unwrap_secret(value: Value) -> Value {
 
 #[cfg(test)]
 mod provider_config_tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -949,7 +949,7 @@ mod provider_config_tests {
         }
 
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
                 AttributeType::enum_(
                     crate::schema::TypeIdentity::new(Some("test"), Vec::<String>::new(), "Region"),
@@ -1366,8 +1366,8 @@ mod provider_config_tests {
         let owned = OwnedTypeIdentity::with_owners(
             identity.clone(),
             NonEmptySchemaTypeOwners::try_from_iter([
-                SchemaTypeOwner::Provider("one".to_string()),
                 SchemaTypeOwner::Provider("two".to_string()),
+                SchemaTypeOwner::Provider("one".to_string()),
             ])
             .expect("two owners are non-empty"),
         );
@@ -1738,7 +1738,7 @@ mod provider_config_tests {
         }
 
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "endpoint".to_string(),
                 AttributeType::refined_string(
                     Some(TypeIdentity::new(
@@ -1856,7 +1856,7 @@ mod provider_config_tests {
         }
 
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
                 AttributeType::refined_string(None, Some(r"^good-[a-z]+$".to_string()), None, None),
             )]))

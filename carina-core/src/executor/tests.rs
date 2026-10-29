@@ -7869,7 +7869,6 @@ impl Provider for CascadeReplaceProvider {
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::differ::create_plan_with_cascades;
-    use crate::override_aware::OverrideAwareResources;
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
     fn string(value: &str) -> Value {
@@ -7978,14 +7977,20 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &schemas,
         &[managed_vpc.clone(), managed_subnet.clone()],
     );
-    let override_aware = OverrideAwareResources::from_parts_for_tests(
-        vec![managed_vpc, managed_subnet],
-        vec![unresolved_vpc, unresolved_subnet],
-    );
-    let unresolved =
-        ResolvedResource::collect_resolved(override_aware.paired_unresolved_resources()).unwrap();
-    let managed =
-        ResolvedResource::collect_resolved(override_aware.resources().iter().cloned()).unwrap();
+    let managed_resources = vec![managed_vpc, managed_subnet];
+    let authored_resources = vec![unresolved_vpc, unresolved_subnet];
+    let unresolved_resources = authored_resources
+        .iter()
+        .cloned()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                UnresolvedResource::from_pre_resolve(resource),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let unresolved = ResolvedResource::collect_resolved(authored_resources).unwrap();
+    let managed = ResolvedResource::collect_resolved(managed_resources.clone()).unwrap();
     let plan = create_plan_with_cascades(
         &managed,
         &unresolved,
@@ -8001,9 +8006,6 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     .expect("test provider hints should succeed");
     assert_eq!(plan.replace_display_info().count(), 2);
 
-    let unresolved_resources = override_aware
-        .unresolved_by_resolved_id()
-        .expect("test resources have distinct resolved ids");
     let deps = build_dependency_analysis(
         plan.effects(),
         &unresolved_resources,
@@ -8028,7 +8030,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         plan.effects()
     );
     let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-        managed: override_aware.resources(),
+        managed: &managed_resources,
         compositions: &[],
         managed_current: &plan_input_states,
         data_source_values: &DataSourceValues::empty(),

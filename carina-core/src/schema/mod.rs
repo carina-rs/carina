@@ -190,7 +190,6 @@ use std::sync::{Arc, OnceLock};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::config_loader::UnresolvedConfigSnapshot;
-use crate::override_aware::CanonicalResourcePair;
 use crate::parser::display_string_literal;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
@@ -7281,7 +7280,7 @@ pub enum UniqueNameSpec {
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
     pub(crate) resource_type: String,
-    pub(crate) attributes: HashMap<String, AttributeSchema>,
+    pub(crate) attributes: BTreeMap<String, AttributeSchema>,
     duplicate_attributes: Vec<String>,
     pub(crate) description: Option<String>,
     /// Cross-attribute validation, including its fingerprintable source.
@@ -7327,7 +7326,7 @@ pub struct ResourceSchema {
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceSchemaParts<'a> {
     pub resource_type: &'a str,
-    pub attributes: &'a HashMap<String, AttributeSchema>,
+    pub attributes: &'a BTreeMap<String, AttributeSchema>,
     pub description: Option<&'a str>,
     pub validation: &'a ResourceValidation,
     pub kind: SchemaKind,
@@ -7966,6 +7965,11 @@ impl ValidatedResourceSchema {
         self.schema.parts()
     }
 
+    /// Iterate top-level attributes in canonical-name order.
+    ///
+    /// [`ResourceSchema`] stores attributes in a [`BTreeMap`], so every
+    /// declaration, diagnostic, and completion walk gets the same order by
+    /// construction.
     pub fn effective_attributes(&self) -> impl Iterator<Item = EffectiveAttribute<'_>> {
         self.schema
             .attributes
@@ -8169,12 +8173,12 @@ impl ValidatedResourceSchema {
 /// Provider-config attribute types that have passed the shared graph validator.
 #[derive(Debug, Clone, Default)]
 pub struct ValidatedConfigSchema {
-    attribute_types: HashMap<String, AttributeType>,
+    attribute_types: BTreeMap<String, AttributeType>,
 }
 
 impl ValidatedConfigSchema {
     pub fn validate(
-        attribute_types: HashMap<String, AttributeType>,
+        attribute_types: BTreeMap<String, AttributeType>,
     ) -> Result<Self, ConfigSchemaValidationError> {
         let defs = BTreeMap::new();
         let mut issues = Vec::new();
@@ -8205,7 +8209,7 @@ impl ValidatedConfigSchema {
         }
     }
 
-    pub fn parts(&self) -> &HashMap<String, AttributeType> {
+    pub fn parts(&self) -> &BTreeMap<String, AttributeType> {
         &self.attribute_types
     }
 
@@ -8901,13 +8905,10 @@ impl WriteOnlySchemaConflict {
 }
 
 fn first_write_only_conflict_in(
-    attributes: &HashMap<String, AttributeSchema>,
+    attributes: &BTreeMap<String, AttributeSchema>,
     defs: &BTreeMap<String, AttributeType>,
 ) -> Option<WriteOnlySchemaConflict> {
-    let mut attributes = attributes.iter().collect::<Vec<_>>();
-    attributes.sort_unstable_by_key(|(name, _)| *name);
-
-    attributes.into_iter().find_map(|(name, attribute)| {
+    attributes.iter().find_map(|(name, attribute)| {
         let analysis = type_write_only_analysis(&attribute.attr_type, defs, &mut Vec::new());
         if analysis.field_mode_conflict {
             return Some(WriteOnlySchemaConflict {
@@ -9210,7 +9211,7 @@ impl ResourceSchema {
     pub fn new(resource_type: impl Into<String>) -> Self {
         Self {
             resource_type: resource_type.into(),
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             duplicate_attributes: Vec::new(),
             description: None,
             validation: ResourceValidation::None,
@@ -9359,7 +9360,7 @@ impl ResourceSchema {
         &self.resource_type
     }
 
-    pub fn attributes(&self) -> &HashMap<String, AttributeSchema> {
+    pub fn attributes(&self) -> &BTreeMap<String, AttributeSchema> {
         &self.attributes
     }
 
@@ -10647,14 +10648,17 @@ pub fn resolve_file_block_names_with_schemas<E>(
     }
 }
 
-/// Resolve an evaluated configuration and its authored snapshot in one
-/// schema-aware operation, returning the only resource pair accepted by the
-/// override-aware input boundary.
-pub fn resolve_config_block_names_with_schemas<E>(
+/// Resolve block names in an evaluated configuration and its authored
+/// snapshot in one schema-aware operation.
+///
+/// This raw primitive returns plain values and carries no pairing guarantee.
+/// Only carina-cli's validated-wiring transition may mint its canonical
+/// resource pair from these values.
+pub fn resolve_config_block_names<E>(
     mut parsed: crate::parser::File<E>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<CanonicalResourcePair<E>, Vec<BlockNameConflict>> {
+) -> Result<(crate::parser::File<E>, Vec<Resource>), Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
@@ -10664,7 +10668,7 @@ pub fn resolve_config_block_names_with_schemas<E>(
         }
     }
     if conflicts.is_empty() {
-        Ok(CanonicalResourcePair::new(parsed, unresolved.resources))
+        Ok((parsed, unresolved.resources))
     } else {
         Err(conflicts)
     }
@@ -11433,11 +11437,11 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// A rootless config type likewise cannot accept an arbitrary lookup:
 ///
 /// ```compile_fail
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 /// use carina_core::resource::{ConcreteValue, Value};
 /// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
 ///
-/// let config = ValidatedConfigSchema::validate(HashMap::from([
+/// let config = ValidatedConfigSchema::validate(BTreeMap::from([
 ///     ("name".to_string(), AttributeType::string()),
 /// ])).unwrap();
 /// let rootless = config.rootless_type("name").unwrap();

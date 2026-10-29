@@ -522,7 +522,7 @@ fn parse(
 }
 
 fn pathless_test_type(attr_type: AttributeType) -> carina_core::schema::RootlessType {
-    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+    carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
         "value".to_string(),
         attr_type,
     )]))
@@ -576,7 +576,7 @@ fn canonical_unresolved(
         resources,
         ..Default::default()
     };
-    carina_core::schema::resolve_config_block_names_with_schemas(
+    resolve_config_block_names_for_test(
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
@@ -604,7 +604,7 @@ fn canonical_pair<E: Clone>(
         resources: unresolved_resources,
         ..Default::default()
     };
-    carina_core::schema::resolve_config_block_names_with_schemas(
+    resolve_config_block_names_for_test(
         evaluated.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
@@ -618,7 +618,7 @@ fn build_override_aware_pair_for_test<S>(
     inputs: LivePreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String>
 where
-    S: carina_core::override_aware::NameOverrideSource + ?Sized,
+    S: carina_core::name_override::NameOverrideSource + ?Sized,
 {
     OverrideAwareResources::build_pair_with_stability(
         &unresolved,
@@ -1158,7 +1158,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resources: unresolved_resources.to_vec(),
         ..Default::default()
     };
-    let canonical_resources = carina_core::schema::resolve_config_block_names_with_schemas(
+    let canonical_resources = resolve_config_block_names_for_test(
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         ctx.schemas(),
@@ -1902,7 +1902,7 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
             "role_arn".to_string(),
             AttributeType::refined_string(
                 None,
@@ -5858,6 +5858,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     let unresolved = evaluated.clone();
 
     let canonical_unresolved = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5920,6 +5921,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let unresolved = evaluated.clone();
 
     let errors = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5956,6 +5958,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     let unresolved = evaluated.clone();
 
     let canonical = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5984,7 +5987,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
             "region".to_string(),
             carina_core::schema::AttributeType::enum_(
                 carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),

@@ -5,7 +5,7 @@
 //! performing live provider reads, so rendering works without installed
 //! providers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
@@ -14,9 +14,6 @@ use carina_core::differ::{
     Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
 };
 use carina_core::executor::UnresolvedResource;
-use carina_core::override_aware::{
-    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
-};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
@@ -29,8 +26,9 @@ use carina_state::{PublishedExports, StateFile, check_and_migrate};
 use crate::commands::plan::compute_export_diffs;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
-    ProviderLoad, ValidatedConfig, add_deferred_create_effects,
+    LateAnonymousIdentityInputs, LoadedProviderFactory, OverrideAwareBuildMode,
+    OverrideAwareResources, PlanPreparationError, PlanPreprocessor, ProviderLoad,
+    RebuildBindingsInputs, ValidatedConfig, add_deferred_create_effects,
     reconcile_late_anonymous_identities,
 };
 
@@ -850,7 +848,7 @@ fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, Validate
 }
 
 fn fixture_region_attribute_types(provider: &str) -> carina_core::schema::ValidatedConfigSchema {
-    carina_core::schema::ValidatedConfigSchema::validate(HashMap::from([(
+    carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
         "region".to_string(),
         AttributeType::enum_(
             TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),

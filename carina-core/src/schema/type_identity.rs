@@ -24,7 +24,9 @@
 use std::fmt;
 
 /// Structured identity of an `AttributeType::Custom`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TypeIdentity {
     /// Provider segment, e.g. `Some("aws")`. `None` when the type
     /// carries no provider axis — a truly provider-agnostic wrapper

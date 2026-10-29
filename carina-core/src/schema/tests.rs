@@ -849,7 +849,7 @@ fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
 
 #[test]
 fn config_schema_admission_rejects_dangling_refs_and_duplicate_fields() {
-    let types = HashMap::from([
+    let types = BTreeMap::from([
         ("direct".to_string(), AttributeType::ref_("Missing")),
         (
             "nested".to_string(),
@@ -889,9 +889,31 @@ fn schema_admission_rejects_one_identity_bound_to_multiple_scalar_kinds() {
         .expect_err("one provider schema cannot bind an identity as both String and Int");
 
     let rendered = error.to_string();
-    assert!(rendered.contains("test.widget.Value"), "{rendered}");
-    assert!(rendered.contains("String"), "{rendered}");
-    assert!(rendered.contains("Int"), "{rendered}");
+    assert_eq!(
+        rendered,
+        "resource schema `test.Widget` is invalid: text: custom type `test.widget.Value` is bound to both Int at count and String"
+    );
+}
+
+#[test]
+fn config_schema_admission_reports_scalar_kind_conflicts_in_canonical_root_order() {
+    let identity = TypeIdentity::new(Some("test"), ["config"], "Value");
+    let errors = ValidatedConfigSchema::validate(BTreeMap::from([
+        (
+            "z_text".to_string(),
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        ),
+        (
+            "a_count".to_string(),
+            AttributeType::refined_int(Some(identity), None),
+        ),
+    ]))
+    .expect_err("one config schema cannot bind an identity as both Int and String");
+
+    assert_eq!(
+        errors.to_string(),
+        "provider config schema is invalid: z_text: custom type `test.config.Value` is bound to both Int at a_count and String"
+    );
 }
 
 #[test]
@@ -971,7 +993,7 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
 
 #[test]
 fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
-    let errors = ValidatedConfigSchema::validate(HashMap::from([
+    let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
             AttributeType::enum_with_base(
@@ -1003,7 +1025,7 @@ fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
 
 #[test]
 fn config_schema_admission_allows_declared_user_input_below_provider_output() {
-    let types = HashMap::from([(
+    let types = BTreeMap::from([(
         "output".to_string(),
         AttributeType::struct_(
             "Output",
@@ -1032,7 +1054,7 @@ fn config_schema_effective_field_lookup_carries_provider_populated_ancestry() {
             vec![StructField::required("value", AttributeType::string()).build()],
         )
     };
-    let types = HashMap::from([
+    let types = BTreeMap::from([
         (
             "writable".to_string(),
             AttributeType::struct_(
@@ -1189,7 +1211,7 @@ fn attribute_schema_write_only_builder() {
 #[test]
 fn first_write_only_conflict_reports_lexicographically_first_attribute() {
     for _ in 0..8 {
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         for index in 0..32 {
             let name = format!("conflict_{index:02}");
             attributes.insert(
@@ -4476,24 +4498,16 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
         ..Default::default()
     };
 
-    let canonical_pair = resolve_config_block_names_with_schemas(
+    let (evaluated, unresolved) = resolve_config_block_names(
         evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("schema alias must resolve independently of the authored value shape");
 
-    assert!(
-        canonical_pair.parsed().resources[0]
-            .attributes
-            .contains_key("rules")
-    );
-    assert!(
-        !canonical_pair.parsed().resources[0]
-            .attributes
-            .contains_key("rule")
-    );
-    let unresolved = &canonical_pair.unresolved()[0].attributes;
+    assert!(evaluated.resources[0].attributes.contains_key("rules"));
+    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
+    let unresolved = &unresolved[0].attributes;
     assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
 }
@@ -4555,17 +4569,14 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         ..Default::default()
     };
 
-    let canonical_pair = resolve_config_block_names_with_schemas(
+    let (evaluated, unresolved) = resolve_config_block_names(
         evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("paired resolution must use the authored ambiguous-key decision");
 
-    for resource in [
-        &canonical_pair.parsed().resources[0],
-        &canonical_pair.unresolved()[0],
-    ] {
+    for resource in [&evaluated.resources[0], &unresolved[0]] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {
             Some(Value::Concrete(ConcreteValue::Map(map))) => map,
             _ => panic!("expected lifecycle map"),
@@ -4573,11 +4584,10 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         assert!(lifecycle.contains_key("transition"));
         assert!(!lifecycle.contains_key("transitions"));
     }
-    let unresolved_lifecycle =
-        match canonical_pair.unresolved()[0].get_attr("lifecycle_configuration") {
-            Some(Value::Concrete(ConcreteValue::Map(map))) => map,
-            _ => panic!("expected unresolved lifecycle map"),
-        };
+    let unresolved_lifecycle = match unresolved[0].get_attr("lifecycle_configuration") {
+        Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+        _ => panic!("expected unresolved lifecycle map"),
+    };
     assert_eq!(
         unresolved_lifecycle.get("transition"),
         Some(&unresolved_ref)

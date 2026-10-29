@@ -25,7 +25,7 @@ pub enum SchemaTypeOwner {
 /// Authored type names describe a semantic [`TypeIdentity`], not a factory.
 /// When several loaded factories declare that identity, an annotation must
 /// retain every owner so validation can apply their constraints conjunctively.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct NonEmptySchemaTypeOwners(BTreeSet<SchemaTypeOwner>);
 
@@ -72,7 +72,9 @@ impl<'de> serde::Deserialize<'de> for NonEmptySchemaTypeOwners {
 /// A bare [`TypeIdentity`] is descriptive metadata, not routing authority.
 /// Pairing it with its schema owner prevents two factories that expose the
 /// same identity from competing in an identity-only map.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct OwnedTypeIdentity {
     owners: NonEmptySchemaTypeOwners,
     identity: TypeIdentity,
@@ -517,7 +519,7 @@ pub trait CustomTypeResolver: Send + Sync {
 /// A provider-derived resolver whose recognition keys come from the same
 /// indexed schema snapshot as its validation implementation.
 pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
-    fn known_custom_types(&self) -> HashSet<OwnedTypeIdentity>;
+    fn known_custom_types(&self) -> BTreeSet<OwnedTypeIdentity>;
 }
 
 impl<F> CustomTypeResolver for F
@@ -557,7 +559,7 @@ pub struct ProviderCustomTypes {
 enum ProviderCustomTypeState {
     Unloaded,
     Loaded {
-        known: HashSet<OwnedTypeIdentity>,
+        known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
     },
 }
@@ -579,7 +581,10 @@ impl ProviderCustomTypes {
         resolver: CustomTypeValidatorFn,
     ) -> Self {
         Self {
-            state: ProviderCustomTypeState::Loaded { known, resolver },
+            state: ProviderCustomTypeState::Loaded {
+                known: known.into_iter().collect(),
+                resolver,
+            },
         }
     }
 
@@ -597,11 +602,11 @@ impl ProviderCustomTypes {
         matches!(self.state, ProviderCustomTypeState::Loaded { .. })
     }
 
-    pub fn known(&self) -> &HashSet<OwnedTypeIdentity> {
+    pub fn known(&self) -> &BTreeSet<OwnedTypeIdentity> {
         match &self.state {
             ProviderCustomTypeState::Unloaded => {
-                static EMPTY: std::sync::LazyLock<HashSet<OwnedTypeIdentity>> =
-                    std::sync::LazyLock::new(HashSet::new);
+                static EMPTY: std::sync::LazyLock<BTreeSet<OwnedTypeIdentity>> =
+                    std::sync::LazyLock::new(BTreeSet::new);
                 &EMPTY
             }
             ProviderCustomTypeState::Loaded {
@@ -657,7 +662,7 @@ impl ProviderContext {
         self.custom_types.is_loaded()
     }
 
-    pub fn known_custom_types(&self) -> &HashSet<OwnedTypeIdentity> {
+    pub fn known_custom_types(&self) -> &BTreeSet<OwnedTypeIdentity> {
         self.custom_types.known()
     }
 

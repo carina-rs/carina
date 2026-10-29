@@ -329,9 +329,10 @@ mod tests {
     use carina_core::schema::{
         AttributeType, RootlessType, TypeIdentity, ValidatedConfigSchema, validator,
     };
+    use std::collections::BTreeMap;
 
     fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
-        ValidatedConfigSchema::validate(HashMap::from([("value".to_string(), attr_type)]))
+        ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
             .expect("test config type must be valid")
             .rootless_type("value")
             .expect("test config type must exist")

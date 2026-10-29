@@ -1,6 +1,10 @@
 //! Permanent name override decision primitives.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::resource::ResourceId;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NameOverride {
@@ -10,6 +14,26 @@ pub struct NameOverride {
     /// original was not captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_value: Option<String>,
+}
+
+/// Minimal state-like surface for reading permanent name overrides.
+///
+/// The trait remains in core so state backends can implement it without
+/// depending on CLI validation wiring.
+pub trait NameOverrideSource {
+    fn name_overrides_for(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&HashMap<String, NameOverride>>;
+}
+
+impl NameOverrideSource for HashMap<ResourceId, HashMap<String, NameOverride>> {
+    fn name_overrides_for(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&HashMap<String, NameOverride>> {
+        self.get(resource_id)
+    }
 }
 
 #[derive(Deserialize)]

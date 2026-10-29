@@ -1,7 +1,7 @@
 //! Value conversion and formatting utilities
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 
 use indexmap::IndexMap;
@@ -6116,7 +6116,7 @@ impl ProviderConfigCanonicalizationError {
 pub(crate) fn canonicalize_provider_config_attributes_with_types(
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
-    attr_types: &HashMap<String, AttributeType>,
+    attr_types: &BTreeMap<String, AttributeType>,
 ) -> Result<IndexMap<String, Value>, ProviderConfigCanonicalizationError> {
     let mut canonical = IndexMap::with_capacity(attributes.len());
     for (attribute, value) in attributes {
@@ -8549,7 +8549,7 @@ mod tests {
         ];
 
         let providers = canonicalize_provider_configs_with_schemas(&providers, &|_provider| {
-            crate::schema::ValidatedConfigSchema::validate(HashMap::from([(
+            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
                 AttributeType::enum_(
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -8580,7 +8580,7 @@ mod tests {
     fn provider_config_accepts_identity_or_configured_provider_namespace_only() {
         use crate::schema::{AttributeType, TypeIdentity};
 
-        let attr_types = HashMap::from([(
+        let attr_types = BTreeMap::from([(
             "region".to_string(),
             AttributeType::enum_(
                 TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
@@ -8626,7 +8626,7 @@ mod tests {
     fn provider_config_alias_namespace_must_preserve_type_segments() {
         use crate::schema::{AttributeType, TypeIdentity};
 
-        let attr_types = HashMap::from([(
+        let attr_types = BTreeMap::from([(
             "state".to_string(),
             AttributeType::enum_(
                 TypeIdentity::new(Some("origin"), ["compute", "Instance"], "State"),
@@ -8715,7 +8715,7 @@ mod tests {
         let untyped = canonicalize_provider_config_attributes_with_types(
             "test",
             &attributes,
-            &HashMap::new(),
+            &BTreeMap::new(),
         )
         .expect_err("an untyped provider config must reject the unresolved enum");
         let display = untyped.to_string();

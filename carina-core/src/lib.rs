@@ -34,7 +34,6 @@ pub mod module;
 pub mod module_resolver;
 pub mod name_override;
 pub(crate) mod non_empty;
-pub mod override_aware;
 pub mod parser;
 pub mod plan;
 pub mod plan_tree;

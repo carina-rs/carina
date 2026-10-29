@@ -2,7 +2,6 @@ use super::*;
 
 use std::collections::HashSet;
 
-use crate::override_aware::OverrideAwareResources;
 use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -126,10 +125,9 @@ fn plan_for(
     current_states: HashMap<ResourceId, State>,
     schemas: &SchemaRegistry,
 ) -> Plan {
-    let managed = OverrideAwareResources::from_parts_for_tests(managed, unresolved);
-    let unresolved = ResolvedResource::collect_resolved(managed.paired_unresolved_resources())
+    let unresolved = ResolvedResource::collect_resolved(unresolved)
         .expect("cascade test resources must have resolved identities");
-    let resolved = ResolvedResource::collect_resolved(managed.resources().iter().cloned())
+    let resolved = ResolvedResource::collect_resolved(managed)
         .expect("cascade test resources must have resolved identities");
     let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
         current_states,
