@@ -326,11 +326,16 @@ struct MockProvider {
 
 enum ClassifiedCreateFixture {
     Created,
+    CreatedNotFound,
+    CreatedReadFailed,
     InFlight,
 }
 
 enum ResumeFixture {
     Resumed,
+    CreatedFound,
+    CreatedNotFound,
+    CreatedReadFailed,
     Ended,
     ResentInFlightWithInvalidSent,
 }
@@ -498,6 +503,28 @@ impl Provider for MockProvider {
                                 ProviderError::api_error("post-create fixture failed"),
                             ))
                     }
+                    ClassifiedCreateFixture::CreatedNotFound => {
+                        let identifier = AppliedIdentifier::new("created-id")
+                            .expect("fixture identifier is non-empty");
+                        Err(attempt
+                            .issued(identifier, crate::provider::Sent::AllRequestAttributes)
+                            .failed(
+                                crate::provider::Observation::Read(ReadOutcome::not_found(id)),
+                                ProviderError::api_error("post-create fixture failed"),
+                            ))
+                    }
+                    ClassifiedCreateFixture::CreatedReadFailed => {
+                        let identifier = AppliedIdentifier::new("created-id")
+                            .expect("fixture identifier is non-empty");
+                        Err(attempt
+                            .issued(identifier, crate::provider::Sent::AllRequestAttributes)
+                            .failed(
+                                crate::provider::Observation::ReadFailed(ProviderError::api_error(
+                                    "read-back access denied",
+                                )),
+                                ProviderError::api_error("post-create fixture failed"),
+                            ))
+                    }
                     ClassifiedCreateFixture::InFlight => {
                         let pending = attempt.pending(
                             crate::provider::PendingToken::new("fixture-create-token"),
@@ -545,6 +572,55 @@ impl Provider for MockProvider {
                         )]),
                     );
                     Ok(resumed.completed(observed))
+                }
+                ResumeFixture::CreatedFound => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "created-found fixture requires an issued continuation",
+                        )));
+                    };
+                    let id = resumed.id().clone();
+                    let identifier = resumed.identifier().clone();
+                    let observed = AppliedState::from_identifier(
+                        id,
+                        identifier,
+                        HashMap::from([(
+                            "id".to_string(),
+                            Value::Concrete(ConcreteValue::String("created-id".into())),
+                        )]),
+                    );
+                    Err(resumed.failed(
+                        crate::provider::Observation::Read(ReadOutcome::found(observed)),
+                        ProviderError::api_error("resumed create fixture failed"),
+                    ))
+                }
+                ResumeFixture::CreatedNotFound => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "created-not-found fixture requires an issued continuation",
+                        )));
+                    };
+                    let id = resumed.id().clone();
+                    Err(resumed.failed(
+                        crate::provider::Observation::Read(ReadOutcome::not_found(id)),
+                        ProviderError::api_error("resumed create fixture failed"),
+                    ))
+                }
+                ResumeFixture::CreatedReadFailed => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "created-read-failed fixture requires an issued continuation",
+                        )));
+                    };
+                    Err(resumed.failed(
+                        crate::provider::Observation::ReadFailed(ProviderError::api_error(
+                            "resumed read-back access denied",
+                        )),
+                        ProviderError::api_error("resumed create fixture failed"),
+                    ))
                 }
                 ResumeFixture::Ended => {
                     let (resume, _create_request) = request.into_parts();
@@ -695,6 +771,14 @@ impl MockObserver {
     fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
     }
+}
+
+fn effect_failure_event<'a>(events: &'a [String], id: &ResourceId) -> &'a str {
+    let prefix = format!("failed:{id}:");
+    events
+        .iter()
+        .find(|event| event.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("missing EffectFailed event for {id}: {events:?}"))
 }
 
 impl ExecutionObserver for MockObserver {
@@ -1991,6 +2075,16 @@ async fn execute_lifecycle_fixture(
     plan: &Plan,
     managed_current: HashMap<ResourceId, Current>,
 ) -> ExecutionResult {
+    execute_lifecycle_fixture_with_observer(provider, plan, managed_current, &MockObserver::new())
+        .await
+}
+
+async fn execute_lifecycle_fixture_with_observer(
+    provider: &MockProvider,
+    plan: &Plan,
+    managed_current: HashMap<ResourceId, Current>,
+    observer: &MockObserver,
+) -> ExecutionResult {
     let input = ExecutionInput {
         plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
@@ -2006,15 +2100,7 @@ async fn execute_lifecycle_fixture(
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
     };
-    completed_result(
-        execute_plan(
-            provider,
-            input,
-            &MockObserver::new(),
-            uncancelled_shutdown(),
-        )
-        .await,
-    )
+    completed_result(execute_plan(provider, input, observer, uncancelled_shutdown()).await)
 }
 
 #[tokio::test]
@@ -2080,9 +2166,12 @@ async fn resume_resumed_publishes_observed() {
         ),
         (2, 0, 0)
     );
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("completed resume did not write an observed create")
+    };
     assert!(matches!(
-        result.applied_states.get(&source_id),
-        Some(Applied::Observed(_))
+        created.observation(),
+        crate::provider::CreateObservation::Observed(_)
     ));
     assert!(matches!(
         result.applied_states.get(&dependent_id),
@@ -2236,6 +2325,7 @@ async fn resume_ended_skips_dependents_and_marks_create_ended() {
 #[tokio::test]
 async fn created_failure_records_observation() {
     let provider = MockProvider::new();
+    let observer = MockObserver::new();
     let source = make_resource("source", &[]);
     let dependent = make_resource("dependent", &["source"]);
     let source_id = source.id.clone();
@@ -2245,7 +2335,8 @@ async fn created_failure_records_observation() {
     plan.add(create_effect(dependent));
     provider.push_classified_create(ClassifiedCreateFixture::Created);
 
-    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+    let result =
+        execute_lifecycle_fixture_with_observer(&provider, &plan, HashMap::new(), &observer).await;
 
     assert_eq!(
         (
@@ -2255,11 +2346,178 @@ async fn created_failure_records_observation() {
         ),
         (0, 1, 1)
     );
-    assert!(matches!(
-        result.applied_states.get(&source_id),
-        Some(Applied::Observed(_))
-    ));
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
     assert!(!result.applied_states.contains_key(&dependent_id));
+    let events = observer.events();
+    assert_eq!(
+        effect_failure_event(&events, &source_id),
+        format!(
+            "failed:{source_id}:post-create fixture failed\nresource created; recorded in state, the next apply completes it"
+        )
+    );
+}
+
+#[tokio::test]
+async fn created_failure_not_found_reports_unobserved_and_records_identifier() {
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let mut source = make_resource("source", &[]);
+    source.id.provider = "test".to_string();
+    let source_id = source.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    provider.push_classified_create(ClassifiedCreateFixture::CreatedNotFound);
+
+    let result =
+        execute_lifecycle_fixture_with_observer(&provider, &plan, HashMap::new(), &observer).await;
+
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
+    let events = observer.events();
+    let failure = effect_failure_event(&events, &source_id);
+    assert_eq!(
+        failure,
+        format!(
+            "failed:{source_id}:post-create fixture failed\ntest reported identifier 'created-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: provider read after create returned not found"
+        )
+    );
+}
+
+#[tokio::test]
+async fn created_failure_read_failed_reports_unobserved_and_records_identifier() {
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let mut source = make_resource("source", &[]);
+    source.id.provider = "test".to_string();
+    let source_id = source.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    provider.push_classified_create(ClassifiedCreateFixture::CreatedReadFailed);
+
+    let result =
+        execute_lifecycle_fixture_with_observer(&provider, &plan, HashMap::new(), &observer).await;
+
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
+    let events = observer.events();
+    let failure = effect_failure_event(&events, &source_id);
+    assert_eq!(
+        failure,
+        format!(
+            "failed:{source_id}:post-create fixture failed\ntest reported identifier 'created-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: read-back access denied"
+        )
+    );
+}
+
+#[tokio::test]
+async fn resumed_created_failure_found_reports_observed_note() {
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let mut source = make_resource("source", &[]);
+    source.id.provider = "test".to_string();
+    let source_id = source.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    provider.push_resume(ResumeFixture::CreatedFound);
+
+    let result = execute_lifecycle_fixture_with_observer(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+        &observer,
+    )
+    .await;
+
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("resumed created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
+    assert!(matches!(
+        created.observation(),
+        crate::provider::CreateObservation::Observed(_)
+    ));
+    let events = observer.events();
+    assert_eq!(
+        effect_failure_event(&events, &source_id),
+        format!(
+            "failed:{source_id}:resumed create fixture failed\nresource created; recorded in state, the next apply completes it"
+        )
+    );
+}
+
+#[tokio::test]
+async fn resumed_created_failure_not_found_reports_unobserved_and_records_identifier() {
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let mut source = make_resource("source", &[]);
+    source.id.provider = "test".to_string();
+    let source_id = source.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    provider.push_resume(ResumeFixture::CreatedNotFound);
+
+    let result = execute_lifecycle_fixture_with_observer(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+        &observer,
+    )
+    .await;
+
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("resumed created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
+    let events = observer.events();
+    let failure = effect_failure_event(&events, &source_id);
+    assert_eq!(
+        failure,
+        format!(
+            "failed:{source_id}:resumed create fixture failed\ntest reported identifier 'created-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: provider read after create returned not found"
+        )
+    );
+}
+
+#[tokio::test]
+async fn resumed_created_failure_read_failed_reports_reason() {
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let mut source = make_resource("source", &[]);
+    source.id.provider = "test".to_string();
+    let source_id = source.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    provider.push_resume(ResumeFixture::CreatedReadFailed);
+
+    let result = execute_lifecycle_fixture_with_observer(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+        &observer,
+    )
+    .await;
+
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("resumed created failure did not retain an observed create")
+    };
+    assert_eq!(created.identifier().as_str(), "created-id");
+    let events = observer.events();
+    assert_eq!(
+        effect_failure_event(&events, &source_id),
+        format!(
+            "failed:{source_id}:resumed create fixture failed\ntest reported identifier 'created-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: resumed read-back access denied"
+        )
+    );
 }
 
 #[tokio::test]

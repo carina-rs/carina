@@ -12,8 +12,8 @@ use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
-    AppliedIdentifier, EmptyAppliedIdentifier, InFlightCreate, InFlightPersistence,
-    NestedWriteOnlyRecord, Observation, ObservedCreate, PersistedAttributes,
+    AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
+    InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
     PersistedAttributesError, RawSavedAttrs, Sent, SentRecord, StateRowInFlightCreate,
     StateTransformMap, merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
@@ -2971,11 +2971,12 @@ impl ResourceState {
         )
     }
 
-    /// Build an applied row for a create that exists but whose finishing step
-    /// failed. Values are selected strictly as observed, then sent, then
-    /// absent. Desired state controls masking but cannot introduce an unsent
-    /// value. The observed create establishes the current desired resource as
-    /// the authoring baseline.
+    /// Build an applied row for a create whose provider reported an identifier
+    /// but whose finishing step failed. The typed observation says whether the
+    /// resource was found. Values are selected strictly as observed, then sent,
+    /// then absent. Desired state controls masking but cannot introduce an
+    /// unsent value. The create establishes the current desired resource as the
+    /// authoring baseline.
     pub fn from_observation(
         resource: &ResolvedResource,
         created: &ObservedCreate,
@@ -2990,14 +2991,10 @@ impl ResourceState {
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, incomplete_detail) = match created.observation() {
-            Observation::Read(carina_core::provider::ReadOutcome::Found { state }) => {
-                (state.attributes(), None)
+            CreateObservation::Observed(state) => (state.attributes(), None),
+            CreateObservation::Unobserved(reason) => {
+                (&no_observed_values, Some(reason.to_string()))
             }
-            Observation::Read(carina_core::provider::ReadOutcome::NotFound { id: _id }) => (
-                &no_observed_values,
-                Some("provider read after create returned not found".to_string()),
-            ),
-            Observation::ReadFailed(error) => (&no_observed_values, Some(error.to_string())),
         };
         let mut selected = SelectedStateAttributes::try_from_provider_values(
             observed_values,

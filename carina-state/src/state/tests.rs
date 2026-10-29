@@ -6308,8 +6308,8 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, Observation, ObservedCreate, PendingToken,
-        PersistedAttributes, ReadOutcome, Sent,
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        PendingToken, PersistedAttributes, Sent,
     };
 
     let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
@@ -6346,7 +6346,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
     let created = ObservedCreate::from_in_flight_for_test(
         pending,
         identifier,
-        Observation::Read(ReadOutcome::found(observed_state)),
+        CreateObservation::Observed(observed_state),
     );
 
     let row =
@@ -6369,11 +6369,110 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 }
 
 #[test]
+fn unobserved_not_found_create_records_identifier_and_partial_read() {
+    use carina_core::provider::{
+        AppliedIdentifier, CreateAttempt, CreateFailureKind, CreateObservation, Observation,
+        ProviderError, ReadOutcome, Sent, UnobservedReason,
+    };
+
+    let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
+        "log_group_name",
+        Value::Concrete(ConcreteValue::String("application-logs".into())),
+    );
+    let identifier = AppliedIdentifier::new("application-logs").unwrap();
+    let failure = CreateAttempt::for_test(resource.id.clone())
+        .issued(identifier.clone(), Sent::only(Vec::<String>::new()))
+        .failed(
+            Observation::Read(ReadOutcome::not_found(resource.id.clone())),
+            ProviderError::api_error("create access denied"),
+        );
+    let created = match failure.into_kind() {
+        CreateFailureKind::Created { created, error: _ } => created,
+        CreateFailureKind::Untracked(error) => {
+            panic!("identifier-bearing failure became untracked: {error}")
+        }
+        CreateFailureKind::InFlight { pending, error } => {
+            panic!("identifier-bearing failure remained in flight {pending:?}: {error}")
+        }
+    };
+
+    match created.observation() {
+        CreateObservation::Observed(state) => {
+            panic!("not-found read-back became observed: {state:?}")
+        }
+        CreateObservation::Unobserved(reason) => match reason {
+            UnobservedReason::NotFound => {}
+            UnobservedReason::ReadFailed(error) => {
+                panic!("not-found read-back became a read failure: {error}")
+            }
+        },
+    }
+
+    let row = ResourceState::from_observation(&resolved(&resource), &created, None, None, None)
+        .expect("unobserved create must remain persistable");
+
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("application-logs")
+    );
+    assert_eq!(
+        row.partial_read(),
+        Some(&PartialReadMarker {
+            detail: "provider read after create returned not found".to_string(),
+            missing_attributes: BTreeSet::from(["log_group_name".to_string()]),
+        })
+    );
+}
+
+#[test]
+fn unobserved_read_failed_observation_records_identifier_and_provider_error_detail() {
+    use carina_core::provider::{
+        AppliedIdentifier, CreateAttempt, CreateFailureKind, Observation, ProviderError, Sent,
+    };
+
+    let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
+        "log_group_name",
+        Value::Concrete(ConcreteValue::String("application-logs".into())),
+    );
+    let identifier = AppliedIdentifier::new("application-logs").unwrap();
+    let read_error = ProviderError::api_error("read-back access denied");
+    let read_error_display = read_error.to_string();
+    let failure = CreateAttempt::for_test(resource.id.clone())
+        .issued(identifier, Sent::only(Vec::<String>::new()))
+        .failed(
+            Observation::ReadFailed(read_error),
+            ProviderError::api_error("create finishing failed"),
+        );
+    let created = match failure.into_kind() {
+        CreateFailureKind::Created { created, error: _ } => created,
+        CreateFailureKind::Untracked(error) => {
+            panic!("identifier-bearing failure became untracked: {error}")
+        }
+        CreateFailureKind::InFlight { pending, error } => {
+            panic!("identifier-bearing failure remained in flight {pending:?}: {error}")
+        }
+    };
+
+    let row = ResourceState::from_observation(&resolved(&resource), &created, None, None, None)
+        .expect("read-failed create must remain persistable");
+
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("application-logs")
+    );
+    assert_eq!(
+        row.partial_read().map(|partial| partial.detail.as_str()),
+        Some(read_error_display.as_str())
+    );
+}
+
+#[test]
 fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::{Diff, diff};
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateFailureKind, Observation,
-        ObservedCreate, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateFailureKind, CreateObservation,
+        Observation, ObservedCreate, PendingToken, PersistedAttributes, ProviderError, ReadOutcome,
+        Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
     use carina_core::schema::{
@@ -6451,14 +6550,13 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             "issuer".to_string(),
             issuer(),
         )]))));
-        let observation = || {
-            let observed_state = AppliedState::new(
+        let observed_state = || {
+            AppliedState::new(
                 resource.id.clone(),
                 identifier.as_str(),
                 HashMap::from([("default_actions".to_string(), observed_actions.clone())]),
             )
-            .unwrap();
-            Observation::Read(ReadOutcome::found(observed_state))
+            .unwrap()
         };
         let created = if persisted_envelope {
             let sent_actions = PersistedValue::encode_desired_value(
@@ -6478,12 +6576,16 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
                 .persist(PersistedAttributes::default(), sent_secrets);
-            ObservedCreate::from_in_flight_for_test(pending, identifier.clone(), observation())
+            ObservedCreate::from_in_flight_for_test(
+                pending,
+                identifier.clone(),
+                CreateObservation::Observed(observed_state()),
+            )
         } else {
             let failed = CreateAttempt::for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .failed(
-                    observation(),
+                    Observation::Read(ReadOutcome::found(observed_state())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
             match failed.into_kind() {

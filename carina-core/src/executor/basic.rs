@@ -16,9 +16,9 @@ use crate::executor::provider_ready::{
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CreateFailureKind, CreateRequest, DeleteRequest, PartialReadDiagnostic,
-    Provider, ProviderReadyResource, ReadRequest, ResumeCreateRequest, ResumeFailureKind,
-    ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
+    PartialReadDiagnostic, Provider, ProviderReadyResource, ReadRequest, ResumeCreateRequest,
+    ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -58,7 +58,7 @@ pub(super) enum BasicEffectResult {
         refresh: Option<(ResourceId, AppliedIdentifier)>,
     },
     ResumeSuccess {
-        created: crate::provider::ObservedCreate,
+        completed: CompletedResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
         binding: Option<String>,
@@ -579,12 +579,12 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             }
         }
         BasicEffectResult::ResumeSuccess {
-            created,
+            completed,
             resource_id,
             resolved_attrs,
             binding,
         } => {
-            let state = created.observed_state();
+            let state = completed.observed_state();
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated
@@ -593,7 +593,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             });
             exec.accumulator.insert_published(
                 resource_id,
-                Applied::Observed(std::sync::Arc::new(created)),
+                Applied::Observed(std::sync::Arc::new(completed.into_observed_create())),
                 &state,
             );
         }
@@ -772,9 +772,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     CreateFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let error_str = format!(
-                            "{error}\nresource created; recorded in state, the next apply completes it"
-                        );
+                        let error_str = format!("{error}\n{}", created.post_error_note());
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
@@ -854,9 +852,10 @@ pub(super) async fn execute_basic_effect<'a>(
                 .await
                 .map(crate::provider::ResumeOutcome::into_kind)
             {
-                Ok(ResumeOutcomeKind::Resumed(created)) => {
-                    let created = created.with_resolved_desired_attributes(resolved_attrs.clone());
-                    let state = created.observed_state();
+                Ok(ResumeOutcomeKind::Resumed(completed)) => {
+                    let completed =
+                        completed.with_resolved_desired_attributes(resolved_attrs.clone());
+                    let state = completed.observed_state();
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
                         state: Some(&state),
@@ -864,7 +863,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         progress,
                     });
                     BasicEffectResult::ResumeSuccess {
-                        created,
+                        completed,
                         resource_id: resource.id.clone(),
                         resolved_attrs,
                         binding: resource.binding.clone(),
@@ -927,9 +926,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     ResumeFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let error = format!(
-                            "{error}\nresource created; recorded in state, the next apply completes it"
-                        );
+                        let error = format!("{error}\n{}", created.post_error_note());
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error,

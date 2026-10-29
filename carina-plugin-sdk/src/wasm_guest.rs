@@ -942,8 +942,8 @@ macro_rules! export_provider {
                 /// undetermined there regardless of identifier issuance.
                 UnissuedPendingToken(wit_types::ProviderError),
                 IssuedPendingToken(wit_types::CreatedFailure),
-                /// A finished result established that the resource exists;
-                /// only its returned attributes failed to cross the boundary.
+                /// A finished result established an identifier; only its
+                /// returned attributes failed to cross the boundary.
                 CreatedAttributes(wit_types::CreatedFailure),
             }
 
