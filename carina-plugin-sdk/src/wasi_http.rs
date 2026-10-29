@@ -196,17 +196,13 @@ impl std::error::Error for TransportFailure {}
 
 /// Return the send phase carried by a connector error from this transport.
 ///
-/// This walks the complete source chain. `None` means the connector error did
-/// not originate from this transport and must not be interpreted as NotSent.
+/// Only a [`TransportFailure`] that is the direct source of the connector error
+/// counts. A transport failure nested deeper under another error returns
+/// `None`, which callers must treat as unknown or [`SendPhase::MaybeSent`].
 pub fn send_phase_of(error: &ConnectorError) -> Option<SendPhase> {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = current {
-        if let Some(failure) = error.downcast_ref::<TransportFailure>() {
-            return Some(failure.phase());
-        }
-        current = error.source();
-    }
-    None
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<TransportFailure>())
+        .map(TransportFailure::phase)
 }
 
 /// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
@@ -348,6 +344,21 @@ fn connector_error(error: TransportFailure) -> ConnectorError {
     } else {
         ConnectorError::other(source, None)
     }
+}
+
+/// Build a transport connector error for downstream native tests.
+///
+/// This test-only helper exists so downstream tests can exercise the
+/// [`SendPhase::NotSent`] branch using the same construction as production.
+#[cfg(feature = "test-utils")]
+pub fn transport_connector_error_for_test(phase: SendPhase) -> ConnectorError {
+    let failure = match phase {
+        SendPhase::NotSent => PreSendError::new("test request was not sent").into(),
+        SendPhase::MaybeSent => {
+            TransportFailure::maybe_sent("test request may have been sent", None)
+        }
+    };
+    connector_error(failure)
 }
 
 struct PreparedRequest {
@@ -887,24 +898,35 @@ mod tests {
     }
 
     #[test]
-    fn send_phase_of_finds_transport_failures_and_rejects_foreign_sources() {
+    fn send_phase_of_accepts_direct_transport_failures_and_rejects_wrapped_or_foreign_sources() {
         let not_sent = connector_error(PreSendError::new("request was not sent").into());
         assert_eq!(send_phase_of(&not_sent), Some(SendPhase::NotSent));
 
-        let maybe_sent = ConnectorError::other(
-            Box::new(WrappedTransportFailure(TransportFailure::from_code(
-                "response timed out",
-                ErrorCode::ConnectionReadTimeout,
-            ))),
+        let maybe_sent = connector_error(TransportFailure::maybe_sent(
+            "request may have been sent",
             None,
-        );
+        ));
         assert_eq!(send_phase_of(&maybe_sent), Some(SendPhase::MaybeSent));
+
+        let wrapped_not_sent = ConnectorError::io(Box::new(WrappedTransportFailure(
+            PreSendError::new("request was not sent").into(),
+        )));
+        assert_eq!(send_phase_of(&wrapped_not_sent), None);
 
         let foreign = ConnectorError::other(
             Box::new(std::io::Error::other("foreign connector error")),
             None,
         );
         assert_eq!(send_phase_of(&foreign), None);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn transport_connector_error_for_test_preserves_send_phase() {
+        for phase in [SendPhase::NotSent, SendPhase::MaybeSent] {
+            let error = transport_connector_error_for_test(phase);
+            assert_eq!(send_phase_of(&error), Some(phase));
+        }
     }
 
     #[test]

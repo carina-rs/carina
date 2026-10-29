@@ -9,7 +9,7 @@ pub use carina_provider_protocol::types;
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod wasm_guest;
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test, feature = "test-utils"))]
 pub mod wasi_http;
 
 // `wasi_http_body` is compiled for every target so its pure-Rust
