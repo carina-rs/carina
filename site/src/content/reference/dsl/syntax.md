@@ -97,9 +97,9 @@ provider awscc {
 }
 ```
 
-`source` is required; `carina init` uses it to install the provider plugin. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a branch or tag; a commit SHA only with a `github.com/...` source) pins which build is installed. The two are mutually exclusive.
+`source` is required; `carina init` uses it to install the provider plugin. The block's name must match the name the provider itself reports (`aws` for `carina-rs/aws`, `awscc` for `carina-rs/awscc`); otherwise loading fails with `configured provider name '<name>' does not match artifact-reported name '<reported>'`. It is a registry address (`carina-rs/awscc`, or `host/namespace/name`), a GitHub repository (`github.com/owner/repo`), or a local `file://` path to a `.wasm` component. `source`, `version`, and `revision` must be string literals. `version` (a version constraint) or `revision` (a branch or tag; a commit SHA only with a `github.com/...` source) pins which build is installed. The two are mutually exclusive.
 
-Multiple providers can be configured in the same directory:
+Multiple providers can be configured in the same directory, one default `provider <kind>` block per kind across all of the directory's `.crn` files. A second block of the same kind, even in another file, is a validation error (`duplicate provider kind`); use a [named provider instance](#named-provider-instances) for additional configurations of the same kind:
 
 ```crn
 provider awscc {

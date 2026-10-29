@@ -14,6 +14,14 @@ carina init [OPTIONS] [PATH]
 
 **PATH** defaults to `.` (current directory). It must be a directory containing one or more `.crn` files.
 
+## Provider Verification
+
+Every installed or cached provider artifact is checked against the SHA-256 recorded in `carina-providers.lock`, and `validate`, `plan` and `apply` check the installed copy again before loading it. If a cached copy does not match, `init` stops without changing the lock file, removes the mismatched copy, and asks you to run `carina init` again to download a verified one. If a freshly downloaded artifact does not match the pin, the origin changed the artifact after it was pinned; confirm the change is legitimate before removing that provider's entry from the lock file and running `carina init` again. A cached artifact that has no lock entry is never trusted; `init` downloads it from the origin instead.
+
+For official `carina-rs` providers, `init` also records the verified artifact for the current user under `~/.carina/trust/` (override with `CARINA_TRUST_RECORD_DIR`). These providers fail to load until the user running Carina has run `carina init`. See [Installation](/getting-started/installation/) for details.
+
+Concurrent `carina init` runs in the same project are serialized: a second run waits and prints `Waiting for provider install lock at <path> (held by another carina process)...`.
+
 ## Flags
 
 ### `--upgrade`
@@ -23,6 +31,8 @@ Re-resolve all provider versions from the constraints in `providers.crn`, ignori
 ### `--locked`
 
 Require the lock file to match `providers.crn` exactly. Errors if any declared provider is missing from the lock file. Intended for CI, similar to `cargo --locked`.
+
+It also errors on `github.com/...` lock entries written by older Carina versions (a `version` entry without its release tag, or a `revision` entry without its artifact ID); run `carina init` once without `--locked` to rewrite them.
 
 `--upgrade` and `--locked` are mutually exclusive.
 

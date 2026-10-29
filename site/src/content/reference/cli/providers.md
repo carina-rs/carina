@@ -36,15 +36,17 @@ carina providers repin-identity <PROVIDER> [PATH] [--force]
 
 ## re-bootstrap
 
-Discards the `sequence` observation and its reference point, returning the provider to the state it was in before first contact.
+Discards the `sequence` observation, its reference point, and the record that the registry serves `sequence` at all, returning the provider to the state it was in before first contact.
 
-Use this when resolution fails because the registry's `sequence` went backwards or jumped further ahead than the client will accept, and you have confirmed the registry is behaving legitimately. The next successful resolution establishes a new reference point from what it observes.
+Use this when resolution fails because the registry's `sequence` went backwards, jumped further ahead than the client will accept, or stopped being served, and you have confirmed the registry is behaving legitimately. The next successful resolution establishes a new reference point from what it observes.
 
 The signer source and workflow pins, signature requirement, recorded yanked versions, and pinned checksum are all retained. In particular, a yanked version stays yanked — un-yanking is not an operation Carina offers, because a genuine un-yank cannot be distinguished from an attacker stripping the flag.
 
 ```bash
 carina providers re-bootstrap <PROVIDER> [PATH] [--force]
 ```
+
+Some refusals have no reset command: an artifact that lost its signature, its `valid_until` or its transparency-log entry, a stable release built from the wrong source ref, a dropped yank flag, or a changed checksum or hostname. The error then names no recovery command. When a registry listing is refused for several reasons at once, every reason is shown, and a recovery command is suggested only if each reason can be cleared by it.
 
 ## Usage
 

@@ -12,7 +12,7 @@ Grant a local `file://` provider the credential and metadata capabilities of an 
 carina plan --trust-local-provider /abs/path/carina-provider-aws.wasm=aws
 ```
 
-Carina resolves symlinks and compares the source file's SHA-256 with the bytes installed by `carina init`. If they differ, the provider remains untrusted and Carina asks you to re-run `carina init`. An `aws` grant can load only an `aws` or `awscc` provider block; a `github` grant can load only a `github` block.
+Carina resolves symlinks and compares the source file's SHA-256 with the bytes installed by `carina init`. Each grant that applies is announced on stderr as `carina: trusting local provider <path> as <kind> (--trust-local-provider)` (or `(CARINA_TRUST_LOCAL_PROVIDER)`). If the bytes differ, the provider remains untrusted and Carina prints `carina: local provider <path> does not match the installed bytes; re-run carina init before trusting it`. An `aws` grant can load only an `aws` or `awscc` provider block; a `github` grant can load only a `github` block.
 
 Without a matching grant, a local provider receives no AWS or GitHub credentials and cannot reach the EC2 or ECS metadata service. Remote providers ignore local grants. An allow-listed `carina-rs` AWS, AWSCC, or GitHub provider loads only after this user's `carina init` downloaded those exact bytes from the origin and recorded their source and SHA-256 under `~/.carina/trust/`. A lock file or `.carina/` directory shipped in a repository does not provide that verification. If the record is absent or unusable, Carina fails before running the provider and reports that the user should run `carina init`.
 
