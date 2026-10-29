@@ -1,5 +1,6 @@
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wasmtime::component::ResourceTable;
@@ -8,7 +9,9 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
-use super::{AllowListHttpHooks, HttpTestRoute, ProviderKind, build_sandboxed_wasi_ctx};
+use super::{
+    AllowListHttpHooks, HttpTestRoute, ProviderKind, ProviderLabel, build_sandboxed_wasi_ctx,
+};
 
 /// Period between increments of the wasmtime engine epoch.
 pub(super) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -172,24 +175,26 @@ impl GuestStore {
     /// compute time.
     pub(super) fn new(
         engine: &Engine,
-        provider_kind: Option<ProviderKind>,
+        label: Arc<ProviderLabel>,
+        kind: Option<ProviderKind>,
         http_ctx: Option<WasiHttpCtx>,
         limits: StoreLimits,
         budget: GuestCallBudget,
     ) -> Self {
-        Self::new_with_http_test_route(engine, provider_kind, http_ctx, limits, budget, None)
+        Self::new_with_http_test_route(engine, label, kind, http_ctx, limits, budget, None)
     }
 
     pub(super) fn new_with_http_test_route(
         engine: &Engine,
-        provider_kind: Option<ProviderKind>,
+        label: Arc<ProviderLabel>,
+        kind: Option<ProviderKind>,
         http_ctx: Option<WasiHttpCtx>,
         limits: StoreLimits,
         budget: GuestCallBudget,
         http_test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
-        let http_hooks = AllowListHttpHooks::with_test_route(provider_kind, http_test_route);
+        let wasi_ctx = build_sandboxed_wasi_ctx(kind);
+        let http_hooks = AllowListHttpHooks::with_test_route(label, kind, http_test_route);
         let host_state = HostState {
             wasi_ctx,
             http_ctx,
@@ -283,6 +288,15 @@ fn compute_epoch_ticks(remaining: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    fn test_provider_label() -> Arc<ProviderLabel> {
+        Arc::new(ProviderLabel {
+            name: "guest-store-test".to_string(),
+            source: carina_provider_resolver::ProviderLoadSource::LocalFile {
+                path: std::path::PathBuf::from("/test-providers/guest-store-test.wasm"),
+            },
+        })
+    }
+
     #[tokio::test]
     async fn wall_budget_includes_synchronous_guest_call_setup() {
         let mut config = wasmtime::Config::new();
@@ -291,6 +305,7 @@ mod tests {
         let limits = wasmtime::StoreLimitsBuilder::new().build();
         let mut store = GuestStore::new(
             &engine,
+            test_provider_label(),
             None,
             None,
             limits,

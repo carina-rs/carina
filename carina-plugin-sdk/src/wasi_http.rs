@@ -93,7 +93,8 @@ pub fn send_phase(code: &ErrorCode) -> SendPhase {
         ErrorCode::TlsCertificateError => SendPhase::NotSent,
         // An alert can arrive after a TLS stream has been established.
         ErrorCode::TlsAlertReceived(..) => SendPhase::MaybeSent,
-        // These request validation failures are defined before transmission.
+        // The carina host never returns HttpRequestDenied: host-policy denials
+        // trap the guest (carina#4100). This arm applies only to foreign hosts.
         ErrorCode::HttpRequestDenied => SendPhase::NotSent,
         // Length/body failures can be discovered after a partial body write.
         ErrorCode::HttpRequestLengthRequired => SendPhase::MaybeSent,
