@@ -16,7 +16,10 @@ use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
     SavedPlanSchemaMismatchError,
 };
-use crate::wiring::{ExpandedCanonicalResources, WiringContext};
+use crate::wiring::{
+    CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, ValidatedConfig,
+    WiringContext,
+};
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
 
@@ -135,75 +138,147 @@ impl InspectedPlanFile {
         }
     }
 
-    pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
+    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
         match self {
-            Self::Verified(plan) => plan.plan_file.backend_config.as_ref(),
-            Self::NeedsSecretVerification(plan) => plan.plan_file.backend_config.as_ref(),
+            Self::Verified(plan) => &plan.plan_file.provider_configs,
+            Self::NeedsSecretVerification(plan) => &plan.plan_file.provider_configs,
         }
     }
+}
 
-    pub(super) fn needs_secret_verification(&self) -> bool {
-        matches!(self, Self::NeedsSecretVerification(_))
+/// Inspected saved plan bound to the provider-load state required by its
+/// secret shape. The mismatched states (a secret plan with an unchecked load,
+/// or a placeholder-free plan with checked current-config inputs) have no
+/// representation.
+pub(super) enum ProviderBoundPlanFile {
+    Verified {
+        plan: VerifiedPlanFile,
+        providers: CompleteProviderLoad,
+    },
+    NeedsSecretVerification {
+        plan: PendingPlanFile,
+        providers: CheckedSavedPlanInputs,
+    },
+}
+
+impl ProviderBoundPlanFile {
+    pub(super) fn verified(plan: VerifiedPlanFile, providers: CompleteProviderLoad) -> Self {
+        Self::Verified { plan, providers }
+    }
+
+    pub(super) fn needs_secret_verification(
+        plan: PendingPlanFile,
+        providers: CheckedSavedPlanInputs,
+    ) -> Self {
+        Self::NeedsSecretVerification { plan, providers }
+    }
+
+    pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
+        match self {
+            Self::Verified { plan, .. } => plan.plan_file.backend_config.as_ref(),
+            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.backend_config.as_ref(),
+        }
     }
 
     pub(super) fn state_lineage(&self) -> Option<&str> {
         match self {
-            Self::Verified(plan) => plan.plan_file.state_lineage.as_deref(),
-            Self::NeedsSecretVerification(plan) => plan.plan_file.state_lineage.as_deref(),
+            Self::Verified { plan, .. } => plan.plan_file.state_lineage.as_deref(),
+            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.state_lineage.as_deref(),
         }
     }
 
     pub(super) fn state_serial(&self) -> Option<u64> {
         match self {
-            Self::Verified(plan) => plan.plan_file.state_serial,
-            Self::NeedsSecretVerification(plan) => plan.plan_file.state_serial,
+            Self::Verified { plan, .. } => plan.plan_file.state_serial,
+            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.state_serial,
         }
     }
 
     pub(super) fn data_source_origins(&self) -> &[DataSource] {
         match self {
-            Self::Verified(plan) => &plan.plan_file.data_source_origins,
-            Self::NeedsSecretVerification(plan) => &plan.plan_file.data_source_origins,
+            Self::Verified { plan, .. } => &plan.plan_file.data_source_origins,
+            Self::NeedsSecretVerification { plan, .. } => &plan.plan_file.data_source_origins,
         }
     }
 
     pub(super) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&carina_state::StateFile>,
-    ) -> Result<ReloadedInspectedPlanFile, AppError> {
+    ) -> Result<ReloadedProviderBoundPlanFile, AppError> {
         match self {
-            Self::Verified(VerifiedPlanFile {
-                plan_file,
-                schema_references,
-            }) => plan_file
-                .reload_in_flight_from_locked_state(state_file)
-                .map(|plan_file| {
-                    ReloadedInspectedPlanFile::Verified(ReloadedVerifiedPlanFile {
+            Self::Verified {
+                plan:
+                    VerifiedPlanFile {
                         plan_file,
                         schema_references,
-                    })
-                })
-                .map_err(AppError::Config),
-            Self::NeedsSecretVerification(PendingPlanFile {
-                plan_file,
-                schema_references,
-            }) => plan_file
+                    },
+                providers,
+            } => plan_file
                 .reload_in_flight_from_locked_state(state_file)
-                .map(|plan_file| {
-                    ReloadedInspectedPlanFile::NeedsSecretVerification(ReloadedPendingPlanFile {
+                .map(|plan_file| ReloadedProviderBoundPlanFile::Verified {
+                    plan: ReloadedVerifiedPlanFile {
                         plan_file,
                         schema_references,
-                    })
+                    },
+                    providers,
                 })
                 .map_err(AppError::Config),
+            Self::NeedsSecretVerification {
+                plan:
+                    PendingPlanFile {
+                        plan_file,
+                        schema_references,
+                    },
+                providers,
+            } => plan_file
+                .reload_in_flight_from_locked_state(state_file)
+                .map(
+                    |plan_file| ReloadedProviderBoundPlanFile::NeedsSecretVerification {
+                        plan: ReloadedPendingPlanFile {
+                            plan_file,
+                            schema_references,
+                        },
+                        providers,
+                    },
+                )
+                .map_err(AppError::Config),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        plan: InspectedPlanFile,
+        providers: CompleteProviderLoad,
+        base_dir: &std::path::Path,
+    ) -> Result<Self, AppError> {
+        match plan {
+            InspectedPlanFile::Verified(plan) => Ok(Self::verified(plan, providers)),
+            InspectedPlanFile::NeedsSecretVerification(plan) => {
+                let unresolved = carina_core::parser::ParsedFile::default();
+                let providers = providers.check_saved_plan_config_pair(
+                    carina_core::parser::InferredFile::default(),
+                    carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+                    base_dir,
+                    false,
+                    &[],
+                    &[],
+                )?;
+                Ok(Self::needs_secret_verification(plan, providers))
+            }
         }
     }
 }
 
-/// Saved-plan state after the only locked-state reload transition.
-pub(super) enum ReloadedInspectedPlanFile {
-    Verified(ReloadedVerifiedPlanFile),
-    NeedsSecretVerification(ReloadedPendingPlanFile),
+/// Provider-bound saved-plan state after the only locked-state reload.
+pub(super) enum ReloadedProviderBoundPlanFile {
+    Verified {
+        plan: ReloadedVerifiedPlanFile,
+        providers: CompleteProviderLoad,
+    },
+    NeedsSecretVerification {
+        plan: ReloadedPendingPlanFile,
+        providers: CheckedSavedPlanInputs,
+    },
 }
 
 /// Placeholder-free saved plan awaiting provider-schema verification.
@@ -212,95 +287,138 @@ pub(super) struct ReloadedVerifiedPlanFile {
     schema_references: PlanSchemaReferences,
 }
 
-/// The exact provider context whose artifacts and schemas matched a saved plan.
-/// Only the verification transition below can construct this witness.
-pub(super) struct VerifiedWiringContext(WiringContext);
+/// Proof that one saved plan's artifact identities and schemas were checked
+/// against the borrowed provider context.
+///
+/// Its constructor is private to this module. Wiring can consume the proof,
+/// but no other caller can manufacture a successful saved-plan transition.
+pub(crate) struct SavedPlanArtifactsChecked<'context, T> {
+    plan: T,
+    context: std::marker::PhantomData<&'context WiringContext>,
+}
 
-impl VerifiedWiringContext {
-    pub(super) fn context(&self) -> &WiringContext {
-        &self.0
+impl<'context, T> SavedPlanArtifactsChecked<'context, T> {
+    fn new(plan: T, _context: &'context WiringContext) -> Self {
+        Self {
+            plan,
+            context: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn into_plan(self) -> T {
+        self.plan
     }
 }
 
-impl ReloadedInspectedPlanFile {
-    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
-        match self {
-            Self::Verified(plan) => plan.plan_file.provider_configs(),
-            Self::NeedsSecretVerification(plan) => plan.plan_file.provider_configs(),
-        }
-    }
-
-    /// Check artifact identities and schemas immediately after provider loading.
-    /// Every later secret/normalizer/provider transition consumes this proof.
-    pub(super) fn verify_loaded_providers(
+impl ReloadedVerifiedPlanFile {
+    /// Consume a complete provider load and return the checked plan together
+    /// with the only wiring value that can execute it.
+    pub(super) fn verify_provider_load(
         self,
-        ctx: WiringContext,
+        providers: CompleteProviderLoad,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<(SchemaCheckedPlanFile, VerifiedWiringContext), AppError> {
-        let recorded_artifacts = match &self {
-            Self::Verified(plan) => plan.plan_file.provider_artifacts(),
-            Self::NeedsSecretVerification(plan) => plan.plan_file.provider_artifacts(),
-        };
-        let loaded_artifacts = recorded_provider_artifacts(&ctx);
-        let provider_names = recorded_artifacts
-            .keys()
-            .chain(loaded_artifacts.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let providers = provider_names
-            .into_iter()
-            .filter_map(|provider| {
-                let recorded = recorded_artifacts.get(&provider);
-                let loaded = loaded_artifacts.get(&provider);
-                if recorded == loaded {
-                    None
-                } else {
-                    Some((
-                        provider,
-                        SavedPlanProviderArtifactDifference {
-                            recorded: recorded.map(RecordedProviderArtifact::summary),
-                            loaded: loaded.map(RecordedProviderArtifact::summary),
-                        },
-                    ))
-                }
-            })
-            .collect::<BTreeMap<_, _>>();
-        if !providers.is_empty() {
-            return Err(AppError::SavedPlanProviderArtifactMismatch(
-                SavedPlanProviderArtifactMismatchError {
-                    providers,
-                    replan_command: apply_target.replan_command().to_string(),
-                },
-            ));
-        }
-
-        let map_mismatch = |mismatch: crate::commands::plan::PlanSchemaFingerprintMismatch| {
-            AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
-                providers: mismatch.providers,
-                replan_command: apply_target.replan_command().to_string(),
-            })
-        };
-        let checked_plan = match self {
-            Self::Verified(plan) => {
-                plan.plan_file
-                    .verify_schema_fingerprints(&plan.schema_references, ctx.schemas())
-                    .map_err(map_mismatch)?;
-                SchemaCheckedPlanFile::Verified(RehydratedPlanFile {
-                    plan_file: plan.plan_file,
+    ) -> Result<ValidatedDesiredPlan, AppError> {
+        let Self {
+            plan_file,
+            schema_references,
+        } = self;
+        let (plan, config) = providers.verify_saved_plan_artifacts(move |ctx| {
+            check_loaded_providers(&plan_file, &schema_references, ctx, apply_target)?;
+            Ok(SavedPlanArtifactsChecked::new(
+                RehydratedPlanFile {
+                    plan_file,
                     planned_secret_hashes: HashMap::new(),
-                })
-            }
-            Self::NeedsSecretVerification(plan) => {
-                plan.plan_file
-                    .verify_schema_fingerprints(&plan.schema_references, ctx.schemas())
-                    .map_err(map_mismatch)?;
-                SchemaCheckedPlanFile::NeedsSecretVerification(SchemaCheckedPendingPlanFile {
-                    plan_file: plan.plan_file,
-                })
-            }
-        };
-        Ok((checked_plan, VerifiedWiringContext(ctx)))
+                },
+                ctx,
+            ))
+        })?;
+        Ok(ValidatedDesiredPlan::without_current_config(plan, config))
     }
+}
+
+impl ReloadedPendingPlanFile {
+    /// Verify artifacts against the complete load that already checked the
+    /// current config, and return its retained canonical pair with the checked
+    /// plan and executable wiring.
+    pub(super) fn verify_provider_load(
+        self,
+        providers: CheckedSavedPlanInputs,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<
+        (
+            SchemaCheckedPendingPlanFile,
+            ValidatedConfig<
+                carina_core::override_aware::CanonicalResourcePair<InferredExportParam>,
+            >,
+        ),
+        AppError,
+    > {
+        let Self {
+            plan_file,
+            schema_references,
+        } = self;
+        providers.verify_saved_plan_artifacts(move |ctx| {
+            check_loaded_providers(&plan_file, &schema_references, ctx, apply_target)?;
+            Ok(SavedPlanArtifactsChecked::new(
+                SchemaCheckedPendingPlanFile { plan_file },
+                ctx,
+            ))
+        })
+    }
+}
+
+/// Check artifact identities and schemas against the context borrowed by the
+/// consuming wiring transition.
+fn check_loaded_providers(
+    plan_file: &ReloadedPlanFile,
+    schema_references: &PlanSchemaReferences,
+    ctx: &WiringContext,
+    apply_target: ApplyTarget<'_>,
+) -> Result<(), AppError> {
+    let recorded_artifacts = plan_file.provider_artifacts();
+    let loaded_artifacts = recorded_provider_artifacts(ctx);
+    let provider_names = recorded_artifacts
+        .keys()
+        .chain(loaded_artifacts.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let providers = provider_names
+        .into_iter()
+        .filter_map(|provider| {
+            let recorded = recorded_artifacts.get(&provider);
+            let loaded = loaded_artifacts.get(&provider);
+            if recorded == loaded {
+                None
+            } else {
+                Some((
+                    provider,
+                    SavedPlanProviderArtifactDifference {
+                        recorded: recorded.map(RecordedProviderArtifact::summary),
+                        loaded: loaded.map(RecordedProviderArtifact::summary),
+                    },
+                ))
+            }
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !providers.is_empty() {
+        return Err(AppError::SavedPlanProviderArtifactMismatch(
+            SavedPlanProviderArtifactMismatchError {
+                providers,
+                replan_command: apply_target.replan_command().to_string(),
+            },
+        ));
+    }
+
+    plan_file
+        .verify_schema_fingerprints(schema_references, ctx.schemas())
+        .map_err(
+            |mismatch: crate::commands::plan::PlanSchemaFingerprintMismatch| {
+                AppError::SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError {
+                    providers: mismatch.providers,
+                    replan_command: apply_target.replan_command().to_string(),
+                })
+            },
+        )
 }
 
 /// Deserialized saved plan whose typed placeholders still need fresh desired
@@ -329,23 +447,34 @@ pub(super) struct ExpansionPriorStates {
 /// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
-    source: SavedPlanSecretCandidateSource,
+    validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
     provider_inputs: ResolvedProviderInputs,
 }
 
-enum SavedPlanSecretCandidateSource {
-    Canonical(Box<ExpandedCanonicalResources<InferredExportParam>>),
-    #[cfg(test)]
-    Parsed(Box<carina_core::parser::InferredFile>),
+#[cfg(test)]
+pub(super) struct TestSavedPlanSecretCandidates {
+    parsed: carina_core::parser::InferredFile,
+    provider_inputs: ResolvedProviderInputs,
+}
+
+#[cfg(test)]
+impl TestSavedPlanSecretCandidates {
+    pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
+        &self.parsed
+    }
+
+    pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
+        &self.provider_inputs
+    }
 }
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        canonical_resources: ExpandedCanonicalResources<InferredExportParam>,
+        validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
         provider_inputs: ResolvedProviderInputs,
     ) -> Self {
         Self {
-            source: SavedPlanSecretCandidateSource::Canonical(Box::new(canonical_resources)),
+            validated,
             provider_inputs,
         }
     }
@@ -354,19 +483,15 @@ impl SavedPlanSecretCandidates {
     pub(super) fn from_test_parts(
         parsed: carina_core::parser::InferredFile,
         provider_inputs: ResolvedProviderInputs,
-    ) -> Self {
-        Self {
-            source: SavedPlanSecretCandidateSource::Parsed(Box::new(parsed)),
+    ) -> TestSavedPlanSecretCandidates {
+        TestSavedPlanSecretCandidates {
+            parsed,
             provider_inputs,
         }
     }
 
     pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
-        match &self.source {
-            SavedPlanSecretCandidateSource::Canonical(resources) => resources.parsed(),
-            #[cfg(test)]
-            SavedPlanSecretCandidateSource::Parsed(parsed) => parsed,
-        }
+        self.validated.resources().parsed()
     }
 
     pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
@@ -374,16 +499,9 @@ impl SavedPlanSecretCandidates {
     }
 }
 
-/// Reloaded saved plan proven to match the currently loaded schemas. The
-/// secret-verification transition accepts only this checked state.
-pub(super) enum SchemaCheckedPlanFile {
-    Verified(RehydratedPlanFile),
-    NeedsSecretVerification(SchemaCheckedPendingPlanFile),
-}
-
 /// Schema-checked saved plan whose desired secret placeholders still need
 /// verification against the current configuration.
-pub(super) struct SchemaCheckedPendingPlanFile {
+pub(crate) struct SchemaCheckedPendingPlanFile {
     plan_file: ReloadedPlanFile,
 }
 
@@ -430,15 +548,16 @@ impl SchemaCheckedPendingPlanFile {
         self,
         candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<DesiredPlanFile, AppError> {
+    ) -> Result<ValidatedDesiredPlan, AppError> {
         let planned_secret_hashes = planned_secret_hashes(self.plan_file.sorted_resources());
         let mut plan_file = self.plan_file;
         super::rehydrate_desired_plan_file(&mut plan_file, &candidates, apply_target)?;
-        Ok(DesiredPlanFile::NeedsHistoricalVerification(
-            DesiredVerifiedPlanFile {
+        Ok(ValidatedDesiredPlan::with_current_config(
+            DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
                 plan_file,
                 planned_secret_hashes,
-            },
+            }),
+            candidates.validated,
         ))
     }
 }
@@ -448,6 +567,107 @@ impl SchemaCheckedPendingPlanFile {
 pub(super) enum DesiredPlanFile {
     Verified(RehydratedPlanFile),
     NeedsHistoricalVerification(DesiredVerifiedPlanFile),
+}
+
+enum SavedPlanExecutionConfig {
+    WithoutCurrentConfig(Box<ValidatedConfig<()>>),
+    WithCurrentConfig(Box<ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>>),
+}
+
+impl SavedPlanExecutionConfig {
+    fn context(&self) -> &WiringContext {
+        match self {
+            Self::WithoutCurrentConfig(config) => config.context(),
+            Self::WithCurrentConfig(config) => config.context(),
+        }
+    }
+}
+
+/// A desired saved plan bound to the exact validated provider context used
+/// for artifact verification and, when needed, current-config validation.
+pub(super) struct ValidatedDesiredPlan {
+    plan: DesiredPlanFile,
+    config: SavedPlanExecutionConfig,
+}
+
+impl ValidatedDesiredPlan {
+    fn without_current_config(plan: RehydratedPlanFile, config: ValidatedConfig<()>) -> Self {
+        Self {
+            plan: DesiredPlanFile::Verified(plan),
+            config: SavedPlanExecutionConfig::WithoutCurrentConfig(Box::new(config)),
+        }
+    }
+
+    fn with_current_config(
+        plan: DesiredPlanFile,
+        config: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+    ) -> Self {
+        Self {
+            plan,
+            config: SavedPlanExecutionConfig::WithCurrentConfig(Box::new(config)),
+        }
+    }
+
+    pub(super) fn context(&self) -> &WiringContext {
+        self.config.context()
+    }
+
+    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
+        self.plan.provider_configs()
+    }
+
+    pub(super) fn sorted_resources(&self) -> &[Resource] {
+        self.plan.sorted_resources()
+    }
+
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        self.plan.current_states()
+    }
+
+    pub(super) fn historical_resource_addresses(&self) -> HistoricalResourceAddresses {
+        self.plan.historical_resource_addresses()
+    }
+
+    pub(super) async fn verify_historical(
+        self,
+        provider: &dyn Provider,
+        actual_states: &mut HashMap<ResourceId, State>,
+        verified_planned_states: &mut HashMap<ResourceId, State>,
+        historical_addresses: &HistoricalResourceAddresses,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<ValidatedExecutablePlan, AppError> {
+        let Self { plan, config } = self;
+        let plan = plan
+            .verify_historical(
+                provider,
+                actual_states,
+                verified_planned_states,
+                historical_addresses,
+                apply_target,
+            )
+            .await?;
+        Ok(ValidatedExecutablePlan { plan, config })
+    }
+}
+
+/// Executable saved-plan payload retaining its validated configuration owner.
+pub(super) struct ValidatedExecutablePlan {
+    plan: ExecutablePlanFile,
+    config: SavedPlanExecutionConfig,
+}
+
+impl ValidatedExecutablePlan {
+    pub(super) fn context(&self) -> &WiringContext {
+        self.config.context()
+    }
+}
+
+impl std::ops::Deref for ValidatedExecutablePlan {
+    type Target = ExecutablePlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
 }
 
 impl DesiredPlanFile {
@@ -624,7 +844,7 @@ impl DesiredVerifiedPlanFile {
 ///
 /// This is still not executable: the schema-checked [`DesiredPlanFile`]
 /// transition is the only path that can wrap it in [`ExecutablePlanFile`].
-pub(super) struct RehydratedPlanFile {
+pub(crate) struct RehydratedPlanFile {
     plan_file: ReloadedPlanFile,
     planned_secret_hashes: PlannedSecretHashes,
 }
@@ -754,14 +974,14 @@ mod tests {
 
     use super::{
         DesiredVerifiedPlanFile, HistoricalResourceAddresses, InspectedPlanFile,
-        SchemaCheckedPlanFile,
+        ReloadedVerifiedPlanFile, VerifiedPlanFile,
     };
     use crate::commands::apply::ApplyTarget;
     use crate::commands::plan::{
         PlanFile, PlanFileContents, RecordedProviderArtifact, SavedDataSourceValue,
     };
     use crate::error::AppError;
-    use crate::wiring::{LoadedProviderFactory, WiringContext};
+    use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedConfig};
 
     struct ArtifactFactory {
         name: &'static str,
@@ -819,8 +1039,16 @@ mod tests {
         }
     }
 
-    fn wasm_context(name: &'static str, bytes: &[u8]) -> WiringContext {
-        WiringContext::new(
+    fn remote_provider_config(name: &str, source: &str) -> ProviderConfig {
+        ProviderConfig {
+            source: Some(source.parse().unwrap()),
+            ..provider_config(name)
+        }
+    }
+
+    fn wasm_context(name: &'static str, bytes: &[u8]) -> ValidatedConfig<()> {
+        ValidatedConfig::for_test(
+            (),
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
                 bytes,
@@ -829,8 +1057,22 @@ mod tests {
         )
     }
 
-    fn builtin_context() -> WiringContext {
-        WiringContext::new_for_test(Vec::new(), &[])
+    fn wasm_load(name: &'static str, bytes: &[u8]) -> ProviderLoad {
+        ProviderLoad::for_test(
+            vec![LoadedProviderFactory::for_test_with_bytes(
+                Box::new(ArtifactFactory { name }),
+                bytes,
+            )],
+            &[provider_config(name)],
+        )
+    }
+
+    fn builtin_context() -> ValidatedConfig<()> {
+        ValidatedConfig::from_factories_for_test((), Vec::new(), &[])
+    }
+
+    fn builtin_load() -> ProviderLoad {
+        ProviderLoad::for_test(Vec::new(), &[])
     }
 
     fn saved_provider_configs(
@@ -873,9 +1115,12 @@ mod tests {
         }
     }
 
-    fn plan_recorded_with(ctx: &WiringContext, provider_configs: Vec<ProviderConfig>) -> PlanFile {
+    fn plan_recorded_with<R>(
+        ctx: &ValidatedConfig<R>,
+        provider_configs: Vec<ProviderConfig>,
+    ) -> PlanFile {
         empty_plan_contents(provider_configs)
-            .record(ctx)
+            .record_for_test(ctx)
             .expect("test plan provider evidence must be valid")
     }
 
@@ -886,38 +1131,128 @@ mod tests {
         }
     }
 
-    fn reloaded(plan: PlanFile) -> super::ReloadedInspectedPlanFile {
-        InspectedPlanFile::inspect(plan)
-            .reload_in_flight_from_locked_state(None)
-            .expect("reload saved plan")
+    fn reloaded(plan: PlanFile) -> ReloadedVerifiedPlanFile {
+        let InspectedPlanFile::Verified(VerifiedPlanFile {
+            plan_file,
+            schema_references,
+        }) = InspectedPlanFile::inspect(plan)
+        else {
+            panic!("artifact fixture unexpectedly contains secret placeholders")
+        };
+        ReloadedVerifiedPlanFile {
+            plan_file: plan_file
+                .reload_in_flight_from_locked_state(None)
+                .expect("reload saved plan"),
+            schema_references,
+        }
     }
 
     #[test]
     fn changed_artifact_with_identical_schemas_fails_before_schema_checked_state() {
         let planned = wasm_context("mock", b"artifact A");
-        let loaded = wasm_context("mock", b"artifact B");
+        let loaded = wasm_load("mock", b"artifact B");
 
         let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
-            .verify_loaded_providers(loaded, apply_target());
+            .verify_provider_load(
+                loaded
+                    .into_complete()
+                    .expect("test provider load is complete"),
+                apply_target(),
+            );
 
         let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = result else {
-            panic!("changed provider bytes must not produce SchemaCheckedPlanFile")
+            panic!("changed provider bytes must not produce a checked plan")
         };
         assert_eq!(mismatch.providers.keys().collect::<Vec<_>>(), vec!["mock"]);
     }
 
     #[test]
+    fn record_rejects_artifact_origin_that_does_not_match_config_source() {
+        let context = wasm_context("mock", b"artifact");
+        let error = empty_plan_contents(vec![remote_provider_config("mock", "carina-rs/mock")])
+            .record_for_test(&context)
+            .expect_err("a file-origin load cannot evidence a remote provider source")
+            .to_string();
+
+        assert!(error.contains("mock"), "provider is missing: {error}");
+        assert!(
+            error.contains("carina-rs/mock"),
+            "expected source is missing: {error}"
+        );
+        assert!(
+            error.contains("file"),
+            "recorded origin is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_locked_artifact_source_that_does_not_match_config_source() {
+        let context = wasm_context("mock", b"artifact");
+        let plan = plan_recorded_with(&context, vec![provider_config("mock")]);
+        let mut encoded = serde_json::to_value(plan).expect("saved plan serializes");
+        encoded["provider_configs"][0]["source"] = serde_json::json!("carina-rs/mock");
+        encoded["provider_artifacts"]["mock"]["origin"] = serde_json::json!({
+            "kind": "locked",
+            "source": "other/mock",
+            "version": {
+                "kind": "version",
+                "version": "1.0.0"
+            }
+        });
+
+        let error = serde_json::from_value::<PlanFile>(encoded)
+            .expect_err("decode must bind a locked artifact to the saved remote source")
+            .to_string();
+
+        assert!(
+            error.contains("carina-rs/mock"),
+            "expected source is missing: {error}"
+        );
+        assert!(
+            error.contains("other/mock"),
+            "recorded source is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn valid_file_artifact_origin_round_trips() {
+        let context = wasm_context("mock", b"artifact");
+        let plan = plan_recorded_with(&context, vec![provider_config("mock")]);
+        let encoded = serde_json::to_vec(&plan).expect("saved plan serializes");
+        let decoded =
+            serde_json::from_slice::<PlanFile>(&encoded).expect("matching file origin must decode");
+
+        assert_eq!(decoded.provider_artifacts(), plan.provider_artifacts());
+    }
+
+    #[test]
     fn unchanged_artifact_and_schemas_produce_schema_checked_state() {
         let planned = wasm_context("mock", b"artifact A");
-        let loaded = wasm_context("mock", b"artifact A");
+        let loaded = wasm_load("mock", b"artifact A");
 
         let result = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
-            .verify_loaded_providers(loaded, apply_target());
+            .verify_provider_load(
+                loaded
+                    .into_complete()
+                    .expect("test provider load is complete"),
+                apply_target(),
+            );
 
-        assert!(matches!(
-            result,
-            Ok((SchemaCheckedPlanFile::Verified(_), _))
-        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn saved_plan_verification_bundles_checked_plan_with_checked_wiring() {
+        let planned = wasm_context("mock", b"artifact A");
+        let loaded = wasm_load("mock", b"artifact A")
+            .into_complete()
+            .expect("test provider load is complete");
+
+        let checked = reloaded(plan_recorded_with(&planned, vec![provider_config("mock")]))
+            .verify_provider_load(loaded, apply_target())
+            .expect("matching artifacts and schemas must verify together");
+
+        assert!(checked.context().provider_artifacts().contains_key("mock"));
     }
 
     #[test]
@@ -929,28 +1264,36 @@ mod tests {
             Some(&RecordedProviderArtifact::BuiltIn)
         );
 
-        let result = reloaded(plan).verify_loaded_providers(builtin_context(), apply_target());
+        let loaded = builtin_load()
+            .into_complete()
+            .expect("test provider load is complete");
+        let result = reloaded(plan).verify_provider_load(loaded, apply_target());
 
-        assert!(matches!(
-            result,
-            Ok((SchemaCheckedPlanFile::Verified(_), _))
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
     fn builtin_vs_wasm_and_missing_or_extra_provider_keys_are_mismatches() {
         let builtin_plan = plan_recorded_with(&builtin_context(), Vec::new());
 
-        let same_name = reloaded(builtin_plan.clone())
-            .verify_loaded_providers(wasm_context("mock", b"artifact"), apply_target());
+        let same_name = reloaded(builtin_plan.clone()).verify_provider_load(
+            wasm_load("mock", b"artifact")
+                .into_complete()
+                .expect("test provider load is complete"),
+            apply_target(),
+        );
         assert!(matches!(
             same_name,
             Err(AppError::SavedPlanProviderArtifactMismatch(ref mismatch))
                 if mismatch.providers.contains_key("mock")
         ));
 
-        let changed_keys = reloaded(builtin_plan)
-            .verify_loaded_providers(wasm_context("other", b"artifact"), apply_target());
+        let changed_keys = reloaded(builtin_plan).verify_provider_load(
+            wasm_load("other", b"artifact")
+                .into_complete()
+                .expect("test provider load is complete"),
+            apply_target(),
+        );
         let Err(AppError::SavedPlanProviderArtifactMismatch(mismatch)) = changed_keys else {
             panic!("missing and extra provider keys must invalidate a saved plan")
         };
@@ -1004,7 +1347,7 @@ mod tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record(&builtin_context())
+        .record_for_test(&builtin_context())
         .expect("test plan provider evidence must be valid")
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan");

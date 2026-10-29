@@ -37,10 +37,11 @@ pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    LoadedProviderFactory, WiringContext, build_factories_from_providers,
-    compute_anonymous_identifiers_with_ctx, compute_canonical_pair_anonymous_identifiers_with_ctx,
-    resolve_config_names_with_ctx, resolve_file_names_with_ctx,
+    WiringContext, compute_anonymous_identifiers_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
     validate_module_internal_ref_types, validate_no_backend_in_modules,
@@ -294,28 +295,29 @@ pub(crate) fn duplicate_declaration_errors(
     errors
 }
 
-/// Run the common validation and module-resolution pipeline.
+/// Test-support wrapper around the non-minting validation report.
 ///
-/// Callers loading a directory must pass both diagnostic channels from the
-/// same [`LoadedConfig`](carina_core::config_loader::LoadedConfig). Requiring
-/// `duplicate_declarations` here prevents production callers from silently
-/// bypassing directory-level uniqueness validation.
+/// Both diagnostic channels from the same
+/// [`LoadedConfig`](carina_core::config_loader::LoadedConfig) remain mandatory,
+/// so fixtures exercise directory-level uniqueness validation as well.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_config(
-    user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
+    providers: &ProviderLoad,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<(), AppError> {
-    let errors = validate_and_resolve_errors(
-        user_dirs,
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        prior_inference_errors,
-        duplicate_declarations,
-    );
+    let errors = providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+        .into_errors();
     if errors.is_empty() {
         Ok(())
     } else {
@@ -323,114 +325,68 @@ pub fn validate_and_resolve_with_config(
     }
 }
 
-/// Vec-returning twin of [`validate_and_resolve_with_config`]. Both loader
-/// diagnostic channels remain required at this lower-level entry point.
-pub fn validate_and_resolve_errors(
+/// Test-support entry point that exercises the real command-scoped provider loader.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn validate_and_resolve_with_provider_load_for_test(
     user_dirs: &carina_core::UserDirs,
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Vec<AppError> {
-    let (factories, load_errors) =
-        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
-            Ok(loaded) => loaded,
-            Err(error) => return vec![error],
-        };
-    validate_and_resolve_errors_with_factories(
+) -> Result<(), AppError> {
+    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    validate_and_resolve_with_config(
         parsed,
         base_dir,
+        &providers,
         skip_resource_validation,
-        factories,
-        load_errors,
         prior_inference_errors,
         duplicate_declarations,
     )
 }
 
-/// Factory-injected variant of [`validate_and_resolve_errors`]. The CLI
-/// validation pipeline runs against caller-provided
-/// [`LoadedProviderFactory`] instances rather than building them from
-/// the parsed file's `provider` blocks.
+/// Test-support collecting, non-minting validation entry point.
 ///
-/// Exposed so e2e tests can drive the full pipeline (parse → resolve →
-/// validate) against hand-built schemas without standing up a WASM provider
-/// plugin (#2247). Its loader diagnostic channels are required just like the
-/// non-injecting entry point.
-pub fn validate_and_resolve_errors_with_factories(
+/// The `&ProviderLoad` privately owns both the factory context and
+/// per-provider diagnostics used to build the report. This helper neither
+/// performs another load nor exposes a context or mints a
+/// [`ValidatedConfig`](crate::wiring::ValidatedConfig).
+/// Production commands use the consuming validation methods on
+/// [`ProviderLoad`] or the report-only loader instead.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn validate_and_resolve_errors(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
+    providers: &ProviderLoad,
     skip_resource_validation: bool,
-    factories: Vec<LoadedProviderFactory>,
-    load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
-    let ctx = WiringContext::new(factories, &parsed.providers);
-    validate_and_resolve_errors_with_context(
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        &ctx,
-        load_errors,
-        prior_inference_errors,
-        duplicate_declarations,
-    )
+    providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )
+        .into_errors()
 }
 
-#[cfg(test)]
-pub(crate) fn validate_and_resolve_errors_with_test_factories(
-    parsed: &mut carina_core::parser::InferredFile,
-    base_dir: &Path,
-    skip_resource_validation: bool,
-    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
-    load_errors: HashMap<String, String>,
-    prior_inference_errors: &[ExportInferenceError],
-    duplicate_declarations: &[DuplicateDeclaration],
-) -> Vec<AppError> {
-    validate_and_resolve_errors_with_factories(
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        LoadedProviderFactory::for_test(factories),
-        load_errors,
-        prior_inference_errors,
-        duplicate_declarations,
-    )
-}
-
-pub(crate) fn validate_and_resolve_errors_with_context(
-    parsed: &mut carina_core::parser::InferredFile,
-    base_dir: &Path,
-    skip_resource_validation: bool,
-    ctx: &WiringContext,
-    load_errors: HashMap<String, String>,
-    prior_inference_errors: &[ExportInferenceError],
-    duplicate_declarations: &[DuplicateDeclaration],
-) -> Vec<AppError> {
-    match validate_and_resolve_errors_with_context_inner(
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        ctx,
-        load_errors,
-        prior_inference_errors,
-        duplicate_declarations,
-        ConfigNameResolution::EvaluatedOnly,
-    ) {
-        Ok(ResolvedConfig::Evaluated(_)) => Vec::new(),
-        Ok(ResolvedConfig::Paired(_)) => unreachable!("evaluated-only validation returned pair"),
-        Err(errors) => errors,
-    }
-}
-
-enum ConfigNameResolution {
+pub(crate) enum ConfigNameResolution {
     EvaluatedOnly,
     Paired(Box<UnresolvedConfigSnapshot>),
 }
 
-enum ResolvedConfig<'a> {
+/// Internal result of the sealed validation pipeline.
+///
+/// The paired form is built only through [`crate::wiring::ValidationPipelineAccess`]
+/// and is immediately captured by the consuming provider-load transition.
+/// After that owner is minted, production code can change its resources only
+/// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
+/// owner transitions.
+pub(crate) enum ResolvedConfig<'a> {
     Evaluated(&'a mut carina_core::parser::InferredFile),
     Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
 }
@@ -467,67 +423,14 @@ impl ResolvedConfig<'_> {
     }
 }
 
-/// Validate and canonicalize the evaluated and authored resource snapshots at
-/// the same schema-aware name-resolution boundary.
-pub(crate) fn validate_and_resolve_config_pair(
-    user_dirs: &carina_core::UserDirs,
-    parsed: carina_core::parser::InferredFile,
-    unresolved: UnresolvedConfigSnapshot,
-    base_dir: &Path,
-    skip_resource_validation: bool,
-    prior_inference_errors: &[ExportInferenceError],
-    duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-    let (factories, load_errors) =
-        build_factories_from_providers(user_dirs, &parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories, &parsed.providers);
-    validate_and_resolve_config_pair_with_context(
-        parsed,
-        unresolved,
-        base_dir,
-        skip_resource_validation,
-        &ctx,
-        load_errors,
-        prior_inference_errors,
-        duplicate_declarations,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_config_pair_with_context(
-    mut parsed: carina_core::parser::InferredFile,
-    unresolved: UnresolvedConfigSnapshot,
-    base_dir: &Path,
-    skip_resource_validation: bool,
-    ctx: &WiringContext,
-    load_errors: HashMap<String, String>,
-    prior_inference_errors: &[ExportInferenceError],
-    duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
-    match validate_and_resolve_errors_with_context_inner(
-        &mut parsed,
-        base_dir,
-        skip_resource_validation,
-        ctx,
-        load_errors,
-        prior_inference_errors,
-        duplicate_declarations,
-        ConfigNameResolution::Paired(Box::new(unresolved)),
-    )
-    .map_err(collapse_errors)?
-    {
-        ResolvedConfig::Paired(pair) => Ok(*pair),
-        ResolvedConfig::Evaluated(_) => unreachable!("paired validation returned evaluated-only"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_and_resolve_errors_with_context_inner<'a>(
+pub(crate) fn validate_and_resolve_errors_inner<'a>(
+    access: &crate::wiring::ValidationPipelineAccess,
     parsed: &'a mut carina_core::parser::InferredFile,
     base_dir: &Path,
-    skip_resource_validation: bool,
     ctx: &WiringContext,
-    load_errors: HashMap<String, String>,
+    load_errors: &HashMap<String, String>,
+    skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
@@ -757,7 +660,7 @@ fn validate_and_resolve_errors_with_context_inner<'a>(
             ResolvedConfig::Evaluated(parsed)
         }
         ConfigNameResolution::Paired(unresolved) => {
-            match resolve_config_names_with_ctx(ctx, std::mem::take(parsed), *unresolved) {
+            match access.resolve_config_names(ctx, std::mem::take(parsed), *unresolved) {
                 Ok(pair) => ResolvedConfig::Paired(Box::new(pair)),
                 Err(name_errors) => {
                     errors.extend(name_errors);
@@ -1155,9 +1058,10 @@ mod tests {
         let mut parsed = empty_parsed_file();
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
         let errors =
-            validate_and_resolve_errors(&user_dirs, &mut parsed, base.path(), false, &[], &[]);
+            validate_and_resolve_errors(&mut parsed, base.path(), &providers, false, &[], &[]);
 
         assert!(errors.iter().any(|error| {
             matches!(
@@ -1196,8 +1100,9 @@ mod tests {
             binding: None,
         });
 
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
         let error =
-            validate_and_resolve_with_config(&user_dirs, &mut parsed, base.path(), false, &[], &[])
+            validate_and_resolve_with_config(&mut parsed, base.path(), &providers, false, &[], &[])
                 .unwrap_err();
         let message = error.to_string();
 
@@ -1232,8 +1137,9 @@ mod tests {
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir).unwrap();
         let result =
-            validate_and_resolve_with_config(&user_dirs, &mut parsed, base_dir, false, &[], &[]);
+            validate_and_resolve_with_config(&mut parsed, base_dir, &providers, false, &[], &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -1282,12 +1188,13 @@ exports {
         let inference_errors = loaded.inference_errors;
         let duplicate_declarations = loaded.duplicate_declarations;
         let mut parsed = loaded.parsed;
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base).unwrap();
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
-            &user_dirs,
             &mut parsed.clone(),
             &base,
+            &providers,
             false,
             &inference_errors,
             &duplicate_declarations,
@@ -1298,9 +1205,9 @@ exports {
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
         let result = validate_and_resolve_with_config(
-            &user_dirs,
             &mut parsed,
             &base,
+            &providers,
             true,
             &inference_errors,
             &duplicate_declarations,
@@ -1336,11 +1243,12 @@ exports {
         let inference_errors = loaded.inference_errors;
         let duplicate_declarations = loaded.duplicate_declarations;
         let mut parsed = loaded.parsed;
+        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
         let err = validate_and_resolve_with_config(
-            &user_dirs,
             &mut parsed.clone(),
             base.path(),
+            &providers,
             false,
             &inference_errors,
             &duplicate_declarations,
@@ -1349,9 +1257,9 @@ exports {
         assert!(err.to_string().contains("duplicate export 'x'"));
 
         let result = validate_and_resolve_with_config(
-            &user_dirs,
             &mut parsed,
             base.path(),
+            &providers,
             true,
             &inference_errors,
             &duplicate_declarations,
@@ -1475,30 +1383,28 @@ exports {
         let mut awscc = resource_create_only_enum_file("awscc.Region.ap_northeast_1");
         let mut aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
 
-        let errors = validate_and_resolve_errors_with_test_factories(
-            &mut awscc,
-            base_dir.path(),
-            false,
-            vec![Box::new(ResourceCreateOnlyEnumFactory {
-                enum_provider: "awscc",
-            })],
-            HashMap::new(),
-            &[],
-            &[],
+        let providers = ProviderLoad::for_test(
+            crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+                ResourceCreateOnlyEnumFactory {
+                    enum_provider: "awscc",
+                },
+            )]),
+            &awscc.providers,
         );
+        let errors =
+            validate_and_resolve_errors(&mut awscc, base_dir.path(), &providers, false, &[], &[]);
         assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
 
-        let errors = validate_and_resolve_errors_with_test_factories(
-            &mut aws,
-            base_dir.path(),
-            false,
-            vec![Box::new(ResourceCreateOnlyEnumFactory {
-                enum_provider: "aws",
-            })],
-            HashMap::new(),
-            &[],
-            &[],
+        let providers = ProviderLoad::for_test(
+            crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+                ResourceCreateOnlyEnumFactory {
+                    enum_provider: "aws",
+                },
+            )]),
+            &aws.providers,
         );
+        let errors =
+            validate_and_resolve_errors(&mut aws, base_dir.path(), &providers, false, &[], &[]);
         assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
         assert_eq!(

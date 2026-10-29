@@ -18,9 +18,9 @@ use carina_core::parser::ProviderContext;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, validate_no_backend_in_modules,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
+    ProviderLoad, validate_no_backend_in_modules, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules,
 };
 
 /// A lint warning with file, line, and message info.
@@ -71,13 +71,10 @@ pub fn run_lint(
     module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
-    let (provider_factories, provider_factory_error) =
-        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
-            Ok((factories, _)) => (factories, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
-    let ctx = WiringContext::new(provider_factories, &parsed.providers);
-    let schemas = ctx.schemas();
+    let (providers, provider_factory_error) =
+        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    let provider_factory_error = provider_factory_error.map(|error| error.to_string());
+    let schemas = providers.schemas();
 
     // Report invalid root-owned module blocks through lint's collected,
     // path-prefixed output. The resolver enforces the same invariants as

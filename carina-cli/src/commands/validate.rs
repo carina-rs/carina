@@ -12,7 +12,7 @@ use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
 use crate::error::AppError;
-use crate::wiring::{WiringContext, build_factories_from_providers};
+use crate::wiring::ProviderLoad;
 
 #[derive(Serialize)]
 struct ValidateOutput {
@@ -48,6 +48,7 @@ struct ValidateWarning {
 /// means validation passed.
 ///
 /// Not used outside test code.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn validate_with_factories(
     path: &Path,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
@@ -63,6 +64,7 @@ pub fn validate_with_factories(
     };
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
+    let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
@@ -78,12 +80,11 @@ pub fn validate_with_factories(
     error_reports.extend(format_inference_errors(&loaded.inference_errors));
 
     error_reports.extend(
-        super::validate_and_resolve_errors_with_factories(
+        super::validate_and_resolve_errors(
             &mut parsed,
             base_dir,
+            &providers,
             false,
-            factories,
-            std::collections::HashMap::new(),
             &loaded.inference_errors,
             &loaded.duplicate_declarations,
         )
@@ -103,6 +104,7 @@ pub fn validate_with_factories(
 /// carina#3121).
 ///
 /// Not used outside test code.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn validated_resource_ids_with_factories(
     path: &Path,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
@@ -118,16 +120,16 @@ pub fn validated_resource_ids_with_factories(
     };
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
+    let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
     // Run the same resolve/validate pass as the CLI so the parsed tree
     // (and its `deferred_for_expressions`) is in the post-validation
     // state the display path observes.
-    let _ = super::validate_and_resolve_errors_with_factories(
+    let _ = super::validate_and_resolve_errors(
         &mut parsed,
         base_dir,
+        &providers,
         false,
-        factories,
-        std::collections::HashMap::new(),
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
@@ -302,26 +304,18 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let (factories, load_errors) =
-        match build_factories_from_providers(user_dirs, &parsed.providers, base_dir) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                error_reports.push(error.to_string());
-                (Vec::new(), Default::default())
-            }
-        };
-    let ctx = WiringContext::new(factories, &parsed.providers);
-    let validation_errors = super::validate_and_resolve_errors_with_context(
+    let (providers, provider_load_error) =
+        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    error_reports.extend(provider_load_error.iter().map(ToString::to_string));
+    let validation_report = providers.validation_report(
         &mut parsed,
         base_dir,
         false,
-        &ctx,
-        load_errors,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     parsed.print_warnings_from(printed_warning_count);
-    error_reports.extend(validation_errors.iter().map(ToString::to_string));
+    error_reports.extend(validation_report.errors().iter().map(ToString::to_string));
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
@@ -330,7 +324,7 @@ pub fn run_validate(
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
         &loaded.authored_bindings,
-        ctx.schemas(),
+        validation_report.schemas(),
     );
 
     // Check for duplicate attribute keys
@@ -451,6 +445,49 @@ fn check_upstream_state_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"
+provider mock {
+  source = 'file:///definitely-missing/mock.wasm'
+}
+backend s3 {
+  bucket = "state"
+  key = "state.json"
+  region = true
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("providers.crn"),
+            "provider mock { source = 'file:///definitely-missing/mock.wasm' }\n",
+        )
+        .unwrap();
+
+        let error = run_validate(
+            &user_dirs,
+            fixture.path(),
+            false,
+            &ProviderContext::default(),
+        )
+        .expect_err("loader and backend validation errors must both fail validation")
+        .to_string();
+
+        assert!(
+            error.contains("declared more than once with a source"),
+            "hard provider load error is missing: {error}"
+        );
+        assert!(
+            error.contains("Invalid attribute 'region' for backend type 's3'"),
+            "unrelated backend validation error is missing: {error}"
+        );
+    }
 
     #[test]
     fn test_validate_output_serialization() {

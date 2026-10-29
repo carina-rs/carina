@@ -7,7 +7,7 @@
 //!   carina-cli/src/commands/apply/mod.rs:477
 //!     load_configuration_with_config(path, ...)            (no expand)
 //!   carina-cli/src/commands/apply/mod.rs:488
-//!     validate_and_resolve_with_config(&mut parsed, ...)   (expands)
+//!     ProviderLoad::validate_evaluated_config(...)         (expands)
 //!       -> carina-cli/src/commands/mod.rs:285
 //!            module_resolver::resolve_modules_with_config(parsed, ...)
 //!   carina-cli/src/commands/apply/mod.rs:999
@@ -26,8 +26,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use carina_cli::commands::validate_and_resolve_errors_with_factories;
-use carina_cli::wiring::{PlanPreprocessor, WiringContext};
+use carina_cli::commands::validate_and_resolve_errors;
+use carina_cli::wiring::{PlanPreprocessor, ProviderLoad};
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::ExecutableDataSourceValues;
@@ -313,10 +313,17 @@ fn apply_path_propagates_module_wait_binding() {
     let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
+    let providers = ProviderLoad::for_test(
+        carina_cli::wiring::LoadedProviderFactory::for_test(vec![
+            Box::new(AwsStub) as Box<dyn ProviderFactory>
+        ]),
+        &parsed.providers,
+    );
 
-    let errors = validate_and_resolve_errors_with_factories(
+    let errors = validate_and_resolve_errors(
         &mut parsed,
         base_dir,
+        &providers,
         // `skip_resource_validation = true` is a real apply-path mode
         // (run_apply's backend-seed re-load uses it,
         // apply/mod.rs:635). It still runs the *same* module
@@ -328,10 +335,6 @@ fn apply_path_propagates_module_wait_binding() {
         // schema, only that the module's `wait` survives apply
         // expansion).
         true,
-        carina_cli::wiring::LoadedProviderFactory::for_test(vec![
-            Box::new(AwsStub) as Box<dyn ProviderFactory>
-        ]),
-        HashMap::new(),
         &inference_errors,
         &[],
     );
@@ -438,14 +441,17 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
-    let errors = validate_and_resolve_errors_with_factories(
-        &mut parsed,
-        base_dir,
-        false,
+    let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
-        HashMap::new(),
+        &parsed.providers,
+    );
+    let errors = validate_and_resolve_errors(
+        &mut parsed,
+        base_dir,
+        &providers,
+        false,
         &inference_errors,
         &[],
     );
@@ -502,26 +508,21 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     )
     .expect("load should succeed");
     let inference_errors = loaded.inference_errors;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
-    let factories = carina_cli::wiring::LoadedProviderFactory::for_test(vec![
-        Box::new(AwsStub) as Box<dyn ProviderFactory>
-    ]);
-    let errs = validate_and_resolve_errors_with_factories(
-        &mut parsed,
-        base_dir,
-        true,
+    let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
-        HashMap::new(),
-        &inference_errors,
-        &[],
+        &parsed.providers,
     );
-    assert!(errs.is_empty(), "expand stage must succeed: {errs:?}");
+    let wiring = providers
+        .validate_evaluated_config(parsed, base_dir, true, &inference_errors, &[])
+        .expect("expand stage must succeed");
 
-    let ctx = WiringContext::new(factories, &parsed.providers);
+    let ctx = wiring.context();
+    let parsed = wiring.evaluated_resources_for_test();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
@@ -590,7 +591,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let mut data_sources = parsed.data_sources.clone();
     let mut data_source_values = carina_core::data_source_value::DataSourceValues::empty();
     let mut orphans = Orphans::new();
-    let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
+    let preprocessor = PlanPreprocessor::new(&NoopNormalizer, ctx);
     preprocessor
         .prepare(
             &mut override_aware_resources,
