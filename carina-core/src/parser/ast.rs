@@ -346,15 +346,13 @@ pub enum TypeExpr {
     /// have been loaded enough to classify it as a resource ref or
     /// provider custom type.
     DottedUnresolved(ResourceTypePath),
-    /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId)
-    /// Distinguished from Ref by having a PascalCase final segment.
+    /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId).
+    ///
+    /// The owner and semantic identity travel as one key because they are not
+    /// interchangeable: AWSCC can own a type in the shared `aws` identity
+    /// namespace.
     SchemaType {
-        /// Provider name (e.g., "awscc")
-        provider: String,
-        /// Service/namespace path (e.g., "ec2")
-        path: String,
-        /// Type name in PascalCase (e.g., "VpcId")
-        type_name: String,
+        owned: super::OwnedTypeIdentity,
     },
     /// Structural record type: `struct { name: type, ... }`.
     ///
@@ -449,11 +447,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
             TypeExpr::DottedUnresolved(path) => write!(f, "{}", path),
-            TypeExpr::SchemaType {
-                provider,
-                path,
-                type_name,
-            } => write!(f, "{}.{}.{}", provider, path, type_name),
+            TypeExpr::SchemaType { owned } => f.write_str(&owned.authored_name()),
             TypeExpr::Struct { fields } => {
                 if fields.is_empty() {
                     write!(f, "struct {{}}")

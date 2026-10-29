@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::ValueDescription;
-use crate::parser::{ProviderContext, TypeExpr, validate_custom_type};
+use crate::parser::{ProviderContext, TypeExpr, validate_custom_type, validate_schema_custom_type};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Static authority available while checking deferred computed values.
@@ -49,6 +49,12 @@ pub enum TypeExprValueError {
     InvalidAccess {
         message: String,
     },
+    CustomTypeValidation {
+        path: Vec<TypeExprValuePathSegment>,
+        expected: Box<TypeExpr>,
+        actual: Box<ValueDescription>,
+        error: Box<crate::parser::CustomTypeValidationError>,
+    },
 }
 
 impl TypeExprValueError {
@@ -56,7 +62,8 @@ impl TypeExprValueError {
         match &mut self {
             Self::Mismatch { path, .. }
             | Self::MissingStructField { path, .. }
-            | Self::UnknownStructField { path, .. } => path.insert(0, segment),
+            | Self::UnknownStructField { path, .. }
+            | Self::CustomTypeValidation { path, .. } => path.insert(0, segment),
             Self::InvalidAccess { .. } => {}
         }
         self
@@ -110,6 +117,15 @@ impl fmt::Display for TypeExprValueError {
                 write!(f, "expected struct, unknown field '{field}'.")
             }
             Self::InvalidAccess { message } => f.write_str(message),
+            Self::CustomTypeValidation {
+                path,
+                expected,
+                actual,
+                error,
+            } => {
+                write_path(f, path)?;
+                write!(f, "expected {expected}, got {actual}: {error}")
+            }
         }
     }
 }
@@ -207,11 +223,21 @@ pub fn check_type_expr_value(
             _ => Err(mismatch(expected, value)),
         },
         TypeExpr::Simple(name) => match value {
-            Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_),
+            ) => {
                 let identity =
                     crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
-                validate_custom_type(&identity, value, config)
-                    .map_err(|error| validation_mismatch(expected, value, error.to_string()))
+                if identified_scalar_shape_is_supported(&identity, value, config, false) {
+                    validate_custom_type(&identity, value, config)
+                        .map_err(|error| validation_mismatch(expected, value, error.to_string()))
+                } else {
+                    Err(mismatch(expected, value))
+                }
             }
             _ => Err(mismatch(expected, value)),
         },
@@ -261,20 +287,21 @@ pub fn check_type_expr_value(
             }
             _ => Err(mismatch(expected, value)),
         },
-        TypeExpr::SchemaType {
-            provider,
-            path,
-            type_name,
-        } => match value {
+        TypeExpr::SchemaType { owned } => match value {
             Value::Concrete(
                 ConcreteValue::String(_)
                 | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_),
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_),
             ) => {
-                let identity =
-                    crate::schema::TypeIdentity::from_schema_type(provider, path, type_name);
-                validate_custom_type(&identity, value, config)
-                    .map_err(|error| validation_mismatch(expected, value, error.to_string()))
+                let identity = owned.identity();
+                if identified_scalar_shape_is_supported(identity, value, config, true) {
+                    validate_schema_custom_type(owned, value, config)
+                        .map_err(|error| custom_type_validation_mismatch(expected, value, error))
+                } else {
+                    Err(mismatch(expected, value))
+                }
             }
             _ => Err(mismatch(expected, value)),
         },
@@ -355,6 +382,71 @@ fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> T
     }
 }
 
+fn custom_type_validation_mismatch(
+    expected: &TypeExpr,
+    value: &Value,
+    error: crate::parser::CustomTypeValidationError,
+) -> TypeExprValueError {
+    TypeExprValueError::CustomTypeValidation {
+        path: Vec::new(),
+        expected: Box::new(expected.clone()),
+        actual: Box::new(ValueDescription::of(value)),
+        error: Box::new(error),
+    }
+}
+
+fn identified_scalar_shape_is_supported(
+    identity: &crate::schema::TypeIdentity,
+    value: &Value,
+    config: &ProviderContext,
+    owner_routed: bool,
+) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => true,
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
+            owner_routed
+                || ![
+                    crate::schema::RefinedScalarKind::String,
+                    crate::schema::RefinedScalarKind::Int,
+                    crate::schema::RefinedScalarKind::Float,
+                ]
+                .into_iter()
+                .any(|kind| crate::schema::builtin_validator(kind, identity).is_some())
+        }
+        Value::Concrete(ConcreteValue::Int(_)) => {
+            (!owner_routed
+                && (crate::schema::builtin_validator(
+                    crate::schema::RefinedScalarKind::Int,
+                    identity,
+                )
+                .is_some()
+                    || crate::schema::builtin_validator(
+                        crate::schema::RefinedScalarKind::Float,
+                        identity,
+                    )
+                    .is_some()))
+                || (owner_routed && config.custom_types_loaded())
+        }
+        Value::Concrete(ConcreteValue::Float(_)) => {
+            (!owner_routed
+                && crate::schema::builtin_validator(
+                    crate::schema::RefinedScalarKind::Float,
+                    identity,
+                )
+                .is_some())
+                || (owner_routed && config.custom_types_loaded())
+        }
+        Value::Concrete(
+            ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::List(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::Map(_),
+        )
+        | Value::Deferred(_) => false,
+    }
+}
+
 fn accepts_interpolation(expected: &TypeExpr) -> bool {
     is_string_shaped(expected)
         || matches!(expected, TypeExpr::Union(members) if members.iter().any(accepts_interpolation))
@@ -381,6 +473,14 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
     }
     match (expected, actual) {
         (TypeExpr::Float, TypeExpr::Int) => true,
+        (
+            TypeExpr::SchemaType {
+                owned: expected_owned,
+            },
+            TypeExpr::SchemaType {
+                owned: actual_owned,
+            },
+        ) => expected_owned.identity() == actual_owned.identity(),
         (TypeExpr::Union(members), actual) => members
             .iter()
             .any(|member| inferred_type_fits(member, actual)),
@@ -423,6 +523,31 @@ mod tests {
         config: &ProviderContext,
     ) -> Result<(), TypeExprValueError> {
         check_type_expr_value(expected, value, config, TypecheckInference::Unavailable)
+    }
+
+    #[test]
+    fn inferred_schema_type_compatibility_uses_identity_not_routing_owner_set() {
+        use crate::parser::{NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner};
+
+        let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+        let expected = TypeExpr::SchemaType {
+            owned: OwnedTypeIdentity::with_owners(
+                identity.clone(),
+                NonEmptySchemaTypeOwners::try_from_iter([
+                    SchemaTypeOwner::Provider("aws".to_string()),
+                    SchemaTypeOwner::Provider("awscc".to_string()),
+                ])
+                .expect("two annotation owners are non-empty"),
+            ),
+        };
+        let actual = TypeExpr::SchemaType {
+            owned: OwnedTypeIdentity::provider("aws", identity),
+        };
+
+        assert!(
+            inferred_type_fits(&expected, &actual),
+            "routing provenance must not make one semantic type incompatible with itself"
+        );
     }
 
     fn string(value: &str) -> Value {
@@ -510,9 +635,10 @@ mod tests {
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
-                provider: "aws".to_string(),
-                path: "ec2".to_string(),
-                type_name: "VpcId".to_string(),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                ),
             },
             TypeExpr::Struct {
                 fields: vec![("name".to_string(), TypeExpr::String)],
@@ -648,9 +774,10 @@ mod tests {
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
-                provider: "aws".to_string(),
-                path: "ec2".to_string(),
-                type_name: "VpcId".to_string(),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                ),
             },
             TypeExpr::Struct { fields: Vec::new() },
             TypeExpr::Unknown,
@@ -691,9 +818,10 @@ mod tests {
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
-                provider: "aws".to_string(),
-                path: "ec2".to_string(),
-                type_name: "VpcId".to_string(),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                ),
             },
             TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
@@ -722,26 +850,37 @@ mod tests {
 
     #[test]
     fn schema_and_reference_types_accept_string_values_and_schema_validates() {
-        use crate::parser::ValidatorFn;
-
-        let schema_type = TypeExpr::SchemaType {
-            provider: "test".to_string(),
-            path: "network".to_string(),
-            type_name: "Id".to_string(),
-        };
         let identity = TypeIdentity::from_schema_type("test", "network", "Id");
-        let mut validators = std::collections::HashMap::<TypeIdentity, ValidatorFn>::new();
-        validators.insert(
-            identity.clone(),
-            Box::new(|value| {
-                value
-                    .starts_with("net-")
-                    .then_some(())
-                    .ok_or_else(|| format!("invalid network id: {value}"))
-            }),
-        );
+        let schema_type = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+        };
+        let checked_identity = identity.clone();
         let config = ProviderContext {
-            validators,
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(move |target, value| {
+                    if target.identity() != &checked_identity {
+                        return Ok(());
+                    }
+                    let text = match value {
+                        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext(),
+                        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => value.as_str(),
+                        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => value.api_value(),
+                        _ => {
+                            return Err(crate::parser::fixture_custom_type_rejection(
+                                target,
+                                "Expected string",
+                            ));
+                        }
+                    };
+                    text.starts_with("net-").then_some(()).ok_or_else(|| {
+                        crate::parser::fixture_custom_type_rejection(
+                            target,
+                            format!("invalid network id: {text}"),
+                        )
+                    })
+                }),
+            ),
             ..ProviderContext::default()
         };
 
@@ -750,18 +889,18 @@ mod tests {
             .expect_err("SchemaType must run its provider validator");
         assert!(matches!(
             error,
-            TypeExprValueError::Mismatch {
-                validator_message: Some(message),
+            TypeExprValueError::CustomTypeValidation {
+                error,
                 ..
-            } if message.contains("invalid network id")
+            } if error.to_string().contains("invalid network id")
         ));
         let invalid_shorthand = Value::Concrete(ConcreteValue::enum_identifier("wrong"));
         assert!(matches!(
             check_with_config(&schema_type, &invalid_shorthand, &config),
-            Err(TypeExprValueError::Mismatch {
-                validator_message: Some(message),
+            Err(TypeExprValueError::CustomTypeValidation {
+                error,
                 ..
-            }) if message.contains("invalid network id")
+            }) if error.to_string().contains("invalid network id")
         ));
 
         let raw = Value::Concrete(ConcreteValue::enum_identifier("net-raw"));
@@ -810,21 +949,31 @@ mod tests {
         );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_validator = Arc::clone(&seen);
+        let declaration = declared_type.clone();
         let config = ProviderContext {
-            custom_type_attribute_types: std::collections::HashMap::from([(
-                identity.clone(),
-                declared_type,
-            )]),
-            custom_type_validator: Some(Box::new(move |_identity, value| {
-                seen_by_validator.lock().unwrap().push(value.to_string());
-                Ok(())
-            })),
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(move |target, value| {
+                    let canonical =
+                        crate::provider::canonicalize_custom_type_value(&declaration, value)
+                            .map_err(|error| {
+                                crate::parser::fixture_invalid_custom_type_value(
+                                    target,
+                                    error.into_type_error(),
+                                )
+                            })?
+                            .expect("concrete enum value must canonicalize");
+                    seen_by_validator
+                        .lock()
+                        .unwrap()
+                        .push(canonical.to_string());
+                    Ok(())
+                }),
+            ),
             ..ProviderContext::default()
         };
         let schema_type = TypeExpr::SchemaType {
-            provider: "test".to_string(),
-            path: "widget".to_string(),
-            type_name: "Mode".to_string(),
+            owned: crate::parser::OwnedTypeIdentity::provider("test", identity),
         };
         let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
 
@@ -832,6 +981,114 @@ mod tests {
             .expect("the declared enum member must validate");
 
         assert_eq!(*seen.lock().unwrap(), ["API_VALUE"]);
+    }
+
+    #[test]
+    fn positive_int_type_expression_validates_numeric_values() {
+        let config = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(|target, value| {
+                    if target.identity().kind == "PositiveInt"
+                        && matches!(value, Value::Concrete(ConcreteValue::Int(value)) if *value > 0)
+                    {
+                        Ok(())
+                    } else {
+                        Err(crate::parser::fixture_custom_type_rejection(
+                            target,
+                            "expected a positive integer",
+                        ))
+                    }
+                }),
+            ),
+            ..ProviderContext::default()
+        };
+
+        for expected in [
+            TypeExpr::Simple("positive_int".to_string()),
+            TypeExpr::SchemaType {
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    TypeIdentity::from_schema_type("test", "widget", "PositiveInt"),
+                ),
+            },
+        ] {
+            check_with_config(&expected, &Value::Concrete(ConcreteValue::Int(1)), &config)
+                .expect("PositiveInt must accept 1 as an integer value");
+            assert!(
+                check_with_config(&expected, &Value::Concrete(ConcreteValue::Int(0)), &config,)
+                    .is_err(),
+                "PositiveInt must reject zero through {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_refined_int_typecheck_preserves_the_integer_value() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+
+        fn schema(identity: TypeIdentity, accepted: i64) -> crate::schema::ValidatedResourceSchema {
+            ResourceSchema::new(format!("test.number_{accepted}"))
+                .attribute(
+                    AttributeSchema::optional(
+                        "value",
+                        AttributeType::refined_int_with_validator(
+                            identity,
+                            None,
+                            legacy_validator(move |value| match value {
+                                Value::Concrete(ConcreteValue::Int(value))
+                                    if *value == accepted =>
+                                {
+                                    Ok(())
+                                }
+                                Value::Concrete(ConcreteValue::Int(value)) => {
+                                    Err(format!("expected {accepted}, got {value}"))
+                                }
+                                _ => Err("Expected integer".to_string()),
+                            }),
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("test schema must validate")
+        }
+
+        let identity = TypeIdentity::from_schema_type("one", "number", "X");
+        let schema = schema(identity.clone(), 5);
+        let declaration = schema
+            .parts()
+            .attributes
+            .get("value")
+            .expect("value declaration")
+            .attr_type()
+            .clone();
+        let config = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "one",
+                    identity.clone(),
+                )]),
+                Box::new(move |target, value| {
+                    declaration
+                        .validate_identified_scalar_value(value)
+                        .map_err(|error| {
+                            crate::parser::fixture_invalid_custom_type_value(target, error)
+                        })
+                }),
+            ),
+            ..ProviderContext::default()
+        };
+        let ty = |provider: &str| TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(provider, identity.clone()),
+        };
+
+        check_with_config(&ty("one"), &Value::Concrete(ConcreteValue::Int(5)), &config)
+            .expect("owner one must run its typed validator");
+        assert!(
+            check_with_config(&ty("one"), &Value::Concrete(ConcreteValue::Int(7)), &config,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -851,28 +1108,68 @@ mod tests {
         };
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_validator = Arc::clone(&seen);
+        let bare_declaration = enum_type(bare_identity.clone());
+        let schema_declaration = enum_type(schema_identity.clone());
         let config = ProviderContext {
-            custom_type_attribute_types: std::collections::HashMap::from([
-                (bare_identity.clone(), enum_type(bare_identity)),
-                (schema_identity.clone(), enum_type(schema_identity)),
-            ]),
-            custom_type_validator: Some(Box::new(move |identity, value| {
-                seen_by_validator
-                    .lock()
-                    .unwrap()
-                    .push((identity.to_string(), value.to_string()));
-                Ok(())
-            })),
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([
+                    crate::parser::OwnedTypeIdentity::provider(
+                        "bare-provider",
+                        bare_identity.clone(),
+                    ),
+                    crate::parser::OwnedTypeIdentity::provider("test", schema_identity.clone()),
+                ]),
+                Box::new(move |target, value| {
+                    let owned = match target {
+                        crate::parser::CustomTypeValidationTarget::Annotation(owned) => owned,
+                        crate::parser::CustomTypeValidationTarget::Declaration { .. } => {
+                            return Err(crate::parser::fixture_custom_type_rejection(
+                                target,
+                                "expected an annotation target",
+                            ));
+                        }
+                    };
+                    let owner = owned
+                        .provider_names()
+                        .next()
+                        .expect("fixture annotation has one owner");
+                    let declaration = match owner {
+                        "bare-provider" => &bare_declaration,
+                        "test" => &schema_declaration,
+                        owner => {
+                            return Err(crate::parser::fixture_custom_type_rejection(
+                                target,
+                                format!("unexpected owner {owner:?}"),
+                            ));
+                        }
+                    };
+                    let canonical =
+                        crate::provider::canonicalize_custom_type_value(declaration, value)
+                            .map_err(|error| {
+                                crate::parser::fixture_invalid_custom_type_value(
+                                    target,
+                                    error.into_type_error(),
+                                )
+                            })?
+                            .expect("concrete enum value must canonicalize");
+                    seen_by_validator.lock().unwrap().push((
+                        owner.to_string(),
+                        owned.identity().to_string(),
+                        canonical.to_string(),
+                    ));
+                    Ok(())
+                }),
+            ),
             ..ProviderContext::default()
         };
         let value = Value::Concrete(ConcreteValue::String("enabled".into()));
 
         for expected in [
-            TypeExpr::Simple("mode".to_string()),
             TypeExpr::SchemaType {
-                provider: "test".to_string(),
-                path: "widget".to_string(),
-                type_name: "Mode".to_string(),
+                owned: crate::parser::OwnedTypeIdentity::provider("bare-provider", bare_identity),
+            },
+            TypeExpr::SchemaType {
+                owned: crate::parser::OwnedTypeIdentity::provider("test", schema_identity.clone()),
             },
         ] {
             check_with_config(&expected, &value, &config)
@@ -882,8 +1179,16 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             [
-                ("Mode".to_string(), "Enabled".to_string()),
-                ("test.widget.Mode".to_string(), "Enabled".to_string()),
+                (
+                    "bare-provider".to_string(),
+                    "Mode".to_string(),
+                    "Enabled".to_string(),
+                ),
+                (
+                    "test".to_string(),
+                    "test.widget.Mode".to_string(),
+                    "Enabled".to_string(),
+                ),
             ]
         );
     }

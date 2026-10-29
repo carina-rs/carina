@@ -563,19 +563,76 @@ A struct type represents a nested object with typed fields.
   leaves, are recorded in state (state v18; secrets as hashes) so plans
   converge.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
-  WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
-  by `carina-plugin-host/src/wasm_convert.rs`. The `ResourceSchema`,
-  `AttributeSchema`, and `StructField` conversions destructure protocol
-  records exhaustively (`OperationConfig` needs no conversion: carina-core
-  re-exports the protocol type, carina#3907), and `AttributeType` conversion
-  patterns name every variant field. The nested `write_only` flag is a
-  required field in the schema JSON (no `#[serde(default)]`), and the protocol
-  minimum is v12, so a host and provider that disagree about it fail at load
-  instead of silently dropping nested write-only members. Adding a protocol field must break
-  compilation until it is consciously carried across or explicitly bound and
-  documented as unavailable on the destination side. Never use a catch-all
-  `_` or `..` at this seam; a silently dropped field is invisible in production
-  and cost carina#3034 its effect (carina#3772).
+  WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
+  sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK
+  accepts only `ValidatedResourceSchema` / `ValidatedConfigSchema` witnesses
+  and projects them there before JSON serialization, while the host keeps only
+  JSON/WIT glue and delegates protocol-record decoding to the same module.
+  Declared descendant modes are preserved; whole-schema validation applies
+  provider-populated ancestry after the graph is reconstructed. Schema
+  defaults use the JSON-compatible projection (`StringList` normalizes to
+  `List`) and reject deferred/core-only values and non-finite floats. SDK
+  guests derive custom-type dispatch from the identity/callback pairs in the
+  same validated resource/config witnesses they serialize; providers do not
+  implement an optional success-default hook. The guest builds a callback
+  table once, keyed by `TypeIdentity`; every binding stores its validated
+  `RefinedScalarKind` and the provider-wide callback set for that identity.
+  Dispatch runs every pointer-distinct callback conjunctively and deduplicates
+  pointer-identical callbacks only as an optimization. Callback-free sibling
+  declarations share the identity's callback set, and separately allocated
+  callbacks from repeated type-constructor calls are valid. This is the honest
+  version-12 behavior: the wire names an identity, not a schema declaration,
+  so the identity is the guest-side type and its constraints are per provider.
+  Version-12 WIT remains
+  `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
+  with the binding's stored kind, and aggregate schema admission rejects an
+  identity reused with another scalar kind. Resource/config schema walks pass
+  the exact declared `AttributeType` to their single schema owner, so local
+  structural constraints remain declaration-specific. A host-backed SDK owner
+  then applies that provider's identity-level guest callback set, which may
+  include callbacks declared by sibling schemas because v12 cannot identify a
+  declaration more narrowly.
+  Authored annotations cannot select an owner: their `OwnedTypeIdentity`
+  contains a non-empty set of every loaded schema owner declaring the semantic
+  `TypeIdentity`, and their values must satisfy every owner. Enum definitions
+  or canonical spellings that disagree across that set are typed errors. Never
+  construct loaded recognition and validation separately: the opaque
+  `ProviderCustomTypes` loaded state derives both its known owner-set keys and
+  its indexed resolver from one factory-schema/config snapshot. Never
+  infer ownership from `TypeIdentity::provider`, because AWSCC may own types in
+  the shared `aws` namespace. Authored/display spelling remains the semantic
+  `TypeIdentity`; schema owners are routing-only data, and bare schema
+  identities are also lifted to owner-bearing `SchemaType` nodes. Core
+  built-ins are keyed
+  by `(RefinedScalarKind, TypeIdentity)`, and scalar canonicalization requires
+  the exact declared `AttributeType`, so an enum cannot inherit a scalar
+  callback or bypass spelling resolution. Whole-schema validation rejects
+  every identified type without a scalar base and every enum shape that v12
+  cannot represent; conversion retains typed defensive errors. Version-12
+  `StringEnum` cannot carry a closed enum's DSL transform or non-plain-String
+  base. Protocol v12 also has no fields for attribute completions or resource
+  wait defaults: those are host-only authoring/execution metadata and are the
+  two intentional one-way omissions pinned by projection tests. The legacy
+  v12 `Custom` decoder preserves the first outer record's name as the only
+  identity, including an empty name; nested `Custom.name` and primitive-base
+  identities never fill it in. Enclosing String/int refinements take
+  precedence over nested/base metadata, falling back to the inner metadata
+  only when the enclosing record omits it. Anonymous legacy `Custom` records
+  with a List base remain ordinary refined lists. A named List base is the one
+  intentional legacy-Custom tightening: core cannot retain that enclosing
+  identity, so decode returns a typed error instead of silently dropping it.
+  Metadata incompatible with the terminal shape remains a typed error. The
+  `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure
+  both core parts and protocol records exhaustively (`OperationConfig` needs no
+  conversion: carina-core re-exports the protocol type, carina#3907), and
+  `AttributeType` conversion patterns name every variant field. The nested
+  `write_only` flag is required in schema JSON (no `#[serde(default)]`), and the
+  protocol minimum remains v12, so a host and provider that disagree about it
+  fail at load instead of silently dropping nested write-only members. Adding
+  a protocol field must break compilation until it is consciously carried
+  across or explicitly bound and documented as unavailable on the destination
+  side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
+  is invisible in production and cost carina#3034 its effect (carina#3772).
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.

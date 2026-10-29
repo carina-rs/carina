@@ -54,7 +54,8 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
+    let factories = factories_for(&schemas);
+    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
 }
 
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
@@ -1322,11 +1323,26 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
             Value::Concrete(ConcreteValue::String("z14grhdcwa56qt".into())),
         ),
     ]);
-    let core_errors = schema
+    let validated_schema = schema
         .clone()
         .validate()
-        .expect("test schema must be valid")
-        .validate_with_origins(&attributes, &|name| name == "hosted_zone_id")
+        .expect("test schema must be valid");
+    let mut core_registry = SchemaRegistry::new();
+    core_registry.insert("test", validated_schema);
+    let core_factories = Arc::new(factories_for(&core_registry));
+    let core_resolver = carina_core::provider::provider_custom_types_from_factories(core_factories);
+    let core_errors = core_registry
+        .get(
+            "test",
+            "route53.Record",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .expect("test schema must be owner-bound")
+        .validate_with_resolver(
+            &attributes,
+            &|name| name == "hosted_zone_id",
+            &core_resolver,
+        )
         .expect_err("both union alternatives must reject the value");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let expected = core_errors[0].to_string();
@@ -1695,7 +1711,7 @@ test.r.renamed_block {
 // A schema produced via the WASM plugin path carries `validate: None`
 // on every `AttributeType::Custom`, with the real validator behind the
 // factory's `validate_custom_type`. The validation pipeline must reach
-// through `ProviderContext.custom_type_validator` so a bad `vpc_id`
+// through the loaded `ProviderContext` resolver so a bad `vpc_id`
 // value is rejected.
 // ============================================================================
 
@@ -1732,6 +1748,18 @@ impl ProviderFactory for WasmStyleProviderFactory {
                 format!("Invalid vpc_id '{}': must start with 'vpc-'", value),
             ));
         }
+        if identity.kind == "MaxAggregationInterval" {
+            let value = value.as_str().parse::<i64>().map_err(|error| {
+                carina_core::provider::ProviderError::invalid_input(format!(
+                    "invalid aggregation interval: {error}"
+                ))
+            })?;
+            if !matches!(value, 60 | 600) {
+                return Err(carina_core::provider::ProviderError::invalid_input(
+                    format!("max_aggregation_interval must be 60 or 600, got {value}"),
+                ));
+            }
+        }
         Ok(())
     }
     fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
@@ -1757,11 +1785,10 @@ impl ProviderFactory for WasmStyleProviderFactory {
 }
 
 fn wasm_style_vpc_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::refined_string_with_validator(
-        carina_core::schema::TypeIdentity::bare("VpcId"),
+    let vpc_id_type = AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         None,
         None,
-        carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
     ResourceSchema::new("ec2.security_group")
@@ -1777,6 +1804,12 @@ fn wasm_style_schemas() -> SchemaRegistry {
             .validate()
             .expect("schema fixture must be valid"),
     );
+    schemas.insert(
+        "awsccmock",
+        wasm_style_flow_log_schema()
+            .validate()
+            .expect("numeric bridge schema fixture must be valid"),
+    );
     schemas
 }
 
@@ -1787,6 +1820,9 @@ fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
             wasm_style_vpc_schema()
                 .validate()
                 .expect("factory test schema must be valid"),
+            wasm_style_flow_log_schema()
+                .validate()
+                .expect("numeric bridge factory schema must be valid"),
         ],
     }) as Box<dyn ProviderFactory>]
 }
@@ -1796,6 +1832,21 @@ fn wasm_style_engine() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = wasm_style_factories();
     let provider_names = vec!["awsccmock".to_string()];
     DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+}
+
+fn wasm_style_flow_log_schema() -> ResourceSchema {
+    let identity = carina_core::schema::TypeIdentity::new(
+        Some("aws"),
+        ["ec2", "FlowLog"],
+        "MaxAggregationInterval",
+    );
+    ResourceSchema::new("ec2.FlowLog").attribute(
+        AttributeSchema::optional(
+            "max_aggregation_interval",
+            AttributeType::refined_int(Some(identity), None),
+        )
+        .build(),
+    )
 }
 
 #[test]
@@ -1852,12 +1903,61 @@ awsccmock.ec2.security_group {
     );
 }
 
+#[test]
+fn numeric_wasm_validator_accepts_60_in_cli_and_lsp() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.FlowLog {
+    max_aggregation_interval = 60
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&wasm_style_engine(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(wasm_style_factories(), &fixture);
+
+    assert!(
+        !lsp_messages_contain(&lsp_diags, "max_aggregation_interval"),
+        "LSP must accept numeric bridge value 60, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        !cli_messages_contain(&cli_diags, "max_aggregation_interval"),
+        "CLI validate must accept numeric bridge value 60, got {cli_diags:?}",
+    );
+}
+
+#[test]
+fn numeric_wasm_validator_rejects_61_in_cli_and_lsp() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.FlowLog {
+    max_aggregation_interval = 61
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&wasm_style_engine(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(wasm_style_factories(), &fixture);
+
+    assert!(
+        lsp_messages_contain(&lsp_diags, "max_aggregation_interval"),
+        "LSP must reject numeric bridge value 61, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        cli_messages_contain(&cli_diags, "max_aggregation_interval"),
+        "CLI validate must reject numeric bridge value 61, got {cli_diags:?}",
+    );
+}
+
 fn wasm_style_subnet_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::refined_string_with_validator(
-        carina_core::schema::TypeIdentity::bare("VpcId"),
+    let vpc_id_type = AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         None,
         None,
-        carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
     ResourceSchema::new("ec2.subnet")

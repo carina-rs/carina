@@ -3,6 +3,11 @@
 use carina_core::resource::{
     ResourceIdentity as CoreResourceIdentity, ResourceIdentityError as CoreResourceIdentityError,
 };
+use carina_core::schema::{
+    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
+    ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedResourceSchema as CoreValidatedResourceSchema, legacy_validator,
+};
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, FoundRead, Pending,
@@ -106,28 +111,11 @@ impl Default for MockProcessProvider {
 }
 
 impl MockProcessProvider {
-    fn optional_string_attribute(name: &str) -> AttributeSchema {
-        AttributeSchema {
-            name: name.to_string(),
-            attr_type: AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
-            },
-            required: false,
-            default: None,
-            description: Some("Mock create/resume test control".to_string()),
-            create_only: false,
-            read_only: false,
-            write_only: false,
-            block_name: None,
-            provider_name: None,
-            removable: None,
-            identity: true,
-            deferred_populate: false,
-        }
+    fn optional_string_attribute(name: &str) -> CoreAttributeSchema {
+        CoreAttributeSchema::optional(name, CoreAttributeType::string())
+            .with_description("Mock create/resume test control")
+            .identity()
+            .build()
     }
 
     fn resource_key(id: &ResourceId) -> String {
@@ -448,31 +436,97 @@ impl CarinaProvider for MockProcessProvider {
         }
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![ResourceSchema {
-            resource_type: "test.short_budget".to_string(),
-            attributes: HashMap::from([(
-                "create_mode".to_string(),
-                Self::optional_string_attribute("create_mode"),
-            )]),
-            description: Some("Mock resource with short operation budgets".to_string()),
-            kind: SchemaKind::Managed,
-            unique_name: UniqueNameSpec::default(),
-            operation_config: Some(OperationConfig {
-                create_timeout_secs: Some(2),
-                update_timeout_secs: Some(2),
-                delete_timeout_secs: Some(2),
-                create_max_retries: None,
-                delete_max_retries: None,
-            }),
-            validators: Vec::new(),
-            exclusive_required: Vec::new(),
-            defs: std::collections::BTreeMap::new(),
-        }]
+    fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
+        vec![
+            CoreResourceSchema::new("test.short_budget")
+                .attribute(Self::optional_string_attribute("create_mode"))
+                .with_description("Mock resource with short operation budgets")
+                .with_operation_config(OperationConfig {
+                    create_timeout_secs: Some(2),
+                    update_timeout_secs: Some(2),
+                    delete_timeout_secs: Some(2),
+                    create_max_retries: None,
+                    delete_max_retries: None,
+                })
+                .validate()
+                .expect("mock process schema must be valid"),
+            CoreResourceSchema::new("test.sdk_validator")
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "guarded",
+                        CoreAttributeType::refined_string_with_validator(
+                            carina_core::schema::TypeIdentity::new(
+                                Some("mock"),
+                                ["test", "sdk_validator"],
+                                "Guarded",
+                            ),
+                            None,
+                            None,
+                            legacy_validator(|_value| {
+                                Err("intentional SDK schema validator rejection".to_string())
+                            }),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("SDK validator schema must be valid"),
+            CoreResourceSchema::new("test.recovery_probe")
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "value",
+                        CoreAttributeType::refined_string_with_validator(
+                            carina_core::schema::TypeIdentity::new(
+                                Some("mock"),
+                                Vec::<String>::new(),
+                                "RecoveryProbe",
+                            ),
+                            None,
+                            None,
+                            legacy_validator(|_value| Ok(())),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("recovery probe schema must be valid"),
+            CoreResourceSchema::new("test.timing_probe")
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "value",
+                        CoreAttributeType::refined_string_with_validator(
+                            carina_core::schema::TypeIdentity::new(
+                                Some("mock"),
+                                Vec::<String>::new(),
+                                "TimingProbe",
+                            ),
+                            None,
+                            None,
+                            legacy_validator(|value| {
+                                if matches!(
+                                    value,
+                                    carina_core::resource::Value::Concrete(
+                                        carina_core::resource::ConcreteValue::String(value)
+                                    ) if value == "__mock_validate_custom_type_hang__"
+                                ) {
+                                    std::thread::sleep(std::time::Duration::from_secs(10));
+                                }
+                                Ok(())
+                            }),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("timing probe schema must be valid"),
+        ]
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
+        CoreValidatedConfigSchema::default()
     }
 
     fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String> {
@@ -483,13 +537,6 @@ impl CarinaProvider for MockProcessProvider {
             && let Ok(delay_millis) = u64::try_from(*delay_millis)
         {
             std::thread::sleep(std::time::Duration::from_millis(delay_millis));
-        }
-        Ok(())
-    }
-
-    fn validate_custom_type(&self, _identity: &TypeIdentity, value: &str) -> Result<(), String> {
-        if value == "__mock_validate_custom_type_hang__" {
-            std::thread::sleep(std::time::Duration::from_secs(10));
         }
         Ok(())
     }

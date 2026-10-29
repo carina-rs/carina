@@ -181,14 +181,8 @@ async fn main() {
     let (service, socket) = LspService::new(move |client| {
         let provider_context = ProviderContext {
             decryptor: None,
-            validators: HashMap::new(),
-            custom_type_attribute_types: HashMap::new(),
-            custom_type_validator: None,
             resource_types: Default::default(),
-            // Schemas load asynchronously after LSP initialize; the
-            // strict carina#3239 parser check is enabled inside
-            // `DiagnosticEngine::new` once schemas are present.
-            customs_loaded: false,
+            ..ProviderContext::default()
         };
 
         // Pass factory builder callback — actual WASM loading happens asynchronously

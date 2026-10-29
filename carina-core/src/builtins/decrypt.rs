@@ -94,7 +94,6 @@ fn parse_decrypt_args(args: &[Value]) -> Result<(&ValueString, Option<&ValueStri
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use crate::builtins::evaluate_builtin_with_config_to_value as evaluate_builtin_with_config;
     use crate::parser::ProviderContext;
@@ -105,11 +104,8 @@ mod tests {
     fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ProviderContext {
         ProviderContext {
             decryptor: Some(decrypt_fn),
-            validators: HashMap::new(),
-            custom_type_attribute_types: HashMap::new(),
-            custom_type_validator: None,
             resource_types: Default::default(),
-            customs_loaded: false,
+            ..ProviderContext::default()
         }
     }
 

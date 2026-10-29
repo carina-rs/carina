@@ -18,11 +18,13 @@
 //! exercise the CLI driver.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, RootlessType, ValidatedConfigSchema,
-    legacy_validator,
+    AttributeSchema, AttributeType, ResourceSchema, RootlessType, SchemaKind, SchemaRegistry,
+    ValidatedConfigSchema, ValidatedResourceSchema, legacy_validator,
 };
 
 fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
@@ -41,15 +43,63 @@ fn render_first_error(
         .clone()
         .validate()
         .expect("snapshot schema must be valid");
-    let result = if string_literal {
-        schema.validate_with_origins(&attrs, &|_| true)
-    } else {
-        schema.validate(&attrs)
-    };
+    let resource_type = schema.parts().resource_type.to_string();
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> =
+        Arc::new(vec![Box::new(SnapshotSchemaFactory {
+            schema: schema.clone(),
+        })]);
+    let resolver = carina_core::provider::provider_custom_types_from_factories(factories);
+    let mut registry = SchemaRegistry::new();
+    registry.insert("test", schema);
+    let result = registry
+        .get("test", &resource_type, SchemaKind::Resource)
+        .expect("snapshot schema must be owner-bound")
+        .validate_with_resolver(&attrs, &|_| string_literal, &resolver);
     let errs = result.expect_err("schema must reject the input under test");
     errs.first()
         .expect("at least one error expected")
         .to_string()
+}
+
+struct SnapshotSchemaFactory {
+    schema: ValidatedResourceSchema,
+}
+
+impl ProviderFactory for SnapshotSchemaFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "snapshot schema provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        unimplemented!("snapshot tests do not construct providers")
+    }
+
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        vec![self.schema.clone()]
+    }
 }
 
 #[test]
