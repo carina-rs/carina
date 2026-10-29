@@ -9807,6 +9807,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
         partial_count: 1,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
+        interrupted_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
@@ -9831,4 +9832,32 @@ fn skipped_export_does_not_downgrade_partial_success() {
     let message = err.to_string();
     assert!(message.contains("1 partial"), "error: {message}");
     assert!(message.contains("1 export not written"), "error: {message}",);
+}
+
+#[test]
+fn interrupted_apply_summary_counts_unknown_outcome() {
+    let result: ExecutionResult = ExecutionResult {
+        success_count: 1,
+        failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        interrupted_count: 1,
+        applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
+        successfully_deleted: HashSet::new(),
+        permanent_name_overrides: HashMap::new(),
+        managed_current: HashMap::new(),
+        data_source_states: HashMap::new(),
+        bindings: Default::default(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let err = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+
+    assert!(matches!(&err, AppError::Config(_)));
+    assert_eq!(
+        err.to_string(),
+        "Apply failed. 1 succeeded, 1 outcome unknown."
+    );
 }

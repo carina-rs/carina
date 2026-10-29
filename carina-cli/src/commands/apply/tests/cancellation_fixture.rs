@@ -23,6 +23,11 @@ struct CancellingObserver<S> {
 impl<S: Send + Sync + 'static> ExecutionObserver<S> for CancellingObserver<S> {
     fn on_event(&self, event: &ExecutionEvent<S>) {
         self.inner.on_event(event);
+        if matches!(event, ExecutionEvent::EffectInterrupted { .. }) {
+            // The inner CLI observer renders the unknown outcome. Interrupted
+            // effects do not advance this fixture's success threshold.
+            return;
+        }
         if matches!(event, ExecutionEvent::EffectSucceeded { .. }) {
             let successes = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
             if successes == self.threshold {

@@ -22,6 +22,8 @@ mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
+pub use wait::StartMarker;
+
 pub use crate::data_source_value::UnresolvedDataSourceInput;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
@@ -820,6 +822,7 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub partial_count: usize,
     pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
+    pub interrupted_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
     pub runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
@@ -842,6 +845,7 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) partial_count: usize,
     pub(super) partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) skip_count: usize,
+    pub(super) interrupted_count: usize,
     pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
     pub(super) permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
@@ -862,6 +866,7 @@ impl<S> ExecutionResultFields<S> {
             partial_count,
             partial_diagnostics,
             skip_count,
+            interrupted_count,
             runtime_synthesized_resources,
             successfully_deleted,
             permanent_name_overrides,
@@ -876,6 +881,7 @@ impl<S> ExecutionResultFields<S> {
             partial_count,
             partial_diagnostics,
             skip_count,
+            interrupted_count,
             applied_states,
             runtime_synthesized_resources,
             successfully_deleted,
@@ -905,6 +911,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
             partial_count,
             partial_diagnostics,
             skip_count,
+            interrupted_count,
             applied_states,
             runtime_synthesized_resources,
             successfully_deleted,
@@ -926,6 +933,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
                 partial_count,
                 partial_diagnostics,
                 skip_count,
+                interrupted_count,
                 runtime_synthesized_resources,
                 successfully_deleted,
                 permanent_name_overrides,
@@ -1062,6 +1070,15 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     EffectStarted {
         effect: &'a Effect<S>,
+        start: StartMarker,
+    },
+    /// The effect was started and then abandoned under cleanup priority.
+    ///
+    /// Its provider-side outcome is unknown because its in-flight future was
+    /// dropped before a terminal result could be observed.
+    EffectInterrupted {
+        effect: &'a Effect<S>,
+        progress: ProgressInfo,
     },
     EffectSucceeded {
         effect: &'a Effect<S>,
@@ -1092,6 +1109,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     /// Emitted at `max(30s, interval * 5)` cadence with the elapsed time and
     /// last observed attributes so operators can see what the wait is reading.
     WaitPolling {
+        effect: &'a Effect<S>,
         observation: WaitObservation<'a>,
         elapsed: Duration,
     },
@@ -1123,6 +1141,16 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     ModuleConstraintFailed {
         error: &'a str,
     },
+}
+
+impl<'a, S> ExecutionEvent<'a, S> {
+    /// Construct a start event for observer-focused tests without exposing the
+    /// production start marker constructor.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn effect_started_for_test(effect: &'a Effect<S>) -> Self {
+        wait::effect_started_for_test(effect)
+    }
 }
 
 /// Observer trait for UI separation during plan execution.

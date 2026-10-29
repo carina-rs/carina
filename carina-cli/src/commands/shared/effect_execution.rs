@@ -201,6 +201,7 @@ mod tests {
             partial_count: 0,
             partial_diagnostics: Vec::new(),
             skip_count: 0,
+            interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
             successfully_deleted: HashSet::new(),

@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
@@ -51,7 +54,8 @@ use crate::commands::shared::lock_heartbeat::{
 };
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
-    FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressSink, RefreshPhase, format_duration,
+    FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressGuard, ProgressSink, RefreshPhase,
+    format_duration,
 };
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
@@ -65,6 +69,49 @@ use crate::wiring::{
     ProviderLoad, ValidatedConfig, get_provider_with_ctx, refresh_loaded_orphan_with_retry,
     refresh_loaded_resource_with_retry,
 };
+
+struct DestroyInFlight<'a, F> {
+    idx: usize,
+    progress: Option<ProgressGuard<'a, usize>>,
+    future: Pin<Box<F>>,
+}
+
+impl<'a, F> DestroyInFlight<'a, F> {
+    fn new(idx: usize, progress: ProgressGuard<'a, usize>, future: F) -> Self {
+        Self {
+            idx,
+            progress: Some(progress),
+            future: Box::pin(future),
+        }
+    }
+
+    fn into_progress(mut self) -> (usize, ProgressGuard<'a, usize>) {
+        (
+            self.idx,
+            self.progress
+                .take()
+                .expect("in-flight destroy effect must own progress"),
+        )
+    }
+}
+
+impl<'a, F: Future> Future for DestroyInFlight<'a, F> {
+    type Output = (usize, ProgressGuard<'a, usize>, F::Output);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.future.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(output) => Poll::Ready((
+                this.idx,
+                this.progress
+                    .take()
+                    .expect("completed destroy effect must own progress"),
+                output,
+            )),
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destroy(
@@ -865,14 +912,14 @@ async fn run_destroy_locked_owned(
                         effect,
                         format!("- skipped (dependent {failed_dep} failed)"),
                     ));
-                    progress.finish(idx, outcome);
+                    progress.outcome_line(outcome);
                     skip_count += 1;
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                progress.start_indexed(idx, format_effect(effect));
+                let active_progress = progress.start_indexed(idx, format_effect(effect));
 
                 // Spawn the deletion as a concurrent future
                 let Effect::Delete {
@@ -892,7 +939,7 @@ async fn run_destroy_locked_owned(
 
                 let provider_ref = &provider;
                 let result_shutdown = &cancel;
-                in_flight.push(async move {
+                let delete = async move {
                     let started = Instant::now();
                     let delete_result = provider_ref
                         .delete(
@@ -904,8 +951,9 @@ async fn run_destroy_locked_owned(
                         )
                         .await;
                     observe_destroy_result_ready_for_tests(result_shutdown).await;
-                    (idx, resource_id, generation, started, delete_result)
-                });
+                    (resource_id, generation, started, delete_result)
+                };
+                in_flight.push(DestroyInFlight::new(idx, active_progress, delete));
             }
         }
 
@@ -925,7 +973,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         "- skipped (destroy cancelled)",
                     ));
-                    progress.finish(idx, outcome);
+                    progress.outcome_line(outcome);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     skip_count += 1;
@@ -953,7 +1001,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         "- retries exhausted (no progress possible)",
                     ));
-                    progress.finish_failed(idx, outcome);
+                    progress.failed_line(outcome);
                     failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
@@ -970,7 +1018,7 @@ async fn run_destroy_locked_owned(
                     effect,
                     "- dependency cycle (no progress possible)",
                 ));
-                progress.finish_failed(idx, outcome);
+                progress.failed_line(outcome);
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
                 failure_count += 1;
@@ -997,7 +1045,11 @@ async fn run_destroy_locked_owned(
             cancelled = true;
             continue;
         };
-        let (finished_idx, resource_id, generation, started, delete_result) = match next {
+        let (
+            finished_idx,
+            active_progress,
+            (resource_id, generation, started, delete_result),
+        ) = match next {
             CleanupInterrupted::Completed(Some(finished)) => finished,
             CleanupInterrupted::Completed(None) => break 'destroy,
             CleanupInterrupted::Abandoned => {
@@ -1022,7 +1074,7 @@ async fn run_destroy_locked_owned(
                     effect,
                     timing,
                 ));
-                progress.finish(finished_idx, outcome);
+                active_progress.finish(outcome);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
@@ -1052,7 +1104,7 @@ async fn run_destroy_locked_owned(
                         retry_num,
                         max_retries
                     ));
-                    progress.finish(finished_idx, outcome);
+                    active_progress.finish(outcome);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     let outcome = FailedOutcome::new(
@@ -1064,7 +1116,7 @@ async fn run_destroy_locked_owned(
                         ),
                         [e.to_string()],
                     );
-                    progress.finish_failed(finished_idx, outcome);
+                    active_progress.finish_failed(outcome);
                     failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
@@ -1075,6 +1127,10 @@ async fn run_destroy_locked_owned(
     // Cleanup-priority abandonment can exit before the normal cancellation
     // drain gets another loop iteration. Finish both active spinners and
     // never-dispatched resources before their backend is dropped.
+    let mut active_progress: HashMap<_, _> = in_flight
+        .into_iter()
+        .map(DestroyInFlight::into_progress)
+        .collect();
     if all_indices
         .iter()
         .any(|idx| !completed_indices.contains(idx))
@@ -1082,6 +1138,7 @@ async fn run_destroy_locked_owned(
         cancelled = true;
         let interrupted = finish_interrupted_destroy_outcomes(
             &progress,
+            &mut active_progress,
             &all_indices,
             &completed_indices,
             &dispatched,
@@ -1110,7 +1167,6 @@ async fn run_destroy_locked_owned(
         skip_count += interrupted.skipped;
         unknown_count += interrupted.unknown;
     }
-    drop(in_flight);
     let state_base = saver.stop(&cancel).await;
     let destroyed_instances = destroyed_instances.into_instances();
 
@@ -1664,6 +1720,7 @@ struct InterruptedDestroyCounts {
 
 fn finish_interrupted_destroy_outcomes(
     progress: &ProgressBackend<usize>,
+    active_progress: &mut HashMap<usize, ProgressGuard<'_, usize>>,
     all_indices: &[usize],
     completed_indices: &HashSet<usize>,
     dispatched: &HashSet<usize>,
@@ -1674,15 +1731,27 @@ fn finish_interrupted_destroy_outcomes(
         if completed_indices.contains(&idx) {
             continue;
         }
-        let outcome = if dispatched.contains(&idx) {
+        let kind = if dispatched.contains(&idx) {
             counts.unknown += 1;
             InterruptedDestroyOutcome::Unknown
         } else {
             counts.skipped += 1;
             InterruptedDestroyOutcome::Skipped
         };
-        progress.finish(idx, outcome_for(idx, outcome));
+        let outcome = outcome_for(idx, kind);
+        if kind == InterruptedDestroyOutcome::Unknown {
+            active_progress
+                .remove(&idx)
+                .expect("dispatched destroy effect must own progress")
+                .finish(outcome);
+        } else {
+            progress.outcome_line(outcome);
+        }
     }
+    assert!(
+        active_progress.is_empty(),
+        "every in-flight destroy effect must receive an interrupted outcome"
+    );
     counts
 }
 
@@ -1971,12 +2040,14 @@ mod tests {
     fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
         let output = SharedProgressWriter::default();
         let progress = ProgressBackend::plain(output.clone());
-        progress.start_indexed(0, "Delete in-flight");
+        let mut active_progress =
+            HashMap::from([(0, progress.start_indexed(0, "Delete in-flight"))]);
         let completed = HashSet::from([2]);
         let dispatched = HashSet::from([0]);
 
         let counts = finish_interrupted_destroy_outcomes(
             &progress,
+            &mut active_progress,
             &[0, 1, 2],
             &completed,
             &dispatched,
@@ -2003,6 +2074,28 @@ mod tests {
                 "  ? Delete resource-0 - interrupted (outcome unknown)\n",
                 "  ⊘ Delete resource-1 - skipped (destroy cancelled)\n",
             )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "dispatched destroy effect must own progress")]
+    fn interrupted_destroy_requires_progress_for_dispatched_effect() {
+        let output = SharedProgressWriter::default();
+        let progress = ProgressBackend::plain(output);
+        let mut active_progress = HashMap::new();
+
+        finish_interrupted_destroy_outcomes(
+            &progress,
+            &mut active_progress,
+            &[0],
+            &HashSet::new(),
+            &HashSet::from([0]),
+            |idx, outcome| match outcome {
+                InterruptedDestroyOutcome::Unknown => NonFailureOutcome::unknown(format!(
+                    "Delete resource-{idx} - interrupted (outcome unknown)"
+                )),
+                InterruptedDestroyOutcome::Skipped => unreachable!(),
+            },
         );
     }
 

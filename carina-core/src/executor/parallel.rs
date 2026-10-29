@@ -25,7 +25,7 @@ use super::scheduler::{
     try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
-    SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
+    SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome, WaitSignal,
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
     wait_failure_message,
 };
@@ -246,6 +246,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
+        interrupted_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
@@ -335,7 +336,8 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
         }
     }
 
-    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<S>> = WaitAwareInFlight::new();
+    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<'_, S>, S> =
+        WaitAwareInFlight::new();
     let mut cancelled = false;
     let cleanup_loop = shutdown.cleanup_aware_loop();
 
@@ -526,7 +528,8 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
-            >| async move {
+            >,
+                                    in_flight_start| async move {
                 let preparation = ProviderPreparationContext::new(
                     &binding_snapshot,
                     module_gate,
@@ -555,6 +558,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                                 completed: completed_ref,
                                 total,
                             },
+                            in_flight_start,
                             observer,
                         )
                         .await,
@@ -572,13 +576,15 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                         Effect::Read { resource } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted {
-                                effect: &effect_for_future,
-                            });
                             let progress = ProgressInfo {
                                 completed: c,
                                 total,
                             };
+                            let started_effect = in_flight_start.emit_started(
+                                observer,
+                                &effect_for_future,
+                                progress,
+                            );
                             let mut resolved = resource.as_inner().clone();
                             let outcome = {
                                 let check_input =
@@ -640,10 +646,10 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                                 }
                             };
                             SingleEffectResult::Read {
+                                started: started_effect,
                                 resource: Box::new(resolved),
                                 outcome,
                                 duration: started.elapsed(),
-                                progress,
                             }
                         }
                         // State operations are handled separately during apply
@@ -656,55 +662,51 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                         Effect::DeferredReplace(_) => unreachable!(
                             "DeferredReplace is handled synchronously before provider dispatch"
                         ),
-                        Effect::Wait {
-                            identity,
-                            target_id,
-                            until,
-                            timeout,
-                            interval,
-                            ..
-                        } => {
+                        Effect::Wait { .. } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted {
-                                effect: &effect_for_future,
-                            });
                             let progress = ProgressInfo {
                                 completed: c,
                                 total,
                             };
+                            let started_effect = in_flight_start.emit_started(
+                                observer,
+                                &effect_for_future,
+                                progress,
+                            );
+                            let wait = WaitEffectRef::from_effect(&effect_for_future)
+                                .expect("Effect::Wait must produce a wait view");
                             let identifier_resolver = |target_id: &ResourceId| {
                                 resolve_wait_identifier(&wait_identifiers, target_id)
                             };
                             let cleanup_loop = shutdown.cleanup_aware_loop();
-                            let target_binding = match binding_snapshot.source(identity.as_str()) {
-                                Some(crate::binding_index::BindingValueSource::WaitAlias {
-                                    target,
-                                }) => target.as_str().to_string(),
-                                Some(
-                                    crate::binding_index::BindingValueSource::Local
-                                    | crate::binding_index::BindingValueSource::Upstream,
-                                )
-                                | None => target_id.id().identity_str().to_string(),
-                            };
+                            let target_binding =
+                                match binding_snapshot.source(wait.identity().as_str()) {
+                                    Some(crate::binding_index::BindingValueSource::WaitAlias {
+                                        target,
+                                    }) => target.as_str().to_string(),
+                                    Some(
+                                        crate::binding_index::BindingValueSource::Local
+                                        | crate::binding_index::BindingValueSource::Upstream,
+                                    )
+                                    | None => wait.target().id().identity_str().to_string(),
+                                };
+                            let binding = wait.identity().to_string();
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
                                 provider,
-                                target_id,
+                                wait,
                                 &identifier_resolver,
-                                until,
-                                *timeout,
-                                *interval,
                                 wait_cancel_rx.expect("wait dispatch must have a cancel receiver"),
                                 observer,
                             )
                             .await;
                             SingleEffectResult::Wait {
-                                binding: identity.to_string(),
+                                started: started_effect,
+                                binding,
                                 target_binding,
                                 outcome,
                                 duration: started.elapsed(),
-                                progress,
                             }
                         }
                     },
@@ -713,9 +715,11 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             };
 
             if effect.is_wait() {
-                in_flight.push_wait(idx, |cancel_rx| Box::pin(make_future(Some(cancel_rx))));
+                in_flight.push_wait(idx, |cancel_rx, start| {
+                    Box::pin(make_future(Some(cancel_rx), start))
+                });
             } else {
-                in_flight.push_non_wait(idx, make_future(None));
+                in_flight.push_non_wait(idx, |start| make_future(None, start));
             }
         }
 
@@ -820,18 +824,13 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
             }
             SingleEffectResult::ReadNoOp => {}
             SingleEffectResult::Read {
+                started,
                 resource,
                 outcome,
                 duration,
-                progress,
             } => match outcome {
                 Ok((resolved_attrs, state)) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect: &effects[finished_idx],
-                        state: Some(&state),
-                        duration,
-                        progress,
-                    });
+                    started.succeeded(Some(&state), duration);
                     accumulated.mutate(|result| {
                         result.success_count += 1;
                         result.bindings.record_applied(
@@ -850,22 +849,17 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                     );
                 }
                 Err(error) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect: &effects[finished_idx],
-                        error: &error,
-                        duration,
-                        progress,
-                    });
+                    started.failed(&error, duration);
                     accumulated.mutate(|result| result.failure_count += 1);
                     failed_indices.insert(finished_idx);
                 }
             },
             SingleEffectResult::Wait {
+                started,
                 binding,
                 target_binding,
                 outcome,
                 duration,
-                progress,
             } => match outcome {
                 WaitOutcome::Satisfied { state } => {
                     // Register the captured target snapshot under the
@@ -883,12 +877,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                         .secret_preserving_wait_snapshot(&target_binding, &state)
                     {
                         Ok(attrs) => {
-                            observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                effect: &effects[finished_idx],
-                                state: Some(&state),
-                                duration,
-                                progress,
-                            });
+                            started.succeeded(Some(&state), duration);
                             accumulated.mutate(|result| {
                                 result.success_count += 1;
                                 result
@@ -902,12 +891,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                             );
                         }
                         Err(error) => {
-                            observer.on_event(&ExecutionEvent::EffectFailed {
-                                effect: &effects[finished_idx],
-                                error: &error,
-                                duration,
-                                progress,
-                            });
+                            started.failed(&error, duration);
                             accumulated.mutate(|result| result.failure_count += 1);
                             failed_indices.insert(finished_idx);
                         }
@@ -916,32 +900,19 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                 WaitOutcome::Unsatisfiable(reason) => {
                     let detail = unsatisfiable_reason_message(&reason);
                     let reason = format!("unsatisfiable: {detail}");
-                    observer.on_event(&ExecutionEvent::EffectSkipped {
-                        effect: &effects[finished_idx],
-                        reason: &reason,
-                        progress,
-                    });
+                    started.skipped(&reason);
                     accumulated.mutate(|result| result.skip_count += 1);
                     failed_indices.insert(finished_idx);
                 }
                 WaitOutcome::Cancelled | WaitOutcome::Abandoned => {
-                    observer.on_event(&ExecutionEvent::EffectSkipped {
-                        effect: &effects[finished_idx],
-                        reason: SKIP_REASON_CANCELLED,
-                        progress,
-                    });
+                    started.skipped(SKIP_REASON_CANCELLED);
                     accumulated.mutate(|result| result.skip_count += 1);
                 }
                 outcome @ (WaitOutcome::Timeout { .. }
                 | WaitOutcome::NotFound(_)
                 | WaitOutcome::ReadFailed(_)) => {
                     let error = wait_failure_message(&outcome, effects[finished_idx].resource_id());
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect: &effects[finished_idx],
-                        error: &error,
-                        duration,
-                        progress,
-                    });
+                    started.failed(&error, duration);
                     accumulated.mutate(|result| result.failure_count += 1);
                     failed_indices.insert(finished_idx);
                 }
@@ -956,7 +927,15 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
 
     // Cleanup-priority mode deliberately drops unresolved provider futures so
     // the caller can persist the results already folded into `applied_states`.
-    drop(in_flight);
+    // Every effect that reached EffectStarted receives a terminal event before
+    // state persistence; queued but never-polled futures are omitted.
+    // Every loop exit passes through this point, so the total includes both
+    // cleanup abandonment and any release-mode fail-safe interruptions that
+    // were emitted while processing a completed future.
+    let total_interrupted_count = in_flight.abandon(observer);
+    if total_interrupted_count > 0 {
+        accumulated.mutate(|result| result.interrupted_count += total_interrupted_count);
+    }
     accumulated.publish_if_dirty(&input.checkpoint_sink);
     let refresh_cancelled = match cleanup_loop.step() {
         LoopStep::Abandon => true,
@@ -1189,10 +1168,21 @@ mod tests {
                         .push(format!("{}:{error}", effect.resource_id()));
                 }
                 ExecutionEvent::Waiting { .. }
-                | ExecutionEvent::EffectStarted { .. }
+                | ExecutionEvent::EffectStarted {
+                    effect: _,
+                    start: _,
+                }
+                | ExecutionEvent::EffectInterrupted {
+                    effect: _,
+                    progress: _,
+                }
                 | ExecutionEvent::EffectSucceeded { .. }
                 | ExecutionEvent::EffectPartiallySucceeded { .. }
-                | ExecutionEvent::WaitPolling { .. }
+                | ExecutionEvent::WaitPolling {
+                    effect: _,
+                    observation: _,
+                    elapsed: _,
+                }
                 | ExecutionEvent::CascadeUpdateSucceeded { .. }
                 | ExecutionEvent::CascadeUpdateFailed { .. }
                 | ExecutionEvent::RenameSucceeded { .. }
