@@ -5,7 +5,7 @@ description: "The archive format a Carina provider uses to ship its documentatio
 
 A provider registry shows each provider version's documentation: an overview page, and one page per resource type and data source. The official providers' pages at [registry.carina-rs.dev](https://registry.carina-rs.dev/providers/index.html) are built this way. The provider supplies them as a **docs bundle**, one archive built by the same release that builds the `.wasm`.
 
-Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write your docs and build the bundle now; the registry checks it only at publish (see below). The authoritative definition is the registry protocol's [Documentation source](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle) section; this page summarizes it.
+Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write your docs and build the bundle now; the registry checks it only at publish (see below). The authoritative definition is the registry protocol's [Documentation source](/reference/registry/protocol/#documentation-source-the-docs-bundle) section; this page summarizes it.
 
 ## Layout
 
@@ -16,6 +16,7 @@ carina-provider-hello-v0.1.0-docs.tar.gz
     greeting.md            # one page per resource type
   data-sources/
     lookup.md              # one page per data source
+  services.json            # optional: groups the pages by service
 ```
 
 `index.md` is the version's top page: what the provider manages, and how to configure its `provider` block. Each file under `resources/` and `data-sources/` becomes a page. A file's name without `.md` is its **slug**, and is the last part of its page URL: `resources/greeting.md` is served at `/providers/<namespace>/<name>/<version>/resources/greeting`. You choose the slugs; the registry does not derive them from resource type names.
@@ -29,7 +30,8 @@ The registry checks every rule when a version is published and refuses a bundle 
 | Archive | One gzip member holding a POSIX tar archive (`ustar` or `pax`) |
 | Entries | Regular files and directories only, no links; see below |
 | Paths | Relative, `/`-separated, no empty, `.` or `..` component; one leading `./` is ignored |
-| Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`; nothing else |
+| Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`, and optionally `services.json` at the root; nothing else |
+| `services.json` | If present, puts every page in exactly one service; see below |
 | Slugs | `[a-z0-9][a-z0-9_]*`, at most 128 bytes |
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
@@ -39,6 +41,23 @@ The tar format has a few more rules: a directory entry declares size 0, paths lo
 Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when (largest number of `|` characters on any line + 1) × number of lines exceeds 250,000. Each page's Markdown may render to at most 2 MiB of HTML, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
 
 Docs are accepted only for stable versions. A pre-release publish that carries a docs bundle is refused as a whole, so send docs only when publishing a stable version; an archive left on a pre-release's GitHub release is harmless. A version's docs are fixed when it is first published: corrected docs ship with the next version.
+
+## Grouping pages by service
+
+Without `services.json`, the sidebar lists every resource and data source in one flat list. A provider with many pages can add `services.json` at the root of the bundle to group them under collapsible service headings:
+
+```json
+{"services":[{"id":"greetings","title":"Greetings","resources":["greeting"],"data_sources":["lookup"]}]}
+```
+
+The registry refuses the whole bundle when the file breaks any of these rules:
+
+- Both levels have exactly the keys shown, with no duplicates, and `services` is not empty.
+- Each `id` matches `[a-z0-9][a-z0-9_]*` and is at most 128 bytes. Each `title` is non-empty, at most 128 characters, and has no control characters or invisible formatting characters such as bidirectional overrides and zero-width spaces.
+- No two services share an `id` or a `title`.
+- Every page in `resources/` and `data-sources/` appears in exactly one service, in the matching list, and every listed slug has a page. A service may not be empty.
+
+Services are shown sorted by `id`, and pages within each list by slug, whatever order the file uses. The file is part of the archive, so it is covered by the archive's digest and signature like the pages. The protocol's [Documentation source](/reference/registry/protocol/#documentation-source-the-docs-bundle) section has the exact rules.
 
 ## How pages are rendered
 
@@ -53,7 +72,7 @@ The registry treats documentation as untrusted input. It renders GitHub Flavored
 
 Build the archive reproducibly: entries sorted by name, a fixed modification time, owner and group 0, and no timestamp in the gzip header. A publish that is retried compares the archive's digest, so a rebuild that produces different bytes from the same files is refused as a conflict.
 
-This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8 or the Markdown limits in the table above. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
+This script uses only the Python standard library. It packs `index.md`, `services.json` when present, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8, the Markdown limits in the table above or the contents of `services.json`. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
 
 ```python
 #!/usr/bin/env python3
@@ -70,7 +89,7 @@ import tarfile
 from pathlib import Path
 
 src, out = Path(sys.argv[1]), Path(sys.argv[2])
-allowed = re.compile(r"index\.md|(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md")
+allowed = re.compile(r"index\.md|services\.json|(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md")
 
 files, unexpected = [], []
 for root, dirs, names in os.walk(src, followlinks=True):
@@ -108,11 +127,11 @@ with open(out, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename
 python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 ```
 
-Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
+Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](/reference/registry/protocol/#documentation-provenance) section has the details.
 
 If you release with [provider-release](/providers/writing/publishing/#the-release-pipeline), its build workflow packs and checks the bundle with a `scripts/docs-bundle.py` copied from carina-provider-aws instead of this script. That script expects carina-provider-aws's own source layout (generated pages as `<service>/<name>.md` with a front-matter title, and an index built from a hand-written `docs/registry/index.md` plus generated page lists), so adapt it as the provider-release README describes. It allows files up to 1 MiB where the registry allows 256 KiB, and like this script it does not check the rendering limits, so keep each page under 256 KiB and within the nesting and rendering limits yourself.
 
-There is no standalone checker for these rules yet; the registry runs them at publish. Making the registry's own validator available to providers is tracked in [carina-rs/registry#139](https://github.com/carina-rs/registry/issues/139).
+There is no standalone checker for these rules yet; the registry runs them at publish.
 
 ## Next steps
 

@@ -1,0 +1,13 @@
+{
+  "protocols": ["1"],
+  "filename": "carina-provider-aws-v0.7.3.wasm",
+  "download_url": "https://github.com/carina-rs/carina-provider-aws/releases/download/v0.7.3/carina-provider-aws-v0.7.3.wasm",
+  "shasum": "54dc14eff22c308a7657f5b602c0c4510d31e71bad598e40e654d8c3090b824f",
+  "shasum_authored_by": "registry",
+  "signature": {
+    "type": "sigstore-bundle",
+    "certificate_identity": "https://github.com/carina-rs/carina-provider-aws/.github/workflows/release.yml@refs/tags/v0.7.3",
+    "certificate_oidc_issuer": "https://token.actions.githubusercontent.com",
+    "bundle_url": "https://registry.example.com/v1/providers/carina-rs/aws/0.7.3/sigstore.json"
+  }
+}

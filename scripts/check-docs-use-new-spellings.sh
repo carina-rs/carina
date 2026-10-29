@@ -23,9 +23,9 @@ check_file() {
       sub(/[[:space:]].*$/, "", tag)
 
       # Carina DSL may be tagged hcl/text or left untagged, so those and unknown
-      # tags remain scanned. Only explicit non-DSL language tags are skipped;
-      # nobody tags Carina DSL as rust or json.
-      skip_fence = (tag ~ /^(rust|json|yaml|toml|ts|tsx|js|jsx|javascript|typescript|python|go)$/)
+      # tags remain scanned. Only explicit non-DSL tags are skipped; nobody tags
+      # Carina DSL as plaintext, rust, or json.
+      skip_fence = (tag ~ /^(plaintext|rust|json|yaml|toml|ts|tsx|js|jsx|javascript|typescript|python|go)$/)
       next
     }
     in_fence && !skip_fence {
