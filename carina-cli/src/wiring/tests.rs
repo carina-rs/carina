@@ -5707,6 +5707,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     let unresolved = evaluated.clone();
 
     let canonical_unresolved = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5769,6 +5770,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let unresolved = evaluated.clone();
 
     let errors = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5805,6 +5807,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     let unresolved = evaluated.clone();
 
     let canonical = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),

@@ -25,21 +25,35 @@ use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 /// An arbitrary evaluated resource vector cannot replace the resolver-owned
 /// evaluated configuration:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// # use carina_cli::wiring::CanonicalResourcePair;
 /// # use carina_core::resource::Resource;
-/// # fn bypass(pair: CanonicalResourcePair<()>, arbitrary: Vec<Resource>) {
-/// let _ = pair.with_transformed_evaluated(arbitrary);
+/// # fn bypass(mut pair: CanonicalResourcePair<()>, arbitrary: Vec<Resource>) {
+/// pair.parsed.resources = arbitrary;
 /// # }
 /// ```
 ///
-/// The pair cannot be minted outside validation wiring:
+/// The pair cannot be minted outside validation wiring, except through the
+/// `cfg(test)`/`test-utils`-gated `resolve_config_block_names_for_test` helper:
 ///
 /// ```compile_fail,E0624
 /// use carina_cli::wiring::CanonicalResourcePair;
 /// use carina_core::parser::File;
 ///
 /// let _ = CanonicalResourcePair::new(File::<()>::default(), Vec::new());
+/// ```
+///
+/// The validation-wiring block-name resolver is also private:
+///
+/// ```compile_fail,E0624
+/// use carina_cli::wiring::CanonicalResourcePair;
+///
+/// let _ = CanonicalResourcePair::<()>::resolve_block_names(
+///     todo!(),
+///     todo!(),
+///     todo!(),
+///     todo!(),
+/// );
 /// ```
 #[derive(Debug, Clone)]
 pub struct CanonicalResourcePair<E> {
@@ -74,6 +88,7 @@ impl<E> CanonicalResourcePair<E> {
     }
 
     pub(super) fn resolve_block_names(
+        _access: &super::ValidationPipelineAccess,
         parsed: File<E>,
         unresolved: UnresolvedConfigSnapshot,
         registry: &SchemaRegistry,
@@ -261,7 +276,7 @@ pub enum OverrideAwareBuildMode<'a> {
 ///
 /// Raw resource vectors cannot be passed to the constructor:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// # use std::collections::HashMap;
 /// # use carina_core::binding_index::PreApplyInputs;
 /// # use carina_core::name_override::NameOverride;
@@ -408,7 +423,7 @@ impl OverrideAwareResources {
         &self.resources
     }
 
-    pub fn resources_mut(&mut self) -> &mut [Resource] {
+    pub(crate) fn resources_mut(&mut self) -> &mut [Resource] {
         &mut self.resources
     }
 

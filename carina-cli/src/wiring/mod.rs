@@ -132,8 +132,8 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    BlockNameConflict, OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry,
-    TypeError, ValidatedResourceSchema, resolve_file_block_names_with_schemas,
+    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
+    ValidatedResourceSchema, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -480,7 +480,7 @@ impl ValidationPipelineAccess {
         parsed: carina_core::parser::File<E>,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-        resolve_config_names_with_ctx(ctx, parsed, unresolved)
+        resolve_config_names_with_ctx(self, ctx, parsed, unresolved)
     }
 }
 
@@ -2057,11 +2057,12 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
 }
 
 fn resolve_config_names_with_ctx<E>(
+    access: &ValidationPipelineAccess,
     ctx: &WiringContext,
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    CanonicalResourcePair::resolve_block_names(parsed, unresolved, ctx.schemas())
+    CanonicalResourcePair::resolve_block_names(access, parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)?
         .resolve_attr_prefixes(ctx.schemas())
         .map_err(|error| split_validation_message(&error))
@@ -2074,8 +2075,13 @@ pub fn resolve_config_block_names_for_test<E>(
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<CanonicalResourcePair<E>, Vec<BlockNameConflict>> {
-    CanonicalResourcePair::resolve_block_names(parsed, unresolved, registry)
+) -> Result<CanonicalResourcePair<E>, Vec<carina_core::schema::BlockNameConflict>> {
+    CanonicalResourcePair::resolve_block_names(
+        &ValidationPipelineAccess::new(),
+        parsed,
+        unresolved,
+        registry,
+    )
 }
 
 pub fn resolve_attr_prefixes_with_ctx(
