@@ -1453,6 +1453,12 @@ impl ParsedBindingUses {
         &self.pending_slots
     }
 
+    #[cfg(test)]
+    pub(crate) fn orphan_pending_slots_for_test(&mut self) {
+        self.records.clear();
+        self.record_indices_by_owner.clear();
+    }
+
     pub(crate) fn has_pending_slot_for(&self, use_site: &BareBindingUse) -> bool {
         self.pending_indices_by_owner
             .get(&BindingUseOwnerKey::from(&use_site.owner))

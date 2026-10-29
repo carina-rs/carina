@@ -514,14 +514,16 @@ pub struct ValidationReady<R> {
     origin: ValidationReadyOrigin,
 }
 
-impl<R> ValidationReady<R> {
-    fn from_saved_plan_artifact(inner: R) -> Self {
+impl ValidationReady<()> {
+    fn from_saved_plan_artifact() -> Self {
         Self {
-            inner,
+            inner: (),
             origin: ValidationReadyOrigin::SavedPlanArtifact,
         }
     }
+}
 
+impl<R> ValidationReady<R> {
     #[cfg(any(test, feature = "test-utils"))]
     fn for_fixture(inner: R) -> Self {
         Self {
@@ -530,6 +532,7 @@ impl<R> ValidationReady<R> {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn into_inner(self) -> R {
         self.inner
     }
@@ -712,6 +715,7 @@ impl ValidationReport<'_> {
         &self.errors
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
         self.errors
     }
@@ -1109,7 +1113,7 @@ impl CompleteProviderLoad {
             checked_plan,
             ValidatedConfig {
                 wiring: ValidatedWiring { load: self },
-                resources: ValidationReady::from_saved_plan_artifact(()),
+                resources: ValidationReady::from_saved_plan_artifact(),
             },
         ))
     }

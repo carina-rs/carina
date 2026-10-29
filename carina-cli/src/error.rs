@@ -680,12 +680,12 @@ pub enum AppError {
     PlanImage(#[from] crate::plan_image::PlanImageError),
 
     /// One schema-aware bare-binding failure at its authored source token.
-    #[error("{0}")]
-    BindingUse(#[source] Box<carina_core::validation::BindingUseFinding>),
+    #[error(transparent)]
+    BindingUse(Box<carina_core::validation::BindingUseFinding>),
 
     /// All schema-aware bare-binding failures from one resolved file.
-    #[error("{0}")]
-    BindingUseReport(#[source] Box<carina_core::validation::BindingUseReport>),
+    #[error(transparent)]
+    BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
@@ -1051,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn located_binding_use_keeps_its_typed_error_chain() {
+    fn located_binding_use_is_terminal_and_keeps_its_typed_resolution_source() {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
         let parsed = carina_core::parser::parse_file(
@@ -1088,21 +1088,13 @@ mod tests {
 
         assert!(app_err.to_string().contains("test.crn:"));
         assert!(app_err.to_string().contains("at line 2"));
-        let finding =
-            std::error::Error::source(&app_err).expect("AppError must retain the located finding");
-        assert!(
-            finding
-                .downcast_ref::<Box<carina_core::validation::BindingUseFinding>>()
-                .is_some(),
-            "the large located finding should remain boxed in the source chain",
-        );
-        let resolution = finding
-            .source()
-            .expect("located finding must retain the binding resolution error");
+        let resolution = std::error::Error::source(&app_err)
+            .expect("the transparent AppError must retain the typed resolution source");
         assert!(
             resolution
                 .downcast_ref::<carina_core::validation::BindingResolutionError>()
-                .is_some()
+                .is_some(),
+            "the located finding is the terminal Display, while its typed resolution remains the source",
         );
     }
 

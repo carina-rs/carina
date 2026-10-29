@@ -303,11 +303,32 @@ impl<'a> ValidationTypeContext<'a> {
     }
 }
 
+/// Shared classification consumed by CLI validation and LSP diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingUseSeverity {
+    Error,
+}
+
 /// One typed failure tied directly to the parser token that authored the use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseFinding {
     pub use_site: crate::parser::BareBindingUse,
     pub error: BindingResolutionError,
+    severity: BindingUseSeverity,
+}
+
+impl BindingUseFinding {
+    fn error(use_site: crate::parser::BareBindingUse, error: BindingResolutionError) -> Self {
+        Self {
+            use_site,
+            error,
+            severity: BindingUseSeverity::Error,
+        }
+    }
+
+    pub fn severity(&self) -> BindingUseSeverity {
+        self.severity
+    }
 }
 
 impl std::fmt::Display for BindingUseFinding {
@@ -328,10 +349,50 @@ impl std::error::Error for BindingUseFinding {
     }
 }
 
+/// Parser/validator consistency failure for a reserved value sink that has no
+/// authored error finding. This should be unreachable for parser-produced
+/// files, but it must block readiness rather than silently dropping a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingUseInvariantError {
+    owner: crate::parser::BindingUseOwner,
+    path: crate::parser::AttributePath,
+}
+
+impl BindingUseInvariantError {
+    fn uncovered(slot: &crate::parser::PendingValueSlot) -> Self {
+        Self {
+            owner: slot.owner.clone(),
+            path: slot.path.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for BindingUseInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let field = self.path.root_name();
+        match &self.owner {
+            crate::parser::BindingUseOwner::Resource(address) => write!(
+                formatter,
+                "Carina could not validate attribute `{field}` on resource `{}` because its source expression was not recorded; please report this internal consistency error",
+                address.resource_id(),
+            ),
+            crate::parser::BindingUseOwner::ModuleArgument { call, argument } => write!(
+                formatter,
+                "Carina could not validate module argument `{argument}` in `{}` at line {} because its source expression was not recorded; please report this internal consistency error",
+                call.source_file().display(),
+                call.call_span().start_line(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BindingUseInvariantError {}
+
 /// Complete result of consuming one parsed file's out-of-band provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
+    invariant_errors: Vec<BindingUseInvariantError>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -342,15 +403,25 @@ impl std::fmt::Display for BindingUseReport {
             }
             finding.fmt(formatter)?;
         }
+        for (index, invariant) in self.invariant_errors.iter().enumerate() {
+            if !self.findings.is_empty() || index > 0 {
+                formatter.write_str("\n")?;
+            }
+            invariant.fmt(formatter)?;
+        }
         Ok(())
     }
 }
 
 impl std::error::Error for BindingUseReport {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.findings
-            .first()
-            .map(|finding| finding as &(dyn std::error::Error + 'static))
+        if let Some(finding) = self.findings.first() {
+            Some(finding as &(dyn std::error::Error + 'static))
+        } else {
+            self.invariant_errors
+                .first()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+        }
     }
 }
 
@@ -401,8 +472,16 @@ impl BindingUseReport {
         self.findings
     }
 
+    pub fn invariant_errors(&self) -> &[BindingUseInvariantError] {
+        &self.invariant_errors
+    }
+
     pub fn is_ready(&self) -> bool {
-        self.findings.is_empty()
+        !self
+            .findings
+            .iter()
+            .any(|finding| finding.severity() == BindingUseSeverity::Error)
+            && self.invariant_errors.is_empty()
     }
 }
 
@@ -993,6 +1072,7 @@ pub fn check_bare_binding_uses<E>(
 ) -> BindingUseReport {
     let mut report = BindingUseReport {
         findings: Vec::new(),
+        invariant_errors: Vec::new(),
     };
 
     for record in file.bare_binding_uses().records() {
@@ -1059,10 +1139,7 @@ pub fn check_bare_binding_uses<E>(
         }
 
         if let Err(error) = result {
-            let finding = BindingUseFinding {
-                use_site: record.authored.clone(),
-                error,
-            };
+            let finding = BindingUseFinding::error(record.authored.clone(), error);
             if !report
                 .findings
                 .iter()
@@ -1070,6 +1147,19 @@ pub fn check_bare_binding_uses<E>(
             {
                 report.findings.push(finding);
             }
+        }
+    }
+
+    for slot in file.bare_binding_uses().pending_slots() {
+        let has_erroring_finding = report.findings.iter().any(|finding| {
+            finding.severity() == BindingUseSeverity::Error
+                && finding.use_site.owner == slot.owner
+                && finding.use_site.path.root_name() == slot.path.root_name()
+        });
+        if !has_erroring_finding {
+            report
+                .invariant_errors
+                .push(BindingUseInvariantError::uncovered(slot));
         }
     }
 
@@ -4309,7 +4399,10 @@ pub(crate) fn narrow_type_expr(
                 ty
             }
             (TypeExpr::Map(inner), PathSegment::Field { .. }) => *inner,
-            (TypeExpr::Ref(path), PathSegment::Field { name }) => {
+            (
+                TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path),
+                PathSegment::Field { name },
+            ) => {
                 let schemas = schemas?;
                 let schema = schemas
                     .get(

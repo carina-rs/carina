@@ -658,20 +658,16 @@ impl DiagnosticEngine {
                 let Some(range) = parser_span_range(doc, finding.use_site.span) else {
                     continue;
                 };
+                let severity = match finding.severity() {
+                    carina_core::validation::BindingUseSeverity::Error => DiagnosticSeverity::ERROR,
+                };
                 if let Some(type_error) = finding.error.type_error()
-                    && let Some(diagnostic) =
+                    && let Some(mut diagnostic) =
                         build_enum_diagnostic_from_error(type_error, Some(range))
                 {
+                    diagnostic.severity = Some(severity);
                     diagnostics.push(diagnostic);
                 } else {
-                    let severity = match &finding.use_site.binding {
-                        carina_core::parser::BareBindingKind::Structural { .. } => {
-                            DiagnosticSeverity::ERROR
-                        }
-                        carina_core::parser::BareBindingKind::Value { .. } => {
-                            DiagnosticSeverity::WARNING
-                        }
-                    };
                     diagnostics.push(Diagnostic {
                         range,
                         severity: Some(severity),
@@ -966,7 +962,8 @@ impl DiagnosticEngine {
                         let typecheck_value = if matches!(
                             attr_value,
                             Value::Deferred(DeferredValue::Coalesce { .. })
-                        ) {
+                        ) || attr_value != authored_attr_value
+                        {
                             attr_value
                         } else {
                             semantic_resource_attributes

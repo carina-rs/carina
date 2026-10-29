@@ -5772,7 +5772,7 @@ let child = selector { items = ["x", "y"] }
 }
 
 #[test]
-fn bare_structural_handle_is_a_real_engine_parse_error() {
+fn bare_structural_handle_is_a_real_engine_validation_error() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let mut schemas = SchemaRegistry::new();
@@ -5805,8 +5805,8 @@ mock.test.resource {
 
     let document = create_document(source);
     assert!(
-        document.parsed().is_none(),
-        "the parser must reject the handle"
+        document.parsed().is_some(),
+        "the parser must preserve the authored use for typed validation"
     );
     let diagnostics = engine.analyze(&document, None);
     let diagnostic = diagnostics

@@ -494,12 +494,19 @@ fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
 
 #[test]
 fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
-    let error = crate::parser::parse(
+    let parsed = crate::parser::parse(
         r#"
             let vpc = mock.test.resource { name = "network" }
             mock.test.Consumer { parent = vpc }
         "#,
         &crate::parser::ProviderContext::default(),
+    )
+    .expect("the parser must preserve the authored use for typed validation");
+    let error = crate::validation::resolve_bare_binding_uses(
+        parsed,
+        &SchemaRegistry::new(),
+        &crate::parser::ProviderContext::default(),
+        &crate::module_resolver::ResolvedModuleSignatures::default(),
     )
     .expect_err("bare handles must never reach identity hashing");
 

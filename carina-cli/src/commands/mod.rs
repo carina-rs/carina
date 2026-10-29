@@ -430,10 +430,17 @@ fn extend_binding_use_errors(
     errors: &mut Vec<AppError>,
     report: &carina_core::validation::BindingUseReport,
 ) {
+    if !report.invariant_errors().is_empty() {
+        errors.push(AppError::BindingUseReport(Box::new(report.clone())));
+        return;
+    }
     errors.extend(
         report
             .findings()
             .iter()
+            .filter(|finding| {
+                finding.severity() == carina_core::validation::BindingUseSeverity::Error
+            })
             .cloned()
             .map(|finding| AppError::BindingUse(Box::new(finding))),
     );
@@ -613,13 +620,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 &module_signatures,
             ),
         );
-        errors.extend(
-            report
-                .findings()
-                .iter()
-                .cloned()
-                .map(|finding| AppError::BindingUse(Box::new(finding))),
-        );
+        extend_binding_use_errors(&mut errors, &report);
     }
 
     // Validate module call arguments before expansion (needs enriched

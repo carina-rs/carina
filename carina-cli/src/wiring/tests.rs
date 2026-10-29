@@ -19,6 +19,14 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
+fn saved_plan_validation_ready_constructor_is_unit_typed() {
+    let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
+    let ValidationReady { inner: (), origin } = ready;
+
+    assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
+}
+
+#[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
     let module_dir = tmp.path().join("modules/query");

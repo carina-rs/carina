@@ -201,7 +201,9 @@ fn destroy_and_state_refresh_reject_nested_forwarding_mismatch() {
             "{args:?} must stop before expansion; stderr={stderr}"
         );
         assert!(
-            stderr.contains("cannot assign String to 'x'") && stderr.contains("expected Int"),
+            stderr.contains("Type mismatch: expected Int, got String (from a)")
+                && stderr.contains("outer/main.crn")
+                && stderr.contains("line 3"),
             "{args:?} must report the shared BindingIndex mismatch; stderr={stderr}"
         );
     }

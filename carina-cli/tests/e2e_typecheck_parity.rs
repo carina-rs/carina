@@ -19,7 +19,7 @@
 //! the acceptance-test suite that exercises the real provider plugins
 //! against `carina-rs/infra/`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use carina_core::provider::{
@@ -125,11 +125,66 @@ fn cli_diagnostics_at(
     )
 }
 
-fn lsp_message_set(diagnostics: &[tower_lsp::lsp_types::Diagnostic]) -> BTreeSet<String> {
-    diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.message.clone())
-        .collect()
+fn cli_validated_file(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    fixture: &TempDir,
+) -> carina_core::parser::InferredFile {
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        fixture.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load CLI fixture");
+    let carina_core::config_loader::LoadedConfig {
+        parsed,
+        inference_errors,
+        duplicate_declarations,
+        ..
+    } = loaded;
+    let providers = carina_cli::wiring::ProviderLoad::for_test(
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories),
+        &parsed.providers,
+    );
+    let validated = providers
+        .validate_evaluated_config(
+            parsed,
+            fixture.path(),
+            false,
+            &inference_errors,
+            &duplicate_declarations,
+        )
+        .expect("CLI validation fixture must pass");
+    validated.evaluated_resources_for_test().clone()
+}
+
+fn message_multiset<'a>(messages: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for message in messages {
+        *counts.entry(message.to_string()).or_default() += 1;
+    }
+    counts
+}
+
+fn lsp_message_multiset(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+) -> BTreeMap<String, usize> {
+    message_multiset(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str()),
+    )
+}
+
+fn cli_located_message_multiset(diagnostics: &[String]) -> BTreeMap<String, usize> {
+    message_multiset(diagnostics.iter().map(|diagnostic| {
+        let message = diagnostic
+            .split_once(": ")
+            .map_or(diagnostic.as_str(), |(_, message)| message);
+        match message.rsplit_once(" at line ") {
+            Some((message, line)) if line.parse::<usize>().is_ok() => message,
+            _ => message,
+        }
+    }))
 }
 
 #[test]
@@ -1136,24 +1191,53 @@ fn enum_shadow_fixture(use_site: &str) -> TempDir {
     ])
 }
 
+fn enum_shadow_module_argument_fixture() -> TempDir {
+    let fixture = tempfile::tempdir().expect("module enum-shadow fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let viewer_request = awscc.test.Source { name = \"shadow\" }\n",
+    )
+    .expect("write binding fixture");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let inner = use { source = "./modules/inner" }
+inner {
+  event_type = viewer_request
+}
+"#,
+    )
+    .expect("write module call fixture");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  event_type: awscc.cloudfront.Distribution.EventType\n}\n",
+    )
+    .expect("write module signature");
+    fixture
+}
+
 #[test]
 fn enum_member_shadowed_by_sibling_resource_binding_reports_typed_error_in_every_resource_position()
 {
     for (position, use_site) in [
-        ("attribute", "  event_type = viewer_request\n"),
+        ("attribute", Some("  event_type = viewer_request\n")),
         (
             "nested block",
-            "  behavior {\n    event_type = viewer_request\n  }\n",
+            Some("  behavior {\n    event_type = viewer_request\n  }\n"),
         ),
-        ("list element", "  event_types = [viewer_request]\n"),
+        ("list element", Some("  event_types = [viewer_request]\n")),
         (
             "map element",
-            "  event_type_map = { default = viewer_request }\n",
+            Some("  event_type_map = { default = viewer_request }\n"),
         ),
+        ("module argument", None),
     ] {
         let schemas = enum_shadow_schemas();
-        let fixture = enum_shadow_fixture(use_site);
+        let fixture =
+            use_site.map_or_else(enum_shadow_module_argument_fixture, enum_shadow_fixture);
         let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
         assert!(
             diagnostics
                 .iter()
@@ -1165,6 +1249,20 @@ fn enum_member_shadowed_by_sibling_resource_binding_reports_typed_error_in_every
                 .iter()
                 .all(|diagnostic| !diagnostic.contains("write 'viewer_request'")),
             "the diagnostic must not advertise a quoted-string escape rejected by strict enum validation: {diagnostics:#?}",
+        );
+        let matching_lsp = lsp
+            .iter()
+            .filter(|diagnostic| diagnostic.message == ENUM_SHADOW_MESSAGE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_lsp.len(),
+            1,
+            "{position} must report the same typed enum-shadow diagnostic in the LSP, got: {lsp:#?}",
+        );
+        assert_eq!(
+            matching_lsp[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+            "{position} blocks CLI validation and must therefore be an LSP error",
         );
     }
 }
@@ -1315,6 +1413,10 @@ fn enum_member_shadowed_by_resource_binding_reports_cli_lsp_parity_and_quick_fix
         cli_message.contains(&diagnostic.message),
         "CLI and LSP must render the same typed error; CLI={cli:#?}; LSP={lsp:#?}",
     );
+    assert!(
+        cli_message.contains("main.crn") && cli_message.contains("line 3"),
+        "the CLI diagnostic must identify the resource owner's authored file and line: {cli_message}",
+    );
 
     let line = "  event_type = viewer_request";
     let start = line.find("viewer_request").expect("value start") as u32;
@@ -1409,6 +1511,8 @@ imported { sources = [source] }
     .expect("write module signature");
 
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let expected_message = "'source' is a resource, not a value; reference one of its attributes, e.g. 'source.<attribute>'";
     assert!(
         cli.iter().any(|message| {
             message.contains("'source' is a resource, not a value")
@@ -1417,25 +1521,45 @@ imported { sources = [source] }
         }),
         "the unrepresentable nested handle must point to the authored token: {cli:#?}",
     );
+    assert_eq!(
+        cli_located_message_multiset(&cli),
+        BTreeMap::from([(expected_message.to_string(), 1)]),
+        "the CLI must emit the authored pending-use finding exactly once: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_message_multiset(&lsp),
+        cli_located_message_multiset(&cli),
+        "CLI and LSP pending-use diagnostics must have the same messages and multiplicities; CLI={cli:#?}; LSP={lsp:#?}",
+    );
     assert!(
         cli.iter()
             .all(|message| !message.contains("unconsumed pending value slot")),
         "internal pending-slot terminology must not reach users: {cli:#?}",
+    );
+    assert!(
+        lsp.iter()
+            .all(|diagnostic| !diagnostic.message.contains("unconsumed pending value slot")),
+        "internal pending-slot terminology must not reach LSP users: {lsp:#?}",
     );
 }
 
 #[test]
 fn issue_2978_canonical_api_spelling_has_cli_lsp_parity_and_identity_derived_fix() {
     let schemas = enum_shadow_schemas();
-    let fixture = write_fixture(&[(
-        "main.crn",
-        r#"let VPC = awscc.test.Source { name = "shadow" }
-awscc.ec2.FlowLog {
+    let fixture = write_fixture(&[
+        (
+            "bindings.crn",
+            "let VPC = awscc.test.Source { name = \"shadow\" }\n",
+        ),
+        (
+            "main.crn",
+            r#"awscc.ec2.FlowLog {
   name = "flow-log"
   resource_type = VPC
 }
 "#,
-    )]);
+        ),
+    ]);
     let expected = "`VPC` was interpreted as the `let` binding; if you meant the enum `ResourceType` value, write `awscc.ec2.FlowLog.ResourceType.vpc`";
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
@@ -1633,7 +1757,7 @@ inner {
 
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-    let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
+    let expected = BTreeMap::from([(ENUM_SHADOW_MESSAGE.to_string(), 1)]);
     assert!(
         matches!(cli.as_slice(), [message]
             if message.contains(ENUM_SHADOW_MESSAGE)
@@ -1642,9 +1766,14 @@ inner {
         "CLI must emit only the located shared binding-use finding: {cli:#?}",
     );
     assert_eq!(
-        lsp_message_set(&lsp),
+        lsp_message_multiset(&lsp),
         expected,
         "LSP must suppress missing-argument and unused-binding secondaries: {lsp:#?}",
+    );
+    assert_eq!(
+        cli_located_message_multiset(&cli),
+        lsp_message_multiset(&lsp),
+        "CLI and LSP must preserve the same diagnostic multiplicities; CLI={cli:#?}; LSP={lsp:#?}",
     );
 }
 
@@ -1716,7 +1845,7 @@ inner {
 
     let cli = cli_diagnostics(factories_for(&schemas), &fixture);
     let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-    let expected = BTreeSet::from([ENUM_SHADOW_MESSAGE.to_string()]);
+    let expected = BTreeMap::from([(ENUM_SHADOW_MESSAGE.to_string(), 1)]);
     assert!(
         matches!(cli.as_slice(), [message]
             if message.contains(ENUM_SHADOW_MESSAGE)
@@ -1725,9 +1854,14 @@ inner {
         "the CLI authority must replace its legacy argument diagnostic with one located finding: {cli:#?}",
     );
     assert_eq!(
-        lsp_message_set(&lsp),
+        lsp_message_multiset(&lsp),
         expected,
         "the LSP must expose exactly the same diagnostic set: {lsp:#?}",
+    );
+    assert_eq!(
+        cli_located_message_multiset(&cli),
+        lsp_message_multiset(&lsp),
+        "CLI and LSP must preserve the same diagnostic multiplicities; CLI={cli:#?}; LSP={lsp:#?}",
     );
 }
 
@@ -1760,15 +1894,20 @@ inner { count = count }
                 && cli_message.contains("line 3")),
         "one authored mismatch must yield the same message with a CLI source location; CLI={cli:#?}; LSP={lsp:#?}",
     );
+    assert_eq!(
+        lsp[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "a binding-use finding that fails CLI validation must be an LSP error: {lsp:#?}",
+    );
 }
 
 #[test]
-fn enum_value_binding_keeps_lexical_precedence_and_validates() {
+fn enum_value_binding_keeps_lexical_precedence_and_preserves_the_bound_member() {
     let schemas = enum_shadow_schemas();
     let fixture = write_fixture(&[
         (
             "bindings.crn",
-            "let viewer_request = awscc.cloudfront.Distribution.EventType.viewer_request\n",
+            "let viewer_request = awscc.cloudfront.Distribution.EventType.origin_request\n",
         ),
         (
             "main.crn",
@@ -1792,6 +1931,81 @@ fn enum_value_binding_keeps_lexical_precedence_and_validates() {
                 && !diagnostic.message.contains("event_type")
         }),
         "LSP must accept the same enum-valued binding: {lsp:#?}",
+    );
+
+    let parsed = cli_validated_file(factories_for(&schemas), &fixture);
+    let distribution = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "cloudfront.Distribution")
+        .expect("validated distribution");
+    assert!(
+        matches!(
+            distribution.get_attr("event_type"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "OriginRequest"
+        ),
+        "the lexical binding must preserve the different `origin_request` member in the CLI tree: {:?}",
+        distribution.get_attr("event_type"),
+    );
+}
+
+#[test]
+fn enum_typed_module_argument_preserves_the_bound_member_in_the_expanded_resource() {
+    let schemas = enum_shadow_schemas();
+    let fixture = tempfile::tempdir().expect("module enum-precedence fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let viewer_request = awscc.cloudfront.Distribution.EventType.origin_request\n",
+    )
+    .expect("write enum binding");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let inner = use { source = "./modules/inner" }
+inner {
+  event_type = viewer_request
+}
+"#,
+    )
+    .expect("write module call");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  event_type: awscc.cloudfront.Distribution.EventType
+}
+
+awscc.cloudfront.Distribution {
+  name = "expanded"
+  event_type = event_type
+}
+"#,
+    )
+    .expect("write module body");
+
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    assert!(
+        lsp.iter().all(|diagnostic| {
+            !diagnostic.message.contains(ENUM_SHADOW_MESSAGE)
+                && !diagnostic.message.contains("viewer_request")
+        }),
+        "LSP must accept the enum-valued module argument binding: {lsp:#?}",
+    );
+    let parsed = cli_validated_file(factories_for(&schemas), &fixture);
+    let expanded = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "cloudfront.Distribution")
+        .expect("expanded module distribution");
+    assert!(
+        matches!(
+            expanded.get_attr("event_type"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "OriginRequest"
+        ),
+        "the module argument must preserve the different `origin_request` member after CLI expansion: {:?}",
+        expanded.get_attr("event_type"),
     );
 }
 
