@@ -1214,8 +1214,8 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
     /// canonical pair without exposing a mutable pair to the caller.
     pub(crate) fn reconcile_identities_with_state(
         &mut self,
-        state_file: &mut Option<StateFile>,
-    ) -> Result<StateBlockResolution, AppError> {
+        state_file: &Option<StateFile>,
+    ) -> StateBlockResolution {
         let Self { wiring, resources } = self;
         let ctx = wiring.context();
         reconcile_canonical_prefixed_names(resources, state_file);
@@ -1238,7 +1238,7 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
                 &state_blocks.claims,
             );
         }
-        Ok(state_blocks)
+        state_blocks
     }
 
     /// Fixture-only identity preparation that still mutates through the owner.
@@ -1266,28 +1266,22 @@ impl ValidatedConfig<carina_core::parser::InferredFile> {
 
     /// Reconcile the evaluated destroy view against state without releasing a
     /// mutable file from the owner.
-    pub(crate) fn reconcile_for_destroy(
-        &mut self,
-        state_file: &mut Option<StateFile>,
-    ) -> Result<(), AppError> {
+    pub(crate) fn reconcile_for_destroy(&mut self, state_file: &Option<StateFile>) {
         self.reconcile_evaluated_identities(state_file, true)
     }
 
     /// Reconcile the evaluated state-refresh view against state without
     /// applying module-instance reconciliation, preserving its existing
     /// command semantics.
-    pub(crate) fn reconcile_for_state_refresh(
-        &mut self,
-        state_file: &mut Option<StateFile>,
-    ) -> Result<(), AppError> {
+    pub(crate) fn reconcile_for_state_refresh(&mut self, state_file: &Option<StateFile>) {
         self.reconcile_evaluated_identities(state_file, false)
     }
 
     fn reconcile_evaluated_identities(
         &mut self,
-        state_file: &mut Option<StateFile>,
+        state_file: &Option<StateFile>,
         reconcile_modules: bool,
-    ) -> Result<(), AppError> {
+    ) {
         let Self { wiring, resources } = self;
         let ctx = wiring.context();
         reconcile_prefixed_names(&mut resources.resources, state_file);
@@ -1315,7 +1309,6 @@ impl ValidatedConfig<carina_core::parser::InferredFile> {
             &mut resources.resources,
             state_file,
         );
-        Ok(())
     }
 }
 
@@ -2160,6 +2153,8 @@ fn provider_config_schema_for(
 /// has already been applied to [`AddressedState`].
 struct AnonymousReconciliationStateView {
     by_type: HashMap<(String, String), Vec<AnonymousIdStateInfo>>,
+    existence_only_by_type: HashMap<(String, String), HashSet<String>>,
+    origins_by_projected_name: HashMap<(String, String), HashMap<String, Vec<ResourceId>>>,
     by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>>,
 }
 
@@ -2170,23 +2165,25 @@ impl AnonymousReconciliationStateView {
         moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     ) -> Self {
         let mut by_type = HashMap::<_, Vec<_>>::new();
+        let mut existence_only_by_type = HashMap::<_, HashSet<_>>::new();
+        let mut origins_by_projected_name = HashMap::<_, HashMap<String, Vec<ResourceId>>>::new();
         let mut by_binding = HashMap::<_, Vec<_>>::new();
+        let moved_targets = moved_pairs
+            .iter()
+            .map(|(from, to)| (from.as_inner().clone(), to.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut create_only_by_type = HashMap::<(String, String), Vec<String>>::new();
 
         for state_resource in state_file.resources() {
-            let projected_target = moved_pairs
-                .iter()
-                .find(|(from, _to)| {
-                    from.provider() == state_resource.provider
-                        && from.resource_type() == state_resource.resource_type
-                        && from.identity() == &state_resource.identity
-                })
-                .map(|(_from, to)| to);
-            let projected_id = projected_target.cloned().unwrap_or_else(|| {
-                resolved_state_row_id(
-                    state_resource,
-                    state_resource.directives.provider_instance.clone(),
-                )
-            });
+            let state_row_id = resolved_state_row_id(
+                state_resource,
+                state_resource.directives.provider_instance.clone(),
+            );
+            let projected_target = moved_targets.get(state_row_id.as_inner());
+            let projected_id = projected_target
+                .cloned()
+                .unwrap_or_else(|| state_row_id.clone());
+            let has_persisted_attributes = state_resource.persisted_attributes().is_some();
             let attribute_values = match state_resource.persisted_attributes() {
                 Some(persisted) => persisted
                     .to_values()
@@ -2199,33 +2196,59 @@ impl AnonymousReconciliationStateView {
                 None if projected_target.is_some() => HashMap::new(),
                 None => continue,
             };
-            let create_only_values = ctx
-                .schemas()
-                .get(
-                    projected_id.provider(),
-                    projected_id.resource_type(),
-                    carina_core::schema::SchemaKind::Resource,
-                )
-                .map(|schema| schema.schema().as_schema().create_only_attributes())
-                .unwrap_or_default()
-                .into_iter()
+            let type_key = (
+                projected_id.provider().to_string(),
+                projected_id.resource_type().to_string(),
+            );
+            let create_only_attributes = create_only_by_type
+                .entry(type_key.clone())
+                .or_insert_with(|| {
+                    ctx.schemas()
+                        .get(
+                            projected_id.provider(),
+                            projected_id.resource_type(),
+                            carina_core::schema::SchemaKind::Resource,
+                        )
+                        .map(|schema| {
+                            schema
+                                .schema()
+                                .as_schema()
+                                .create_only_attributes()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+            let create_only_values = create_only_attributes
+                .iter()
                 .filter_map(|attribute| {
                     attribute_values
                         .get(attribute)
                         .cloned()
-                        .map(|value| (attribute.to_string(), value))
+                        .map(|value| (attribute.clone(), value))
                 })
                 .collect();
             let projected_name = projected_id.identity_str().to_string();
+            origins_by_projected_name
+                .entry(type_key.clone())
+                .or_default()
+                .entry(projected_name.clone())
+                .or_default()
+                .push(state_row_id.as_inner().clone());
+            if !has_persisted_attributes {
+                existence_only_by_type
+                    .entry(type_key.clone())
+                    .or_default()
+                    .insert(projected_name.clone());
+            }
 
             by_type
-                .entry((
-                    projected_id.provider().to_string(),
-                    projected_id.resource_type().to_string(),
-                ))
+                .entry(type_key)
                 .or_default()
                 .push(AnonymousIdStateInfo {
                     name: projected_name.clone(),
+                    provider_instance: projected_id.provider_instance().map(str::to_string),
                     create_only_values,
                 });
             if let Some(binding) = &state_resource.binding {
@@ -2241,6 +2264,8 @@ impl AnonymousReconciliationStateView {
 
         Self {
             by_type,
+            existence_only_by_type,
+            origins_by_projected_name,
             by_binding,
         }
     }
@@ -2251,29 +2276,34 @@ impl AnonymousReconciliationStateView {
         provider: &str,
         resource_type: &str,
     ) -> identifier::ScreenedStateEntries<AnonymousIdStateInfo> {
-        let entries = self
-            .by_type
-            .get(&(provider.to_string(), resource_type.to_string()))
+        let type_key = (provider.to_string(), resource_type.to_string());
+        let entries = self.by_type.get(&type_key).into_iter().flatten().cloned();
+        let existence_only = self.existence_only_by_type.get(&type_key);
+        let claimed_origin_names = self
+            .origins_by_projected_name
+            .get(&type_key)
             .into_iter()
-            .flatten()
-            .cloned();
-        claims.screen_entries(provider, resource_type, entries, |entry| {
-            entry.name.as_str()
-        })
+            .flat_map(HashMap::iter)
+            .filter_map(|(projected_name, origins)| {
+                origins
+                    .iter()
+                    .any(|origin| claims.claims_from(origin))
+                    .then_some(projected_name.as_str())
+            })
+            .collect::<HashSet<_>>();
+        claims
+            .screen_entries(provider, resource_type, entries, |entry| {
+                entry.name.as_str()
+            })
+            .exclude_candidates(|entry| {
+                existence_only.is_some_and(|names| names.contains(&entry.name))
+                    || claimed_origin_names.contains(entry.name.as_str())
+            })
     }
 
     fn entries_by_binding(&self, binding: &str) -> Vec<AnonymousIdBindingStateInfo> {
         self.by_binding.get(binding).cloned().unwrap_or_default()
     }
-}
-
-fn anonymous_id_state_entries(
-    state_view: &AnonymousReconciliationStateView,
-    claims: &StateBlockClaims,
-    provider: &str,
-    resource_type: &str,
-) -> identifier::ScreenedStateEntries<AnonymousIdStateInfo> {
-    state_view.entries_by_type(claims, provider, resource_type)
 }
 
 fn reconcile_anonymous_identifiers_with_ctx(
@@ -2287,9 +2317,7 @@ fn reconcile_anonymous_identifiers_with_ctx(
         resources,
         data_sources,
         ctx.schemas(),
-        &|provider, resource_type| {
-            anonymous_id_state_entries(state_view, claims, provider, resource_type)
-        },
+        &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(binding),
         claims,
     )
@@ -2309,9 +2337,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
     Ok(identifier::detect_anonymous_to_named_renames(
         resources,
         ctx.schemas(),
-        &|provider, resource_type| {
-            anonymous_id_state_entries(state_view, claims, provider, resource_type)
-        },
+        &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
         claims,
@@ -3473,21 +3499,8 @@ impl DeferredCreateTarget {
     }
 }
 
-/// I/O-free state derived from the identity-reconciled configuration/state
-/// view before managed and data-source refreshes run.
-///
-/// A caller must choose one of two typed transitions before it can obtain a
-/// [`PreparedDeferredForExpansion`]:
-///
-/// - [`DeferredForExpansionPrelude::reconcile_addresses`] for planning/apply
-///   views, which applies explicit moves and detected anonymous-address moves;
-/// - [`DeferredForExpansionPrelude::preserve_addresses`] for `state refresh`,
-///   which must refresh the rows at their persisted addresses without applying
-///   pending configuration transitions.
-///
-/// Both transitions own the exact state/metadata view accepted by expansion,
-/// so a future caller cannot silently choose the wrong behavior with a flag or
-/// substitute independently keyed maps.
+/// State and metadata maps that have crossed the shared address-reconciliation
+/// boundary.
 pub(crate) struct AddressedState {
     managed_current: HashMap<ResourceId, Current>,
     orphans: Orphans,
@@ -3549,46 +3562,215 @@ fn apply_detected_resource_moves(
     moves: Vec<ResolvedMove>,
 ) -> Result<(), AppError> {
     for resolved_move in moves {
+        let conflicting_pair = addressed
+            .moved_pairs
+            .iter()
+            .find(|(existing_from, existing_to)| {
+                let continues_forward = existing_to == resolved_move.from()
+                    && existing_from != resolved_move.to()
+                    && resolved_move.from() != resolved_move.to();
+                let overlaps = existing_from == resolved_move.from()
+                    || existing_from == resolved_move.to()
+                    || existing_to == resolved_move.from()
+                    || existing_to == resolved_move.to();
+                overlaps && !continues_forward
+            });
+        if let Some((existing_from, existing_to)) = conflicting_pair {
+            return Err(AppError::DetectedMoveConflict {
+                from: Box::new(resolved_move.from().clone()),
+                to: Box::new(resolved_move.to().clone()),
+                existing_from: Box::new(existing_from.clone()),
+                existing_to: Box::new(existing_to.clone()),
+            });
+        }
         let authority = resolved_move.authority();
-        promote_orphan_or_move_current_state(
+        let transferred = promote_orphan_or_move_current_state(
             &mut addressed.managed_current,
             &mut addressed.orphans,
             &authority,
         )?;
+        if !transferred {
+            return Err(AppError::MoveSourceNotLoaded {
+                from: Box::new(resolved_move.from().clone()),
+                to: Box::new(resolved_move.to().clone()),
+            });
+        }
         if let Some(keys) = addressed.prev_explicit.remove(authority.from()) {
             addressed.prev_explicit.insert(authority.to().clone(), keys);
         }
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
-        addressed.moved_pairs.push(resolved_move.into_parts());
+        let (from, to) = resolved_move.into_parts();
+        if let Some((_origin, prior_target)) = addressed
+            .moved_pairs
+            .iter_mut()
+            .find(|(_origin, prior_target)| prior_target == &from)
+        {
+            *prior_target = to;
+        } else {
+            addressed.moved_pairs.push((from, to));
+        }
     }
     Ok(())
 }
 
-fn detect_and_apply_automatic_resource_moves(
+pub(crate) fn detect_automatic_resource_moves(
     ctx: &WiringContext,
     resources: &[Resource],
     data_sources: &[DataSource],
     providers: &[ProviderConfig],
     state_file: &Option<StateFile>,
     claims: &StateBlockClaims,
-    addressed: &mut AddressedState,
-) -> Result<(), AppError> {
+) -> Result<DetectedAutomaticMoves, AppError> {
     let Some(state_file) = state_file.as_ref() else {
-        return Ok(());
+        return Ok(DetectedAutomaticMoves::from_moves(Vec::new()));
     };
-    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &addressed.moved_pairs);
-    let moves =
+    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &[]);
+    let mut moves =
         reconcile_anonymous_identifiers_with_ctx(ctx, resources, data_sources, &state_view, claims);
-    apply_detected_resource_moves(addressed, moves)?;
 
-    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &addressed.moved_pairs);
-    let moves =
-        detect_anonymous_to_named_moves_with_ctx(ctx, resources, providers, &state_view, claims)?;
-    apply_detected_resource_moves(addressed, moves)
+    let projected_pairs = moves
+        .iter()
+        .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
+        .collect::<Vec<_>>();
+    let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+    moves.extend(detect_anonymous_to_named_moves_with_ctx(
+        ctx,
+        resources,
+        providers,
+        &state_view,
+        claims,
+    )?);
+    Ok(DetectedAutomaticMoves::from_moves(moves))
 }
 
+/// Automatic moves detected once from the persisted pre-refresh view.
+///
+/// Its borrowed projection drives every phase-1 state read. The value itself
+/// is then consumed by address reconciliation, which applies those exact
+/// moves rather than running the detectors again.
+pub(crate) struct DetectedAutomaticMoves {
+    moves: Vec<ResolvedMove>,
+    source_by_target: HashMap<ResourceId, ResolvedResourceId>,
+}
+
+impl DetectedAutomaticMoves {
+    fn from_moves(moves: Vec<ResolvedMove>) -> Self {
+        let mut source_by_target = HashMap::new();
+        for resolved_move in &moves {
+            let source = source_by_target
+                .remove(resolved_move.from().as_inner())
+                .unwrap_or_else(|| resolved_move.from().clone());
+            source_by_target.insert(resolved_move.to().as_inner().clone(), source);
+        }
+        Self {
+            moves,
+            source_by_target,
+        }
+    }
+
+    pub(crate) fn state_read_projection(&self) -> AutomaticMoveStateReadProjection<'_> {
+        AutomaticMoveStateReadProjection {
+            source_by_target: &self.source_by_target,
+        }
+    }
+
+    fn into_moves(self) -> Vec<ResolvedMove> {
+        self.moves
+    }
+
+    fn apply_after_explicit(self, addressed: &mut AddressedState) -> Result<(), AppError> {
+        for resolved_move in &self.moves {
+            if let Some((existing_from, existing_to)) =
+                addressed
+                    .moved_pairs
+                    .iter()
+                    .find(|(existing_from, existing_to)| {
+                        existing_from == resolved_move.from()
+                            || existing_from == resolved_move.to()
+                            || existing_to == resolved_move.from()
+                            || existing_to == resolved_move.to()
+                    })
+            {
+                return Err(AppError::DetectedMoveConflict {
+                    from: Box::new(resolved_move.from().clone()),
+                    to: Box::new(resolved_move.to().clone()),
+                    existing_from: Box::new(existing_from.clone()),
+                    existing_to: Box::new(existing_to.clone()),
+                });
+            }
+        }
+        apply_detected_resource_moves(addressed, self.into_moves())
+    }
+}
+
+/// Borrowed state-file read view projected through [`DetectedAutomaticMoves`].
+pub(crate) struct AutomaticMoveStateReadProjection<'moves> {
+    source_by_target: &'moves HashMap<ResourceId, ResolvedResourceId>,
+}
+
+impl AutomaticMoveStateReadProjection<'_> {
+    fn source_for<'a>(&'a self, desired: &'a ResourceId) -> &'a ResourceId {
+        self.source_by_target
+            .get(desired)
+            .map_or(desired, ResolvedResourceId::as_inner)
+    }
+
+    pub(crate) fn build_current(
+        &self,
+        state_file: &Option<StateFile>,
+        desired: &ResourceId,
+    ) -> (ResourceId, Current) {
+        let source = self.source_for(desired).clone();
+        let current = state_file
+            .as_ref()
+            .map(|state_file| state_file.build_state_for_resource(&source))
+            .unwrap_or_else(|| Current::absent(source.clone()));
+        (source, current)
+    }
+
+    pub(crate) fn saved_dependency_bindings(
+        &self,
+        state_file: &Option<StateFile>,
+        resources: &[Resource],
+    ) -> HashMap<ResourceId, BTreeSet<String>> {
+        let Some(state_file) = state_file.as_ref() else {
+            return HashMap::new();
+        };
+        resources
+            .iter()
+            .filter_map(|resource| {
+                let state = state_file.find_resource_for_id(self.source_for(&resource.id))?;
+                (!state.dependency_bindings.is_empty())
+                    .then(|| (resource.id.clone(), state.dependency_bindings.clone()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn persisted_resource_ids(&self, resources: &[Resource]) -> HashSet<ResourceId> {
+        resources
+            .iter()
+            .map(|resource| self.source_for(&resource.id).clone())
+            .collect()
+    }
+}
+
+/// I/O-free state derived from the identity-reconciled configuration/state
+/// view before managed and data-source refreshes run.
+///
+/// A caller must choose one of two typed transitions before it can obtain a
+/// [`PreparedDeferredForExpansion`]:
+///
+/// - [`DeferredForExpansionPrelude::reconcile_addresses`] for planning/apply
+///   views, which applies explicit moves and detected anonymous-address moves;
+/// - [`DeferredForExpansionPrelude::preserve_addresses`] for `state refresh`,
+///   which must refresh the rows at their persisted addresses without applying
+///   pending configuration transitions.
+///
+/// Both transitions own the exact state/metadata view accepted by expansion,
+/// so a future caller cannot silently choose the wrong behavior with a flag or
+/// substitute independently keyed maps.
 pub struct DeferredForExpansionPrelude<'state> {
     state_file: &'state Option<StateFile>,
     sorted_resources: Vec<Resource>,
@@ -3598,11 +3780,9 @@ pub struct DeferredForExpansionPrelude<'state> {
 }
 
 /// Inputs for the I/O-free identity/move reconciliation transition.
-pub struct ReconcileDeferredForExpansionInputs<'a, E> {
-    pub ctx: &'a WiringContext,
+pub(crate) struct ReconcileDeferredForExpansionInputs<'a, E> {
     pub parsed: &'a carina_core::parser::File<E>,
-    pub provider_configs: &'a [ProviderConfig],
-    pub state_block_claims: &'a StateBlockClaims,
+    pub detected_automatic_moves: DetectedAutomaticMoves,
     pub managed_current: HashMap<ResourceId, Current>,
     pub orphans: Orphans,
     /// Addresses already read by the pre-expansion refresh pass. The prepared
@@ -3703,7 +3883,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
 
     /// Apply every address-changing state transition once and retain the exact
     /// metadata/alias/exclusion inputs used by expansion.
-    pub fn reconcile_addresses<E>(
+    pub(crate) fn reconcile_addresses<E>(
         mut self,
         mut inputs: ReconcileDeferredForExpansionInputs<'_, E>,
         warning_policy: DeferredForWarningPolicy,
@@ -3730,15 +3910,9 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             prev_explicit: self.prev_explicit,
             moved_pairs,
         };
-        detect_and_apply_automatic_resource_moves(
-            inputs.ctx,
-            &self.sorted_resources,
-            &inputs.parsed.data_sources,
-            inputs.provider_configs,
-            self.state_file,
-            inputs.state_block_claims,
-            &mut addressed,
-        )?;
+        inputs
+            .detected_automatic_moves
+            .apply_after_explicit(&mut addressed)?;
         Ok(ReconciledDeferredForExpansion(
             AddressedDeferredForExpansionInputs {
                 sorted_resources: self.sorted_resources,
@@ -4710,12 +4884,14 @@ async fn finish_expanded_refresh_state<R, P: Provider + ProviderNormalizer>(
     if !new_child_ids.is_empty() {
         let children = refreshable_child_ids.select(&sorted_resources, orphans);
         refresh_resource_set(
-            inputs.provider,
-            inputs.refresh_phase,
+            RefreshResourceSetInputs {
+                provider: inputs.provider,
+                refresh_phase: inputs.refresh_phase,
+                state_file: inputs.state_file,
+                schemas: inputs.schemas,
+                saved_dep_bindings: inputs.saved_dep_bindings,
+            },
             children,
-            inputs.state_file,
-            inputs.schemas,
-            inputs.saved_dep_bindings,
             managed_current,
         )
         .await?;
@@ -4808,6 +4984,15 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // second owned resource graph can diverge before the transition below.
     let sorted_resources = expansion_prelude.sorted_resources();
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
+    let detected_automatic_moves = detect_automatic_resource_moves(
+        ctx,
+        sorted_resources,
+        &data_sources,
+        raw_provider_configs,
+        state_file,
+        state_block_claims,
+    )?;
+    let state_read_projection = detected_automatic_moves.state_read_projection();
 
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(ctx, provider_configs, progress_sink).await?;
@@ -4836,24 +5021,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // Provider reads do not retain Carina-only dependency metadata. Build the
     // restoration map once so both managed refresh and the unconditional
     // data-source phase consume the same snapshot.
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
-        .as_ref()
-        .map(|sf| {
-            sorted_resources
-                .iter()
-                .filter_map(|resource| {
-                    let identity = resource.id.identity_str()?;
-                    let state = sf.find_resource(
-                        &resource.id.provider,
-                        &resource.id.resource_type,
-                        identity,
-                    )?;
-                    (!state.dependency_bindings.is_empty())
-                        .then(|| (resource.id.clone(), state.dependency_bindings.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let saved_dep_bindings =
+        state_read_projection.saved_dependency_bindings(state_file, sorted_resources);
     let reconciled_expansion = if let Some(refresh_phase) = refresh_phase.as_ref() {
         // Read states for all resources concurrently using the identifier from
         // state. An address with no row is absent; a persisted row without an
@@ -4864,13 +5033,16 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // from their dependencies (#1683). Phase 1: managed resources in
         // parallel. Phase 2: data sources whose input attributes have
         // been resolved against phase 1's `managed_current`.
-        refresh_resource_set(
-            provider_ref,
-            refresh_phase,
+        refresh_projected_resource_set(
+            RefreshResourceSetInputs {
+                provider: provider_ref,
+                refresh_phase,
+                state_file,
+                schemas: ctx.schemas(),
+                saved_dep_bindings: &saved_dep_bindings,
+            },
+            &state_read_projection,
             sorted_resources.iter(),
-            state_file,
-            ctx.schemas(),
-            &saved_dep_bindings,
             &mut managed_current,
         )
         .await?;
@@ -4880,8 +5052,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // *old* address. Must run before automatic address reconciliation so
         // the transfer has the source state entries to move.
         if let Some(sf) = state_file.as_ref() {
-            let desired_ids: HashSet<ResourceId> =
-                sorted_resources.iter().map(|r| r.id.clone()).collect();
+            let desired_ids = state_read_projection.persisted_resource_ids(sorted_resources);
             let loaded_orphans = sf.build_orphans(&desired_ids);
             let refreshed = refresh_loaded_orphans(
                 provider_ref,
@@ -4923,10 +5094,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // use the typed late-reconciliation pass after plan preparation.
         expansion_prelude.reconcile_addresses(
             ReconcileDeferredForExpansionInputs {
-                ctx,
                 parsed,
-                provider_configs: raw_provider_configs,
-                state_block_claims,
+                detected_automatic_moves,
                 managed_current,
                 orphans,
                 already_refreshed: orphan_refreshed_ids,
@@ -4937,13 +5106,13 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
             for resource in sorted_resources {
-                let current = sf.build_state_for_resource(&resource.id);
-                managed_current.insert(resource.id.clone(), current);
+                let (loaded_id, current) =
+                    state_read_projection.build_current(state_file, &resource.id);
+                managed_current.insert(loaded_id, current);
             }
 
             // Also include orphaned resources from state file
-            let desired_ids: HashSet<ResourceId> =
-                sorted_resources.iter().map(|r| r.id.clone()).collect();
+            let desired_ids = state_read_projection.persisted_resource_ids(sorted_resources);
             orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
 
             // Transfer state for explicit and detected anonymous address
@@ -4965,10 +5134,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         }
         expansion_prelude.reconcile_addresses(
             ReconcileDeferredForExpansionInputs {
-                ctx,
                 parsed,
-                provider_configs: raw_provider_configs,
-                state_block_claims,
+                detected_automatic_moves,
                 managed_current,
                 orphans,
                 already_refreshed: orphan_refreshed_ids,
@@ -5050,13 +5217,16 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // cannot diverge between the two paths (compile-time parity).
         let children = || refreshable_child_ids.select(&sorted_resources, &addressed.orphans);
         if let Some(refresh_phase) = refresh_phase.as_ref() {
+            let child_saved_dep_bindings = HashMap::new();
             refresh_resource_set(
-                &provider,
-                refresh_phase,
+                RefreshResourceSetInputs {
+                    provider: &provider,
+                    refresh_phase,
+                    state_file,
+                    schemas: ctx.schemas(),
+                    saved_dep_bindings: &child_saved_dep_bindings,
+                },
                 children(),
-                state_file,
-                ctx.schemas(),
-                &HashMap::new(),
                 &mut addressed.managed_current,
             )
             .await?;
@@ -5473,11 +5643,18 @@ fn materialize_moved_states_with_warning_sink(
 
             // Transfer state from the old name to the new name so the
             // differ compares desired(to) against actual(from).
-            if target_is_desired {
-                promote_orphan_or_move_current_state(managed_current, orphans, &authority)?;
+            let transferred = if target_is_desired {
+                promote_orphan_or_move_current_state(managed_current, orphans, &authority)?
             } else if orphans.rekey(&authority) {
+                true
             } else {
-                rekey_current_for_move(managed_current, &authority)?;
+                rekey_current_for_move(managed_current, &authority)?
+            };
+            if !transferred {
+                return Err(AppError::MoveSourceNotLoaded {
+                    from: Box::new(resolved_move.from().clone()),
+                    to: Box::new(resolved_move.to().clone()),
+                });
             }
 
             // Transfer prev_explicit so the differ detects attribute
@@ -5501,13 +5678,13 @@ fn promote_orphan_or_move_current_state(
     managed_current: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
     authority: &MoveAuthority<'_>,
-) -> Result<(), carina_core::differ::CurrentMoveRoutingMismatch> {
+) -> Result<bool, carina_core::differ::CurrentMoveRoutingMismatch> {
     if let Some(current) = orphans.take_rebound(authority) {
         managed_current.insert(authority.to().clone(), current);
+        Ok(true)
     } else {
-        rekey_current_for_move(managed_current, authority)?;
+        rekey_current_for_move(managed_current, authority)
     }
-    Ok(())
 }
 
 pub fn resolve_state_block_claims(
@@ -6229,13 +6406,79 @@ async fn refresh_loaded_orphans(
 /// does not return (#1565); pass an empty map when there is nothing to
 /// restore (the new loop children have no prior state-file dep
 /// bindings).
+pub(crate) struct RefreshResourceSetInputs<'a, 'backend> {
+    pub provider: &'a dyn Provider,
+    pub refresh_phase: &'a RefreshPhase<'backend>,
+    pub state_file: &'a Option<StateFile>,
+    pub schemas: &'a SchemaRegistry,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+}
+
+struct DirectManagedStateReads;
+
+trait ManagedStateReads {
+    fn build_current(
+        &self,
+        state_file: &Option<StateFile>,
+        desired: &ResourceId,
+    ) -> (ResourceId, Current);
+}
+
+impl ManagedStateReads for DirectManagedStateReads {
+    fn build_current(
+        &self,
+        state_file: &Option<StateFile>,
+        desired: &ResourceId,
+    ) -> (ResourceId, Current) {
+        let current = state_file
+            .as_ref()
+            .map(|state_file| state_file.build_state_for_resource(desired))
+            .unwrap_or_else(|| Current::absent(desired.clone()));
+        (desired.clone(), current)
+    }
+}
+
+impl ManagedStateReads for AutomaticMoveStateReadProjection<'_> {
+    fn build_current(
+        &self,
+        state_file: &Option<StateFile>,
+        desired: &ResourceId,
+    ) -> (ResourceId, Current) {
+        AutomaticMoveStateReadProjection::build_current(self, state_file, desired)
+    }
+}
+
+/// Refresh resources at their own addresses. Post-expansion children use this
+/// shape, which cannot accept an automatic-move projection.
 pub(crate) async fn refresh_resource_set<'a>(
-    provider: &dyn Provider,
-    refresh_phase: &RefreshPhase<'_>,
+    inputs: RefreshResourceSetInputs<'_, '_>,
     resources: impl Iterator<Item = &'a Resource>,
-    state_file: &Option<StateFile>,
-    schemas: &SchemaRegistry,
-    saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
+    managed_current: &mut HashMap<ResourceId, Current>,
+) -> Result<(), AppError> {
+    refresh_resource_set_with_state_reads(
+        inputs,
+        &DirectManagedStateReads,
+        resources,
+        managed_current,
+    )
+    .await
+}
+
+/// Refresh the original phase-1 resource set through the moves detected from
+/// the same pre-refresh persisted-state view.
+pub(crate) async fn refresh_projected_resource_set<'a>(
+    inputs: RefreshResourceSetInputs<'_, '_>,
+    projection: &AutomaticMoveStateReadProjection<'_>,
+    resources: impl Iterator<Item = &'a Resource>,
+    managed_current: &mut HashMap<ResourceId, Current>,
+) -> Result<(), AppError> {
+    refresh_resource_set_with_state_reads(inputs, projection, resources, managed_current).await
+}
+
+async fn refresh_resource_set_with_state_reads<'a>(
+    inputs: RefreshResourceSetInputs<'_, '_>,
+    state_reads: &impl ManagedStateReads,
+    resources: impl Iterator<Item = &'a Resource>,
     managed_current: &mut HashMap<ResourceId, Current>,
 ) -> Result<(), AppError> {
     let results: Vec<Result<(ResourceId, Current), AppError>> =
@@ -6244,18 +6487,16 @@ pub(crate) async fn refresh_resource_set<'a>(
         // compositions carry no provider state.
         stream::iter(resources)
             .map(|resource| {
-                let progress = refresh_phase.begin(&resource.id);
-                let loaded = state_file
-                    .as_ref()
-                    .map(|sf| sf.build_state_for_resource(&resource.id))
-                    .unwrap_or_else(|| Current::absent(resource.id.clone()));
-                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                let progress = inputs.refresh_phase.begin(&resource.id);
+                let (loaded_id, loaded) =
+                    state_reads.build_current(inputs.state_file, &resource.id);
+                let dep_bindings = inputs.saved_dep_bindings.get(&resource.id).cloned();
                 async move {
                     let mut current = refresh_loaded_resource_with_retry(
-                        provider,
+                        inputs.provider,
                         loaded,
-                        state_file.as_ref(),
-                        schemas,
+                        inputs.state_file.as_ref(),
+                        inputs.schemas,
                     )
                     .await
                     .map_err(AppError::Provider)?;
@@ -6263,7 +6504,7 @@ pub(crate) async fn refresh_resource_set<'a>(
                         current.set_dependency_bindings(deps);
                     }
                     progress.finish();
-                    Ok((resource.id.clone(), current))
+                    Ok((loaded_id, current))
                 }
             })
             .buffer_unordered(5)

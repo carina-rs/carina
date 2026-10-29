@@ -296,7 +296,7 @@ async fn run_destroy_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-    validated_config.reconcile_for_destroy(&mut state_file)?;
+    validated_config.reconcile_for_destroy(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(

@@ -1146,7 +1146,7 @@ pub(crate) async fn run_state_refresh_locked(
         return Ok(());
     }
 
-    validated_config.reconcile_for_state_refresh(&mut state_file)?;
+    validated_config.reconcile_for_state_refresh(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(

@@ -7473,6 +7473,18 @@ impl Current {
         }
     }
 
+    pub(crate) fn restore_move_source(&mut self, authority: &MoveAuthority<'_>) {
+        let from = authority.from();
+        match self {
+            Self::Absent(state) => state.0.id = from.clone(),
+            Self::Present(present) => present.state.id = from.clone(),
+            Self::CreateInFlight(pending) => {
+                *pending = pending.clone().rebind_for_move(authority.source_address());
+            }
+            Self::MissingIdentifier(state) => state.0.id = from.clone(),
+        }
+    }
+
     pub fn set_dependency_bindings(&mut self, dependency_bindings: BTreeSet<String>) {
         match self {
             Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,

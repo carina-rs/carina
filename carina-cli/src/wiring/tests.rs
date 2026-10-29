@@ -4136,6 +4136,225 @@ fn detected_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)>
         .collect()
 }
 
+fn test_detected_bucket_move(from: &str, to: &str) -> ResolvedMove {
+    ResolvedMove::from_moved_block(
+        &MovedAddresses::new(
+            "awscc",
+            "s3.Bucket",
+            test_identity(from.to_string()),
+            test_identity(to.to_string()),
+        ),
+        bucket_id(from),
+        bucket_id(to),
+    )
+    .expect("test move addresses must match their resolved ids")
+}
+
+#[test]
+fn resource_move_invariants_missing_detected_source_is_an_error() {
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    let result = apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("missing", "target")],
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::MoveSourceNotLoaded { from, to })
+                if from.identity_str() == "missing" && to.identity_str() == "target"
+        ),
+        "a missing move source must fail with the typed invariant error"
+    );
+    assert!(
+        addressed.moved_pairs.is_empty(),
+        "a failed transfer must not record a move"
+    );
+}
+
+#[test]
+fn resource_move_invariants_chained_moves_are_composed() {
+    let source = bucket_id("source");
+    let intermediate = bucket_id("intermediate");
+    let target = bucket_id("target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            source.as_inner().clone(),
+            Current::absent(source.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![
+            test_detected_bucket_move("source", "intermediate"),
+            test_detected_bucket_move("intermediate", "target"),
+        ],
+    )
+    .expect("both links have a loaded source");
+
+    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert!(
+        addressed.managed_current.contains_key(target.as_inner()),
+        "the state maps must be re-keyed to the final destination"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(intermediate.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
+    let explicit_source = bucket_id("explicit_source");
+    let explicit_target = bucket_id("explicit_target");
+    let detected_source = bucket_id("detected_source");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            detected_source.as_inner().clone(),
+            Current::absent(detected_source.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+    };
+
+    let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
+        "detected_source",
+        "explicit_source",
+    )]);
+    let result = detected.apply_after_explicit(&mut addressed);
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DetectedMoveConflict {
+                from,
+                to,
+                existing_from,
+                existing_to,
+            }) if *from == detected_source
+                && *to == explicit_source
+                && *existing_from == explicit_source
+                && *existing_to == explicit_target
+        ),
+        "the pre-refresh projection cannot be applied across an explicit move"
+    );
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(explicit_source.clone(), explicit_target)]
+    );
+    assert!(
+        addressed
+            .managed_current
+            .contains_key(detected_source.as_inner()),
+        "conflict detection must run before state is re-keyed"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(explicit_source.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
+    let explicit_source = bucket_id("explicit_source");
+    let explicit_target = bucket_id("explicit_target");
+    let detected_target = bucket_id("detected_target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            explicit_target.as_inner().clone(),
+            Current::absent(explicit_target.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+    };
+
+    let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
+        "explicit_target",
+        "detected_target",
+    )]);
+    let result = detected.apply_after_explicit(&mut addressed);
+
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DetectedMoveConflict {
+                from,
+                to,
+                existing_from,
+                existing_to,
+            }) if *from == explicit_target
+                && *to == detected_target
+                && *existing_from == explicit_source
+                && *existing_to == explicit_target
+        ),
+        "an automatic projection cannot compose through an explicit move"
+    );
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(explicit_source, explicit_target.clone())]
+    );
+    assert!(
+        addressed
+            .managed_current
+            .contains_key(explicit_target.as_inner()),
+        "conflict detection must run before state is re-keyed"
+    );
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(detected_target.as_inner())
+    );
+}
+
+#[test]
+fn resource_move_invariants_late_move_can_extend_an_early_chain() {
+    let source = bucket_id("source");
+    let intermediate = bucket_id("intermediate");
+    let target = bucket_id("target");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::from([(
+            intermediate.as_inner().clone(),
+            Current::absent(intermediate.as_inner().clone()),
+        )]),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: vec![(source.clone(), intermediate.clone())],
+    };
+
+    apply_detected_resource_moves(
+        &mut addressed,
+        vec![test_detected_bucket_move("intermediate", "target")],
+    )
+    .expect("late detection may extend the already-applied early move");
+
+    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert!(addressed.managed_current.contains_key(target.as_inner()));
+    assert!(
+        !addressed
+            .managed_current
+            .contains_key(intermediate.as_inner())
+    );
+}
+
 #[test]
 fn test_plan_fails_on_two_moves_to_same_target() {
     let desired = Vec::new();
@@ -4489,6 +4708,183 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
     resource
 }
 
+#[test]
+fn resource_move_invariants_anonymous_match_uses_state_row_routing() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    let mut prior = association_state(old_name, "rtb-private", "subnet-a");
+    prior.directives.provider_instance = Some("persisted-route".to_string());
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+
+    let mut desired = desired_association(new_name, "private_rtb", "subnet-a");
+    desired.id.provider_instance = Some("desired-route".to_string());
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(
+        moves[0].from().provider_instance.as_deref(),
+        Some("persisted-route"),
+        "move.from must be the matched state row's routed address"
+    );
+    assert_eq!(
+        moves[0].to().provider_instance.as_deref(),
+        Some("desired-route")
+    );
+}
+
+#[test]
+fn resource_move_invariants_named_match_uses_state_row_routing() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "awscc_s3_bucket_11111111";
+    let mut prior = ResourceState::new("s3.Bucket", test_identity(old_name), "awscc");
+    prior.directives.provider_instance = Some("persisted-route".to_string());
+    prior.set_persisted_attribute("bucket_name", serde_json::json!("logs"));
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+    let desired = Resource::with_provider(
+        "awscc",
+        "s3.Bucket",
+        test_identity("logs"),
+        Some("desired-route".to_string()),
+    )
+    .with_binding("logs")
+    .with_attribute(
+        "bucket_name",
+        Value::Concrete(ConcreteValue::String("logs".into())),
+    );
+
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let moves = detect_anonymous_to_named_moves_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    )
+    .expect("empty provider configuration is valid for this create-only match");
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(
+        moves[0].from().provider_instance.as_deref(),
+        Some("persisted-route"),
+        "anonymous-to-named move.from must retain the state row's route"
+    );
+    assert_eq!(
+        moves[0].to().provider_instance.as_deref(),
+        Some("desired-route")
+    );
+}
+
+#[test]
+fn resource_move_invariants_projected_attribute_less_row_is_not_a_candidate() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let source = bucket_id("awscc_s3_bucket_11111111");
+    let target = bucket_id("awscc_s3_bucket_aaaaaaaa");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(ResourceState::new(
+            "s3.Bucket",
+            source.identity().clone(),
+            "awscc",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(ResourceState::new(
+            "s3.Bucket",
+            test_identity("awscc_s3_bucket_22222222"),
+            "awscc",
+        ))
+        .expect("test state setup must be valid");
+
+    let state_view =
+        AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target.clone())]);
+    assert!(
+        state_view
+            .entries_by_type(&StateBlockClaims::empty(), "awscc", "s3.Bucket")
+            .candidates()
+            .next()
+            .is_none(),
+        "a projected row without persisted attributes is existence-only"
+    );
+
+    let desired = bucket_resource(target.identity_str());
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired],
+        &[],
+        &state_view,
+        &StateBlockClaims::empty(),
+    );
+    assert!(
+        moves.is_empty(),
+        "the projected target must still satisfy the exact-address existence check"
+    );
+}
+
+#[test]
+fn resource_move_invariants_projected_state_read_preserves_dependency_bindings() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let mut prior = association_state(old_name, "rtb-private", "subnet-a");
+    prior.dependency_bindings.insert("private_rtb".to_string());
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(prior)
+        .expect("test state setup must be valid");
+    let desired = desired_association(new_name, "private_rtb", "subnet-a");
+    let resources = vec![desired];
+    let state = Some(state_file);
+
+    let detected_moves = detect_automatic_resource_moves(
+        &ctx,
+        &resources,
+        &[],
+        &[],
+        &state,
+        &StateBlockClaims::empty(),
+    )
+    .expect("the automatic move projection must resolve");
+    let projection = detected_moves.state_read_projection();
+    let (loaded_id, loaded) = projection.build_current(&state, &resources[0].id);
+    let saved = projection.saved_dependency_bindings(&state, &resources);
+
+    assert_eq!(loaded_id.identity_str(), Some(old_name));
+    assert_eq!(loaded.id().identity_str(), Some(old_name));
+    assert_eq!(
+        saved.get(&resources[0].id),
+        Some(&["private_rtb".to_string()].into_iter().collect()),
+        "phase-1 metadata lookup must read the moved source row"
+    );
+}
+
 fn assert_claimed_association_stays_orphaned_after_reconcile() {
     use carina_state::state::StateFile;
 
@@ -4593,10 +4989,8 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
     };
 
     let mut destroy_config = config();
-    let mut destroy_state = state();
-    destroy_config
-        .reconcile_for_destroy(&mut destroy_state)
-        .expect("destroy identity preparation must succeed");
+    let destroy_state = state();
+    destroy_config.reconcile_for_destroy(&destroy_state);
     assert!(
         destroy_state
             .as_ref()
@@ -4614,10 +5008,8 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
     );
 
     let mut refresh_config = config();
-    let mut refresh_state = state();
-    refresh_config
-        .reconcile_for_state_refresh(&mut refresh_state)
-        .expect("state refresh identity preparation must succeed");
+    let refresh_state = state();
+    refresh_config.reconcile_for_state_refresh(&refresh_state);
     assert!(
         refresh_state
             .as_ref()
@@ -7293,14 +7685,22 @@ mod expand_same_config_deferred_for_tests {
             &parsed.resources,
             &schemas,
         );
-        let prepared = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
-            .expect("build expansion prelude")
+        let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
+            .expect("build expansion prelude");
+        let detected_automatic_moves = detect_automatic_resource_moves(
+            &wiring,
+            prelude.sorted_resources(),
+            &parsed.data_sources,
+            &[],
+            &state_file,
+            &claims,
+        )
+        .expect("detect automatic moves");
+        let prepared = prelude
             .reconcile_addresses(
                 ReconcileDeferredForExpansionInputs {
-                    ctx: &wiring,
                     parsed: &parsed,
-                    provider_configs: &[],
-                    state_block_claims: &claims,
+                    detected_automatic_moves,
                     managed_current: HashMap::new(),
                     orphans: Orphans::new(),
                     already_refreshed: HashSet::new(),

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::differ::restore_current_move_source;
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::SavedPlan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
@@ -508,24 +509,38 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 
 impl SchemaCheckedPendingPlanFile {
     /// Reconstruct the minimal plan-time prior-state view needed by
-    /// deferred-`for` expansion. Required sources are cloned from snapshots
-    /// that already crossed the locked in-flight reload boundary; unrelated
-    /// managed snapshots contribute only their refreshed address, avoiding a
-    /// deep clone of every saved state.
+    /// deferred-`for` expansion. Saved snapshots have already crossed address
+    /// reconciliation, so move targets are restored through their plan-minted
+    /// move authority before the current configuration replays those moves.
+    /// Unrelated managed snapshots contribute only their refreshed address,
+    /// avoiding a deep clone of every saved state.
     pub(super) fn expansion_prior_states(
         &self,
         required_managed: &[Resource],
-    ) -> ExpansionPriorStates {
+    ) -> Result<ExpansionPriorStates, AppError> {
         let required_managed: HashSet<&ResourceId> = required_managed
             .iter()
             .map(|resource| &resource.id)
             .collect();
+        let plan = self.plan_file.plan();
+        let moved_origins = MovedOrigins::from_plan(plan);
         let mut managed = HashMap::new();
         let mut already_refreshed = HashSet::new();
         for entry in self.plan_file.current_states() {
             let ReloadedCurrentStateEntry::Managed { id, current } = entry;
-            if required_managed.contains(id) {
-                managed.insert(id.clone(), current.as_ref().clone());
+            let origin = moved_origins.origin_for(id);
+            if required_managed.contains(id) || origin != id {
+                let current = if origin == id {
+                    current.as_ref().clone()
+                } else {
+                    let authority = plan.move_authority(origin, id).ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "saved plan has no move authority from {origin} to {id}"
+                        ))
+                    })?;
+                    restore_current_move_source(current.as_ref().clone(), &authority)?
+                };
+                managed.insert(origin.clone(), current);
             } else if !matches!(current.as_ref(), Current::Absent(_)) {
                 // Plan-time orphan refresh owns these addresses. Keep only
                 // their ids: expansion needs the exclusion set, not a deep
@@ -533,10 +548,10 @@ impl SchemaCheckedPendingPlanFile {
                 already_refreshed.insert(id.clone());
             }
         }
-        ExpansionPriorStates {
+        Ok(ExpansionPriorStates {
             managed,
             already_refreshed,
-        }
+        })
     }
 
     pub(super) fn data_source_values(

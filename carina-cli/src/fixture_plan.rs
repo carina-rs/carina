@@ -311,9 +311,7 @@ where
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
-    } = validated_config
-        .reconcile_identities_with_state(&mut state_file)
-        .expect("fixture state identities must remain unique");
+    } = validated_config.reconcile_identities_with_state(&state_file);
     let (wiring, canonical_resources) = validated_config.context_and_resources();
     let parsed = canonical_resources.parsed();
 
@@ -331,49 +329,6 @@ where
     )
     .expect("fixture deferred-for prelude must resolve");
     let sorted_resources = expansion_prelude.sorted_resources();
-
-    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
-    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
-    let mut orphans = Orphans::new();
-    if let Some(sf) = state_file.as_ref() {
-        for resource in sorted_resources {
-            let current = sf.build_state_for_resource(&resource.id);
-            managed_current.insert(resource.id.clone(), current);
-        }
-        data_source_states.extend(
-            data_sources
-                .iter()
-                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
-        );
-
-        let desired_ids: HashSet<ResourceId> = sorted_resources
-            .iter()
-            .map(|r| r.id.clone())
-            .chain(data_sources.iter().map(|d| d.id.clone()))
-            .collect();
-        orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
-    } else {
-        for resource in sorted_resources {
-            managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
-        }
-        for ds in &data_sources {
-            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
-        }
-    }
-    let mut data_source_values =
-        DataSourceValues::from_data_sources(&data_sources, |data_source| {
-            DataSourceValue::read(
-                data_source_states
-                    .get(&data_source.id)
-                    .cloned()
-                    .expect("fixture initialized every data-source state"),
-            )
-        });
-
-    let directives_map = state_file
-        .as_ref()
-        .map(|sf| sf.build_directives())
-        .unwrap_or_default();
 
     // Insert every upstream binding — even when the state file is
     // unreadable — so `resolve_refs_for_plan` knows the binding name
@@ -401,6 +356,60 @@ where
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
+    let detected_automatic_moves = crate::wiring::detect_automatic_resource_moves(
+        wiring,
+        sorted_resources,
+        &data_sources,
+        raw_provider_configs,
+        &state_file,
+        &state_block_claims,
+    )
+    .expect("fixture automatic moves must resolve");
+    let state_read_projection = detected_automatic_moves.state_read_projection();
+
+    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut orphans = Orphans::new();
+    if let Some(sf) = state_file.as_ref() {
+        for resource in sorted_resources {
+            let (loaded_id, current) =
+                state_read_projection.build_current(&state_file, &resource.id);
+            managed_current.insert(loaded_id, current);
+        }
+        data_source_states.extend(
+            data_sources
+                .iter()
+                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
+        );
+
+        let desired_ids: HashSet<ResourceId> = state_read_projection
+            .persisted_resource_ids(sorted_resources)
+            .into_iter()
+            .chain(data_sources.iter().map(|d| d.id.clone()))
+            .collect();
+        orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
+    } else {
+        for resource in sorted_resources {
+            managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
+        }
+        for ds in &data_sources {
+            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
+        }
+    }
+    let mut data_source_values =
+        DataSourceValues::from_data_sources(&data_sources, |data_source| {
+            DataSourceValue::read(
+                data_source_states
+                    .get(&data_source.id)
+                    .cloned()
+                    .expect("fixture initialized every data-source state"),
+            )
+        });
+
+    let directives_map = state_file
+        .as_ref()
+        .map(|sf| sf.build_directives())
+        .unwrap_or_default();
 
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
@@ -577,10 +586,8 @@ where
     let mut reconciled_expansion = expansion_prelude
         .reconcile_addresses(
             crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: wiring,
                 parsed,
-                provider_configs: raw_provider_configs,
-                state_block_claims: &state_block_claims,
+                detected_automatic_moves,
                 managed_current,
                 orphans,
                 already_refreshed: HashSet::new(),

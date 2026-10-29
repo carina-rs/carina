@@ -305,6 +305,22 @@ pub fn rebind_current_for_move(
     Ok(current)
 }
 
+/// Restore a saved post-move snapshot to the source side of the exact move
+/// edge that will be replayed during current-configuration verification.
+pub fn restore_current_move_source(
+    mut current: Current,
+    authority: &MoveAuthority<'_>,
+) -> Result<Current, CurrentMoveRoutingMismatch> {
+    if current.id() != authority.to() {
+        return Err(CurrentMoveRoutingMismatch {
+            actual: Box::new(current.id().clone()),
+            expected: Box::new(authority.to().clone()),
+        });
+    }
+    current.restore_move_source(authority);
+    Ok(current)
+}
+
 /// Atomically move one keyed current-state entry through the checked move
 /// seam. A missing source is not an error and leaves the map unchanged.
 pub fn rekey_current_for_move(

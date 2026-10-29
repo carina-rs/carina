@@ -34,24 +34,35 @@ pub struct StateBlockClaims {
 /// resource type, retaining both the complete entry set and the safe heuristic
 /// candidate subset.
 pub struct ScreenedStateEntries<T> {
-    entries: Vec<(T, bool)>,
+    entries: Vec<(T, bool, bool)>,
 }
 
 impl<T> ScreenedStateEntries<T> {
     pub fn candidates(&self) -> impl Iterator<Item = &T> {
         self.entries
             .iter()
-            .filter_map(|(entry, claimed)| (!claimed).then_some(entry))
+            .filter_map(|(entry, claimed, eligible)| (!claimed && *eligible).then_some(entry))
     }
 
     pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
-        self.entries.iter().map(|(entry, _)| entry)
+        self.entries.iter().map(|(entry, _, _)| entry)
     }
 
     pub(crate) fn claimed(&self) -> impl Iterator<Item = &T> {
         self.entries
             .iter()
-            .filter_map(|(entry, claimed)| claimed.then_some(entry))
+            .filter_map(|(entry, claimed, _)| claimed.then_some(entry))
+    }
+
+    /// Retain entries for exact-address existence checks while excluding
+    /// entries that do not carry enough state to participate in heuristics.
+    pub fn exclude_candidates(mut self, excluded: impl Fn(&T) -> bool) -> Self {
+        for (entry, _, eligible) in &mut self.entries {
+            if excluded(entry) {
+                *eligible = false;
+            }
+        }
+        self
     }
 }
 
@@ -89,13 +100,16 @@ impl StateBlockClaims {
                             self.claims_from(&resource_id)
                         },
                     );
-                    (entry, claimed)
+                    (entry, claimed, true)
                 })
                 .collect(),
         }
     }
 
-    fn claims_from(&self, resource_id: &ResourceId) -> bool {
+    /// Whether an operator-written state block owns this persisted source
+    /// address. Projected state views use this to keep the source claim after
+    /// presenting the row under a moved-to address.
+    pub fn claims_from(&self, resource_id: &ResourceId) -> bool {
         self.from
             .iter()
             .any(|address| address.matches_resource_id(resource_id))
@@ -1101,8 +1115,23 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
 pub struct AnonymousIdStateInfo {
     /// The resource name (anonymous identifier) stored in state
     pub name: String,
+    /// Provider-instance routing carried by the persisted state row.
+    pub provider_instance: Option<String>,
     /// Create-only attribute values from state, keyed by DSL attribute name
     pub create_only_values: HashMap<String, String>,
+}
+
+fn resolved_anonymous_state_id(
+    provider: &str,
+    resource_type: &str,
+    entry: &AnonymousIdStateInfo,
+) -> ResolvedResourceId {
+    ResolvedResourceId::with_provider_identity(
+        provider,
+        resource_type,
+        ResourceIdentity::new(entry.name.clone()),
+        entry.provider_instance.clone(),
+    )
 }
 
 /// Cross-resource state information used to resolve simple deferred
@@ -1185,7 +1214,8 @@ fn canonical_or_resolved_create_only_value_string(
 /// Every matching branch returns a [`ResolvedMove`] from the matched state row
 /// to the resource's resolved current address. This includes SimHash matches
 /// for older identifier formats and unique full or partial create-only
-/// matches. The move carries the desired resource's provider-instance route.
+/// matches. The move source carries the matched state row's provider-instance
+/// route, while the destination carries the desired resource's route.
 pub fn reconcile_anonymous_identifiers(
     resources: &[Resource],
     data_sources: &[DataSource],
@@ -1279,22 +1309,21 @@ pub fn reconcile_anonymous_identifiers(
                             .is_some_and(|names| names.contains(&entry.name))
                 })
                 .filter_map(|entry| match extract_hash_from_identifier(&entry.name) {
-                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry.name.as_str(), hash)),
+                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
                     _ => None,
                 });
 
-            if let Some((state_name, _)) =
+            if let Some((state_entry, _)) =
                 closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
             {
                 // The state entry may use an older identifier format (e.g.
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a move so the wiring
                 // layer can re-key the state entry.
-                let from = ResolvedResourceId::with_provider_identity(
+                let from = resolved_anonymous_state_id(
                     resolved_resource_id.provider(),
                     resolved_resource_id.resource_type(),
-                    ResourceIdentity::new(state_name.to_string()),
-                    resolved_resource_id.provider_instance().map(str::to_string),
+                    state_entry,
                 );
                 moves.push(ResolvedMove::from_detected_rename(
                     from,
@@ -1303,7 +1332,7 @@ pub fn reconcile_anonymous_identifiers(
                 claimed_names
                     .entry(key)
                     .or_default()
-                    .insert(state_name.to_string());
+                    .insert(state_entry.name.clone());
             }
             continue;
         }
@@ -1316,8 +1345,8 @@ pub fn reconcile_anonymous_identifiers(
         // Entries already used by another current resource are live and must
         // not be stolen; entries claimed earlier in this pass are also excluded
         // so two resources cannot collapse onto the same state row.
-        let mut full_matches: Vec<&str> = Vec::new();
-        let mut partial_matches: Vec<&str> = Vec::new();
+        let mut full_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
+        let mut partial_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
         for entry in state_entries.candidates() {
             if entry.name == resource_identity {
                 // Same identifier, no reconciliation needed
@@ -1348,9 +1377,9 @@ pub fn reconcile_anonymous_identifiers(
             }
 
             if matched > 0 && mismatched == 0 {
-                full_matches.push(&entry.name);
+                full_matches.push(entry);
             } else if matched > 0 && mismatched > 0 {
-                partial_matches.push(&entry.name);
+                partial_matches.push(entry);
             }
         }
 
@@ -1362,12 +1391,11 @@ pub fn reconcile_anonymous_identifiers(
             None
         };
 
-        if let Some(matched_name) = matched_name {
-            let from = ResolvedResourceId::with_provider_identity(
+        if let Some(matched_entry) = matched_name {
+            let from = resolved_anonymous_state_id(
                 resolved_resource_id.provider(),
                 resolved_resource_id.resource_type(),
-                ResourceIdentity::new(matched_name.to_string()),
-                resolved_resource_id.provider_instance().map(str::to_string),
+                matched_entry,
             );
             moves.push(ResolvedMove::from_detected_rename(
                 from,
@@ -1376,7 +1404,7 @@ pub fn reconcile_anonymous_identifiers(
             claimed_names
                 .entry(key)
                 .or_default()
-                .insert(matched_name.to_string());
+                .insert(matched_entry.name.clone());
         }
     }
     moves
@@ -1476,9 +1504,9 @@ pub fn detect_anonymous_to_named_renames(
             }
         }
 
-        let matched_name: Option<&str> = if !resource_co_values.is_empty() {
+        let matched_entry: Option<&AnonymousIdStateInfo> = if !resource_co_values.is_empty() {
             // Create-only path: find orphaned entries whose create-only values all match.
-            let mut matches: Vec<&str> = Vec::new();
+            let mut matches: Vec<&AnonymousIdStateInfo> = Vec::new();
             for entry in state_entries.candidates() {
                 if used_in_dsl.contains(&entry.name) {
                     continue;
@@ -1493,7 +1521,7 @@ pub fn detect_anonymous_to_named_renames(
                         .is_some_and(|v| v == value)
                 });
                 if all_match {
-                    matches.push(&entry.name);
+                    matches.push(entry);
                 }
             }
             // Only rename on a unique match to avoid rebinding the wrong entry.
@@ -1511,19 +1539,18 @@ pub fn detect_anonymous_to_named_renames(
                 .candidates()
                 .filter(|e| !used_in_dsl.contains(&e.name))
                 .filter_map(|e| match extract_hash_from_identifier(&e.name) {
-                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((e.name.as_str(), hash)),
+                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((e, hash)),
                     _ => None,
                 });
             closest_unique_simhash_match(resource_hash, candidates, |(_, h)| h)
-                .map(|(name, _)| name)
+                .map(|(entry, _)| entry)
         };
 
-        if let Some(name) = matched_name {
-            let from = ResolvedResourceId::with_provider_identity(
+        if let Some(entry) = matched_entry {
+            let from = resolved_anonymous_state_id(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                ResourceIdentity::new(name.to_string()),
-                resource.id.provider_instance.clone(),
+                entry,
             );
             let Some(to) = ResolvedResourceId::try_new(resource.id.clone()) else {
                 continue;
